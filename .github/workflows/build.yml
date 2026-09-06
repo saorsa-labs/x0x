@@ -32,6 +32,8 @@ jobs:
           subprocess.run(['git', 'diff', '--exit-code', 'HEAD', '--'], check=True)
           assert not subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'])
           expected = {
+              'Cargo.toml': 'd4d01c80f179aec856cce40492e127c8773803257c9482675b182671c2778335',
+              'tests/fixtures/bootstrap-535-ant-quic-85a.lock': '4e024f966be6807092ef081626a5de3ae3ff07e94f5b5807d5e05595097590eb',
               'src/server/routes/identity.rs': 'c0db5fd0d512941c67bbee717dfa6224a832d80b3760d9f02963ae881dc0e8b5',
               'src/server/routes/public_group_bootstrap_outbox.rs': 'a12934d7adf5e90c93c298410a618880bfa4a8eeed36e0d9d806a68461fd322a',
               'tests/f2_public_group_bootstrap_wiring.rs': 'ecd05257e75644ca7f328f14c2013200b2d6550e5ef1340dd11ab441cf92ed41',
@@ -66,32 +68,81 @@ jobs:
       - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1 # failing CI action
         with:
           tool: nextest@0.9.143
-      - name: Resolve and retain the diagnostic dependency graph
+      - name: Restore the reviewed lock and fetch dependencies without changing it
         run: |
           set -euo pipefail
-          cargo generate-lockfile
+          cp tests/fixtures/bootstrap-535-ant-quic-85a.lock Cargo.lock
+          cargo fetch --locked
+          echo '4e024f966be6807092ef081626a5de3ae3ff07e94f5b5807d5e05595097590eb  Cargo.lock' | sha256sum --check
           cp Cargo.lock "$RUNNER_TEMP/bootstrap-diagnostic/Cargo.lock"
           cargo nextest --version
           rustc --version --verbose
       - name: Run exactly one bootstrap restart test inside the reviewed namespace
         run: |
           python3 - <<'PYCODE'
-          import hashlib, json, os, pathlib, subprocess, time
+          import hashlib, json, os, pathlib, subprocess, tempfile, time
           evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'bootstrap-diagnostic'
-          lock = hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest()
-          command = ['bash', 'scripts/ci/nextest-isolated.sh', '--all-features', '--test',
-                     'f2_public_group_bootstrap_wiring', '--', '-E',
+          scratch = pathlib.Path(tempfile.mkdtemp(prefix='x0x-metadata-', dir=os.environ['RUNNER_TEMP']))
+          expected_lock = '4e024f966be6807092ef081626a5de3ae3ff07e94f5b5807d5e05595097590eb'
+          digest_lock = lambda: hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest()
+          command = ['python3', 'scripts/ci/isolated-runtime.py', 'python3',
+                     'scripts/ci/nextest-reuse.py', 'run', str(scratch), '-E',
                      'test(=bootstrap_outbox_survives_sender_restart_and_clears_only_on_ack)']
+          receipt = {'command': command, 'exit': 1, 'lock_sha256': expected_lock,
+                     'runtime_started': False, 'stages': []}
           started = time.monotonic()
-          with (evidence / 'stdout.log').open('x') as out, (evidence / 'stderr.log').open('x') as err:
-              result = subprocess.run(command, stdout=out, stderr=err)
-          unchanged = lock == hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest()
-          receipt = {'command': command, 'exit': result.returncode, 'seconds': time.monotonic()-started,
-                     'lock_sha256': lock, 'lock_unchanged': unchanged}
-          (evidence / 'command.json').write_text(json.dumps(receipt, indent=2))
-          print(json.dumps(receipt), flush=True)
-          assert unchanged, 'resolved lock changed'
-          raise SystemExit(result.returncode)
+          try:
+              assert digest_lock() == expected_lock, 'unreviewed dependency graph'
+              with (evidence / 'stdout.log').open('x') as out, (evidence / 'stderr.log').open('x') as err:
+                  def stage(name, args, destination):
+                      began = time.monotonic()
+                      result = subprocess.run(args, stdout=destination, stderr=err)
+                      receipt['stages'].append({'stage': name, 'command': args, 'exit': result.returncode,
+                                                'seconds': time.monotonic()-began})
+                      receipt['exit'] = result.returncode or 1
+                      assert result.returncode == 0, f'{name} failed before runtime'
+                      assert digest_lock() == expected_lock, f'{name} changed the lock'
+                  with (scratch / 'cargo.json').open('x') as metadata:
+                      stage('locked-metadata', ['cargo', 'metadata', '--locked', '--all-features',
+                            '--format-version', '1'], metadata)
+                  graph = json.loads((scratch / 'cargo.json').read_text())
+                  packages = [package for package in graph['packages'] if package['name'] == 'ant-quic']
+                  expected_source = 'git+https://github.com/saorsa-labs/ant-quic?rev=85a173a298ce877725c591cf50cea5ea5fc9cb13#85a173a298ce877725c591cf50cea5ea5fc9cb13'
+                  assert len(packages) == 1 and packages[0]['source'] == expected_source
+                  assert packages[0]['version'] == '0.27.49'
+                  dependency_root = pathlib.Path(packages[0]['manifest_path']).parent
+                  dependency_head = subprocess.check_output(['git', '-C', str(dependency_root),
+                                                            'rev-parse', 'HEAD'], text=True).strip()
+                  assert dependency_head == '85a173a298ce877725c591cf50cea5ea5fc9cb13'
+                  subprocess.run(['git', '-C', str(dependency_root), 'diff', '--quiet', 'HEAD', '--'], check=True)
+                  assert not subprocess.check_output(['git', '-C', str(dependency_root), 'ls-files',
+                                                      '--others', '--exclude-standard', '--', 'src',
+                                                      'Cargo.toml', 'build.rs', 'ant-quic-workspace-hack'])
+                  dependency_files = {
+                      'src/p2p_endpoint.rs': '31523515e05b04762b88e65d6b1dd897be0a22fb66b4922959ff7bb6e12786e8',
+                      'src/p2p_endpoint/socket_binding.rs': 'ecea5cb6c1cc534f58d87f110bf866de0c79deeaf4bae187e9538f4feb4f9b95',
+                  }
+                  for name, expected in dependency_files.items():
+                      assert hashlib.sha256((dependency_root / name).read_bytes()).hexdigest() == expected
+                  receipt['dependency_custody'] = {'head': dependency_head, 'files': dependency_files}
+                  resolved = next(node for node in graph['resolve']['nodes'] if node['id'] == packages[0]['id'])
+                  receipt['ant_quic'] = {'source': expected_source, 'version': packages[0]['version'],
+                                         'features': resolved['features']}
+                  with (scratch / 'binaries.json').open('x') as binaries:
+                      stage('locked-binaries-only', ['cargo', 'nextest', 'list', '--all-features',
+                            '--test', 'f2_public_group_bootstrap_wiring', '--locked', '--cargo-metadata',
+                            str(scratch / 'cargo.json'), '--list-type', 'binaries-only',
+                            '--message-format', 'json'], binaries)
+                  stage('record-custody', ['python3', 'scripts/ci/nextest-reuse.py', 'record', str(scratch)], out)
+                  receipt['runtime_started'] = True
+                  result = subprocess.run(command, stdout=out, stderr=err)
+                  receipt['exit'] = result.returncode
+          finally:
+              receipt.update(seconds=time.monotonic()-started, lock_unchanged=digest_lock() == expected_lock)
+              (evidence / 'command.json').write_text(json.dumps(receipt, indent=2))
+              print(json.dumps(receipt), flush=True)
+          assert receipt['lock_unchanged'], 'resolved lock changed'
+          raise SystemExit(receipt['exit'])
           PYCODE
       - name: Collect explicit evidence whitelist
         id: collect

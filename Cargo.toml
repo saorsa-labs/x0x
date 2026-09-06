@@ -185,3 +185,7 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
+
+# Disposable consumer acceptance only; not a release dependency publication.
+[patch.crates-io]
+ant-quic = { git = "https://github.com/saorsa-labs/ant-quic", rev = "85a173a298ce877725c591cf50cea5ea5fc9cb13" }
