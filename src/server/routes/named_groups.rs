@@ -29896,6 +29896,7 @@ pub(in crate::server) mod tests {
     mod pr291_restart_marker_matrix;
     mod wp_c;
     mod wp_c_491;
+    mod wp_c_491_rt2;
 
     fn fake_group_state_commit(
         group_id: &str,
