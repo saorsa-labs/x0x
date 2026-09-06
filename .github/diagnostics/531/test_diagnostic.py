@@ -1,13 +1,73 @@
 import importlib.util
+import errno
 import json
 from pathlib import Path
 import tempfile
 import subprocess
 import unittest
+from unittest.mock import MagicMock, patch
 
 spec = importlib.util.spec_from_file_location('diagnostic', Path(__file__).with_name('diagnostic.py'))
 diag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(diag)
+
+
+probe_spec = importlib.util.spec_from_file_location('probes', Path(__file__).with_name('probes.py'))
+probes = importlib.util.module_from_spec(probe_spec)
+probe_spec.loader.exec_module(probes)
+
+
+class ForbiddenUdpControls(unittest.TestCase):
+    def test_permission_denial_is_recorded(self):
+        for number in (errno.EPERM, errno.EACCES):
+            with self.subTest(errno=number):
+                sock = MagicMock()
+                sock.sendto.side_effect = OSError(number, 'fixture denied')
+                self.assertEqual(probes.forbidden_udp_send(sock, ('127.0.0.1', 29483)),
+                                 {'outcome': 'denied', 'errno': number})
+                sock.sendto.assert_called_once_with(probes.PAYLOAD, ('127.0.0.1', 29483))
+
+    def test_successful_send_is_recorded_without_claiming_delivery(self):
+        sock = MagicMock()
+        self.assertEqual(probes.forbidden_udp_send(sock, ('::1', 29483)),
+                         {'outcome': 'sent', 'errno': None})
+        sock.sendto.assert_called_once_with(probes.PAYLOAD, ('::1', 29483))
+
+    def test_unexpected_send_error_fails(self):
+        sock = MagicMock()
+        sock.sendto.side_effect = OSError(errno.ENETUNREACH, 'fixture wrong route')
+        with self.assertRaises(OSError) as raised:
+            probes.forbidden_udp_send(sock, ('127.0.0.1', 29483))
+        self.assertEqual(raised.exception.errno, errno.ENETUNREACH)
+
+    def family_with_delivery(self, delivered):
+        # Exercise actual family_control counter collection, with no real sockets.
+        sockets = [MagicMock() for _ in range(5)]
+        for sock in sockets[:2]:
+            connection = MagicMock()
+            connection.__enter__.return_value = connection
+            connection.recv.return_value = probes.PAYLOAD
+            sock.accept.return_value = (connection, ('127.0.0.1', 44000))
+        sockets[2].recvfrom.side_effect = [(probes.PAYLOAD, ('127.0.0.1', 29482)),
+                                         (b'reply-received', ('127.0.0.1', 29482))]
+        sockets[3].accept.side_effect = probes.socket.timeout()
+        if delivered:
+            sockets[4].recvfrom.return_value = (probes.PAYLOAD, ('127.0.0.1', 29482))
+        else:
+            sockets[4].recvfrom.side_effect = probes.socket.timeout()
+        child = subprocess.CompletedProcess([], 0, stdout='fixture', stderr='')
+        with patch.object(probes.socket, 'socket', side_effect=sockets), \
+                patch.object(probes.subprocess, 'run', return_value=child):
+            return probes.family_control('4')
+
+    def test_zero_delivery_family_control_passes(self):
+        result = self.family_with_delivery(False)
+        self.assertEqual(result['forbidden_counters'], {'tcp': 0, 'udp': 0})
+        self.assertEqual(result['server_positive'], [True]*4)
+
+    def test_received_forbidden_packet_fails_actual_family_control(self):
+        with self.assertRaisesRegex(AssertionError, "'udp': 1"):
+            self.family_with_delivery(True)
 
 
 class SourceCustodyControls(unittest.TestCase):

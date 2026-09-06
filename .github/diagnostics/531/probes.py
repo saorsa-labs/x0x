@@ -1,4 +1,5 @@
 """Synthetic namespace controls only. No product or public endpoint requests."""
+import errno
 import json
 import socket
 import subprocess
@@ -6,6 +7,18 @@ import sys
 import threading
 
 PAYLOAD = b'531-synthetic-only'
+
+
+def forbidden_udp_send(sock, address):
+    # DROP may report denial immediately or accept the syscall without delivery.
+    # Receiver counters and the supervisor's nft counters remain authoritative.
+    try:
+        sock.sendto(PAYLOAD, address)
+    except OSError as error:
+        if error.errno not in (errno.EPERM, errno.EACCES):
+            raise
+        return {'outcome': 'denied', 'errno': error.errno}
+    return {'outcome': 'sent', 'errno': None}
 
 
 def client(family):
@@ -26,8 +39,7 @@ def client(family):
         sock.sendto(PAYLOAD, (host, 29481))
         result['positive'].append(sock.recvfrom(128)[0] == PAYLOAD)
         sock.sendto(b'reply-received', (host, 29481))
-        # A successful UDP send syscall is NOT proof of delivery under DROP.
-        sock.sendto(PAYLOAD, (host, 29483))
+        result['forbidden_udp_send'] = forbidden_udp_send(sock, (host, 29483))
     with socket.socket(af, socket.SOCK_STREAM) as sock:
         sock.settimeout(.5)
         try:
