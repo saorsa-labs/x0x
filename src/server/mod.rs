@@ -1058,12 +1058,14 @@ pub async fn serve_with_options(
     // instead of duplicated; best-effort — never fails startup.
     routes::home::provision_home(&state).await;
 
-    // #449 P4: retire duplicate Homes left over from a pre-fix fork, but only
-    // once we are seated in the canonical one. Called HERE rather than inside
-    // `provision_home` because that returns early on several paths — including
-    // the common "we already have a Home" one, which is exactly when a stale
-    // duplicate needs clearing.
-    routes::home::reconcile_home_duplicates(&state).await;
+    // #449 P4: automatic retirement of duplicate Homes is DELIBERATELY NOT
+    // wired here. Independent review found this call site ran before
+    // `crdt_subscriptions::load`, so a duplicate carrying a durable
+    // `x0x.group.<id>.symphony.*` manifest entry could pass an "empty" probe
+    // and be terminally withdrawn before its own evidence was loaded — and
+    // the emptiness proof is not held across the withdrawal in any case.
+    // Duplicates are reported read-only by `GET /home` until a proven
+    // retirement fence exists. See docs/design/449-p4-retirement-fence.md.
 
     // ADR 0028: post-restore queue drain — any queued approvals whose
     // predecessors arrived during downtime can now be drained (Kimi blocker 9).

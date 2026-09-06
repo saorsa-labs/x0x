@@ -126,7 +126,7 @@ pub(in crate::server) async fn home_duplicates(
     ids
 }
 
-/// Why a duplicate Home may NOT be retired automatically (#449 P4).
+/// Evidence that a duplicate Home is NOT safe to delete (#449 P4).
 ///
 /// Empty ⇒ safe to retire. Withdrawal is terminal and cleans only crypto
 /// material: durable history, the group delegations that live ONLY in history,
@@ -217,94 +217,83 @@ pub(in crate::server) async fn home_retire_blockers(
 
     // Group-scoped CRDT task lists are namespaced by convention, not keyed,
     // so nothing would clean them up.
+    //
+    // Review P2: the in-memory manifest is NOT sufficient evidence. Its loader
+    // maps read and parse failures to an empty manifest — correct for REST and
+    // rehydration, which fail closed elsewhere, but for a destructive decision
+    // "could not read the evidence" would masquerade as "there is none". The
+    // durable file is therefore probed directly, and an unreadable or
+    // unparseable one is a blocker in its own right.
     let prefixes = [
         format!("x0x.group.{group_id}."),
         format!("x0x.group.{stable_id}."),
     ];
-    if state
-        .crdt_subscriptions
-        .read()
-        .await
-        .entries
-        .iter()
-        .any(|entry| prefixes.iter().any(|p| entry.id.starts_with(p.as_str())))
-    {
-        blockers.push("has group-scoped task lists".to_string());
+    match durable_json_is_readable(&state.crdt_subscriptions_path).await {
+        Readable::Absent => {}
+        Readable::Ok => {
+            if state
+                .crdt_subscriptions
+                .read()
+                .await
+                .entries
+                .iter()
+                .any(|entry| prefixes.iter().any(|p| entry.id.starts_with(p.as_str())))
+            {
+                blockers.push("has group-scoped task lists".to_string());
+            }
+        }
+        Readable::Unavailable(why) => blockers.push(format!(
+            "task-list manifest unreadable ({why}) — cannot prove this Home has no task lists"
+        )),
     }
 
-    if state
-        .rider_tokens
-        .lock()
-        .await
-        .grants_any_group(&[group_id, stable_id.as_str()])
-    {
-        blockers.push("a rider token grants this group".to_string());
+    // Same class for rider grants: an unreadable or corrupt store is not proof
+    // that the durable grant set is empty. Repairing a transient read problem
+    // after withdrawal would leave a grant pointing at an orphaned group.
+    let rider_path = state
+        .data_dir
+        .join(crate::server::rider_auth::RIDER_TOKENS_FILE);
+    match durable_json_is_readable(&rider_path).await {
+        Readable::Absent => {}
+        Readable::Ok => {
+            if state
+                .rider_tokens
+                .lock()
+                .await
+                .grants_any_group(&[group_id, stable_id.as_str()])
+            {
+                blockers.push("a rider token grants this group".to_string());
+            }
+        }
+        Readable::Unavailable(why) => blockers.push(format!(
+            "rider-token store unreadable ({why}) — cannot prove this Home has no grants"
+        )),
     }
 
     blockers
 }
 
-/// Retire duplicate Homes this device no longer needs (#449 P4).
-///
-/// Runs only once this device is seated in the canonical Home, so the order is
-/// always **join-then-retire, never the reverse** — retiring first would leave
-/// the device with no Home at all, and withdrawal is terminal. A duplicate
-/// with anything to lose is left alone and reported by `GET /home`; nothing is
-/// ever deleted merely to tidy up.
-pub(in crate::server) async fn reconcile_home_duplicates(state: &Arc<AppState>) {
-    let Some(user_kp) = state.agent.identity().user_keypair() else {
-        return;
-    };
-    let owner = user_kp.user_id();
-    let HomeResolution::Local {
-        group_id: canonical,
-        ..
-    } = resolve_home(state).await
-    else {
-        return;
-    };
-    for duplicate in home_duplicates(state, &canonical, &owner).await {
-        let blockers = home_retire_blockers(state, &duplicate).await;
-        if !blockers.is_empty() {
-            tracing::info!(
-                group_id = %duplicate,
-                blockers = ?blockers,
-                "duplicate Home kept — not provably empty; surfaced for the owner (#449)"
-            );
-            continue;
-        }
-        match retire_home_group(state, &duplicate).await {
-            Ok(()) => tracing::info!(
-                group_id = %duplicate,
-                canonical = %canonical,
-                "retired an empty duplicate Home (#449)"
-            ),
-            Err(e) => tracing::warn!(
-                group_id = %duplicate,
-                "duplicate Home retirement failed, retrying later: {e}"
-            ),
-        }
-    }
+/// Durable-evidence readability, for gates that must not confuse "no evidence"
+/// with "evidence unavailable" (#449 P4, review P2).
+enum Readable {
+    /// The file does not exist — genuinely nothing recorded.
+    Absent,
+    /// The file exists and parses as JSON.
+    Ok,
+    /// The file exists but could not be read or parsed.
+    Unavailable(String),
 }
 
-/// Withdraw `group_id` through the audited terminal path (#449 P4).
-///
-/// Reuses `leave_group` rather than reaching for internals: it enforces the
-/// sole-member disposition, seals the terminal commit, prunes TreeKEM and
-/// publishes the signed `GroupDeleted` to members. With #506 fixed, a Hidden
-/// group's withdrawal no longer emits a public discovery card.
-async fn retire_home_group(state: &Arc<AppState>, group_id: &str) -> Result<(), String> {
-    let response = super::named_groups::leave_group(
-        State(Arc::clone(state)),
-        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
-        Path(group_id.to_string()),
-    )
-    .await
-    .into_response();
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("leave_group returned {}", response.status()))
+/// Probe a durable JSON evidence file WITHOUT adopting the lenient
+/// fail-to-empty semantics its normal loader uses.
+async fn durable_json_is_readable(path: &std::path::Path) -> Readable {
+    match tokio::fs::read(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Readable::Absent,
+        Err(e) => Readable::Unavailable(e.to_string()),
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(_) => Readable::Ok,
+            Err(e) => Readable::Unavailable(e.to_string()),
+        },
     }
 }
 
@@ -1097,10 +1086,14 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
     let mut duplicates = Vec::new();
     for id in home_duplicates(&state, &group_id, &owner).await {
         let blockers = home_retire_blockers(&state, &id).await;
+        // #449 P4: report evidence, never a safety verdict. `safe_to_retire`
+        // was removed deliberately — no sound emptiness proof exists yet (the
+        // proof is not held across a terminal withdrawal), so claiming safety
+        // is exactly the thing this device cannot currently establish.
         duplicates.push(serde_json::json!({
             "group_id": id,
-            "safe_to_retire": blockers.is_empty(),
-            "blockers": blockers,
+            "retirement": "manual_only",
+            "evidence_against_deletion": blockers,
         }));
     }
     let primary_self_name = self_name_for(state.as_ref(), &home.primary_agent).await;
@@ -1131,6 +1124,8 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
                 "verified": primary_ok,
             },
             "members": members,
+            // Read-only inventory. Automatic retirement is not implemented;
+            // see docs/design/449-p4-retirement-fence.md.
             "duplicates": duplicates,
             "warnings": {
                 "no_roaming_agent": home_roaming_warning_for(&info).is_some(),
@@ -1421,9 +1416,23 @@ pub(in crate::server::routes) mod tests {
 
             // Advertise it, then retire it through the real terminal path.
             advertise_canonical_home(&state, &home_id).await;
-            retire_home_group(&state, &home_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("retire: {e}"))?;
+            // Owner-driven deletion through the audited terminal path. This is
+            // the operator action that is still available today; it is NOT the
+            // automated retirement, which is deliberately not implemented.
+            let response = super::super::named_groups::leave_group(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(home_id.clone()),
+            )
+            .await
+            .into_response();
+            anyhow::ensure!(
+                response.status().is_success(),
+                "leave_group returned {}",
+                response.status()
+            );
             assert!(
                 find_home(&state, &owner).await.is_none(),
                 "precondition: the retired Home no longer resolves"
@@ -1524,6 +1533,59 @@ pub(in crate::server::routes) mod tests {
         Ok(id)
     }
 
+    /// WHY (review P2): an unreadable task-list manifest is not evidence of
+    /// absence. Its loader maps read/parse failure to an EMPTY manifest —
+    /// correct for REST and rehydration, which fail closed elsewhere — but for
+    /// a deletion decision that turns "could not read the evidence" into
+    /// "there is none". A corrupt manifest must therefore be reported as
+    /// evidence against deletion, not silently as a clean bill of health.
+    #[tokio::test]
+    async fn an_unreadable_task_list_manifest_is_evidence_against_deletion() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state_with_history(dir.path(), [0x6F; 32]).await?;
+        provision_home(&state).await;
+        let duplicate = provision_duplicate_home(&state).await?;
+        tokio::fs::write(&state.crdt_subscriptions_path, b"{ not json").await?;
+
+        let blockers = home_retire_blockers(&state, &duplicate).await;
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("task-list manifest unreadable")),
+            "a corrupt manifest must block, got {blockers:?}"
+        );
+        Ok(())
+    }
+
+    /// WHY (review P2): same class for rider grants. A missing, unreadable or
+    /// corrupt `rider-tokens.json` maps to an empty grant set — safe for token
+    /// AUTHENTICATION, which fails closed by granting nothing, but not proof
+    /// that the durable grant set is empty. Repairing a transient read problem
+    /// after deletion would leave a grant pointing at an orphaned group.
+    #[tokio::test]
+    async fn an_unreadable_rider_store_is_evidence_against_deletion() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state_with_history(dir.path(), [0x70; 32]).await?;
+        provision_home(&state).await;
+        let duplicate = provision_duplicate_home(&state).await?;
+        tokio::fs::write(
+            state
+                .data_dir
+                .join(crate::server::rider_auth::RIDER_TOKENS_FILE),
+            b"{ not json",
+        )
+        .await?;
+
+        let blockers = home_retire_blockers(&state, &duplicate).await;
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("rider-token store unreadable")),
+            "a corrupt rider store must block, got {blockers:?}"
+        );
+        Ok(())
+    }
+
     /// WHY (review P2): an ABSENT history store must block retirement.
     ///
     /// History is off by default in the library, so `agent.history()` is
@@ -1558,84 +1620,6 @@ pub(in crate::server::routes) mod tests {
             "an absent history store must block retirement, got {blockers:?}"
         );
 
-        reconcile_home_duplicates(&state).await;
-        assert!(
-            state
-                .named_groups
-                .read()
-                .await
-                .get(&duplicate)
-                .is_some_and(|info| !info.withdrawn),
-            "nothing may be retired while emptiness cannot be proven"
-        );
-        Ok(())
-    }
-
-    /// WHY (#449 P4): the ordering rule — **join first, retire second.**
-    ///
-    /// Retiring a duplicate before this device is seated in the canonical
-    /// Home would leave it with no Home at all, and withdrawal is terminal.
-    /// A device that has not adopted must retire NOTHING, however empty its
-    /// duplicate looks.
-    #[tokio::test]
-    async fn nothing_is_retired_before_adoption_completes() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let state = owned_state_with_history(dir.path(), [0x6A; 32]).await?;
-        provision_home(&state).await;
-        let owner = owner_of(&state);
-        let (local_home, _) = find_home(&state, &owner).await.expect("local Home");
-
-        // The canonical Home lives on a device we have not joined.
-        advertise_canonical_home(&state, &"7f".repeat(16)).await;
-        assert!(
-            matches!(
-                resolve_home(&state).await,
-                HomeResolution::AdoptionPending { .. }
-            ),
-            "precondition: adoption has not completed"
-        );
-
-        reconcile_home_duplicates(&state).await;
-
-        let groups = state.named_groups.read().await;
-        assert!(
-            !groups
-                .get(&local_home)
-                .expect("local Home still present")
-                .withdrawn,
-            "a device that has not adopted must keep its Home — retiring leaves none"
-        );
-        Ok(())
-    }
-
-    /// WHY (#449 P4): once this device IS seated in the canonical Home, an
-    /// empty leftover is cleaned up rather than left as permanent clutter.
-    #[tokio::test]
-    async fn empty_duplicate_is_retired_once_seated_in_canonical() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let state = owned_state_with_history(dir.path(), [0x6B; 32]).await?;
-        provision_home(&state).await;
-        let owner = owner_of(&state);
-        let (canonical, _) = find_home(&state, &owner).await.expect("canonical Home");
-        let duplicate = provision_duplicate_home(&state).await?;
-        advertise_canonical_home(&state, &canonical).await;
-        assert_eq!(
-            home_retire_blockers(&state, &duplicate).await,
-            Vec::<String>::new(),
-            "precondition: a freshly created, untouched duplicate is provably empty"
-        );
-
-        reconcile_home_duplicates(&state).await;
-
-        let groups = state.named_groups.read().await;
-        assert!(
-            groups.get(&duplicate).is_none_or(|info| info.withdrawn),
-            "an empty duplicate must be retired once seated in the canonical Home"
-        );
-        assert!(
-            groups.get(&canonical).is_some_and(|info| !info.withdrawn),
-            "the canonical Home must survive"
-        );
         Ok(())
     }
 
@@ -1697,16 +1681,6 @@ pub(in crate::server::routes) mod tests {
             "history must block automatic retirement, got {blockers:?}"
         );
 
-        reconcile_home_duplicates(&state).await;
-        assert!(
-            state
-                .named_groups
-                .read()
-                .await
-                .get(&duplicate)
-                .is_some_and(|info| !info.withdrawn),
-            "a duplicate with history must be kept, never silently deleted"
-        );
         Ok(())
     }
 
