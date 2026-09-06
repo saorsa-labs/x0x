@@ -2451,27 +2451,38 @@ async fn member_banned_lost_initial_volley_recovers_via_bounded_resend() {
     let (group_id, bob_group_id, bob_agent_id) =
         converged_pair_group(alice, bob, "Lost MemberBanned").await;
 
-    let ban: Value = alice
+    eprintln!("[diagnostic531] ready group={group_id} bob_group={bob_group_id} bob={bob_agent_id}");
+    let started = std::time::Instant::now();
+    let ban_response = alice
         .post(
             &format!("/groups/{group_id}/ban/{bob_agent_id}"),
             serde_json::json!({}),
         )
-        .await
-        .json()
-        .await
-        .unwrap();
+        .await;
+    let ban_status = ban_response.status();
+    let ban: Value = ban_response.json().await.unwrap();
+    eprintln!(
+        "[diagnostic531] ban elapsed={:?} status={ban_status} body={ban}",
+        started.elapsed()
+    );
     assert_eq!(ban["ok"], true, "ban response: {ban:?}");
 
     // Delivery proof: bob's own roster can only show him banned if the event
     // reached and was applied by bob — alice's local state says nothing about
     // bob's copy.
     let ban_seen = wait_until(Duration::from_secs(30), || async {
-        let members: Value = bob
-            .get(&format!("/groups/{bob_group_id}/members"))
-            .await
-            .json()
-            .await
-            .unwrap_or_default();
+        let response = bob.get(&format!("/groups/{bob_group_id}/members")).await;
+        let status = response.status();
+        let bytes = response.bytes().await;
+        let members: Value = match &bytes {
+            Ok(body) => serde_json::from_slice(body).unwrap_or_default(),
+            Err(_) => Value::Null,
+        };
+        eprintln!(
+            "[diagnostic531] poll elapsed={:?} status={status} body={:?}",
+            started.elapsed(),
+            bytes.as_ref().map(|body| String::from_utf8_lossy(body))
+        );
         members["members"]
             .as_array()
             .map(|ms| {

@@ -1,0 +1,134 @@
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location('diagnostic', Path(__file__).with_name('diagnostic.py'))
+diag = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(diag)
+
+
+class DiagnosticControls(unittest.TestCase):
+    def test_expected_sockets(self):
+        for line in (
+            'tcp LISTEN 0 128 127.0.0.1:29381 0.0.0.0:* users:fixture',
+            'tcp ESTAB 0 0 127.0.0.1:44001 127.0.0.1:29382',
+            'tcp ESTAB 0 0 127.0.0.1:29382 127.0.0.1:44001',
+            'udp UNCONN 0 0 0.0.0.0:29481 0.0.0.0:*',
+            'udp UNCONN 0 0 [::]:29482 [::]:*',
+        ):
+            self.assertTrue(diag.valid_socket(line), line)
+
+    def test_foreign_and_malformed_sockets_stop_admission(self):
+        for line in (
+            'tcp LISTEN 0 128 0.0.0.0:29381 0.0.0.0:*',
+            'tcp ESTAB 0 0 127.0.0.1:44001 127.0.0.1:12700',
+            'tcp ESTAB 0 0 127.0.0.1:29381 192.0.2.1:44001',
+            'udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*',
+            'udp ESTAB 0 0 127.0.0.1:29481 127.0.0.1:59949',
+            'udp UNCONN 0 0 192.0.2.1:29481 0.0.0.0:*', 'unparsed',
+        ):
+            self.assertFalse(diag.valid_socket(line), line)
+
+    def test_exactly_one_matching_case_required(self):
+        case = {'filter-match': {'status': 'matches'}}
+        good = {'rust-suites': {'suite': {'testcases': {diag.TEST: case}}}}
+        self.assertTrue(diag.selected_test(good))
+        self.assertFalse(diag.selected_test({}))
+        self.assertFalse(diag.selected_test({'rust-suites': {'suite': {'testcases': {'wrong': case}}}}))
+        good['rust-suites']['other'] = {'testcases': {diag.TEST: case}}
+        self.assertFalse(diag.selected_test(good))
+
+    def test_only_drop_counters_count_for_fence_witness(self):
+        rules = {'nftables': [
+            {'rule': {'expr': [{'counter': {'packets': 20}}, {'accept': None}]}},
+            {'rule': {'expr': [{'counter': {'packets': 3}}, {'drop': None}]}}]}
+        self.assertEqual(diag.drop_count(rules), 3)
+
+    def test_collector_excludes_raw_state_tokens_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as root:
+            evidence = Path(root)
+            raw = evidence/'private-data'
+            logs = raw/'logs'
+            logs.mkdir(parents=True)
+            (raw/'api-token').write_text('fixture-secret')
+            (raw/'machine.key').write_text('fixture-secret')
+            (logs/'pair-alice.start.log').write_text('safe-log')
+            (evidence/'receipt.json').write_text('{}')
+            (evidence/'fixture.stdout').symlink_to(raw/'api-token')
+            diag.collect(evidence)
+            names = {p.name for p in (evidence/'upload').iterdir()}
+            self.assertEqual(names, {'receipt.json', 'pair-alice.start.log', 'collection.json'})
+            self.assertNotIn('fixture-secret', ''.join(p.read_text() for p in (evidence/'upload').iterdir()))
+
+
+    def test_symlinked_log_directory_cannot_export_external_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            evidence, outside = base/'evidence', base/'outside'
+            evidence.mkdir(); outside.mkdir()
+            (outside/'pair-alice.start.log').write_text('external-secret')
+            (evidence/'private-data').mkdir()
+            (evidence/'private-data'/'logs').symlink_to(outside, target_is_directory=True)
+            diag.collect(evidence)
+            self.assertFalse((evidence/'upload'/'pair-alice.start.log').exists())
+
+    def test_symlinked_data_ancestor_cannot_export_external_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            evidence, outside = base/'evidence', base/'outside'
+            evidence.mkdir(); (outside/'logs').mkdir(parents=True)
+            (outside/'logs'/'pair-alice.start.log').write_text('external-secret')
+            (evidence/'private-data').symlink_to(outside, target_is_directory=True)
+            diag.collect(evidence)
+            self.assertFalse((evidence/'upload'/'pair-alice.start.log').exists())
+
+    def test_symlinked_upload_directory_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            evidence, outside = base/'evidence', base/'outside'
+            evidence.mkdir(); outside.mkdir()
+            (evidence/'receipt.json').write_text('{}')
+            (evidence/'upload').symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(FileExistsError):
+                diag.collect(evidence)
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_preexisting_upload_destination_cannot_overwrite_external_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            evidence = base/'evidence'
+            (evidence/'upload').mkdir(parents=True)
+            external = base/'sentinel'
+            external.write_text('preserve-me')
+            (evidence/'receipt.json').write_text('{}')
+            (evidence/'upload'/'receipt.json').symlink_to(external)
+            with self.assertRaises(FileExistsError):
+                diag.collect(evidence)
+            self.assertEqual(external.read_text(), 'preserve-me')
+
+
+    def test_workflow_never_uploads_after_rejected_collection(self):
+        import yaml
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[2]/'workflows'/'build.yml').read_text())
+        steps = workflow['jobs']['diagnostic']['steps']
+        collect = next(step for step in steps if step.get('name') == 'Assemble explicit evidence whitelist')
+        upload = next(step for step in steps if step.get('uses', '').startswith('actions/upload-artifact@'))
+        self.assertEqual(collect['if'], 'always()')  # Salvage a failed fixture's diagnostics.
+        # Evaluate the actual workflow predicate's supported conjunction terms.
+        # Removing the collection gate makes all negative outcomes incorrectly admit upload.
+        def admitted(outcome):
+            terms = {
+                'always()': True,
+                "steps.collect.outcome == 'success'": outcome == 'success',
+            }
+            return all(terms[term.strip()] for term in upload['if'].split('&&'))
+        for outcome in ('failure', 'cancelled', 'skipped'):
+            self.assertFalse(admitted(outcome), outcome)
+        self.assertTrue(admitted('success'))
+        self.assertEqual(collect.get('id'), 'collect')
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -498,10 +498,11 @@ async fn pair_with_extra_config_and_node_env(
     let plane_id = format!("x0x-test-{}", rand::random::<u32>());
     let owned_extra = with_private_plane(&plane_id, extra_config);
     let extra_config = owned_extra.as_str();
-    let alice_api = allocate_unused_tcp_port();
-    let alice_bind = allocate_unused_udp_port();
-    let bob_api = allocate_unused_tcp_port();
-    let bob_bind = allocate_unused_udp_port();
+    // Temporary #531 diagnostic: exact ports reviewed with fence.sb.
+    let alice_api = 29381;
+    let alice_bind = 29481;
+    let bob_api = 29382;
+    let bob_bind = 29482;
 
     let alice = start_instance_with_env(
         &binary,
@@ -817,18 +818,15 @@ async fn start_instance_with_env(
     env: &[(&str, &str)],
 ) -> AgentInstance {
     let config_dir = std::env::temp_dir().join(format!("x0x-test-{name}"));
-    let _ = std::fs::remove_dir_all(&config_dir);
-    let _ = std::fs::create_dir_all(&config_dir);
-
-    // Kill stale daemons from prior failed runs that may still own these fixed ports.
-    for port in [api_port, bind_port] {
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "lsof -ti tcp:{port} 2>/dev/null | xargs kill -9 2>/dev/null || true"
-            ))
-            .status();
-    }
+    std::fs::create_dir(&config_dir).expect("fresh diagnostic node directory");
+    let identity_dir = config_dir.join("identity");
+    let acl_path = config_dir.join("disabled-acl.toml");
+    std::fs::write(&acl_path, "").expect("write private disabled ACL");
+    let bootstrap = if bootstrap.is_empty() {
+        "bootstrap_peers = []"
+    } else {
+        bootstrap
+    };
 
     let config_path = config_dir.join("config.toml");
     // NOTE: `[update] enabled = false` is MANDATORY in every test config —
@@ -837,14 +835,17 @@ async fn start_instance_with_env(
     // `extra_config` cannot swallow the flat keys above it.
     let config_content = format!(
         "api_address = \"127.0.0.1:{api_port}\"\n\
-         bind_address = \"0.0.0.0:{bind_port}\"\n\
+         bind_address = \"127.0.0.1:{bind_port}\"\n\
          data_dir = \"{}\"\n\
+         identity_dir = \"{}\"\n\
+         port_mapping_enabled = false\n\
          log_level = \"warn\"\n\
          {bootstrap}\n\
          {extra_config}\n\
          [update]\n\
          enabled = false\n",
-        config_dir.display()
+        config_dir.display(),
+        identity_dir.display()
     );
     std::fs::write(&config_path, &config_content).expect("write config");
 
@@ -870,6 +871,12 @@ async fn start_instance_with_env(
         .arg("--name")
         .arg(name)
         .arg("--no-hard-coded-bootstrap")
+        .arg("--disable-peer-cache")
+        .arg("--no-port-mapping")
+        .arg("--exec-acl")
+        .arg(&acl_path)
+        .arg("--connect-acl")
+        .arg(&acl_path)
         .stdout(stdout)
         .stderr(stderr);
     for (key, value) in env {
@@ -878,6 +885,11 @@ async fn start_instance_with_env(
     let process = command
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start x0xd {name}: {e}"));
+    eprintln!(
+        "[diagnostic531] node={name} pid={} api={api_port} quic={bind_port} data={}",
+        process.id(),
+        config_dir.display()
+    );
 
     // Wrap the Child in an AgentInstance immediately so that Drop kills
     // the process if anything below panics (health timeout, token read, etc.).

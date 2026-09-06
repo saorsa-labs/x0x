@@ -1,0 +1,22 @@
+# Namespace-local exact tuple policy; TCP ephemeral ports are reply-only.
+table inet diag531 {
+  chain input { type filter hook input priority 0; policy drop;
+    iifname "lo" ip saddr 127.0.0.1 ip daddr 127.0.0.1 tcp dport { 29381, 29382 } counter accept
+    iifname "lo" ip saddr 127.0.0.1 ip daddr 127.0.0.1 tcp sport { 29381, 29382 } ct state established counter accept
+    iifname "lo" ip saddr 127.0.0.1 ip daddr 127.0.0.1 udp sport { 29481, 29482 } udp dport { 29481, 29482 } counter accept
+    iifname "lo" ip6 saddr ::1 ip6 daddr ::1 tcp dport { 29381, 29382 } counter accept
+    iifname "lo" ip6 saddr ::1 ip6 daddr ::1 tcp sport { 29381, 29382 } ct state established counter accept
+    iifname "lo" ip6 saddr ::1 ip6 daddr ::1 udp sport { 29481, 29482 } udp dport { 29481, 29482 } counter accept
+    counter drop
+  }
+  chain output { type filter hook output priority 0; policy drop;
+    oifname "lo" ip saddr 127.0.0.1 ip daddr 127.0.0.1 tcp dport { 29381, 29382 } counter accept
+    oifname "lo" ip saddr 127.0.0.1 ip daddr 127.0.0.1 tcp sport { 29381, 29382 } ct state established counter accept
+    oifname "lo" ip saddr 127.0.0.1 ip daddr 127.0.0.1 udp sport { 29481, 29482 } udp dport { 29481, 29482 } counter accept
+    oifname "lo" ip6 saddr ::1 ip6 daddr ::1 tcp dport { 29381, 29382 } counter accept
+    oifname "lo" ip6 saddr ::1 ip6 daddr ::1 tcp sport { 29381, 29382 } ct state established counter accept
+    oifname "lo" ip6 saddr ::1 ip6 daddr ::1 udp sport { 29481, 29482 } udp dport { 29481, 29482 } counter accept
+    counter drop
+  }
+  chain forward { type filter hook forward priority 0; policy drop; }
+}

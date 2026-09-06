@@ -1,0 +1,99 @@
+diff --git a/tests/harness/src/cluster.rs b/tests/harness/src/cluster.rs
+index d95b3b3..1b4b75f 100644
+--- a/tests/harness/src/cluster.rs
++++ b/tests/harness/src/cluster.rs
+@@ -501,4 +501,5 @@ async fn pair_with_extra_config_and_node_env(
+-    let alice_api = allocate_unused_tcp_port();
+-    let alice_bind = allocate_unused_udp_port();
+-    let bob_api = allocate_unused_tcp_port();
+-    let bob_bind = allocate_unused_udp_port();
++    // Temporary #531 diagnostic: exact ports reviewed with fence.sb.
++    let alice_api = 29381;
++    let alice_bind = 29481;
++    let bob_api = 29382;
++    let bob_bind = 29482;
+@@ -820,12 +821,9 @@ async fn start_instance_with_env(
+-    let _ = std::fs::remove_dir_all(&config_dir);
+-    let _ = std::fs::create_dir_all(&config_dir);
+-
+-    // Kill stale daemons from prior failed runs that may still own these fixed ports.
+-    for port in [api_port, bind_port] {
+-        let _ = Command::new("sh")
+-            .arg("-c")
+-            .arg(format!(
+-                "lsof -ti tcp:{port} 2>/dev/null | xargs kill -9 2>/dev/null || true"
+-            ))
+-            .status();
+-    }
++    std::fs::create_dir(&config_dir).expect("fresh diagnostic node directory");
++    let identity_dir = config_dir.join("identity");
++    let acl_path = config_dir.join("disabled-acl.toml");
++    std::fs::write(&acl_path, "").expect("write private disabled ACL");
++    let bootstrap = if bootstrap.is_empty() {
++        "bootstrap_peers = []"
++    } else {
++        bootstrap
++    };
+@@ -840 +838 @@ async fn start_instance_with_env(
+-         bind_address = \"0.0.0.0:{bind_port}\"\n\
++         bind_address = \"127.0.0.1:{bind_port}\"\n\
+@@ -841,0 +840,2 @@ async fn start_instance_with_env(
++         identity_dir = \"{}\"\n\
++         port_mapping_enabled = false\n\
+@@ -847 +847,2 @@ async fn start_instance_with_env(
+-        config_dir.display()
++        config_dir.display(),
++        identity_dir.display()
+@@ -872,0 +874,6 @@ async fn start_instance_with_env(
++        .arg("--disable-peer-cache")
++        .arg("--no-port-mapping")
++        .arg("--exec-acl")
++        .arg(&acl_path)
++        .arg("--connect-acl")
++        .arg(&acl_path)
+@@ -880,0 +888,5 @@ async fn start_instance_with_env(
++    eprintln!(
++        "[diagnostic531] node={name} pid={} api={api_port} quic={bind_port} data={}",
++        process.id(),
++        config_dir.display()
++    );
+diff --git a/tests/named_group_integration.rs b/tests/named_group_integration.rs
+index 414af37..96a60c5 100644
+--- a/tests/named_group_integration.rs
++++ b/tests/named_group_integration.rs
+@@ -2454 +2454,3 @@ async fn member_banned_lost_initial_volley_recovers_via_bounded_resend() {
+-    let ban: Value = alice
++    eprintln!("[diagnostic531] ready group={group_id} bob_group={bob_group_id} bob={bob_agent_id}");
++    let started = std::time::Instant::now();
++    let ban_response = alice
+@@ -2459,4 +2461,7 @@ async fn member_banned_lost_initial_volley_recovers_via_bounded_resend() {
+-        .await
+-        .json()
+-        .await
+-        .unwrap();
++        .await;
++    let ban_status = ban_response.status();
++    let ban: Value = ban_response.json().await.unwrap();
++    eprintln!(
++        "[diagnostic531] ban elapsed={:?} status={ban_status} body={ban}",
++        started.elapsed()
++    );
+@@ -2469,6 +2474,12 @@ async fn member_banned_lost_initial_volley_recovers_via_bounded_resend() {
+-        let members: Value = bob
+-            .get(&format!("/groups/{bob_group_id}/members"))
+-            .await
+-            .json()
+-            .await
+-            .unwrap_or_default();
++        let response = bob.get(&format!("/groups/{bob_group_id}/members")).await;
++        let status = response.status();
++        let bytes = response.bytes().await;
++        let members: Value = match &bytes {
++            Ok(body) => serde_json::from_slice(body).unwrap_or_default(),
++            Err(_) => Value::Null,
++        };
++        eprintln!(
++            "[diagnostic531] poll elapsed={:?} status={status} body={:?}",
++            started.elapsed(),
++            bytes.as_ref().map(|body| String::from_utf8_lossy(body))
++        );
