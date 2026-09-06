@@ -108,6 +108,9 @@ STARTUP_EMPTY_TOKEN = "token-file-empty"
 STARTUP_INVALID_ADDRESS = "port-file-not-a-socket-address"
 STARTUP_NON_LOOPBACK = "port-file-address-not-loopback"
 STARTUP_HEALTH_NOT_READY = "health-endpoint-not-ready"
+# The port file exists but does not name the address we configured: the daemon
+# did not adopt the configured layout. Distinct from a malformed file.
+STARTUP_ADDRESS_MISMATCH = "port-file-address-differs-from-configured"
 
 
 class AddressError(ValueError):
@@ -178,9 +181,58 @@ def api_call(host, port, token, path):
         return None, None
 
 
-def wait_for_api(root, deadline):
-    """Poll until ready, retaining WHY it was not ready as a category."""
-    port_file, token_file = root / "api.port", root / "api-token"
+def phase_layout(root, api_port):
+    """Every path this harness depends on, stated EXPLICITLY.
+
+    Run 34065470489 failed `port-file-absent` because the harness assumed
+    `X0X_HOME` sets the daemon's data directory. It does not:
+    `DaemonConfig::default_data_dir()` is `dirs::data_dir()/x0x`
+    (src/server/state.rs:463-467) and never consults `X0X_HOME`, which governs
+    the IDENTITY home (`storage::x0x_home_dir`). Nothing here is left to
+    environment inference; the config names both directories, following the
+    working fixture pattern in `tests/leak_hunt_dm.sh:94-107`.
+
+    Precedence relied on (src/server/mod.rs:414-440): an explicit
+    `identity_dir` wins over `--name` and over `~/.x0x`, and when set "ALL
+    identity keys derive from it and `~/.x0x` is never touched".
+    """
+    return {
+        "root": root,
+        "identity_dir": root / "identity",
+        "data_dir": root / "data",
+        "config": root / "config.toml",
+        "user_key": root / "identity" / "user.key",
+        "api_port_file": root / "data" / "api.port",
+        "api_token_file": root / "data" / "api-token",
+        "api_host": "127.0.0.1",
+        "api_port": api_port,
+    }
+
+
+def write_daemon_config(layout):
+    """Explicit config.toml — the pattern tests/leak_hunt_dm.sh already uses."""
+    layout["identity_dir"].mkdir(mode=0o700, parents=True, exist_ok=True)
+    layout["data_dir"].mkdir(mode=0o700, parents=True, exist_ok=True)
+    layout["config"].write_text(
+        'identity_dir = "%s"\n' % layout["identity_dir"]
+        + 'data_dir = "%s"\n' % layout["data_dir"]
+        + 'bind_address = "127.0.0.1:0"\n'
+        + 'api_address = "%s:%d"\n' % (layout["api_host"], layout["api_port"])
+        + 'log_level = "warn"\n'
+        + "[update]\nenabled = false\n"
+    )
+
+
+def wait_for_api(layout, deadline):
+    """Poll until ready, retaining WHY it was not ready as a category.
+
+    The API address is CONFIGURED, so readiness never depends on discovering a
+    port. `api.port` is still required and cross-checked against that address:
+    it is written under the same `data_dir` the config names
+    (server/mod.rs:953,1034), so agreement is evidence the daemon adopted the
+    configured layout rather than a default one.
+    """
+    port_file, token_file = layout["api_port_file"], layout["api_token_file"]
     category = STARTUP_MISSING_PORT
     while time.monotonic() < deadline:
         if not port_file.is_file():
@@ -195,25 +247,31 @@ def wait_for_api(root, deadline):
             except OSError:
                 category = STARTUP_MISSING_PORT
             else:
-                try:
-                    token = token_file.read_text().strip()
-                except OSError:
-                    token = ""
-                if not token:
-                    category = STARTUP_EMPTY_TOKEN
-                elif api_call(host, port, token, "/health")[0] == 200:
-                    return host, port, token
+                if (host, port) != (layout["api_host"], layout["api_port"]):
+                    category = STARTUP_ADDRESS_MISMATCH
                 else:
-                    category = STARTUP_HEALTH_NOT_READY
+                    try:
+                        token = token_file.read_text().strip()
+                    except OSError:
+                        token = ""
+                    if not token:
+                        category = STARTUP_EMPTY_TOKEN
+                    elif api_call(host, port, token, "/health")[0] == 200:
+                        return host, port, token
+                    else:
+                        category = STARTUP_HEALTH_NOT_READY
         time.sleep(POLL_INTERVAL_S)
     raise PhaseError("startup", category)
 
 
-def start_daemon(binary, root, log_path):
+def start_daemon(binary, layout, log_path):
     handle = log_path.open("ab")
     process = subprocess.Popen(
-        [str(binary), "--skip-update-check", "--no-hard-coded-bootstrap"],
-        env={**os.environ, "X0X_HOME": str(root)},
+        [str(binary), "--config", str(layout["config"]),
+         "--skip-update-check", "--no-hard-coded-bootstrap"],
+        # X0X_HOME stays pinned so nothing can reach the real ~/.x0x even if a
+        # path were left unset; the config is what actually decides.
+        env={**os.environ, "X0X_HOME": str(layout["root"])},
         stdout=handle, stderr=handle, stdin=subprocess.DEVNULL,
         start_new_session=True, close_fds=True,
     )
@@ -344,14 +402,14 @@ def observe(host, port, token, call=api_call):
     }
 
 
-def phase(binary, root, private_logs, label):
+def phase(binary, layout, private_logs, label):
     """Always returns a structured result; failures never escape without one."""
     log_path = private_logs / f"x0xd-{label}.log"
-    process, handle = start_daemon(binary, root, log_path)
+    process, handle = start_daemon(binary, layout, log_path)
     outcome = {"label": label, "pid": process.pid, "ok": False,
                "failure": None, "observation": None}
     try:
-        host, port, token = wait_for_api(root, time.monotonic() + STARTUP_TIMEOUT_S)
+        host, port, token = wait_for_api(layout, time.monotonic() + STARTUP_TIMEOUT_S)
         outcome["observation"] = observe(host, port, token)
         outcome["ok"] = True
     except PhaseError as error:
@@ -636,6 +694,77 @@ def self_test():
             got = error.category
         cases.append((f"addr:{name}", True, got == expect))
 
+    # --- explicit daemon layout: the run-34065470489 regression ---
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "phase"
+        layout = phase_layout(root, 12780)
+        write_daemon_config(layout)
+        config_text = layout["config"].read_text()
+
+        # The config must NAME both directories. Relying on X0X_HOME for the
+        # data dir is exactly what produced `port-file-absent`.
+        cases.append(("layout:config_names_data_dir", True,
+                      f'data_dir = "{layout["data_dir"]}"' in config_text))
+        cases.append(("layout:config_names_identity_dir", True,
+                      f'identity_dir = "{layout["identity_dir"]}"' in config_text))
+        cases.append(("layout:config_names_api_address", True,
+                      'api_address = "127.0.0.1:12780"' in config_text))
+        cases.append(("layout:update_disabled", True,
+                      "[update]\nenabled = false" in config_text))
+        # Port/token are read from the CONFIGURED data dir, not from X0X_HOME.
+        cases.append(("layout:port_file_under_configured_data_dir", True,
+                      layout["api_port_file"] == layout["data_dir"] / "api.port"))
+        cases.append(("layout:token_file_under_configured_data_dir", True,
+                      layout["api_token_file"] == layout["data_dir"] / "api-token"))
+        # The owner key is written into the configured identity dir.
+        cases.append(("layout:user_key_under_configured_identity_dir", True,
+                      layout["user_key"] == layout["identity_dir"] / "user.key"))
+        cases.append(("layout:data_and_identity_are_distinct", True,
+                      layout["data_dir"] != layout["identity_dir"]))
+        cases.append(("layout:directories_created", True,
+                      layout["data_dir"].is_dir() and layout["identity_dir"].is_dir()))
+
+        # Restart shares ONE root; the contrast fixture must not.
+        other = phase_layout(Path(tmp) / "control", 12781)
+        cases.append(("layout:contrast_root_is_distinct", True,
+                      other["data_dir"] != layout["data_dir"]))
+        cases.append(("layout:contrast_api_port_is_distinct", True,
+                      other["api_port"] != layout["api_port"]))
+
+        # A port file naming a DIFFERENT address than configured must be its
+        # own category, not silently accepted.
+        # Slightly in the FUTURE so the loop body actually runs once. An
+        # already-expired deadline would skip evaluation and return the initial
+        # category, which would make these controls vacuous.
+        def one_pass():
+            try:
+                wait_for_api(layout, time.monotonic() + 0.05)
+                return "returned"
+            except PhaseError as error:
+                return error.detail
+        layout["api_token_file"].write_text("t")
+        layout["api_port_file"].write_text("127.0.0.1:9999")
+        cases.append(("layout:address_mismatch_category", True,
+                      one_pass() == STARTUP_ADDRESS_MISMATCH))
+
+        layout["api_port_file"].write_text("not-an-address")
+        cases.append(("layout:malformed_port_category", True,
+                      one_pass() == STARTUP_INVALID_ADDRESS))
+
+        layout["api_port_file"].write_text("127.0.0.1:12780")
+        layout["api_token_file"].write_text("   ")
+        cases.append(("layout:empty_token_category", True,
+                      one_pass() == STARTUP_EMPTY_TOKEN))
+
+        layout["api_token_file"].unlink()
+        cases.append(("layout:missing_token_category", True,
+                      one_pass() == STARTUP_MISSING_TOKEN))
+
+        layout["api_port_file"].unlink()
+        cases.append(("layout:missing_port_category", True,
+                      one_pass() == STARTUP_MISSING_PORT))
+
     failed = [(n, e, g) for n, e, g in cases if e != g]
     for name, expect, got in cases:
         print(f"{'ok  ' if expect == got else 'FAIL'} {name} (expected {expect}, got {got})")
@@ -669,36 +798,43 @@ def main():
     # Daemon logs stay in the namespace's PRIVATE tmpfs and die with it.
     # `evidence` is the surviving directory and receives ONLY the allowlisted
     # receipt (review P2).
-    root = Path(os.environ["X0X_HOME"])
-    private_logs = root.parent / "x0x-449-logs"
-    control_root = root.parent / "x0x-449-control"
-    for path in (root, control_root, private_logs):
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Disposable roots inside the namespace's private tmpfs. Both phases of the
+    # restart share ONE root (that is the point); the contrast uses another.
+    base = Path(os.environ["X0X_HOME"]).parent
+    private_logs = base / "x0x-449-logs"
+    main_layout = phase_layout(base / "x0x-449-main", 12780)
+    control_layout = phase_layout(base / "x0x-449-control", 12781)
+    private_logs.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     receipt = {"issue": "449", "preparation": False, "phases": {}, "verdict": None}
     try:
-        for path, seed in ((root, OWNER_SEED), (control_root, CONTROL_SEED)):
+        for layout, seed in ((main_layout, OWNER_SEED), (control_layout, CONTROL_SEED)):
+            write_daemon_config(layout)
+            # Explicit output PATH wins over every default and over --name
+            # (src/bin/x0x.rs:1846-1852), so the owner key lands exactly in the
+            # identity_dir the daemon config names.
             result = subprocess.run(
-                [str(args.cli), "user-id", "create", "--from-seed", seed],
-                env={**os.environ, "X0X_HOME": str(path)},
+                [str(args.cli), "user-id", "create", str(layout["user_key"]),
+                 "--from-seed", seed],
+                env={**os.environ, "X0X_HOME": str(layout["root"])},
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             if result.returncode != 0:
                 raise PhaseError("owner-key", f"user-id create exit {result.returncode}")
+            if not layout["user_key"].is_file():
+                raise PhaseError("owner-key", "user.key absent from the configured identity_dir")
 
         # Each phase is appended and flushed the moment it completes, so a
         # later start failure cannot discard earlier cleanup evidence.
-        before = phase(args.binary, root, private_logs, "before")
+        before = phase(args.binary, main_layout, private_logs, "before")
         receipt["phases"]["before"] = before
         write_receipt(args.evidence, receipt)
 
-        after = phase(args.binary, root, private_logs, "after")
+        after = phase(args.binary, main_layout, private_logs, "after")
         receipt["phases"]["after"] = after
         write_receipt(args.evidence, receipt)
 
-        os.environ["X0X_HOME"] = str(control_root)
-        control = phase(args.binary, control_root, private_logs, "control")
-        os.environ["X0X_HOME"] = str(root)
+        control = phase(args.binary, control_layout, private_logs, "control")
         receipt["phases"]["control"] = control
         write_receipt(args.evidence, receipt)
 
