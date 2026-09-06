@@ -2233,6 +2233,129 @@ mod tests {
             .collect()
     }
 
+    /// Cumulative EAGER send attempts claimed by sg (stage_stats). Claims are
+    /// recorded synchronously before detached forward tasks are spawned, so a
+    /// delta taken after `handle_incoming` / publish returns is the settle
+    /// target for the test recorder — not a guessed minimum.
+    fn eager_outbound_attempt_msgs(manager: &PubSubManager) -> u64 {
+        manager
+            .stage_stats()
+            .outbound_by_kind
+            .get("eager")
+            .map(|meter| meter.msgs)
+            .unwrap_or(0)
+    }
+
+    /// Count Eager frames for `msg_id` in the recorder without draining.
+    fn count_eager_for_msg(manager: &PubSubManager, msg_id: [u8; 32]) -> usize {
+        manager
+            .transport
+            .recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sends
+            .iter()
+            .filter(|(_, bytes)| {
+                peek_pubsub_header(bytes)
+                    .is_some_and(|h| h.kind == MessageKind::Eager && h.msg_id == msg_id)
+            })
+            .count()
+    }
+
+    /// Peek Eager (peer, message) pairs for `msg_id` without draining.
+    fn peek_eager_for_msg(
+        manager: &PubSubManager,
+        msg_id: [u8; 32],
+    ) -> Vec<(PeerId, saorsa_gossip_pubsub::GossipMessage)> {
+        manager
+            .transport
+            .recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sends
+            .iter()
+            .filter_map(|(peer, bytes)| {
+                let message: saorsa_gossip_pubsub::GossipMessage =
+                    postcard::from_bytes(bytes).ok()?;
+                (message.header.kind == MessageKind::Eager && message.header.msg_id == msg_id)
+                    .then_some((*peer, message))
+            })
+            .collect()
+    }
+
+    /// Wait with a declared deadline until every metered EAGER attempt for
+    /// `msg_id` has hit the test recorder (complete per-message recipient set).
+    /// `attempted == 0` settles immediately as the legitimate empty forward set
+    /// (e.g. D=1 inbound from the sole selected peer).
+    async fn await_eager_settled_for_msg(
+        manager: &PubSubManager,
+        msg_id: [u8; 32],
+        attempted: usize,
+    ) -> Vec<(PeerId, saorsa_gossip_pubsub::GossipMessage)> {
+        if attempted == 0 {
+            return peek_eager_for_msg(manager, msg_id);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if count_eager_for_msg(manager, msg_id) >= attempted {
+                    return peek_eager_for_msg(manager, msg_id);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "eager fanout for msg did not settle before deadline (wanted {attempted} recorded sends)"
+            )
+        })
+    }
+
+    /// Like [`await_eager_settled_for_msg`], but discovers the sole new msg_id
+    /// after a drained recorder (local publish path).
+    async fn await_eager_settled_attempts(
+        manager: &PubSubManager,
+        attempted: usize,
+    ) -> Vec<(PeerId, saorsa_gossip_pubsub::GossipMessage)> {
+        if attempted == 0 {
+            return Vec::new();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let msg_id = manager
+                    .transport
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .sends
+                    .iter()
+                    .find_map(|(_, bytes)| {
+                        peek_pubsub_header(bytes).and_then(|h| {
+                            (h.kind == MessageKind::Eager).then_some(h.msg_id)
+                        })
+                    });
+                if let Some(msg_id) = msg_id {
+                    if count_eager_for_msg(manager, msg_id) >= attempted {
+                        return peek_eager_for_msg(manager, msg_id);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "eager publish fanout did not settle before deadline (wanted {attempted} recorded sends)"
+            )
+        })
+    }
+
     fn slice1_signed_frame(
         kind: MessageKind,
         topic: TopicId,
@@ -2287,15 +2410,22 @@ mod tests {
                     _ => manager.prefer_one_full_bootstrap_eager(&[topic]).await,
                 }
                 recorded_eager(&manager);
+                let publish_before = eager_outbound_attempt_msgs(&manager);
                 manager
                     .publish_topic_id(name.into(), topic, Bytes::from(format!("local-{writer}")))
                     .await
                     .unwrap();
-                let sends = recorded_eager(&manager);
+                let publish_attempted =
+                    (eager_outbound_attempt_msgs(&manager) - publish_before) as usize;
+                let sends = await_eager_settled_attempts(&manager, publish_attempted).await;
                 assert_eq!(
                     sends.len(),
                     expected,
                     "writer {writer}, D={degree}, full={full}"
+                );
+                assert_eq!(
+                    publish_attempted, expected,
+                    "metered publish attempts must match the selected ceiling"
                 );
                 if expected <= 2 {
                     let actual = sends
@@ -2312,6 +2442,7 @@ mod tests {
                         "all writers preserve preferred + deterministic remainder"
                     );
                 }
+                recorded_eager(&manager);
                 let local = tokio::time::timeout(Duration::from_secs(2), sub.recv())
                     .await
                     .unwrap()
@@ -2319,12 +2450,46 @@ mod tests {
                 assert_eq!(local.payload, Bytes::from(format!("local-{writer}")));
                 // A selected inbound sender cannot expand stock sg; unlisted
                 // inbound expansion is the separate, explicitly held sg gate.
+                let inbound_from = PeerId::new([8; 32]);
+                let inbound_msg_id = [50 + writer; 32];
                 let payload = encode_v1(name, &Bytes::from(format!("remote-{writer}"))).unwrap();
-                let frame =
-                    slice1_signed_frame(MessageKind::Eager, topic, payload, [50 + writer; 32]);
-                manager.handle_incoming(PeerId::new([8; 32]), frame).await;
-                let sends = recorded_eager(&manager);
-                assert!(sends.len() <= expected);
+                let frame = slice1_signed_frame(MessageKind::Eager, topic, payload, inbound_msg_id);
+                let inbound_before = eager_outbound_attempt_msgs(&manager);
+                manager.handle_incoming(inbound_from, frame).await;
+                let inbound_attempted =
+                    (eager_outbound_attempt_msgs(&manager) - inbound_before) as usize;
+                let sends =
+                    await_eager_settled_for_msg(&manager, inbound_msg_id, inbound_attempted).await;
+                assert_eq!(
+                    sends.len(),
+                    inbound_attempted,
+                    "settled recipient set must include every metered attempt"
+                );
+                assert!(
+                    sends.iter().all(|(peer, _)| *peer != inbound_from),
+                    "forward set must exclude the inbound sender"
+                );
+                if expected == 1 {
+                    // Sole selected peer is the sender: legitimate zero-recipient forward.
+                    assert_eq!(
+                        inbound_attempted, 0,
+                        "D=1 inbound from sole selected peer must claim zero forwards"
+                    );
+                    assert!(
+                        sends.is_empty(),
+                        "D=1 inbound from sole selected peer must record zero recipients"
+                    );
+                } else {
+                    assert!(
+                        inbound_attempted >= 1,
+                        "live eligible recipients must yield positive forward attempts"
+                    );
+                    assert!(
+                        inbound_attempted <= expected,
+                        "inbound fanout must obey the selected ceiling"
+                    );
+                }
+                recorded_eager(&manager);
                 let received = tokio::time::timeout(Duration::from_secs(2), sub.recv())
                     .await
                     .unwrap()
@@ -2350,12 +2515,15 @@ mod tests {
         let name = "x0x/dm/v1/bus";
         let topic = TopicId::from_entity(name.as_bytes());
         let mut sub = manager.subscribe(name.into()).await;
+        let cached_before = eager_outbound_attempt_msgs(&manager);
         manager
             .publish(name.into(), Bytes::from("cached"))
             .await
             .unwrap();
-        let initial = recorded_eager(&manager);
+        let cached_attempted = (eager_outbound_attempt_msgs(&manager) - cached_before) as usize;
+        let initial = await_eager_settled_attempts(&manager, cached_attempted).await;
         let id = initial[0].1.header.msg_id;
+        recorded_eager(&manager);
         let request = slice1_signed_frame(
             MessageKind::IWant,
             topic,
@@ -2363,11 +2531,14 @@ mod tests {
             [0; 32],
         );
         // Real cached IWANT handler + spawned send task + outbound recorder.
+        let repair_before = eager_outbound_attempt_msgs(&manager);
         manager.handle_incoming(PeerId::new([7; 32]), request).await;
-        let repaired = recorded_eager(&manager);
+        let repair_attempted = (eager_outbound_attempt_msgs(&manager) - repair_before) as usize;
+        let repaired = await_eager_settled_for_msg(&manager, id, repair_attempted).await;
         assert_eq!(repaired.len(), 1);
         assert_eq!(repaired[0].0, PeerId::new([7; 32]));
         assert_eq!(repaired[0].1.header.msg_id, id);
+        recorded_eager(&manager);
         manager.sample_egress();
         let before = manager.egress_diagnostics();
         assert_eq!(before["subscribed_topics"][0]["name"], name);
@@ -2386,24 +2557,39 @@ mod tests {
                 .unwrap()
                 > 0
         );
+        let before_refresh_pub = eager_outbound_attempt_msgs(&manager);
         manager
             .publish(name.into(), Bytes::from("after-iwant-before-refresh"))
             .await
             .unwrap();
+        let before_refresh_attempted =
+            (eager_outbound_attempt_msgs(&manager) - before_refresh_pub) as usize;
+        let before_refresh_sends =
+            await_eager_settled_attempts(&manager, before_refresh_attempted).await;
         assert!(
-            recorded_eager(&manager).len() <= 2,
+            before_refresh_sends.len() <= 2,
             "repair promotion must preserve the ceiling before refresh"
         );
+        assert!(
+            !before_refresh_sends.is_empty(),
+            "publish with live selected peers must record positive eager delivery"
+        );
+        recorded_eager(&manager);
         manager.refresh_topic_peers().await;
+        let after_hard_before = eager_outbound_attempt_msgs(&manager);
         manager
             .publish(name.into(), Bytes::from("after-hard-exceed"))
             .await
             .unwrap();
+        let after_hard_attempted =
+            (eager_outbound_attempt_msgs(&manager) - after_hard_before) as usize;
+        let after_hard_sends = await_eager_settled_attempts(&manager, after_hard_attempted).await;
         assert_eq!(
-            recorded_eager(&manager).len(),
+            after_hard_sends.len(),
             2,
             "byte thresholds never shed sends"
         );
+        recorded_eager(&manager);
         let first = tokio::time::timeout(Duration::from_secs(2), sub.recv())
             .await
             .unwrap()
@@ -2447,8 +2633,10 @@ mod tests {
             manager.refresh_topic_peers().await;
             recorded_eager(&manager);
             let payload = Bytes::from(format!("after-removing-{removed:?}"));
+            let pub_before = eager_outbound_attempt_msgs(&manager);
             manager.publish(name.into(), payload.clone()).await.unwrap();
-            let sends = recorded_eager(&manager);
+            let pub_attempted = (eager_outbound_attempt_msgs(&manager) - pub_before) as usize;
+            let sends = await_eager_settled_attempts(&manager, pub_attempted).await;
             assert_eq!(
                 sends
                     .iter()
@@ -2456,6 +2644,7 @@ mod tests {
                     .collect::<HashSet<_>>(),
                 expected
             );
+            recorded_eager(&manager);
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(2), sub.recv())
                     .await
@@ -2474,23 +2663,38 @@ mod tests {
         let topic = TopicId::from_entity(name.as_bytes());
         let mut sub = manager.subscribe(name.into()).await;
         for peer in [3, 4, 5] {
+            let inbound_from = PeerId::new([peer; 32]);
+            let inbound_msg_id = [peer; 32];
             let frame = slice1_signed_frame(
                 MessageKind::Eager,
                 topic,
                 encode_v1(name, &Bytes::from(vec![peer])).unwrap(),
-                [peer; 32],
+                inbound_msg_id,
             );
-            manager
-                .handle_incoming(PeerId::new([peer; 32]), frame)
-                .await;
+            let inbound_before = eager_outbound_attempt_msgs(&manager);
+            manager.handle_incoming(inbound_from, frame).await;
+            let inbound_attempted =
+                (eager_outbound_attempt_msgs(&manager) - inbound_before) as usize;
+            let sends =
+                await_eager_settled_for_msg(&manager, inbound_msg_id, inbound_attempted).await;
+            assert_eq!(sends.len(), inbound_attempted);
+            assert!(
+                sends.iter().all(|(peer_id, _)| *peer_id != inbound_from),
+                "forward set must exclude the unlisted inbound sender"
+            );
+            assert!(
+                inbound_attempted >= 1,
+                "unlisted inbound with live selected peers must forward positively"
+            );
+            assert!(
+                inbound_attempted <= 2,
+                "inbound handler must cap before forwarding"
+            );
+            recorded_eager(&manager);
             assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
                 .await
                 .unwrap()
                 .is_some());
-            assert!(
-                recorded_eager(&manager).len() <= 2,
-                "inbound handler must cap before forwarding"
-            );
             let requester = PeerId::new([peer + 3; 32]);
             let request = slice1_signed_frame(
                 MessageKind::IWant,
@@ -2498,37 +2702,58 @@ mod tests {
                 postcard::to_stdvec(&vec![[peer; 32]]).unwrap().into(),
                 [0; 32],
             );
+            let repair_before = eager_outbound_attempt_msgs(&manager);
             manager.handle_incoming(requester, request).await;
-            let repair = recorded_eager(&manager);
+            let repair_attempted = (eager_outbound_attempt_msgs(&manager) - repair_before) as usize;
+            let repair =
+                await_eager_settled_for_msg(&manager, inbound_msg_id, repair_attempted).await;
             assert_eq!(
                 repair.len(),
                 1,
                 "cached IWANT reply remains available outside selected peers"
             );
             assert_eq!(repair[0].0, requester);
+            recorded_eager(&manager);
+            let interleave_before = eager_outbound_attempt_msgs(&manager);
             manager
                 .publish(name.into(), Bytes::from(vec![peer, 9]))
                 .await
                 .unwrap();
+            let interleave_attempted =
+                (eager_outbound_attempt_msgs(&manager) - interleave_before) as usize;
+            let interleave = await_eager_settled_attempts(&manager, interleave_attempted).await;
             assert!(
-                recorded_eager(&manager).len() <= 2,
+                !interleave.is_empty(),
+                "interleaved publish after repair promotion must attempt delivery"
+            );
+            assert!(
+                interleave.len() <= 2,
                 "interleaved publish after repair promotion"
             );
+            recorded_eager(&manager);
             assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
                 .await
                 .unwrap()
                 .is_some());
         }
         recorded_eager(&manager);
+        let final_before = eager_outbound_attempt_msgs(&manager);
         manager
             .publish(name.into(), Bytes::from("between-refreshes"))
             .await
             .unwrap();
-        let actual = recorded_eager(&manager).len();
+        let final_attempted = (eager_outbound_attempt_msgs(&manager) - final_before) as usize;
+        let final_sends = await_eager_settled_attempts(&manager, final_attempted).await;
+        let actual = final_sends.len();
+        assert!(
+            !final_sends.is_empty(),
+            "between-refreshes publish must attempt positive eager delivery"
+        );
         assert!(
             actual <= 2,
             "pinned sg must preserve D between x0x refreshes"
         );
+        recorded_eager(&manager);
         eprintln!("Pinned sg #51: D=2, unlisted inbound + interleaved publish, final eager fanout={actual}");
     }
 
@@ -2625,12 +2850,15 @@ mod tests {
         let topic = TopicId::from_entity(name.as_bytes());
         let _owner_sub = owner.subscribe(name.into()).await;
         let mut receiver_sub = receiver.subscribe(name.into()).await;
+        let first_before = eager_outbound_attempt_msgs(&owner);
         owner
             .publish(name.into(), Bytes::from("deliberately-missed"))
             .await
             .unwrap();
-        let first = recorded_eager(&owner);
+        let first_attempted = (eager_outbound_attempt_msgs(&owner) - first_before) as usize;
+        let first = await_eager_settled_attempts(&owner, first_attempted).await;
         let id = first[0].1.header.msg_id;
+        recorded_eager(&owner);
         // Lose both selected carriers; no initial EAGER reaches the receiver.
         owner
             .transport
@@ -2667,10 +2895,13 @@ mod tests {
             })
             .expect("real IHAVE handler emits IWANT")
             .1;
+        let repair_before = eager_outbound_attempt_msgs(&owner);
         owner.handle_incoming(PeerId::new([4; 32]), request).await;
-        let repair = recorded_eager(&owner);
+        let repair_attempted = (eager_outbound_attempt_msgs(&owner) - repair_before) as usize;
+        let repair = await_eager_settled_for_msg(&owner, id, repair_attempted).await;
         assert_eq!(repair.len(), 1);
         assert_eq!(repair[0].0, PeerId::new([4; 32]));
+        recorded_eager(&owner);
         receiver
             .handle_incoming(
                 PeerId::new([3; 32]),
@@ -2682,11 +2913,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.payload, Bytes::from("deliberately-missed"));
+        let after_before = eager_outbound_attempt_msgs(&owner);
         owner
             .publish(name.into(), Bytes::from("after-recovery"))
             .await
             .unwrap();
-        assert!(recorded_eager(&owner).len() <= 2);
+        let after_attempted = (eager_outbound_attempt_msgs(&owner) - after_before) as usize;
+        let after_sends = await_eager_settled_attempts(&owner, after_attempted).await;
+        assert!(after_sends.len() <= 2);
+        assert!(!after_sends.is_empty());
     }
 
     #[test]
