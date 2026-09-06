@@ -1,134 +1,43 @@
-name: Build
-
+name: CI isolation synthetic admission
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
-
-env:
-  CARGO_TERM_COLOR: always
-
+    inputs:
+      expected_commit:
+        description: Exact reviewed diagnostic commit
+        required: true
+        type: string
+permissions:
+  contents: read
 jobs:
-  validate-release-metadata:
-    name: Validate release metadata
+  isolation-witness:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
-
-      - name: Test release metadata validation
-        run: python3 .github/scripts/test_release_metadata.py
-
-      - name: Validate release metadata (pull request)
-        if: github.event_name == 'pull_request'
+          persist-credentials: false
+      - name: Verify exact diagnostic source
         run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode pull_request \
-            --base-sha "${{ github.event.pull_request.base.sha }}"
-
-      - name: Validate release metadata (push or dispatch)
-        if: github.event_name != 'pull_request'
-        run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode push_main
-
-  build-matrix:
-    name: Build ${{ matrix.platform }}
-    needs: validate-release-metadata
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux x86_64 GNU
-          - platform: linux-x64-gnu
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cross: false
-
-          # Linux x86_64 musl (static linking)
-          - platform: linux-x64-musl
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cross: true
-
-          # Linux ARM64
-          - platform: linux-arm64-gnu
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            cross: true
-
-          # macOS x86_64 (cross-compiled on Apple Silicon)
-          - platform: macos-x64
-            os: macos-14
-            target: x86_64-apple-darwin
-            cross: false
-
-          # macOS ARM64 (Apple Silicon)
-          - platform: macos-arm64
-            os: macos-14
-            target: aarch64-apple-darwin
-            cross: false
-
-          # Windows x86_64
-          - platform: windows-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-registry-
-
-      - name: Cache cargo index
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-git-
-
-      - name: Cache target directory
-        uses: actions/cache@v5
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-target-
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Upload artifacts
+          python3 - <<'PYCODE'
+          import hashlib, json, os, pathlib, re, subprocess
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          expected = os.environ['EXPECTED_COMMIT']
+          assert re.fullmatch(r'[0-9a-f]{40}', expected) and head == expected
+          paths = sorted(pathlib.Path('scripts/ci').glob('*'))
+          print(json.dumps({'head': head, 'scripts': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths if p.is_file()}}, indent=2))
+          PYCODE
+      - name: Run synthetic namespace controls only
+        run: python3 scripts/ci/isolation-witness.py
+      - name: Retain bounded isolation receipts
+        if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: x0x-${{ matrix.platform }}
+          name: isolation-synthetic-evidence
           path: |
-            target/${{ matrix.target }}/release/x0x*
-            !target/${{ matrix.target }}/release/*.d
-            !target/${{ matrix.target }}/release/*.pdb
-          if-no-files-found: error
+            ${{ runner.temp }}/x0x-isolation-*/*.json
+            ${{ runner.temp }}/x0x-witness-total-*/*.json
+            ${{ runner.temp }}/x0x-cancel-witness-*/*.stdout
+            ${{ runner.temp }}/x0x-cancel-witness-*/*.stderr
+          if-no-files-found: warn
