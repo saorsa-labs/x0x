@@ -1058,6 +1058,13 @@ pub async fn serve_with_options(
     // instead of duplicated; best-effort — never fails startup.
     routes::home::provision_home(&state).await;
 
+    // #449 P4: retire duplicate Homes left over from a pre-fix fork, but only
+    // once we are seated in the canonical one. Called HERE rather than inside
+    // `provision_home` because that returns early on several paths — including
+    // the common "we already have a Home" one, which is exactly when a stale
+    // duplicate needs clearing.
+    routes::home::reconcile_home_duplicates(&state).await;
+
     // ADR 0028: post-restore queue drain — any queued approvals whose
     // predecessors arrived during downtime can now be drained (Kimi blocker 9).
     {

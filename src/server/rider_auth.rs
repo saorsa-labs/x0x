@@ -243,6 +243,20 @@ pub(super) struct RiderTokenStore {
 }
 
 impl RiderTokenStore {
+    /// Whether any live token grants one of `group_ids` (#449 P4).
+    ///
+    /// Retiring a group whose id a rider still names would silently strip
+    /// that rider's grant — so a duplicate Home with an outstanding grant is
+    /// never retired automatically.
+    pub(super) fn grants_any_group(&self, group_ids: &[&str]) -> bool {
+        self.records.values().any(|record| {
+            record
+                .groups
+                .iter()
+                .any(|granted| group_ids.contains(&granted.as_str()))
+        })
+    }
+
     /// Load the store from `path` (a missing file is an empty store; a
     /// corrupt file is logged and treated as empty — rider tokens fail
     /// closed, they can never grant more than was persisted).

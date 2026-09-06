@@ -255,6 +255,9 @@ impl SyncDaemonView for DaemonView {
                     group_id = %group_id,
                     "joined the owner's canonical Home (#449 adoption)"
                 );
+                // Adoption has completed, so any duplicate we were holding is
+                // now retirable — join first, retire second.
+                super::home::reconcile_home_duplicates(&state).await;
             } else {
                 // #447: the winner may not have our cert blob yet, so a
                 // refusal is expected and TRANSIENT. Retry on the next pass
