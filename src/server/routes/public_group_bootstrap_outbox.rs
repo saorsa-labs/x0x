@@ -835,6 +835,29 @@ pub(in crate::server) async fn public_group_bootstrap_outbox_step(state: &Arc<Ap
     settle_public_group_bootstrap_attempt(state, &obligation, attempt).await;
 }
 
+// Static diagnostic categories only: never expose the error's detail string.
+fn bootstrap_delivery_error_kind(error: &x0x::dm::DmError) -> &'static str {
+    use x0x::dm::DmError;
+    match error {
+        DmError::RecipientKeyUnavailable(_) => "recipient_key_unavailable",
+        DmError::RecipientKeyInvalid(_) => "recipient_key_invalid",
+        DmError::AckSemanticsUnavailable(_) => "recipient_ack_semantics_unavailable",
+        DmError::IdempotencyConflict(_) => "idempotency_conflict",
+        DmError::Timeout { .. } => "timeout",
+        DmError::PeerLikelyOffline { .. } => "peer_likely_offline",
+        DmError::PeerDisconnected { .. } => "peer_disconnected",
+        DmError::ReceiverBackpressured { .. } => "receiver_backpressured",
+        DmError::RecipientRejected { .. } => "recipient_rejected",
+        DmError::LocalGossipUnavailable(_) => "local_gossip_unavailable",
+        DmError::EnvelopeConstruction(_) => "envelope_construction",
+        DmError::PayloadTooLarge { .. } => "payload_too_large",
+        DmError::NoConnectivity(_) => "no_connectivity",
+        DmError::PublishFailed(_) => "publish_failed",
+        DmError::NoRelayCandidate => "no_relay_candidate",
+        DmError::RelayBuildFailed(_) => "relay_build_failed",
+    }
+}
+
 /// Apply one delivery attempt's outcome to the outbox.
 ///
 /// Split out from the worker so the rule that decides whether an obligation
@@ -883,6 +906,7 @@ async fn settle_public_group_bootstrap_attempt(
                 group_id = %LogHexId::group(&obligation.group_id),
                 recipient = %LogHexId::agent(&obligation.recipient_hex),
                 %error,
+                error_kind = bootstrap_delivery_error_kind(&error),
                 "public-group bootstrap delivery attempt failed"
             );
             if let Err(schedule_error) =
@@ -1072,6 +1096,76 @@ mod tests {
     use anyhow::{Context, Result};
 
     use super::super::named_groups::tests::secure_endpoint_test_state;
+
+    #[test]
+    fn bootstrap_error_categories_use_variants_without_error_details() {
+        use x0x::dm::DmError;
+        let detail = || "DO_NOT_EMIT_FIXTURE_SECRET".to_string();
+        let cases = [
+            (
+                DmError::RecipientKeyUnavailable(detail()),
+                "recipient_key_unavailable",
+            ),
+            (
+                DmError::RecipientKeyInvalid(detail()),
+                "recipient_key_invalid",
+            ),
+            (
+                DmError::AckSemanticsUnavailable(detail()),
+                "recipient_ack_semantics_unavailable",
+            ),
+            (
+                DmError::IdempotencyConflict(detail()),
+                "idempotency_conflict",
+            ),
+            (
+                DmError::Timeout {
+                    retries: 0,
+                    elapsed: std::time::Duration::ZERO,
+                },
+                "timeout",
+            ),
+            (
+                DmError::PeerLikelyOffline {
+                    phi: 1.0,
+                    last_seen_ms_ago: None,
+                },
+                "peer_likely_offline",
+            ),
+            (
+                DmError::PeerDisconnected { reason: detail() },
+                "peer_disconnected",
+            ),
+            (
+                DmError::ReceiverBackpressured { reason: detail() },
+                "receiver_backpressured",
+            ),
+            (
+                DmError::RecipientRejected { reason: detail() },
+                "recipient_rejected",
+            ),
+            (
+                DmError::LocalGossipUnavailable(detail()),
+                "local_gossip_unavailable",
+            ),
+            (
+                DmError::EnvelopeConstruction(detail()),
+                "envelope_construction",
+            ),
+            (
+                DmError::PayloadTooLarge { len: 2, max: 1 },
+                "payload_too_large",
+            ),
+            (DmError::NoConnectivity(detail()), "no_connectivity"),
+            (DmError::PublishFailed(detail()), "publish_failed"),
+            (DmError::NoRelayCandidate, "no_relay_candidate"),
+            (DmError::RelayBuildFailed(detail()), "relay_build_failed"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(bootstrap_delivery_error_kind(&error), expected);
+            assert!(!bootstrap_delivery_error_kind(&error).contains("DO_NOT_EMIT"));
+        }
+    }
 
     /// A committed SignedPublic group with `recipient` on its roster, in the
     /// exact shape the add-member path hands to the outbox.

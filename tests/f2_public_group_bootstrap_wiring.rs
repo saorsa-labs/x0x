@@ -57,9 +57,68 @@ const BOOTSTRAP_EVENTS: &[&str] = &[
     "public-group bootstrap was not durably installed",
 ];
 
+const BOOTSTRAP_ERROR_KINDS: &[&str] = &[
+    "recipient_key_unavailable",
+    "recipient_key_invalid",
+    "recipient_ack_semantics_unavailable",
+    "idempotency_conflict",
+    "timeout",
+    "peer_likely_offline",
+    "peer_disconnected",
+    "receiver_backpressured",
+    "recipient_rejected",
+    "local_gossip_unavailable",
+    "envelope_construction",
+    "payload_too_large",
+    "no_connectivity",
+    "publish_failed",
+    "no_relay_candidate",
+    "relay_build_failed",
+];
+
+// These existing stages distinguish refusal before sending, publish failure,
+// receipt before typed admission, and durable completion. No other fields are kept.
+const BOOTSTRAP_DM_STAGES: &[&str] = &[
+    "strict_durable_ack_gate_refused",
+    "path_chosen",
+    "primary_inbox_publish_failed",
+    "legacy_bus_fallback_publish_failed",
+    "inbound_envelope_received",
+    "inbound_signature_failed",
+    "inbound_pairing_denied",
+    "inbound_durable_typed_route_unavailable",
+    "inbound_durable_typed_handler_failed",
+    "inbound_durable_typed_completion_dropped",
+    "inbound_durable_typed_completed",
+    "inbound_durable_ack_published",
+];
+
+fn closed_label(value: &str, allowed: &'static [&'static str]) -> Option<&'static str> {
+    allowed.iter().copied().find(|known| *known == value)
+}
+
+fn reconnect_outcome(body: &Value) -> &'static str {
+    body["outcome"]
+        .as_str()
+        .and_then(|value| {
+            closed_label(
+                value,
+                &[
+                    "Direct",
+                    "Coordinated",
+                    "AlreadyConnected",
+                    "Unreachable",
+                    "NotFound",
+                ],
+            )
+        })
+        .unwrap_or("missing_or_unknown")
+}
+
 #[derive(Default)]
 struct BootstrapObservations {
     phase: &'static str,
+    reconnect_outcome: &'static str,
     polls: u64,
     last_projection: Value,
     before_restart: Value,
@@ -76,36 +135,57 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BootstrapTrace {
         metadata: &tracing::Metadata<'_>,
         _: tracing_subscriber::layer::Context<'_, S>,
     ) -> bool {
-        metadata.target() == "x0x::server::routes::public_group_bootstrap_outbox"
+        matches!(
+            metadata.target(),
+            "x0x::server::routes::public_group_bootstrap_outbox" | "dm.trace"
+        )
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() != "x0x::server::routes::public_group_bootstrap_outbox" {
-            return;
-        }
         #[derive(Default)]
-        struct Message(String);
-        impl tracing::field::Visit for Message {
+        struct Fields {
+            message: String,
+            error_kind: Option<&'static str>,
+            stage: Option<&'static str>,
+        }
+        impl tracing::field::Visit for Fields {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
-                    self.0 = format!("{value:?}");
+                    self.message = format!("{value:?}");
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "error_kind" => self.error_kind = closed_label(value, BOOTSTRAP_ERROR_KINDS),
+                    "stage" => self.stage = closed_label(value, BOOTSTRAP_DM_STAGES),
+                    _ => {}
                 }
             }
         }
-        let mut message = Message::default();
-        event.record(&mut message);
-        let Some(&known) = BOOTSTRAP_EVENTS.iter().find(|&&known| known == message.0) else {
-            return;
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        let mut summary = match event.metadata().target() {
+            "x0x::server::routes::public_group_bootstrap_outbox" => {
+                let Some(known) = closed_label(&fields.message, BOOTSTRAP_EVENTS) else {
+                    return;
+                };
+                json!({"event": known, "error_kind": fields.error_kind})
+            }
+            "dm.trace" => {
+                let Some(stage) = fields.stage else {
+                    return;
+                };
+                json!({"stage": stage})
+            }
+            _ => return,
         };
         let mut observations = self.0.lock().unwrap();
         if observations.events.len() == 64 {
             observations.events.pop_front();
             observations.dropped_events += 1;
         }
-        let phase = observations.phase;
-        observations
-            .events
-            .push_back(json!({"phase": phase, "event": known}));
+        summary["phase"] = json!(observations.phase);
+        observations.events.push_back(summary);
     }
 }
 
@@ -163,6 +243,7 @@ impl Drop for BootstrapFailureDiagnostics {
             json!({
                 "phase": observations.phase,
                 "polls": observations.polls,
+                "reconnect_outcome": observations.reconnect_outcome,
                 "last_projection": observations.last_projection,
                 "before_restart": observations.before_restart,
                 "after_restart": observations.after_restart,
@@ -590,6 +671,7 @@ async fn bootstrap_outbox_survives_sender_restart_and_clears_only_on_ack() {
 
     // Now — and only now — an application ACK is possible, so the obligation
     // written before the restart must both deliver and drain.
+    observations.lock().unwrap().reconnect_outcome = reconnect_outcome(&connected);
     observations.lock().unwrap().phase = "waiting_for_install";
     wait_until(
         "the restarted authority never delivered the surviving obligation",
@@ -699,4 +781,37 @@ fn bootstrap_diagnostic_trace_keeps_only_allowed_events_and_bounds_history() {
         .events
         .iter()
         .all(|event| event["event"] == "public-group bootstrap delivery attempt failed"));
+}
+
+#[test]
+fn bootstrap_diagnostic_categories_and_outcomes_reject_unknown_details() {
+    assert_eq!(
+        reconnect_outcome(&json!({"ok": true, "outcome": "Unreachable"})),
+        "Unreachable"
+    );
+    assert_eq!(reconnect_outcome(&json!({"outcome": "Direct"})), "Direct");
+    assert_eq!(
+        reconnect_outcome(&json!({"outcome": "DO_NOT_EMIT_FIXTURE_SECRET"})),
+        "missing_or_unknown"
+    );
+    let observations = Arc::new(Mutex::new(BootstrapObservations::default()));
+    let subscriber = tracing_subscriber::registry().with(BootstrapTrace(Arc::clone(&observations)));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::warn!(target: "x0x::server::routes::public_group_bootstrap_outbox",
+            error_kind = "timeout", error = "DO_NOT_EMIT_FIXTURE_SECRET",
+            "public-group bootstrap delivery attempt failed");
+        tracing::warn!(target: "x0x::server::routes::public_group_bootstrap_outbox",
+            error_kind = "DO_NOT_EMIT_FIXTURE_SECRET",
+            "public-group bootstrap delivery attempt failed");
+        tracing::debug!(target: "dm.trace", stage = "inbound_envelope_received", payload = "DO_NOT_EMIT_FIXTURE_SECRET");
+        tracing::debug!(target: "dm.trace", stage = "DO_NOT_EMIT_FIXTURE_SECRET");
+    });
+    let observations = observations.lock().unwrap();
+    assert_eq!(observations.events.len(), 3);
+    assert_eq!(observations.events[0]["error_kind"], "timeout");
+    assert!(observations.events[1]["error_kind"].is_null());
+    assert_eq!(observations.events[2]["stage"], "inbound_envelope_received");
+    assert!(!serde_json::to_string(&observations.events)
+        .unwrap()
+        .contains("DO_NOT_EMIT_FIXTURE_SECRET"));
 }
