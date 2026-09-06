@@ -130,5 +130,28 @@ class DiagnosticControls(unittest.TestCase):
         self.assertEqual(collect.get('id'), 'collect')
 
 
+    def test_artifact_path_is_bound_from_runner_environment_at_step_runtime(self):
+        import subprocess
+        import yaml
+        workflow = yaml.safe_load((Path(__file__).resolve().parents[2]/'workflows'/'build.yml').read_text())
+        job = workflow['jobs']['diagnostic']
+        self.assertNotIn('DIAG_ARTIFACTS', job['env'])
+        self.assertFalse(any('runner.' in str(value) for value in job['env'].values()))
+        binding = next(step for step in job['steps'] if step.get('name') == 'Bind isolated evidence path')
+        self.assertEqual(binding['shell'], 'bash')
+        self.assertNotIn('${{', binding['run'])
+        with tempfile.TemporaryDirectory(prefix='531 path with spaces ') as root:
+            env_file = Path(root)/'github-env'
+            result = subprocess.run(['bash', '-eu', '-c', binding['run']],
+                                    env={'PATH': '/usr/bin:/bin', 'RUNNER_TEMP': root,
+                                         'GITHUB_ENV': str(env_file)}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(env_file.read_text(), f'DIAG_ARTIFACTS={root}/x0x-531-evidence\n')
+        # This proves shell binding and catches the previous unsupported location;
+        # it does not claim to emulate GitHub's expression-context validator.
+        upload = next(step for step in job['steps'] if step.get('uses', '').startswith('actions/upload-artifact@'))
+        self.assertEqual(upload['with']['path'], '${{ runner.temp }}/x0x-531-evidence/upload/')
+
+
 if __name__ == '__main__':
     unittest.main()

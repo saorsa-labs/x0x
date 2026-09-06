@@ -12,12 +12,15 @@ jobs:
       RUSTFLAGS: -D warnings
       CARGO_INCREMENTAL: 0
       CARGO_TERM_COLOR: never
-      DIAG_ARTIFACTS: ${{ runner.temp }}/x0x-531-evidence
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5, original CI
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Bind isolated evidence path
+        shell: bash
+        run: |
+          printf 'DIAG_ARTIFACTS=%s/x0x-531-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: 1.98.1
