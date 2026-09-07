@@ -757,6 +757,17 @@ fn allow_local_discovery_addresses(config: &network::NetworkConfig) -> bool {
 }
 
 pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
+    let interfaces = match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces,
+        Err(_) => return Vec::new(),
+    };
+    rank_local_interface_addrs(interfaces.into_iter().map(|iface| iface.ip()), port)
+}
+
+fn rank_local_interface_addrs(
+    ips: impl IntoIterator<Item = std::net::IpAddr>,
+    port: u16,
+) -> Vec<std::net::SocketAddr> {
     fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
         v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
     }
@@ -784,13 +795,7 @@ pub fn collect_local_interface_addrs(port: u16) -> Vec<std::net::SocketAddr> {
 
     let mut ranked = Vec::new();
 
-    let interfaces = match if_addrs::get_if_addrs() {
-        Ok(interfaces) => interfaces,
-        Err(_) => return Vec::new(),
-    };
-
-    for iface in interfaces {
-        let ip = iface.ip();
+    for ip in ips {
         if ip.is_unspecified() || ip.is_loopback() {
             continue;
         }
@@ -22679,21 +22684,55 @@ fn different_ids_produce_different_shard_topics() {
 }
 
 #[test]
-fn collect_local_interface_addrs_returns_non_empty() {
-    let addrs = collect_local_interface_addrs(5483);
-    assert!(!addrs.is_empty(), "should find at least one interface");
-    for addr in &addrs {
-        assert_eq!(addr.port(), 5483, "all addrs should use port 5483");
+fn local_interface_addrs_rank_deduplicate_and_preserve_port() {
+    // Exercise the production selection without assuming the host has a LAN.
+    let ips: Vec<std::net::IpAddr> = [
+        "fd00::1",
+        "10.0.0.2",
+        "2001:db8::1",
+        "100.64.0.1",
+        "8.8.8.8",
+        "192.168.1.2",
+        "8.8.8.8",
+        "fd00::1",
+        "127.0.0.1",
+        "fe80::1",
+    ]
+    .map(|ip| ip.parse().unwrap())
+    .into();
+    for port in [0, 5483, 9000] {
+        let expected: Vec<std::net::SocketAddr> = [
+            "8.8.8.8",
+            "100.64.0.1",
+            "10.0.0.2",
+            "192.168.1.2",
+            "2001:db8::1",
+            "fd00::1",
+        ]
+        .map(|ip| std::net::SocketAddr::new(ip.parse().unwrap(), port))
+        .into();
+        assert_eq!(
+            rank_local_interface_addrs(ips.iter().copied(), port),
+            expected
+        );
     }
 }
 
 #[test]
-fn collect_local_interface_addrs_returns_reasonable_results() {
-    let addrs = collect_local_interface_addrs(9000);
-    assert!(!addrs.is_empty(), "should find at least one interface");
-    for addr in &addrs {
-        assert_eq!(addr.port(), 9000, "all addrs should use port 9000");
-    }
+fn local_interface_addrs_allow_empty_and_exclude_unusable_addresses() {
+    assert!(rank_local_interface_addrs([], 5483).is_empty());
+    // A loopback-only network namespace legitimately has no eligible addresses.
+    let excluded = [
+        "0.0.0.0",
+        "::",
+        "127.0.0.1",
+        "::1",
+        "169.254.1.1",
+        "fe80::1",
+        "febf::1",
+    ]
+    .map(|ip| ip.parse().unwrap());
+    assert!(rank_local_interface_addrs(excluded, 9000).is_empty());
 }
 
 #[test]
