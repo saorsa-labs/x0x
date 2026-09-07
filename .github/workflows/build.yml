@@ -60,7 +60,7 @@ jobs:
               'tests/rt3_harness.py':
                   'b0211a4fd1d8a90e6532a42e926543d15f6fc03b6b61e639abab9fc11daf7566',
               'tests/rt3_harness_controls.py':
-                  '45b885846a1ba5fa240cc35aa2ca27ec6fe86dd86ce0d905eadb087478923d32',
+                  '8c5a242ac804cd7276a8172385a18cd487ad596f33ea4401e9b4195cd73c6b16',
               'scripts/ci/isolated-runtime.py':
                   '2a0c2521c19d5054b6e77c995e1604e9e9e174208157bb4331b5b38783aedced',
               'scripts/ci/isolation-witness.py':
@@ -88,60 +88,246 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
       - name: Build fresh locked daemon CLI and typed witness
+        id: build
         run: |
           python3 - <<'PY'
           import hashlib, json, os, subprocess
           from pathlib import Path
-          root, target = Path(os.environ['RT3_ROOT']), Path.cwd() / 'target'
-          target.mkdir(mode=0o700)
-          env = {**os.environ, 'CARGO_TARGET_DIR': str(target)}
-          metadata = subprocess.check_output([
-              'cargo', 'metadata', '--locked', '--features', 'rt3-diagnostic',
-              '--format-version', '1'
-          ], env=env)
-          meta = json.loads(metadata)
-          package = next(item for item in meta['packages']
-                         if item['manifest_path'] == str(Path.cwd() / 'Cargo.toml'))
-          argv = [
-              'cargo', 'build', '--locked', '--features', 'rt3-diagnostic',
-              '--bin', 'x0xd', '--bin', 'x0x', '--bin', 'rt3_fixture',
-              '--message-format=json'
-          ]
-          with (root / 'build.jsonl').open('wb') as output, (
-              root / 'build.stderr'
-          ).open('wb') as error:
-              build = subprocess.run(argv, env=env, stdout=output, stderr=error)
-          record = {
-              'argv': argv, 'exit': build.returncode, 'target': str(target),
-              'rustc': subprocess.check_output(['rustc', '-Vv'], text=True),
-              'cargo': subprocess.check_output(['cargo', '-V'], text=True),
-              'binaries': {},
+          root, safe, target = (
+              Path(os.environ['RT3_ROOT']), Path(os.environ['RT3_SAFE']),
+              Path.cwd() / 'target'
+          )
+          expected_lock = '5769726f49c34214f818a9c21e435cfabe02ba5efc1e47a62d6b888c1ee6f9c2'
+          names = ('x0xd', 'x0x', 'rt3_fixture')
+          receipt = {
+              'schema': 1, 'stage': 'start', 'status': 1,
+              'error_class': 'none', 'accepted': False,
+              'target_preexisting': target.exists(), 'target_created': False,
+              'metadata_exit': None, 'package_matches': None, 'build_exit': None,
+              'lock_sha256': None, 'lock_matches': False, 'source_unchanged': False,
+              'binaries': {
+                  name: {
+                      'candidate_count': None, 'fresh_false': None,
+                      'manifest_match': None, 'executable_present': None,
+                      'executable_is_file': None, 'executable_is_executable': None,
+                  } for name in names
+              },
           }
-          assert build.returncode == 0, 'locked build failed; no runtime'
-          rows = [json.loads(line) for line in (root / 'build.jsonl').read_text().splitlines()
-                  if line.startswith('{')]
-          for name in ('x0xd', 'x0x', 'rt3_fixture'):
-              selected = [row for row in rows
-                          if row.get('reason') == 'compiler-artifact'
-                          and row.get('package_id') == package['id']
-                          and row.get('target', {}).get('name') == name]
-              assert len(selected) == 1 and selected[0]['fresh'] is False, name
-              row, binary = selected[0], target / 'debug' / name
-              assert row['executable'] == str(binary)
-              assert row['manifest_path'] == package['manifest_path']
-              assert binary.is_file() and os.access(binary, os.X_OK)
-              record['binaries'][name] = {
-                  'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-                  'cargo': row,
+
+          def update_custody():
+              lock_path = Path('Cargo.lock')
+              if lock_path.is_file():
+                  receipt['lock_sha256'] = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+                  receipt['lock_matches'] = receipt['lock_sha256'] == expected_lock
+              source = json.loads((root / 'source.json').read_text())
+              receipt['source_unchanged'] = receipt['lock_matches'] and all(
+                  hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest
+                  for name, digest in source['files'].items()
+              )
+
+          def write_receipt():
+              update_custody()
+              (safe / 'build-selection.json').write_text(
+                  json.dumps(receipt, sort_keys=True) + '\n'
+              )
+
+          def fail(stage, error_class):
+              receipt['stage'] = stage
+              receipt['error_class'] = error_class
+              receipt['status'] = 1
+              receipt['accepted'] = False
+              write_receipt()
+              raise SystemExit(1)
+
+          def main():
+              if receipt['target_preexisting']:
+                  fail('target', 'target_preexisting')
+              target.mkdir(mode=0o700)
+              receipt['target_created'] = True
+              env = {**os.environ, 'CARGO_TARGET_DIR': str(target)}
+              metadata_argv = [
+                  'cargo', 'metadata', '--locked', '--features', 'rt3-diagnostic',
+                  '--format-version', '1'
+              ]
+              # Full Cargo output stays private; only closed scalars enter RT3_SAFE.
+              with (root / 'metadata.json').open('wb') as output, (
+                  root / 'metadata.stderr'
+              ).open('wb') as error:
+                  metadata = subprocess.run(
+                      metadata_argv, env=env, stdout=output, stderr=error
+                  )
+              receipt['metadata_exit'] = metadata.returncode
+              if metadata.returncode != 0:
+                  fail('metadata', 'metadata_failed')
+              try:
+                  meta = json.loads((root / 'metadata.json').read_text())
+              except (OSError, ValueError, TypeError):
+                  fail('metadata', 'metadata_invalid')
+              matches = [
+                  item for item in meta.get('packages', [])
+                  if item.get('manifest_path') == str(Path.cwd() / 'Cargo.toml')
+              ]
+              receipt['package_matches'] = len(matches)
+              if len(matches) != 1:
+                  fail('metadata', 'package_selection')
+              package = matches[0]
+              argv = [
+                  'cargo', 'build', '--locked', '--features', 'rt3-diagnostic',
+                  '--bin', 'x0xd', '--bin', 'x0x', '--bin', 'rt3_fixture',
+                  '--message-format=json'
+              ]
+              with (root / 'build.jsonl').open('wb') as output, (
+                  root / 'build.stderr'
+              ).open('wb') as error:
+                  build = subprocess.run(argv, env=env, stdout=output, stderr=error)
+              receipt['build_exit'] = build.returncode
+              if build.returncode != 0:
+                  fail('build', 'build_failed')
+              try:
+                  rows = [
+                      json.loads(line)
+                      for line in (root / 'build.jsonl').read_text().splitlines()
+                      if line.startswith('{')
+                  ]
+              except (OSError, ValueError, TypeError):
+                  fail('selection', 'build_output_invalid')
+              record = {
+                  'argv': argv, 'exit': build.returncode, 'target': str(target),
+                  'rustc': subprocess.check_output(['rustc', '-Vv'], text=True),
+                  'cargo': subprocess.check_output(['cargo', '-V'], text=True),
+                  'binaries': {},
               }
-          lock = hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest()
-          assert lock == '5769726f49c34214f818a9c21e435cfabe02ba5efc1e47a62d6b888c1ee6f9c2'
-          record['lock_sha256'] = lock
-          record['packages'] = sorted([
-              {'name': item['name'], 'version': item['version'], 'source': item['source']}
-              for item in meta['packages']
-          ], key=lambda item: (item['name'], item['version']))
-          (root / 'build.json').write_text(json.dumps(record, indent=2) + '\n')
+              for name in names:
+                  binary = target / 'debug' / name
+                  selected = [
+                      row for row in rows
+                      if row.get('reason') == 'compiler-artifact'
+                      and row.get('package_id') == package['id']
+                      and row.get('target', {}).get('name') == name
+                      and row.get('target', {}).get('kind') == ['bin']
+                      and row.get('executable') == str(binary)
+                  ]
+                  summary = receipt['binaries'][name]
+                  summary['candidate_count'] = len(selected)
+                  summary['executable_present'] = len(selected) == 1
+                  if len(selected) != 1:
+                      fail('selection', 'artifact_selection')
+                  row = selected[0]
+                  summary['fresh_false'] = row.get('fresh') is False
+                  summary['manifest_match'] = (
+                      row.get('manifest_path') == package.get('manifest_path')
+                  )
+                  summary['executable_is_file'] = binary.is_file()
+                  summary['executable_is_executable'] = os.access(binary, os.X_OK)
+                  if not summary['fresh_false']:
+                      fail('selection', 'artifact_freshness')
+                  if not summary['manifest_match']:
+                      fail('selection', 'artifact_manifest')
+                  if not (summary['executable_is_file'] and
+                          summary['executable_is_executable']):
+                      fail('selection', 'artifact_custody')
+                  record['binaries'][name] = {
+                      'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+                      'cargo': row,
+                  }
+              update_custody()
+              if not receipt['lock_matches']:
+                  fail('custody', 'lock_changed')
+              if not receipt['source_unchanged']:
+                  fail('custody', 'source_changed')
+              record['lock_sha256'] = receipt['lock_sha256']
+              record['packages'] = sorted([
+                  {'name': item['name'], 'version': item['version'], 'source': item['source']}
+                  for item in meta['packages']
+              ], key=lambda item: (item['name'], item['version']))
+              (root / 'build.json').write_text(json.dumps(record, indent=2) + '\n')
+              receipt['stage'] = 'complete'
+              receipt['status'] = 0
+              receipt['error_class'] = 'none'
+              receipt['accepted'] = True
+              write_receipt()
+
+          try:
+              main()
+          except SystemExit:
+              raise
+          except Exception:
+              receipt['stage'] = 'unexpected'
+              receipt['error_class'] = 'unexpected'
+              receipt['status'] = 1
+              receipt['accepted'] = False
+              write_receipt()
+              raise
+          PY
+      - name: Collect pre-runtime build receipts
+        id: build_collect
+        if: always() && steps.build.outcome == 'failure'
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root, safe = (Path(os.environ[name]) for name in ('RT3_ROOT', 'RT3_SAFE'))
+          selection_path = safe / 'build-selection.json'
+          assert selection_path.is_file() and not selection_path.is_symlink()
+          value = json.loads(selection_path.read_text())
+          assert set(value) == {
+              'schema', 'stage', 'status', 'error_class', 'accepted',
+              'target_preexisting', 'target_created', 'metadata_exit',
+              'package_matches', 'build_exit', 'lock_sha256', 'lock_matches',
+              'source_unchanged', 'binaries',
+          }
+          assert value['schema'] == 1 and value['accepted'] is False
+          assert type(value['status']) is int and value['status'] != 0
+          assert value['stage'] in {
+              'target', 'metadata', 'build', 'selection', 'custody', 'unexpected'
+          }
+          assert value['error_class'] in {
+              'target_preexisting', 'metadata_failed', 'metadata_invalid',
+              'package_selection', 'build_failed', 'build_output_invalid',
+              'artifact_selection', 'artifact_freshness', 'artifact_manifest',
+              'artifact_custody', 'lock_changed', 'source_changed', 'unexpected',
+          }
+          for key in ('target_preexisting', 'target_created', 'lock_matches',
+                      'source_unchanged'):
+              assert type(value[key]) is bool
+          for key in ('metadata_exit', 'package_matches', 'build_exit'):
+              assert value[key] is None or type(value[key]) is int
+          assert value['lock_sha256'] is None or re.fullmatch(
+              '[0-9a-f]{64}', value['lock_sha256']
+          )
+          assert set(value['binaries']) == {'x0xd', 'x0x', 'rt3_fixture'}
+          fields = {
+              'candidate_count', 'fresh_false', 'manifest_match',
+              'executable_present', 'executable_is_file', 'executable_is_executable',
+          }
+          for binary in value['binaries'].values():
+              assert set(binary) == fields
+              assert binary['candidate_count'] is None or (
+                  type(binary['candidate_count']) is int
+              )
+              for key in fields - {'candidate_count'}:
+                  assert binary[key] is None or type(binary[key]) is bool
+          source_path = root / 'source.json'
+          assert source_path.is_file() and not source_path.is_symlink()
+          source = json.loads(source_path.read_text())
+          assert set(source) == {'head', 'tree', 'files'}
+          assert re.fullmatch('[0-9a-f]{40}', source['head'])
+          assert re.fullmatch('[0-9a-f]{40}', source['tree'])
+          assert set(source['files']) == {
+              'Cargo.toml', 'src/bin/rt3_fixture.rs', 'tests/rt3_harness.py',
+              'tests/rt3_harness_controls.py', 'scripts/ci/isolated-runtime.py',
+              'scripts/ci/isolation-witness.py', 'ci/491-rt3/Cargo.lock.fixture',
+          }
+          assert all(re.fullmatch('[0-9a-f]{64}', digest)
+                     for digest in source['files'].values())
+          (safe / 'source.json').write_text(json.dumps(source, indent=2) + '\n')
+          (safe / 'collection.json').write_text(json.dumps({
+              'schema': 1, 'phase': 'pre_runtime_build',
+              'failure_class': value['error_class'], 'accepted': False,
+          }, sort_keys=True) + '\n')
+          assert {path.name for path in safe.iterdir()} == {
+              'build-selection.json', 'source.json', 'collection.json'
+          }
           PY
       - name: Run inert witness and harness controls
         run: |
@@ -364,7 +550,7 @@ jobs:
           assert supervisor['child_exit'] == 0 and supervisor['child_reaped'] is True
           PY
       - name: Upload privacy-safe RT3 receipts
-        if: always() && steps.collect.outcome == 'success'
+        if: always() && (steps.collect.outcome == 'success' || steps.build_collect.outcome == 'success')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rt3-hydration-receipts-${{ github.run_id }}

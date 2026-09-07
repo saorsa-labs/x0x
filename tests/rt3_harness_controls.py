@@ -15,6 +15,7 @@ import unittest
 
 
 HARNESS_PATH = Path(__file__).with_name("rt3_harness.py")
+WORKFLOW_PATH = HARNESS_PATH.parent.parent / ".github/workflows/build.yml"
 SPEC = importlib.util.spec_from_file_location("rt3_harness", HARNESS_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError("cannot load RT3 harness")
@@ -23,6 +24,156 @@ SPEC.loader.exec_module(HARNESS)
 
 
 class HarnessControls(unittest.TestCase):
+    @staticmethod
+    def workflow_step_script(name: str, next_name: str) -> str:
+        workflow = WORKFLOW_PATH.read_text()
+        block = workflow.split(f"      - name: {name}\n", 1)[1]
+        block = block.split(f"      - name: {next_name}\n", 1)[0]
+        return textwrap.dedent(block.split("        run: |\n", 1)[1])
+
+    @classmethod
+    def run_inert_build(cls, mode: str, collect_failure: bool = False) -> dict[str, object]:
+        fake_cargo = r'''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args == ['-V']:
+    print('cargo 1.95.0 (inert)')
+    raise SystemExit(0)
+if args and args[0] == 'metadata':
+    print(json.dumps({'packages': [{
+        'id': 'path+file:///inert#x0x@0.41.3',
+        'name': 'x0x', 'version': '0.41.3', 'source': None,
+        'manifest_path': str(Path.cwd() / 'Cargo.toml'),
+    }]}))
+    raise SystemExit(0)
+if not args or args[0] != 'build':
+    raise SystemExit(97)
+if os.environ['FAKE_BUILD_MODE'] == 'build_failure':
+    raise SystemExit(23)
+target = Path(os.environ['CARGO_TARGET_DIR'])
+manifest = str(Path.cwd() / 'Cargo.toml')
+package = 'path+file:///inert#x0x@0.41.3'
+for name in ('x0xd', 'x0x', 'rt3_fixture'):
+    binary = target / 'debug' / name
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(name)
+    binary.chmod(0o700)
+    if name == 'x0x':
+        print(json.dumps({
+            'reason': 'compiler-artifact', 'package_id': package,
+            'target': {'name': 'x0x', 'kind': ['lib']},
+            'executable': None, 'manifest_path': manifest, 'fresh': False,
+        }))
+    print(json.dumps({
+        'reason': 'compiler-artifact', 'package_id': package,
+        'target': {'name': name, 'kind': ['bin']},
+        'executable': str(binary), 'manifest_path': manifest,
+        'fresh': os.environ['FAKE_BUILD_MODE'] == 'fresh_x0x' and name == 'x0x',
+    }))
+'''
+        fake_rustc = "#!/usr/bin/env bash\nprintf '%s\\n' 'rustc 1.95.0 (inert)'\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = Path(temporary)
+            work = runner / "work"
+            root = runner / "root"
+            safe = root / "safe"
+            tools = runner / "tools"
+            for path in (work, root, safe, tools):
+                path.mkdir()
+            lock = HARNESS_PATH.parent.parent / "ci/491-rt3/Cargo.lock.fixture"
+            fixture_files = {
+                "Cargo.toml": b'[package]\nname = "x0x"\nversion = "0.41.3"\n',
+                "src/bin/rt3_fixture.rs": b"inert fixture\n",
+                "tests/rt3_harness.py": b"inert harness\n",
+                "tests/rt3_harness_controls.py": b"inert controls\n",
+                "scripts/ci/isolated-runtime.py": b"inert wrapper\n",
+                "scripts/ci/isolation-witness.py": b"inert witness\n",
+                "ci/491-rt3/Cargo.lock.fixture": lock.read_bytes(),
+            }
+            for name, contents in fixture_files.items():
+                destination = work / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(contents)
+            (work / "Cargo.lock").write_bytes(lock.read_bytes())
+            (root / "source.json").write_text(
+                json.dumps(
+                    {
+                        "head": "a" * 40,
+                        "tree": "b" * 40,
+                        "files": {
+                            name: __import__("hashlib").sha256(contents).hexdigest()
+                            for name, contents in fixture_files.items()
+                        },
+                    }
+                )
+            )
+            (tools / "cargo").write_text(fake_cargo)
+            (tools / "rustc").write_text(fake_rustc)
+            for executable in (tools / "cargo", tools / "rustc"):
+                executable.chmod(0o700)
+            environment = {
+                **os.environ,
+                "PATH": f"{tools}:{os.environ['PATH']}",
+                "RT3_ROOT": str(root),
+                "RT3_SAFE": str(safe),
+                "FAKE_BUILD_MODE": mode,
+            }
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    cls.workflow_step_script(
+                        "Build fresh locked daemon CLI and typed witness",
+                        "Collect pre-runtime build receipts",
+                    ),
+                ],
+                cwd=work,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            selection = json.loads((safe / "build-selection.json").read_text())
+            collection_result = None
+            collection = None
+            if collect_failure:
+                collection_result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        cls.workflow_step_script(
+                            "Collect pre-runtime build receipts",
+                            "Run inert witness and harness controls",
+                        ),
+                    ],
+                    cwd=work,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                )
+                if (safe / "collection.json").is_file():
+                    collection = json.loads((safe / "collection.json").read_text())
+            rows = [
+                json.loads(line)
+                for line in (root / "build.jsonl").read_text().splitlines()
+                if line.startswith("{")
+            ]
+            return {
+                "returncode": result.returncode,
+                "selection": selection,
+                "collection_returncode": (
+                    None if collection_result is None else collection_result.returncode
+                ),
+                "collection": collection,
+                "safe_names": {path.name for path in safe.iterdir()},
+                "raw_names": {path.name for path in root.iterdir()} - {"safe"},
+                "build_record_present": (root / "build.json").is_file(),
+                "x0x_name_rows": sum(
+                    row.get("target", {}).get("name") == "x0x" for row in rows
+                ),
+            }
+
     @staticmethod
     def clean_children() -> list[dict[str, object]]:
         return [
@@ -159,7 +310,7 @@ class HarnessControls(unittest.TestCase):
             self.assertTrue(harness.observations["negative_hydration_state_unchanged"])
 
     def test_missing_outcome_retains_timeout_wrapper_receipts(self) -> None:
-        workflow = (HARNESS_PATH.parent.parent / ".github/workflows/build.yml").read_text()
+        workflow = WORKFLOW_PATH.read_text()
         block = workflow.split("      - name: Collect privacy-safe receipts\n", 1)[1]
         block = block.split("      - name: Enforce semantic acceptance\n", 1)[0]
         script = textwrap.dedent(block.split("        run: |\n", 1)[1])
@@ -242,6 +393,61 @@ class HarnessControls(unittest.TestCase):
             self.assertTrue((safe / "admission.json").is_file())
             self.assertFalse((safe / "outcome.json").exists())
             self.assertFalse((safe / "exit.json").exists())
+
+    def test_build_selection_ignores_same_name_library_row(self) -> None:
+        result = self.run_inert_build("success")
+        selection = result["selection"]
+        self.assertEqual(result["returncode"], 0)
+        self.assertTrue(selection["accepted"])
+        self.assertEqual(selection["stage"], "complete")
+        self.assertEqual(result["x0x_name_rows"], 2)
+        self.assertEqual(selection["binaries"]["x0x"]["candidate_count"], 1)
+        self.assertTrue(selection["binaries"]["x0x"]["fresh_false"])
+        self.assertTrue(selection["binaries"]["x0x"]["manifest_match"])
+        self.assertTrue(selection["source_unchanged"])
+        self.assertTrue(selection["lock_matches"])
+        self.assertTrue(result["build_record_present"])
+        self.assertEqual(result["safe_names"], {"build-selection.json"})
+
+    def test_build_failure_exit_is_retained_without_raw_uploads(self) -> None:
+        result = self.run_inert_build("build_failure", collect_failure=True)
+        selection = result["selection"]
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(selection["status"], 1)
+        self.assertEqual(selection["build_exit"], 23)
+        self.assertEqual(selection["error_class"], "build_failed")
+        self.assertFalse(selection["accepted"])
+        self.assertEqual(result["collection_returncode"], 0)
+        self.assertEqual(
+            result["collection"],
+            {
+                "schema": 1,
+                "phase": "pre_runtime_build",
+                "failure_class": "build_failed",
+                "accepted": False,
+            },
+        )
+        self.assertEqual(
+            result["safe_names"],
+            {"build-selection.json", "source.json", "collection.json"},
+        )
+        self.assertIn("build.jsonl", result["raw_names"])
+        self.assertIn("build.stderr", result["raw_names"])
+        self.assertNotIn("build.jsonl", result["safe_names"])
+        self.assertNotIn("build.stderr", result["safe_names"])
+
+    def test_fresh_binary_row_fails_closed_with_scalar_receipt(self) -> None:
+        result = self.run_inert_build("fresh_x0x", collect_failure=True)
+        selection = result["selection"]
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(selection["build_exit"], 0)
+        self.assertEqual(selection["error_class"], "artifact_freshness")
+        self.assertEqual(selection["binaries"]["x0x"]["candidate_count"], 1)
+        self.assertFalse(selection["binaries"]["x0x"]["fresh_false"])
+        self.assertFalse(selection["accepted"])
+        self.assertEqual(result["collection_returncode"], 0)
+        self.assertEqual(result["collection"]["failure_class"], "artifact_freshness")
+        self.assertFalse(result["collection"]["accepted"])
 
     def test_flat_agent_and_group_shapes(self) -> None:
         group = {
