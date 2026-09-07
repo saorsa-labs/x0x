@@ -6,14 +6,18 @@
 
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
+#[path = "fixture_ownership.rs"]
+mod fixture_ownership;
+use fixture_ownership::{FixtureDirectory, OwnedChild, PortReservations};
+
 /// A single x0xd daemon instance.
 pub struct AgentInstance {
-    process: Child,
+    process: OwnedChild,
     binary: PathBuf,
     config_path: PathBuf,
     /// Instance name (e.g., "alice-12345").
@@ -24,6 +28,9 @@ pub struct AgentInstance {
     pub api_token: String,
     /// Data directory (cleaned up on drop if temp).
     data_dir: PathBuf,
+    api_port: u16,
+    bind_port: u16,
+    directory: FixtureDirectory,
 }
 
 #[allow(dead_code)]
@@ -57,8 +64,10 @@ impl AgentInstance {
     /// [`Self::start`] to create a downtime window during which other
     /// instances can mutate shared state (offline-mutation tests).
     pub fn stop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        if let Err(error) = self.process.stop() {
+            self.directory.preserve();
+            panic!("Failed to stop owned x0xd {}: {error}", self.name);
+        }
     }
 
     /// Start the daemon again after [`Self::stop`] and wait until healthy.
@@ -70,19 +79,25 @@ impl AgentInstance {
     /// The daemon inherits `RUST_LOG` from this process — set it in the test
     /// environment to raise verbosity for post-restart diagnostics.
     pub async fn start(&mut self) {
+        let reservations = self.prepare_start();
         let (stdout, stderr) = match test_log_stdio(&self.name, "restart") {
             Some(pair) => pair,
             None => (Stdio::null(), Stdio::null()),
         };
-        self.process = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .arg("--config")
             .arg(&self.config_path)
             .arg("--name")
             .arg(&self.name)
             .stdout(stdout)
-            .stderr(stderr)
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name));
+            .stderr(stderr);
+        drop(reservations);
+        self.process = OwnedChild::new(
+            command
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name)),
+        );
         self.refresh_runtime_state().await;
     }
     /// Restart the daemon on a FORCED NEW QUIC (bind) port, keeping the same
@@ -120,11 +135,15 @@ impl AgentInstance {
         std::fs::write(&self.config_path, &rebuilt)
             .unwrap_or_else(|e| panic!("rewrite {}: {e}", self.config_path.display()));
 
+        self.bind_port = new_bind;
+        let reservations = self.prepare_start();
+
         let (stdout, stderr) = match test_log_stdio(&self.name, "restart-newport") {
             Some(pair) => pair,
             None => (Stdio::null(), Stdio::null()),
         };
-        self.process = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .arg("--config")
             .arg(&self.config_path)
             .arg("--name")
@@ -134,11 +153,35 @@ impl AgentInstance {
             // solely to the survivor's proactive path.
             .arg("--no-hard-coded-bootstrap")
             .stdout(stdout)
-            .stderr(stderr)
-            .spawn()
-            .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name));
+            .stderr(stderr);
+        drop(reservations);
+        self.process = OwnedChild::new(
+            command
+                .spawn()
+                .unwrap_or_else(|e| panic!("Failed to restart x0xd {}: {e}", self.name)),
+        );
         self.refresh_runtime_state().await;
         new_bind
+    }
+
+    fn prepare_start(&mut self) -> PortReservations {
+        self.process
+            .require_stopped()
+            .unwrap_or_else(|e| panic!("Cannot start x0xd {}: {e}", self.name));
+        self.directory.preserve();
+        // A persistent token alone cannot distinguish a failed restart from a
+        // foreign listener. Require an advertisement produced by this startup.
+        self.directory
+            .clear_api_advertisement()
+            .unwrap_or_else(|e| panic!("clear owned api.port for {}: {e}", self.name));
+        PortReservations::bind(self.api_port, self.bind_port)
+            .unwrap_or_else(|e| panic!("Cannot admit x0xd {}: {e}", self.name))
+    }
+
+    fn require_running(&mut self) {
+        self.process
+            .require_running()
+            .unwrap_or_else(|e| panic!("x0xd {} startup failed: {e}", self.name));
     }
 
     async fn refresh_runtime_state(&mut self) {
@@ -149,14 +192,29 @@ impl AgentInstance {
         // flakiness knife-edge for the first daemon of a run.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         let client = reqwest::Client::new();
+        let mut last_api_advertisement = None;
         loop {
-            if let Ok(resp) = client.get(format!("http://{api_addr}/health")).send().await {
-                if resp.status().is_success() {
-                    break;
+            self.require_running();
+            // Server startup writes api.port only after binding its listener
+            // and loading causal state. This file is private and was cleared
+            // before restart; never contact a health endpoint without it.
+            if self
+                .directory
+                .advertises_api(&api_addr, &mut last_api_advertisement)
+                .unwrap_or_else(|e| panic!("read owned api.port for {}: {e}", self.name))
+            {
+                if let Ok(resp) = client.get(format!("http://{api_addr}/health")).send().await {
+                    self.require_running();
+                    if resp.status().is_success() {
+                        break;
+                    }
                 }
             }
             if tokio::time::Instant::now() > deadline {
-                panic!("x0xd {} did not become healthy within 90s", self.name);
+                panic!(
+                    "x0xd {} did not become healthy within 90s; last owned api.port: {:?}",
+                    self.name, last_api_advertisement
+                );
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -164,10 +222,13 @@ impl AgentInstance {
         let token_file = self.data_dir.join("api-token");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
+            self.require_running();
             if let Ok(token) = std::fs::read_to_string(&token_file) {
                 let token = token.trim().to_string();
                 if !token.is_empty() {
+                    self.require_running();
                     self.api_token = token;
+                    self.directory.allow_cleanup();
                     return;
                 }
             }
@@ -332,8 +393,10 @@ pub struct AgentPair {
 
 impl Drop for AgentInstance {
     fn drop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        if let Err(error) = self.process.stop() {
+            self.directory.preserve();
+            eprintln!("[cluster] could not stop owned x0xd {}: {error}", self.name);
+        }
     }
 }
 
@@ -816,19 +879,11 @@ async fn start_instance_with_env(
     extra_config: &str,
     env: &[(&str, &str)],
 ) -> AgentInstance {
-    let config_dir = std::env::temp_dir().join(format!("x0x-test-{name}"));
-    let _ = std::fs::remove_dir_all(&config_dir);
-    let _ = std::fs::create_dir_all(&config_dir);
-
-    // Kill stale daemons from prior failed runs that may still own these fixed ports.
-    for port in [api_port, bind_port] {
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "lsof -ti tcp:{port} 2>/dev/null | xargs kill -9 2>/dev/null || true"
-            ))
-            .status();
-    }
+    let reservations = PortReservations::bind(api_port, bind_port)
+        .unwrap_or_else(|e| panic!("Cannot admit x0xd {name}: {e}"));
+    let directory = FixtureDirectory::new_in(&std::env::temp_dir())
+        .unwrap_or_else(|e| panic!("create owned fixture directory for {name}: {e}"));
+    let config_dir = directory.path().to_path_buf();
 
     let config_path = config_dir.join("config.toml");
     // NOTE: `[update] enabled = false` is MANDATORY in every test config —
@@ -839,11 +894,13 @@ async fn start_instance_with_env(
         "api_address = \"127.0.0.1:{api_port}\"\n\
          bind_address = \"0.0.0.0:{bind_port}\"\n\
          data_dir = \"{}\"\n\
+         identity_dir = \"{}/identity\"\n\
          log_level = \"warn\"\n\
          {bootstrap}\n\
          {extra_config}\n\
          [update]\n\
          enabled = false\n",
+        config_dir.display(),
         config_dir.display()
     );
     std::fs::write(&config_path, &config_content).expect("write config");
@@ -875,9 +932,14 @@ async fn start_instance_with_env(
     for (key, value) in env {
         command.env(key, value);
     }
-    let process = command
-        .spawn()
-        .unwrap_or_else(|e| panic!("Failed to start x0xd {name}: {e}"));
+    // Reservations cannot be handed to x0xd. Release only at the spawn boundary;
+    // an intervening claimant must make this child fail, never be evicted.
+    drop(reservations);
+    let process = OwnedChild::new(
+        command
+            .spawn()
+            .unwrap_or_else(|e| panic!("Failed to start x0xd {name}: {e}")),
+    );
 
     // Wrap the Child in an AgentInstance immediately so that Drop kills
     // the process if anything below panics (health timeout, token read, etc.).
@@ -891,6 +953,9 @@ async fn start_instance_with_env(
         api_addr: api_addr.clone(),
         api_token: String::new(), // placeholder — filled below
         data_dir: config_dir.clone(),
+        api_port,
+        bind_port,
+        directory,
     };
 
     // Wait for health / token — if this panics, `instance` is dropped,
