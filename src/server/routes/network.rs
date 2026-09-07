@@ -698,6 +698,118 @@ mod participation_diagnostics_tests {
             agent.shutdown().await;
         }
     }
+
+    #[tokio::test]
+    async fn gossip_route_reports_reject_v1_and_receipt_increment() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .with_gossip_config(x0x::gossip::GossipConfig {
+                    relay: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let app = Router::new()
+            .route("/diagnostics/gossip", get(gossip_diagnostics))
+            .with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/diagnostics/gossip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["outer_signature_policy"], "reject_v1");
+        assert_eq!(body["outer_v1_receipts"].as_u64(), Some(0));
+        // Contract: no payload/key material in the diagnostics surface.
+        let dumped = body.to_string();
+        assert!(!dumped.contains("secret"));
+        assert!(!dumped.contains("private_key"));
+
+        // Egress diagnostics from main must remain on the surface (adapt, do not drop).
+        assert!(body["subscribed_topics"].is_array());
+        assert!(body["outbound_by_topic_named"].is_array());
+        assert_eq!(body["egress_budget"]["byte_policy"], "observe_only");
+
+        let topic = "adr014-diag-v1";
+        let topic_id = saorsa_gossip_types::TopicId::from_entity(topic.as_bytes());
+        // Leaf refuses unsubscribed Eager before signature verify; subscribe so
+        // the frame reaches RejectV1 and increments outer_v1_receipts.
+        let _sub = agent.subscribe(topic).await.unwrap();
+        let signing_key = saorsa_gossip_identity::MlDsaKeyPair::generate().unwrap();
+        let header = saorsa_gossip_types::MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic: topic_id,
+            msg_id: [11u8; 32],
+            kind: saorsa_gossip_types::MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes = postcard::to_stdvec(&header).unwrap();
+        let signature = signing_key.sign(&header_bytes).unwrap();
+        let msg = saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: Some(bytes::Bytes::from("diag-v1")),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+        let frame: bytes::Bytes = postcard::to_stdvec(&msg).unwrap().into();
+        agent
+            .handle_gossip_incoming_for_test(saorsa_gossip_types::PeerId::new([13; 32]), frame)
+            .await;
+
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics/gossip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["outer_signature_policy"], "reject_v1");
+        assert_eq!(
+            body["outer_v1_receipts"].as_u64(),
+            Some(1),
+            "valid outer V1 must increment receipt counter via diagnostics"
+        );
+
+        agent.shutdown().await;
+    }
 }
 
 /// GET /diagnostics/transport — transport-layer connection accounting (#368).
