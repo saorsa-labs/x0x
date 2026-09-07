@@ -32,6 +32,7 @@
 //! the daemon crate carries no cpal/device dependency).
 
 use std::f64::consts::TAU;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -49,6 +50,26 @@ const CALL_SECS: usize = 5;
 const FRAMES: usize = CALL_SECS * 50; // 20 ms frames
 const TONE_A_HZ: f64 = 440.0;
 const TONE_B_HZ: f64 = 1200.0;
+const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+async fn wait_for_connection<F, Fut>(timeout: Duration, mut is_connected: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if is_connected().await {
+            return true;
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(CONNECTION_POLL_INTERVAL)).await;
+    }
+}
 
 fn loopback_network_config() -> NetworkConfig {
     NetworkConfig {
@@ -161,15 +182,19 @@ async fn main() {
         .expect("alice connects to bob");
     let bob_peer = ant_quic::PeerId(bob.machine_id().0);
     let alice_peer = ant_quic::PeerId(alice.machine_id().0);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if alice_network.is_connected(&bob_peer).await
-            && bob_network.is_connected(&alice_peer).await
-        {
-            break;
+    let connected = wait_for_connection(Duration::from_secs(10), || {
+        let alice_network = Arc::clone(&alice_network);
+        let bob_network = Arc::clone(&bob_network);
+        async move {
+            alice_network.is_connected(&bob_peer).await
+                && bob_network.is_connected(&alice_peer).await
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await;
+    assert!(
+        connected,
+        "transport connection was not visible from both agents within 10 seconds"
+    );
     let now_secs = now_ms() / 1000;
     alice
         .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr, now_secs))
@@ -353,4 +378,35 @@ async fn main() {
 
     alice.shutdown().await;
     bob.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future;
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_wait_reports_deadline_instead_of_falling_through() {
+        let started = tokio::time::Instant::now();
+        let connected =
+            wait_for_connection(Duration::from_millis(40), || future::ready(false)).await;
+
+        assert!(!connected);
+        assert_eq!(started.elapsed(), Duration::from_millis(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_wait_accepts_bidirectional_success_before_deadline() {
+        let started = tokio::time::Instant::now();
+        let mut polls = 0;
+        let connected = wait_for_connection(Duration::from_secs(10), || {
+            polls += 1;
+            future::ready(polls == 2)
+        })
+        .await;
+
+        assert!(connected);
+        assert_eq!(polls, 2);
+        assert_eq!(started.elapsed(), CONNECTION_POLL_INTERVAL);
+    }
 }
