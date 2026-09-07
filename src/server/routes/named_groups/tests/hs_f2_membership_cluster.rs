@@ -1546,9 +1546,11 @@ async fn drive_joiner_welcome_install(
 /// (`spawn_blob_responder`), and announce traffic never matches a probe
 /// nonce.
 async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()> {
+    let started = std::time::Instant::now();
     let topic = crate::announce_blob::ANNOUNCE_BLOB_TOPIC;
     let mut owner_sub = owner.subscribe(topic).await?;
     let mut joiner_sub = joiner.subscribe(topic).await?;
+    restart_readiness_diag("subscriptions_ready", started);
     await_restart_gossip_ready_with(
         async |probe| Ok(owner.publish(topic, probe).await?),
         async |probe| Ok(joiner.publish(topic, probe).await?),
@@ -1568,6 +1570,13 @@ async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()>
     .await
 }
 
+fn restart_readiness_diag(phase: &str, started: std::time::Instant) {
+    eprintln!(
+        "DIAG hs_f2_restart phase={phase} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+}
+
 // The real-agent wrapper and deterministic delayed-delivery regressions share
 // this entire readiness loop; the tests replace only publication/reception IO.
 async fn await_restart_gossip_ready_with(
@@ -1576,6 +1585,7 @@ async fn await_restart_gossip_ready_with(
     mut owner_receive: impl AsyncFnMut() -> Option<Vec<u8>>,
     mut joiner_receive: impl AsyncFnMut() -> Option<Vec<u8>>,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     use std::sync::atomic::{AtomicU64, Ordering};
     static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     let base = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1589,6 +1599,10 @@ async fn await_restart_gossip_ready_with(
         let mut joiner_probes = std::collections::HashSet::new();
         let mut owner_got = false;
         let mut joiner_got = false;
+        let mut owner_publish_reported = false;
+        let mut joiner_publish_reported = false;
+        let mut owner_remote_reported = false;
+        let mut joiner_remote_reported = false;
         loop {
             let owner_probe =
                 format!("hs-f2/restart-gossip-probe/{base}.{round}/owner").into_bytes();
@@ -1597,7 +1611,15 @@ async fn await_restart_gossip_ready_with(
             owner_probes.insert(owner_probe.clone());
             joiner_probes.insert(joiner_probe.clone());
             owner_publish(owner_probe).await?;
+            if !owner_publish_reported {
+                restart_readiness_diag("owner_probe_published", started);
+                owner_publish_reported = true;
+            }
             joiner_publish(joiner_probe).await?;
+            if !joiner_publish_reported {
+                restart_readiness_diag("joiner_probe_published", started);
+                joiner_publish_reported = true;
+            }
             let quiet = tokio::time::sleep(std::time::Duration::from_secs(1));
             tokio::pin!(quiet);
             while !(owner_got && joiner_got) {
@@ -1609,6 +1631,10 @@ async fn await_restart_gossip_ready_with(
                         };
                         if joiner_probes.contains(&message) {
                             owner_got = true;
+                            if !owner_remote_reported {
+                                restart_readiness_diag("owner_received_remote_probe", started);
+                                owner_remote_reported = true;
+                            }
                         }
                     }
                     message = joiner_receive() => {
@@ -1617,11 +1643,16 @@ async fn await_restart_gossip_ready_with(
                         };
                         if owner_probes.contains(&message) {
                             joiner_got = true;
+                            if !joiner_remote_reported {
+                                restart_readiness_diag("joiner_received_remote_probe", started);
+                                joiner_remote_reported = true;
+                            }
                         }
                     }
                 }
             }
             if owner_got && joiner_got {
+                restart_readiness_diag("ready", started);
                 return Ok(());
             }
             round += 1;
@@ -1629,6 +1660,7 @@ async fn await_restart_gossip_ready_with(
     })
     .await
     .map_err(|_| {
+        restart_readiness_diag("timeout", started);
         anyhow::anyhow!(
             "gossip delivery between the restarted owner and the joiner \
              never became bidirectionally ready within 20 s"
@@ -1880,6 +1912,7 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         .network()
         .expect("restarted owner network")
         .clone();
+    let reconnect_started = std::time::Instant::now();
     owner_net.connect_addr(joiner_addr).await?;
     let reconnect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while std::time::Instant::now() < reconnect_deadline {
@@ -1888,10 +1921,12 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(
-        owner_net.is_connected(&joiner_peer).await,
-        "restarted owner must reconnect to the joiner"
-    );
+    let reconnected = owner_net.is_connected(&joiner_peer).await;
+    if !reconnected {
+        restart_readiness_diag("reconnect_timeout", reconnect_started);
+    }
+    assert!(reconnected, "restarted owner must reconnect to the joiner");
+    restart_readiness_diag("reconnect_established", reconnect_started);
     // Readiness barrier replacing the old fixed 2 s settle: the QUIC
     // reconnect above proves TRANSPORT only — prove gossip pubsub routes
     // in BOTH directions before the one-shot certified announce depends
