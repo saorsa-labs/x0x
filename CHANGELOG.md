@@ -55,11 +55,7 @@ All notable changes to this project will be documented in this file.
   non-Encrypted policy — or a different group binding — is rejected
   instead of silently un-encrypting replicas back onto plaintext paths.
 
-## [v0.41.4] - TBD
-
-> **DRAFT / PREP ONLY** — `Cargo.toml` package version remains **0.41.3** until
-> after the #535 CI fence lands and this branch is rebased. Date TBD at cut.
-> Experimental framing only; not claiming full #504 acceptance.
+## [v0.41.4] - 2026-09-07
 
 Patch candidate: experimental Leaf eager-degree selection + named gossip egress
 meters (#504 slice 1), test-oracle settle for detached eager fanout, and
