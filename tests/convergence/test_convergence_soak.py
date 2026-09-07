@@ -144,25 +144,163 @@ class ModernOnlyPredicateTests(unittest.TestCase):
         self.assertIsNone(
             SOAK.extract_grants_enabled_from_diagnostics_body(body))
 
-    def test_prereq_blocking_incomplete_under_modern_expect_fixed(self):
-        # Mirror main()._prereq_blocking: incomplete_policy blocks modern
+    def test_shared_prereq_gate_is_blocking_incomplete_under_modern_expect_fixed(self):
+        # Call the production helper (not a local copy) so divergence/deletion
+        # of the shared predicate is caught.
+        kw = dict(modern_only=True, expect_fixed=True)
+        self.assertTrue(SOAK.prereq_gate_is_blocking(
+            {"status": SOAK.INCOMPLETE_POLICY}, **kw))
+        self.assertTrue(SOAK.prereq_gate_is_blocking(
+            {"status": "fail"}, **kw))
+        self.assertTrue(SOAK.prereq_gate_is_blocking(
+            {"status": "unsupported"}, **kw))
+        self.assertFalse(SOAK.prereq_gate_is_blocking(
+            {"status": SOAK.NOT_IN_MODERN_PREDICATE}, **kw))
+        self.assertFalse(SOAK.prereq_gate_is_blocking(
+            {"status": "pass"}, **kw))
+
+    def test_summarize_overall_fails_on_incomplete_policy_modern_expect_fixed(self):
+        # summarize OVERALL must share the same blocking as main() exit.
         class Args:
-            modern_only = True
+            nodes = 3
             expect_fixed = True
-        args = Args()
-        def _prereq_blocking(g):
-            st = g.get("status")
-            if args.modern_only and st == SOAK.NOT_IN_MODERN_PREDICATE:
-                return False
-            if args.modern_only and st == SOAK.INCOMPLETE_POLICY:
-                return True
-            return st in ("fail", "unsupported")
-        self.assertTrue(_prereq_blocking(
-            {"status": SOAK.INCOMPLETE_POLICY}))
-        self.assertTrue(_prereq_blocking({"status": "fail"}))
-        self.assertFalse(_prereq_blocking(
-            {"status": SOAK.NOT_IN_MODERN_PREDICATE}))
-        self.assertFalse(_prereq_blocking({"status": "pass"}))
+            modern_only = True
+        runs = [{"pass": True, "phases": {}, "diagnostics_deltas": {}}]
+        gates = [{"name": SOAK.MODERN_POLICY_ADMISSION,
+                  "status": SOAK.INCOMPLETE_POLICY}]
+        text = SOAK.summarize(runs, Args(), prereq_gates=gates)
+        self.assertIn("OVERALL: FAIL", text)
+        self.assertNotIn("OVERALL: PASS", text)
+
+    def test_summarize_overall_pass_when_only_not_in_modern(self):
+        class Args:
+            nodes = 3
+            expect_fixed = True
+            modern_only = True
+        runs = [{"pass": True, "phases": {}, "diagnostics_deltas": {}}]
+        gates = [{"name": "mixed_version_skew_load_bearing",
+                  "status": SOAK.NOT_IN_MODERN_PREDICATE}]
+        text = SOAK.summarize(runs, Args(), prereq_gates=gates)
+        self.assertIn("OVERALL: PASS", text)
+
+    def test_grants_extractor_null_empty_wrong_types_are_none(self):
+        # P2-1: bool(None/0/"") must NOT become False; empty inventory ≠ disabled.
+        cases = [
+            {"legacy_grants_enabled": None},
+            {"legacy_grants_enabled": 0},
+            {"legacy_grants_enabled": ""},
+            {"grants_enabled": None},
+            {"grants_enabled": 0},
+            {"grants_enabled": ""},
+            {"legacy_grants": []},
+            {"legacy_grants": {}},
+            {"migration_grants": []},
+            {"migration_grants": {}},
+            {"migration_grants": None},
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                self.assertIsNone(
+                    SOAK.extract_grants_enabled_from_diagnostics_body(body))
+
+    def test_grants_extractor_classifier_null_empty_do_not_pass(self):
+        # extractor→classifier: malformed evidence must stay incomplete, never PASS.
+        bodies = [
+            {"outer_signature_policy": "reject_v1",
+             "legacy_grants_enabled": None},
+            {"outer_signature_policy": "reject_v1",
+             "legacy_grants_enabled": 0},
+            {"outer_signature_policy": "reject_v1",
+             "legacy_grants_enabled": ""},
+            {"outer_signature_policy": "reject_v1", "legacy_grants": []},
+            {"outer_signature_policy": "reject_v1", "legacy_grants": {}},
+            {"outer_signature_policy": "reject_v1", "migration_grants": []},
+            # enabled-but-empty inventory is not a disabled attestation
+            {"outer_signature_policy": "reject_v1",
+             "legacy_grants": [], "grants_note": "enabled-but-empty"},
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                g_flag = SOAK.extract_grants_enabled_from_diagnostics_body(body)
+                self.assertIsNone(g_flag)
+                gate = SOAK.classify_modern_policy_admission(
+                    "reject_v1", g_flag)
+                self.assertEqual(gate["status"], SOAK.INCOMPLETE_POLICY)
+                self.assertNotEqual(gate["status"], "pass")
+
+    def test_grants_extractor_explicit_false_passes_classifier(self):
+        for key in ("legacy_grants_enabled", "grants_enabled"):
+            with self.subTest(key=key):
+                body = {"outer_signature_policy": "reject_v1", key: False}
+                g_flag = SOAK.extract_grants_enabled_from_diagnostics_body(body)
+                self.assertIs(g_flag, False)
+                gate = SOAK.classify_modern_policy_admission(
+                    "reject_v1", g_flag)
+                self.assertEqual(gate["status"], "pass")
+
+    def test_classifier_requires_grants_enabled_is_false(self):
+        # Identity check: not-True/not-None must not PASS.
+        for bad in (0, "", [], {}, "disabled"):
+            with self.subTest(bad=bad):
+                gate = SOAK.classify_modern_policy_admission("reject_v1", bad)
+                self.assertEqual(gate["status"], SOAK.INCOMPLETE_POLICY)
+
+    def test_probe_reaps_owned_child_on_wait_ready_failure(self):
+        # P2-3: inert Node — start ok, wait_ready raises → exact stop/reap;
+        # outcome remains incomplete_policy. No PID/port scanning.
+        stops = []
+
+        class InertNode:
+            def __init__(self, name, api_port, quic_port, root_dir, x0xd,
+                         log_level):
+                self.name = name
+                self.api_port = api_port
+                self.quic_port = quic_port
+                self.proc = object()
+                self.token = None
+                self._started = False
+
+            def write_config(self, bootstrap_quic_ports):
+                return None
+
+            def start(self):
+                self._started = True
+
+            def wait_ready(self, timeout=60):
+                raise RuntimeError(f"{self.name}: /health not up in {timeout}s")
+
+            def stop(self, grace=8):
+                # Match Node.stop: idempotent once reaped (helper + finally).
+                if self.proc is None:
+                    return
+                stops.append(self)
+                self.proc = None
+
+            @property
+            def running(self):
+                return self.proc is not None
+
+            def req(self, *a, **k):
+                raise AssertionError("req must not be called after wait failure")
+
+        class Args:
+            api_base = 27810
+            quic_base = 27910
+            x0xd = pathlib.Path("x0xd")
+            log_level = "warn"
+
+        real_node = SOAK.Node
+        SOAK.Node = InertNode
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                gate = SOAK.run_modern_policy_admission_gate(
+                    Args(), tmp, nodes=[])
+        finally:
+            SOAK.Node = real_node
+
+        self.assertEqual(gate["status"], SOAK.INCOMPLETE_POLICY)
+        self.assertEqual(len(stops), 1, "owned child must be stop/reaped exactly")
+        self.assertIs(stops[0].proc, None)
 
 
 if __name__ == "__main__":
