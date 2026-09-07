@@ -193,6 +193,18 @@ impl ServerHandle {
         self.cancel.clone()
     }
 
+    /// Return whether the owned supervisor task has completed.
+    ///
+    /// This is a non-blocking lifecycle observation for embedders and tests
+    /// diagnosing a lost control-plane listener. It does not consume the
+    /// handle or alter shutdown behavior.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
     /// Request shutdown, then await run-to-completion.
     pub async fn shutdown_and_wait(self) -> anyhow::Result<()> {
         self.cancel.cancel();

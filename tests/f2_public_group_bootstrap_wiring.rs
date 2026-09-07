@@ -30,6 +30,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
+use std::{error::Error, io};
 
 use serde_json::Value;
 use x0x::server::{serve_with_options, DaemonConfig, ServeOptions, ServerHandle};
@@ -67,15 +68,132 @@ impl Daemon {
     }
 
     async fn post_json(&self, path: &str, body: Value) -> Value {
-        self.client
-            .post(self.url(path))
-            .json(&body)
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("POST {path}: {e}"))
+        let route = safe_route(path);
+        let response = match self.client.post(self.url(path)).json(&body).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let flags = RequestFailureFlags::from_error(&error);
+                let health = self.failure_health_async().await;
+                let supervisor_finished = self.handle.is_finished();
+                let shutdown_requested = self.handle.cancellation_token().is_cancelled();
+                panic!(
+                    "POST {route}: request_failed category={} connect={} timeout={} request={} body={} source={} health={} health_status={} supervisor_finished={} shutdown_requested={}",
+                    flags.category(),
+                    flags.connect,
+                    flags.timeout,
+                    flags.request,
+                    flags.body,
+                    flags.source,
+                    health.category,
+                    health.status.map_or("none".to_string(), |status| status.to_string()),
+                    supervisor_finished,
+                    shutdown_requested,
+                )
+            }
+        };
+        response
             .json()
             .await
-            .unwrap_or_else(|e| panic!("POST {path} json: {e}"))
+            .unwrap_or_else(|e| panic!("POST {route} json decode failed: {e}"))
+    }
+
+    /// Probe only after a POST transport failure. `/health` is auth-exempt and
+    /// this short bound avoids perturbing the successful path or test deadline.
+    async fn failure_health_async(&self) -> HealthProbe {
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            self.client.get(self.url("/health")).send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => HealthProbe {
+                category: "response",
+                status: Some(response.status().as_u16()),
+            },
+            Ok(Err(error)) => HealthProbe {
+                category: RequestFailureFlags::from_error(&error).category(),
+                status: None,
+            },
+            Err(_) => HealthProbe {
+                category: "outer_timeout",
+                status: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RequestFailureFlags {
+    connect: bool,
+    timeout: bool,
+    request: bool,
+    body: bool,
+    source: &'static str,
+}
+
+impl RequestFailureFlags {
+    fn from_error(error: &reqwest::Error) -> Self {
+        Self {
+            connect: error.is_connect(),
+            timeout: error.is_timeout(),
+            request: error.is_request(),
+            body: error.is_body(),
+            source: source_category(error),
+        }
+    }
+
+    fn category(&self) -> &'static str {
+        if self.timeout {
+            "timeout"
+        } else if self.connect {
+            "connect"
+        } else if self.body {
+            "body"
+        } else if self.request {
+            "request"
+        } else {
+            "other"
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HealthProbe {
+    category: &'static str,
+    status: Option<u16>,
+}
+
+fn source_category(error: &reqwest::Error) -> &'static str {
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            return io_kind_category(io_error.kind());
+        }
+        source = cause.source();
+    }
+    "none"
+}
+
+fn io_kind_category(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::ConnectionRefused => "io_connection_refused",
+        io::ErrorKind::ConnectionReset => "io_connection_reset",
+        io::ErrorKind::ConnectionAborted => "io_connection_aborted",
+        io::ErrorKind::TimedOut => "io_timed_out",
+        io::ErrorKind::NotConnected => "io_not_connected",
+        _ => "io_other",
+    }
+}
+
+fn safe_route(path: &str) -> &'static str {
+    match path {
+        "/agents/connect" => "agents_connect",
+        "/groups" => "groups",
+        p if p.starts_with("/groups/") => "groups_subroute",
+        "/agent/card/import" => "agent_card_import",
+        p if p.starts_with("/agent/card") => "agent_card",
+        "/health" => "health",
+        _ => "other",
     }
 }
 
@@ -456,4 +574,45 @@ fn group_entry<'a>(groups: &'a Value, name: &str) -> Option<&'a Value> {
 
 fn group_listing_contains(groups: &Value, name: &str) -> bool {
     group_entry(groups, name).is_some()
+}
+
+#[test]
+fn failure_classification_is_deterministic_and_route_safe() {
+    let timeout = RequestFailureFlags {
+        connect: true,
+        timeout: true,
+        request: true,
+        body: false,
+        source: "io_timed_out",
+    };
+    assert_eq!(timeout.category(), "timeout");
+    assert_eq!(safe_route("/groups/secret-id/members"), "groups_subroute");
+    assert_eq!(safe_route("/agents/connect"), "agents_connect");
+    assert_eq!(safe_route("/unknown/secret-id"), "other");
+}
+
+#[test]
+fn failure_classification_preserves_connect_and_body_categories() {
+    let connect = RequestFailureFlags {
+        connect: true,
+        timeout: false,
+        request: true,
+        body: false,
+        source: "io_connection_refused",
+    };
+    let body = RequestFailureFlags {
+        connect: false,
+        timeout: false,
+        request: false,
+        body: true,
+        source: "none",
+    };
+    assert_eq!(connect.category(), "connect");
+    assert_eq!(connect.source, "io_connection_refused");
+    assert_eq!(body.category(), "body");
+    assert_eq!(
+        io_kind_category(io::ErrorKind::ConnectionReset),
+        "io_connection_reset"
+    );
+    assert_eq!(io_kind_category(io::ErrorKind::Other), "io_other");
 }
