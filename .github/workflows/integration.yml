@@ -31,7 +31,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run guardian tests
-        run: cargo test --all-features --test api_coverage
+        run: |
+          cargo test --all-features --test api_coverage --no-run
+          python3 scripts/ci/isolated-runtime.py cargo test --offline --locked --all-features --test api_coverage
 
   # ── Property tests (every PR, ~2min) ──────────────────────────────────
   proptest:
@@ -69,11 +71,11 @@ jobs:
         # --build-jobs 2: belt-and-braces cap on parallel linking, since each
         # proptest binary links the (large) x0x crate.
         run: |
-          cargo nextest run --all-features --build-jobs 2 --lib \
+          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 2 --lib \
             --test proptest_connectivity --test proptest_crdt --test proptest_files \
             --test proptest_groups --test proptest_kv --test proptest_mls \
             --test proptest_presence --test proptest_trust \
-            -E 'binary(proptest_connectivity) | binary(proptest_crdt) | binary(proptest_files) | binary(proptest_groups) | binary(proptest_kv) | binary(proptest_mls) | binary(proptest_presence) | binary(proptest_trust) | test(/^proptest_/) | test(/proptest/)'
+            -- -E 'binary(proptest_connectivity) | binary(proptest_crdt) | binary(proptest_files) | binary(proptest_groups) | binary(proptest_kv) | binary(proptest_mls) | binary(proptest_presence) | binary(proptest_trust) | test(/^proptest_/) | test(/proptest/)'
 
   # ── Integration tests — split into parallel jobs (issue #197) ──────────
   #    The old monolithic `integration` job ran ~10 suites sequentially
@@ -96,6 +98,8 @@ jobs:
     name: Integration (core)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
     steps:
       - uses: actions/checkout@v5
         with:
@@ -111,9 +115,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: Run daemon API integration tests
-        run: cargo nextest run --all-features --test daemon_api_integration -- --ignored
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test daemon_api_integration -- -- --ignored
       - name: Run named group D4 signed commit integration tests
-        run: cargo nextest run --all-features --test named_group_d4_apply -- --ignored
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_d4_apply -- -- --ignored
 
   # Groups: the heavy named-group daemon suite (28 daemon-backed tests),
   # isolated on its own runner so it cannot stack on core's cold build.
@@ -123,6 +127,8 @@ jobs:
     name: Integration (groups)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
     steps:
       - uses: actions/checkout@v5
         with:
@@ -138,13 +144,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: Run named group integration tests
-        run: cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_integration -- --run-ignored ignored-only
 
   # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
   integration-net:
     name: Integration (net)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
     steps:
       - uses: actions/checkout@v5
         with:
@@ -160,13 +168,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: Run GUI smoke tests
-        run: cargo nextest run --all-features --test gui_smoke
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test gui_smoke --
       - name: Run WebSocket tests
-        run: cargo nextest run --all-features --test ws_integration -- --ignored
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test ws_integration -- -- --ignored
       - name: Run KvStore first-join bootstrap tests (issue 96)
-        run: cargo nextest run --all-features --test kv_first_join_bootstrap --test-threads 1 -- --ignored
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test kv_first_join_bootstrap -- --test-threads 1 -- --ignored
       - name: Run local-topic routing tests (issue 89)
-        run: cargo nextest run --all-features --test local_topics --test-threads 1 -- --ignored
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test local_topics -- --test-threads 1 -- --ignored
 
   # ── De-flaked timing suites moved off the PR path (issue #197).
   #    These are convergence/jitter-prone budgets (the join-metadata suite
@@ -179,6 +187,8 @@ jobs:
     name: Integration Timing Suites (weekly)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1800
     if: github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v5
@@ -197,17 +207,19 @@ jobs:
       - name: Build release binaries (shared across suites)
         run: cargo build --release --bin x0xd --bin x0x
       - name: Run peer-lifecycle daemon tests (de-flaked, ignored-only)
-        run: cargo nextest run --all-features --test peer_lifecycle_integration --run-ignored ignored-only
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test peer_lifecycle_integration -- --run-ignored ignored-only
       - name: Run x0x_0041 reissue timing test (de-flaked, ignored-only)
-        run: cargo nextest run --all-features --test x0x_0041_prefer_newest_test --run-ignored ignored-only
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test x0x_0041_prefer_newest_test -- --run-ignored ignored-only
       - name: Run named-group join-metadata convergence tests (de-flaked, ignored-only)
-        run: cargo nextest run --all-features --test named_group_join_metadata_event --run-ignored ignored-only
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_join_metadata_event -- --run-ignored ignored-only
 
   # ── Soak test (weekly, ~90min) ────────────────────────────────────────
   soak:
     name: Soak Test
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 5400
     if: github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v5
@@ -226,7 +238,7 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --bin x0xd
       - name: Run 1-hour soak
-        run: bash tests/soak/run_soak.sh --duration 1h
+        run: python3 scripts/ci/isolated-runtime.py bash tests/soak/run_soak.sh --duration 1h
       - name: Upload soak results
         if: always()
         uses: actions/upload-artifact@v5
