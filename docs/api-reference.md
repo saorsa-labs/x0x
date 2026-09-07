@@ -1878,7 +1878,7 @@ structured push.
 | Stream | `event:` name | `data:` shape |
 |---|---|---|
 | `GET /events` | `message` | outer `{"type":"message","data":{subscription_id, topic, payload, sender?, verified, trust_level?}}` — only for active REST `/subscribe` subscriptions |
-| `GET /events` | `file:offer` / `file:complete` | outer `{"type":"file:offer"|"file:complete","data":{...}}`; offer data has `transfer_id`, `filename`, `size`, `sender`, while complete data has `transfer_id`, `filename`, `sha256`, `path` |
+| `GET /events` | `file:offer` / `file:complete` | outer `{"type":"file:offer"\|"file:complete","data":{...}}`; offer data has `transfer_id`, `filename`, `size`, `sender`, while complete data has `transfer_id`, `filename`, `sha256`, `path` |
 | `GET /presence/events` | `presence` | `{"event":"online","agent_id","reachable"}` / `{"event":"offline","agent_id"}` |
 | `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` attempts to replay `history_direct_message` rows then emits `live` `{}` even when history is unavailable or its query fails; 15 s keepalive is a `ping` comment |
 | `GET /peers/events` | `peer-lifecycle` | `{"peer_id","event","at_ms"}` — `event` is the Debug text of the transition (`Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`); treat as open string |
