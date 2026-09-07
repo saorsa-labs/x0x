@@ -699,7 +699,6 @@ impl PubSubManager {
         })
     }
 
-
     /// Outer saorsa-gossip signature policy for `GET /diagnostics/gossip`.
     ///
     /// Explicit string mapping (not `Debug`) so operators and harnesses can
