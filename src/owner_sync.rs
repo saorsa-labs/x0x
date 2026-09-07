@@ -1441,7 +1441,7 @@ impl OwnerSyncStore {
     /// A caller that must ACT on the canonical answer — `POST /home/seat` is
     /// the only one today — acquires this before resolving the canonical
     /// Home and holds it until its durable side effect has landed. See
-    /// [`OwnerSyncStore::canonical_home_gate`] for the linearization
+    /// the doc comment on `canonical_home_gate` for the linearization
     /// statement and the lock order this participates in.
     ///
     /// This is not a substitute for reading the register: it makes the read
