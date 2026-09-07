@@ -103,7 +103,9 @@ activate KvStoreSync or legacy compatibility. Older application receivers
 need a paired patch and audit. Authentic stock-binary gates remain required;
 where stock cannot consume V3, record the failure/hold without substituting a
 patched binary or weakening the historical predicates. Registry gossip
-`0.5.75` predates #48 despite the same workspace version. See the
+**0.5.76** now contains #48/`SignedKvTopic` and current x0x pins 0.5.76.
+Registry gossip `0.5.75` predates #48 despite the earlier workspace version —
+never treat 0.5.75 as #48 adoption. See the
 [dependency strategy and gate ledger](../legacy-compat.md).
 
 ## Validation
@@ -114,17 +116,21 @@ production publication verified by gossip's crypto API, both-direction
 author mismatch, terminal-payload tampering, size/shape bounds, default V2
 publication, and signing/local-topic refusal. Crypto API verification and
 canonical preimage fixtures are not execution of #48's `SignedKvTopic` verifier;
-that integration is still blocked on G4.
+that facility integration remains an OPEN facility-G4 item (publication
+prerequisite MET on 0.5.76; not a modern-release blocker per ADR-014 /
+legacy-compat.md).
 Run the required ordered Rust gates on the exact pushed tree.
 
 G0 is MET. G1–G8 are OPEN: published ant-quic provenance; x0x provenance and
-guarded egress; policy/registration and receive/apply audit; complete dependency
-bump; real-daemon efficiency/fail-closed gates; both authentic mixed-version
-phases with original deadlines; unchanged ten-run convergence; David's explicit
-enablement decision. Local tests close none of these acceptance gates.
+guarded egress; policy/registration and receive/apply audit; facility G4
+remaining verifier/roster/tree work (0.5.76 publication MET); real-daemon
+efficiency/fail-closed gates; both authentic mixed-version phases with original
+deadlines; unchanged ten-run convergence; David's explicit enablement
+decision. Local tests close none of these acceptance gates.
 
-x0x #515 remains draft. This ADR authorizes no merge, undraft, tag, daemon
-operation, deploy or product work on #530, #531 or #274.
+Undraft, tag, deploy, and live-daemon work follow modern-release (ADR-014)
+owners separately. This ADR still authorizes no facility enablement, no G8,
+and no #530/#531/#274 product work. Do not renew G4 as a global #515 block.
 
 ## Notes for AI-assisted work
 
