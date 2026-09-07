@@ -104,17 +104,21 @@ case "$OS-$ARCH" in
   linux-aarch64) PLATFORM="linux-arm64-gnu" ;;
   darwin-arm64)  PLATFORM="macos-arm64" ;;
   darwin-x86_64) PLATFORM="macos-x64" ;;
+  *) printf 'Unsupported platform: %s-%s\n' "$OS" "$ARCH" >&2; exit 1 ;;
 esac
 curl -sfL "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-${PLATFORM}.tar.gz" | tar xz
+mkdir -p ~/.local/bin
 cp "x0x-${PLATFORM}/x0xd" "x0x-${PLATFORM}/x0x" ~/.local/bin/ && chmod +x ~/.local/bin/x0xd ~/.local/bin/x0x
 ```
 
-**Option B: install script** — download, review, then run (adds GPG verification; `--start` / `--autostart` are opt-in flags):
+**Option B: shell installer (installs and starts the daemon)** — download and review the script before running it. It downloads over HTTPS but does **not** verify GPG signatures. It stops the selected existing instance and starts the installed daemon automatically; `--autostart` additionally enables startup on boot. There is no `--start` opt-in. Run this option only when your human has authorized the install and daemon startup. To install the binaries before starting a daemon, use Option A and follow §1.2 when authorized.
 
 ```bash
 curl -sfLO https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh
 less install.sh && sh install.sh
 ```
+
+The separate [`scripts/install.py`](https://github.com/saorsa-labs/x0x/blob/main/scripts/install.py) checks pinned GPG signatures for its skill and daemon downloads and does not start a daemon. Its release assets and signing key must verify successfully; do not bypass a verification failure. This is a different installer, not a verification feature of `install.sh`.
 
 **Option C: from source** — `cargo build --release --bin x0xd --bin x0x` (requires Rust).
 **Option D: as a Rust library** — `cargo add x0x` (no daemon needed).
