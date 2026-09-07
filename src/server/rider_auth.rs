@@ -242,6 +242,36 @@ pub(super) struct RiderTokenStore {
     records: BTreeMap<u64, RiderTokenRecord>,
 }
 
+/// STRICT typed probe of the persisted rider-token file, returning every
+/// granted group id (#449 P4 review r3).
+///
+/// [`RiderTokenStore::load`] flattens read AND schema failures to an empty
+/// store — correct for authentication, which fails closed by granting
+/// nothing. An observation gate needs the distinction: an unreadable or
+/// wrong-schema file is not proof that the durable grant set is empty. A
+/// generic-JSON probe would not do, since `null` and a wrong-typed `tokens`
+/// field are valid JSON this schema rejects.
+///
+/// `Ok(None)` = file absent · `Ok(Some(ids))` = parsed and schema-valid ·
+/// `Err(why)` = present but unreadable or wrong schema.
+pub(super) async fn probe_granted_groups_strict(
+    path: &std::path::Path,
+) -> Result<Option<Vec<String>>, String> {
+    match tokio::fs::read(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+        Ok(bytes) => match serde_json::from_slice::<RiderTokenFile>(&bytes) {
+            Ok(file) => Ok(Some(
+                file.tokens
+                    .into_values()
+                    .flat_map(|record| record.groups)
+                    .collect(),
+            )),
+            Err(e) => Err(e.to_string()),
+        },
+    }
+}
+
 impl RiderTokenStore {
     /// Load the store from `path` (a missing file is an empty store; a
     /// corrupt file is logged and treated as empty — rider tokens fail

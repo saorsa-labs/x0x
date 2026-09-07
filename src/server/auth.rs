@@ -309,6 +309,7 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/shutdown"
                     | "/sync/devices/enroll"
                     | "/home/rename"
+                    | "/home/seat"
                     | "/upgrade/apply"
             ) || is_two_segment_action(path, "delegate")
         }
@@ -654,6 +655,7 @@ mod tests {
             ),
             (Method::POST, "/groups/some-group/delegate"),
             (Method::POST, "/home/rename"),
+            (Method::POST, "/home/seat"),
             (Method::POST, "/upgrade/apply"),
         ] {
             // The route is classified durable-owner…

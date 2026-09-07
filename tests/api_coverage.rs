@@ -81,6 +81,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Put, "/profile", daemon_api_profile_round_trip),
     covered!(Get, "/home", home_routes_wired),
     covered!(Post, "/home/rename", home_rename_round_trips),
+    covered!(
+        Post,
+        "/home/seat",
+        home_seat_mints_addressed_invite_for_named_device
+    ),
     covered!(Get, "/sync/devices", sync_routes_wired),
     covered!(Post, "/sync/devices/enroll", sync_routes_wired),
     covered!(Delete, "/sync/devices/:machine_id", sync_routes_wired),

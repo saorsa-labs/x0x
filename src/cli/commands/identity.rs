@@ -300,6 +300,14 @@ pub async fn home_rename(client: &DaemonClient, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `x0x home seat <AGENT_ID>` — POST /home/seat (#449 owner-driven adoption).
+pub async fn home_seat(client: &DaemonClient, agent_id: &str) -> Result<()> {
+    let body = serde_json::json!({ "agent_id": agent_id });
+    let resp = client.post("/home/seat", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x owner agents issue` — POST /owner/agents/issue (ADR-0039).
 pub async fn owner_agents_issue(
     client: &DaemonClient,

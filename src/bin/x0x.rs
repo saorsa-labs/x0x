@@ -476,6 +476,13 @@ enum HomeSub {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Seat another of the owner's devices in this Home (#449): mints an
+    /// invite addressed to that agent. Run on the canonical-Home device.
+    Seat {
+        /// Agent id (64 lowercase hex) of the device to seat.
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+    },
 }
 
 /// `x0x owner` subcommands (ADR-0036 registry, ADR-0039 harness boundary).
@@ -1964,6 +1971,9 @@ async fn run(
         Commands::Home { sub } => match sub {
             None => commands::identity::home(&client).await,
             Some(HomeSub::Rename { name }) => commands::identity::home_rename(&client, &name).await,
+            Some(HomeSub::Seat { agent_id }) => {
+                commands::identity::home_seat(&client, &agent_id).await
+            }
         },
         Commands::Owner { sub } => match sub {
             None => commands::identity::owner_agents(&client).await,

@@ -782,6 +782,39 @@ pub struct OwnerSyncStore {
     /// Test injection: make the next durable writes fail AFTER the rename
     /// (simulates a post-rename fsync failure). Never set in production.
     fail_after_rename: std::sync::atomic::AtomicBool,
+    /// #449 r3 P2: serializes canonical-Home ADMISSION against readers who
+    /// must act on the canonical answer they got.
+    ///
+    /// A seat mint is linearized at the moment it acquires the gate; a
+    /// canonical pointer accepted after that waits until the mint's durable
+    /// persistence completes; a pointer accepted before it makes the seat
+    /// refuse 409.
+    ///
+    /// Without it, `POST /home/seat` could resolve canonical A, await the
+    /// per-group membership lock, and durably persist an addressed invite
+    /// into A after the local register had already accepted B — offering a
+    /// seat in the LOSING Home. A pre-await recheck cannot close that: the
+    /// mint transaction itself awaits, so the window reopens inside it.
+    ///
+    /// Every writer that can change the `(HomePointer, HOME_POINTER_KEY)`
+    /// register takes `.write()` for the whole of its records mutation plus
+    /// persist: [`Self::commit_batch`] (and therefore [`Self::merge_record`],
+    /// which wraps it), [`Self::mint`], and
+    /// [`Self::records_insert_for_testing`]. Writes that touch no
+    /// `HomePointer` record skip the gate, so ordinary name and journal sync
+    /// is never serialized behind a seat.
+    ///
+    /// **Lock order, never to be violated.** Readers:
+    /// `canonical_home_gate` → per-group membership lock → `named_groups`
+    /// and persistence. Writers: `canonical_home_gate` → `records`. The two
+    /// cannot cycle because `commit_batch`, `mint` and `apply_record` never
+    /// take a membership lock or `named_groups` (`apply_record`'s
+    /// `HomePointer` arm is a no-op and its names arm spawns), and the
+    /// reader never touches `records` while holding a membership lock.
+    ///
+    /// This is a LOCAL linearization boundary only. It claims nothing about
+    /// cross-device election ordering.
+    canonical_home_gate: tokio::sync::RwLock<()>,
 }
 
 /// Per-device sync status surfaced by `GET /sync/devices`.
@@ -849,6 +882,7 @@ impl OwnerSyncStore {
             generation_tx,
             poisoned: std::sync::Mutex::new(None),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
+            canonical_home_gate: tokio::sync::RwLock::new(()),
         })
     }
 
@@ -1183,6 +1217,15 @@ impl OwnerSyncStore {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
+        // #449 r3 P2: an inbound batch that can change the canonical Home
+        // register waits behind any in-flight seat mint, and blocks the next
+        // one until this batch is durable. Batches that touch no HomePointer
+        // record skip the gate entirely (lock order: gate → records).
+        let _canonical_gate = if batch.iter().any(|r| r.kind == SyncKind::HomePointer) {
+            Some(self.canonical_home_gate.write().await)
+        } else {
+            None
+        };
         let mut records = self.records.write().await;
         // (kind, key) → the value held BEFORE this batch first touched it.
         let mut touched: BTreeMap<(SyncKind, String), Option<VersionedRecord>> = BTreeMap::new();
@@ -1343,6 +1386,14 @@ impl OwnerSyncStore {
             )));
         }
         let now_ms = now_unix_ms();
+        // #449 r3 P2: the LOCAL publisher of a canonical Home pointer is
+        // fenced on the same gate as inbound commits (lock order: gate →
+        // records). Other kinds are unaffected.
+        let _canonical_gate = if kind == SyncKind::HomePointer {
+            Some(self.canonical_home_gate.write().await)
+        } else {
+            None
+        };
         let mut records = self.records.write().await;
         let stored = records.get(&(kind, key.to_string()));
         if stored.is_some_and(|r| r.value == *desired) {
@@ -1383,6 +1434,20 @@ impl OwnerSyncStore {
                 Err(e)
             }
         }
+    }
+
+    /// Hold the canonical-Home admission gate for reading (#449 r3 P2).
+    ///
+    /// A caller that must ACT on the canonical answer — `POST /home/seat` is
+    /// the only one today — acquires this before resolving the canonical
+    /// Home and holds it until its durable side effect has landed. See
+    /// the doc comment on `canonical_home_gate` for the linearization
+    /// statement and the lock order this participates in.
+    ///
+    /// This is not a substitute for reading the register: it makes the read
+    /// and the act that follows it one unit, nothing more.
+    pub async fn canonical_home_gate_read(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.canonical_home_gate.read().await
     }
 
     /// Full record snapshot (winners only), for surfaces and sessions.
@@ -1486,6 +1551,14 @@ impl OwnerSyncStore {
         if self.poison_refusal().is_some() {
             return; // test helper respects poison too
         }
+        // #449 r3 P2: the unverified test writer participates in the gate
+        // too, so a test cannot accidentally prove a fence that production
+        // writers honour but this back door bypasses.
+        let _canonical_gate = if record.kind == SyncKind::HomePointer {
+            Some(self.canonical_home_gate.write().await)
+        } else {
+            None
+        };
         let mut records = self.records.write().await;
         records.insert((record.kind, record.key.clone()), record);
         let _ = self.persist_records(&records).await;

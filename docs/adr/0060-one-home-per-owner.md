@@ -126,6 +126,39 @@ Consequently, adoption, retirement and any device-vs-rider Home eligibility
 rule are **out of scope for this ADR** and must be decided explicitly — with
 ADR-0039 reconciled rather than bypassed — before implementation.
 
+### Adoption eligibility — decided 2026-09-07 (David Irvine)
+
+Recorded here rather than in a new ADR because it *resolves* the deferral
+above without changing this ADR's decision, and because ADR numbers are
+centrally allocated. Analysis: `docs/design/449-adoption-eligibility-options.md`.
+
+**Adoption is owner-driven, not inferred.** The owner explicitly seats a device
+by running a command on the device that holds the canonical Home, naming the
+joiner; that device mints an ADDRESSED v4 invite (`intended_joiner`) through the
+existing invite authority, and the joiner uses the existing
+`x0x group join --home` path with the expected owner pinned. This needs **no new
+signed Tier-1 state, no protocol version change, and no amendment to
+ADR-0039** — Home eligibility stays mode-agnostic and rider scope stays
+deny-by-default, because a human decides per agent rather than a rule deciding
+per class. It therefore cannot reproduce any of the three defects above.
+
+**Explicitly rejected:** replicating hosting mode in signed state. The signal
+does exist at the issuing daemon (`routes/owner.rs:76,109`) and is lost only in
+transit (`SyncValue::IssuanceJournal` carries no mode; `apply_journal_line`
+materialises every synced line as `Acp`), but any rule that acts on it would
+deny riders a seat — an amendment to Accepted ADR-0039 acquired as a side
+effect of a bug fix. If ever wanted, that is its own ADR.
+
+**Deferred, not rejected:** binding the joiner's agent id into the existing
+owner-key possession proof in the sync handshake. It is the only *automatic*
+signal a rider structurally cannot produce, but it requires a protocol version
+bump behind a strict-equality gate. It rides along only if such a bump is taken
+for another reason.
+
+**What this does not decide:** retirement (ADR-0065 stays read-only
+inventory), any multi-device convergence claim, or closure of #449, which
+requires the seating command shipped, reviewed and runtime-accepted.
+
 ## Consequences
 
 ### Positive
@@ -180,6 +213,23 @@ ADR-0039 reconciled rather than bypassed — before implementation.
   the exception must not widen into "newest wins".
 - A daemon with no `user.key` provisions no Home and mints no records.
 - `SyncKind::ALL.len() == 4` — the Tier-1 tripwire remains untripped.
+- **Retired-pointer lifecycle across a DISK RELOAD** — covered by
+  `a_retired_pointer_reloaded_from_disk_does_not_suppress_replacement`: the
+  state is dropped and rebuilt from the same data dir, so the roster and the
+  owner-sync record store re-read from disk, and the persisted pointer to the
+  retired Home must not suppress a replacement.
+- **Single-device Home identity across a genuine PROCESS restart — VALIDATED
+  at runtime.** GitHub Actions run `34068244844` (ubuntu-24.04, commit
+  `cad5e73f563abe5d749e1d673984546e896ff41e`), in a loopback-only
+  network/PID/mount namespace: a real `x0xd` was started, observed, terminated,
+  confirmed exited AND reaped, then a NEW process was started on the same data
+  root. Distinct PIDs 27 -> 36; the same Home resolved on both sides, still
+  `state: local`, with the primary agent the local agent, the local agent a
+  member, and the Home present in the live group inventory whose identity set
+  was unchanged. A contrast fixture on a distinct root with a distinct owner
+  produced a DIFFERENT Home, so the equality assertion had discriminating
+  power. 47/47 checks true. Evidence:
+  `review-artifacts/claude-449-runtime-run3-receipt.md`.
 - **Not yet validated:** full distributed convergence across independent
-  record stores, and the retired-pointer lifecycle across a real process
-  restart. The election tests use a single in-memory register.
+  record stores — the election tests use a single in-memory register, and the
+  run above is a SINGLE-DEVICE restart only.

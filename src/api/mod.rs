@@ -449,6 +449,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
     },
     EndpointDef {
+        method: Method::Post,
+        path: "/home/seat",
+        cli_name: "home seat",
+        description: "Mint an addressed Home invite seating another of the owner's devices (#449)",
+        category: "groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID")]),
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/owner/agents",
         cli_name: "owner agents",

@@ -1058,6 +1058,15 @@ pub async fn serve_with_options(
     // instead of duplicated; best-effort — never fails startup.
     routes::home::provision_home(&state).await;
 
+    // #449 P4: automatic retirement of duplicate Homes is DELIBERATELY NOT
+    // wired here. Independent review found this call site ran before
+    // `crdt_subscriptions::load`, so a duplicate carrying a durable
+    // `x0x.group.<id>.symphony.*` manifest entry could pass an "empty" probe
+    // and be terminally withdrawn before its own evidence was loaded — and
+    // the emptiness proof is not held across the withdrawal in any case.
+    // Duplicates are reported read-only by `GET /home` until a proven
+    // retirement fence exists. See docs/design/449-p4-retirement-fence.md.
+
     // ADR 0028: post-restore queue drain — any queued approvals whose
     // predecessors arrived during downtime can now be drained (Kimi blocker 9).
     {
@@ -1744,6 +1753,7 @@ pub async fn serve_with_options(
         .route("/profile", get(get_profile).put(update_profile))
         .route("/home", get(routes::home::get_home))
         .route("/home/rename", post(routes::home::rename_home))
+        .route("/home/seat", post(routes::home::seat_home))
         .route("/owner/agents", get(owner_agents))
         .route("/owner/agents/issue", post(owner_agents_issue))
         .route("/owner/agents/:id", delete(owner_agents_revoke))
