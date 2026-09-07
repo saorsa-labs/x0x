@@ -5861,6 +5861,23 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_config_with_provenance(to, payload, config)
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// #461: provenance variant for the direct-send HTTP route — identical
+    /// behavior to the public method INCLUDING the ADR-0023 §4 outbound
+    /// history wiring (this is the single common path; the public method
+    /// only maps away the ingress), plus the observed ingress of the
+    /// winning authenticated durable ACK (`None` when unstamped). The public
+    /// struct and every public signature are unchanged.
+    pub(crate) async fn send_direct_with_config_with_provenance(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
         // history wiring point. Classify before the send so the payload is
@@ -5880,20 +5897,7 @@ impl Agent {
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
         }
-        result.map(|(receipt, _ingress)| receipt)
-    }
-    /// #461: provenance variant for the direct-send HTTP route — same
-    /// behavior and history wiring, plus the observed ingress of the
-    /// winning authenticated durable ACK (`None` when unstamped). The
-    /// public struct and every public signature are unchanged.
-    pub(crate) async fn send_direct_with_config_with_provenance(
-        &self,
-        to: &identity::AgentId,
-        payload: Vec<u8>,
-        config: dm::DmSendConfig,
-    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
-        self.send_direct_with_config_inner_with_provenance(to, payload, config)
-            .await
+        result
     }
 
     /// Record a durable outbound DM row after a successful send (ADR-0023).
@@ -18170,6 +18174,71 @@ mod tests {
             CapabilityRefreshRegistration::Unavailable
         ));
         assert_eq!(registry.len(), 0);
+    }
+
+    /// #461 regression (b8a9e2a HOLD): the provenance entry used by the
+    /// REST /direct/send route must carry the SAME ADR-0023 outbound
+    /// history wiring as the public method — an offline agent self-DM
+    /// through `send_direct_with_config_with_provenance` must leave an
+    /// Outbound row in its history store. No sockets, no daemon: the real
+    /// loopback send path with a real history DB.
+    #[tokio::test]
+    async fn provenance_entry_records_outbound_history_on_success() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db_path = dir.path().join("history.db");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_history(history::HistoryConfig {
+                enabled: true,
+                db_path: Some(db_path.clone()),
+                ..history::HistoryConfig::default()
+            })
+            .build()
+            .await
+            .expect("agent with history");
+        let self_id = agent.agent_id();
+        let payload = b"provenance-history-regression".to_vec();
+
+        let (receipt, ingress) = agent
+            .send_direct_with_config_with_provenance(
+                &self_id,
+                payload.clone(),
+                dm::DmSendConfig::default(),
+            )
+            .await
+            .expect("self-DM via the provenance entry");
+        assert_eq!(receipt.path, dm::DmPath::Loopback);
+        assert_eq!(ingress, None, "loopback self-DM observes no ACK ingress");
+
+        // The outbound writer is asynchronous — poll through the agent's OWN
+        // store handle (a second connection cannot take the live writer's
+        // SQLite locks; the daemon-kill pattern only opens post-mortem).
+        let query = history::HistoryQuery {
+            scope: Some(history::Scope::Dm(hex::encode(self_id.as_bytes()))),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows = agent
+                .history_handle
+                .as_ref()
+                .expect("history handle")
+                .store()
+                .query(&query)
+                .expect("query history");
+            if rows.iter().any(|r| {
+                r.record.payload == payload && r.record.direction == history::Direction::Outbound
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provenance entry must record the outbound history row (b8a9e2a regression)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     #[tokio::test]

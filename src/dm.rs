@@ -885,8 +885,11 @@ impl DmLogicalId {
 
 // ─── Receipt and caller-configurable send behaviour ────────────────────────
 
-/// Result of a successful `send_direct`. `path` lets callers observe which
-/// transport actually delivered.
+/// Result of a successful `send_direct`. `path` is the SEND STRATEGY the
+/// sender chose (loopback / gossip inbox / raw-QUIC lane), NOT proof of the
+/// transport that actually delivered a durable ACK — for the observed ACK
+/// ingress of durable sends, see the #461 provenance exposed by the
+/// direct-send route (absent when unknown).
 #[derive(Debug, Clone)]
 pub struct DmReceipt {
     pub request_id: [u8; 16],
@@ -895,7 +898,7 @@ pub struct DmReceipt {
     pub path: DmPath,
 }
 
-/// Which transport delivered the DM.
+/// The send strategy the sender chose for the DM (not delivery proof).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmPath {
     /// Local loopback path for messages addressed to this same agent.
