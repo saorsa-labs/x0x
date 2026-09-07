@@ -201,8 +201,10 @@ convergence-release:
 # `convergence-release` unchanged). Fail-closed if X0XD_LEGACY_BINARY is set
 # (stock-in-modern-predicate refused). Builds x0xd + x0xd-forge-injector, then
 # runs soak --runs 10 --expect-fixed --modern-only (mixed-version labeled
-# not_in_modern_predicate; never PASS). RejectV1 diagnostics assert is TODO
-# until #546 lands — do not fake 10/10 here.
+# not_in_modern_predicate; never PASS). modern_policy_admission fails closed
+# until #546 diagnostics prove outer_signature_policy=reject_v1 and legacy
+# grants disabled on the freeze tip (incomplete_policy/fail both block).
+# Do not fake 10/10 here.
 convergence-release-modern:
     @if [ -n "${X0XD_LEGACY_BINARY:-}" ]; then echo "REFUSING convergence-release-modern: X0XD_LEGACY_BINARY must be unset (ADR-014 fail-closed)"; exit 2; fi
     cargo build --release --bin x0xd --bin x0xd-forge-injector

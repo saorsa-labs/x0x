@@ -434,6 +434,8 @@ MODERN_EXCLUDED_GATE_NAMES = (
     "mixed_version_skew_degraded",
 )
 NOT_IN_MODERN_PREDICATE = "not_in_modern_predicate"
+INCOMPLETE_POLICY = "incomplete_policy"
+MODERN_POLICY_ADMISSION = "modern_policy_admission"
 
 
 
@@ -2763,6 +2765,172 @@ def classify_prereq_gates_for_modern(gates):
     return out
 
 
+def classify_modern_policy_admission(policy, grants_enabled):
+    """Classify live or fixture policy readback for modern admission.
+
+    PASS only when policy is reject_v1 AND grants_enabled is False.
+    None policy → incomplete_policy (missing/unreadable).
+    accept_v1 or unexpected → fail.
+    grants_enabled True → fail.
+    grants_enabled None with reject_v1 → incomplete_policy (cannot prove
+    grants disabled — do not invent a PASS path).
+    """
+    base = {"name": MODERN_POLICY_ADMISSION, "modern_only": True}
+    if policy is None:
+        return {
+            **base,
+            "status": INCOMPLETE_POLICY,
+            "reason": "missing_or_unreadable_outer_signature_policy",
+            "outer_signature_policy": None,
+            "grants_enabled": grants_enabled,
+        }
+    p = str(policy).strip().lower().replace("-", "_")
+    if p in ("accept_v1",):
+        return {
+            **base,
+            "status": "fail",
+            "reason": "AcceptV1_not_allowed",
+            "outer_signature_policy": policy,
+            "grants_enabled": grants_enabled,
+        }
+    if grants_enabled is True:
+        return {
+            **base,
+            "status": "fail",
+            "reason": "grants_enabled",
+            "outer_signature_policy": policy,
+            "grants_enabled": True,
+        }
+    if p != "reject_v1":
+        return {
+            **base,
+            "status": "fail",
+            "reason": f"unexpected_policy:{policy}",
+            "outer_signature_policy": policy,
+            "grants_enabled": grants_enabled,
+        }
+    if grants_enabled is None:
+        return {
+            **base,
+            "status": INCOMPLETE_POLICY,
+            "reason": "grants_disabled_unproven",
+            "outer_signature_policy": policy,
+            "grants_enabled": None,
+        }
+    return {
+        **base,
+        "status": "pass",
+        "reason": "reject_v1_grants_disabled",
+        "outer_signature_policy": policy,
+        "grants_enabled": False,
+    }
+
+
+def extract_policy_from_diagnostics_body(body):
+    """Pull outer_signature_policy from GET /diagnostics/gossip body (#546)."""
+    if not isinstance(body, dict):
+        return None
+    val = body.get("outer_signature_policy")
+    if val is None:
+        return None
+    return val
+
+
+def extract_grants_enabled_from_diagnostics_body(body):
+    """Best-effort grants-enabled flag from diagnostics.
+
+    Prefer explicit boolean fields; map receipt-style legacy_grants strings.
+    If no grants evidence key is present (current #546 tip), return None so
+    admission stays incomplete_policy — never a silent PASS.
+    """
+    if not isinstance(body, dict):
+        return None
+    if "legacy_grants_enabled" in body:
+        return bool(body["legacy_grants_enabled"])
+    if "grants_enabled" in body:
+        return bool(body["grants_enabled"])
+    if "legacy_grants" in body:
+        val = body["legacy_grants"]
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            v = val.strip().lower()
+            if v in ("disabled", "false", "off", "none"):
+                return False
+            if v in ("enabled", "true", "on", "active"):
+                return True
+            return None
+        if isinstance(val, (list, dict)):
+            return len(val) > 0
+        return None
+    if "migration_grants" in body:
+        g = body.get("migration_grants")
+        if g is None:
+            return None
+        if isinstance(g, (list, dict)):
+            return len(g) > 0
+    return None
+
+
+def run_modern_policy_admission_gate(args, out_dir, nodes=None):
+    """Live modern_policy_admission gate (ADR-014 / #548 HOLD fail-closed).
+
+    GET /diagnostics/gossip from a live node when available; otherwise spawn a
+    short-lived probe node. Missing/unreadable diagnostics or unproven grants
+    → incomplete_policy (blocking under --modern-only --expect-fixed).
+    """
+    body = None
+    source = None
+    owned = []
+    try:
+        for n in (nodes or []):
+            if not getattr(n, "running", False):
+                continue
+            try:
+                r = n.req("GET", "/diagnostics/gossip")
+                if r.get("status") == 200 and isinstance(r.get("body"), dict):
+                    body = r["body"]
+                    source = f"node:{n.name}"
+                    break
+            except OSError:
+                continue
+        if body is None:
+            pol_dir = pathlib.Path(out_dir) / "modern-policy-admission"
+            pol_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                node = _spawn_isolated_node(
+                    "policy-admit", args.api_base + 50, args.quic_base + 50,
+                    pol_dir, args.x0xd, args.log_level, [])
+                owned.append(node)
+                r = node.req("GET", "/diagnostics/gossip")
+                if r.get("status") == 200 and isinstance(r.get("body"), dict):
+                    body = r["body"]
+                    source = "ephemeral:policy-admit"
+                else:
+                    gate = classify_modern_policy_admission(None, None)
+                    gate["diagnostics_source"] = "ephemeral:unreadable"
+                    gate["http_status"] = r.get("status") if isinstance(r, dict) else None
+                    return gate
+            except Exception as e:
+                gate = classify_modern_policy_admission(None, None)
+                gate["diagnostics_source"] = "unavailable"
+                gate["error"] = f"{type(e).__name__}: {e}"
+                return gate
+        policy = extract_policy_from_diagnostics_body(body)
+        grants_enabled = extract_grants_enabled_from_diagnostics_body(body)
+        gate = classify_modern_policy_admission(policy, grants_enabled)
+        gate["diagnostics_source"] = source
+        if isinstance(body, dict) and "outer_v1_receipts" in body:
+            gate["outer_v1_receipts"] = body.get("outer_v1_receipts")
+        return gate
+    finally:
+        for n in owned:
+            try:
+                n.stop()
+            except Exception:
+                pass
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="x0x three-node convergence soak harness")
@@ -2953,6 +3121,13 @@ def main():
         prereq_gates.append(run_forged_first_seen_gate(args, out_root))
         if args.modern_only:
             prereq_gates = classify_prereq_gates_for_modern(prereq_gates)
+        # #548 HOLD: fail-closed modern policy admission under modern+expect-fixed.
+        # PASS only on live reject_v1 + proven grants disabled; incomplete_policy
+        # and fail both block (never green without admission proof).
+        if args.modern_only and args.expect_fixed:
+            log("=== modern_policy_admission (fail-closed live readback) ===")
+            prereq_gates.append(
+                run_modern_policy_admission_gate(args, out_root))
     finally:
         report_path = out_root / "report.json"
         report_path.write_text(json.dumps({
@@ -2985,6 +3160,10 @@ def main():
             st = g.get("status")
             if args.modern_only and st == NOT_IN_MODERN_PREDICATE:
                 return False
+            # incomplete_policy blocks under modern+expect-fixed (fail-closed
+            # admission; missing #546 diagnostics must not green the recipe).
+            if args.modern_only and st == INCOMPLETE_POLICY:
+                return True
             return st in ("fail", "unsupported")
         prereq_ok = all(not _prereq_blocking(g) for g in prereq_gates)
     else:

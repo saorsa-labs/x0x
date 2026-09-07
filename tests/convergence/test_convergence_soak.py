@@ -108,6 +108,62 @@ class ModernOnlyPredicateTests(unittest.TestCase):
         self.assertEqual(rec["predicate"], SOAK.NOT_IN_MODERN_PREDICATE)
         self.assertNotEqual(rec["status"], "pass")
 
+    def test_policy_admission_none_policy_incomplete(self):
+        g = SOAK.classify_modern_policy_admission(None, False)
+        self.assertEqual(g["name"], SOAK.MODERN_POLICY_ADMISSION)
+        self.assertEqual(g["status"], SOAK.INCOMPLETE_POLICY)
+        self.assertNotEqual(g["status"], "pass")
+
+    def test_policy_admission_none_grants_incomplete(self):
+        # reject_v1 without proven grants-disabled evidence must not PASS
+        g = SOAK.classify_modern_policy_admission("reject_v1", None)
+        self.assertEqual(g["status"], SOAK.INCOMPLETE_POLICY)
+        self.assertNotEqual(g["status"], "pass")
+
+    def test_policy_admission_accept_v1_fail(self):
+        g = SOAK.classify_modern_policy_admission("accept_v1", False)
+        self.assertEqual(g["status"], "fail")
+        self.assertIn("AcceptV1", g["reason"])
+
+    def test_policy_admission_grants_enabled_fail(self):
+        g = SOAK.classify_modern_policy_admission("reject_v1", True)
+        self.assertEqual(g["status"], "fail")
+        self.assertEqual(g["reason"], "grants_enabled")
+
+    def test_policy_admission_reject_v1_grants_disabled_pass(self):
+        g = SOAK.classify_modern_policy_admission("reject_v1", False)
+        self.assertEqual(g["status"], "pass")
+        self.assertEqual(g["outer_signature_policy"], "reject_v1")
+        self.assertIs(g["grants_enabled"], False)
+
+    def test_policy_admission_extract_missing_grants_is_none(self):
+        # #546 tip exposes policy/receipts but not grants — must stay unproven
+        body = {"outer_signature_policy": "reject_v1", "outer_v1_receipts": 0}
+        self.assertEqual(
+            SOAK.extract_policy_from_diagnostics_body(body), "reject_v1")
+        self.assertIsNone(
+            SOAK.extract_grants_enabled_from_diagnostics_body(body))
+
+    def test_prereq_blocking_incomplete_under_modern_expect_fixed(self):
+        # Mirror main()._prereq_blocking: incomplete_policy blocks modern
+        class Args:
+            modern_only = True
+            expect_fixed = True
+        args = Args()
+        def _prereq_blocking(g):
+            st = g.get("status")
+            if args.modern_only and st == SOAK.NOT_IN_MODERN_PREDICATE:
+                return False
+            if args.modern_only and st == SOAK.INCOMPLETE_POLICY:
+                return True
+            return st in ("fail", "unsupported")
+        self.assertTrue(_prereq_blocking(
+            {"status": SOAK.INCOMPLETE_POLICY}))
+        self.assertTrue(_prereq_blocking({"status": "fail"}))
+        self.assertFalse(_prereq_blocking(
+            {"status": SOAK.NOT_IN_MODERN_PREDICATE}))
+        self.assertFalse(_prereq_blocking({"status": "pass"}))
+
 
 if __name__ == "__main__":
     unittest.main()
