@@ -160,6 +160,7 @@ impl Store {
         }
         migrate(&conn)?;
         ensure_indexes(&conn)?;
+        backfill_canonical_ids(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -204,7 +205,11 @@ impl Store {
                 {
                     InsertOutcome::StaleRejected
                 }
-                Some((prev_id, _, _)) => {
+                Some((prev_id, _, prev_msg)) => {
+                    tx.execute(
+                        "DELETE FROM history_canonical_ids WHERE history_msg_id = ?1",
+                        rusqlite::params![prev_msg],
+                    )?;
                     tx.execute(
                         "DELETE FROM history WHERE id = ?1",
                         rusqlite::params![prev_id],
@@ -261,6 +266,32 @@ impl Store {
              thread_root, thread_parent, ingress_sender_agent, logical_request_id \
              FROM history WHERE msg_id = ?1 ORDER BY id DESC LIMIT 1";
         let params = vec![rusqlite::types::Value::from(msg_id.to_vec())];
+        let guard = lock_conn(&self.conn)?;
+        Ok(collect_rows(&guard, sql, params)?.into_iter().next())
+    }
+
+    /// Point lookup of a canonical ADR-0029 group-message id.
+    ///
+    /// The canonical id is maintained in a derived auxiliary table so older
+    /// binaries can continue to open and write the v4 `history` schema. The
+    /// store's `msg_id` dedupe key remains unchanged.
+    pub fn get_by_canonical_group_msg_id(
+        &self,
+        canonical_msg_id: [u8; 32],
+        group_id: &str,
+    ) -> HistoryResult<Option<StoredRecord>> {
+        let sql =
+            "SELECT h.id, h.msg_id, h.scope_kind, h.scope_id, h.author_agent, h.author_machine, \
+             h.author_pubkey, h.sent_at_ms, h.seen_at_ms, h.direction, h.content_type, h.payload, \
+             h.signed_artifact, h.signature, h.sig_context, h.provenance, h.replace_key, \
+             h.thread_root, h.thread_parent, h.ingress_sender_agent, h.logical_request_id \
+             FROM history h JOIN history_canonical_ids c ON c.history_msg_id = h.msg_id \
+             WHERE c.canonical_msg_id = ?1 AND c.scope_kind = 1 AND c.scope_id = ?2 \
+             ORDER BY h.id DESC LIMIT 1";
+        let params = vec![
+            rusqlite::types::Value::from(canonical_msg_id.to_vec()),
+            rusqlite::types::Value::from(group_id.to_string()),
+        ];
         let guard = lock_conn(&self.conn)?;
         Ok(collect_rows(&guard, sql, params)?.into_iter().next())
     }
@@ -427,6 +458,7 @@ impl Store {
         if evicted > 0 {
             guard.execute_batch("PRAGMA incremental_vacuum;")?;
         }
+        cleanup_canonical_ids(&guard)?;
         Ok(evicted)
     }
 
@@ -437,6 +469,7 @@ impl Store {
             "DELETE FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
             rusqlite::params![scope.kind(), scope.id()],
         )?;
+        cleanup_canonical_ids(&guard)?;
         guard.execute_batch("PRAGMA incremental_vacuum;")?;
         Ok(n as u64)
     }
@@ -630,22 +663,40 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
         ],
     )
     .map_err(|e| HistoryError::Database(format!("insert failed: {e}")))?;
+    if let Some(canonical_msg_id) = canonical_group_msg_id(
+        record.scope.kind(),
+        record.scope.id(),
+        record.signed_artifact.as_deref(),
+        &record.payload,
+    ) {
+        tx.execute(
+            "INSERT OR REPLACE INTO history_canonical_ids \
+             (history_msg_id, canonical_msg_id, scope_kind, scope_id) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                record.msg_id.as_slice(),
+                &canonical_msg_id[..],
+                record.scope.kind(),
+                record.scope.id(),
+            ],
+        )
+        .map_err(|e| HistoryError::Database(format!("canonical index insert failed: {e}")))?;
+    }
     Ok(())
 }
 
-/// Indexes that are pure query accelerators, created idempotently at every
-/// open rather than inside the versioned migration chain.
+/// Indexes and derived projections created idempotently at every open rather
+/// than inside the versioned migration chain.
 ///
 /// This is a deliberate departure from the migration convention, and the
-/// reason is rollback safety. An index changes no column, no row meaning, and
-/// no data: an older binary opening this database reads and writes it exactly
-/// as before, and SQLite maintains the index for those writes transparently.
-/// Adding one via a v4→v5 migration would instead bump `SCHEMA_VERSION`, and
-/// `migrate` rejects any database newer than the running binary — so a
-/// rollback from this release to v0.37.4 would leave every upgraded user with
-/// a `history.db` that refuses to open. Paying that for a performance-only
-/// change is the wrong trade. Schema changes that alter the data model still
-/// go through the versioned chain.
+/// reason is rollback safety. The auxiliary table contains only a rebuildable
+/// projection; an older binary opening this database reads and writes the
+/// unchanged v4 `history` table exactly as before. A new binary reconstructs
+/// the projection on open, including rows written by that older binary.
+/// Adding a column to `history` via a v4→v5 migration would instead bump
+/// `SCHEMA_VERSION`, and `migrate` rejects any database newer than the running
+/// binary. Schema changes that alter the existing data model still go through
+/// the versioned chain.
 ///
 /// `idx_logical_request` backs `find_by_logical_request`, the ADR 0030 §1
 /// receiver durable-history lookup, which runs on every inbound v2 DM.
@@ -658,10 +709,109 @@ fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_logical_request \
          ON history(ingress_sender_agent, logical_request_id) \
-         WHERE logical_request_id IS NOT NULL;",
+         WHERE logical_request_id IS NOT NULL; \
+         CREATE TABLE IF NOT EXISTS history_canonical_ids ( \
+           history_msg_id BLOB NOT NULL PRIMARY KEY, \
+           canonical_msg_id BLOB NOT NULL, \
+           scope_kind INTEGER NOT NULL, \
+           scope_id TEXT NOT NULL \
+         ); \
+         CREATE INDEX IF NOT EXISTS idx_history_canonical \
+           ON history_canonical_ids(canonical_msg_id, scope_kind, scope_id); \
+         CREATE TRIGGER IF NOT EXISTS history_canonical_ids_ad AFTER DELETE ON history BEGIN \
+           DELETE FROM history_canonical_ids WHERE history_msg_id = old.msg_id; \
+         END;",
     )
     .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
     Ok(())
+}
+
+/// Populate the rebuildable canonical projection for rows written by an older
+/// binary or before this auxiliary table existed. Only a structurally valid
+/// group artifact is indexed; the history row itself is never changed. The
+/// existing unique history `msg_id` is the cache key so SQLite rowid reuse
+/// cannot attach an old projection to a new row.
+fn backfill_canonical_ids(conn: &Connection) -> HistoryResult<()> {
+    // Reconcile only missing keys: the existing unique artifact hash is
+    // immutable for a history row, and the delete trigger removes its
+    // projection when an older writer deletes that row. Keep each read
+    // bounded so opening a large history cannot allocate all payloads at
+    // once. Invalid rows still advance the id cursor and cannot stall this
+    // loop. Commit each bounded batch independently so an interrupted open
+    // retains completed projection work and resumes on the next open.
+    let mut after_id = 0_i64;
+    loop {
+        let tx = conn.unchecked_transaction()?;
+        let candidates = {
+            let mut stmt = tx.prepare(
+                "SELECT h.id, h.msg_id, h.scope_id, h.payload, h.signed_artifact \
+                 FROM history h LEFT JOIN history_canonical_ids c \
+                 ON c.history_msg_id = h.msg_id \
+                 WHERE h.scope_kind = 1 AND c.history_msg_id IS NULL AND h.id > ?1 \
+                 ORDER BY h.id LIMIT 256",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![after_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let Some((last_id, _, _, _, _)) = candidates.last() else {
+            tx.rollback()?;
+            break;
+        };
+        let last_id = *last_id;
+        for (_, history_msg_id, scope_id, payload, signed_artifact) in candidates {
+            let Some(canonical_msg_id) =
+                canonical_group_msg_id(1, &scope_id, signed_artifact.as_deref(), &payload)
+            else {
+                continue;
+            };
+            tx.execute(
+                "INSERT OR REPLACE INTO history_canonical_ids \
+                 (history_msg_id, canonical_msg_id, scope_kind, scope_id) \
+                 VALUES (?1, ?2, 1, ?3)",
+                rusqlite::params![history_msg_id, &canonical_msg_id[..], scope_id],
+            )?;
+        }
+        tx.commit()?;
+        after_id = last_id;
+    }
+    Ok(())
+}
+
+fn cleanup_canonical_ids(conn: &Connection) -> HistoryResult<()> {
+    conn.execute(
+        "DELETE FROM history_canonical_ids \
+         WHERE history_msg_id NOT IN (SELECT msg_id FROM history)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Derive the ADR-0029 identity without weakening the history record's
+/// artifact/payload hash invariant. This deliberately mirrors the REST
+/// projection's scope and body checks.
+fn canonical_group_msg_id(
+    scope_kind: i64,
+    scope_id: &str,
+    signed_artifact: Option<&[u8]>,
+    payload: &[u8],
+) -> Option<[u8; 32]> {
+    if scope_kind != 1 {
+        return None;
+    }
+    let message =
+        serde_json::from_slice::<crate::groups::GroupPublicMessage>(signed_artifact?).ok()?;
+    if message.group_id != scope_id || message.body.as_bytes() != payload {
+        return None;
+    }
+    hex::decode(message.msg_id()).ok()?.try_into().ok()
 }
 
 /// Forward-only schema migration.
@@ -1152,6 +1302,367 @@ mod tests {
         assert_eq!(stored.thread_parent, r.thread_parent);
         assert_eq!(stored.ingress_sender_agent, r.ingress_sender_agent);
         assert_eq!(stored.logical_request_id, Some([0x31; 16]));
+    }
+
+    fn group_record(group_id: &str, body: &str, timestamp: u64) -> (HistoryRecord, [u8; 32]) {
+        group_record_with_provenance(group_id, body, timestamp, Provenance::VerifiedEnvelope)
+    }
+
+    fn group_record_with_provenance(
+        group_id: &str,
+        body: &str,
+        timestamp: u64,
+        provenance: Provenance,
+    ) -> (HistoryRecord, [u8; 32]) {
+        let message = crate::groups::GroupPublicMessage {
+            group_id: group_id.to_string(),
+            state_hash_at_send: "state-hash".to_string(),
+            revision_at_send: timestamp,
+            author_agent_id: "aa".repeat(32),
+            author_public_key: "bb".repeat(64),
+            author_user_id: None,
+            kind: crate::groups::GroupPublicMessageKind::Chat,
+            body: body.to_string(),
+            timestamp,
+            thread_root: None,
+            thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
+            rider_provenance: None,
+            signature: "cc".repeat(64),
+        };
+        let artifact = serde_json::to_vec(&message).unwrap();
+        let canonical = hex::decode(message.msg_id()).unwrap().try_into().unwrap();
+        let payload = message.body.as_bytes().to_vec();
+        let record = HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope: Scope::Group(group_id.to_string()),
+            author_agent: Some(message.author_agent_id),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: timestamp as i64,
+            seen_at_ms: timestamp as i64,
+            direction: Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: Some(artifact),
+            signature: Some(vec![1]),
+            sig_context: Some("x0x.group.public-message.v1".to_string()),
+            provenance,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        (record, canonical)
+    }
+
+    #[test]
+    fn canonical_group_index_survives_reopen_and_old_writer_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let (target, canonical) = group_record("canonical-group", "canonical body", 1);
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.insert(&target).unwrap(), InsertOutcome::Inserted);
+            let row = store
+                .get_by_canonical_group_msg_id(canonical, "canonical-group")
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.record.msg_id, target.msg_id);
+            assert_eq!(store.insert(&target).unwrap(), InsertOutcome::Duplicate);
+            assert!(store
+                .get_by_canonical_group_msg_id(canonical, "another-group")
+                .unwrap()
+                .is_none());
+            let guard = lock_conn(&store.conn).unwrap();
+            let count: i64 = guard
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='history_canonical_ids'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            let plan: String = guard
+                .query_row(
+                    "EXPLAIN QUERY PLAN SELECT h.id FROM history h \
+                     JOIN history_canonical_ids c ON c.history_msg_id = h.msg_id \
+                     WHERE c.canonical_msg_id = ?1 AND c.scope_kind = 1 AND c.scope_id = ?2",
+                    rusqlite::params![&canonical[..], "canonical-group"],
+                    |row| row.get(3),
+                )
+                .unwrap();
+            assert!(
+                plan.contains("idx_history_canonical"),
+                "canonical lookup must use its derived index, got plan: {plan}"
+            );
+        }
+
+        // A v4 writer knows only the history table. Its insert and delete are
+        // valid with the derived table present; reopening then backfills the
+        // newly inserted signed group artifact.
+        let (legacy, legacy_canonical) = group_record("legacy-group", "legacy group body", 2);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+             author_agent, direction, content_type, payload, signed_artifact, signature, \
+             sig_context, provenance) \
+             VALUES (?1, 1, ?2, ?3, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0)",
+            rusqlite::params![
+                &legacy.msg_id[..],
+                "legacy-group",
+                legacy.sent_at_ms,
+                legacy.author_agent,
+                legacy.content_type,
+                legacy.payload,
+                legacy.signed_artifact,
+                legacy.signature,
+                legacy.sig_context,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM history WHERE msg_id = ?1",
+            rusqlite::params![&target.msg_id[..]],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        assert!(store
+            .get_by_canonical_group_msg_id(canonical, "canonical-group")
+            .unwrap()
+            .is_none());
+        let row = store
+            .get_by_canonical_group_msg_id(legacy_canonical, "legacy-group")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.record.msg_id, legacy.msg_id);
+        assert!(store
+            .get_by_canonical_group_msg_id([0x55; 32], "legacy-group")
+            .unwrap()
+            .is_none());
+        assert_eq!(stored_schema_version(&store), 4);
+    }
+
+    #[test]
+    fn canonical_backfill_is_batched_and_skips_invalid_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        // Create the v4 history shape and auxiliary projection first, then
+        // write rows using only the v4 columns an older binary knows.
+        let store = Store::open(&path).unwrap();
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        let mut canonical_ids = Vec::new();
+        for n in 0..300_u64 {
+            let (record, canonical) =
+                group_record("batched-legacy-group", &format!("legacy body {n}"), n + 1);
+            let payload = if n == 1 || n == 257 {
+                b"payload does not match signed artifact".to_vec()
+            } else {
+                record.payload.clone()
+            };
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                 author_agent, direction, content_type, payload, signed_artifact, signature, \
+                 sig_context, provenance) \
+                 VALUES (?1, 1, ?2, ?3, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0)",
+                rusqlite::params![
+                    &record.msg_id[..],
+                    "batched-legacy-group",
+                    record.sent_at_ms,
+                    record.author_agent,
+                    record.content_type,
+                    payload,
+                    record.signed_artifact,
+                    record.signature,
+                    record.sig_context,
+                ],
+            )
+            .unwrap();
+            canonical_ids.push((n, canonical));
+        }
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        // 300 candidates force at least two 256-row keyset batches. The
+        // invalid rows must be skipped while their ids still advance the
+        // cursor, otherwise startup would loop forever on the first bad row.
+        for n in [0_usize, 2, 256, 299] {
+            let (_, canonical) = canonical_ids[n];
+            assert!(
+                store
+                    .get_by_canonical_group_msg_id(canonical, "batched-legacy-group")
+                    .unwrap()
+                    .is_some(),
+                "valid row {n} must be backfilled"
+            );
+        }
+        for n in [1_usize, 257] {
+            let (_, canonical) = canonical_ids[n];
+            assert!(
+                store
+                    .get_by_canonical_group_msg_id(canonical, "batched-legacy-group")
+                    .unwrap()
+                    .is_none(),
+                "scope/body-mismatched row {n} must not be indexed"
+            );
+        }
+        let guard = lock_conn(&store.conn).unwrap();
+        let indexed: i64 = guard
+            .query_row("SELECT count(*) FROM history_canonical_ids", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 298);
+    }
+
+    #[test]
+    fn canonical_backfill_resumes_after_second_batch_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let store = Store::open(&path).unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        let mut abort_msg_hex = None;
+        for n in 0..600_u64 {
+            let (record, _) =
+                group_record("resume-legacy-group", &format!("resume body {n}"), n + 1);
+            if n == 257 {
+                // Row 258 is in the second 256-row candidate batch. The
+                // trigger below must abort that batch after row 257 has been
+                // attempted, proving the batch transaction rolls back as a
+                // unit while batch one remains committed.
+                abort_msg_hex = Some(hex::encode(record.msg_id));
+            }
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                 author_agent, direction, content_type, payload, signed_artifact, signature, \
+                 sig_context, provenance) \
+                 VALUES (?1, 1, ?2, ?3, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0)",
+                rusqlite::params![
+                    &record.msg_id[..],
+                    "resume-legacy-group",
+                    record.sent_at_ms,
+                    record.author_agent,
+                    record.content_type,
+                    record.payload,
+                    record.signed_artifact,
+                    record.signature,
+                    record.sig_context,
+                ],
+            )
+            .unwrap();
+        }
+        let abort_msg_hex = abort_msg_hex.unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER issue321_abort_second_batch BEFORE INSERT ON \
+             history_canonical_ids WHEN NEW.history_msg_id = X'{abort_msg_hex}' BEGIN \
+             SELECT RAISE(ABORT, 'issue321 injected second-batch failure'); END;"
+        ))
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            Store::open(&path).is_err(),
+            "the injected second-batch failure must make this open fail"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let indexed: i64 = conn
+            .query_row("SELECT count(*) FROM history_canonical_ids", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            indexed, 256,
+            "the first committed batch must survive while the failed second batch rolls back"
+        );
+        let aborted_indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM history_canonical_ids WHERE history_msg_id = ?1",
+                rusqlite::params![hex::decode(&abort_msg_hex).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(aborted_indexed, 0);
+        let history_rows: i64 = conn
+            .query_row("SELECT count(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(history_rows, 600, "backfill must never mutate history rows");
+        conn.execute_batch("DROP TRIGGER issue321_abort_second_batch")
+            .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        let indexed: i64 = lock_conn(&store.conn)
+            .unwrap()
+            .query_row("SELECT count(*) FROM history_canonical_ids", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 600, "a later open must resume all missing batches");
+        assert_eq!(stored_schema_version(&store), 4);
+    }
+
+    #[test]
+    fn canonical_index_preserves_local_and_verified_provenance() {
+        let (store, _dir) = open();
+        for (n, provenance) in [
+            (1_u64, Provenance::LocalSend),
+            (2_u64, Provenance::VerifiedEnvelope),
+        ] {
+            let (record, canonical) = group_record_with_provenance(
+                "provenance-group",
+                &format!("provenance body {n}"),
+                n,
+                provenance,
+            );
+            assert_eq!(store.insert(&record).unwrap(), InsertOutcome::Inserted);
+            let stored = store
+                .get_by_canonical_group_msg_id(canonical, "provenance-group")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.record.msg_id, record.msg_id);
+            assert_eq!(stored.record.provenance, provenance);
+        }
+    }
+
+    #[test]
+    fn canonical_group_lookup_is_not_limited_by_history_scan_budget() {
+        let (store, _dir) = open();
+        let (target, canonical) = group_record("large-group", "old canonical body", 1);
+        assert_eq!(store.insert(&target).unwrap(), InsertOutcome::Inserted);
+        let newer: Vec<HistoryRecord> = (0..4_100)
+            .map(|n| {
+                rec(
+                    format!("newer row {n}").as_bytes(),
+                    Scope::Group("large-group".to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(store.insert_batch(&newer).unwrap().0, newer.len() as u64);
+        let row = store
+            .get_by_canonical_group_msg_id(canonical, "large-group")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.record.payload, target.payload);
+    }
+
+    #[test]
+    fn invalid_group_artifact_is_not_added_to_canonical_index() {
+        let (store, _dir) = open();
+        let (mut record, canonical) = group_record("invalid-group", "signed body", 1);
+        record.payload = b"different body".to_vec();
+        assert_eq!(store.insert(&record).unwrap(), InsertOutcome::Inserted);
+        assert!(store
+            .get_by_canonical_group_msg_id(canonical, "invalid-group")
+            .unwrap()
+            .is_none());
     }
 
     fn rec(payload: &[u8], scope: Scope) -> HistoryRecord {

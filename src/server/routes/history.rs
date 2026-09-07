@@ -15,7 +15,7 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use std::sync::Arc;
-use x0x::history::{HistoryQuery, Scope, StoredRecord};
+use x0x::history::{HistoryQuery, Scope, Store, StoredRecord};
 
 /// Query parameters shared by `GET /history` and `GET /history/search`.
 #[derive(Debug, serde::Deserialize)]
@@ -215,45 +215,8 @@ pub(in crate::server) async fn history_message(
     };
 
     let store = Arc::clone(history.store());
-    let lookup = tokio::task::spawn_blocking(move || -> Result<Option<StoredRecord>, String> {
-        // Fast path: the store dedupe key. DM/topic rows expose exactly this
-        // id via row_json, and pre-ADR-0029 callers hold it directly.
-        if let Some(row) = store.get_by_msg_id(msg_id).map_err(|e| e.to_string())? {
-            return Ok(Some(row));
-        }
-        // Canonical group-message ids differ from the dedupe key and are
-        // recomputable only from the signed artifact; resolve them with a
-        // bounded newest-first scan inside the caller's scope.
-        let Some(scope) = scope else {
-            return Ok(None);
-        };
-        let mut before_id: Option<i64> = None;
-        let mut scanned = 0usize;
-        while scanned < HISTORY_MESSAGE_SCAN_BUDGET {
-            let q = HistoryQuery {
-                scope: Some(scope.clone()),
-                scope_kind: None,
-                since_ms: None,
-                until_ms: None,
-                limit: HISTORY_MESSAGE_SCAN_PAGE,
-                before_id,
-            };
-            let rows = store.query(&q).map_err(|e| e.to_string())?;
-            if rows.is_empty() {
-                return Ok(None);
-            }
-            scanned += rows.len();
-            before_id = rows.last().map(|r| r.id);
-            for row in rows {
-                let canonical = group_history_message(&row.record)
-                    .map(|m| m.msg_id())
-                    .unwrap_or_else(|| hex::encode(row.record.msg_id));
-                if canonical == requested_hex {
-                    return Ok(Some(row));
-                }
-            }
-        }
-        Ok(None)
+    let lookup = tokio::task::spawn_blocking(move || {
+        resolve_history_message(&store, msg_id, &requested_hex, scope)
     })
     .await;
 
@@ -270,6 +233,63 @@ pub(in crate::server) async fn history_message(
         Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("lookup: {e}")),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
     }
+}
+
+/// Resolve the point-lookup contract in the same order as the HTTP handler:
+/// internal dedupe id, indexed canonical group id, then the bounded legacy
+/// scan for rows written before the derived projection existed.
+fn resolve_history_message(
+    store: &Store,
+    msg_id: [u8; 32],
+    requested_hex: &str,
+    scope: Option<Scope>,
+) -> Result<Option<StoredRecord>, String> {
+    // Fast path: the store dedupe key. DM/topic rows expose exactly this id
+    // via row_json, and pre-ADR-0029 callers hold it directly.
+    if let Some(row) = store.get_by_msg_id(msg_id).map_err(|e| e.to_string())? {
+        return Ok(Some(row));
+    }
+    // Canonical group-message ids differ from the dedupe key and are
+    // maintained in a derived indexed projection. Legacy rows that predate
+    // that projection still fall through to the bounded scan.
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    if let Scope::Group(group_id) = &scope {
+        if let Some(row) = store
+            .get_by_canonical_group_msg_id(msg_id, group_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(Some(row));
+        }
+    }
+    let mut before_id: Option<i64> = None;
+    let mut scanned = 0usize;
+    while scanned < HISTORY_MESSAGE_SCAN_BUDGET {
+        let q = HistoryQuery {
+            scope: Some(scope.clone()),
+            scope_kind: None,
+            since_ms: None,
+            until_ms: None,
+            limit: HISTORY_MESSAGE_SCAN_PAGE,
+            before_id,
+        };
+        let rows = store.query(&q).map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        scanned += rows.len();
+        before_id = rows.last().map(|r| r.id);
+        for row in rows {
+            let canonical = group_history_message(&row.record)
+                .map(|m| m.msg_id())
+                .unwrap_or_else(|| hex::encode(row.record.msg_id));
+            if canonical == requested_hex {
+                return Ok(Some(row));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// GET /history/search — FTS5 search over text payloads within a scope.
@@ -390,7 +410,7 @@ pub(in crate::server) async fn history_diagnostics(
 mod tests {
     use super::*;
     use x0x::groups::{GroupPublicMessage, GroupPublicMessageKind};
-    use x0x::history::{Direction, HistoryRecord, Provenance};
+    use x0x::history::{Direction, HistoryRecord, Provenance, Store};
 
     #[test]
     fn group_history_json_uses_canonical_message_id_and_thread_ancestry() {
@@ -443,5 +463,148 @@ mod tests {
         assert_eq!(json["msg_id"], message.msg_id());
         assert_eq!(json["thread_root"], root);
         assert_eq!(json["thread_parent"], root);
+    }
+
+    #[test]
+    fn canonical_resolver_uses_index_past_legacy_scan_budget() {
+        let dir = tempfile::tempdir().expect("temporary history directory");
+        let store = Store::open(&dir.path().join("history.db")).expect("open history store");
+        let message = GroupPublicMessage {
+            group_id: "resolver-group".to_string(),
+            state_hash_at_send: "state-1".to_string(),
+            revision_at_send: 1,
+            author_agent_id: "author-1".to_string(),
+            author_public_key: "public-key-1".to_string(),
+            author_user_id: None,
+            kind: GroupPublicMessageKind::Chat,
+            body: "old canonical payload".to_string(),
+            timestamp: 1,
+            thread_root: None,
+            thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
+            rider_provenance: None,
+            signature: "signature-1".to_string(),
+        };
+        let artifact = serde_json::to_vec(&message).expect("serialize group artifact");
+        let payload = message.body.as_bytes().to_vec();
+        let target = HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope: Scope::Group(message.group_id.clone()),
+            author_agent: Some(message.author_agent_id.clone()),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1,
+            seen_at_ms: 1,
+            direction: Direction::Outbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: Some(artifact),
+            signature: Some(vec![1]),
+            sig_context: Some("x0x.group.public-message.v1".to_string()),
+            provenance: Provenance::VerifiedEnvelope,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        store.insert(&target).expect("insert canonical target");
+
+        let mut local_message = message.clone();
+        local_message.body = "old local canonical payload".to_string();
+        local_message.timestamp = 2;
+        local_message.revision_at_send = 2;
+        local_message.signature = "signature-local".to_string();
+        let local_artifact =
+            serde_json::to_vec(&local_message).expect("serialize local group artifact");
+        let local_payload = local_message.body.as_bytes().to_vec();
+        let local_target = HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&local_artifact), &local_payload),
+            scope: Scope::Group(local_message.group_id.clone()),
+            author_agent: Some(local_message.author_agent_id.clone()),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 2,
+            seen_at_ms: 2,
+            direction: Direction::Outbound,
+            content_type: "text/plain".to_string(),
+            payload: local_payload,
+            signed_artifact: Some(local_artifact),
+            signature: Some(vec![2]),
+            sig_context: Some("x0x.group.public-message.v1".to_string()),
+            provenance: Provenance::LocalSend,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        store
+            .insert(&local_target)
+            .expect("insert local canonical target");
+
+        let newer: Vec<HistoryRecord> = (0..4_100_u64)
+            .map(|n| {
+                let payload = format!("newer resolver row {n}").into_bytes();
+                HistoryRecord {
+                    msg_id: HistoryRecord::compute_msg_id(None, &payload),
+                    scope: Scope::Group("resolver-group".to_string()),
+                    author_agent: Some("author-1".to_string()),
+                    author_machine: None,
+                    author_pubkey: None,
+                    sent_at_ms: n as i64 + 2,
+                    seen_at_ms: n as i64 + 2,
+                    direction: Direction::Inbound,
+                    content_type: "text/plain".to_string(),
+                    payload,
+                    signed_artifact: None,
+                    signature: None,
+                    sig_context: None,
+                    provenance: Provenance::VerifiedEnvelope,
+                    replace_key: None,
+                    thread_root: None,
+                    thread_parent: None,
+                    ingress_sender_agent: None,
+                    logical_request_id: None,
+                }
+            })
+            .collect();
+        assert_eq!(
+            store.insert_batch(&newer).expect("insert newer rows").0,
+            newer.len() as u64
+        );
+
+        let canonical = message.msg_id();
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical)
+            .expect("canonical hex")
+            .try_into()
+            .expect("canonical length");
+        let resolved = resolve_history_message(
+            &store,
+            canonical_bytes,
+            &canonical,
+            Some(Scope::Group("resolver-group".to_string())),
+        )
+        .expect("resolve canonical id")
+        .expect("canonical target");
+        assert_eq!(resolved.record.msg_id, target.msg_id);
+        assert_eq!(resolved.record.provenance, Provenance::VerifiedEnvelope);
+
+        let local_canonical = local_message.msg_id();
+        let local_canonical_bytes: [u8; 32] = hex::decode(&local_canonical)
+            .expect("local canonical hex")
+            .try_into()
+            .expect("local canonical length");
+        let local_resolved = resolve_history_message(
+            &store,
+            local_canonical_bytes,
+            &local_canonical,
+            Some(Scope::Group("resolver-group".to_string())),
+        )
+        .expect("resolve local canonical id")
+        .expect("local canonical target");
+        assert_eq!(local_resolved.record.msg_id, local_target.msg_id);
+        assert_eq!(local_resolved.record.provenance, Provenance::LocalSend);
     }
 }
