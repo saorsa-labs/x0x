@@ -587,6 +587,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "outbound_by_topic_named": egress["outbound_by_topic_named"],
                 "egress_budget": egress["egress_budget"],
                 "outer_signature_policy": state.agent.gossip_outer_signature_policy(),
+                "legacy_grants_enabled": false,
                 "outer_v1_receipts": state.agent.gossip_outer_v1_receipts(),
                 "gossip_publish_zero_fanout": snap.publish_zero_fanout,
                 "pubsub_stages": pubsub_stages,
@@ -749,6 +750,7 @@ mod participation_diagnostics_tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["outer_signature_policy"], "reject_v1");
+        assert_eq!(body["legacy_grants_enabled"], false);
         assert_eq!(body["outer_v1_receipts"].as_u64(), Some(0));
         // Contract: no payload/key material in the diagnostics surface.
         let dumped = body.to_string();
@@ -802,6 +804,7 @@ mod participation_diagnostics_tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["outer_signature_policy"], "reject_v1");
+        assert_eq!(body["legacy_grants_enabled"], false);
         assert_eq!(
             body["outer_v1_receipts"].as_u64(),
             Some(1),
