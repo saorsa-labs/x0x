@@ -191,7 +191,7 @@ jobs:
           source "$RUNNER_TEMP/coverage-env.sh"
           cargo llvm-cov clean --workspace
           bash scripts/ci/nextest-isolated.sh --all-features --workspace -- -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)'
-          cargo llvm-cov report --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 65.7
+          cargo llvm-cov report --workspace --lcov --output-path lcov.info --fail-under-lines 65.7
           python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
 
       - name: Upload LCOV report
