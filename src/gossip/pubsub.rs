@@ -540,7 +540,7 @@ impl PubSubManager {
             })?;
 
         let transport = Arc::new(PubSubTransport::new(Arc::clone(&network)));
-        let mut plumtree_inner =
+        let plumtree_inner =
             PlumtreePubSub::new(peer_id, Arc::clone(&transport), plumtree_signing_key);
         // ADR-014 modern-only: reject outer v1 (header-only-signed) frames.
         plumtree_inner.set_signature_policy(SignaturePolicy::RejectV1);
