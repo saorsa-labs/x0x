@@ -55,6 +55,35 @@ All notable changes to this project will be documented in this file.
   non-Encrypted policy — or a different group binding — is rejected
   instead of silently un-encrypting replicas back onto plaintext paths.
 
+## [v0.41.4] - 2026-09-07
+
+Patch candidate: experimental Leaf eager-degree selection + named gossip egress
+meters (#504 slice 1), test-oracle settle for detached eager fanout, and
+consumer deps on published saorsa-gossip **0.5.76** / ant-quic **0.27.50**.
+
+### Added
+
+- **Experimental Leaf eager ceiling and named egress meters (#504 slice 1).**
+  Configurable `leaf_max_eager_degree` (default 2; 0 restores stock selection;
+  valid 0–12) with shared PeerId dedupe/sort and helper preference across
+  writers; soft/hard byte thresholds remain observe-only (no shedding).
+  `GET /diagnostics/gossip` gains `subscribed_topics`, `outbound_by_topic_named`,
+  and `egress_budget` (incl. repair subset). See
+  `docs/504-slice1-experimental.md`. Sustained-cap claim and full #504 closure
+  remain held.
+
+### Fixed
+
+- **Slice1 test-oracle settle:** await detached eager fanout completion before
+  ceiling assertions so in-process fanout/delivery checks do not race the
+  recording transport.
+
+### Changed
+
+- **Dependencies:** direct `saorsa-gossip-*` → **0.5.76** and `ant-quic` →
+  **0.27.50** from crates.io; removed the temporary `[patch.crates-io]` git pin
+  formerly used for sg draft #51 integration.
+
 ## [v0.41.3] - 2026-09-05
 
 Emergency GUI fix: the embedded GUI was completely dead in v0.41.1 and v0.41.2.

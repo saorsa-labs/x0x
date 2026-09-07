@@ -8,16 +8,19 @@
 //! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned
 //! - **V2** (signed): `[0x02 | agent_id | pubkey | signature | topic | payload]`
 
+use super::egress::{EgressMeter, PubSubTransport};
 use super::participation::{
     classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, ParticipationMode,
     ParticipationSnapshot, RELAY_BYTES_SEMANTICS,
 };
+use super::GossipConfig;
 use crate::contacts::{ContactStore, TrustLevel};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
+use saorsa_gossip_transport::GossipTransport;
 use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
 };
@@ -335,7 +338,11 @@ pub struct PubSubManager {
     /// Network node used by PlumTree transport and topic peer initialization.
     network: Arc<NetworkNode>,
     /// PlumTree pub/sub engine from saorsa-gossip-pubsub.
-    plumtree: Arc<PlumtreePubSub<NetworkNode>>,
+    plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
+    transport: Arc<PubSubTransport>,
+    egress_config: GossipConfig,
+    egress_meter: Mutex<EgressMeter>,
+    eager_ceiling_initialized: tokio::sync::OnceCell<()>,
     /// Local topic subscription ref-counts (for stats and cleanup).
     topic_ref_counts: Arc<RwLock<HashMap<String, usize>>>,
     /// Signing context for authenticating published messages.
@@ -484,8 +491,9 @@ impl PubSubManager {
                 NetworkError::NodeCreation(format!("failed to create PlumTree signing key: {e}"))
             })?;
 
+        let transport = Arc::new(PubSubTransport::new(Arc::clone(&network)));
         let plumtree_inner =
-            PlumtreePubSub::new(peer_id, Arc::clone(&network), plumtree_signing_key);
+            PlumtreePubSub::new(peer_id, Arc::clone(&transport), plumtree_signing_key);
         let plumtree_inner = match oracle {
             Some(oracle) => plumtree_inner.with_health_oracle(oracle),
             None => plumtree_inner,
@@ -497,6 +505,10 @@ impl PubSubManager {
         Ok(Self {
             network,
             plumtree,
+            transport,
+            egress_config: GossipConfig::default(),
+            egress_meter: Mutex::new(EgressMeter::default()),
+            eager_ceiling_initialized: tokio::sync::OnceCell::new(),
             topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
             signing,
             contacts: std::sync::OnceLock::new(),
@@ -519,6 +531,116 @@ impl PubSubManager {
             zero_fanout_warns: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fanout_report_override: Mutex::new(None),
+        })
+    }
+
+    /// Apply the validated, observe-only budget before starting the runtime.
+    pub(crate) async fn configure_egress(&mut self, config: &GossipConfig) {
+        self.egress_config = config.clone();
+        self.egress_config.participation = self.participation;
+        if let Some(warning) = self.egress_config.normalize_egress_budget() {
+            tracing::warn!("{warning}");
+        }
+        self.ensure_eager_ceiling().await;
+    }
+
+    /// Configure before any topic creation or inbound handling, including
+    /// standalone managers made with the synchronous public constructors.
+    async fn ensure_eager_ceiling(&self) {
+        self.eager_ceiling_initialized
+            .get_or_init(|| async {
+                let degree = if self.participation.forwards_passthrough() {
+                    0
+                } else {
+                    self.egress_config.leaf_max_eager_degree
+                };
+                self.plumtree.set_eager_degree_ceiling(degree).await;
+            })
+            .await;
+    }
+
+    /// Sample independently of HTTP reads, once per runtime peer-refresh tick.
+    pub(crate) fn sample_egress(&self) {
+        let stages = serde_json::to_value(self.plumtree.stage_stats()).unwrap_or_default();
+        let mut config = self.egress_config.clone();
+        config.participation = self.participation;
+        self.egress_meter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sample(
+                Instant::now(),
+                &stages["outbound_by_topic"],
+                &self.subscribed_topic_keys(),
+                &config,
+            );
+    }
+
+    /// Named subscription/outbound diagnostics. Names use stored IDs, including
+    /// raw DM inbox IDs; unknown or no-longer-subscribed rows stay unknown-hex.
+    pub fn egress_diagnostics(&self) -> serde_json::Value {
+        let names = self
+            .topic_id_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut subscribed = names
+            .iter()
+            .map(|(name, id)| (name.clone(), id.to_string()))
+            .collect::<Vec<_>>();
+        subscribed.sort();
+        let topics = subscribed
+            .iter()
+            .map(|(name, id)| serde_json::json!({"name": name, "topic_id_hex8": id}))
+            .collect::<Vec<_>>();
+        let stages = serde_json::to_value(self.plumtree.stage_stats()).unwrap_or_default();
+        let rows = stages["outbound_by_topic"]
+            .as_object()
+            .map(|rows| {
+                rows.iter()
+                    .map(|(id, counters)| {
+                        let matching = subscribed
+                            .iter()
+                            .filter(|(_, topic)| topic == id)
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>();
+                        serde_json::json!({
+                            "topic_id_hex8": id,
+                            "name": matching.first().map(String::as_str).unwrap_or("unknown-hex"),
+                            "names": matching,
+                            "outbound": counters,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let meter = self
+            .egress_meter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        serde_json::json!({
+            "subscribed_topics": topics,
+            "outbound_by_topic_named": rows,
+            "egress_budget": {
+                "leaf_max_eager_degree": self.egress_config.leaf_max_eager_degree,
+                "leaf_egress_soft_bytes_per_sec": self.egress_config.leaf_egress_soft_bytes_per_sec,
+                "leaf_egress_hard_bytes_per_sec": self.egress_config.leaf_egress_hard_bytes_per_sec,
+                "applies_to_leaf": !self.participation.forwards_passthrough(),
+                "sustained_cap_status": "experimental: pinned sg draft #51 ceiling; publication and full acceptance pending",
+                "byte_policy": "observe_only",
+                "window_secs": 60,
+                "sample_age_secs": meter.sampled_at.map(|at| at.elapsed().as_secs_f64()),
+                "subscribed_outbound_bytes_per_sec_60s": meter.rate,
+                "egress_budget_soft_exceeded": meter.soft_exceeded,
+                "egress_budget_hard_exceeded": meter.hard_exceeded,
+                "exceed_count_unit": "runtime samples above threshold (nominally 1s)",
+                "rate_semantics": "1s sampled subscribed-topic send-attempt bytes, all kinds including repair; 60s denominator including warm-up",
+                "per_topic_meter_limit": "sg may omit topics beyond its bounded meter; rate is observed bytes, not a hard bound",
+                "repair": {
+                    "tracking_overflow": self.transport.repair_tracking_overflow.load(Ordering::Relaxed),
+                    "iwant_matched_eager_attempt_msgs": self.transport.repair_msgs.load(Ordering::Relaxed),
+                    "iwant_matched_eager_attempt_bytes": self.transport.repair_bytes.load(Ordering::Relaxed),
+                    "semantics": "subset of eager counters matching authenticated v2 in-flight IWANT peer/topic/message IDs; includes coincident same-message forwards, not confirmed delivery; anti_entropy stays separate"
+                }
+            }
         })
     }
 
@@ -1011,9 +1133,16 @@ impl PubSubManager {
     /// PlumTree never creates pass-through state or eager-forwards them.
     /// Full nodes keep today's `handle_message` behaviour.
     pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
+        self.ensure_eager_ceiling().await;
         if self.refuse_leaf_unsubscribed_passthrough(&data) {
             return;
         }
+        let _repair_scope =
+            if peek_pubsub_header(&data).is_some_and(|header| header.kind == MessageKind::IWant) {
+                self.transport.track_iwant(peer, &data)
+            } else {
+                None
+            };
         if let Err(e) = self.plumtree.handle_message(peer, data).await {
             tracing::warn!(
                 "Failed to handle PlumTree pubsub message from {}: {e}",
@@ -1089,13 +1218,7 @@ impl PubSubManager {
     pub async fn refresh_topic_peers(&self) {
         // Issue #206: plane-gated peer view — only plane-cleared peers may
         // enter PlumTree eager sets.
-        let peers: Vec<PeerId> = self
-            .network
-            .gossip_plane_peers()
-            .await
-            .into_iter()
-            .map(|peer| PeerId::new(peer.0))
-            .collect();
+        let peers: Vec<PeerId> = self.transport.connected_peer_ids().await;
 
         // Refresh locally subscribed topics.
         let subscribed: Vec<String> = self.topic_ref_counts.read().await.keys().cloned().collect();
@@ -1106,9 +1229,13 @@ impl PubSubManager {
                 subscribed.len()
             );
         }
-        for topic in &subscribed {
-            let topic_id = TopicId::from_entity(topic.as_bytes());
-            self.apply_topic_peers(topic_id, peers.clone()).await;
+        let subscribed_ids: HashSet<TopicId> = self
+            .subscribed_topic_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for topic_id in &subscribed_ids {
+            self.apply_topic_peers(*topic_id, peers.clone()).await;
         }
 
         // Full (bootstrap / relay / `--relay`): also refresh pass-through
@@ -1122,10 +1249,6 @@ impl PubSubManager {
             .fetch_add(1, Ordering::Relaxed);
 
         let all_plumtree_topics = self.known_plumtree_topics().await;
-        let subscribed_ids: std::collections::HashSet<TopicId> = subscribed
-            .iter()
-            .map(|t| TopicId::from_entity(t.as_bytes()))
-            .collect();
         for topic_id in all_plumtree_topics {
             if !subscribed_ids.contains(&topic_id) {
                 self.apply_topic_peers(topic_id, peers.clone()).await;
@@ -1134,11 +1257,13 @@ impl PubSubManager {
     }
 
     async fn apply_topic_peers(&self, topic_id: TopicId, peers: Vec<PeerId>) {
+        self.ensure_eager_ceiling().await;
         #[cfg(test)]
         self.refreshed_topic_ids
             .lock()
             .expect("refresh log")
             .push(topic_id);
+        let peers = self.ordered_topic_peers(peers).await;
         self.plumtree.set_topic_peers(topic_id, peers).await;
     }
 
@@ -1187,14 +1312,10 @@ impl PubSubManager {
 
     /// Initialize PlumTree peers for a topic from currently connected peers.
     async fn initialize_topic_peers(&self, topic: TopicId) {
+        self.ensure_eager_ceiling().await;
         // Issue #206: plane-gated peer view (see refresh_topic_peers).
-        let peers: Vec<PeerId> = self
-            .network
-            .gossip_plane_peers()
-            .await
-            .into_iter()
-            .map(|peer| PeerId::new(peer.0))
-            .collect();
+        let peers: Vec<PeerId> = self.transport.connected_peer_ids().await;
+        let peers = self.ordered_topic_peers(peers).await;
         self.plumtree.initialize_topic_peers(topic, peers).await;
     }
 
@@ -1207,14 +1328,8 @@ impl PubSubManager {
     pub(crate) async fn refresh_subscribed_topic_id(&self, topic: &str, topic_id: TopicId) {
         self.register_dynamic_topic_priority(topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
-        let peers: Vec<PeerId> = self
-            .network
-            .gossip_plane_peers()
-            .await
-            .into_iter()
-            .map(|peer| PeerId::new(peer.0))
-            .collect();
-        self.plumtree.set_topic_peers(topic_id, peers).await;
+        let peers: Vec<PeerId> = self.transport.connected_peer_ids().await;
+        self.apply_topic_peers(topic_id, peers).await;
     }
 
     /// C5b: prefer one connected Full/bootstrap peer at the front of the
@@ -1227,11 +1342,11 @@ impl PubSubManager {
             return;
         }
         let plane: Vec<[u8; 32]> = self
-            .network
-            .gossip_plane_peers()
+            .transport
+            .connected_peer_ids()
             .await
             .into_iter()
-            .map(|peer| peer.0)
+            .map(|peer| *peer.as_bytes())
             .collect();
         self.apply_preferred_eager_peer(plane, topic_ids).await;
     }
@@ -1305,49 +1420,79 @@ impl PubSubManager {
     /// C5b continuation: pick the preferred eager peer and apply it to the
     /// ACK topics only (called by [`Self::prefer_one_full_bootstrap_eager`]).
     async fn apply_preferred_eager_peer(&self, plane: Vec<[u8; 32]>, topic_ids: &[TopicId]) {
+        let peers = plane.into_iter().map(PeerId::new).collect::<Vec<_>>();
+        for topic_id in topic_ids {
+            self.apply_topic_peers(*topic_id, peers.clone()).await;
+        }
+    }
+
+    /// One policy for every initializer/overwrite. Keep the full transport plane
+    /// as the source on each refresh so disconnected selected peers are replaced.
+    async fn ordered_topic_peers(&self, peers: Vec<PeerId>) -> Vec<PeerId> {
         let mut coordinators = Vec::new();
         let mut relays = Vec::new();
         if let Some(cache) = self.network.bootstrap_cache() {
+            // Fetch all candidates before tie-breaking. Truncating a HashMap-
+            // derived candidate list to six first would make the choice flap.
             coordinators = cache
-                .select_coordinators(6)
+                .select_coordinators(usize::MAX)
                 .await
                 .into_iter()
+                .filter(|peer| peer.capabilities.supports_coordination)
                 .map(|peer| peer.peer_id.0)
                 .collect();
             relays = cache
-                .select_relay_peers(6)
+                .select_relay_peers(usize::MAX)
                 .await
                 .into_iter()
+                .filter(|peer| peer.capabilities.supports_relay)
                 .map(|peer| peer.peer_id.0)
                 .collect();
         }
-        let Some(preferred) = select_one_full_bootstrap_eager_peer(
-            &plane,
+        ordered_leaf_peers(
+            peers,
             &coordinators,
             &relays,
             &self.network.config().pinned_bootstrap_peers,
-        ) else {
-            return;
-        };
-
-        let mut peers = vec![PeerId::new(preferred)];
-        for id in plane {
-            if id != preferred {
-                peers.push(PeerId::new(id));
-            }
-        }
-        for topic_id in topic_ids {
-            self.plumtree
-                .set_topic_peers(*topic_id, peers.clone())
-                .await;
-        }
+            if self.participation.forwards_passthrough() {
+                0
+            } else {
+                self.egress_config.leaf_max_eager_degree
+            },
+        )
     }
+}
+
+fn ordered_leaf_peers(
+    mut peers: Vec<PeerId>,
+    coordinators: &[[u8; 32]],
+    relays: &[[u8; 32]],
+    pinned: &HashSet<[u8; 32]>,
+    degree: usize,
+) -> Vec<PeerId> {
+    peers.sort_by_key(|peer| *peer.as_bytes());
+    peers.dedup();
+    let plane = peers
+        .iter()
+        .map(|peer| *peer.as_bytes())
+        .collect::<Vec<_>>();
+    if let Some(preferred) =
+        select_one_full_bootstrap_eager_peer(&plane, coordinators, relays, pinned)
+    {
+        peers.retain(|peer| peer.as_bytes() != &preferred);
+        peers.insert(0, PeerId::new(preferred));
+    }
+    if degree != 0 {
+        peers.truncate(degree);
+    }
+    peers
 }
 
 /// Pick at most one connected Full/bootstrap peer for ACK-topic eager.
 ///
 /// Order: coordinators, then relays, then pinned bootstrap IDs. Returns
-/// `None` when the plane has no such peer so callers leave membership alone.
+/// `None` when the plane has no such peer; the Leaf policy then uses the
+/// sorted eligible plane without a preferred slot. Ties use the full PeerId.
 pub(crate) fn select_one_full_bootstrap_eager_peer(
     plane: &[[u8; 32]],
     coordinators: &[[u8; 32]],
@@ -1357,10 +1502,17 @@ pub(crate) fn select_one_full_bootstrap_eager_peer(
     let connected: std::collections::HashSet<[u8; 32]> = plane.iter().copied().collect();
     coordinators
         .iter()
-        .find(|id| connected.contains(*id))
+        .filter(|id| connected.contains(*id))
+        .min()
         .copied()
-        .or_else(|| relays.iter().find(|id| connected.contains(*id)).copied())
-        .or_else(|| plane.iter().copied().find(|id| pinned.contains(id)))
+        .or_else(|| {
+            relays
+                .iter()
+                .filter(|id| connected.contains(*id))
+                .min()
+                .copied()
+        })
+        .or_else(|| plane.iter().copied().filter(|id| pinned.contains(id)).min())
 }
 
 /// Decode and filter a delivered payload before exposing it to x0x subscribers.
@@ -2019,6 +2171,793 @@ mod tests {
                 .await
                 .expect("Failed to create test node"),
         )
+    }
+
+    async fn slice1_manager(degree: usize, full: bool) -> PubSubManager {
+        let mut network_config = NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: vec![],
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..Default::default()
+        };
+        network_config.pinned_bootstrap_peers.insert([8; 32]);
+        let node = Arc::new(NetworkNode::new(network_config, None, None).await.unwrap());
+        let mut manager = PubSubManager::new_with_participation(
+            node,
+            None,
+            None,
+            if full {
+                ParticipationMode::Full
+            } else {
+                ParticipationMode::Leaf
+            },
+            "slice1_test",
+        )
+        .unwrap();
+        manager
+            .configure_egress(&GossipConfig {
+                leaf_max_eager_degree: degree,
+                leaf_egress_soft_bytes_per_sec: 1,
+                leaf_egress_hard_bytes_per_sec: 2,
+                ..Default::default()
+            })
+            .await;
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: (1..=8).rev().map(|id| PeerId::new([id; 32])).collect(),
+            sends: Vec::new(),
+        });
+        manager
+    }
+
+    fn recorded_eager(
+        manager: &PubSubManager,
+    ) -> Vec<(PeerId, saorsa_gossip_pubsub::GossipMessage)> {
+        let sends = std::mem::take(
+            &mut manager
+                .transport
+                .recorder
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .sends,
+        );
+        sends
+            .into_iter()
+            .filter_map(|(peer, bytes)| {
+                let message: saorsa_gossip_pubsub::GossipMessage =
+                    postcard::from_bytes(&bytes).unwrap();
+                (message.header.kind == MessageKind::Eager).then_some((peer, message))
+            })
+            .collect()
+    }
+
+    /// Cumulative EAGER send attempts claimed by sg (stage_stats). Claims are
+    /// recorded synchronously before detached forward tasks are spawned, so a
+    /// delta taken after `handle_incoming` / publish returns is the settle
+    /// target for the test recorder — not a guessed minimum.
+    fn eager_outbound_attempt_msgs(manager: &PubSubManager) -> u64 {
+        manager
+            .stage_stats()
+            .outbound_by_kind
+            .get("eager")
+            .map(|meter| meter.msgs)
+            .unwrap_or(0)
+    }
+
+    /// Count Eager frames for `msg_id` in the recorder without draining.
+    fn count_eager_for_msg(manager: &PubSubManager, msg_id: [u8; 32]) -> usize {
+        manager
+            .transport
+            .recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sends
+            .iter()
+            .filter(|(_, bytes)| {
+                peek_pubsub_header(bytes)
+                    .is_some_and(|h| h.kind == MessageKind::Eager && h.msg_id == msg_id)
+            })
+            .count()
+    }
+
+    /// Peek Eager (peer, message) pairs for `msg_id` without draining.
+    fn peek_eager_for_msg(
+        manager: &PubSubManager,
+        msg_id: [u8; 32],
+    ) -> Vec<(PeerId, saorsa_gossip_pubsub::GossipMessage)> {
+        manager
+            .transport
+            .recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sends
+            .iter()
+            .filter_map(|(peer, bytes)| {
+                let message: saorsa_gossip_pubsub::GossipMessage =
+                    postcard::from_bytes(bytes).ok()?;
+                (message.header.kind == MessageKind::Eager && message.header.msg_id == msg_id)
+                    .then_some((*peer, message))
+            })
+            .collect()
+    }
+
+    /// Wait with a declared deadline until every metered EAGER attempt for
+    /// `msg_id` has hit the test recorder (complete per-message recipient set).
+    /// `attempted == 0` settles immediately as the legitimate empty forward set
+    /// (e.g. D=1 inbound from the sole selected peer).
+    async fn await_eager_settled_for_msg(
+        manager: &PubSubManager,
+        msg_id: [u8; 32],
+        attempted: usize,
+    ) -> Vec<(PeerId, saorsa_gossip_pubsub::GossipMessage)> {
+        if attempted == 0 {
+            return peek_eager_for_msg(manager, msg_id);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if count_eager_for_msg(manager, msg_id) >= attempted {
+                    return peek_eager_for_msg(manager, msg_id);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "eager fanout for msg did not settle before deadline (wanted {attempted} recorded sends)"
+            )
+        })
+    }
+
+    /// Like [`await_eager_settled_for_msg`], but discovers the sole new msg_id
+    /// after a drained recorder (local publish path).
+    async fn await_eager_settled_attempts(
+        manager: &PubSubManager,
+        attempted: usize,
+    ) -> Vec<(PeerId, saorsa_gossip_pubsub::GossipMessage)> {
+        if attempted == 0 {
+            return Vec::new();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let msg_id = manager
+                    .transport
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .sends
+                    .iter()
+                    .find_map(|(_, bytes)| {
+                        peek_pubsub_header(bytes).and_then(|h| {
+                            (h.kind == MessageKind::Eager).then_some(h.msg_id)
+                        })
+                    });
+                if let Some(msg_id) = msg_id {
+                    if count_eager_for_msg(manager, msg_id) >= attempted {
+                        return peek_eager_for_msg(manager, msg_id);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "eager publish fanout did not settle before deadline (wanted {attempted} recorded sends)"
+            )
+        })
+    }
+
+    fn slice1_signed_frame(
+        kind: MessageKind,
+        topic: TopicId,
+        payload: Bytes,
+        id: [u8; 32],
+    ) -> Bytes {
+        let key = saorsa_gossip_identity::MlDsaKeyPair::generate().unwrap();
+        let mut header = MessageHeader::new(topic, kind, 10);
+        header.msg_id = id;
+        header.seal_payload_hash(Some(&payload));
+        let signature = key.sign(&postcard::to_stdvec(&header).unwrap()).unwrap();
+        postcard::to_stdvec(&saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: key.public_key().to_vec(),
+        })
+        .unwrap()
+        .into()
+    }
+
+    #[tokio::test]
+    async fn slice1_four_writers_record_actual_eager_recipients_and_delivery() {
+        for (degree, full) in [(1, false), (2, false), (12, false), (0, false), (2, true)] {
+            let manager = slice1_manager(degree, full).await;
+            let name = "x0x/dm/v1/inbox/slice1";
+            let topic = TopicId::new([42; 32]);
+            let mut sub = manager.subscribe_topic_id(name.into(), topic).await;
+            let expected = if full || degree == 0 || degree == 12 {
+                6
+            } else {
+                degree
+            };
+            for writer in 0..4 {
+                // Permute HashMap-like plane ordering before each actual writer.
+                manager
+                    .transport
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .peers
+                    .rotate_left(1);
+                match writer {
+                    0 => manager.initialize_topic_peers(topic).await,
+                    1 => {
+                        manager.refresh_topic_peers().await;
+                        manager.refresh_topic_peers().await;
+                    }
+                    2 => manager.refresh_subscribed_topic_id(name, topic).await,
+                    _ => manager.prefer_one_full_bootstrap_eager(&[topic]).await,
+                }
+                recorded_eager(&manager);
+                let publish_before = eager_outbound_attempt_msgs(&manager);
+                manager
+                    .publish_topic_id(name.into(), topic, Bytes::from(format!("local-{writer}")))
+                    .await
+                    .unwrap();
+                let publish_attempted =
+                    (eager_outbound_attempt_msgs(&manager) - publish_before) as usize;
+                let sends = await_eager_settled_attempts(&manager, publish_attempted).await;
+                assert_eq!(
+                    sends.len(),
+                    expected,
+                    "writer {writer}, D={degree}, full={full}"
+                );
+                assert_eq!(
+                    publish_attempted, expected,
+                    "metered publish attempts must match the selected ceiling"
+                );
+                if expected <= 2 {
+                    let actual = sends
+                        .iter()
+                        .map(|(peer, _)| *peer.as_bytes())
+                        .collect::<HashSet<_>>();
+                    let wanted = if degree == 1 {
+                        HashSet::from([[8; 32]])
+                    } else {
+                        HashSet::from([[8; 32], [1; 32]])
+                    };
+                    assert_eq!(
+                        actual, wanted,
+                        "all writers preserve preferred + deterministic remainder"
+                    );
+                }
+                recorded_eager(&manager);
+                let local = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(local.payload, Bytes::from(format!("local-{writer}")));
+                // A selected inbound sender cannot expand stock sg; unlisted
+                // inbound expansion is the separate, explicitly held sg gate.
+                let inbound_from = PeerId::new([8; 32]);
+                let inbound_msg_id = [50 + writer; 32];
+                let payload = encode_v1(name, &Bytes::from(format!("remote-{writer}"))).unwrap();
+                let frame = slice1_signed_frame(MessageKind::Eager, topic, payload, inbound_msg_id);
+                let inbound_before = eager_outbound_attempt_msgs(&manager);
+                manager.handle_incoming(inbound_from, frame).await;
+                let inbound_attempted =
+                    (eager_outbound_attempt_msgs(&manager) - inbound_before) as usize;
+                let sends =
+                    await_eager_settled_for_msg(&manager, inbound_msg_id, inbound_attempted).await;
+                assert_eq!(
+                    sends.len(),
+                    inbound_attempted,
+                    "settled recipient set must include every metered attempt"
+                );
+                assert!(
+                    sends.iter().all(|(peer, _)| *peer != inbound_from),
+                    "forward set must exclude the inbound sender"
+                );
+                if expected == 1 {
+                    // Sole selected peer is the sender: legitimate zero-recipient forward.
+                    assert_eq!(
+                        inbound_attempted, 0,
+                        "D=1 inbound from sole selected peer must claim zero forwards"
+                    );
+                    assert!(
+                        sends.is_empty(),
+                        "D=1 inbound from sole selected peer must record zero recipients"
+                    );
+                } else {
+                    assert!(
+                        inbound_attempted >= 1,
+                        "live eligible recipients must yield positive forward attempts"
+                    );
+                    assert!(
+                        inbound_attempted <= expected,
+                        "inbound fanout must obey the selected ceiling"
+                    );
+                }
+                recorded_eager(&manager);
+                let received = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(received.payload, Bytes::from(format!("remote-{writer}")));
+            }
+            assert_eq!(
+                manager.egress_diagnostics()["subscribed_topics"][0]["topic_id_hex8"],
+                topic.to_string(),
+                "named diagnostics must retain the raw DM transport ID"
+            );
+            let topics = manager.plumtree_topic_ids().await;
+            assert!(
+                !topics.contains(&TopicId::from_entity(name.as_bytes())),
+                "periodic refresh must use the stored raw DM ID"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slice1_named_meters_repair_and_thresholds_do_not_shed() {
+        let manager = slice1_manager(2, false).await;
+        let name = "x0x/dm/v1/bus";
+        let topic = TopicId::from_entity(name.as_bytes());
+        let mut sub = manager.subscribe(name.into()).await;
+        let cached_before = eager_outbound_attempt_msgs(&manager);
+        manager
+            .publish(name.into(), Bytes::from("cached"))
+            .await
+            .unwrap();
+        let cached_attempted = (eager_outbound_attempt_msgs(&manager) - cached_before) as usize;
+        let initial = await_eager_settled_attempts(&manager, cached_attempted).await;
+        let id = initial[0].1.header.msg_id;
+        recorded_eager(&manager);
+        let request = slice1_signed_frame(
+            MessageKind::IWant,
+            topic,
+            postcard::to_stdvec(&vec![id]).unwrap().into(),
+            [0; 32],
+        );
+        // Real cached IWANT handler + spawned send task + outbound recorder.
+        let repair_before = eager_outbound_attempt_msgs(&manager);
+        manager.handle_incoming(PeerId::new([7; 32]), request).await;
+        let repair_attempted = (eager_outbound_attempt_msgs(&manager) - repair_before) as usize;
+        let repaired = await_eager_settled_for_msg(&manager, id, repair_attempted).await;
+        assert_eq!(repaired.len(), 1);
+        assert_eq!(repaired[0].0, PeerId::new([7; 32]));
+        assert_eq!(repaired[0].1.header.msg_id, id);
+        recorded_eager(&manager);
+        manager.sample_egress();
+        let before = manager.egress_diagnostics();
+        assert_eq!(before["subscribed_topics"][0]["name"], name);
+        assert_eq!(
+            before["subscribed_topics"][0]["topic_id_hex8"],
+            "a746d680e31732d1"
+        );
+        assert_eq!(before["outbound_by_topic_named"][0]["name"], name);
+        assert_eq!(
+            before["egress_budget"]["repair"]["iwant_matched_eager_attempt_msgs"],
+            1
+        );
+        assert!(
+            before["egress_budget"]["egress_budget_hard_exceeded"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let before_refresh_pub = eager_outbound_attempt_msgs(&manager);
+        manager
+            .publish(name.into(), Bytes::from("after-iwant-before-refresh"))
+            .await
+            .unwrap();
+        let before_refresh_attempted =
+            (eager_outbound_attempt_msgs(&manager) - before_refresh_pub) as usize;
+        let before_refresh_sends =
+            await_eager_settled_attempts(&manager, before_refresh_attempted).await;
+        assert!(
+            before_refresh_sends.len() <= 2,
+            "repair promotion must preserve the ceiling before refresh"
+        );
+        assert!(
+            !before_refresh_sends.is_empty(),
+            "publish with live selected peers must record positive eager delivery"
+        );
+        recorded_eager(&manager);
+        manager.refresh_topic_peers().await;
+        let after_hard_before = eager_outbound_attempt_msgs(&manager);
+        manager
+            .publish(name.into(), Bytes::from("after-hard-exceed"))
+            .await
+            .unwrap();
+        let after_hard_attempted =
+            (eager_outbound_attempt_msgs(&manager) - after_hard_before) as usize;
+        let after_hard_sends = await_eager_settled_attempts(&manager, after_hard_attempted).await;
+        assert_eq!(
+            after_hard_sends.len(),
+            2,
+            "byte thresholds never shed sends"
+        );
+        recorded_eager(&manager);
+        let first = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.payload, Bytes::from("cached"));
+        assert_eq!(second.payload, Bytes::from("after-iwant-before-refresh"));
+        let third = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.payload, Bytes::from("after-hard-exceed"));
+        assert_eq!(
+            manager.egress_diagnostics()["egress_budget"]["egress_budget_hard_exceeded"],
+            before["egress_budget"]["egress_budget_hard_exceeded"],
+            "HTTP reads must not increment counters"
+        );
+    }
+
+    #[tokio::test]
+    async fn slice1_replacement_after_selected_peer_failure() {
+        let manager = slice1_manager(2, false).await;
+        let name = "slice1-failover";
+        let mut sub = manager.subscribe(name.into()).await;
+        for (removed, expected) in [
+            (vec![8], HashSet::from([[1; 32], [2; 32]])),
+            (vec![1, 2], HashSet::from([[3; 32], [4; 32]])),
+        ] {
+            manager
+                .transport
+                .recorder
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .peers
+                .retain(|peer| !removed.contains(&peer.as_bytes()[0]));
+            manager.refresh_topic_peers().await;
+            recorded_eager(&manager);
+            let payload = Bytes::from(format!("after-removing-{removed:?}"));
+            let pub_before = eager_outbound_attempt_msgs(&manager);
+            manager.publish(name.into(), payload.clone()).await.unwrap();
+            let pub_attempted = (eager_outbound_attempt_msgs(&manager) - pub_before) as usize;
+            let sends = await_eager_settled_attempts(&manager, pub_attempted).await;
+            assert_eq!(
+                sends
+                    .iter()
+                    .map(|(peer, _)| *peer.as_bytes())
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+            recorded_eager(&manager);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+                payload
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn slice1_pinned_sg_caps_unlisted_inbound_and_interleaved_publish() {
+        let manager = slice1_manager(2, false).await;
+        let name = "slice1-sg-hold";
+        let topic = TopicId::from_entity(name.as_bytes());
+        let mut sub = manager.subscribe(name.into()).await;
+        for peer in [3, 4, 5] {
+            let inbound_from = PeerId::new([peer; 32]);
+            let inbound_msg_id = [peer; 32];
+            let frame = slice1_signed_frame(
+                MessageKind::Eager,
+                topic,
+                encode_v1(name, &Bytes::from(vec![peer])).unwrap(),
+                inbound_msg_id,
+            );
+            let inbound_before = eager_outbound_attempt_msgs(&manager);
+            manager.handle_incoming(inbound_from, frame).await;
+            let inbound_attempted =
+                (eager_outbound_attempt_msgs(&manager) - inbound_before) as usize;
+            let sends =
+                await_eager_settled_for_msg(&manager, inbound_msg_id, inbound_attempted).await;
+            assert_eq!(sends.len(), inbound_attempted);
+            assert!(
+                sends.iter().all(|(peer_id, _)| *peer_id != inbound_from),
+                "forward set must exclude the unlisted inbound sender"
+            );
+            assert!(
+                inbound_attempted >= 1,
+                "unlisted inbound with live selected peers must forward positively"
+            );
+            assert!(
+                inbound_attempted <= 2,
+                "inbound handler must cap before forwarding"
+            );
+            recorded_eager(&manager);
+            assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap()
+                .is_some());
+            let requester = PeerId::new([peer + 3; 32]);
+            let request = slice1_signed_frame(
+                MessageKind::IWant,
+                topic,
+                postcard::to_stdvec(&vec![[peer; 32]]).unwrap().into(),
+                [0; 32],
+            );
+            let repair_before = eager_outbound_attempt_msgs(&manager);
+            manager.handle_incoming(requester, request).await;
+            let repair_attempted = (eager_outbound_attempt_msgs(&manager) - repair_before) as usize;
+            let repair =
+                await_eager_settled_for_msg(&manager, inbound_msg_id, repair_attempted).await;
+            assert_eq!(
+                repair.len(),
+                1,
+                "cached IWANT reply remains available outside selected peers"
+            );
+            assert_eq!(repair[0].0, requester);
+            recorded_eager(&manager);
+            let interleave_before = eager_outbound_attempt_msgs(&manager);
+            manager
+                .publish(name.into(), Bytes::from(vec![peer, 9]))
+                .await
+                .unwrap();
+            let interleave_attempted =
+                (eager_outbound_attempt_msgs(&manager) - interleave_before) as usize;
+            let interleave = await_eager_settled_attempts(&manager, interleave_attempted).await;
+            assert!(
+                !interleave.is_empty(),
+                "interleaved publish after repair promotion must attempt delivery"
+            );
+            assert!(
+                interleave.len() <= 2,
+                "interleaved publish after repair promotion"
+            );
+            recorded_eager(&manager);
+            assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap()
+                .is_some());
+        }
+        recorded_eager(&manager);
+        let final_before = eager_outbound_attempt_msgs(&manager);
+        manager
+            .publish(name.into(), Bytes::from("between-refreshes"))
+            .await
+            .unwrap();
+        let final_attempted = (eager_outbound_attempt_msgs(&manager) - final_before) as usize;
+        let final_sends = await_eager_settled_attempts(&manager, final_attempted).await;
+        let actual = final_sends.len();
+        assert!(
+            !final_sends.is_empty(),
+            "between-refreshes publish must attempt positive eager delivery"
+        );
+        assert!(
+            actual <= 2,
+            "pinned sg must preserve D between x0x refreshes"
+        );
+        recorded_eager(&manager);
+        eprintln!("Pinned sg #51: D=2, unlisted inbound + interleaved publish, final eager fanout={actual}");
+    }
+
+    #[tokio::test]
+    async fn slice1_pinned_sg_concurrent_publishers_after_maintenance_timers() {
+        let manager = slice1_manager(2, false).await;
+        // The measured DM bus is Critical and queues concurrent sends. Normal
+        // topics intentionally shed when their single sg send slot is occupied.
+        let name = "x0x/dm/v1/bus";
+        let topic = TopicId::from_entity(name.as_bytes());
+        let mut sub = manager.subscribe(name.into()).await;
+        // Exercise two actual maintenance periods (including startup jitter).
+        // Keep sg's std::time deadlines and Tokio timers on the same clock.
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_secs(31)).await;
+        }
+        let frames = (3..=6)
+            .map(|peer| {
+                (
+                    PeerId::new([peer; 32]),
+                    slice1_signed_frame(
+                        MessageKind::Eager,
+                        topic,
+                        encode_v1(name, &Bytes::from(vec![peer])).unwrap(),
+                        [peer; 32],
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        recorded_eager(&manager);
+        tokio::join!(
+            async {
+                for (peer, frame) in frames {
+                    manager.handle_incoming(peer, frame).await;
+                }
+            },
+            async {
+                for id in 10..14 {
+                    manager
+                        .publish(name.into(), Bytes::from(vec![id]))
+                        .await
+                        .unwrap();
+                }
+            }
+        );
+        // Inbound EAGER fanout uses detached tasks: handler completion alone
+        // is not transport evidence. Await all expected recording sends.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let eager_count = manager
+                    .transport
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .sends
+                    .iter()
+                    .filter(|(_, bytes)| {
+                        peek_pubsub_header(bytes).is_some_and(|h| h.kind == MessageKind::Eager)
+                    })
+                    .count();
+                if eager_count >= 16 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eight messages must reach both selected peers");
+        let mut sends_per_message = HashMap::new();
+        for (_, message) in recorded_eager(&manager) {
+            *sends_per_message.entry(message.header.msg_id).or_insert(0) += 1;
+        }
+        assert_eq!(sends_per_message.len(), 8);
+        assert_eq!(manager.stage_stats().outbound_budget_exhausted, 0);
+        assert!(
+            sends_per_message.values().all(|count| *count <= 2),
+            "each concurrent unsolicited forwarding event obeys D"
+        );
+        for _ in 0..8 {
+            assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn slice1_ihave_iwant_recovers_missed_message_after_selected_failure() {
+        let owner = slice1_manager(2, false).await;
+        let receiver = slice1_manager(2, false).await;
+        let name = "slice1-recovery";
+        let topic = TopicId::from_entity(name.as_bytes());
+        let _owner_sub = owner.subscribe(name.into()).await;
+        let mut receiver_sub = receiver.subscribe(name.into()).await;
+        let first_before = eager_outbound_attempt_msgs(&owner);
+        owner
+            .publish(name.into(), Bytes::from("deliberately-missed"))
+            .await
+            .unwrap();
+        let first_attempted = (eager_outbound_attempt_msgs(&owner) - first_before) as usize;
+        let first = await_eager_settled_attempts(&owner, first_attempted).await;
+        let id = first[0].1.header.msg_id;
+        recorded_eager(&owner);
+        // Lose both selected carriers; no initial EAGER reaches the receiver.
+        owner
+            .transport
+            .recorder
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .peers
+            .retain(|peer| ![1, 8].contains(&peer.as_bytes()[0]));
+        owner.refresh_topic_peers().await;
+        let ihave = slice1_signed_frame(
+            MessageKind::IHave,
+            topic,
+            postcard::to_stdvec(&vec![id]).unwrap().into(),
+            [0; 32],
+        );
+        receiver.handle_incoming(PeerId::new([3; 32]), ihave).await;
+        let sends = std::mem::take(
+            &mut receiver
+                .transport
+                .recorder
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .sends,
+        );
+        let request = sends
+            .into_iter()
+            .find(|(peer, bytes)| {
+                *peer == PeerId::new([3; 32])
+                    && peek_pubsub_header(bytes).is_some_and(|h| h.kind == MessageKind::IWant)
+            })
+            .expect("real IHAVE handler emits IWANT")
+            .1;
+        let repair_before = eager_outbound_attempt_msgs(&owner);
+        owner.handle_incoming(PeerId::new([4; 32]), request).await;
+        let repair_attempted = (eager_outbound_attempt_msgs(&owner) - repair_before) as usize;
+        let repair = await_eager_settled_for_msg(&owner, id, repair_attempted).await;
+        assert_eq!(repair.len(), 1);
+        assert_eq!(repair[0].0, PeerId::new([4; 32]));
+        recorded_eager(&owner);
+        receiver
+            .handle_incoming(
+                PeerId::new([3; 32]),
+                postcard::to_stdvec(&repair[0].1).unwrap().into(),
+            )
+            .await;
+        let recovered = tokio::time::timeout(Duration::from_secs(2), receiver_sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.payload, Bytes::from("deliberately-missed"));
+        let after_before = eager_outbound_attempt_msgs(&owner);
+        owner
+            .publish(name.into(), Bytes::from("after-recovery"))
+            .await
+            .unwrap();
+        let after_attempted = (eager_outbound_attempt_msgs(&owner) - after_before) as usize;
+        let after_sends = await_eager_settled_attempts(&owner, after_attempted).await;
+        assert!(after_sends.len() <= 2);
+        assert!(!after_sends.is_empty());
+    }
+
+    #[test]
+    fn slice1_deterministic_full_width_ties_duplicates_and_replacements() {
+        let mut peers = (1..=8).map(|id| PeerId::new([id; 32])).collect::<Vec<_>>();
+        peers.push(PeerId::new([1; 32]));
+        for _ in 0..peers.len() {
+            peers.rotate_left(1);
+            let selected = ordered_leaf_peers(
+                peers.clone(),
+                &[[8; 32], [7; 32]],
+                &[[6; 32]],
+                &HashSet::new(),
+                2,
+            );
+            assert_eq!(selected, vec![PeerId::new([7; 32]), PeerId::new([1; 32])]);
+        }
+        let mut a = [1; 32];
+        a[31] = 2;
+        let mut b = a;
+        b[31] = 3;
+        assert_eq!(
+            ordered_leaf_peers(
+                vec![PeerId::new(b), PeerId::new(a)],
+                &[],
+                &[],
+                &HashSet::new(),
+                1
+            ),
+            vec![PeerId::new(a)]
+        );
+        peers.retain(|peer| ![1, 7].contains(&peer.as_bytes()[0]));
+        assert_eq!(
+            ordered_leaf_peers(peers, &[[7; 32], [8; 32]], &[], &HashSet::new(), 2),
+            vec![PeerId::new([8; 32]), PeerId::new([2; 32])]
+        );
     }
 
     // -----------------------------------------------------------------------

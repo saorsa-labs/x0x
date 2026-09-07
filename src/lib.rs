@@ -3963,6 +3963,14 @@ impl Agent {
             .map(|rt| rt.pubsub().participation_snapshot())
     }
 
+    /// Named topic meters and experimental Leaf egress budget diagnostics.
+    #[must_use]
+    pub fn gossip_egress_diagnostics(&self) -> Option<serde_json::Value> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().egress_diagnostics())
+    }
+
     /// Record a `fan_out == 0` group publish and return whether to `warn!`.
     ///
     /// Increments `publish_zero_fanout` (surfaced as

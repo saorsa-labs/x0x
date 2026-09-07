@@ -274,6 +274,10 @@ async fn main() -> anyhow::Result<()> {
         config.bootstrap_peers = Some(Vec::new());
     }
 
+    if let Some(warning) = config.gossip.normalize_egress_budget() {
+        eprintln!("Warning: {warning}");
+    }
+
     config
         .gossip
         .validate()
