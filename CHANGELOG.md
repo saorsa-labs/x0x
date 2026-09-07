@@ -63,7 +63,7 @@ All notable changes to this project will be documented in this file.
 
 Patch candidate: experimental Leaf eager-degree selection + named gossip egress
 meters (#504 slice 1), test-oracle settle for detached eager fanout, and
-consumer deps on published saorsa-gossip **0.5.76** / ant-quic **0.27.49**.
+consumer deps on published saorsa-gossip **0.5.76** / ant-quic **0.27.50**.
 
 ### Added
 
@@ -85,7 +85,7 @@ consumer deps on published saorsa-gossip **0.5.76** / ant-quic **0.27.49**.
 ### Changed
 
 - **Dependencies:** direct `saorsa-gossip-*` → **0.5.76** and `ant-quic` →
-  **0.27.49** from crates.io; removed the temporary `[patch.crates-io]` git pin
+  **0.27.50** from crates.io; removed the temporary `[patch.crates-io]` git pin
   formerly used for sg draft #51 integration.
 
 ## [v0.41.3] - 2026-09-05

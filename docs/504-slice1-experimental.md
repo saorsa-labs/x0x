@@ -2,7 +2,7 @@
 
 Implements the x0x portion of [design #534](design/504-leaf-egress-budget.md)
 §6.1–6.2. Consumes published crates.io **saorsa-gossip 0.5.76** (sg crate family)
-and **ant-quic 0.27.49** so shared types stay on one release line (replacing the
+and **ant-quic 0.27.50** so shared types stay on one release line (replacing the
 earlier temporary git pin of sg draft #51). The ceiling is configured once before
 any topic creation or inbound traffic, including standalone managers; Full / D=0
 use stock bounds. **Sustained-cap claim and full #504 acceptance remain held —
