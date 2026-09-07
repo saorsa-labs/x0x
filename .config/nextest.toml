@@ -91,3 +91,15 @@ threads-required = 4
 [[profile.default.overrides]]
 filter = "test(discovered_but_disconnected_peer_is_dialed_by_same_send) | test(identity_epoch_converges_with_linear_application_publishes) | test(non_treekem_self_leave_directly_delivers_member_removed_to_retained_owner) | binary(gossip_plane_isolation)"
 test-group = "quic-localhost"
+
+# Issue #510: cap concurrent execution of the deadline-carrying membership
+# cluster tests at two. This bounds their overlap with one another while
+# leaving unrelated suite tests eligible to run concurrently. Deadlines,
+# assertions and test selection remain unchanged; this resource limit does
+# not by itself establish the cause of a convergence timeout.
+[test-groups.membership-cluster]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = "test(hs_f2_membership_cluster) | test(issue506_public_broadcast_control)"
+test-group = "membership-cluster"
