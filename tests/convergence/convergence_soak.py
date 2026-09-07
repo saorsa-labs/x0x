@@ -427,6 +427,17 @@ REVIEWED_SOURCES = [
 ]
 LEGACY_REQUIRED_VERSION = "0.30.1"
 
+# ADR-014 modern-only predicate: stock mixed-version phases are excluded from
+# PASS and labeled not_in_modern_predicate (never silently skipped-as-green).
+MODERN_EXCLUDED_GATE_NAMES = (
+    "mixed_version_skew_load_bearing",
+    "mixed_version_skew_degraded",
+)
+NOT_IN_MODERN_PREDICATE = "not_in_modern_predicate"
+INCOMPLETE_POLICY = "incomplete_policy"
+MODERN_POLICY_ADMISSION = "modern_policy_admission"
+
+
 
 def sha256_file(path):
     """Streaming SHA-256 hex digest of a file."""
@@ -2698,6 +2709,228 @@ def summarize(runs, args, prereq_gates=None, provenance=None,
     return "\n".join(lines)
 
 
+
+def modern_excluded_gate_record(name):
+    """Classifier record for a stock mixed-version phase under --modern-only.
+
+    Status is never PASS: ADR-014 requires explicit not_in_modern_predicate.
+    """
+    return {
+        "name": name,
+        "status": NOT_IN_MODERN_PREDICATE,
+        "predicate": NOT_IN_MODERN_PREDICATE,
+        "modern_only": True,
+        "note": ("stock v0.30.1 mixed-version phase excluded from modern "
+                 "release predicate (ADR-014); retained on stock "
+                 "convergence-release only"),
+    }
+
+
+def refuse_legacy_env_under_modern_only(legacy_binary=None, environ=None):
+    """Fail closed if a legacy binary path is supplied under --modern-only.
+
+    Returns an error string when refusal is required, else None. Used by
+    main() and hermetic self-tests.
+    """
+    import os as _os
+    env = environ if environ is not None else _os.environ
+    env_val = env.get("X0XD_LEGACY_BINARY")
+    if legacy_binary or env_val:
+        return (
+            "REFUSING --modern-only: X0XD_LEGACY_BINARY / --legacy-binary "
+            "must be unset (stock-in-modern-predicate is fail-closed; "
+            "use stock `just convergence-release` for mixed-version)")
+    return None
+
+
+def classify_prereq_gates_for_modern(gates):
+    """Ensure mixed-version gates are labeled not_in_modern_predicate.
+
+    Any gate whose name is in MODERN_EXCLUDED_GATE_NAMES is rewritten to the
+    classifier label (never PASS). Other gates are left unchanged.
+    """
+    out = []
+    for g in gates:
+        name = g.get("name") if isinstance(g, dict) else None
+        if name in MODERN_EXCLUDED_GATE_NAMES:
+            out.append(modern_excluded_gate_record(name))
+        else:
+            out.append(g)
+    # Always emit both excluded names so the receipt/classifier is complete
+    # even if mixed-version was never invoked.
+    present = {g.get("name") for g in out if isinstance(g, dict)}
+    for name in MODERN_EXCLUDED_GATE_NAMES:
+        if name not in present:
+            out.append(modern_excluded_gate_record(name))
+    return out
+
+
+def classify_modern_policy_admission(policy, grants_enabled):
+    """Classify live or fixture policy readback for modern admission.
+
+    PASS only when policy is reject_v1 AND grants_enabled is False.
+    None policy → incomplete_policy (missing/unreadable).
+    accept_v1 or unexpected → fail.
+    grants_enabled True → fail.
+    grants_enabled None with reject_v1 → incomplete_policy (cannot prove
+    grants disabled — do not invent a PASS path).
+    """
+    base = {"name": MODERN_POLICY_ADMISSION, "modern_only": True}
+    if policy is None:
+        return {
+            **base,
+            "status": INCOMPLETE_POLICY,
+            "reason": "missing_or_unreadable_outer_signature_policy",
+            "outer_signature_policy": None,
+            "grants_enabled": grants_enabled,
+        }
+    p = str(policy).strip().lower().replace("-", "_")
+    if p in ("accept_v1",):
+        return {
+            **base,
+            "status": "fail",
+            "reason": "AcceptV1_not_allowed",
+            "outer_signature_policy": policy,
+            "grants_enabled": grants_enabled,
+        }
+    if grants_enabled is True:
+        return {
+            **base,
+            "status": "fail",
+            "reason": "grants_enabled",
+            "outer_signature_policy": policy,
+            "grants_enabled": True,
+        }
+    if p != "reject_v1":
+        return {
+            **base,
+            "status": "fail",
+            "reason": f"unexpected_policy:{policy}",
+            "outer_signature_policy": policy,
+            "grants_enabled": grants_enabled,
+        }
+    if grants_enabled is None:
+        return {
+            **base,
+            "status": INCOMPLETE_POLICY,
+            "reason": "grants_disabled_unproven",
+            "outer_signature_policy": policy,
+            "grants_enabled": None,
+        }
+    return {
+        **base,
+        "status": "pass",
+        "reason": "reject_v1_grants_disabled",
+        "outer_signature_policy": policy,
+        "grants_enabled": False,
+    }
+
+
+def extract_policy_from_diagnostics_body(body):
+    """Pull outer_signature_policy from GET /diagnostics/gossip body (#546)."""
+    if not isinstance(body, dict):
+        return None
+    val = body.get("outer_signature_policy")
+    if val is None:
+        return None
+    return val
+
+
+def extract_grants_enabled_from_diagnostics_body(body):
+    """Best-effort grants-enabled flag from diagnostics.
+
+    Prefer explicit boolean fields; map receipt-style legacy_grants strings.
+    If no grants evidence key is present (current #546 tip), return None so
+    admission stays incomplete_policy — never a silent PASS.
+    """
+    if not isinstance(body, dict):
+        return None
+    if "legacy_grants_enabled" in body:
+        return bool(body["legacy_grants_enabled"])
+    if "grants_enabled" in body:
+        return bool(body["grants_enabled"])
+    if "legacy_grants" in body:
+        val = body["legacy_grants"]
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            v = val.strip().lower()
+            if v in ("disabled", "false", "off", "none"):
+                return False
+            if v in ("enabled", "true", "on", "active"):
+                return True
+            return None
+        if isinstance(val, (list, dict)):
+            return len(val) > 0
+        return None
+    if "migration_grants" in body:
+        g = body.get("migration_grants")
+        if g is None:
+            return None
+        if isinstance(g, (list, dict)):
+            return len(g) > 0
+    return None
+
+
+def run_modern_policy_admission_gate(args, out_dir, nodes=None):
+    """Live modern_policy_admission gate (ADR-014 / #548 HOLD fail-closed).
+
+    GET /diagnostics/gossip from a live node when available; otherwise spawn a
+    short-lived probe node. Missing/unreadable diagnostics or unproven grants
+    → incomplete_policy (blocking under --modern-only --expect-fixed).
+    """
+    body = None
+    source = None
+    owned = []
+    try:
+        for n in (nodes or []):
+            if not getattr(n, "running", False):
+                continue
+            try:
+                r = n.req("GET", "/diagnostics/gossip")
+                if r.get("status") == 200 and isinstance(r.get("body"), dict):
+                    body = r["body"]
+                    source = f"node:{n.name}"
+                    break
+            except OSError:
+                continue
+        if body is None:
+            pol_dir = pathlib.Path(out_dir) / "modern-policy-admission"
+            pol_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                node = _spawn_isolated_node(
+                    "policy-admit", args.api_base + 50, args.quic_base + 50,
+                    pol_dir, args.x0xd, args.log_level, [])
+                owned.append(node)
+                r = node.req("GET", "/diagnostics/gossip")
+                if r.get("status") == 200 and isinstance(r.get("body"), dict):
+                    body = r["body"]
+                    source = "ephemeral:policy-admit"
+                else:
+                    gate = classify_modern_policy_admission(None, None)
+                    gate["diagnostics_source"] = "ephemeral:unreadable"
+                    gate["http_status"] = r.get("status") if isinstance(r, dict) else None
+                    return gate
+            except Exception as e:
+                gate = classify_modern_policy_admission(None, None)
+                gate["diagnostics_source"] = "unavailable"
+                gate["error"] = f"{type(e).__name__}: {e}"
+                return gate
+        policy = extract_policy_from_diagnostics_body(body)
+        grants_enabled = extract_grants_enabled_from_diagnostics_body(body)
+        gate = classify_modern_policy_admission(policy, grants_enabled)
+        gate["diagnostics_source"] = source
+        if isinstance(body, dict) and "outer_v1_receipts" in body:
+            gate["outer_v1_receipts"] = body.get("outer_v1_receipts")
+        return gate
+    finally:
+        for n in owned:
+            try:
+                n.stop()
+            except Exception:
+                pass
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="x0x three-node convergence soak harness")
@@ -2731,6 +2964,11 @@ def parse_args():
     p.add_argument("--expect-fixed", action="store_true",
                    help="turn known-gap expectations into hard gates "
                         "(use to verify the fixes)")
+    p.add_argument("--modern-only", action="store_true",
+                   help="ADR-014 modern release predicate: exclude stock "
+                        "mixed-version from PASS (label "
+                        "not_in_modern_predicate); refuse if "
+                        "X0XD_LEGACY_BINARY/--legacy-binary is set")
     p.add_argument("--log-level", default="info",
                    help="daemon log_level (default info)")
     p.add_argument("--out-dir", default=str(DEFAULT_OUT),
@@ -2769,6 +3007,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # ADR-014: under --modern-only, refuse legacy env fail-closed BEFORE any
+    # soak work (stock-in-modern-predicate must never run green).
+    if args.modern_only:
+        refuse = refuse_legacy_env_under_modern_only(args.legacy_binary)
+        if refuse:
+            log(refuse)
+            return 2
+        # Do not carry a legacy path into provenance / mixed-version.
+        args.legacy_binary = None
     if not args.x0xd.is_file():
         log(f"ERROR: x0xd not found at {args.x0xd} — build with "
             f"`cargo build --release --bin x0xd` or set X0XD_TEST_BINARY")
@@ -2859,10 +3106,28 @@ def main():
         # Prerequisite-gated security/skew gates run ONCE per invocation
         # (they do not depend on soak repetition and use isolated ports).
         log("=== prerequisite gates (mixed-version / malicious announce) ===")
-        prereq_gates.extend(run_mixed_version_gate(args, out_root))
+        if args.modern_only:
+            # Stock mixed-version is NOT in the modern predicate: emit
+            # classifier labels instead of running / UNSUPPORTED-under-expect-fixed.
+            prereq_gates.extend(
+                modern_excluded_gate_record(n)
+                for n in MODERN_EXCLUDED_GATE_NAMES)
+            log("modern-only: mixed_version_skew labeled "
+                f"{NOT_IN_MODERN_PREDICATE} (excluded from PASS)")
+        else:
+            prereq_gates.extend(run_mixed_version_gate(args, out_root))
         prereq_gates.append(run_malicious_owner_announce_gate(args, out_root))
         prereq_gates.append(run_owner_offline_checkpoint_gate(args, out_root))
         prereq_gates.append(run_forged_first_seen_gate(args, out_root))
+        if args.modern_only:
+            prereq_gates = classify_prereq_gates_for_modern(prereq_gates)
+        # #548 HOLD: fail-closed modern policy admission under modern+expect-fixed.
+        # PASS only on live reject_v1 + proven grants disabled; incomplete_policy
+        # and fail both block (never green without admission proof).
+        if args.modern_only and args.expect_fixed:
+            log("=== modern_policy_admission (fail-closed live readback) ===")
+            prereq_gates.append(
+                run_modern_policy_admission_gate(args, out_root))
     finally:
         report_path = out_root / "report.json"
         report_path.write_text(json.dumps({
@@ -2889,8 +3154,18 @@ def main():
     # provenance refusal (stale binary / wrong legacy version) already failed
     # fast above under --expect-fixed.
     if args.expect_fixed:
-        prereq_ok = all(g.get("status") not in ("fail", "unsupported")
-                        for g in prereq_gates)
+        # Under --modern-only, not_in_modern_predicate is an explicit exclude
+        # label (not PASS, not a failure) — stock phases must not block modern.
+        def _prereq_blocking(g):
+            st = g.get("status")
+            if args.modern_only and st == NOT_IN_MODERN_PREDICATE:
+                return False
+            # incomplete_policy blocks under modern+expect-fixed (fail-closed
+            # admission; missing #546 diagnostics must not green the recipe).
+            if args.modern_only and st == INCOMPLETE_POLICY:
+                return True
+            return st in ("fail", "unsupported")
+        prereq_ok = all(not _prereq_blocking(g) for g in prereq_gates)
     else:
         prereq_ok = all(g.get("status") != "fail" for g in prereq_gates)
     # Release-environment gates: critical hard-error growth and mDNS mesh

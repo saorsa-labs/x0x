@@ -61,5 +61,109 @@ class NodeIdentityIsolationTests(unittest.TestCase):
                              "disposable test marker, not key material")
 
 
+
+
+class ModernOnlyPredicateTests(unittest.TestCase):
+    """Hermetic ADR-014 modern-only classifier + env-refuse self-tests."""
+
+    def test_refuse_legacy_env_when_env_set(self):
+        err = SOAK.refuse_legacy_env_under_modern_only(
+            legacy_binary=None,
+            environ={"X0XD_LEGACY_BINARY": "/tmp/fake-x0xd-0.30.1"})
+        self.assertIsNotNone(err)
+        self.assertIn("REFUSING", err)
+        self.assertIn("X0XD_LEGACY_BINARY", err)
+
+    def test_refuse_legacy_env_when_flag_path_set(self):
+        err = SOAK.refuse_legacy_env_under_modern_only(
+            legacy_binary="/tmp/fake-x0xd-0.30.1",
+            environ={})
+        self.assertIsNotNone(err)
+        self.assertIn("REFUSING", err)
+
+    def test_allow_when_legacy_unset(self):
+        err = SOAK.refuse_legacy_env_under_modern_only(
+            legacy_binary=None, environ={})
+        self.assertIsNone(err)
+
+    def test_classifier_labels_mixed_version_not_pass(self):
+        raw = [
+            {"name": "mixed_version_skew_load_bearing", "status": "pass"},
+            {"name": "mixed_version_skew_degraded", "status": "unsupported"},
+            {"name": "malicious_owner_announce", "status": "pass"},
+        ]
+        classified = SOAK.classify_prereq_gates_for_modern(raw)
+        by_name = {g["name"]: g for g in classified}
+        for name in SOAK.MODERN_EXCLUDED_GATE_NAMES:
+            self.assertIn(name, by_name)
+            self.assertEqual(by_name[name]["status"],
+                             SOAK.NOT_IN_MODERN_PREDICATE)
+            self.assertNotEqual(by_name[name]["status"], "pass")
+        self.assertEqual(by_name["malicious_owner_announce"]["status"], "pass")
+
+    def test_modern_excluded_gate_record_never_pass(self):
+        rec = SOAK.modern_excluded_gate_record(
+            "mixed_version_skew_load_bearing")
+        self.assertEqual(rec["status"], SOAK.NOT_IN_MODERN_PREDICATE)
+        self.assertEqual(rec["predicate"], SOAK.NOT_IN_MODERN_PREDICATE)
+        self.assertNotEqual(rec["status"], "pass")
+
+    def test_policy_admission_none_policy_incomplete(self):
+        g = SOAK.classify_modern_policy_admission(None, False)
+        self.assertEqual(g["name"], SOAK.MODERN_POLICY_ADMISSION)
+        self.assertEqual(g["status"], SOAK.INCOMPLETE_POLICY)
+        self.assertNotEqual(g["status"], "pass")
+
+    def test_policy_admission_none_grants_incomplete(self):
+        # reject_v1 without proven grants-disabled evidence must not PASS
+        g = SOAK.classify_modern_policy_admission("reject_v1", None)
+        self.assertEqual(g["status"], SOAK.INCOMPLETE_POLICY)
+        self.assertNotEqual(g["status"], "pass")
+
+    def test_policy_admission_accept_v1_fail(self):
+        g = SOAK.classify_modern_policy_admission("accept_v1", False)
+        self.assertEqual(g["status"], "fail")
+        self.assertIn("AcceptV1", g["reason"])
+
+    def test_policy_admission_grants_enabled_fail(self):
+        g = SOAK.classify_modern_policy_admission("reject_v1", True)
+        self.assertEqual(g["status"], "fail")
+        self.assertEqual(g["reason"], "grants_enabled")
+
+    def test_policy_admission_reject_v1_grants_disabled_pass(self):
+        g = SOAK.classify_modern_policy_admission("reject_v1", False)
+        self.assertEqual(g["status"], "pass")
+        self.assertEqual(g["outer_signature_policy"], "reject_v1")
+        self.assertIs(g["grants_enabled"], False)
+
+    def test_policy_admission_extract_missing_grants_is_none(self):
+        # #546 tip exposes policy/receipts but not grants — must stay unproven
+        body = {"outer_signature_policy": "reject_v1", "outer_v1_receipts": 0}
+        self.assertEqual(
+            SOAK.extract_policy_from_diagnostics_body(body), "reject_v1")
+        self.assertIsNone(
+            SOAK.extract_grants_enabled_from_diagnostics_body(body))
+
+    def test_prereq_blocking_incomplete_under_modern_expect_fixed(self):
+        # Mirror main()._prereq_blocking: incomplete_policy blocks modern
+        class Args:
+            modern_only = True
+            expect_fixed = True
+        args = Args()
+        def _prereq_blocking(g):
+            st = g.get("status")
+            if args.modern_only and st == SOAK.NOT_IN_MODERN_PREDICATE:
+                return False
+            if args.modern_only and st == SOAK.INCOMPLETE_POLICY:
+                return True
+            return st in ("fail", "unsupported")
+        self.assertTrue(_prereq_blocking(
+            {"status": SOAK.INCOMPLETE_POLICY}))
+        self.assertTrue(_prereq_blocking({"status": "fail"}))
+        self.assertFalse(_prereq_blocking(
+            {"status": SOAK.NOT_IN_MODERN_PREDICATE}))
+        self.assertFalse(_prereq_blocking({"status": "pass"}))
+
+
 if __name__ == "__main__":
     unittest.main()
