@@ -590,6 +590,18 @@ fn test_crdt_merge_performance() {
         .map(|task| (*task.id(), task.title().to_string()))
         .collect();
     assert_eq!(observed.len(), (TASKS_PER_REPLICA * 2) as usize);
+    let ordered_ids = |list: &TaskList| {
+        list.tasks_ordered()
+            .into_iter()
+            .map(|task| *task.id())
+            .collect::<Vec<_>>()
+    };
+    let merged_order = ordered_ids(&list1);
+    assert_eq!(
+        merged_order.len(),
+        expected.len(),
+        "merge must not duplicate tasks"
+    );
     assert_eq!(
         observed, expected,
         "post-merge TaskId->title map must equal the exact union of both replicas"
@@ -604,6 +616,11 @@ fn test_crdt_merge_performance() {
         .map(|task| (*task.id(), task.title().to_string()))
         .collect();
     assert_eq!(remerged, expected, "re-merging must not change the union");
+    assert_eq!(
+        ordered_ids(&list1),
+        merged_order,
+        "re-merging must preserve task order"
+    );
 
     // Merge is DIRECTION-INDEPENDENT (CRDT commutativity at this scale):
     // merging the pre-merge replica-1 into replica-2 yields the identical
@@ -618,6 +635,11 @@ fn test_crdt_merge_performance() {
     assert_eq!(
         reverse_observed, expected,
         "both merge directions must agree on the exact TaskId->title map"
+    );
+    assert_eq!(
+        ordered_ids(&reverse),
+        merged_order,
+        "both merge directions must agree on ordered task IDs"
     );
 }
 
