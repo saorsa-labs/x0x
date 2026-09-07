@@ -167,8 +167,7 @@ jobs:
               f"X0X_TEST_X0XD_BIN={os.environ['HOME_BIN_X0XD']}",
               f"X0X_TEST_X0X_BIN={os.environ['HOME_BIN_X0X']}",
               'python3', 'scripts/ci/nextest-reuse.py', 'run', os.environ['HOME_SCRATCH'],
-              '--all-features', '--test', 'home_onboarding_isolated', '--run-ignored',
-              'ignored-only', '--test-threads', '1', '--no-tests', 'fail',
+              '--run-ignored', 'ignored-only', '--test-threads', '1', '--no-tests', 'fail',
               '-E', 'test(=home_onboarding_single_announce_restart)']
           with (raw / 'nextest.log').open('wb') as output:
               result = subprocess.run(argv, stdout=output, stderr=subprocess.STDOUT,
