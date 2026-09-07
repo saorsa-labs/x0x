@@ -551,7 +551,13 @@ fn spawn_subscription_loop(
     tokio::spawn(async move {
         tracing::info!(topic = %topic_for_task, "DM inbox service subscribed");
         while let Some(message) = subscription.recv().await {
-            pipeline.handle_incoming(message, ack_legacy_bus).await;
+            pipeline
+                .handle_incoming(
+                    message,
+                    ack_legacy_bus,
+                    crate::dm::DmAckIngress::Subscription,
+                )
+                .await;
         }
         tracing::debug!(topic = %topic_for_task, "DM inbox subscription closed");
     })
@@ -916,7 +922,8 @@ impl InboxPipeline {
             trust_level: None,
             raw_envelope: None,
         };
-        self.handle_incoming(message, false).await;
+        self.handle_incoming(message, false, crate::dm::DmAckIngress::DirectTyped)
+            .await;
         true
     }
 }
@@ -1078,7 +1085,12 @@ async fn durable_history_logical_request(
 }
 
 impl InboxPipeline {
-    async fn handle_incoming(&self, msg: PubSubMessage, ack_legacy_bus: bool) {
+    async fn handle_incoming(
+        &self,
+        msg: PubSubMessage,
+        ack_legacy_bus: bool,
+        ack_ingress: crate::dm::DmAckIngress,
+    ) {
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
             (Some(s), Some(pk)) if msg.verified => (s, pk.to_vec()),
             _ => {
@@ -1347,12 +1359,15 @@ impl InboxPipeline {
                 // The ACK's own `protocol_version` names the receipt semantics
                 // the recipient is claiming; the waiter accepts it only if
                 // that matches what the send negotiated (ADR 0030 §2).
-                let resolved = self.inflight.resolve_for_protocol(
+                // #461: stamp the ingress of the transport that actually
+                // carried this authenticated ACK (first-valid winner only).
+                let resolved = self.inflight.resolve_for_ingress(
                     &ack.acks_request_id,
                     envelope.protocol_version,
                     sender_agent_id,
                     sender_machine_id,
                     ack.outcome,
+                    ack_ingress,
                 );
                 tracing::debug!(
                     acked = %hex::encode(ack.acks_request_id),
@@ -2558,7 +2573,10 @@ mod tests {
         service.shutdown().await;
 
         let message = durable_payload_message(&harness, &sender, machine, 0x51, b"durable hello");
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert!(
             committed_rows(&history, &sender, 0x51).is_empty(),
@@ -2682,7 +2700,10 @@ mod tests {
         for _ in 0..2 {
             let message =
                 durable_payload_message(&harness, &sender, machine, 0x54, b"durable hello");
-            harness.pipeline.handle_incoming(message, false).await;
+            harness
+                .pipeline
+                .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+                .await;
         }
 
         let rows = committed_rows(&history, &sender, 0x54);
@@ -2704,7 +2725,10 @@ mod tests {
         let _service = attach_history(&mut harness);
 
         let first = durable_payload_message(&harness, &sender, machine, 0x55, b"original bytes");
-        harness.pipeline.handle_incoming(first, false).await;
+        harness
+            .pipeline
+            .handle_incoming(first, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         let mut envelope = craft_unsigned_payload_envelope_versioned(
             &harness,
@@ -2780,7 +2804,10 @@ mod tests {
         let mut acks = watch_acks_to(&harness, &sender).await;
 
         let first = durable_payload_message(&harness, &sender, machine, 0x56, b"original bytes");
-        harness.pipeline.handle_incoming(first, false).await;
+        harness
+            .pipeline
+            .handle_incoming(first, false, crate::dm::DmAckIngress::Subscription)
+            .await;
         assert_eq!(
             next_ack_outcome(&mut acks).await,
             DmAckOutcome::Accepted,
@@ -2789,7 +2816,10 @@ mod tests {
 
         // Replay-cache binding check: the id is still hot in memory.
         let rebound = durable_payload_message(&harness, &sender, machine, 0x56, b"different bytes");
-        harness.pipeline.handle_incoming(rebound, false).await;
+        harness
+            .pipeline
+            .handle_incoming(rebound, false, crate::dm::DmAckIngress::Subscription)
+            .await;
         let hot = next_ack_outcome(&mut acks).await;
         assert!(
             matches!(hot, DmAckOutcome::IdempotencyConflict { .. }),
@@ -2803,7 +2833,10 @@ mod tests {
         harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
         let after_restart =
             durable_payload_message(&harness, &sender, machine, 0x56, b"different bytes");
-        harness.pipeline.handle_incoming(after_restart, false).await;
+        harness
+            .pipeline
+            .handle_incoming(after_restart, false, crate::dm::DmAckIngress::Subscription)
+            .await;
         assert!(
             matches!(
                 next_ack_outcome(&mut acks).await,
@@ -2825,7 +2858,10 @@ mod tests {
         let _service = attach_history(&mut harness);
 
         let message = payload_message(&harness, &sender, machine, 0x56);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
@@ -2862,7 +2898,10 @@ mod tests {
         assert!(harness.pipeline.history.is_none());
 
         let message = durable_payload_message(&harness, &sender, machine, 0x57, b"durable hello");
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert_no_delivery(&mut harness.receiver).await;
         assert!(
@@ -3403,7 +3442,10 @@ mod tests {
         let history = harness.pipeline.history.clone().expect("history handle");
 
         let message = durable_payload_message(&harness, &sender, machine, 0xC5, b"c5 hedge");
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         let rows = committed_rows(&history, &sender, 0xC5);
         assert_eq!(
@@ -3569,7 +3611,10 @@ mod tests {
             trust_level: None,
             raw_envelope: None,
         };
-        harness.pipeline.handle_incoming(msg, false).await;
+        harness
+            .pipeline
+            .handle_incoming(msg, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         // The fix: the sender's inbox topic is now subscribed (the receipt
         // is the trigger), so the ACK publish has peers.
@@ -3596,6 +3641,35 @@ mod tests {
         );
     }
 
+    fn signed_ack_envelope_bytes(
+        sender: &AgentKeypair,
+        machine_kp: &MachineKeypair,
+        recipient_agent_id: &AgentId,
+        request_id: [u8; 16],
+    ) -> Bytes {
+        let created = now_unix_ms();
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_DURABLE_ACK,
+            request_id,
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine_kp.machine_id().as_bytes(),
+            recipient_agent_id: *recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created,
+            expires_at_unix_ms: created + ACK_ENVELOPE_LIFETIME_MS,
+            body: EnvelopeBuilder::build_ack_body(request_id, DmAckOutcome::Accepted),
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope(&mut envelope, sender);
+        let mut attestation = DmOriginAttestation::for_envelope(
+            &envelope,
+            machine_kp.public_key().as_bytes().to_vec(),
+        );
+        attestation.sign(machine_kp).expect("attest ACK");
+        envelope.origin_attestation = Some(attestation);
+        Bytes::from(envelope.to_wire_bytes().expect("encode ACK"))
+    }
+
     /// C5 receive path: ingesting the same ACK envelope via Direct/typed
     /// completes the waiter. Fan-out as a user DM must not happen.
     #[tokio::test]
@@ -3603,14 +3677,17 @@ mod tests {
         let sender = test_keypair();
         let machine_kp = MachineKeypair::generate().expect("machine");
         let machine = machine_kp.machine_id();
-        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let harness = make_inbox_harness(&sender, Some(machine), None).await;
         let request_id = [0xC8; 16];
-        let waiter = harness.pipeline.inflight.register_for_protocol(
-            request_id,
-            DM_PROTOCOL_DURABLE_ACK,
-            sender.agent_id(),
-            Some(machine),
-        );
+        let (waiter, ingress_cell) = harness
+            .pipeline
+            .inflight
+            .register_for_protocol_with_provenance(
+                request_id,
+                DM_PROTOCOL_DURABLE_ACK,
+                sender.agent_id(),
+                Some(machine),
+            );
 
         let created = now_unix_ms();
         let mut envelope = DmEnvelope {
@@ -3651,6 +3728,146 @@ mod tests {
                 .expect("waiter must complete from the Direct-ingested envelope")
                 .expect("oneshot"),
             DmAckOutcome::Accepted
+        );
+        assert_eq!(
+            *ingress_cell.lock().expect("cell"),
+            Some(crate::dm::DmAckIngress::DirectTyped),
+            "#461: the direct-typed hedge that carried the winning ACK must be reported"
+        );
+    }
+
+    /// #461: an authenticated ACK delivered through the subscription-labelled
+    /// ingress (the exact `handle_incoming` call `spawn_subscription_loop`
+    /// makes) stamps `Subscription`. The literal loop wrapper itself needs
+    /// transport-signed gossip frames and is not hermetically drivable; this
+    /// exercises its precise stamping call site.
+    #[tokio::test]
+    async fn subscription_labelled_ack_stamps_subscription_ingress() {
+        let sender = test_keypair();
+        let machine_kp = MachineKeypair::generate().expect("machine");
+        let machine = machine_kp.machine_id();
+        let harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let request_id = [0xC9; 16];
+        let (waiter, ingress_cell) = harness
+            .pipeline
+            .inflight
+            .register_for_protocol_with_provenance(
+                request_id,
+                DM_PROTOCOL_DURABLE_ACK,
+                sender.agent_id(),
+                Some(machine),
+            );
+        let encoded = signed_ack_envelope_bytes(
+            &sender,
+            &machine_kp,
+            &harness.recipient_agent_id,
+            request_id,
+        );
+        let message = PubSubMessage {
+            topic: String::from("dm-inbox"),
+            payload: encoded,
+            sender: Some(sender.agent_id()),
+            sender_public_key: Some(sender.public_key().as_bytes().to_vec()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        };
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter must complete from the subscription-labelled ACK")
+                .expect("oneshot"),
+            DmAckOutcome::Accepted
+        );
+        assert_eq!(
+            *ingress_cell.lock().expect("cell"),
+            Some(crate::dm::DmAckIngress::Subscription)
+        );
+    }
+
+    /// #461: an INVALID-signature ACK leaves the waiter pending and the
+    /// provenance cell `None`; the subsequent VALID ACK wins and stamps its
+    /// own ingress. Unknown is never fabricated.
+    #[tokio::test]
+    async fn invalid_signature_ack_leaves_none_then_valid_wins() {
+        let sender = test_keypair();
+        let machine_kp = MachineKeypair::generate().expect("machine");
+        let machine = machine_kp.machine_id();
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let request_id = [0xCA; 16];
+        let (mut waiter, ingress_cell) = harness
+            .pipeline
+            .inflight
+            .register_for_protocol_with_provenance(
+                request_id,
+                DM_PROTOCOL_DURABLE_ACK,
+                sender.agent_id(),
+                Some(machine),
+            );
+        let mut corrupted = signed_ack_envelope_bytes(
+            &sender,
+            &machine_kp,
+            &harness.recipient_agent_id,
+            request_id,
+        )
+        .to_vec();
+        // Corrupt the trailing signature bytes.
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+        let bad = Bytes::from(corrupted);
+        let bad_message = PubSubMessage {
+            topic: String::from("dm-inbox"),
+            payload: bad,
+            sender: Some(sender.agent_id()),
+            sender_public_key: Some(sender.public_key().as_bytes().to_vec()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        };
+        harness
+            .pipeline
+            .handle_incoming(bad_message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_eq!(*ingress_cell.lock().expect("cell"), None);
+        assert!(
+            waiter.try_recv().is_err(),
+            "an invalid-signature ACK must not resolve the waiter"
+        );
+
+        let valid = signed_ack_envelope_bytes(
+            &sender,
+            &machine_kp,
+            &harness.recipient_agent_id,
+            request_id,
+        );
+        let good_message = PubSubMessage {
+            topic: String::from("dm-inbox"),
+            payload: valid,
+            sender: Some(sender.agent_id()),
+            sender_public_key: Some(sender.public_key().as_bytes().to_vec()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        };
+        harness
+            .pipeline
+            .handle_incoming(good_message, false, crate::dm::DmAckIngress::DirectTyped)
+            .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("valid ACK must resolve the waiter after the invalid one")
+                .expect("oneshot"),
+            DmAckOutcome::Accepted
+        );
+        assert_eq!(
+            *ingress_cell.lock().expect("cell"),
+            Some(crate::dm::DmAckIngress::DirectTyped),
+            "the winner's ingress is reported, not the invalid attempt's label"
         );
         assert_no_delivery(&mut harness.receiver).await;
     }
@@ -3908,7 +4125,10 @@ mod tests {
         .await;
 
         let message = payload_message(&harness, &sender, clean_claim, 0x11);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert_no_delivery(&mut harness.receiver).await;
         assert_eq!(
@@ -3930,7 +4150,10 @@ mod tests {
         let mut harness = make_inbox_harness(&sender, Some(clean_machine), None).await;
 
         let message = payload_message(&harness, &sender, clean_machine, 0x22);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
@@ -3948,7 +4171,10 @@ mod tests {
         let mut harness = make_inbox_harness(&sender, None, Some(&revoked_machine)).await;
 
         let message = payload_message(&harness, &sender, revoked_machine.machine_id(), 0x33);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert_no_delivery(&mut harness.receiver).await;
         assert_eq!(
@@ -3969,7 +4195,10 @@ mod tests {
         let mut harness = make_inbox_harness(&sender, None, None).await;
 
         let message = payload_message(&harness, &sender, clean_claim, 0x44);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
@@ -4014,7 +4243,10 @@ mod tests {
         );
 
         let message = wrap_in_pubsub(&harness, &sender, &envelope);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert_no_delivery(&mut harness.receiver).await;
         assert_eq!(
@@ -4048,7 +4280,10 @@ mod tests {
         envelope.origin_attestation = Some(attestation);
 
         let message = wrap_in_pubsub(&harness, &sender, &envelope);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert_no_delivery(&mut harness.receiver).await;
         assert_eq!(
@@ -4085,7 +4320,10 @@ mod tests {
 
         // Stripped envelope: agent-signed, no attestation, claims B.
         let stripped = payload_message(&harness, &sender, unrevoked_b, 0x53);
-        harness.pipeline.handle_incoming(stripped, false).await;
+        harness
+            .pipeline
+            .handle_incoming(stripped, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
@@ -4131,7 +4369,10 @@ mod tests {
         );
 
         let message = wrap_in_pubsub(&harness, &sender, &envelope);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert_no_delivery(&mut harness.receiver).await;
         assert_eq!(
@@ -4188,7 +4429,10 @@ mod tests {
         assert!(envelope.verify_origin_attestation().is_ok());
 
         let message = wrap_in_pubsub(&harness, &sender, &envelope);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert_no_delivery(&mut harness.receiver).await;
     }
@@ -4205,7 +4449,10 @@ mod tests {
         let mut harness = make_inbox_harness(&sender, None, Some(&machine)).await;
 
         let message = attested_payload_message(&harness, &sender, &machine, 0x64);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         assert_no_delivery(&mut harness.receiver).await;
         assert_eq!(
@@ -4230,7 +4477,10 @@ mod tests {
         let mut harness = make_inbox_harness(&sender, None, None).await;
 
         let message = attested_payload_message(&harness, &sender, &machine, 0x65);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
 
         let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
@@ -4262,7 +4512,10 @@ mod tests {
 
         // 1. Fresh B attestation: accepted even though the binding says A.
         let message = attested_payload_message(&harness, &sender, &machine_b, 0x66);
-        harness.pipeline.handle_incoming(message, false).await;
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
         let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
             .expect("delivery timeout")
@@ -4287,7 +4540,10 @@ mod tests {
 
         // 3. Stale A attestation: A is revoked → EP3 rejects.
         let stale = attested_payload_message(&harness, &sender, &machine_a, 0x67);
-        harness.pipeline.handle_incoming(stale, false).await;
+        harness
+            .pipeline
+            .handle_incoming(stale, false, crate::dm::DmAckIngress::Subscription)
+            .await;
         assert_eq!(
             harness
                 .pipeline
@@ -4570,7 +4826,10 @@ mod tests {
         };
 
         let before = dm.diagnostics_snapshot().stats.incoming_signature_failed;
-        harness.pipeline.handle_incoming(msg, false).await;
+        harness
+            .pipeline
+            .handle_incoming(msg, false, crate::dm::DmAckIngress::Subscription)
+            .await;
         let after = dm.diagnostics_snapshot().stats.incoming_signature_failed;
 
         assert_eq!(

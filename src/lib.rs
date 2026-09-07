@@ -6475,6 +6475,8 @@ impl Agent {
             accepted_at: std::time::Instant::now(),
             retries_used: 0,
             path: dm::DmPath::Relayed { via: relay_agent },
+            // #461: relay-lane send — no durable-ACK waiter was involved.
+            observed_ack_ingress: None,
         })
     }
 

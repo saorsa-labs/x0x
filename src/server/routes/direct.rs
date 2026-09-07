@@ -449,6 +449,16 @@ pub(in crate::server) async fn direct_send(
                 "request_id": hex::encode(receipt.request_id),
                 "require_ack": ack_result,
             });
+            // #461: observed ingress of the transport that actually carried
+            // the winning durable ACK, when known. Optional: absent for
+            // publish-only/unknown outcomes; `path` above remains the send
+            // strategy.
+            if let Some(ingress) = receipt.observed_ack_ingress {
+                body["observed_ack_ingress"] = serde_json::json!(match ingress {
+                    x0x::dm::DmAckIngress::DirectTyped => "direct_typed",
+                    x0x::dm::DmAckIngress::Subscription => "subscription",
+                });
+            }
             attach_recipient_ack_diagnostics(
                 &mut body,
                 snap.last_ack_publish_ms,

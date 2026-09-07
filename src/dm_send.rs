@@ -226,7 +226,7 @@ pub async fn send_via_gossip(
         bytes = wire.len(),
     );
 
-    let mut rx = inflight.register_for_protocol(
+    let (mut rx, ack_ingress_cell) = inflight.register_for_protocol_with_provenance(
         request_id,
         protocol_version,
         recipient_agent_id,
@@ -253,7 +253,12 @@ pub async fn send_via_gossip(
                         ack_observed = "before_retry",
                     );
                     guard.mark_resolved();
-                    return ack_outcome_to_receipt(outcome, request_id, attempt.saturating_sub(1));
+                    return ack_outcome_to_receipt(
+                        outcome,
+                        &ack_ingress_cell,
+                        request_id,
+                        attempt.saturating_sub(1),
+                    );
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Closed) => {
@@ -353,7 +358,7 @@ pub async fn send_via_gossip(
                     attempt,
                 );
                 guard.mark_resolved();
-                return ack_outcome_to_receipt(outcome, request_id, attempt);
+                return ack_outcome_to_receipt(outcome, &ack_ingress_cell, request_id, attempt);
             }
             Ok(Ok(None)) => {
                 tracing::debug!(
@@ -400,7 +405,12 @@ pub async fn send_via_gossip(
                                 ack_observed = "during_backoff",
                             );
                             guard.mark_resolved();
-                            return ack_outcome_to_receipt(outcome, request_id, attempt);
+                            return ack_outcome_to_receipt(
+                                outcome,
+                                &ack_ingress_cell,
+                                request_id,
+                                attempt,
+                            );
                         }
                         BackoffWait::ReplacedShortCircuit { new_generation } => {
                             tracing::debug!(
@@ -430,7 +440,7 @@ pub async fn send_via_gossip(
             ack_observed = "before_timeout",
         );
         guard.mark_resolved();
-        return ack_outcome_to_receipt(outcome, request_id, config.max_retries);
+        return ack_outcome_to_receipt(outcome, &ack_ingress_cell, request_id, config.max_retries);
     }
 
     Err(DmError::Timeout {
@@ -572,15 +582,22 @@ async fn wait_for_ack_or_backoff_or_replaced(
 
 fn ack_outcome_to_receipt(
     outcome: DmAckOutcome,
+    ack_ingress_cell: &crate::dm::ProvenanceCell,
     request_id: [u8; 16],
     retries_used: u8,
 ) -> Result<DmReceipt, DmError> {
+    // #461: observed ingress of the winning ACK, or None when unstamped
+    // (unknown/publish-only). Never fabricated.
+    let observed_ingress = ack_ingress_cell.lock().ok().and_then(|cell| *cell);
     match outcome {
         DmAckOutcome::Accepted => Ok(DmReceipt {
             request_id,
             accepted_at: Instant::now(),
             retries_used,
+            // `path` keeps reporting the send STRATEGY (unchanged public
+            // semantics); observed ingress rides separately (#461).
             path: DmPath::GossipInbox,
+            observed_ack_ingress: observed_ingress,
         }),
         DmAckOutcome::RejectedByPolicy { reason } => Err(DmError::RecipientRejected { reason }),
         // ADR 0030 §2: the recipient refused to issue the durable receipt,
@@ -603,6 +620,9 @@ fn gossip_publish_receipt(request_id: [u8; 16], retries_used: u8) -> DmReceipt {
         accepted_at: Instant::now(),
         retries_used,
         path: DmPath::GossipInbox,
+        // Publish-only outcome: no authenticated ACK was observed, so no
+        // ingress may be claimed (#461).
+        observed_ack_ingress: None,
     }
 }
 
@@ -645,6 +665,7 @@ fn receipt_for_path(path: DmPath) -> DmReceipt {
         request_id: fresh_request_id(),
         accepted_at: Instant::now(),
         retries_used: 0,
+        observed_ack_ingress: None,
         path,
     }
 }
@@ -934,7 +955,13 @@ mod tests {
     fn ack_outcome_to_receipt_converts_accepted() {
         let outcome = DmAckOutcome::Accepted;
         let request_id = [1u8; 16];
-        let receipt = ack_outcome_to_receipt(outcome, request_id, 2).unwrap();
+        let receipt = ack_outcome_to_receipt(
+            outcome,
+            &std::sync::Arc::new(std::sync::Mutex::new(None)),
+            request_id,
+            2,
+        )
+        .unwrap();
         assert_eq!(receipt.request_id, request_id);
         assert_eq!(receipt.retries_used, 2);
         assert_eq!(receipt.path, DmPath::GossipInbox);
@@ -954,7 +981,12 @@ mod tests {
         let outcome = DmAckOutcome::RejectedByPolicy {
             reason: "not trusted".to_string(),
         };
-        let result = ack_outcome_to_receipt(outcome, [2u8; 16], 1);
+        let result = ack_outcome_to_receipt(
+            outcome,
+            &std::sync::Arc::new(std::sync::Mutex::new(None)),
+            [2u8; 16],
+            1,
+        );
         assert!(result.is_err(), "rejected should return error");
         let err = result.unwrap_err();
         assert!(
