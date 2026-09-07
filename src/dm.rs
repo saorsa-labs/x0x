@@ -2028,7 +2028,14 @@ impl InFlightAcks {
                 ) =>
             {
                 let waiter = entry.remove();
-                if let Some(ingress) = ingress {
+                // #563 P2: provenance describes the transport that carried the
+                // DURABLE ACK. A v1 waiter resolves normally (no v1 failure,
+                // no negotiation change) but its receipt must not claim
+                // durable-ACK ingress — stamp only when the resolved
+                // waiter negotiated at least DM_PROTOCOL_DURABLE_ACK.
+                if let Some(ingress) =
+                    ingress.filter(|_| waiter.protocol_version >= DM_PROTOCOL_DURABLE_ACK)
+                {
                     if let Ok(mut cell) = waiter.ingress_cell.lock() {
                         *cell = Some(ingress);
                     }

@@ -3653,6 +3653,35 @@ mod tests {
         );
     }
 
+    fn signed_v1_ack_envelope_bytes(
+        sender: &AgentKeypair,
+        machine_kp: &MachineKeypair,
+        recipient_agent_id: &AgentId,
+        request_id: [u8; 16],
+    ) -> Bytes {
+        let created = now_unix_ms();
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_V1,
+            request_id,
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine_kp.machine_id().as_bytes(),
+            recipient_agent_id: *recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created,
+            expires_at_unix_ms: created + ACK_ENVELOPE_LIFETIME_MS,
+            body: EnvelopeBuilder::build_ack_body(request_id, DmAckOutcome::Accepted),
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope(&mut envelope, sender);
+        let mut attestation = DmOriginAttestation::for_envelope(
+            &envelope,
+            machine_kp.public_key().as_bytes().to_vec(),
+        );
+        attestation.sign(machine_kp).expect("attest v1 ACK");
+        envelope.origin_attestation = Some(attestation);
+        Bytes::from(envelope.to_wire_bytes().expect("encode v1 ACK"))
+    }
+
     fn signed_ack_envelope_bytes(
         sender: &AgentKeypair,
         machine_kp: &MachineKeypair,
@@ -3745,6 +3774,59 @@ mod tests {
             *ingress_cell.lock().expect("cell"),
             Some(crate::dm::DmAckIngress::DirectTyped),
             "#461: the direct-typed hedge that carried the winning ACK must be reported"
+        );
+    }
+
+    /// #563 P2: an authenticated V1 (non-durable) ACK resolves its v1 waiter
+    /// NORMALLY — no failure, no negotiation change — but must NOT stamp
+    /// provenance: `observed_ack_ingress` describes the DURABLE-ACK
+    /// transport, and the HTTP mapper omits the field when it is None. The
+    /// envelope is fully signed/attested and flows through the REAL
+    /// subscription dispatch seam, exactly like a v1 gossip ACK would.
+    #[tokio::test]
+    async fn v1_ack_resolves_waiter_but_stamps_no_durable_ingress() {
+        let sender = test_keypair();
+        let machine_kp = MachineKeypair::generate().expect("machine");
+        let machine = machine_kp.machine_id();
+        let harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let request_id = [0xCB; 16];
+        let (waiter, ingress_cell) = harness
+            .pipeline
+            .inflight
+            .register_for_protocol_with_provenance(
+                request_id,
+                DM_PROTOCOL_V1,
+                sender.agent_id(),
+                Some(machine),
+            );
+        let encoded = signed_v1_ack_envelope_bytes(
+            &sender,
+            &machine_kp,
+            &harness.recipient_agent_id,
+            request_id,
+        );
+        let message = PubSubMessage {
+            topic: String::from("dm-inbox"),
+            payload: encoded,
+            sender: Some(sender.agent_id()),
+            sender_public_key: Some(sender.public_key().as_bytes().to_vec()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        };
+        dispatch_subscription_message(&harness.pipeline, message, false).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("v1 waiter must complete NORMALLY (no v1 failure)")
+                .expect("oneshot"),
+            DmAckOutcome::Accepted,
+            "v1 ACKs keep their existing semantics"
+        );
+        assert_eq!(
+            *ingress_cell.lock().expect("cell"),
+            None,
+            "#563: a v1 ACK must not populate durable-ACK provenance; the HTTP mapper omits the field on None"
         );
     }
 
