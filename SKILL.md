@@ -323,6 +323,42 @@ x0x agents machine <agent_id>            # GET /agents/:id/machine — which mac
 x0x agents by-user <user_id>             # GET /users/:user_id/agents (also /users/:user_id/machines)
 ```
 
+**Card import and direct-connect REST contracts**
+
+These are ordinary bearer-token routes (durable API or session token); a scoped
+rider token is denied by the ADR-0039 route fence. Import a card with the card
+link (or raw card encoding) and an optional trust level:
+
+```bash
+curl -X POST "http://$API/agent/card/import" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"card":"x0x://agent/...","trust_level":"known"}'
+# 200 -> {"ok":true,"agent_id":"<64-hex>","display_name":"...",
+#         "trust_level":"Known","trust_change_ignored":false,"groups":0,"stores":0}
+```
+
+`trust_level` defaults to `known`. A malformed card, invalid signed-card
+signature, invalid card agent id, or unknown trust level returns 400; signed cards
+are verified and legacy unsigned cards remain importable. Import also refreshes the
+local discovery/capability cache. Re-import never lowers an existing trust level
+and a blocked contact remains blocked. See the [full API reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md) for the card fields.
+
+To request a connection to a discovered agent, send its 64-character hex id:
+
+```bash
+curl -X POST "http://$API/agents/connect" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"agent_id":"<64-hex>"}'
+# 200 example -> {"ok":true,"outcome":"Unreachable","addr":null}
+```
+
+`Direct` and `Coordinated` outcomes include an address string;
+`AlreadyConnected`, `Unreachable`, and `NotFound` use `addr: null`.
+Malformed ids return 400; an internal connection error returns 500. The route
+applies a 60-second operation bound and maps a timeout to 200 with
+`{"ok":true,"outcome":"Unreachable","addr":null}`. Treat `outcome` (and
+then `/peers` or a direct-send result) as the evidence: `ok` only says the route
+returned a JSON result, not that transport connectivity was established.
+
 **Contacts & trust** — `blocked` (silently dropped) | `unknown` | `known` | `trusted`:
 
 ```bash
@@ -445,6 +481,34 @@ curl -X PUT "http://$API/stores/team-config/greeting" -H "Authorization: Bearer 
 curl -X POST "http://$API/stores/team-config/join" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"expected_owner":"<owner agent_id>"}'
 ```
+
+**Group-scoped encrypted stores** use a separate route from ordinary `/stores`;
+ordinary stores remain signed/plaintext according to their creation policy. The
+caller must use the normal durable or session bearer and be an active member of
+the named group; scoped rider tokens are denied by the ADR-0039 route fence. The
+group must be `MlsEncrypted` on the GSS plane (ADR-0010):
+
+```bash
+curl -X POST "http://$API/groups/<group_id>/stores" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"private-app-state"}'
+# 201 -> {"ok":true,"id":"x0x/group/.../kv/...","store_id":"<hex>",
+#         "group_id":"<stable-group-id>","topic":"...","policy":"encrypted",
+#         "epoch":1,"checkpoint_available":false,"ownership":{...}}
+```
+
+Opening the same name is idempotent and returns 200 with the same metadata. Empty
+names or an unsupported group policy/plane return 400; a missing group is 404;
+a non-member is 403; a rider token is also 403 at middleware before this handler
+(the handler retains its group-grant check as defense in depth); a withdrawn group
+is 409. Creating a new handle also returns 409 when the local shared secret is
+missing. Reopening an existing handle can return 200 with `epoch: 0` if the
+secure context is unavailable; metadata success does not prove the store is ready
+for use. Rekey refreshes the secure context and its reported
+`epoch`; leaving, removing, or withdrawing the group invalidates and retires its
+handles, so later store activity fails closed. This route creates a group-bound
+encrypted store; it does not change the behavior or encryption of an existing
+ordinary `/stores` record. See the [encrypted-store API design](https://github.com/saorsa-labs/x0x/blob/main/docs/design/encrypted-kvstore.md#api-shape) and [full API reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md).
 
 Claims are advisory (never exclusive); `fence_token` fences your own local replica across restarts. Task ownership transfer rides ADR-0040 delegation (claiming ≠ ownership).
 
@@ -590,7 +654,41 @@ x0x peer probe|health|events        # per-peer liveness, health snapshot, SSE li
 x0x network status                  # NAT type, external addrs, direct capability
 ```
 
-Read-only snapshots: `/diagnostics/connectivity` (NodeStatus — UPnP, NAT, relay, mDNS), `/ack` (ACK-v2 latency buckets), `/gossip` (drop detection), `/transport` (zombie-connection hunt), `/relay` (ADR-0035 metering), `/dm` (DM counters + per-peer state), `/groups` (ingest + drop buckets), `/history` (writer/reaper), `/connect` (ACL allow/deny), `/ws` (outbound-queue health), `/exec` (counters + ACL summary).
+The complete read-only snapshot inventory is `/diagnostics/connectivity`
+(NodeStatus: UPnP, NAT, relay, mDNS), `/diagnostics/ack` (ACK-v2 latency
+buckets), `/diagnostics/gossip` (drop detection and participation),
+`/diagnostics/transport` (connection accounting), `/diagnostics/relay` (ADR-0035
+metering), `/diagnostics/dm` (DM counters and per-peer state),
+`/diagnostics/groups` (ingest and drop buckets), `/diagnostics/history`
+(writer/reaper), `/diagnostics/connect` (ACL allow/deny),
+`/diagnostics/ws` (outbound-queue health), and `/diagnostics/exec` (counters
+and ACL summary).
+
+The three routes detailed below are `GET` with no request body and require the
+normal local bearer token. They return snapshots, not SLAs or proof that a peer
+is reachable; a node that has not initialized the relevant runtime returns 503
+with `{"ok":false,"error":"..."}`.
+
+- `/diagnostics/ack` returns `{"ok":true,"ack":{...}}` (503 `network not
+  initialized` or `ACK diagnostics unavailable`). The `ack` object is the
+  ant-quic ACK-v2 per-stage latency/outcome snapshot; its bucket and counter
+  names are versioned by the installed ant-quic dependency.
+- `/diagnostics/gossip` returns `{"ok":true,"stats":{...},...}`. `stats`
+  contains publish/receive/decode/delivery/drop and in-flight deltas; the
+  envelope also includes `participation`, `subscribed_topics`,
+  `outbound_by_topic_named`, `egress_budget`, `outer_signature_policy`,
+  `legacy_grants_enabled` (currently `false`), `outer_v1_receipts`,
+  `gossip_publish_zero_fanout`, `pubsub_stages`, `dispatcher`, `recv_pump`,
+  and `discovery_cache_entries` (`agents`, `machines`, `users`). The route
+  returns 503 `gossip runtime not initialized` when gossip has no snapshot.
+- `/diagnostics/transport` returns `{"ok":true,"transport":{...}}` (503
+  `network node not initialized`). The transport object includes active versus
+  x0x-visible connections, `peer_entries` (`peer_id`, `remote_addr`), successful
+  and failed establishments, NAT/direct/relayed counters, bootstrap totals,
+  churn and connection-pool/read-pump counters such as open connections,
+  buffered bytes, and orphan closures.
+
+Use the [full API reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md#diagnostics) for the route table and the versioned field context; do not interpret a non-zero counter alone as a failure.
 
 ### 7.4 Troubleshooting
 
