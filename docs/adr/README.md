@@ -74,6 +74,8 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0063: Signed KV legacy gossip compatibility adoption boundary](./0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md) — draft; V3 pairing preparation only, G0 met and G1–G8 open; disabled pending audited adoption
 
+- [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
+
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
 Documentation-audit corrections, 2026-07-19. The ADR files themselves are
