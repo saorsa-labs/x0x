@@ -118,6 +118,8 @@ profile-heap = ["dep:dhat"]
 # Voice/video adapters for saorsa-webrtc: X0xSignaling over DMs and
 # X0xLinkTransport over ADR-0022 byte streams (StreamProtocol::WebRtcV1).
 voice = ["dep:saorsa-webrtc-core", "dep:saorsa-webrtc-codecs"]
+# Diagnostic-only #491 RT3 fixture/witness; excluded from ordinary builds.
+rt3-diagnostic = []
 
 [dev-dependencies]
 # `start_paused` virtual-clock tests for the state-request bootstrap tail
@@ -149,6 +151,11 @@ test = false
 name = "x0x"
 path = "src/bin/x0x.rs"
 test = false
+
+[[bin]]
+name = "rt3_fixture"
+path = "src/bin/rt3_fixture.rs"
+required-features = ["rt3-diagnostic"]
 
 [[bin]]
 name = "gui-coverage"
