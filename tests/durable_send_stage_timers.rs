@@ -161,21 +161,19 @@ async fn first_durable_send_stage_timers_sum_to_wall_time() {
         stages.budget_stage
     );
 
-    let bob_diag: Value = bob_client
-        .get(bob.url("/diagnostics/dm"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // Sender 200 means the ACK arrived; Bob records last_ack_publish_ms only
+    // after the async ACK publisher finishes its route join. Poll briefly so
+    // the diagnostic race cannot flake CI. Do not extend product send budgets.
     if status == StatusCode::OK {
+        let bob_diag = wait_for_last_ack_publish_ms(&bob, Duration::from_secs(5)).await;
         assert!(
             bob_diag
                 .get("last_ack_publish_ms")
                 .and_then(Value::as_u64)
                 .is_some(),
-            "receiver must export last_ack_publish_ms after a durable ACK: {bob_diag}"
+            "receiver must export last_ack_publish_ms after a durable ACK \
+             (ack_publish_route_failed={:?}): {bob_diag}",
+            bob_diag.get("ack_publish_route_failed")
         );
     }
 }
@@ -235,6 +233,37 @@ fn rewrite_unspecified_to_loopback(addr: &str) -> String {
         return format!("127.0.0.1:{rest}");
     }
     addr.to_string()
+}
+
+/// Wait until Bob's ACK publisher has written `last_ack_publish_ms`, or the
+/// observation deadline elapses. Delivery already succeeded on the 200 path;
+/// this only closes the diagnostic-export race against an immediate GET.
+async fn wait_for_last_ack_publish_ms(fixture: &DaemonFixture, deadline: Duration) -> Value {
+    let client = fixture.authed_client(Duration::from_secs(5));
+    let started = tokio::time::Instant::now();
+    let mut last = Value::Null;
+    let mut polls = 0usize;
+    while started.elapsed() < deadline {
+        polls += 1;
+        if let Ok(resp) = client.get(fixture.url("/diagnostics/dm")).send().await {
+            if let Ok(body) = resp.json::<Value>().await {
+                last = body;
+                if last
+                    .get("last_ack_publish_ms")
+                    .and_then(Value::as_u64)
+                    .is_some()
+                {
+                    return last;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    eprintln!(
+        "last_ack_publish_ms still unset after {deadline:?} ({polls} polls); \
+         returning final /diagnostics/dm for assertion pairing"
+    );
+    last
 }
 
 async fn wait_for_durable_capability(fixture: &DaemonFixture, deadline: Duration) -> usize {
