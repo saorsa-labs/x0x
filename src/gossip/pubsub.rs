@@ -2,10 +2,11 @@
 //!
 //! This module implements topic-based pub/sub for x0x with:
 //! - PlumTree dissemination via `saorsa-gossip-pubsub`
-//! - x0x payload-level message authentication (V2 signed format)
+//! - x0x payload-level message authentication (V2 and topic-bound V3)
 //!
-//! Two wire formats coexist during the transition period:
+//! Three wire formats coexist during the transition period:
 //! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned
+//! - **V3** (Signed KV pairing): same fields as V2, with signed topic length
 //! - **V2** (signed): `[0x02 | agent_id | pubkey | signature | topic | payload]`
 
 use super::egress::{EgressMeter, PubSubTransport};
@@ -171,6 +172,53 @@ const MSG_V2_PREFIX: &[u8] = b"x0x-msg-v2";
 /// Version byte for signed messages.
 const VERSION_V2: u8 = 0x02;
 
+/// Reserved exclusively for the topic-bound signed inner envelope (ADR-0063).
+const VERSION_V3: u8 = 0x03;
+
+/// Domain and bounds of gossip #48's Signed KV inner verifier (ADR-0063).
+const MSG_V3_PREFIX: &[u8] = b"x0x-msg-v3";
+const MAX_V3_ENVELOPE_BYTES: usize = 1024 * 1024;
+const ML_DSA_65_PUBKEY_LEN: usize = 1952;
+const ML_DSA_65_SIG_LEN: usize = 3309;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignedVersion {
+    V2,
+    V3,
+}
+
+impl SignedVersion {
+    fn byte(self) -> u8 {
+        match self {
+            Self::V2 => VERSION_V2,
+            Self::V3 => VERSION_V3,
+        }
+    }
+
+    fn signing_payload(
+        self,
+        author: &[u8; 32],
+        topic: &[u8],
+        payload: &[u8],
+    ) -> NetworkResult<Vec<u8>> {
+        match self {
+            Self::V2 => Ok(build_signing_payload(author, topic, payload)),
+            Self::V3 => {
+                let len = u16::try_from(topic.len())
+                    .map_err(|_| NetworkError::SerializationError("Topic too long".to_string()))?;
+                let mut signed =
+                    Vec::with_capacity(MSG_V3_PREFIX.len() + 32 + 2 + topic.len() + payload.len());
+                signed.extend_from_slice(MSG_V3_PREFIX);
+                signed.extend_from_slice(author);
+                signed.extend_from_slice(&len.to_be_bytes());
+                signed.extend_from_slice(topic);
+                signed.extend_from_slice(payload);
+                Ok(signed)
+            }
+        }
+    }
+}
+
 /// Signing context for message authentication.
 ///
 /// Holds the agent identity and key material needed to sign outgoing
@@ -223,7 +271,7 @@ impl SigningContext {
 
 /// Message published to the pub/sub system.
 ///
-/// Messages may be signed (v2) or unsigned (v1 legacy). The `sender` and
+/// Messages may be signed (v2 or v3) or unsigned (v1 legacy). The `sender` and
 /// `verified` fields indicate the authentication state.
 #[derive(Debug, Clone)]
 pub struct PubSubMessage {
@@ -233,13 +281,13 @@ pub struct PubSubMessage {
     pub payload: Bytes,
     /// Sender's AgentId (`None` for unsigned legacy v1 messages).
     pub sender: Option<AgentId>,
-    /// Sender's ML-DSA-65 public key bytes (included in v2 messages).
+    /// Sender's ML-DSA-65 public key bytes (included in signed messages).
     pub sender_public_key: Option<Vec<u8>>,
     /// Whether the ML-DSA-65 signature was verified.
     pub verified: bool,
     /// Trust level from the local contact store (populated during incoming handling).
     pub trust_level: Option<TrustLevel>,
-    /// The raw V2 wire envelope bytes for signed messages (`None` for v1).
+    /// The raw V2 or V3 wire envelope bytes for signed messages (`None` for v1).
     ///
     /// ADR 0028: an authority relays the requester-authored predecessor
     /// envelope unchanged to active witnesses. The relay is a courier, not an
@@ -399,7 +447,7 @@ pub struct PubSubManager {
 struct PublishFanoutOutcome {
     /// Eager-peer publish count at `publish_local`. `0` is the black-hole.
     fan_out: u32,
-    /// Signed V2 envelope bytes when signing is enabled.
+    /// Signed envelope bytes when signing is enabled.
     envelope: Option<Bytes>,
 }
 
@@ -961,7 +1009,7 @@ impl PubSubManager {
     pub async fn publish_with_fanout(&self, topic: String, payload: Bytes) -> NetworkResult<u32> {
         let topic_id = TopicId::from_entity(topic.as_bytes());
         Ok(self
-            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload)
+            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
             .await?
             .fan_out)
     }
@@ -1009,9 +1057,33 @@ impl PubSubManager {
         topic_id: TopicId,
         payload: Bytes,
     ) -> NetworkResult<Option<Bytes>> {
-        self.publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload)
+        self.publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
             .await
             .map(|outcome| outcome.envelope)
+    }
+
+    /// Publish a topic-bound V3 inner envelope for the Signed KV pairing.
+    ///
+    /// This requires an author signing context and a network topic. It never
+    /// falls back to V2 or unsigned local delivery. It does not register a
+    /// compatibility topic, issue a grant, or enable legacy transport. Callers
+    /// must separately establish the Signed policy and audited receive/apply
+    /// path before adoption (ADR-0063). Existing publishers remain on V2.
+    pub async fn publish_signed_kv_v3(
+        &self,
+        topic: String,
+        payload: Bytes,
+    ) -> NetworkResult<Bytes> {
+        if self.signing.is_none() || is_local_topic(&topic) {
+            return Err(NetworkError::SerializationError(
+                "Signed KV V3 requires signing and a network topic".to_string(),
+            ));
+        }
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V3)
+            .await?
+            .envelope
+            .ok_or_else(|| NetworkError::SerializationError("Missing V3 envelope".to_string()))
     }
 
     /// Publish and return both the signed envelope (when signing) and the
@@ -1021,6 +1093,7 @@ impl PubSubManager {
         topic: String,
         topic_id: TopicId,
         payload: Bytes,
+        version: SignedVersion,
     ) -> NetworkResult<PublishFanoutOutcome> {
         // `local:` topics fan out to same-daemon subscribers only — the
         // payload never reaches PlumTree or any remote peer (issue #89).
@@ -1033,17 +1106,19 @@ impl PubSubManager {
         }
 
         let (encoded, envelope_bytes) = if let Some(ref ctx) = self.signing {
-            let signing_payload =
-                build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
-            let result = ctx.sign(&signing_payload).and_then(|signature| {
-                encode_v2(
-                    &ctx.agent_id,
-                    &ctx.public_key_bytes,
-                    &signature,
-                    &topic,
-                    &payload,
-                )
-            });
+            let result = version
+                .signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload)
+                .and_then(|signing_payload| ctx.sign(&signing_payload))
+                .and_then(|signature| {
+                    encode_signed(
+                        version,
+                        &ctx.agent_id,
+                        &ctx.public_key_bytes,
+                        &signature,
+                        &topic,
+                        &payload,
+                    )
+                });
             match result {
                 Ok(encoded) => {
                     let envelope = Bytes::clone(&encoded);
@@ -1736,6 +1811,11 @@ fn encode_v1(topic: &str, payload: &Bytes) -> NetworkResult<Bytes> {
     let topic_len = u16::try_from(topic_bytes.len())
         .map_err(|_| NetworkError::SerializationError("Topic too long".to_string()))?;
 
+    if topic_len.to_be_bytes()[0] >= VERSION_V2 {
+        return Err(NetworkError::SerializationError(
+            "Unsigned topic length uses a reserved signed version byte".to_string(),
+        ));
+    }
     let mut buf = Vec::with_capacity(2 + topic_bytes.len() + payload.len());
     buf.extend_from_slice(&topic_len.to_be_bytes());
     buf.extend_from_slice(topic_bytes);
@@ -1776,21 +1856,22 @@ fn decode_v1(data: &[u8]) -> NetworkResult<PubSubMessage> {
 }
 
 // ---------------------------------------------------------------------------
-// Wire format: V2 (signed)
+// Wire formats: V2 and V3 (signed)
 // ---------------------------------------------------------------------------
 
-/// Encode a v2 (signed) pub/sub message.
+/// Encode a signed pub/sub message with an explicit version.
 ///
 /// Format:
 /// ```text
-/// [version: 0x02]
+/// [version: 0x02 (V2) or 0x03 (V3)]
 /// [sender_agent_id: 32 bytes]
 /// [pubkey_len: u16_be] [sender_public_key: pubkey_len bytes]
 /// [sig_len: u16_be]    [signature: sig_len bytes]
 /// [topic_len: u16_be]  [topic_bytes: topic_len bytes]
 /// [payload: remaining bytes]
 /// ```
-fn encode_v2(
+fn encode_signed(
+    version: SignedVersion,
     agent_id: &AgentId,
     public_key: &[u8],
     signature: &[u8],
@@ -1807,9 +1888,12 @@ fn encode_v2(
 
     let total =
         1 + 32 + 2 + public_key.len() + 2 + signature.len() + 2 + topic_bytes.len() + payload.len();
+    if version == SignedVersion::V3 {
+        validate_v3_bounds(total, public_key.len(), signature.len())?;
+    }
     let mut buf = Vec::with_capacity(total);
 
-    buf.push(VERSION_V2);
+    buf.push(version.byte());
     buf.extend_from_slice(agent_id.as_bytes());
     buf.extend_from_slice(&pk_len.to_be_bytes());
     buf.extend_from_slice(public_key);
@@ -1850,10 +1934,53 @@ fn take_lp<'a>(data: &'a [u8], pos: &mut usize, what: &str) -> NetworkResult<&'a
 
 /// Decode a v2 (signed) message, verifying the ML-DSA-65 signature.
 pub(crate) fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
+    decode_signed(data, SignedVersion::V2)
+}
+
+/// Decode and authenticate the V3 inner envelope required by Signed KV compatibility.
+///
+/// Rejects V2, unsupported versions, and invalid signatures. Successful signature
+/// verification is not store authorization: callers still enforce the concrete
+/// topic, author roster, Signed ownership and state-request rules (ADR-0063).
+pub fn decode_signed_kv_v3(data: &[u8]) -> NetworkResult<PubSubMessage> {
+    if data.len() > MAX_V3_ENVELOPE_BYTES {
+        return Err(NetworkError::SerializationError(
+            "V3 envelope exceeds 1 MiB".to_string(),
+        ));
+    }
+    let message = decode_signed(data, SignedVersion::V3)?;
+    if !message.verified {
+        return Err(NetworkError::SerializationError(
+            "Invalid V3 signature".to_string(),
+        ));
+    }
+    Ok(message)
+}
+
+fn validate_v3_bounds(total: usize, key_len: usize, sig_len: usize) -> NetworkResult<()> {
+    if total > MAX_V3_ENVELOPE_BYTES {
+        return Err(NetworkError::SerializationError(
+            "V3 envelope exceeds 1 MiB".to_string(),
+        ));
+    }
+    if key_len != ML_DSA_65_PUBKEY_LEN || sig_len != ML_DSA_65_SIG_LEN {
+        return Err(NetworkError::SerializationError(
+            "Invalid V3 ML-DSA-65 key or signature length".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_signed(data: &[u8], version: SignedVersion) -> NetworkResult<PubSubMessage> {
+    if data.first() != Some(&version.byte()) {
+        return Err(NetworkError::SerializationError(
+            "Unexpected signed message version".to_string(),
+        ));
+    }
     // Minimum: 1 (version) + 32 (agent_id) + 2 (pk_len) + 2 (sig_len) + 2 (topic_len)
     if data.len() < 39 {
         return Err(NetworkError::SerializationError(
-            "V2 message too short".to_string(),
+            "Signed message too short".to_string(),
         ));
     }
 
@@ -1874,6 +2001,9 @@ pub(crate) fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
     let public_key_bytes = public_key_bytes.to_vec();
 
     let signature_bytes = take_lp(data, &mut pos, "signature")?;
+    if version == SignedVersion::V3 {
+        validate_v3_bounds(data.len(), public_key_bytes.len(), signature_bytes.len())?;
+    }
 
     let topic_bytes = take_lp(data, &mut pos, "topic")?;
     let topic = String::from_utf8(topic_bytes.to_vec())
@@ -1884,6 +2014,7 @@ pub(crate) fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
 
     // Verify: reconstruct the public key and check the signature
     let verified = verify_signature(
+        version,
         &public_key_bytes,
         &agent_id_bytes,
         topic.as_bytes(),
@@ -1909,11 +2040,16 @@ pub(crate) fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
     })
 }
 
-/// Auto-detect and decode a pub/sub message (v1 or v2).
+/// Auto-detect and decode a pub/sub message (v1, v2 or v3).
 ///
 /// The first byte distinguishes the format:
 /// - `0x02` → v2 (signed)
-/// - Anything else → v1 (legacy unsigned, where byte is high byte of topic_len)
+/// - `0x03` → v3 (topic-bound signed; never retried as V2 or V1)
+/// - `0x00` or `0x01` → v1 (unsigned, where byte is high byte of topic_len)
+/// - Higher bytes → unsupported version error
+///
+/// V1 has no version byte. Its encoder limits topics to 511 UTF-8 bytes;
+/// Signed KV compatibility callers must use [`decode_signed_kv_v3`] directly.
 pub fn decode_auto(data: Bytes) -> NetworkResult<PubSubMessage> {
     if data.is_empty() {
         return Err(NetworkError::SerializationError(
@@ -1921,10 +2057,13 @@ pub fn decode_auto(data: Bytes) -> NetworkResult<PubSubMessage> {
         ));
     }
 
-    if data[0] == VERSION_V2 {
-        decode_v2(&data)
-    } else {
-        decode_v1(&data)
+    match data[0] {
+        VERSION_V2 => decode_v2(&data),
+        VERSION_V3 => decode_signed_kv_v3(&data),
+        0 | 1 => decode_v1(&data),
+        version => Err(NetworkError::SerializationError(format!(
+            "Unsupported x0x envelope version 0x{version:02x}"
+        ))),
     }
 }
 
@@ -1942,6 +2081,7 @@ fn build_signing_payload(agent_id: &[u8; 32], topic: &[u8], payload: &[u8]) -> V
 
 /// Verify an ML-DSA-65 signature against the reconstructed signing payload.
 fn verify_signature(
+    version: SignedVersion,
     public_key_bytes: &[u8],
     agent_id: &[u8; 32],
     topic: &[u8],
@@ -1966,7 +2106,9 @@ fn verify_signature(
             Err(_) => return false,
         };
 
-    let signing_payload = build_signing_payload(agent_id, topic, payload);
+    let Ok(signing_payload) = version.signing_payload(agent_id, topic, payload) else {
+        return false;
+    };
 
     ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
         &public_key,
@@ -1981,6 +2123,23 @@ mod tests {
     use super::*;
     use crate::identity::AgentKeypair;
     use crate::network::NetworkConfig;
+
+    fn encode_v2(
+        agent_id: &AgentId,
+        public_key: &[u8],
+        signature: &[u8],
+        topic: &str,
+        payload: &Bytes,
+    ) -> NetworkResult<Bytes> {
+        encode_signed(
+            SignedVersion::V2,
+            agent_id,
+            public_key,
+            signature,
+            topic,
+            payload,
+        )
+    }
 
     #[test]
     fn classify_x0x_topic_routes_dm_bus_to_critical() {
@@ -2167,9 +2326,19 @@ mod tests {
     /// Helper to create a test network node.
     async fn test_node() -> Arc<NetworkNode> {
         Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
-                .await
-                .expect("Failed to create test node"),
+            NetworkNode::new(
+                NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..NetworkConfig::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to create test node"),
         )
     }
 
@@ -3365,6 +3534,274 @@ mod tests {
     #[test]
     fn test_auto_detect_empty() {
         assert!(decode_auto(Bytes::new()).is_err());
+    }
+
+    // ADR-0063: fixtures independently construct the exact gossip #48 preimage.
+    fn v3_fixture(ctx: &SigningContext, topic: &str, payload: &[u8]) -> Bytes {
+        let mut preimage = b"x0x-msg-v3".to_vec();
+        preimage.extend_from_slice(ctx.agent_id.as_bytes());
+        preimage.extend_from_slice(
+            &u16::try_from(topic.len())
+                .expect("topic fits")
+                .to_be_bytes(),
+        );
+        preimage.extend_from_slice(topic.as_bytes());
+        preimage.extend_from_slice(payload);
+        let signature = ctx.sign(&preimage).expect("fixture sign");
+        encode_signed(
+            SignedVersion::V3,
+            &ctx.agent_id,
+            &ctx.public_key_bytes,
+            &signature,
+            topic,
+            &Bytes::copy_from_slice(payload),
+        )
+        .expect("fixture encode")
+    }
+
+    fn topic_length_offset(envelope: &[u8]) -> usize {
+        let mut pos = 33;
+        take_lp(envelope, &mut pos, "public key").expect("key");
+        take_lp(envelope, &mut pos, "signature").expect("signature");
+        pos
+    }
+
+    #[tokio::test]
+    async fn v3_rejects_topic_boundary_rewrites() {
+        let ctx = SigningContext::from_keypair(&AgentKeypair::generate().expect("keygen"));
+        for (short, suffix) in [("T", "/state-sync"), ("é", "/other")] {
+            let long = format!("{short}{suffix}");
+            for (topic, payload, rewritten_topic) in [
+                (short, format!("{suffix}body"), long.as_str()),
+                (long.as_str(), "body".to_string(), short),
+            ] {
+                let original = v3_fixture(&ctx, topic, payload.as_bytes());
+                let valid = decode_signed_kv_v3(&original).expect("honest original");
+                assert!(valid.verified);
+                assert_eq!(valid.payload.as_ref(), payload.as_bytes());
+                let offset = topic_length_offset(&original);
+                let mut rewritten = original.to_vec();
+                rewritten[offset..offset + 2].copy_from_slice(
+                    &u16::try_from(rewritten_topic.len())
+                        .expect("length")
+                        .to_be_bytes(),
+                );
+                // Topic+payload concatenation is unchanged: only the boundary moved.
+                assert!(decode_signed_kv_v3(&rewritten)
+                    .expect_err("rewrite rejected")
+                    .to_string()
+                    .contains("Invalid V3 signature"));
+                assert!(decode_for_delivery(Bytes::from(rewritten), None, None)
+                    .await
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn v3_strict_version_dispatch_and_relabeling() {
+        let ctx = SigningContext::from_keypair(&AgentKeypair::generate().expect("keygen"));
+        let payload = Bytes::from_static(b"body");
+        let signature = ctx
+            .sign(&build_signing_payload(
+                ctx.agent_id.as_bytes(),
+                b"T",
+                &payload,
+            ))
+            .expect("v2 sign");
+        let v2 = encode_v2(
+            &ctx.agent_id,
+            &ctx.public_key_bytes,
+            &signature,
+            "T",
+            &payload,
+        )
+        .expect("v2 encode");
+        assert!(
+            decode_auto(v2.clone())
+                .expect("stock v2 remains v2")
+                .verified
+        );
+        assert!(decode_signed_kv_v3(&v2).is_err());
+        let mut relabeled = v2.to_vec();
+        relabeled[0] = VERSION_V3;
+        assert!(decode_auto(Bytes::from(relabeled)).is_err());
+        let v3 = v3_fixture(&ctx, "T", &payload);
+        assert!(decode_auto(v3.clone()).expect("v3 dispatch").verified);
+        assert!(decode_v2(&v3).is_err());
+        for version in [0, 1, 2, 4, 255] {
+            let mut wrong = v3.to_vec();
+            wrong[0] = version;
+            assert!(decode_signed_kv_v3(&wrong).is_err());
+            if version == VERSION_V2 {
+                assert!(
+                    !decode_auto(Bytes::from(wrong))
+                        .expect("v2 dispatch uses v2 domain")
+                        .verified
+                );
+            }
+        }
+        for end in 0..=topic_length_offset(&v3) + 2 {
+            assert!(decode_signed_kv_v3(&v3[..end]).is_err(), "truncation {end}");
+        }
+        let mut tampered = v3.to_vec();
+        tampered[1] ^= 1;
+        assert!(decode_signed_kv_v3(&tampered).is_err());
+        let mut appended = v3.to_vec();
+        appended.push(0);
+        assert!(decode_signed_kv_v3(&appended).is_err());
+    }
+
+    #[test]
+    fn v3_signing_preimage_matches_gossip_contract() {
+        let author = [42; 32];
+        let signed = SignedVersion::V3
+            .signing_payload(&author, "é".as_bytes(), b"/state-sync")
+            .expect("signing payload");
+        let mut expected = b"x0x-msg-v3".to_vec();
+        expected.extend_from_slice(&author);
+        expected.extend_from_slice(&[0, 2]); // UTF-8 byte length, not character count
+        expected.extend_from_slice("é/state-sync".as_bytes());
+        assert_eq!(signed, expected);
+        assert!(SignedVersion::V3
+            .signing_payload(&author, &vec![b'x'; 65536], b"")
+            .is_err());
+        for len in [512, 767, 768, 1023, 1024, 65535] {
+            assert!(encode_v1(&"x".repeat(len), &Bytes::new()).is_err());
+        }
+        for len in [0, 255, 256, 511] {
+            assert!(decode_auto(
+                encode_v1(&"x".repeat(len), &Bytes::new()).expect("unreserved v1 length")
+            )
+            .is_ok());
+        }
+        // V2 signs identical concatenations; V3 authenticates the split itself.
+        assert_eq!(
+            build_signing_payload(&author, b"T", b"/state-syncbody"),
+            build_signing_payload(&author, b"T/state-sync", b"body")
+        );
+        assert_ne!(
+            SignedVersion::V3
+                .signing_payload(&author, b"T", b"/state-syncbody")
+                .unwrap(),
+            SignedVersion::V3
+                .signing_payload(&author, b"T/state-sync", b"body")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn signed_and_unknown_versions_never_fall_through_to_unsigned() {
+        // Valid UTF-8 deliberately removes the accidental protection of random
+        // key bytes failing V1's topic parsing. Stock decode_v1 accepts these.
+        for version in VERSION_V2..=u8::MAX {
+            let mut bytes = vec![b'x'; 2 + (usize::from(version) << 8)];
+            bytes[0] = version;
+            bytes[1] = 0;
+            assert!(decode_v1(&bytes).is_ok());
+            assert!(decode_auto(Bytes::from(bytes)).is_err());
+        }
+    }
+
+    #[test]
+    fn v3_enforces_gossip_shape_and_size_bounds() {
+        let ctx = SigningContext::from_keypair(&AgentKeypair::generate().expect("keygen"));
+        // Construct malformed frames through V2 so V3's encoder cannot mask a
+        // missing check in its decoder. No cryptographic verification is needed.
+        for (key_len, sig_len) in [(1951, 3309), (1953, 3309), (1952, 3308), (1952, 3310)] {
+            let key = vec![0; key_len];
+            let signature = vec![0; sig_len];
+            assert!(encode_signed(
+                SignedVersion::V3,
+                &ctx.agent_id,
+                &key,
+                &signature,
+                "T",
+                &Bytes::new()
+            )
+            .is_err());
+            let mut malformed = encode_v2(&ctx.agent_id, &key, &signature, "T", &Bytes::new())
+                .unwrap()
+                .to_vec();
+            malformed[0] = VERSION_V3;
+            assert!(decode_signed_kv_v3(&malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("length"));
+        }
+        let header_len = 39 + ctx.public_key_bytes.len() + ML_DSA_65_SIG_LEN + 1;
+        let payload = vec![0; MAX_V3_ENVELOPE_BYTES - header_len];
+        let at_limit = v3_fixture(&ctx, "T", &payload);
+        assert_eq!(at_limit.len(), MAX_V3_ENVELOPE_BYTES);
+        assert!(decode_signed_kv_v3(&at_limit).unwrap().verified);
+        let mut oversized = at_limit.to_vec();
+        oversized.push(0);
+        assert!(decode_signed_kv_v3(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds 1 MiB"));
+        assert!(encode_signed(
+            SignedVersion::V3,
+            &ctx.agent_id,
+            &ctx.public_key_bytes,
+            &vec![0; ML_DSA_65_SIG_LEN],
+            "T",
+            &Bytes::from(vec![0; payload.len() + 1])
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn v3_publisher_requires_signing_and_emits_verifiable_envelope() {
+        let node = test_node().await;
+        let unsigned = PubSubManager::new(Arc::clone(&node), None).expect("manager");
+        assert!(unsigned
+            .publish_signed_kv_v3("T".to_string(), Bytes::new())
+            .await
+            .is_err());
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = PubSubManager::new(node, Some(Arc::clone(&ctx))).expect("manager");
+        // Preparation must not implicitly migrate even a Signed KV topic name.
+        for topic in ["ordinary", "T", "T/state-sync"] {
+            let envelope = manager
+                .publish_and_get_envelope(topic.to_string(), Bytes::from_static(b"body"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(envelope[0], VERSION_V2);
+            assert!(decode_v2(&envelope).unwrap().verified);
+        }
+        assert!(manager
+            .publish_signed_kv_v3("local:T".to_string(), Bytes::new())
+            .await
+            .is_err());
+        for topic in ["T", "T/state-sync"] {
+            let envelope = manager
+                .publish_signed_kv_v3(topic.to_string(), Bytes::from_static(b"body"))
+                .await
+                .expect("v3 publish");
+            assert_eq!(envelope[0], VERSION_V3);
+            let msg = decode_signed_kv_v3(&envelope).expect("paired receiver");
+            assert_eq!(msg.topic, topic);
+            assert_eq!(msg.sender, Some(ctx.agent_id));
+            assert_eq!(msg.raw_envelope, Some(envelope.clone()));
+            // Independently verify the production signer with gossip's crypto API.
+            let mut pos = 33;
+            let key = take_lp(&envelope, &mut pos, "key").expect("key");
+            assert_eq!(PeerId::from_pubkey(key).as_bytes(), ctx.agent_id.as_bytes());
+            let signature = take_lp(&envelope, &mut pos, "signature").expect("signature");
+            let mut expected = b"x0x-msg-v3".to_vec();
+            expected.extend_from_slice(ctx.agent_id.as_bytes());
+            expected.extend_from_slice(&u16::try_from(topic.len()).expect("length").to_be_bytes());
+            expected.extend_from_slice(topic.as_bytes());
+            expected.extend_from_slice(b"body");
+            assert!(
+                saorsa_gossip_identity::MlDsaKeyPair::verify(key, &expected, signature)
+                    .expect("gossip verify")
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

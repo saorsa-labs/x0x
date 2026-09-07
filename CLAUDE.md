@@ -69,6 +69,7 @@ These are NOT auto-loaded. Read them when the task touches the relevant area.
   `tests/CLAUDE.md` (auto-loaded when working in `tests/`)
 - Full REST + WebSocket API: `docs/api-reference.md`
 - Self-update system internals: `docs/upgrade-system.md`
+- Signed KV compatibility preparation and gate holds: `docs/legacy-compat.md`
 - Trust model, connectivity, enhanced announcements: `docs/trust-and-connectivity.md`
 - x0x-symphony integration: `docs/symphony-integration.md`
 - CI/CD workflows: `docs/cicd.md`

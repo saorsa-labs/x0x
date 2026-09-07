@@ -72,6 +72,8 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0061: Self-Update Must Resolve Restart Ownership Before Replacing Binaries](./0061-supervised-upgrade-restart-ownership.md) (proposed 2026-09-06) — reject known supervisor/restart-setting conflicts before replacement; explicit platform policy and migration, separate readiness/recovery acceptance for #493/#415
 
+- [ADR 0063: Signed KV legacy gossip compatibility adoption boundary](./0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md) — draft; V3 pairing preparation only, G0 met and G1–G8 open; disabled pending audited adoption
+
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
 Documentation-audit corrections, 2026-07-19. The ADR files themselves are
