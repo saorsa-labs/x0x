@@ -78,9 +78,11 @@ message through real IHAVE/IWANT handlers after both selected carriers fail.
 The recovery fixture supplies the signed IHAVE advertisement; subsequent
 request, cache response and local delivery use the actual handlers.
 
-HOLD: sg #51 review/publication; exhaustive GRAFT/scoring/cooling integration
-acceptance; full §6.2 acceptance; and external before/after public Leaf soak.
-The sibling sg PR has its own maintenance and replacement tests; those are
-separate dependency evidence, not x0x integration credit.
-PR deferred pending #535 CI fence on main. No push or PR is authorized for
-this local checkpoint. No daemon restart or public-mesh test is part of it.
+HOLD: exhaustive GRAFT/scoring/cooling integration acceptance; full §6.2
+acceptance; and external before/after public Leaf soak. Sustained public-mesh
+cap claims remain out of scope for this experimental framing.
+
+Published dependency line: crates.io saorsa-gossip **0.5.76** + ant-quic
+**0.27.50** (CI fence #535 merged to main). Ships via draft release PR #544
+(no tag/publish from docs alone). Daemon restart and public-mesh soak are
+still not part of this checkpoint.
