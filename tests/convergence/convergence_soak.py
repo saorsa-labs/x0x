@@ -427,6 +427,15 @@ REVIEWED_SOURCES = [
 ]
 LEGACY_REQUIRED_VERSION = "0.30.1"
 
+# ADR-014 modern-only predicate: stock mixed-version phases are excluded from
+# PASS and labeled not_in_modern_predicate (never silently skipped-as-green).
+MODERN_EXCLUDED_GATE_NAMES = (
+    "mixed_version_skew_load_bearing",
+    "mixed_version_skew_degraded",
+)
+NOT_IN_MODERN_PREDICATE = "not_in_modern_predicate"
+
+
 
 def sha256_file(path):
     """Streaming SHA-256 hex digest of a file."""
@@ -2698,6 +2707,62 @@ def summarize(runs, args, prereq_gates=None, provenance=None,
     return "\n".join(lines)
 
 
+
+def modern_excluded_gate_record(name):
+    """Classifier record for a stock mixed-version phase under --modern-only.
+
+    Status is never PASS: ADR-014 requires explicit not_in_modern_predicate.
+    """
+    return {
+        "name": name,
+        "status": NOT_IN_MODERN_PREDICATE,
+        "predicate": NOT_IN_MODERN_PREDICATE,
+        "modern_only": True,
+        "note": ("stock v0.30.1 mixed-version phase excluded from modern "
+                 "release predicate (ADR-014); retained on stock "
+                 "convergence-release only"),
+    }
+
+
+def refuse_legacy_env_under_modern_only(legacy_binary=None, environ=None):
+    """Fail closed if a legacy binary path is supplied under --modern-only.
+
+    Returns an error string when refusal is required, else None. Used by
+    main() and hermetic self-tests.
+    """
+    import os as _os
+    env = environ if environ is not None else _os.environ
+    env_val = env.get("X0XD_LEGACY_BINARY")
+    if legacy_binary or env_val:
+        return (
+            "REFUSING --modern-only: X0XD_LEGACY_BINARY / --legacy-binary "
+            "must be unset (stock-in-modern-predicate is fail-closed; "
+            "use stock `just convergence-release` for mixed-version)")
+    return None
+
+
+def classify_prereq_gates_for_modern(gates):
+    """Ensure mixed-version gates are labeled not_in_modern_predicate.
+
+    Any gate whose name is in MODERN_EXCLUDED_GATE_NAMES is rewritten to the
+    classifier label (never PASS). Other gates are left unchanged.
+    """
+    out = []
+    for g in gates:
+        name = g.get("name") if isinstance(g, dict) else None
+        if name in MODERN_EXCLUDED_GATE_NAMES:
+            out.append(modern_excluded_gate_record(name))
+        else:
+            out.append(g)
+    # Always emit both excluded names so the receipt/classifier is complete
+    # even if mixed-version was never invoked.
+    present = {g.get("name") for g in out if isinstance(g, dict)}
+    for name in MODERN_EXCLUDED_GATE_NAMES:
+        if name not in present:
+            out.append(modern_excluded_gate_record(name))
+    return out
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="x0x three-node convergence soak harness")
@@ -2731,6 +2796,11 @@ def parse_args():
     p.add_argument("--expect-fixed", action="store_true",
                    help="turn known-gap expectations into hard gates "
                         "(use to verify the fixes)")
+    p.add_argument("--modern-only", action="store_true",
+                   help="ADR-014 modern release predicate: exclude stock "
+                        "mixed-version from PASS (label "
+                        "not_in_modern_predicate); refuse if "
+                        "X0XD_LEGACY_BINARY/--legacy-binary is set")
     p.add_argument("--log-level", default="info",
                    help="daemon log_level (default info)")
     p.add_argument("--out-dir", default=str(DEFAULT_OUT),
@@ -2769,6 +2839,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # ADR-014: under --modern-only, refuse legacy env fail-closed BEFORE any
+    # soak work (stock-in-modern-predicate must never run green).
+    if args.modern_only:
+        refuse = refuse_legacy_env_under_modern_only(args.legacy_binary)
+        if refuse:
+            log(refuse)
+            return 2
+        # Do not carry a legacy path into provenance / mixed-version.
+        args.legacy_binary = None
     if not args.x0xd.is_file():
         log(f"ERROR: x0xd not found at {args.x0xd} — build with "
             f"`cargo build --release --bin x0xd` or set X0XD_TEST_BINARY")
@@ -2859,10 +2938,21 @@ def main():
         # Prerequisite-gated security/skew gates run ONCE per invocation
         # (they do not depend on soak repetition and use isolated ports).
         log("=== prerequisite gates (mixed-version / malicious announce) ===")
-        prereq_gates.extend(run_mixed_version_gate(args, out_root))
+        if args.modern_only:
+            # Stock mixed-version is NOT in the modern predicate: emit
+            # classifier labels instead of running / UNSUPPORTED-under-expect-fixed.
+            prereq_gates.extend(
+                modern_excluded_gate_record(n)
+                for n in MODERN_EXCLUDED_GATE_NAMES)
+            log("modern-only: mixed_version_skew labeled "
+                f"{NOT_IN_MODERN_PREDICATE} (excluded from PASS)")
+        else:
+            prereq_gates.extend(run_mixed_version_gate(args, out_root))
         prereq_gates.append(run_malicious_owner_announce_gate(args, out_root))
         prereq_gates.append(run_owner_offline_checkpoint_gate(args, out_root))
         prereq_gates.append(run_forged_first_seen_gate(args, out_root))
+        if args.modern_only:
+            prereq_gates = classify_prereq_gates_for_modern(prereq_gates)
     finally:
         report_path = out_root / "report.json"
         report_path.write_text(json.dumps({
@@ -2889,8 +2979,14 @@ def main():
     # provenance refusal (stale binary / wrong legacy version) already failed
     # fast above under --expect-fixed.
     if args.expect_fixed:
-        prereq_ok = all(g.get("status") not in ("fail", "unsupported")
-                        for g in prereq_gates)
+        # Under --modern-only, not_in_modern_predicate is an explicit exclude
+        # label (not PASS, not a failure) — stock phases must not block modern.
+        def _prereq_blocking(g):
+            st = g.get("status")
+            if args.modern_only and st == NOT_IN_MODERN_PREDICATE:
+                return False
+            return st in ("fail", "unsupported")
+        prereq_ok = all(not _prereq_blocking(g) for g in prereq_gates)
     else:
         prereq_ok = all(g.get("status") != "fail" for g in prereq_gates)
     # Release-environment gates: critical hard-error growth and mDNS mesh

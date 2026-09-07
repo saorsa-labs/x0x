@@ -61,5 +61,53 @@ class NodeIdentityIsolationTests(unittest.TestCase):
                              "disposable test marker, not key material")
 
 
+
+
+class ModernOnlyPredicateTests(unittest.TestCase):
+    """Hermetic ADR-014 modern-only classifier + env-refuse self-tests."""
+
+    def test_refuse_legacy_env_when_env_set(self):
+        err = SOAK.refuse_legacy_env_under_modern_only(
+            legacy_binary=None,
+            environ={"X0XD_LEGACY_BINARY": "/tmp/fake-x0xd-0.30.1"})
+        self.assertIsNotNone(err)
+        self.assertIn("REFUSING", err)
+        self.assertIn("X0XD_LEGACY_BINARY", err)
+
+    def test_refuse_legacy_env_when_flag_path_set(self):
+        err = SOAK.refuse_legacy_env_under_modern_only(
+            legacy_binary="/tmp/fake-x0xd-0.30.1",
+            environ={})
+        self.assertIsNotNone(err)
+        self.assertIn("REFUSING", err)
+
+    def test_allow_when_legacy_unset(self):
+        err = SOAK.refuse_legacy_env_under_modern_only(
+            legacy_binary=None, environ={})
+        self.assertIsNone(err)
+
+    def test_classifier_labels_mixed_version_not_pass(self):
+        raw = [
+            {"name": "mixed_version_skew_load_bearing", "status": "pass"},
+            {"name": "mixed_version_skew_degraded", "status": "unsupported"},
+            {"name": "malicious_owner_announce", "status": "pass"},
+        ]
+        classified = SOAK.classify_prereq_gates_for_modern(raw)
+        by_name = {g["name"]: g for g in classified}
+        for name in SOAK.MODERN_EXCLUDED_GATE_NAMES:
+            self.assertIn(name, by_name)
+            self.assertEqual(by_name[name]["status"],
+                             SOAK.NOT_IN_MODERN_PREDICATE)
+            self.assertNotEqual(by_name[name]["status"], "pass")
+        self.assertEqual(by_name["malicious_owner_announce"]["status"], "pass")
+
+    def test_modern_excluded_gate_record_never_pass(self):
+        rec = SOAK.modern_excluded_gate_record(
+            "mixed_version_skew_load_bearing")
+        self.assertEqual(rec["status"], SOAK.NOT_IN_MODERN_PREDICATE)
+        self.assertEqual(rec["predicate"], SOAK.NOT_IN_MODERN_PREDICATE)
+        self.assertNotEqual(rec["status"], "pass")
+
+
 if __name__ == "__main__":
     unittest.main()

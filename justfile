@@ -197,6 +197,17 @@ convergence-release:
     cargo build --release --bin x0xd --bin x0xd-forge-injector
     python3 tests/convergence/convergence_soak.py --runs 10 --expect-fixed
 
+# ADR-014 modern-only RELEASE convergence recipe (additive; stock
+# `convergence-release` unchanged). Fail-closed if X0XD_LEGACY_BINARY is set
+# (stock-in-modern-predicate refused). Builds x0xd + x0xd-forge-injector, then
+# runs soak --runs 10 --expect-fixed --modern-only (mixed-version labeled
+# not_in_modern_predicate; never PASS). RejectV1 diagnostics assert is TODO
+# until #546 lands — do not fake 10/10 here.
+convergence-release-modern:
+    @if [ -n "${X0XD_LEGACY_BINARY:-}" ]; then echo "REFUSING convergence-release-modern: X0XD_LEGACY_BINARY must be unset (ADR-014 fail-closed)"; exit 2; fi
+    cargo build --release --bin x0xd --bin x0xd-forge-injector
+    python3 tests/convergence/convergence_soak.py --runs 10 --expect-fixed --modern-only
+
 # Check dependencies against the RustSec advisory database (supply-chain guard)
 audit:
     cargo audit
