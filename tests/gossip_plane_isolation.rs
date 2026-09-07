@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use x0x::network::{validate_plane_id, NetworkConfig};
+use x0x::network::{validate_plane_id, DisconnectReason, NetworkConfig, NetworkEvent};
 use x0x::Agent;
 
 const TOPIC: &str = "x0x.test.plane-isolation.v1";
@@ -36,14 +36,40 @@ async fn build_agent(dir: &std::path::Path, name: &str, network_id: Option<&str>
         .unwrap_or_else(|e| panic!("build {name}: {e}"))
 }
 
-/// Dial `b` from `a` and wait until both sides register the connection.
-async fn connect_pair(a: &Agent, b: &Agent) {
+/// Dial `b` from `a` and prove the authenticated transport answered with `b`'s
+/// identity. The transport may be policy-closed immediately after this
+/// returns, so callers that expect a stable connection must use `connect_pair`.
+async fn dial_pair(a: &Agent, b: &Agent) -> ant_quic::PeerId {
     let b_addr = b.bound_addr().await.expect("b bound addr");
     let a_network = a.network().expect("a network");
     let connected = a_network.connect_addr(b_addr).await.expect("a dials b");
     assert_eq!(connected.0, b.machine_id().0, "a connected to b's identity");
+    ant_quic::PeerId(connected.0)
+}
 
-    let b_peer = ant_quic::PeerId(b.machine_id().0);
+/// Dial `b` while preserving a transport error for the cross-plane oracle.
+/// An authenticated dial can race the plane gate's policy close and therefore
+/// return an error from the post-handshake gate; callers must prove that race
+/// independently from the lifecycle and network event streams.
+async fn try_dial_pair(a: &Agent, b: &Agent) -> Result<ant_quic::PeerId, String> {
+    let b_addr = b.bound_addr().await.expect("b bound addr");
+    let a_network = a.network().expect("a network");
+    let connected = a_network
+        .connect_addr(b_addr)
+        .await
+        .map_err(|e| format!("a dials b: {e}"))?;
+    assert_eq!(
+        connected.0,
+        b.machine_id().0,
+        "a authenticated the unexpected peer identity"
+    );
+    Ok(ant_quic::PeerId(connected.0))
+}
+
+/// Dial `b` from `a` and wait until both sides register the connection.
+async fn connect_pair(a: &Agent, b: &Agent) {
+    let b_peer = dial_pair(a, b).await;
+    let a_network = a.network().expect("a network");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         if a_network.is_connected(&b_peer).await {
@@ -121,13 +147,33 @@ async fn cross_plane_pair_does_not_exchange_gossip() {
 
     let mut prod_sub = prod.subscribe(TOPIC).await.expect("prod sub");
     let mut testnet_sub = testnet.subscribe(TOPIC).await.expect("testnet sub");
-    connect_pair(&prod, &testnet).await;
+    let prod_network = prod.network().expect("prod network");
+    let testnet_network = testnet.network().expect("testnet network");
+    let mut prod_events = prod_network.subscribe();
+    let mut testnet_events = testnet_network.subscribe();
+    let mut prod_lifecycle = prod_network
+        .subscribe_all_peer_events()
+        .await
+        .expect("prod lifecycle subscription");
+    let mut testnet_lifecycle = testnet_network
+        .subscribe_all_peer_events()
+        .await
+        .expect("testnet lifecycle subscription");
+    let testnet_peer = ant_quic::PeerId(testnet.machine_id().0);
+    let prod_peer = ant_quic::PeerId(prod.machine_id().0);
+    let dial_error = match try_dial_pair(&prod, &testnet).await {
+        Ok(peer) => {
+            assert_eq!(peer, testnet_peer, "a authenticated the unexpected peer");
+            None
+        }
+        Err(error) => Some(error),
+    };
 
-    // Publish in both directions across the (initially connected) link.
-    // Neither may be delivered to the other side: the plane gate holds
-    // frames from non-cleared peers, and the mismatched hellos refuse the
-    // connection. (Each side DOES see its own publish echoed locally; the
-    // assertions below only look for the foreign payload.)
+    // Publish in both directions immediately after the authenticated dial.
+    // The link may already be policy-closing: the plane gate holds frames
+    // from non-cleared peers, and mismatched hellos refuse the connection.
+    // (Each side DOES see its own publish echoed locally; the assertions below
+    // only look for the foreign payload.)
     testnet
         .publish(TOPIC, b"testnet junk payload".to_vec())
         .await
@@ -153,32 +199,86 @@ async fn cross_plane_pair_does_not_exchange_gossip() {
         "testnet must not receive prod's cross-plane publish"
     );
 
-    // Hard isolation: the mismatched hello must tear the connection down on
-    // both sides and keep it down (PolicyRejection tombstone).
-    let prod_network = prod.network().expect("prod network");
-    let testnet_peer = ant_quic::PeerId(testnet.machine_id().0);
+    // Hard isolation: the mismatched hello must produce an exact
+    // PolicyRejection event, a suppression tombstone, and a transport close.
+    // The event subscription is established before the dial so a policy close
+    // that wins the scheduler race cannot be mistaken for never connecting.
     // Panic-on-never guard for EVENTUAL behaviour (the disconnect fires and
     // sticks), not a latency bound: under loaded CI runners the hello
     // round-trip, the PolicyRejection close, and ant-quic mDNS redial races
     // all stretch, and a deadline sized for an idle machine flakes while the
     // invariant holds (issue #241 pattern).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut disconnected = false;
-    while tokio::time::Instant::now() < deadline {
-        if !prod_network.is_connected(&testnet_peer).await {
-            disconnected = true;
-            break;
+    let mut prod_established = false;
+    let mut testnet_established = false;
+    let mut prod_rejected = false;
+    let mut testnet_rejected = false;
+    while tokio::time::Instant::now() < deadline
+        && !((prod_established && prod_rejected) || (testnet_established && testnet_rejected))
+    {
+        tokio::select! {
+            event = prod_events.recv() => {
+                if let Ok(NetworkEvent::PeerDisconnected { peer_id, reason }) = event {
+                    if peer_id == testnet_peer.0 && reason == DisconnectReason::PolicyRejection {
+                        prod_rejected = true;
+                    }
+                }
+            }
+            event = testnet_events.recv() => {
+                if let Ok(NetworkEvent::PeerDisconnected { peer_id, reason }) = event {
+                    if peer_id == prod_peer.0 && reason == DisconnectReason::PolicyRejection {
+                        testnet_rejected = true;
+                    }
+                }
+            }
+            lifecycle = prod_lifecycle.recv() => {
+                if let Ok((peer_id, ant_quic::PeerLifecycleEvent::Established { .. })) = lifecycle {
+                    if peer_id == testnet_peer {
+                        prod_established = true;
+                    }
+                }
+            }
+            lifecycle = testnet_lifecycle.recv() => {
+                if let Ok((peer_id, ant_quic::PeerLifecycleEvent::Established { .. })) = lifecycle {
+                    if peer_id == prod_peer {
+                        testnet_established = true;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let rejection_side = if prod_established && prod_rejected {
+        Some(true)
+    } else if testnet_established && testnet_rejected {
+        Some(false)
+    } else {
+        None
+    };
     assert!(
-        disconnected,
-        "prod should have disconnected the cross-plane testnet peer"
+        rejection_side.is_some(),
+        "cross-plane dial outcome {dial_error:?} must prove an exact authenticated Established + PolicyRejection path"
+    );
+    let (rejected_network, rejected_peer) = if rejection_side == Some(true) {
+        (prod_network, testnet_peer)
+    } else {
+        (testnet_network, prod_peer)
+    };
+    assert!(
+        rejected_network.is_reconnect_suppressed(rejected_peer.0),
+        "PolicyRejection must install a reconnect-suppression tombstone"
+    );
+    assert!(
+        !rejected_network.is_connected(&rejected_peer).await,
+        "PolicyRejection must close the transport"
     );
     // Stay-down check across several eager-set refresh ticks.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
-        !prod_network.is_connected(&testnet_peer).await,
+        !prod_network.is_connected(&testnet_peer).await
+            && !testnet_network
+                .is_connected(&ant_quic::PeerId(prod.machine_id().0))
+                .await,
         "cross-plane peer must stay disconnected (tombstoned)"
     );
 }
