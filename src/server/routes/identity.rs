@@ -349,20 +349,88 @@ pub(in crate::server) struct CardQuery {
     pub(in crate::server) include_local_addresses: bool,
 }
 
-/// Populate `addresses` with locally-discovered globally-routable interfaces.
-///
-/// Agent cards are copy-pasteable identity links (`x0x://agent/...`) that can
-/// be shared anywhere. They must only carry globally-advertisable addresses —
-/// a card minted inside a Vultr VPC must not embed `10.200.0.1:5483` or
-/// recipients in London will spend ~50s dialing a black hole.
-fn discover_local_card_addresses(port: u16, addresses: &mut Vec<String>, include_local: bool) {
-    for addr in x0x::collect_local_interface_addrs(port) {
+/// Assemble observed and interface hints while keeping shared cards public-only.
+fn card_addresses(
+    local_addr: std::net::SocketAddr,
+    external_addrs: &[std::net::SocketAddr],
+    interface_addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+    include_local: bool,
+) -> Vec<String> {
+    let mut addresses: Vec<String> = external_addrs
+        .iter()
+        .filter(|addr| include_local || x0x::is_publicly_advertisable(**addr))
+        .map(ToString::to_string)
+        .collect();
+    for addr in interface_addrs {
         if !include_local && !x0x::is_publicly_advertisable(addr) {
             continue;
         }
-        let s = addr.to_string();
-        if !addresses.contains(&s) {
-            addresses.push(s);
+        let text = addr.to_string();
+        if !addresses.contains(&text) {
+            addresses.push(text);
+        }
+    }
+    // An explicitly bound loopback listener is usable in local testnets even
+    // when no peer has reported an external address and interface discovery
+    // deliberately excludes loopback. Never add this hint to shared cards.
+    if include_local
+        && local_addr.port() != 0
+        && !local_addr.ip().is_unspecified()
+        && !local_addr.ip().is_multicast()
+        && !addresses.contains(&local_addr.to_string())
+    {
+        addresses.push(local_addr.to_string());
+    }
+    if include_local {
+        prioritize_local_card_addresses(&mut addresses);
+    }
+    addresses
+}
+
+#[cfg(test)]
+mod card_address_tests {
+    use super::card_addresses;
+
+    #[test]
+    fn local_bind_requires_opt_in_and_a_usable_destination() {
+        for bind in ["127.0.0.1:5483", "[::1]:5483", "192.168.1.2:5483"] {
+            assert!(card_addresses(bind.parse().unwrap(), &[], [], false).is_empty());
+        }
+        for bind in [
+            "0.0.0.0:5483",
+            "[::]:5483",
+            "127.0.0.1:0",
+            "[::1]:0",
+            "224.0.0.1:5483",
+            "[ff02::1]:5483",
+        ] {
+            assert!(card_addresses(bind.parse().unwrap(), &[], [], true).is_empty());
+        }
+    }
+
+    #[test]
+    fn existing_hints_keep_scope_order_and_duplicate_suppression() {
+        let local = "127.0.0.1:5483".parse().unwrap();
+        let external = ["8.8.8.8:5483".parse().unwrap(), local];
+        let interfaces = [
+            "192.168.1.2:5483".parse().unwrap(),
+            "8.8.8.8:5483".parse().unwrap(),
+        ];
+        assert_eq!(
+            card_addresses(local, &external, interfaces, false),
+            vec!["8.8.8.8:5483"]
+        );
+        assert_eq!(
+            card_addresses(local, &external, interfaces, true),
+            vec!["127.0.0.1:5483", "192.168.1.2:5483", "8.8.8.8:5483"]
+        );
+    }
+
+    #[test]
+    fn explicit_loopback_bind_is_available_without_discovery() {
+        for bind in ["127.0.0.1:5483", "[::1]:5483"] {
+            let local = bind.parse().unwrap();
+            assert_eq!(card_addresses(local, &[], [], true), vec![bind]);
         }
     }
 }
@@ -469,26 +537,15 @@ pub(in crate::server) async fn get_agent_card(
     // Add user ID if available
     card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
 
-    // Add external addresses from ant-quic NodeStatus, filtered to
-    // globally-advertisable scope only (see discover_local_card_addresses
-    // doc-comment), then augment with local probes so cards remain useful
-    // before the first observed-address frame arrives from another peer.
+    // Observed addresses and interface hints remain public-only by default.
     if let Some(network) = state.agent.network() {
         if let Some(ns) = network.node_status().await {
-            card.addresses = ns
-                .external_addrs
-                .iter()
-                .filter(|a| query.include_local_addresses || x0x::is_publicly_advertisable(**a))
-                .map(|a| a.to_string())
-                .collect();
-            discover_local_card_addresses(
-                ns.local_addr.port(),
-                &mut card.addresses,
+            card.addresses = card_addresses(
+                ns.local_addr,
+                &ns.external_addrs,
+                x0x::collect_local_interface_addrs(ns.local_addr.port()),
                 query.include_local_addresses,
             );
-            if query.include_local_addresses {
-                prioritize_local_card_addresses(&mut card.addresses);
-            }
         }
     }
 
