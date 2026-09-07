@@ -168,6 +168,65 @@ async fn announce_full_cert(state: &AppState, cert: x0x::identity::AgentCertific
         .insert(agent_id, entry);
 }
 
+/// Emit a bounded, privacy-minimal snapshot when a certificate wait expires.
+///
+/// The cache uses `try_read` so a diagnostic cannot extend or mask the wait.
+/// Aggregate blob counters describe the cache process as a whole; they are
+/// not attributed to this joiner.
+fn emit_certificate_resolution_diagnostics(state: &AppState, joiner_id: x0x::identity::AgentId) {
+    let cache = state.agent.identity_discovery_cache();
+    let (
+        cache_busy,
+        entry_present,
+        digest_present,
+        cert_present,
+        digest_matches_cert,
+        cert_binds_joiner,
+    ) = match cache.try_read() {
+        Ok(cache) => match cache.get(&joiner_id) {
+            Some(entry) => {
+                let cert = entry.agent_certificate.as_ref();
+                let digest = entry.cert_digest;
+                let digest_matches_cert = digest.zip(cert).is_some_and(|(digest, cert)| {
+                    digest == crate::announce_v3::cert_digest(&entry.user_id, &Some(cert.clone()))
+                });
+                let cert_binds_joiner = cert
+                    .and_then(|cert| cert.agent_id().ok())
+                    .is_some_and(|agent_id| agent_id == joiner_id);
+                (
+                    false,
+                    true,
+                    digest.is_some(),
+                    cert.is_some(),
+                    digest_matches_cert,
+                    cert_binds_joiner,
+                )
+            }
+            None => (false, false, false, false, false, false),
+        },
+        Err(_) => (true, false, false, false, false, false),
+    };
+    let blob_stats = state.agent.announce_blob_cache.snapshot();
+    eprintln!(
+        concat!(
+            "DIAG cert-resolution-state cache_busy={} entry_present={} ",
+            "digest_present={} cert_present={} digest_matches_cert={} ",
+            "cert_binds_joiner={} blob_cache_hits={} blob_cache_misses={} ",
+            "blob_fetches_ok={} blob_fetches_failed={}"
+        ),
+        cache_busy,
+        entry_present,
+        digest_present,
+        cert_present,
+        digest_matches_cert,
+        cert_binds_joiner,
+        blob_stats.blob_cache_hits,
+        blob_stats.blob_cache_misses,
+        blob_stats.blob_fetches_ok,
+        blob_stats.blob_fetches_failed,
+    );
+}
+
 async fn diagnostics_row(
     state: &AppState,
     group_id: &str,
@@ -1947,39 +2006,7 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         None
     });
     if cert_event.is_none() {
-        let cache = owner_state.agent.identity_discovery_cache();
-        let cache = cache.read().await;
-        let entry = cache.get(&joiner_id);
-        let cert = entry.and_then(|entry| entry.agent_certificate.as_ref());
-        let cert_digest = entry.and_then(|entry| entry.cert_digest);
-        let digest_matches_cert = entry.is_some_and(|entry| {
-            entry
-                .cert_digest
-                .zip(entry.agent_certificate.as_ref())
-                .is_some_and(|(digest, cert)| {
-                    digest == crate::announce_v3::cert_digest(&entry.user_id, &Some(cert.clone()))
-                })
-        });
-        let cert_binds_joiner = cert
-            .and_then(|cert| cert.agent_id().ok())
-            .is_some_and(|agent_id| agent_id == joiner_id);
-        let blob_stats = owner_state.agent.announce_blob_cache.snapshot();
-        eprintln!(
-            concat!(
-                "DIAG cert-event-state entry_present={} digest_present={} cert_present={} ",
-                "digest_matches_cert={} cert_binds_joiner={} ",
-                "blob_cache_hits={} blob_cache_misses={} blob_fetches_ok={} blob_fetches_failed={}"
-            ),
-            entry.is_some(),
-            cert_digest.is_some(),
-            cert.is_some(),
-            digest_matches_cert,
-            cert_binds_joiner,
-            blob_stats.blob_cache_hits,
-            blob_stats.blob_cache_misses,
-            blob_stats.blob_fetches_ok,
-            blob_stats.blob_fetches_failed,
-        );
+        emit_certificate_resolution_diagnostics(owner_state.as_ref(), joiner_id);
     }
     assert!(
         cert_event.is_some_and(|event| event.agent_id == joiner_id),
@@ -1999,18 +2026,7 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
             break;
         }
         if std::time::Instant::now() >= evidence_deadline {
-            let cache = owner_state.agent.identity_discovery_cache();
-            let cache = cache.read().await;
-            let entry = cache.get(&joiner_id);
-            let peers = owner_net.connected_peers().await.len();
-            eprintln!(
-                "DIAG entry_present={} digest={:?} cert={:?} blob_stats={:?} peers={}",
-                entry.is_some(),
-                entry.and_then(|e| e.cert_digest.map(|d| hex::encode(&d[..4]))),
-                entry.and_then(|e| e.agent_certificate.as_ref().map(|c| c.agent_id().is_ok())),
-                owner_state.agent.announce_blob_cache.snapshot(),
-                peers
-            );
+            emit_certificate_resolution_diagnostics(owner_state.as_ref(), joiner_id);
             panic!("#447: the single identity announce must resolve (blob fetch + watcher)");
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -2662,6 +2678,9 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
             .and_then(|e| e.agent_certificate.clone());
         if resolved.is_some() {
             break;
+        }
+        if std::time::Instant::now() >= evidence_deadline {
+            emit_certificate_resolution_diagnostics(owner_state.as_ref(), joiner_id);
         }
         assert!(
             std::time::Instant::now() < evidence_deadline,
