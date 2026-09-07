@@ -137,7 +137,26 @@ We will adopt option 3 as the **interim** position.
   in-memory manifest untouched — the positive control, and the state the
   startup-ordering defect used to act on
   (`a_durable_task_list_entry_is_observed_from_disk`).
+- **The inventory is read-only and stays empty across a real process restart —
+  VALIDATED at runtime.** GitHub Actions run `34068244844` (ubuntu-24.04,
+  commit `cad5e73f563abe5d749e1d673984546e896ff41e`) in a loopback-only
+  network/PID/mount namespace. In all three daemon phases `GET /home` returned
+  a `duplicates` array that DECODED, was **explicitly empty**, carried an empty
+  `retirement_values` set, and had **no `safe_to_retire` field** on any entry.
+  Across the restart the group total and the group identity set were both
+  unchanged, so nothing was deleted. Evidence:
+  `review-artifacts/claude-449-runtime-run3-receipt.md`.
 - **Not validated, because not implemented:** any automatic retirement. The
   conditions under which it could become safe are specified in
   `docs/design/449-p4-retirement-fence.md`; that design is unreviewed and
   unimplemented.
+- **Not validated, and NOT claimed by the run above:**
+  - a POPULATED `duplicates[]`. It is not runtime-reachable on a single device
+    with this code — one device holds two stamped Homes only after adoption
+    (unimplemented) or from a pre-fix fork made by an older binary — so the run
+    observed only the EMPTY case. A populated inventory remains covered by pure
+    tests only.
+  - forced retirement of a non-empty duplicate, and the
+    history/delegation/task-list/rider-grant purge it would require.
+  - anything multi-device: no adoption, and no convergence across independent
+    record stores.

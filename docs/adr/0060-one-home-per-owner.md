@@ -185,8 +185,18 @@ ADR-0039 reconciled rather than bypassed — before implementation.
   state is dropped and rebuilt from the same data dir, so the roster and the
   owner-sync record store re-read from disk, and the persisted pointer to the
   retired Home must not suppress a replacement.
+- **Single-device Home identity across a genuine PROCESS restart — VALIDATED
+  at runtime.** GitHub Actions run `34068244844` (ubuntu-24.04, commit
+  `cad5e73f563abe5d749e1d673984546e896ff41e`), in a loopback-only
+  network/PID/mount namespace: a real `x0xd` was started, observed, terminated,
+  confirmed exited AND reaped, then a NEW process was started on the same data
+  root. Distinct PIDs 27 -> 36; the same Home resolved on both sides, still
+  `state: local`, with the primary agent the local agent, the local agent a
+  member, and the Home present in the live group inventory whose identity set
+  was unchanged. A contrast fixture on a distinct root with a distinct owner
+  produced a DIFFERENT Home, so the equality assertion had discriminating
+  power. 47/47 checks true. Evidence:
+  `review-artifacts/claude-449-runtime-run3-receipt.md`.
 - **Not yet validated:** full distributed convergence across independent
-  record stores (the election tests use a single in-memory register), and the
-  lifecycle across a genuine PROCESS restart. The reload fixture above is not
-  a process boundary — it does not exit, reap or respawn anything, and drop
-  does not release resources the way process exit does.
+  record stores — the election tests use a single in-memory register, and the
+  run above is a SINGLE-DEVICE restart only.
