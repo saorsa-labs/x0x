@@ -59,8 +59,13 @@ where
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if is_connected().await {
-            return true;
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        match tokio::time::timeout_at(deadline, is_connected()).await {
+            Ok(true) => return tokio::time::Instant::now() < deadline,
+            Ok(false) => {}
+            Err(_) => return false,
         }
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -390,6 +395,28 @@ mod tests {
         let started = tokio::time::Instant::now();
         let connected =
             wait_for_connection(Duration::from_millis(40), || future::ready(false)).await;
+
+        assert!(!connected);
+        assert_eq!(started.elapsed(), Duration::from_millis(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_wait_bounds_a_pending_check() {
+        let started = tokio::time::Instant::now();
+        let connected = wait_for_connection(Duration::from_millis(40), || future::pending()).await;
+
+        assert!(!connected);
+        assert_eq!(started.elapsed(), Duration::from_millis(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_wait_rejects_success_after_deadline() {
+        let started = tokio::time::Instant::now();
+        let connected = wait_for_connection(Duration::from_millis(40), || async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            true
+        })
+        .await;
 
         assert!(!connected);
         assert_eq!(started.elapsed(), Duration::from_millis(40));
