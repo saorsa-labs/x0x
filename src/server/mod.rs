@@ -1753,6 +1753,7 @@ pub async fn serve_with_options(
         .route("/profile", get(get_profile).put(update_profile))
         .route("/home", get(routes::home::get_home))
         .route("/home/rename", post(routes::home::rename_home))
+        .route("/home/seat", post(routes::home::seat_home))
         .route("/owner/agents", get(owner_agents))
         .route("/owner/agents/issue", post(owner_agents_issue))
         .route("/owner/agents/:id", delete(owner_agents_revoke))

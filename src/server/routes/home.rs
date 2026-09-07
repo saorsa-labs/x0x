@@ -977,20 +977,38 @@ fn primary_agent_trusted(
 /// Deliberately NOT a 404: the caller asked where the owner's Home is, and
 /// "on another device, not yet joined" answers that. A 404 here is what made
 /// a second device look Home-less and silently provision a duplicate.
+/// #449 (option (c)): the owner-driven exit from a non-canonical Home.
+///
+/// Adoption is deliberately NOT automatic — no evidence this device holds
+/// distinguishes an owner's other DEVICE from an ADR-0039 API-key rider, so
+/// the owner decides. Reporting `elsewhere`/`adoption_pending` without
+/// naming the two commands that resolve it leaves the operator with a
+/// diagnosis and no cure, which is what made the duplicate feel permanent.
+fn home_seat_next_step(local_agent_hex: &str, owner_hex: &str) -> String {
+    format!(
+        "run `x0x home seat {local_agent_hex}` on the device that holds the canonical Home, \
+         then `x0x group join --home --owner {owner_hex} <invite>` here"
+    )
+}
+
 fn home_elsewhere_response(
     owner: &crate::identity::UserId,
     canonical: &str,
     local: Option<&str>,
+    local_agent_hex: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let owner_hex = hex::encode(owner.as_bytes());
+    let next_step = home_seat_next_step(local_agent_hex, &owner_hex);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "state": "elsewhere",
-            "owner_user_id": hex::encode(owner.as_bytes()),
+            "owner_user_id": owner_hex,
             "canonical_group_id": canonical,
             "local_group_id": local,
             "detail": "the owner's Home lives on another device; this device is not a member yet",
+            "next_step": next_step,
         })),
     )
 }
@@ -1014,6 +1032,7 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
         return not_found("no Home provisioned (un-owned install)");
     };
     let owner = user_kp.user_id();
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     // #449: "the Home is on another device" is a real answer, not a 404.
     // Reporting 404 there is what let a duplicate stay invisible.
     let (group_id, info, adopting_from) = match resolve_home(&state).await {
@@ -1023,11 +1042,11 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
                 Some((_, info)) => (local, info, Some(canonical)),
                 // Raced with a membership change: fall back to the honest
                 // "not seated here" answer rather than serving stale state.
-                None => return home_elsewhere_response(&owner, &canonical, None),
+                None => return home_elsewhere_response(&owner, &canonical, None, &local_agent_hex),
             }
         }
         HomeResolution::Elsewhere { canonical } => {
-            return home_elsewhere_response(&owner, &canonical, None)
+            return home_elsewhere_response(&owner, &canonical, None, &local_agent_hex)
         }
         HomeResolution::Unknown => return not_found("no Home provisioned"),
     };
@@ -1079,9 +1098,7 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
         }));
     }
     let primary_self_name = self_name_for(state.as_ref(), &home.primary_agent).await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
+    let mut payload = serde_json::json!({
             "ok": true,
             // #469 (A3): the Home-join pin (`x0x group join --home
             // --owner <hex>`) needs the owner's user id visible where the
@@ -1114,8 +1131,22 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
                 "primary_agent_unverified": !primary_ok,
                 "unretired_duplicate_home": !duplicates.is_empty(),
             },
-        })),
-    )
+    });
+    // #449 (option (c)): only the LOSING device needs a cure, so `local`
+    // keeps its exact pre-#449 shape — an added key there would be a wire
+    // change every settled install pays for nothing.
+    if adopting_from.is_some() {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "next_step".to_string(),
+                serde_json::Value::String(home_seat_next_step(
+                    &local_agent_hex,
+                    &hex::encode(owner.as_bytes()),
+                )),
+            );
+        }
+    }
+    (StatusCode::OK, Json(payload))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1179,6 +1210,223 @@ pub(in crate::server) async fn rename_home(
     )
     .await
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct SeatHomeRequest {
+    agent_id: String,
+}
+
+/// #449 option (c): 409 body for a seat request this device cannot serve.
+/// `reason` is a TYPED token (`elsewhere` / `adoption_pending` /
+/// `unknown`), not prose — the CLI and the GUI branch on it.
+fn seat_conflict(reason: &str, canonical: Option<&str>, detail: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": detail,
+            "reason": reason,
+            "canonical_group_id": canonical,
+        })),
+    )
+        .into_response()
+}
+
+fn seat_bad_request(detail: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "ok": false, "error": detail })),
+    )
+        .into_response()
+}
+
+/// POST /home/seat — mint an ADDRESSED Home invite for one of the owner's
+/// other devices (#449, decision option (c): adoption is OWNER-DRIVEN).
+///
+/// Why a command and not an automatic rule: nothing this device holds
+/// separates the owner's other DEVICE from an ADR-0039 API-key rider
+/// sub-agent. `CertMode` does not survive owner-journal sync (it is
+/// re-materialised as `Acp`), the certificate carries no hosting mode, and
+/// the Tier-1 device set is keyed by machine with no machine-to-agent
+/// binding. Any automatic rule would be guessing, and guessing wrong seats
+/// a rider in the owner's private space. The owner naming the agent is the
+/// only evidence that exists today.
+///
+/// Deliberately NOT done here: no auto-delivery of the invite over any
+/// transport, and no new `SyncKind`/`SyncValue`/protocol version. The
+/// invite string travels the way every other Home invite already does — by
+/// hand, consumed with the #469 A3 owner pin.
+///
+/// Refuses unless this device is seated in the CANONICAL Home: a device
+/// that lost the election would otherwise mint seats into the duplicate it
+/// is itself supposed to leave, multiplying the very fork #449 closes.
+pub(in crate::server) async fn seat_home(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    Json(req): Json<SeatHomeRequest>,
+) -> Response {
+    // Same authority as every other Home mutation (#446): a seat is device
+    // admission to the owner's private space, so a session token — which a
+    // harness holds — must not be able to grant one.
+    if !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "seating a device in the Home requires the durable API token (not a session token)"
+            })),
+        )
+            .into_response();
+    }
+    if state.agent.identity().user_keypair().is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "no Home provisioned (un-owned install)"
+            })),
+        )
+            .into_response();
+    }
+
+    let joiner = req.agent_id;
+    if joiner.len() != 64
+        || !joiner
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return seat_bad_request("agent_id must be 64 lowercase hex characters");
+    }
+    // Seating ourselves is a no-op that would burn a live-invite slot and
+    // hand the operator a token no one can consume.
+    if joiner == hex::encode(state.agent.agent_id().as_bytes()) {
+        return seat_bad_request(
+            "agent_id is this daemon's own agent, which already holds the Home seat; \
+             pass the agent id of the device you want to seat",
+        );
+    }
+
+    let (group_id, info) = match resolve_home(&state).await {
+        HomeResolution::Local { group_id, info } => (group_id, info),
+        HomeResolution::AdoptionPending { canonical, .. } => {
+            return seat_conflict(
+                "adoption_pending",
+                Some(&canonical),
+                "this device holds a Home that LOST the election, so it cannot seat other \
+                 devices; run this on the device that holds the canonical Home",
+            )
+        }
+        HomeResolution::Elsewhere { canonical } => {
+            return seat_conflict(
+                "elsewhere",
+                Some(&canonical),
+                "the owner's Home lives on another device; run this there",
+            )
+        }
+        HomeResolution::Unknown => {
+            return seat_conflict("unknown", None, "no Home provisioned on this device")
+        }
+    };
+    // The join pin the operator will type MUST be the owner axis of the group
+    // the invite actually belongs to. Deriving it from the local user key
+    // would echo what this device believes rather than what the group
+    // asserts, and deriving it from the invite would be reading unverified
+    // content back to the verifier — both make the #469 A3 pin circular.
+    let Some(owner_hex) = info
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .map(|owner| hex::encode(owner.as_bytes()))
+    else {
+        return seat_conflict(
+            "unknown",
+            Some(&group_id),
+            "the resolved Home carries no OwnerCertified admission axis, so no owner pin \
+             exists to hand the joining device",
+        );
+    };
+
+    // Mint through the EXISTING invite authority (`POST /groups/:id/invite`)
+    // rather than a parallel path: the live-cap, the owner-axis durable
+    // fence, the signed v4 assembly, the recorded secret and the durable
+    // persist are one transaction there, and a second mint surface would be
+    // a second place for that transaction to drift.
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let body =
+        axum::body::Bytes::from(serde_json::json!({ "intended_joiner": joiner }).to_string());
+    let minted = super::named_groups::create_group_invite(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(actor),
+        Path(group_id.clone()),
+        headers,
+        body,
+    )
+    .await
+    .into_response();
+    if !minted.status().is_success() {
+        return minted;
+    }
+    let minted_body = match axum::body::to_bytes(minted.into_body(), 1 << 20).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("could not read the minted invite: {e}")
+                })),
+            )
+                .into_response()
+        }
+    };
+    let invite = serde_json::from_slice::<serde_json::Value>(&minted_body)
+        .ok()
+        .and_then(|body| {
+            body["invite_link"]
+                .as_str()
+                .map(std::string::ToString::to_string)
+        });
+    let Some(invite) = invite else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "the invite authority returned no invite link"
+            })),
+        )
+            .into_response();
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": group_id,
+            "invite": invite,
+            "intended_joiner": joiner,
+            // The owner axis of THIS group, read from its policy — the value
+            // the joining device must pin.
+            "owner_user_id": owner_hex,
+            // #469 A3: the owner pin is not optional advice — an unpinned
+            // Home join can be answered by any group, so the hint carries it.
+            "join_hint": format!("x0x group join {invite} --home --owner {owner_hex}"),
+            // A minted invite is an OFFER, not a seat. The named device holds
+            // no membership until it joins and that join is accepted, so a
+            // 200 here must not read as "the device is in". `seated` is the
+            // machine-readable half of that: a caller that branches on it
+            // cannot mistake a mint for a completed adoption.
+            "seated": false,
+            "note": "an invite was minted; the device is NOT seated until it redeems the invite via the join path",
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -2151,6 +2399,602 @@ pub(in crate::server::routes) mod tests {
                 .as_array()
                 .is_none_or(|w| w.is_empty()),
             "auth-exempt /health must not leak Home existence: {health_body}"
+        );
+        Ok(())
+    }
+
+    fn durable_owner() -> crate::server::rider_auth::ActorContext {
+        crate::server::rider_auth::ActorContext::Owner { durable: true }
+    }
+
+    /// Every invite secret recorded across every group this device holds.
+    /// A refusal that still minted would show up here even if the refusal
+    /// path returned the right status.
+    async fn issued_invite_count(state: &Arc<AppState>) -> usize {
+        state
+            .named_groups
+            .read()
+            .await
+            .values()
+            .map(|info| info.issued_invites.len())
+            .sum()
+    }
+
+    async fn seat(
+        state: &Arc<AppState>,
+        agent_id: &str,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let response = seat_home(
+            State(Arc::clone(state)),
+            axum::extract::Extension(durable_owner()),
+            Json(SeatHomeRequest {
+                agent_id: agent_id.to_string(),
+            }),
+        )
+        .await;
+        response_json(response).await
+    }
+
+    /// WHY (#449, option (c)): adoption is owner-driven, so the ONE thing
+    /// the seat command must produce is an invite that only the named
+    /// device can consume. An unaddressed invite would be first-joiner-wins
+    /// — the owner would be handing a Home seat to whoever redeems the
+    /// string first, which is the failure #469 A4 addressing exists to
+    /// prevent. This asserts the DECODED, signature-verified invite rather
+    /// than the echoed response field, so dropping the addressing anywhere
+    /// between the handler and the mint transaction fails the test.
+    ///
+    /// The no-op half of the contract — that a mint seats nobody and
+    /// deletes nothing — is pinned separately by
+    /// `home_seat_mint_changes_no_membership_or_groups`.
+    #[tokio::test]
+    async fn home_seat_mints_addressed_invite_for_named_device() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x49; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("Home provisioned");
+
+        let device = "7c".repeat(32);
+        let (status, body) = seat(&state, &device).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["group_id"], home_id);
+        assert_eq!(body["intended_joiner"], device);
+        // The pin must be the group's OWN admission axis, not this device's
+        // idea of who the owner is.
+        let owner_hex = hex::encode(owner.as_bytes());
+        assert_eq!(
+            body["owner_user_id"], owner_hex,
+            "the owner pin must be a first-class field, not only prose inside join_hint"
+        );
+        let hint = body["join_hint"].as_str().expect("join hint");
+        // The machine-readable and human-readable halves of "this is an
+        // offer, not an adoption" must BOTH be present.
+        assert_eq!(
+            body["seated"], false,
+            "a mint must report seated=false: {body}"
+        );
+        assert!(
+            body["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("NOT seated")),
+            "the response must not read as a completed seat: {body}"
+        );
+
+        // Decode and CRYPTOGRAPHICALLY verify the returned invite: the
+        // addressing is only meaningful if the signatures that bind it hold.
+        let invite = body["invite"].as_str().expect("invite link");
+        assert_eq!(
+            hint,
+            format!("x0x group join {invite} --home --owner {owner_hex}"),
+            "the hint must be the real CLI argument order with the owner pin"
+        );
+        let signed = crate::groups::invite::SignedInvite::from_link(invite)
+            .map_err(|e| anyhow::anyhow!("invite does not decode: {e}"))?;
+        signed
+            .verify_v4_signatures()
+            .map_err(|e| anyhow::anyhow!("invite signatures do not verify: {e:?}"))?;
+        signed
+            .verify_v4_owner_countersignature()
+            .map_err(|e| anyhow::anyhow!("owner countersignature does not verify: {e:?}"))?;
+        assert_eq!(
+            signed.intended_joiner.as_deref(),
+            Some(device.as_str()),
+            "the SIGNED invite must address the named device"
+        );
+        assert_eq!(signed.group_id, home_id);
+        assert_eq!(
+            signed.inviter,
+            hex::encode(state.agent.agent_id().as_bytes()),
+            "this daemon must be the recorded inviter"
+        );
+        assert!(
+            signed.base_state_hash.is_some(),
+            "an authority-minted v4 invite carries the base state snapshot"
+        );
+        assert_eq!(
+            signed
+                .policy
+                .as_ref()
+                .and_then(|p| p.admission.owner_certified_user_id())
+                .map(|o| hex::encode(o.as_bytes())),
+            Some(owner_hex),
+            "the invite's own policy must carry the same owner axis as the pin"
+        );
+
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&home_id).expect("home still held");
+        let addressed: Vec<&Option<String>> = info
+            .issued_invites
+            .values()
+            .map(|record| &record.intended_joiner)
+            .collect();
+        assert_eq!(
+            addressed,
+            vec![&Some(device.clone())],
+            "the authority must record exactly one invite, addressed to the named device"
+        );
+        Ok(())
+    }
+
+    /// WHY (#449, and Root checklist item 6): minting is an OFFER. The named
+    /// device holds no membership until it redeems the invite and that join
+    /// is accepted, so a mint that quietly added a roster entry would report
+    /// an adoption that never happened and let a device that never proved
+    /// possession of its key read the Home.
+    ///
+    /// The other half matters more: retirement of a leftover duplicate is a
+    /// separate MANUAL act (`docs/design/449-p4-retirement-fence.md`), because
+    /// no sound emptiness proof exists yet. A seat command that deleted or
+    /// withdrew the duplicate as a side effect would destroy data the owner
+    /// has not migrated. This snapshots the whole group map, the canonical
+    /// Home's roster, and every withdrawn flag, so ANY structural side effect
+    /// of a mint fails the test rather than only the ones anticipated here.
+    #[tokio::test]
+    async fn home_seat_mint_changes_no_membership_or_groups() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x51; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("Home provisioned");
+        // A leftover duplicate must survive the mint untouched.
+        let duplicate = provision_duplicate_home(&state).await?;
+        advertise_canonical_home(&state, &home_id).await;
+
+        let snapshot = |state: Arc<AppState>, home_id: String, duplicate: String| async move {
+            let groups = state.named_groups.read().await;
+            (
+                groups
+                    .iter()
+                    .map(|(id, info)| (id.clone(), info.withdrawn))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+                groups.get(&home_id).cloned(),
+                groups.get(&duplicate).cloned(),
+            )
+        };
+        let before = snapshot(Arc::clone(&state), home_id.clone(), duplicate.clone()).await;
+
+        let device = "7d".repeat(32);
+        let (status, body) = seat(&state, &device).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["seated"], false);
+
+        let after = snapshot(Arc::clone(&state), home_id.clone(), duplicate.clone()).await;
+        assert_eq!(
+            after.0, before.0,
+            "minting must neither create, delete nor withdraw any group"
+        );
+        let (home_before, home_after) = (
+            before.1.as_ref().expect("home before"),
+            after.1.as_ref().expect("home after"),
+        );
+        assert_eq!(
+            home_after.members_v2, home_before.members_v2,
+            "minting must not add the named device to the roster"
+        );
+        assert_eq!(
+            home_after.membership_revision, home_before.membership_revision,
+            "minting must not advance the membership revision"
+        );
+        assert!(
+            !home_after.members.contains(&device),
+            "the named device must not appear as a member before it joins"
+        );
+        assert_eq!(
+            after.2, before.2,
+            "the leftover duplicate Home must be byte-identical after a seat mint"
+        );
+        Ok(())
+    }
+
+    /// WHY (#446 fence at the ROUTE layer, applied to #449): the durable
+    /// check must fire BEFORE the body extractor, so a session or rider
+    /// bearer gets the typed refusal whatever it posts — a malformed body
+    /// must not turn a 403 into a 400 that leaks which bodies are accepted.
+    /// Driven through the real `auth_middleware` rather than a handler call,
+    /// because the handler gate alone would leave the pre-extractor path
+    /// untested. A rider is denied here as the CALLER; ADR-0039 riders hold
+    /// no owner authority regardless of what scopes they were granted.
+    #[tokio::test]
+    async fn home_seat_denies_session_and_rider_through_real_middleware() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x4F; 32]).await?;
+        provision_home(&state).await;
+        let before = issued_invite_count(&state).await;
+        let app = axum::Router::new()
+            .route("/home/seat", axum::routing::post(seat_home))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let call = |bearer: String, body: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::post("/home/seat")
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .expect("body builds"),
+                )
+                .await
+            }
+        };
+
+        let well_formed = serde_json::json!({ "agent_id": "7c".repeat(32) }).to_string();
+        let well_formed: &'static str = Box::leak(well_formed.into_boxed_str());
+
+        // An unknown bearer never reaches the durable question.
+        let response = call("not-a-real-token".to_string(), well_formed).await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unknown bearer is 401"
+        );
+
+        let session = state.sessions.issue(std::time::Instant::now());
+        for body in [well_formed, "{\"agent_id\":", "not json at all"] {
+            let response = call(session.clone(), body).await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "a session bearer is 403 whatever the body is ({body})"
+            );
+        }
+
+        // A rider — even one granted Home scopes — is not the owner.
+        let rider = {
+            let mut store = state.rider_tokens.lock().await;
+            let (token, _record) = store
+                .issue(
+                    "ab".repeat(32),
+                    vec!["home".to_string(), "groups".to_string()],
+                    None,
+                    60,
+                    String::new(),
+                    None,
+                    None,
+                    crate::server::rider_auth::unix_now_secs(),
+                )
+                .await?;
+            token
+        };
+        for body in [well_formed, "{\"agent_id\":"] {
+            let response = call(rider.clone(), body).await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "an explicitly Home-scoped rider still cannot mint a seat ({body})"
+            );
+        }
+
+        assert_eq!(
+            issued_invite_count(&state).await,
+            before,
+            "no refused caller may leave a minted invite behind"
+        );
+        Ok(())
+    }
+
+    /// WHY (ADR-0039, mode-agnostic Home eligibility): the seat command must
+    /// NOT read `CertMode` on the TARGET. Mode does not survive owner-journal
+    /// sync (it is re-materialised as `Acp`) and the certificate carries none,
+    /// so a mode-based target rule would be unreliable AND would amend an
+    /// Accepted ADR as a side effect of a duplicate-Home fix. When the durable
+    /// owner explicitly names an agent their journal labels `Rider`, the mint
+    /// proceeds. The refusal that matters is on the CALLER, pinned by
+    /// `home_seat_denies_session_and_rider_through_real_middleware` and
+    /// `home_seat_refuses_rider_caller`.
+    #[tokio::test]
+    async fn home_seat_does_not_filter_target_by_mode() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x50; 32]).await?;
+        provision_home(&state).await;
+
+        // Certify a sub-agent the owner's own journal labels `Rider`.
+        let target = crate::identity::AgentKeypair::generate()?;
+        let (public_key, _secret) = target.to_bytes();
+        let response = super::super::owner::owner_agents_issue(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(durable_owner()),
+            Json(serde_json::from_value(serde_json::json!({
+                "agent_public_key": hex::encode(public_key),
+                "mode": "rider",
+                "label": "a harness rider",
+            }))?),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{:?}", response.1 .0);
+        let issued = response.1 .0;
+        let rider_agent = issued["agent_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("issue response carries no agent_id: {issued}"))?
+            .to_string();
+
+        // Sanity: the roster really does label this target `Rider`, so the
+        // test would notice if a mode filter were added.
+        let roster = state.agent.owner_issued_certificates().await;
+        assert!(
+            roster.iter().any(|record| record.agent_id == rider_agent
+                && record.mode == crate::profile::CertMode::Rider),
+            "fixture must produce a Rider-labelled target: {roster:?}"
+        );
+
+        let (status, body) = seat(&state, &rider_agent).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a durable owner naming a Rider-labelled agent must still mint: {body}"
+        );
+        assert_eq!(body["intended_joiner"], rider_agent);
+        Ok(())
+    }
+
+    /// WHY (#446 fence, applied to #449): a Home seat is device admission
+    /// to the owner's private space. A session token is what a harness
+    /// holds, so if a session could seat a device, an ADR-0039 rider could
+    /// let itself into the Home — the exact outcome owner-driven adoption
+    /// exists to prevent. Refusal must also leave NO minted invite behind.
+    #[tokio::test]
+    async fn home_seat_refuses_session_owner() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x4A; 32]).await?;
+        provision_home(&state).await;
+        let before = issued_invite_count(&state).await;
+
+        let response = seat_home(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: false,
+            }),
+            Json(SeatHomeRequest {
+                agent_id: "7c".repeat(32),
+            }),
+        )
+        .await;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            issued_invite_count(&state).await,
+            before,
+            "a refused seat must not mint an invite"
+        );
+        Ok(())
+    }
+
+    /// WHY (#449): the device that LOST the Home election is the one whose
+    /// operator is most likely to type this command, and it is precisely
+    /// the device that must not answer it. Minting there would seat a
+    /// second device into the duplicate that is itself supposed to be
+    /// retired — turning a two-way fork into a three-way one. The refusal
+    /// carries the typed reason and the canonical id so the operator learns
+    /// WHERE to run it, and mints nothing.
+    #[tokio::test]
+    async fn home_seat_refuses_when_adoption_is_pending() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x4B; 32]).await?;
+        provision_home(&state).await;
+        let canonical = "e1".repeat(16);
+        advertise_canonical_home(&state, &canonical).await;
+        let before = issued_invite_count(&state).await;
+
+        let (status, body) = seat(&state, &"7c".repeat(32)).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "adoption_pending");
+        assert_eq!(body["canonical_group_id"], canonical);
+        assert_eq!(
+            issued_invite_count(&state).await,
+            before,
+            "a device that lost the election must mint nothing"
+        );
+        Ok(())
+    }
+
+    /// WHY (#449): the agent id becomes the invite's `intended_joiner`,
+    /// which the authority compares byte-for-byte against
+    /// `MemberJoined.member_agent_id`. A malformed id would mint an invite
+    /// no device can ever consume while still consuming a live-invite slot,
+    /// so it has to be refused BEFORE the mint, not discovered at join time.
+    #[tokio::test]
+    async fn home_seat_rejects_malformed_agent_id() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x4C; 32]).await?;
+        provision_home(&state).await;
+        let before = issued_invite_count(&state).await;
+
+        for bad in [
+            String::new(),
+            "7c".repeat(31),
+            "7C".repeat(32),
+            format!("{}zz", "7c".repeat(31)),
+        ] {
+            let (status, body) = seat(&state, &bad).await?;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "agent_id {bad:?} must be refused: {body}"
+            );
+        }
+        assert_eq!(issued_invite_count(&state).await, before);
+        Ok(())
+    }
+
+    /// WHY (#449): this daemon's own agent already holds the seat, so
+    /// seating it is not a mutation — it is a live-invite slot spent on a
+    /// token nobody can redeem (the addressed joiner is already a member).
+    /// Answering `ok` there would tell the operator their duplicate was
+    /// resolved when nothing happened.
+    #[tokio::test]
+    async fn home_seat_refuses_seating_the_local_agent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x4D; 32]).await?;
+        provision_home(&state).await;
+        let before = issued_invite_count(&state).await;
+
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        let (status, body) = seat(&state, &local).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(issued_invite_count(&state).await, before);
+        Ok(())
+    }
+
+    /// WHY (#449): `adoption_pending` is a diagnosis. Without the cure
+    /// alongside it the operator knows their Home is a duplicate and has no
+    /// way to act, which is what made the duplicate feel permanent. The
+    /// settled `local` shape must stay byte-identical — every healthy
+    /// install reads that response, and none of them needs the advice.
+    #[tokio::test]
+    async fn home_adoption_pending_reports_the_seat_command() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x4E; 32]).await?;
+        provision_home(&state).await;
+
+        let (status, settled) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{settled}");
+        assert_eq!(settled["state"], "local");
+        assert!(
+            settled.get("next_step").is_none(),
+            "a settled Home must not carry adoption advice: {settled}"
+        );
+
+        advertise_canonical_home(&state, &"e2".repeat(16)).await;
+        let (status, pending) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{pending}");
+        assert_eq!(pending["state"], "adoption_pending");
+        let next_step = pending["next_step"].as_str().expect("next_step present");
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        let owner = hex::encode(owner_of(&state).as_bytes());
+        assert!(
+            next_step.contains(&format!("x0x home seat {local}")),
+            "next_step must name THIS device's agent id: {next_step}"
+        );
+        assert!(
+            next_step.contains(&format!("--owner {owner}")),
+            "next_step must carry the owner pin: {next_step}"
+        );
+        Ok(())
+    }
+
+    /// WHY (ADR-0039 deny-by-default, Root checklist item 1): a rider is not
+    /// a diminished owner, it is a different principal. `is_durable_owner`
+    /// matches only `Owner { durable: true }`, so a rider must be refused
+    /// even when its token was granted the Home group explicitly — the grant
+    /// buys it reach into Home CONTENT, never the authority to admit new
+    /// devices to the owner's private space. This drives the handler
+    /// directly with a `Rider` actor, so it fails if the gate is ever
+    /// loosened to "any non-session actor" while the middleware still
+    /// happens to reject riders on its own.
+    #[tokio::test]
+    async fn home_seat_refuses_rider_caller() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x52; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("Home provisioned");
+        let before = issued_invite_count(&state).await;
+
+        // A rider granted this very Home, which is the strongest grant a
+        // rider token can carry.
+        let rider = crate::server::rider_auth::ActorContext::Rider {
+            sub_agent_id: "ab".repeat(32),
+            token_id: 1,
+            token_hash: "cd".repeat(32),
+            groups: vec![home_id.clone()],
+        };
+        assert!(
+            rider.rider_allows_group(&home_id),
+            "fixture must grant the rider this Home, or the test proves nothing"
+        );
+
+        let response = seat_home(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(rider),
+            Json(SeatHomeRequest {
+                agent_id: "7c".repeat(32),
+            }),
+        )
+        .await;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a Home-granted rider still cannot mint a seat: {body}"
+        );
+        assert_eq!(
+            issued_invite_count(&state).await,
+            before,
+            "a refused rider must not leave a minted invite behind"
+        );
+        Ok(())
+    }
+
+    /// WHY (Root checklist item 6): each refusal is asserted in isolation
+    /// elsewhere, which cannot catch a leak that only appears once a caller
+    /// retries. This walks the three non-durable refusal paths in sequence
+    /// against ONE before/after count, so a mint that escaped on any attempt
+    /// — or a partial mint rolled back on only the first — shows up here.
+    /// The invariant is absolute: no refused seat request may consume a
+    /// live-invite slot, because the slots are capped and burning them would
+    /// let a rejected caller deny the owner their own seating capacity.
+    #[tokio::test]
+    async fn home_seat_refusals_mint_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x53; 32]).await?;
+        provision_home(&state).await;
+        let before = issued_invite_count(&state).await;
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+
+        // Session owner → 403.
+        let response = seat_home(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: false,
+            }),
+            Json(SeatHomeRequest {
+                agent_id: "7c".repeat(32),
+            }),
+        )
+        .await;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session refusal: {body}");
+
+        // Malformed target → 400.
+        let (status, body) = seat(&state, "not-a-hex-agent-id").await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "malformed refusal: {body}");
+
+        // The local agent → 400.
+        let (status, body) = seat(&state, &local).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "self-seat refusal: {body}");
+
+        assert_eq!(
+            issued_invite_count(&state).await,
+            before,
+            "three refusals in sequence must leave the invite ledger untouched"
         );
         Ok(())
     }

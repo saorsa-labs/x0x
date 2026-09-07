@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 176,
+  "endpoint_count": 177,
   "endpoints": [
     {
       "category": "status",
@@ -495,6 +495,24 @@
             "cli": "NAME",
             "in": "body",
             "name": "name",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "groups",
+      "cli_name": "home seat",
+      "description": "Mint an addressed Home invite seating another of the owner's devices (#449)",
+      "method": "POST",
+      "path": "/home/seat",
+      "request": {
+        "fields": [
+          {
+            "cli": "AGENT_ID",
+            "in": "body",
+            "name": "agent_id",
             "required": true
           }
         ],
