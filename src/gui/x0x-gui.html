@@ -854,6 +854,7 @@ function escJs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'")
 function u8encode(s){return btoa(unescape(encodeURIComponent(s)))}
 function u8decode(s){return decodeURIComponent(escape(atob(s)))}
 function short(s,n){return s?(s.substring(0,n||10)+'…'):'—'}
+function agentDisplayName(agentId,contact,discovered){return (contact&&contact.label)||(discovered&&discovered.self_name)||short(agentId)}
 function copyId(el){navigator.clipboard.writeText(el.textContent.replace('agent:','').replace('…','')).then(()=>toast('Copied to clipboard','info'))}
 function copyText(text){navigator.clipboard.writeText(text).then(()=>toast('Copied','info'))}
 function fmtTime(ts){return ts?new Date(typeof ts==='number'&&ts<1e12?ts*1000:ts).toLocaleTimeString():'—'}
@@ -1874,7 +1875,7 @@ async function pollDash(){
     S.set('discovered',d.agents);
     const tb=document.getElementById('h-agents');
     if(tb)tb.innerHTML=d.agents.map(x=>`<tr>
-      <td><span class="aid-short" style="cursor:pointer" onclick="showAgentDetail('${x.agent_id}')">${short(x.agent_id)}</span></td>
+      <td><span style="cursor:pointer" onclick="showAgentDetail('${x.agent_id}')">${esc(agentDisplayName(x.agent_id,(S.get('contacts')||[]).find(c=>c.agent_id===x.agent_id),x))}</span><div class="aid-short">${short(x.agent_id)}</div></td>
       <td>${x.user_id?'<span style="color:var(--lv)">'+short(x.user_id,8)+'</span>':'—'}</td>
       <td style="font-size:11px">${(x.addresses||[]).join(', ')||'—'}</td>
       <td>${x.nat_type||'—'}</td>
@@ -3152,7 +3153,7 @@ function renderAgentRow(c){
   return `<div class="agent-row" onclick="showAgentDetail('${c.agent_id}')">
     <span style="font-size:14px">&#129302;</span>
     <div style="flex:1">
-      <div style="font-weight:500">${esc(c.label||short(c.agent_id))}</div>
+      <div style="font-weight:500">${esc(agentDisplayName(c.agent_id,c,c.discovered))}</div>
       <div class="aid-short">${short(c.agent_id,12)}</div>
     </div>
     ${trustHtml(c.trust_level)}
@@ -4604,7 +4605,7 @@ function renderAgentDetail(el,data){
   const c=data.contact;
   const d=data.disc;
   const aid=data.agentId;
-  const name=c?c.label||short(aid):short(aid);
+  const name=agentDisplayName(aid,c,d);
   const trust=c?c.trust_level:'Unknown';
   const idType=c?c.identity_type:'Unknown';
   el.innerHTML=`<div class="detail-header">
