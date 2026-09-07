@@ -1801,16 +1801,30 @@ class Run:
 # never faked by degrading the current binary.
 
 def _spawn_isolated_node(name, api_port, quic_port, root_dir, x0xd,
-                        log_level, bootstrap_quic_ports):
+                        log_level, bootstrap_quic_ports, owned=None):
     """Build, configure, and start a single isolated node, returning it once
     /health is up and the api token is written. Used by the prerequisite
-    gates which need bespoke topologies/binaries outside the soak Run."""
+    gates which need bespoke topologies/binaries outside the soak Run.
+
+    If ``owned`` is provided, the Node is appended BEFORE start/wait so a
+    readiness failure cannot orphan a live child. On start/wait failure the
+    helper also stop/reaps before re-raising (defense in depth).
+    """
     node = Node(name, api_port, quic_port, root_dir, x0xd, log_level)
     node.write_config(bootstrap_quic_ports)
+    if owned is not None:
+        owned.append(node)
     log(f"starting {name} (api={api_port}, quic={quic_port}, "
         f"binary={x0xd})")
-    node.start()
-    node.wait_ready()
+    try:
+        node.start()
+        node.wait_ready()
+    except Exception:
+        try:
+            node.stop()
+        except Exception:
+            pass
+        raise
     return node
 
 
@@ -2693,12 +2707,14 @@ def summarize(runs, args, prereq_gates=None, provenance=None,
     lines.append("")
     soak_pass = (passed == total)
     if prereq_gates:
-        if args.expect_fixed:
-            prereq_pass = all(g.get("status") not in ("fail", "unsupported")
-                              for g in prereq_gates)
-        else:
-            prereq_pass = all(g.get("status") != "fail"
-                              for g in prereq_gates)
+        prereq_pass = all(
+            not prereq_gate_is_blocking(
+                g,
+                modern_only=getattr(args, "modern_only", False),
+                expect_fixed=bool(getattr(args, "expect_fixed", False)),
+            )
+            for g in prereq_gates
+        )
     else:
         prereq_pass = True
     overall = soak_pass and prereq_pass
@@ -2708,6 +2724,24 @@ def summarize(runs, args, prereq_gates=None, provenance=None,
     lines.append(f"OVERALL: {tag}")
     return "\n".join(lines)
 
+
+
+def prereq_gate_is_blocking(gate, *, modern_only=False, expect_fixed=False):
+    """Single shared predicate for summarize OVERALL and main() exit.
+
+    Under --expect-fixed: fail and unsupported always block. Under
+    --modern-only --expect-fixed, incomplete_policy also blocks (fail-closed
+    admission). not_in_modern_predicate never blocks (explicit exclude label).
+    Without --expect-fixed only status==fail blocks.
+    """
+    st = gate.get("status") if isinstance(gate, dict) else None
+    if expect_fixed:
+        if modern_only and st == NOT_IN_MODERN_PREDICATE:
+            return False
+        if modern_only and st == INCOMPLETE_POLICY:
+            return True
+        return st in ("fail", "unsupported")
+    return st == "fail"
 
 
 def modern_excluded_gate_record(name):
@@ -2768,12 +2802,13 @@ def classify_prereq_gates_for_modern(gates):
 def classify_modern_policy_admission(policy, grants_enabled):
     """Classify live or fixture policy readback for modern admission.
 
-    PASS only when policy is reject_v1 AND grants_enabled is False.
+    PASS only when policy is reject_v1 AND grants_enabled is False
+    (identity check — not merely not-True / not-None).
     None policy → incomplete_policy (missing/unreadable).
     accept_v1 or unexpected → fail.
     grants_enabled True → fail.
-    grants_enabled None with reject_v1 → incomplete_policy (cannot prove
-    grants disabled — do not invent a PASS path).
+    grants_enabled None / wrong type with reject_v1 → incomplete_policy
+    (cannot prove grants disabled — do not invent a PASS path).
     """
     base = {"name": MODERN_POLICY_ADMISSION, "modern_only": True}
     if policy is None:
@@ -2809,20 +2844,21 @@ def classify_modern_policy_admission(policy, grants_enabled):
             "outer_signature_policy": policy,
             "grants_enabled": grants_enabled,
         }
-    if grants_enabled is None:
+    if grants_enabled is False:
         return {
             **base,
-            "status": INCOMPLETE_POLICY,
-            "reason": "grants_disabled_unproven",
+            "status": "pass",
+            "reason": "reject_v1_grants_disabled",
             "outer_signature_policy": policy,
-            "grants_enabled": None,
+            "grants_enabled": False,
         }
+    # None / wrong types / non-False: cannot prove grants disabled.
     return {
         **base,
-        "status": "pass",
-        "reason": "reject_v1_grants_disabled",
+        "status": INCOMPLETE_POLICY,
+        "reason": "grants_disabled_unproven",
         "outer_signature_policy": policy,
-        "grants_enabled": False,
+        "grants_enabled": grants_enabled,
     }
 
 
@@ -2839,16 +2875,23 @@ def extract_policy_from_diagnostics_body(body):
 def extract_grants_enabled_from_diagnostics_body(body):
     """Best-effort grants-enabled flag from diagnostics.
 
-    Prefer explicit boolean fields; map receipt-style legacy_grants strings.
+    Accept only a strict boolean, or a documented legacy_grants string enum
+    (disabled/enabled). Null, 0, "", empty list/dict inventory, and other
+    wrong types are None (incomplete) — never coerce via bool() into a false
+    "disabled" attestation. Empty inventory ≠ facility disabled.
     If no grants evidence key is present (current #546 tip), return None so
     admission stays incomplete_policy — never a silent PASS.
     """
     if not isinstance(body, dict):
         return None
+
+    def _strict_bool(val):
+        return val if isinstance(val, bool) else None
+
     if "legacy_grants_enabled" in body:
-        return bool(body["legacy_grants_enabled"])
+        return _strict_bool(body["legacy_grants_enabled"])
     if "grants_enabled" in body:
-        return bool(body["grants_enabled"])
+        return _strict_bool(body["grants_enabled"])
     if "legacy_grants" in body:
         val = body["legacy_grants"]
         if isinstance(val, bool):
@@ -2860,15 +2903,12 @@ def extract_grants_enabled_from_diagnostics_body(body):
             if v in ("enabled", "true", "on", "active"):
                 return True
             return None
-        if isinstance(val, (list, dict)):
-            return len(val) > 0
+        # list/dict inventory cannot attest facility disabled (enabled-but-
+        # empty is a real state); reject as unproven.
         return None
     if "migration_grants" in body:
-        g = body.get("migration_grants")
-        if g is None:
-            return None
-        if isinstance(g, (list, dict)):
-            return len(g) > 0
+        # Inventory alone is not a boolean disabled attestation.
+        return None
     return None
 
 
@@ -2898,10 +2938,12 @@ def run_modern_policy_admission_gate(args, out_dir, nodes=None):
             pol_dir = pathlib.Path(out_dir) / "modern-policy-admission"
             pol_dir.mkdir(parents=True, exist_ok=True)
             try:
+                # Own before start/wait: _spawn_isolated_node appends to
+                # owned prior to start/wait_ready so a readiness raise cannot
+                # leak a live child (helper also stop/reaps on failure).
                 node = _spawn_isolated_node(
                     "policy-admit", args.api_base + 50, args.quic_base + 50,
-                    pol_dir, args.x0xd, args.log_level, [])
-                owned.append(node)
+                    pol_dir, args.x0xd, args.log_level, [], owned=owned)
                 r = node.req("GET", "/diagnostics/gossip")
                 if r.get("status") == 200 and isinstance(r.get("body"), dict):
                     body = r["body"]
@@ -3153,21 +3195,12 @@ def main():
     # recipe demands every phase be exercised, never silently skipped. A
     # provenance refusal (stale binary / wrong legacy version) already failed
     # fast above under --expect-fixed.
-    if args.expect_fixed:
-        # Under --modern-only, not_in_modern_predicate is an explicit exclude
-        # label (not PASS, not a failure) — stock phases must not block modern.
-        def _prereq_blocking(g):
-            st = g.get("status")
-            if args.modern_only and st == NOT_IN_MODERN_PREDICATE:
-                return False
-            # incomplete_policy blocks under modern+expect-fixed (fail-closed
-            # admission; missing #546 diagnostics must not green the recipe).
-            if args.modern_only and st == INCOMPLETE_POLICY:
-                return True
-            return st in ("fail", "unsupported")
-        prereq_ok = all(not _prereq_blocking(g) for g in prereq_gates)
-    else:
-        prereq_ok = all(g.get("status") != "fail" for g in prereq_gates)
+    # Shared with summarize OVERALL — do not fork this predicate.
+    prereq_ok = all(
+        not prereq_gate_is_blocking(
+            g, modern_only=args.modern_only, expect_fixed=args.expect_fixed)
+        for g in prereq_gates
+    )
     # Release-environment gates: critical hard-error growth and mDNS mesh
     # contamination are HARD gates under --expect-fixed (a release must run
     # clean); reported but non-blocking in the one-run smoke.
