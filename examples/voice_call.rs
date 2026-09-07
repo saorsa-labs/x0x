@@ -413,7 +413,10 @@ mod tests {
     async fn connection_wait_rejects_success_after_deadline() {
         let started = tokio::time::Instant::now();
         let connected = wait_for_connection(Duration::from_millis(40), || async {
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            // Resolve true on the deadline boundary. `timeout_at` may return
+            // the ready predicate here, so the post-predicate deadline guard
+            // must still reject the late success.
+            tokio::time::sleep(Duration::from_millis(40)).await;
             true
         })
         .await;
