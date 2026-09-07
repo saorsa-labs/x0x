@@ -542,6 +542,24 @@ impl Drop for DmInboxService {
     }
 }
 
+/// #461: production dispatch for a subscription-delivered message. The
+/// ingress label is selected HERE, by production code — `spawn_subscription_loop`
+/// and the #461 controls drive this same seam; callers never choose the
+/// label, so a loop-label regression cannot hide behind a test-supplied one.
+async fn dispatch_subscription_message(
+    pipeline: &InboxPipeline,
+    message: PubSubMessage,
+    ack_legacy_bus: bool,
+) {
+    pipeline
+        .handle_incoming(
+            message,
+            ack_legacy_bus,
+            crate::dm::DmAckIngress::Subscription,
+        )
+        .await
+}
+
 fn spawn_subscription_loop(
     topic_for_task: String,
     ack_legacy_bus: bool,
@@ -551,13 +569,7 @@ fn spawn_subscription_loop(
     tokio::spawn(async move {
         tracing::info!(topic = %topic_for_task, "DM inbox service subscribed");
         while let Some(message) = subscription.recv().await {
-            pipeline
-                .handle_incoming(
-                    message,
-                    ack_legacy_bus,
-                    crate::dm::DmAckIngress::Subscription,
-                )
-                .await;
+            dispatch_subscription_message(&pipeline, message, ack_legacy_bus).await;
         }
         tracing::debug!(topic = %topic_for_task, "DM inbox subscription closed");
     })
@@ -3772,10 +3784,9 @@ mod tests {
             trust_level: None,
             raw_envelope: None,
         };
-        harness
-            .pipeline
-            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
-            .await;
+        // Production-selected label: the test drives the SAME dispatch seam
+        // the subscription loop uses and cannot choose the ingress itself.
+        dispatch_subscription_message(&harness.pipeline, message, false).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), waiter)
                 .await
@@ -3828,10 +3839,7 @@ mod tests {
             trust_level: None,
             raw_envelope: None,
         };
-        harness
-            .pipeline
-            .handle_incoming(bad_message, false, crate::dm::DmAckIngress::Subscription)
-            .await;
+        dispatch_subscription_message(&harness.pipeline, bad_message, false).await;
         assert_eq!(*ingress_cell.lock().expect("cell"), None);
         assert!(
             waiter.try_recv().is_err(),
@@ -3853,10 +3861,7 @@ mod tests {
             trust_level: None,
             raw_envelope: None,
         };
-        harness
-            .pipeline
-            .handle_incoming(good_message, false, crate::dm::DmAckIngress::DirectTyped)
-            .await;
+        dispatch_subscription_message(&harness.pipeline, good_message, false).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), waiter)
                 .await
@@ -3866,8 +3871,8 @@ mod tests {
         );
         assert_eq!(
             *ingress_cell.lock().expect("cell"),
-            Some(crate::dm::DmAckIngress::DirectTyped),
-            "the winner's ingress is reported, not the invalid attempt's label"
+            Some(crate::dm::DmAckIngress::Subscription),
+            "the winner's ingress is the SEAM-selected label, not a test-supplied one"
         );
         assert_no_delivery(&mut harness.receiver).await;
     }

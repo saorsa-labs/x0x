@@ -1,9 +1,9 @@
 //! Sender-side gossip DM path (phase 4 of `docs/design/dm-over-gossip.md`).
 
 use crate::dm::{
-    dm_inbox_topic, millis_since, now_unix_ms, DmAckOutcome, DmError, DmPath, DmReceipt,
-    DmSendConfig, DurableSendStages, EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_DURABLE_ACK,
-    DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
+    dm_inbox_topic, millis_since, now_unix_ms, DmAckIngress, DmAckOutcome, DmError, DmPath,
+    DmReceipt, DmSendConfig, DurableSendStages, EnvelopeBuilder, InFlightAcks,
+    DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
 };
 use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
@@ -148,6 +148,33 @@ pub async fn send_via_gossip(
     config: &DmSendConfig,
     lifecycle_hint: Option<DmLifecycleHint>,
 ) -> Result<DmReceipt, DmError> {
+    send_via_gossip_with_provenance(
+        ctx,
+        recipient_agent_id,
+        recipient_machine_id,
+        recipient_kem_public_key,
+        payload,
+        config,
+        lifecycle_hint,
+    )
+    .await
+    .map(|(receipt, _ingress)| receipt)
+}
+
+/// #461: internal provenance variant. Returns the unchanged public
+/// `DmReceipt` PLUS the observed ingress of the winning authenticated ACK
+/// (`None` when unstamped — unknown/publish-only). The public struct and
+/// all public signatures are unchanged; in-crate callers (the direct-send
+/// HTTP route) read the ingress from this tuple.
+pub(crate) async fn send_via_gossip_with_provenance(
+    ctx: DmSendContext<'_>,
+    recipient_agent_id: AgentId,
+    recipient_machine_id: Option<MachineId>,
+    recipient_kem_public_key: &[u8],
+    payload: Vec<u8>,
+    config: &DmSendConfig,
+    lifecycle_hint: Option<DmLifecycleHint>,
+) -> Result<(DmReceipt, Option<DmAckIngress>), DmError> {
     let DmSendContext {
         pubsub,
         signing,
@@ -381,7 +408,7 @@ pub async fn send_via_gossip(
                     retries_used = attempt,
                     ack_required = false,
                 );
-                return Ok(gossip_publish_receipt(request_id, attempt));
+                return Ok((gossip_publish_receipt(request_id, attempt), None));
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -585,20 +612,23 @@ fn ack_outcome_to_receipt(
     ack_ingress_cell: &crate::dm::ProvenanceCell,
     request_id: [u8; 16],
     retries_used: u8,
-) -> Result<DmReceipt, DmError> {
+) -> Result<(DmReceipt, Option<DmAckIngress>), DmError> {
     // #461: observed ingress of the winning ACK, or None when unstamped
     // (unknown/publish-only). Never fabricated.
     let observed_ingress = ack_ingress_cell.lock().ok().and_then(|cell| *cell);
     match outcome {
-        DmAckOutcome::Accepted => Ok(DmReceipt {
-            request_id,
-            accepted_at: Instant::now(),
-            retries_used,
-            // `path` keeps reporting the send STRATEGY (unchanged public
-            // semantics); observed ingress rides separately (#461).
-            path: DmPath::GossipInbox,
-            observed_ack_ingress: observed_ingress,
-        }),
+        DmAckOutcome::Accepted => Ok((
+            DmReceipt {
+                request_id,
+                accepted_at: Instant::now(),
+                retries_used,
+                // `path` keeps reporting the send STRATEGY (unchanged public
+                // semantics); observed ingress rides the internal provenance
+                // tuple (#461) — the public struct is unchanged.
+                path: DmPath::GossipInbox,
+            },
+            observed_ingress,
+        )),
         DmAckOutcome::RejectedByPolicy { reason } => Err(DmError::RecipientRejected { reason }),
         // ADR 0030 §2: the recipient refused to issue the durable receipt,
         // but nothing about the trust relationship failed. Surfacing this as
@@ -620,9 +650,6 @@ fn gossip_publish_receipt(request_id: [u8; 16], retries_used: u8) -> DmReceipt {
         accepted_at: Instant::now(),
         retries_used,
         path: DmPath::GossipInbox,
-        // Publish-only outcome: no authenticated ACK was observed, so no
-        // ingress may be claimed (#461).
-        observed_ack_ingress: None,
     }
 }
 
@@ -665,7 +692,6 @@ fn receipt_for_path(path: DmPath) -> DmReceipt {
         request_id: fresh_request_id(),
         accepted_at: Instant::now(),
         retries_used: 0,
-        observed_ack_ingress: None,
         path,
     }
 }
@@ -962,9 +988,11 @@ mod tests {
             2,
         )
         .unwrap();
-        assert_eq!(receipt.request_id, request_id);
-        assert_eq!(receipt.retries_used, 2);
-        assert_eq!(receipt.path, DmPath::GossipInbox);
+        assert_eq!(receipt.0.request_id, request_id);
+        assert_eq!(receipt.0.retries_used, 2);
+        assert_eq!(receipt.0.path, DmPath::GossipInbox);
+        // Unstamped cell: unknown ingress must not be fabricated.
+        assert_eq!(receipt.1, None);
     }
 
     #[test]

@@ -1132,7 +1132,6 @@ mod tests {
             accepted_at: std::time::Instant::now(),
             retries_used: 0,
             path: x0x::dm::DmPath::GossipInbox,
-            observed_ack_ingress: None,
         }
     }
 

@@ -5875,12 +5875,25 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner(to, payload, config)
+            .send_direct_with_config_inner_with_provenance(to, payload, config)
             .await;
-        if let (Ok(receipt), Some(recorded_payload)) = (&result, history_payload) {
+        if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
         }
-        result
+        result.map(|(receipt, _ingress)| receipt)
+    }
+    /// #461: provenance variant for the direct-send HTTP route — same
+    /// behavior and history wiring, plus the observed ingress of the
+    /// winning authenticated durable ACK (`None` when unstamped). The
+    /// public struct and every public signature are unchanged.
+    pub(crate) async fn send_direct_with_config_with_provenance(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        self.send_direct_with_config_inner_with_provenance(to, payload, config)
+            .await
     }
 
     /// Record a durable outbound DM row after a successful send (ADR-0023).
@@ -5923,12 +5936,12 @@ impl Agent {
         });
     }
 
-    async fn send_direct_with_config_inner(
+    async fn send_direct_with_config_inner_with_provenance(
         &self,
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
-    ) -> Result<dm::DmReceipt, dm::DmError> {
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
         // the raw agent key, so the gate must refuse HERE, before any
@@ -5989,7 +6002,7 @@ impl Agent {
                 path = "loopback",
                 delivered_subscribers = delivered,
             );
-            return Ok(receipt);
+            return Ok((receipt, None));
         }
 
         let send_started = std::time::Instant::now();
@@ -6222,7 +6235,7 @@ impl Agent {
         };
 
         let result = if let Some(receipt) = preferred_raw_receipt {
-            Ok(receipt)
+            Ok((receipt, None))
         } else if preferred_raw_err.as_ref().is_some_and(|err| {
             config.stop_fallback_on_raw_error
                 || Self::raw_quic_error_should_stop_fallback(err, gossip_ok)
@@ -6247,7 +6260,7 @@ impl Agent {
                     // `Replaced` for that machine_id rather than serving out
                     // the full backoff window.
                     let lifecycle_hint = self.dm_lifecycle_hint(to).await;
-                    dm_send::send_via_gossip(
+                    dm_send::send_via_gossip_with_provenance(
                         dm_send::DmSendContext {
                             pubsub: std::sync::Arc::clone(runtime.pubsub()),
                             signing: &signing,
@@ -6287,7 +6300,8 @@ impl Agent {
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
-                    .map_err(Self::map_raw_quic_dm_error),
+                    .map_err(Self::map_raw_quic_dm_error)
+                    .map(|receipt| (receipt, None)),
             }
         };
 
@@ -6307,7 +6321,7 @@ impl Agent {
         match result {
             Ok(receipt) => {
                 self.direct_messaging
-                    .record_outgoing_succeeded(*to, receipt.path);
+                    .record_outgoing_succeeded(*to, receipt.0.path);
                 // X0X-0070b: every direct-DM success clears the relay engine's
                 // per-peer failure history. A peer that had crossed
                 // `needs_relay` and now recovers a direct path increments
@@ -6336,7 +6350,7 @@ impl Agent {
                             Ok(relay_receipt) => {
                                 self.direct_messaging
                                     .record_outgoing_succeeded(*to, relay_receipt.path);
-                                return Ok(relay_receipt);
+                                return Ok((relay_receipt, None));
                             }
                             Err(relay_err) => {
                                 tracing::debug!(
@@ -6476,7 +6490,6 @@ impl Agent {
             retries_used: 0,
             path: dm::DmPath::Relayed { via: relay_agent },
             // #461: relay-lane send — no durable-ACK waiter was involved.
-            observed_ack_ingress: None,
         })
     }
 

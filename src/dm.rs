@@ -893,12 +893,6 @@ pub struct DmReceipt {
     pub accepted_at: Instant,
     pub retries_used: u8,
     pub path: DmPath,
-    /// #461: ingress of the transport that actually carried the winning
-    /// authenticated durable ACK, when observed. `None` for publish-only
-    /// outcomes and any resolution without an ingress stamp — unknown is
-    /// never fabricated. Distinct from `path`, the send strategy. Additive
-    /// read surface; struct-literal construction sites are in-crate.
-    pub observed_ack_ingress: Option<DmAckIngress>,
 }
 
 /// Which transport delivered the DM.
