@@ -145,6 +145,21 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Run named group integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_integration -- --run-ignored ignored-only
+      # The existing isolated nextest invocation resolves Cargo.lock and warms
+      # the locked dependency graph before this offline daemon build.
+      - name: Build and pin x0xd for issue #321
+        run: |
+          cargo build --offline --locked --all-features --bin x0xd
+          test -x target/debug/x0xd
+          sha256sum target/debug/x0xd
+      - name: Run issue #321 verified history restart acceptance
+        run: |
+          test -x target/debug/x0xd
+          sha256sum target/debug/x0xd
+          bash scripts/ci/nextest-isolated.sh --all-features \
+            --test named_group_e_live -- \
+            --run-ignored ignored-only \
+            -E 'test(=e_verified_envelope_history_lookup_survives_restart)'
 
   # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
   integration-net:
