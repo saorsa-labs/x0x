@@ -126,6 +126,39 @@ Consequently, adoption, retirement and any device-vs-rider Home eligibility
 rule are **out of scope for this ADR** and must be decided explicitly — with
 ADR-0039 reconciled rather than bypassed — before implementation.
 
+### Adoption eligibility — decided 2026-09-07 (David Irvine)
+
+Recorded here rather than in a new ADR because it *resolves* the deferral
+above without changing this ADR's decision, and because ADR numbers are
+centrally allocated. Analysis: `docs/design/449-adoption-eligibility-options.md`.
+
+**Adoption is owner-driven, not inferred.** The owner explicitly seats a device
+by running a command on the device that holds the canonical Home, naming the
+joiner; that device mints an ADDRESSED v4 invite (`intended_joiner`) through the
+existing invite authority, and the joiner uses the existing
+`x0x group join --home` path with the expected owner pinned. This needs **no new
+signed Tier-1 state, no protocol version change, and no amendment to
+ADR-0039** — Home eligibility stays mode-agnostic and rider scope stays
+deny-by-default, because a human decides per agent rather than a rule deciding
+per class. It therefore cannot reproduce any of the three defects above.
+
+**Explicitly rejected:** replicating hosting mode in signed state. The signal
+does exist at the issuing daemon (`routes/owner.rs:76,109`) and is lost only in
+transit (`SyncValue::IssuanceJournal` carries no mode; `apply_journal_line`
+materialises every synced line as `Acp`), but any rule that acts on it would
+deny riders a seat — an amendment to Accepted ADR-0039 acquired as a side
+effect of a bug fix. If ever wanted, that is its own ADR.
+
+**Deferred, not rejected:** binding the joiner's agent id into the existing
+owner-key possession proof in the sync handshake. It is the only *automatic*
+signal a rider structurally cannot produce, but it requires a protocol version
+bump behind a strict-equality gate. It rides along only if such a bump is taken
+for another reason.
+
+**What this does not decide:** retirement (ADR-0065 stays read-only
+inventory), any multi-device convergence claim, or closure of #449, which
+requires the seating command shipped, reviewed and runtime-accepted.
+
 ## Consequences
 
 ### Positive
