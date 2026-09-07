@@ -109,7 +109,7 @@ jobs:
         # runs. Tracked separately; do not let it gate unrelated PRs.
         # NB: `binary()` (test-binary name), not `test()` — `test()` would
         # match the test function name, which is different from the binary.
-        run: cargo nextest run --all-features --workspace -E '!binary(x0x_0041_synthetic_kill_restart)'
+        run: bash scripts/ci/nextest-isolated.sh --all-features --workspace -- -E '!binary(x0x_0041_synthetic_kill_restart)'
 
       - name: Upload test results
         if: always()
@@ -187,8 +187,11 @@ jobs:
         #   tranche 2 (#141): 65.0 → 65.6 (exec-ACL denials; actual 66.61%)
         #   tranche 3 (#124): 65.6 → 65.7 (storage/identity errors; actual 66.70%)
         run: |
+          cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
+          source "$RUNNER_TEMP/coverage-env.sh"
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 65.7 nextest -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)'
+          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)'
+          cargo llvm-cov report --workspace --lcov --output-path lcov.info --fail-under-lines 65.7
           python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
 
       - name: Upload LCOV report
@@ -298,12 +301,12 @@ jobs:
 
       - name: Run parity gate
         run: |
-          cargo nextest run --all-features \
+          bash scripts/ci/nextest-isolated.sh --all-features \
             --test api_manifest \
             --test parity_cli \
             --test api_coverage \
             --test gui_smoke \
-            --test gui_named_group_parity
+            --test gui_named_group_parity --
 
       - name: Upload GUI coverage report
         if: always()
@@ -328,7 +331,7 @@ jobs:
         uses: taiki-e/install-action@just
 
       - name: Authority check (same recipe as `just check`)
-        run: just deploy-check
+        run: python3 scripts/ci/isolated-runtime.py just deploy-check
 
       - name: Control self-test (each disclosed condition must flip red)
-        run: just deploy-check-selftest
+        run: python3 scripts/ci/isolated-runtime.py just deploy-check-selftest
