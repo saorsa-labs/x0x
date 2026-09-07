@@ -118,6 +118,8 @@ profile-heap = ["dep:dhat"]
 # Voice/video adapters for saorsa-webrtc: X0xSignaling over DMs and
 # X0xLinkTransport over ADR-0022 byte streams (StreamProtocol::WebRtcV1).
 voice = ["dep:saorsa-webrtc-core", "dep:saorsa-webrtc-codecs"]
+# Diagnostic-only #491 fixture helper; excluded from ordinary package builds.
+rt4-diagnostic = []
 
 [dev-dependencies]
 # `start_paused` virtual-clock tests for the state-request bootstrap tail
@@ -159,6 +161,12 @@ test = false
 name = "x0xd-forge-injector"
 path = "src/bin/x0xd_forge_injector.rs"
 test = false
+
+[[bin]]
+name = "rt4_fixture"
+path = "src/bin/rt4_fixture.rs"
+test = false
+required-features = ["rt4-diagnostic"]
 
 [[bench]]
 name = "gossip_dispatch_throughput"

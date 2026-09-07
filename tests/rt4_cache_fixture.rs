@@ -163,9 +163,10 @@ async fn rt4_corrupted_checksum_yields_empty_load() {
 }
 
 /// Prune-predicate: after removing self from a mixed 2-peer cache, the
-/// remaining count is 1 (the file is NOT unlinked); after removing self
-/// from a self-only cache, remaining is 0 (the file IS unlinked by x0x).
-/// This exercises the actual `remove` + `peer_count` public API.
+/// remaining count is 1 (the file is not unlinked); after removing self
+/// from a self-only cache, remaining is 0. The file unlink is asserted
+/// separately by the real x0xd process harness. This exercises the actual
+/// `remove` + `peer_count` public API.
 #[tokio::test]
 async fn rt4_prune_remaining_predicate() {
     // Mixed: remove self → remaining=1 → no unlink.
@@ -187,7 +188,7 @@ async fn rt4_prune_remaining_predicate() {
     );
     drop(cache);
 
-    // Self-only: remove self → remaining=0 → x0x unlinks the file.
+    // Self-only: remove self → remaining=0; runtime x0xd owns unlinking.
     let dir2 = tempfile::tempdir().unwrap();
     write_fixture(dir2.path(), &[(self_id, "self")])
         .await

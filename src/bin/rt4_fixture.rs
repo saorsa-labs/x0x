@@ -4,7 +4,7 @@
 //!
 //! Usage:
 //!   rt4_fixture write <cache_dir> <self_id_hex> [nonself_id_hex]
-//!   rt4_fixture inspect <cache_dir>
+//!   rt4_fixture inspect <cache_dir> [must_contain_hex|-] [must_not_contain_hex|-]
 //!   rt4_fixture corrupt-checksum <cache_dir>
 
 use ant_quic::bootstrap_cache::{BootstrapCache, BootstrapCacheConfig};
@@ -29,8 +29,18 @@ fn parse_peer_id(hex: &str) -> Result<PeerId, String> {
 
 fn print_usage() {
     eprintln!("usage: rt4_fixture write <cache_dir> <self_id_hex> [nonself_id_hex]");
-    eprintln!("       rt4_fixture inspect <cache_dir>");
+    eprintln!(
+        "       rt4_fixture inspect <cache_dir> [must_contain_hex|-] [must_not_contain_hex|-]"
+    );
     eprintln!("       rt4_fixture corrupt-checksum <cache_dir>");
+}
+
+fn parse_optional_peer_id(args: &[String], index: usize) -> Result<Option<PeerId>, String> {
+    match args.get(index) {
+        None => Ok(None),
+        Some(value) if value == "-" => Ok(None),
+        Some(value) => parse_peer_id(value).map(Some),
+    }
 }
 
 #[tokio::main]
@@ -93,6 +103,20 @@ async fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         "inspect" => {
+            let must_contain = match parse_optional_peer_id(&args, 3) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("error: invalid required peer id: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let must_not_contain = match parse_optional_peer_id(&args, 4) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("error: invalid forbidden peer id: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
             let config = config_for(&dir);
             let cache = match BootstrapCache::open(config).await {
                 Ok(c) => c,
@@ -102,8 +126,24 @@ async fn main() -> std::process::ExitCode {
                 }
             };
             let count = cache.peer_count().await;
-            println!("count={count}");
-            std::process::ExitCode::SUCCESS
+            let contains_expected = match must_contain {
+                Some(id) => cache.contains(&id).await,
+                None => true,
+            };
+            let contains_forbidden = match must_not_contain {
+                Some(id) => cache.contains(&id).await,
+                None => false,
+            };
+            println!(
+                "count={count} contains_expected={} contains_forbidden={}",
+                u8::from(contains_expected),
+                u8::from(contains_forbidden)
+            );
+            if contains_expected && !contains_forbidden {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            }
         }
         "corrupt-checksum" => {
             let file = dir.join("bootstrap_cache.json");
