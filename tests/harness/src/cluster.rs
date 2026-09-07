@@ -15,6 +15,31 @@ use tokio::sync::OnceCell;
 mod fixture_ownership;
 use fixture_ownership::{FixtureDirectory, OwnedChild, PortReservations};
 
+/// A pair of daemon ports whose listeners remain held until the corresponding
+/// child reaches the spawn boundary. Keeping the listeners alongside the
+/// numbers prevents duplicate allocations within one fixture and protects
+/// delayed rolling starts from unrelated claimants.
+struct ReservedPorts {
+    listeners: PortReservations,
+    api_port: u16,
+    bind_port: u16,
+}
+
+impl ReservedPorts {
+    fn bind(name: &str) -> Self {
+        let listeners = PortReservations::bind(0, 0)
+            .unwrap_or_else(|error| panic!("Cannot reserve ports for {name}: {error}"));
+        let (api_port, bind_port) = listeners
+            .ports()
+            .unwrap_or_else(|error| panic!("Cannot inspect reserved ports for {name}: {error}"));
+        Self {
+            listeners,
+            api_port,
+            bind_port,
+        }
+    }
+}
+
 /// A single x0xd daemon instance.
 pub struct AgentInstance {
     process: OwnedChild,
@@ -462,13 +487,12 @@ fn solo_plane_id() -> &'static str {
 pub async fn solo() -> (AgentInstance, u16) {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
-    let api = allocate_unused_tcp_port();
-    let bind = allocate_unused_udp_port();
+    let ports = ReservedPorts::bind("solo");
+    let bind = ports.bind_port;
     let instance = start_instance(
         &binary,
         &format!("solo-{suffix}"),
-        api,
-        bind,
+        ports,
         "",
         &with_private_plane(solo_plane_id(), ""),
     )
@@ -482,13 +506,11 @@ pub async fn solo() -> (AgentInstance, u16) {
 pub async fn join_peer(anchor: &AgentInstance, anchor_bind: u16) -> AgentInstance {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
-    let api = allocate_unused_tcp_port();
-    let bind = allocate_unused_udp_port();
+    let ports = ReservedPorts::bind("join_peer");
     let instance = start_instance(
         &binary,
         &format!("late-{suffix}"),
-        api,
-        bind,
+        ports,
         &format!("bootstrap_peers = [\"127.0.0.1:{anchor_bind}\"]"),
         &with_private_plane(solo_plane_id(), ""),
     )
@@ -561,16 +583,14 @@ async fn pair_with_extra_config_and_node_env(
     let plane_id = format!("x0x-test-{}", rand::random::<u32>());
     let owned_extra = with_private_plane(&plane_id, extra_config);
     let extra_config = owned_extra.as_str();
-    let alice_api = allocate_unused_tcp_port();
-    let alice_bind = allocate_unused_udp_port();
-    let bob_api = allocate_unused_tcp_port();
-    let bob_bind = allocate_unused_udp_port();
+    let alice_ports = ReservedPorts::bind("pair-alice");
+    let alice_bind = alice_ports.bind_port;
+    let bob_ports = ReservedPorts::bind("pair-bob");
 
     let alice = start_instance_with_env(
         &binary,
         &format!("pair-alice-{suffix}"),
-        alice_api,
-        alice_bind,
+        alice_ports,
         "",
         extra_config,
         alice_env,
@@ -583,8 +603,7 @@ async fn pair_with_extra_config_and_node_env(
     let bob = start_instance_with_env(
         &binary,
         &format!("pair-bob-{suffix}"),
-        bob_api,
-        bob_bind,
+        bob_ports,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
         bob_env,
@@ -641,12 +660,10 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     let plane_id = format!("x0x-test-{}", rand::random::<u32>());
     let owned_extra = with_private_plane(&plane_id, extra_config);
     let extra_config = owned_extra.as_str();
-    let alice_api = allocate_unused_tcp_port();
-    let alice_bind = allocate_unused_udp_port();
-    let bob_api = allocate_unused_tcp_port();
-    let bob_bind = allocate_unused_udp_port();
-    let charlie_api = allocate_unused_tcp_port();
-    let charlie_bind = allocate_unused_udp_port();
+    let alice_ports = ReservedPorts::bind("cluster-alice");
+    let alice_bind = alice_ports.bind_port;
+    let bob_ports = ReservedPorts::bind("cluster-bob");
+    let charlie_ports = ReservedPorts::bind("cluster-charlie");
 
     // Rolling start: each node needs time for its QUIC listener to bind and
     // mDNS/bootstrap to propagate before the next node comes up. Starting
@@ -656,8 +673,7 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     let alice = start_instance(
         &binary,
         &format!("test-alice-{suffix}"),
-        alice_api,
-        alice_bind,
+        alice_ports,
         "",
         extra_config,
     )
@@ -673,8 +689,7 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     let bob = start_instance(
         &binary,
         &format!("test-bob-{suffix}"),
-        bob_api,
-        bob_bind,
+        bob_ports,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
     )
@@ -690,8 +705,7 @@ async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     let charlie = start_instance(
         &binary,
         &format!("test-charlie-{suffix}"),
-        charlie_api,
-        charlie_bind,
+        charlie_ports,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
     )
@@ -851,21 +865,11 @@ fn test_log_stdio(name: &str, suffix: &str) -> Option<(Stdio, Stdio)> {
 async fn start_instance(
     binary: &PathBuf,
     name: &str,
-    api_port: u16,
-    bind_port: u16,
+    ports: ReservedPorts,
     bootstrap: &str,
     extra_config: &str,
 ) -> AgentInstance {
-    start_instance_with_env(
-        binary,
-        name,
-        api_port,
-        bind_port,
-        bootstrap,
-        extra_config,
-        &[],
-    )
-    .await
+    start_instance_with_env(binary, name, ports, bootstrap, extra_config, &[]).await
 }
 
 /// As [`start_instance`], plus environment variables applied to this daemon
@@ -873,14 +877,16 @@ async fn start_instance(
 async fn start_instance_with_env(
     binary: &PathBuf,
     name: &str,
-    api_port: u16,
-    bind_port: u16,
+    ports: ReservedPorts,
     bootstrap: &str,
     extra_config: &str,
     env: &[(&str, &str)],
 ) -> AgentInstance {
-    let reservations = PortReservations::bind(api_port, bind_port)
-        .unwrap_or_else(|e| panic!("Cannot admit x0xd {name}: {e}"));
+    let ReservedPorts {
+        listeners: reservations,
+        api_port,
+        bind_port,
+    } = ports;
     let directory = FixtureDirectory::new_in(&std::env::temp_dir())
         .unwrap_or_else(|e| panic!("create owned fixture directory for {name}: {e}"));
     let config_dir = directory.path().to_path_buf();
@@ -962,4 +968,20 @@ async fn start_instance_with_env(
     // killing the process.
     instance.refresh_runtime_state().await;
     instance
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::{fixture_ownership::PortReservations, ReservedPorts};
+
+    #[test]
+    fn reserved_pair_ports_are_distinct_and_held() {
+        let first = ReservedPorts::bind("pure-test-first");
+        let second = ReservedPorts::bind("pure-test-second");
+
+        assert_ne!(first.api_port, second.api_port);
+        assert_ne!(first.bind_port, second.bind_port);
+        assert!(PortReservations::bind(first.api_port, first.bind_port).is_err());
+        assert!(PortReservations::bind(second.api_port, second.bind_port).is_err());
+    }
 }
