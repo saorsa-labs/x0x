@@ -183,7 +183,7 @@ async fn rt4_prune_remaining_predicate() {
     assert_eq!(
         cache.peer_count().await,
         1,
-        "mixed: remaining=1 after self removal (no unlink expected)"
+        "mixed: remaining=1 after self removal (no unlink in pure API)"
     );
     drop(cache);
 
@@ -203,6 +203,6 @@ async fn rt4_prune_remaining_predicate() {
     assert_eq!(
         cache2.peer_count().await,
         0,
-        "self-only: remaining=0 after self removal (x0x unlinks the file)"
+        "self-only: remaining=0 after self removal (x0x unlink is a RUNTIME assertion, not provable here)"
     );
 }
