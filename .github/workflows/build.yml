@@ -58,9 +58,9 @@ jobs:
               'src/bin/rt3_fixture.rs':
                   '5d14ba7f926dd70a59305632d50c25be5d0e6fe00dc9824f69f744c3f052e1bd',
               'tests/rt3_harness.py':
-                  'b0211a4fd1d8a90e6532a42e926543d15f6fc03b6b61e639abab9fc11daf7566',
+                  '20bec0cb14a2bcc04ba834aecded4eeba1e6e6e418145e896da77f835df30d84',
               'tests/rt3_harness_controls.py':
-                  '8c5a242ac804cd7276a8172385a18cd487ad596f33ea4401e9b4195cd73c6b16',
+                  '604f4f11764e8c50cb9c88029794b7c9676cc4db98e9aa7f08ad81391b0b1764',
               'scripts/ci/isolated-runtime.py':
                   '2a0c2521c19d5054b6e77c995e1604e9e9e174208157bb4331b5b38783aedced',
               'scripts/ci/isolation-witness.py':

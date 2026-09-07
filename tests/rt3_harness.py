@@ -35,6 +35,21 @@ ERROR_CLASSES = {
 }
 
 
+def loopback_api_base(advertisement: str) -> str | None:
+    host, separator, port_text = advertisement.rpartition(":")
+    if (
+        separator != ":"
+        or host != "127.0.0.1"
+        or not port_text.isascii()
+        or not port_text.isdigit()
+    ):
+        return None
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        return None
+    return f"http://{host}:{port}"
+
+
 def active_agent_ids(group_body: dict[str, object]) -> set[str]:
     members = group_body.get("members")
     if not isinstance(members, list):
@@ -350,10 +365,9 @@ class Harness:
                 self.stop_child(name, attempt_shutdown=False)
                 self.fail("process", f"{name} exited before health")
             if port_path.is_file() and token_path.is_file():
-                port = port_path.read_text().strip()
+                base = loopback_api_base(port_path.read_text().strip())
                 token = token_path.read_text().strip()
-                if port.isdigit() and token:
-                    base = f"http://127.0.0.1:{int(port)}"
+                if base is not None and token:
                     try:
                         status, body = self.http("GET", base, token, "/health")
                         if status == 200 and body.get("ok") is True:

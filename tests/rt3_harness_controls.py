@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 HARNESS_PATH = Path(__file__).with_name("rt3_harness.py")
@@ -24,6 +25,21 @@ SPEC.loader.exec_module(HARNESS)
 
 
 class HarnessControls(unittest.TestCase):
+    class InertProcess:
+        def __init__(self) -> None:
+            self.pid = 12345
+            self.returncode: int | None = None
+            self.wait_calls = 0
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: int) -> int:
+            del timeout
+            self.wait_calls += 1
+            self.returncode = 0
+            return self.returncode
+
     @staticmethod
     def workflow_step_script(name: str, next_name: str) -> str:
         workflow = WORKFLOW_PATH.read_text()
@@ -186,6 +202,90 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
             }
             for name in ("owner", "device", "positive", "negative")
         ]
+
+    @staticmethod
+    def readiness_harness(temporary: str) -> object:
+        return HARNESS.Harness(
+            argparse.Namespace(
+                artifacts=temporary,
+                x0xd="/inert/x0xd",
+                x0x="/inert/x0x",
+                fixture="/inert/rt3_fixture",
+            )
+        )
+
+    def test_start_child_accepts_current_socket_address_advertisement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            data.mkdir()
+            (data / "api.port").write_text("127.0.0.1:49152\n")
+            (data / "api-token").write_text("inert-token\n")
+            harness = self.readiness_harness(temporary)
+            process = self.InertProcess()
+            with (
+                mock.patch.object(HARNESS.subprocess, "Popen", return_value=process),
+                mock.patch.object(
+                    harness,
+                    "http",
+                    return_value=(200, {"ok": True}),
+                ) as http,
+                mock.patch.object(HARNESS.time, "monotonic", side_effect=[0.0, 0.0]),
+            ):
+                result = harness.start_child("owner", root / "owner.toml", data)
+            self.assertEqual(result, ("http://127.0.0.1:49152", "inert-token"))
+            http.assert_called_once_with(
+                "GET", "http://127.0.0.1:49152", "inert-token", "/health"
+            )
+            self.assertEqual(process.wait_calls, 0)
+            harness.children["owner"].log_handle.close()
+
+    def test_start_child_rejects_unsafe_advertisements_and_cleans_up(self) -> None:
+        rejected = (
+            "localhost:49152",
+            "10.0.0.1:49152",
+            "127.0.0.1:0",
+            "127.0.0.1:65536",
+            "127.0.0.1:not-a-port",
+            "49152",
+        )
+        for advertisement in rejected:
+            with self.subTest(advertisement=advertisement):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    data = root / "data"
+                    data.mkdir()
+                    (data / "api.port").write_text(advertisement)
+                    (data / "api-token").write_text("inert-token")
+                    harness = self.readiness_harness(temporary)
+                    process = self.InertProcess()
+                    with (
+                        mock.patch.object(
+                            HARNESS.subprocess, "Popen", return_value=process
+                        ),
+                        mock.patch.object(harness, "http") as http,
+                        mock.patch.object(
+                            HARNESS.time,
+                            "monotonic",
+                            side_effect=[0.0, 0.0, 46.0],
+                        ),
+                        mock.patch.object(HARNESS.time, "sleep"),
+                    ):
+                        with self.assertRaises(HARNESS.DiagnosticFailure) as error:
+                            harness.start_child("owner", root / "owner.toml", data)
+                    self.assertEqual(error.exception.error_class, "timeout")
+                    http.assert_not_called()
+                    self.assertEqual(process.wait_calls, 1)
+                    self.assertEqual(
+                        harness.children["owner"].receipt(),
+                        {
+                            "name": "owner",
+                            "shutdown_status": None,
+                            "escalation": "none",
+                            "exit_status": 0,
+                            "reaped": True,
+                        },
+                    )
 
     def test_actual_positive_and_negative_predicates(self) -> None:
         before = {"state_revision": 7, "state_hash": "aa", "roster_root": "bb"}
