@@ -1636,6 +1636,20 @@ fn restart_readiness_diag(phase: &str, started: std::time::Instant) {
     );
 }
 
+fn restart_readiness_failure_diag(
+    phase: &str,
+    started: std::time::Instant,
+    owner_last: &str,
+    joiner_last: &str,
+) {
+    eprintln!(
+        "DIAG hs_f2_restart phase={phase} elapsed_ms={} \
+         owner_expected=joiner_probe owner_last={owner_last} \
+         joiner_expected=owner_probe joiner_last={joiner_last}",
+        started.elapsed().as_millis()
+    );
+}
+
 // The real-agent wrapper and deterministic delayed-delivery regressions share
 // this entire readiness loop; the tests replace only publication/reception IO.
 async fn await_restart_gossip_ready_with(
@@ -1648,6 +1662,8 @@ async fn await_restart_gossip_ready_with(
     use std::sync::atomic::{AtomicU64, Ordering};
     static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     let base = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut owner_last = "none";
+    let mut joiner_last = "none";
 
     // Fresh retries avoid epidemic dedupe, but delivery can take longer than
     // one retry interval. Accept exact probes issued in THIS invocation in
@@ -1669,12 +1685,28 @@ async fn await_restart_gossip_ready_with(
                 format!("hs-f2/restart-gossip-probe/{base}.{round}/joiner").into_bytes();
             owner_probes.insert(owner_probe.clone());
             joiner_probes.insert(joiner_probe.clone());
-            owner_publish(owner_probe).await?;
+            if let Err(error) = owner_publish(owner_probe).await {
+                restart_readiness_failure_diag(
+                    "owner_publish_error",
+                    started,
+                    owner_last,
+                    joiner_last,
+                );
+                return Err(error);
+            }
             if !owner_publish_reported {
                 restart_readiness_diag("owner_probe_published", started);
                 owner_publish_reported = true;
             }
-            joiner_publish(joiner_probe).await?;
+            if let Err(error) = joiner_publish(joiner_probe).await {
+                restart_readiness_failure_diag(
+                    "joiner_publish_error",
+                    started,
+                    owner_last,
+                    joiner_last,
+                );
+                return Err(error);
+            }
             if !joiner_publish_reported {
                 restart_readiness_diag("joiner_probe_published", started);
                 joiner_publish_reported = true;
@@ -1686,26 +1718,54 @@ async fn await_restart_gossip_ready_with(
                     _ = &mut quiet => break,
                     message = owner_receive() => {
                         let Some(message) = message else {
+                            owner_last = "subscription_closed";
+                            restart_readiness_failure_diag(
+                                "owner_receive_error",
+                                started,
+                                owner_last,
+                                joiner_last,
+                            );
                             anyhow::bail!("owner gossip subscription closed");
                         };
                         if joiner_probes.contains(&message) {
                             owner_got = true;
+                            owner_last = "expected_remote_probe";
                             if !owner_remote_reported {
                                 restart_readiness_diag("owner_received_remote_probe", started);
                                 owner_remote_reported = true;
                             }
+                        } else if !owner_got {
+                            owner_last = if owner_probes.contains(&message) {
+                                "local_probe"
+                            } else {
+                                "unrelated_payload"
+                            };
                         }
                     }
                     message = joiner_receive() => {
                         let Some(message) = message else {
+                            joiner_last = "subscription_closed";
+                            restart_readiness_failure_diag(
+                                "joiner_receive_error",
+                                started,
+                                owner_last,
+                                joiner_last,
+                            );
                             anyhow::bail!("joiner gossip subscription closed");
                         };
                         if owner_probes.contains(&message) {
                             joiner_got = true;
+                            joiner_last = "expected_remote_probe";
                             if !joiner_remote_reported {
                                 restart_readiness_diag("joiner_received_remote_probe", started);
                                 joiner_remote_reported = true;
                             }
+                        } else if !joiner_got {
+                            joiner_last = if joiner_probes.contains(&message) {
+                                "local_probe"
+                            } else {
+                                "unrelated_payload"
+                            };
                         }
                     }
                 }
@@ -1719,10 +1779,12 @@ async fn await_restart_gossip_ready_with(
     })
     .await
     .map_err(|_| {
-        restart_readiness_diag("timeout", started);
+        restart_readiness_failure_diag("timeout", started, owner_last, joiner_last);
         anyhow::anyhow!(
             "gossip delivery between the restarted owner and the joiner \
-             never became bidirectionally ready within 20 s"
+             never became bidirectionally ready within 20 s \
+             (owner_expected=joiner_probe owner_last={owner_last}; \
+             joiner_expected=owner_probe joiner_last={joiner_last})"
         )
     })??;
     Ok(())
@@ -1791,9 +1853,13 @@ async fn restart_gossip_ready_rejects_missing_return_direction() {
     let started = tokio::time::Instant::now();
     let (result, owner_received, joiner_received) =
         restart_gossip_probe_fixture(Some(200), None, false).await;
+    let error = result.expect_err("one-way delivery must never satisfy readiness");
     assert!(
-        result.is_err(),
-        "one-way delivery must never satisfy readiness"
+        error.to_string().contains(
+            "owner_expected=joiner_probe owner_last=none; \
+             joiner_expected=owner_probe joiner_last=expected_remote_probe"
+        ),
+        "missing-direction receipt: {error:#}"
     );
     assert_eq!(owner_received, 0);
     assert!(joiner_received > 0);
@@ -1805,12 +1871,34 @@ async fn restart_gossip_ready_rejects_unissued_nonce() {
     let started = tokio::time::Instant::now();
     let (result, owner_received, joiner_received) =
         restart_gossip_probe_fixture(Some(200), Some(200), true).await;
+    let error = result.expect_err("unissued probe must never satisfy readiness");
     assert!(
-        result.is_err(),
-        "unissued probe must never satisfy readiness"
+        error.to_string().contains(
+            "owner_expected=joiner_probe owner_last=expected_remote_probe; \
+             joiner_expected=owner_probe joiner_last=unrelated_payload"
+        ),
+        "wrong-probe receipt: {error:#}"
     );
     assert!(owner_received > 0 && joiner_received > 0);
     assert_eq!(started.elapsed(), std::time::Duration::from_secs(20));
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_gossip_ready_preserves_subscription_close_failure() {
+    let result = await_restart_gossip_ready_with(
+        async |_| Ok(()),
+        async |_| Ok(()),
+        async || None,
+        async || std::future::pending().await,
+    )
+    .await;
+
+    assert_eq!(
+        result
+            .expect_err("closed subscription must remain an error")
+            .to_string(),
+        "owner gossip subscription closed"
+    );
 }
 
 /// #457/#447/#458 review r2 item 5 — the REAL end-to-end walkthrough on the
