@@ -774,7 +774,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
-| GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` first replays up to N stored `dm:` rows as `history_direct_message` events, then a `live` marker, then live frames (ADR-0023 §7) — this (or `/ws/direct?backfill=N`) is how a client READS already-delivered DMs |
+| GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` requests up to N stored `dm:` rows as `history_direct_message` events before a `live` marker and live frames (ADR-0023 §7). The attempt is best-effort; reconcile through [`/history`](#durable-history-adr-0023) |
 
 ### Direct send request body
 
@@ -1693,6 +1693,7 @@ Client → server:
 ```json
 {"type":"ping"}
 {"type":"subscribe","topics":["topic-a","topic-b"]}
+{"type":"subscribe","topics":["topic-a"],"backfill":{"limit":50}}
 {"type":"unsubscribe","topics":["topic-a"]}
 {"type":"publish","topic":"topic-a","payload":"aGVsbG8="}
 {"type":"send_direct","agent_id":"hex64...","payload":"aGVsbG8="}
@@ -1731,8 +1732,8 @@ Server → client (complete outbound frame set):
 |---|---|---|
 | `connected` | `session_id`, `agent_id` | Session registered (`/ws` and `/ws/direct`) |
 | `message` | `topic`, `payload` (base64), `origin?` | Gossip arrives on a subscribed topic. Home/delegation group traffic arrives here as opaque base64 — decode `GroupPublicMessage` payloads yourself |
-| `direct_message` | `sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?` | DM arrives (`/ws/direct` only; `?backfill=N` replays history rows first) |
-| `live` | `topic` (`"direct"` on `/ws/direct?backfill=N`) | Backfill ended, live frames begin (ADR-0023) |
+| `direct_message` | `sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?` | DM arrives (`/ws/direct` only; `?backfill=N` requests best-effort history rows first) |
+| `live` | `topic` (`"direct"` on `/ws/direct?backfill=N`) | A requested best-effort backfill attempt has transitioned to live frames (ADR-0023); this does not confirm that history existed, its query succeeded, or every replay row reached the client |
 | `subscribed` / `unsubscribed` | `topics[]` | After the corresponding client command |
 | `mention` | `topic`, `group_id`, `msg_id`, `author_agent_id`, `reason` (`"mention"` \| `"delegation"`), `mentions[]` (omitted when empty), `timestamp` | An ingested, validated group message names the local agent (ADR-0040). **Emitted only on the group's shared topic channel — the session must be subscribed to the group's topic; an unsubscribed `/ws` session gets nothing (routing still happens daemon-side).** A delegation carrier directed at the local agent produces the same frame with `reason: "delegation"` — there is no separate `delegation` event type |
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
@@ -1741,6 +1742,37 @@ Server → client (complete outbound frame set):
 **Delivery semantics.** Topic/control/error frames are best-effort and may be
 dropped for a full per-session queue; DM/keepalive pressure closes the socket
 with close code `1013` instead of emitting another event.
+
+#### Reconnect and replay
+
+SSE events carry no event IDs and the server does not
+consume `Last-Event-ID`; `/events` and `/peers/events` may drop lagged broadcast
+items without a replay cursor. A new `/presence/events` connection begins from
+an empty local comparison map, so currently discovered agents may be emitted as
+`online` state again. Treat presence events as state updates, not an exact
+transition log.
+
+A closed WebSocket session loses its topic subscriptions. Reconnect with a
+valid session token (mint a new one if the old token expired), resubscribe, and
+request `{"backfill":{"limit":N}}` where appropriate. Backfill and its `live`
+marker are best-effort: no history runtime or a failed query can still produce
+the marker, and WebSocket replay rows plus the marker use the droppable control
+queue. Do not checkpoint completeness from `live`; reconcile durable messages
+through the retained local history for the relevant `dm:<agent_hex>`,
+`group:<stable_id>`, or `topic:<name>` scope:
+
+```text
+GET /history?scope=topic:topic-a&limit=100
+→ {"ok":true,"count":100,"next_before_id":731,"records":[...]}
+GET /history?scope=topic:topic-a&limit=100&before_id=731
+```
+
+Each response is newest-first. Consume `records`, deduplicate by their stable
+`msg_id` (or local row `id` where appropriate), and pass `next_before_id` as
+the next request's `before_id` until `records` is empty or reaches a boundary
+the client already knows. This can recover only history still retained by that
+daemon; it cannot recover missing or pruned history, or transient presence and
+file events that are not durable-history rows.
 
 **What is deliberately *not* a WS/SSE event:** Home renames, member changes
 and rekeys (REST/state-commit operations — re-fetch `GET /home` or the group
@@ -1754,9 +1786,9 @@ structured push.
 | Stream | `event:` name | `data:` shape |
 |---|---|---|
 | `GET /events` | `message` | outer `{"type":"message","data":{subscription_id, topic, payload, sender?, verified, trust_level?}}` — only for active REST `/subscribe` subscriptions |
-| `GET /events` | `file:offer` / `file:complete` | transfer notifications (`transfer_id`, `filename`, `size`, `sender` / `sha256`, `path`) |
+| `GET /events` | `file:offer` / `file:complete` | outer `{"type":"file:offer"|"file:complete","data":{...}}`; offer data has `transfer_id`, `filename`, `size`, `sender`, while complete data has `transfer_id`, `filename`, `sha256`, `path` |
 | `GET /presence/events` | `presence` | `{"event":"online","agent_id","reachable"}` / `{"event":"offline","agent_id"}` |
-| `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` first replays `history_direct_message` rows then emits `live` `{}`; 15 s keepalive is a `ping` comment |
+| `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` attempts to replay `history_direct_message` rows then emits `live` `{}` even when history is unavailable or its query fails; 15 s keepalive is a `ping` comment |
 | `GET /peers/events` | `peer-lifecycle` | `{"peer_id","event","at_ms"}` — `event` is the Debug text of the transition (`Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`); treat as open string |
 
 ## Voice (ADR-0042)
@@ -1818,8 +1850,8 @@ x0x direct send <agent_id> hello --logical-id order-42   # retry-safe identity
 x0x direct send <agent_id> hello --no-durable-ack        # reach a 0.37.x peer
 x0x direct send <agent_id> hello --prefer-raw-quic-if-connected false  # gossip-first (pre-v0.37 behavior)
 x0x direct send <agent_id> hello --prefer-raw-quic-if-connected true --raw-quic-receive-ack-ms 4000 --stop-fallback-on-raw-error
-x0x direct events --backfill 20        # replay 20 stored DM rows, then live (ADR-0023 §7)
-x0x ws direct --backfill 20            # same replay via the WebSocket stream URL
+x0x direct events --backfill 20        # request up to 20 stored DM rows, then live (ADR-0023 §7)
+x0x ws direct --backfill 20            # same best-effort request via the WebSocket stream URL
 x0x groups create
 x0x group create team-chat --display-name alice
 x0x tasks create inbox team.tasks
