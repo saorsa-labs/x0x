@@ -4692,8 +4692,9 @@ mod tests {
             "outer V2 must not count as a v1 receipt"
         );
 
-        // Tamper: keep a valid V2 header/signature but swap the payload bytes so
-        // the sealed payload_hash no longer matches.
+        // Tamper: second valid encode_v1 envelope; sealed hash still over original
+        // inner so mismatch is specifically outer hash check.
+        let inner_alt = encode_v1(topic, &Bytes::from("v2-payload-alt")).expect("inner alt");
         let mut bad_header = MessageHeader {
             version: 1,
             payload_hash: None,
@@ -4708,7 +4709,7 @@ mod tests {
         let signature = signing_key.sign(&header_bytes).expect("sign");
         let tampered = saorsa_gossip_pubsub::GossipMessage {
             header: bad_header,
-            payload: Some(Bytes::from("swapped-payload-not-hashed")),
+            payload: Some(inner_alt),
             signature,
             public_key: signing_key.public_key().to_vec(),
         };
