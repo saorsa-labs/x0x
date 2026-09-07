@@ -1217,6 +1217,24 @@ pub(in crate::server) struct SeatHomeRequest {
     agent_id: String,
 }
 
+/// Test-only barrier fired by [`seat_home`] once it holds the canonical
+/// gate and has selected its Home, immediately before it enters the invite
+/// authority.
+///
+/// A regression for the #449 r3 P2 race has to observe that exact instant:
+/// a sleep would prove only that the race is slow to lose, not that the
+/// gate orders anything. `notify_one` stores a permit, so a test that waits
+/// after the handler has already passed the point still wakes.
+///
+/// Test binaries run one process per test under nextest, so this static is
+/// not shared between concurrent regressions.
+#[cfg(test)]
+pub(in crate::server::routes::home) fn seat_selected_canonical_hook() -> &'static tokio::sync::Notify
+{
+    static HOOK: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    HOOK.get_or_init(tokio::sync::Notify::new)
+}
+
 /// #449 option (c): 409 body for a seat request this device cannot serve.
 /// `reason` is a TYPED token (`elsewhere` / `adoption_pending` /
 /// `unknown`), not prose — the CLI and the GUI branch on it.
@@ -1309,6 +1327,25 @@ pub(in crate::server) async fn seat_home(
         );
     }
 
+    // #449 r3 P2: hold the canonical-Home admission gate ACROSS the
+    // resolution and the mint. Resolving canonical A and then awaiting the
+    // invite authority's per-group membership lock leaves a window in which
+    // an owner-sync commit can make B canonical; the mint reloads A, sees a
+    // live non-withdrawn group, and durably records an addressed invite into
+    // the LOSING Home. A recheck before the await cannot close it, because
+    // the mint transaction awaits too. Under the gate this call is
+    // linearized: a pointer accepted before it makes us refuse below, and a
+    // pointer accepted after it waits for our invite to become durable.
+    //
+    // Lock order (see `OwnerSyncStore::canonical_home_gate`): this gate →
+    // per-group membership lock → named_groups/persistence. Nothing on the
+    // owner-sync writer side takes a membership lock, so there is no cycle.
+    let _canonical_gate = match state.owner_sync.as_ref() {
+        Some(sync) => Some(sync.store().canonical_home_gate_read().await),
+        // No owner sync means no canonical register exists to race with.
+        None => None,
+    };
+
     let (group_id, info) = match resolve_home(&state).await {
         HomeResolution::Local { group_id, info } => (group_id, info),
         HomeResolution::AdoptionPending { canonical, .. } => {
@@ -1348,6 +1385,9 @@ pub(in crate::server) async fn seat_home(
              exists to hand the joining device",
         );
     };
+
+    #[cfg(test)]
+    seat_selected_canonical_hook().notify_one();
 
     // Mint through the EXISTING invite authority (`POST /groups/:id/invite`)
     // rather than a parallel path: the live-cap, the owner-axis durable
@@ -2995,6 +3035,220 @@ pub(in crate::server::routes) mod tests {
             issued_invite_count(&state).await,
             before,
             "three refusals in sequence must leave the invite ledger untouched"
+        );
+        Ok(())
+    }
+
+    /// Advertise `group_id` as the canonical Home through the REAL store
+    /// writer, so the fence under test is the production one.
+    async fn commit_canonical_home(state: &Arc<AppState>, group_id: &str) -> anyhow::Result<()> {
+        let sync = state
+            .owner_sync
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))?;
+        let owner_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .ok_or_else(|| anyhow::anyhow!("owned state has a user key"))?;
+        sync.store()
+            .mint(
+                crate::owner_sync::SyncKind::HomePointer,
+                crate::owner_sync::HOME_POINTER_KEY,
+                &crate::owner_sync::SyncValue::HomePointer {
+                    group_id: group_id.to_string(),
+                    policy: home_policy(&owner_kp.user_id()),
+                    roster: vec![],
+                    primary_agent: "aa".repeat(32),
+                    provisioned_at_ms: 1,
+                },
+                owner_kp,
+                state.agent.machine_id(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// WHY (#449 r3 P2, the TOCTOU root found): `seat_home` resolves the
+    /// canonical Home, then awaits the invite authority's per-group
+    /// membership lock. In that window an owner-sync commit can accept a
+    /// pointer naming a DIFFERENT Home. The mint reloads the old group,
+    /// finds it live and non-withdrawn, and durably records an addressed
+    /// invite into the Home that just lost — offering a device a seat in the
+    /// duplicate the owner is trying to leave, which is fork amplification,
+    /// exactly what #449 exists to stop.
+    ///
+    /// A recheck before the await cannot fix this, because the mint
+    /// transaction awaits too. So this test refuses to be satisfied by one:
+    /// it proves ORDERING. While the seat is parked on the membership lock,
+    /// the competing pointer commit must still be PENDING. If the gate were
+    /// a recheck, or absent, that commit would complete immediately and the
+    /// assertion fails.
+    ///
+    /// The barrier is a test hook fired at the instant the handler has taken
+    /// the gate and selected its Home, never a sleep: a sleep would prove
+    /// only that the race is slow, not that anything orders it.
+    ///
+    /// The linearization this pins is the one root permits: a pointer
+    /// accepted AFTER the gate waits for the mint to become durable, and the
+    /// NEXT seat then refuses. Durable ledger state is inspected on both
+    /// sides, not only the HTTP status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn home_seat_mint_is_linearized_ahead_of_a_later_canonical_pointer() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x54; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_a, _) = find_home(&state, &owner).await.expect("Home A provisioned");
+        commit_canonical_home(&state, &home_a).await?;
+        // B is a Home this device is NOT seated in. That is what makes the
+        // post-switch expectation unambiguous: had B been a local duplicate
+        // we also hold, the correct answer after the switch would be a
+        // successful mint into B, and the refusal this test asserts would be
+        // wrong. A stays a fully live, non-withdrawn Home throughout, so no
+        // withdrawal or role check can account for the refusal.
+        let home_b = "e5".repeat(16);
+
+        // Park the seat: hold A's REAL membership lock, the same lock the
+        // invite authority takes.
+        let membership = super::super::named_groups::group_membership_lock(&state, &home_a).await;
+        let held = membership.lock().await;
+
+        let seat_state = Arc::clone(&state);
+        let device = "7e".repeat(32);
+        let seat_device = device.clone();
+        let seat_task = tokio::spawn(async move {
+            let response = seat_home(
+                State(seat_state),
+                axum::extract::Extension(durable_owner()),
+                Json(SeatHomeRequest {
+                    agent_id: seat_device,
+                }),
+            )
+            .await;
+            response_json(response).await
+        });
+
+        // The handler now holds the gate and has selected A.
+        seat_selected_canonical_hook().notified().await;
+
+        let commit_state = Arc::clone(&state);
+        let commit_b = home_b.clone();
+        let mut commit =
+            tokio::spawn(async move { commit_canonical_home(&commit_state, &commit_b).await });
+
+        // THE FENCE. The two directions are asymmetric on purpose.
+        //
+        // FENCED: the commit CANNOT complete. It is blocked on the gate's
+        // write side, held for reading by a seat that is itself blocked on
+        // the membership lock this test holds. That is a hard impossibility,
+        // not a timing assumption, so this direction cannot flake.
+        //
+        // UNFENCED: the commit is one `records` write plus one small durable
+        // persist on a tmpdir — single-digit milliseconds. The window below
+        // is three orders of magnitude larger, so an unfenced writer lands
+        // inside it every time. The window is the ORACLE for that direction;
+        // the BARRIER that put us at the exact instant of the race is the
+        // test hook above, never a sleep. The mutation that removes the gate
+        // is run against this test and must fail it.
+        let landed = tokio::time::timeout(std::time::Duration::from_secs(5), &mut commit).await;
+        assert!(
+            landed.is_err(),
+            "a canonical pointer accepted after the seat took the gate must wait for the \
+             mint to become durable; it completed while the seat was still blocked: {landed:?}"
+        );
+        assert_eq!(
+            state
+                .owner_sync
+                .as_ref()
+                .expect("sync")
+                .canonical_home()
+                .await
+                .map(|home| home.group_id),
+            Some(home_a.clone()),
+            "the register must still name A while the seat holds the gate"
+        );
+
+        drop(held);
+
+        let (status, body) = seat_task.await??;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fenced seat must succeed: {body}"
+        );
+        assert_eq!(body["group_id"], home_a, "the invite must belong to A");
+        let signed = crate::groups::invite::SignedInvite::from_link(
+            body["invite"].as_str().expect("invite link"),
+        )
+        .map_err(|e| anyhow::anyhow!("invite does not decode: {e}"))?;
+        signed
+            .verify_v4_signatures()
+            .map_err(|e| anyhow::anyhow!("invite signatures do not verify: {e:?}"))?;
+        assert_eq!(signed.intended_joiner.as_deref(), Some(device.as_str()));
+
+        // Durable ledger, not just the response.
+        let after_mint = issued_invite_count(&state).await;
+        assert_eq!(after_mint, 1, "exactly one invite is recorded on A");
+
+        commit.await??;
+        assert_eq!(
+            state
+                .owner_sync
+                .as_ref()
+                .expect("sync")
+                .canonical_home()
+                .await
+                .map(|home| home.group_id),
+            Some(home_b.clone()),
+            "once the mint is durable the queued pointer takes effect"
+        );
+
+        // The NEXT seat sees the new canonical and refuses.
+        let (status, body) = seat(&state, &"7f".repeat(32)).await?;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "after B wins, seating from A must refuse: {body}"
+        );
+        assert_eq!(body["reason"], "adoption_pending");
+        assert_eq!(body["canonical_group_id"], home_b);
+        assert_eq!(
+            issued_invite_count(&state).await,
+            after_mint,
+            "the refused second seat must add nothing to the durable ledger"
+        );
+        Ok(())
+    }
+
+    /// WHY (#449 r3 P2, the ordering that must NOT mint): when the canonical
+    /// pointer moved to B before the seat request arrives, there is no race
+    /// to fence — the answer is simply that this device is no longer the one
+    /// that may seat. The gate must not turn a settled refusal into a
+    /// mint. Asserted on the durable ledger, which must stay empty: a
+    /// refusal that still burned a live-invite slot would let a stale
+    /// operator exhaust the owner's seating capacity.
+    #[tokio::test]
+    async fn home_seat_refuses_when_canonical_moved_before_the_gate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x55; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_a, _) = find_home(&state, &owner).await.expect("Home A provisioned");
+        commit_canonical_home(&state, &home_a).await?;
+
+        let home_b = "e6".repeat(16);
+        commit_canonical_home(&state, &home_b).await?;
+
+        let (status, body) = seat(&state, &"7e".repeat(32)).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "adoption_pending");
+        assert_eq!(body["canonical_group_id"], home_b);
+        assert_eq!(
+            issued_invite_count(&state).await,
+            0,
+            "a seat refused on a moved canonical must leave A's ledger empty"
         );
         Ok(())
     }
