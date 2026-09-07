@@ -20,7 +20,7 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
-use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
+use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub, SignaturePolicy};
 use saorsa_gossip_transport::GossipTransport;
 use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
@@ -542,6 +542,13 @@ impl PubSubManager {
         let transport = Arc::new(PubSubTransport::new(Arc::clone(&network)));
         let plumtree_inner =
             PlumtreePubSub::new(peer_id, Arc::clone(&transport), plumtree_signing_key);
+        // ADR-014 modern-only: reject outer v1 (header-only-signed) frames.
+        plumtree_inner.set_signature_policy(SignaturePolicy::RejectV1);
+        if plumtree_inner.signature_policy() != SignaturePolicy::RejectV1 {
+            return Err(NetworkError::NodeCreation(
+                "mandatory outer signature policy RejectV1 could not be installed".to_string(),
+            ));
+        }
         let plumtree_inner = match oracle {
             Some(oracle) => plumtree_inner.with_health_oracle(oracle),
             None => plumtree_inner,
@@ -690,6 +697,27 @@ impl PubSubManager {
                 }
             }
         })
+    }
+
+    /// Outer saorsa-gossip signature policy for `GET /diagnostics/gossip`.
+    ///
+    /// Explicit string mapping (not `Debug`) so operators and harnesses can
+    /// assert the modern-only RejectV1 boundary without parsing Rust enums.
+    #[must_use]
+    pub fn outer_signature_policy(&self) -> &'static str {
+        match self.plumtree.signature_policy() {
+            SignaturePolicy::RejectV1 => "reject_v1",
+            SignaturePolicy::AcceptV1 => "accept_v1",
+        }
+    }
+
+    /// Cumulative outer v1 (header-only-signed) receipts since startup.
+    ///
+    /// Counts rejected frames under RejectV1 as well — evidence of contact
+    /// with the sunset boundary, not acceptance.
+    #[must_use]
+    pub fn outer_v1_receipts(&self) -> u64 {
+        self.plumtree.v1_receipt_count()
     }
 
     /// Snapshot of Leaf vs Full participation for `GET /diagnostics/gossip`.
@@ -1365,6 +1393,12 @@ impl PubSubManager {
     #[cfg(test)]
     fn set_known_plumtree_topics_for_test(&self, topics: Vec<TopicId>) {
         *self.known_topic_override.lock().expect("topic override") = Some(topics);
+    }
+
+    /// Test hook: seed PlumTree eager peers so a publish fans out on the wire.
+    #[cfg(test)]
+    async fn set_topic_peers_for_test(&self, topic_id: TopicId, peers: Vec<PeerId>) {
+        self.plumtree.set_topic_peers(topic_id, peers).await;
     }
 
     /// X0X-0074: classify a dynamic topic name and register it with the
@@ -4533,5 +4567,228 @@ mod tests {
             None,
             "no Full/bootstrap on the plane must leave topic membership unchanged"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-014 RejectV1 modern-only outer signature policy
+    // -----------------------------------------------------------------------
+
+    fn outer_signing_key() -> saorsa_gossip_identity::MlDsaKeyPair {
+        saorsa_gossip_identity::MlDsaKeyPair::generate().expect("ml-dsa key")
+    }
+
+    fn signed_outer_frame(
+        signing_key: &saorsa_gossip_identity::MlDsaKeyPair,
+        topic: TopicId,
+        payload: Bytes,
+        version_v2: bool,
+    ) -> Bytes {
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id: [7u8; 32],
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        if version_v2 {
+            header.seal_payload_hash(Some(payload.as_ref()));
+        }
+        let header_bytes = postcard::to_stdvec(&header).expect("header serialize");
+        let signature = signing_key.sign(&header_bytes).expect("sign header");
+        let msg = saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+        postcard::to_stdvec(&msg)
+            .expect("gossip frame serialize")
+            .into()
+    }
+
+    #[tokio::test]
+    async fn adr014_constructors_install_reject_v1() {
+        let node = test_node().await;
+        let plain = PubSubManager::new(Arc::clone(&node), None).expect("new");
+        assert_eq!(plain.outer_signature_policy(), "reject_v1");
+        assert_eq!(plain.outer_v1_receipts(), 0);
+
+        let with_oracle =
+            PubSubManager::new_with_oracle(Arc::clone(&node), None, None).expect("new_with_oracle");
+        assert_eq!(with_oracle.outer_signature_policy(), "reject_v1");
+
+        let leaf = PubSubManager::new_with_participation(
+            Arc::clone(&node),
+            None,
+            None,
+            ParticipationMode::Leaf,
+            "default_leaf",
+        )
+        .expect("leaf");
+        assert_eq!(leaf.outer_signature_policy(), "reject_v1");
+
+        let full = PubSubManager::new_with_participation(
+            node,
+            None,
+            None,
+            ParticipationMode::Full,
+            "operator_relay",
+        )
+        .expect("full");
+        assert_eq!(full.outer_signature_policy(), "reject_v1");
+    }
+
+    #[tokio::test]
+    async fn adr014_valid_outer_v1_eager_is_rejected_and_receipted() {
+        let node = test_node().await;
+        let manager = PubSubManager::new(node, None).expect("manager");
+        let topic = "adr014-v1-reject";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let mut sub = manager.subscribe(topic.to_string()).await;
+        let inner = encode_v1(topic, &Bytes::from("v1-era-payload")).expect("inner v1");
+        let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, false);
+        assert_eq!(manager.outer_v1_receipts(), 0);
+
+        manager.handle_incoming(PeerId::new([9; 32]), frame).await;
+
+        assert_eq!(
+            manager.outer_v1_receipts(),
+            1,
+            "valid outer V1 must increment the sunset receipt counter"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "RejectV1 must not deliver a valid outer V1 frame to subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn adr014_outer_v2_positive_and_tampered_negative() {
+        let node = test_node().await;
+        let manager = PubSubManager::new(node, None).expect("manager");
+        let topic = "adr014-v2-ok";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let mut sub = manager.subscribe(topic.to_string()).await;
+        let signing_key = outer_signing_key();
+        let inner = encode_v1(topic, &Bytes::from("v2-payload")).expect("inner");
+        let good = signed_outer_frame(&signing_key, topic_id, inner.clone(), true);
+
+        manager.handle_incoming(PeerId::new([3; 32]), good).await;
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv())
+            .await
+            .expect("timeout waiting for V2 delivery")
+            .expect("subscriber closed");
+        assert_eq!(delivered.payload, Bytes::from("v2-payload"));
+        assert_eq!(
+            manager.outer_v1_receipts(),
+            0,
+            "outer V2 must not count as a v1 receipt"
+        );
+
+        // Tamper: second valid encode_v1 envelope; sealed hash still over original
+        // inner so mismatch is specifically outer hash check.
+        let inner_alt = encode_v1(topic, &Bytes::from("v2-payload-alt")).expect("inner alt");
+        let mut bad_header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic: topic_id,
+            msg_id: [8u8; 32],
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        bad_header.seal_payload_hash(Some(inner.as_ref()));
+        let header_bytes = postcard::to_stdvec(&bad_header).expect("header");
+        let signature = signing_key.sign(&header_bytes).expect("sign");
+        let tampered = saorsa_gossip_pubsub::GossipMessage {
+            header: bad_header,
+            payload: Some(inner_alt),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+        let tampered_bytes: Bytes = postcard::to_stdvec(&tampered)
+            .expect("serialize tampered")
+            .into();
+        manager
+            .handle_incoming(PeerId::new([4; 32]), tampered_bytes)
+            .await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "payload-hash mismatch must not deliver"
+        );
+    }
+
+    #[tokio::test]
+    async fn adr014_publish_with_signing_context_emits_outer_v2() {
+        let node = test_node().await;
+        let kp = AgentKeypair::generate().expect("agent key");
+        let ctx = Arc::new(SigningContext::from_keypair(&kp));
+        let manager = PubSubManager::new(Arc::clone(&node), Some(ctx)).expect("manager");
+        let topic = "adr014-publish-v2";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let _sub = manager.subscribe(topic.to_string()).await;
+        manager
+            .set_topic_peers_for_test(topic_id, vec![PeerId::new([42; 32])])
+            .await;
+        let _ = node.take_pubsub_send_capture();
+
+        manager
+            .publish_with_fanout(topic.to_string(), Bytes::from("signed-modern"))
+            .await
+            .expect("publish");
+
+        let frames = node.take_pubsub_send_capture();
+        assert!(
+            !frames.is_empty(),
+            "publish must hand at least one PubSub frame to the recording transport"
+        );
+        let msg: saorsa_gossip_pubsub::GossipMessage =
+            postcard::from_bytes(&frames[0]).expect("decode outer GossipMessage");
+        assert_eq!(msg.header.version, 2, "modern publish must seal outer V2");
+        let payload = msg.payload.as_ref().expect("eager payload");
+        let expected = blake3::hash(payload.as_ref());
+        let sealed = msg.header.payload_hash.expect("V2 payload_hash");
+        assert_eq!(&sealed[..], expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn adr014_leaf_and_full_refuse_v1_without_grant_api() {
+        // PubSubManager exposes no grant/register/AcceptV1 restore path; both
+        // participation modes keep the fixed RejectV1 receive policy.
+        for (mode, reason) in [
+            (ParticipationMode::Leaf, "default_leaf"),
+            (ParticipationMode::Full, "operator_relay"),
+        ] {
+            let node = test_node().await;
+            let manager = PubSubManager::new_with_participation(node, None, None, mode, reason)
+                .expect("manager");
+            assert_eq!(manager.outer_signature_policy(), "reject_v1");
+            let topic = format!("adr014-refuse-{reason}");
+            let topic_id = TopicId::from_entity(topic.as_bytes());
+            let mut sub = manager.subscribe(topic.clone()).await;
+            let inner = encode_v1(&topic, &Bytes::from("still-v1")).expect("inner");
+            let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, false);
+            manager.handle_incoming(PeerId::new([5; 32]), frame).await;
+            assert_eq!(manager.outer_v1_receipts(), 1);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none(),
+                "{reason} must refuse valid outer V1"
+            );
+        }
     }
 }
