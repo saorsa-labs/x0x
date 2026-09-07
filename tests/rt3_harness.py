@@ -33,6 +33,26 @@ ERROR_CLASSES = {
     "none", "assertion", "filesystem", "http", "process", "timeout",
     "unexpected",
 }
+COUNTER_KEYS = {
+    "positive_hydration_state_before",
+    "positive_hydration_state_after",
+    "positive_hydration_roster_before",
+    "positive_hydration_roster_response",
+    "positive_hydration_roster_after",
+    "positive_seal_state_before",
+    "positive_seal_state_commit",
+    "positive_seal_state_after",
+    "positive_seal_roster_before",
+    "positive_seal_roster_after",
+    "negative_hydration_state_before",
+    "negative_hydration_state_after",
+    "negative_hydration_roster_before",
+    "negative_hydration_roster_after",
+    "negative_seal_state_before",
+    "negative_seal_state_after",
+    "negative_seal_roster_before",
+    "negative_seal_roster_after",
+}
 
 
 def loopback_api_base(advertisement: str) -> str | None:
@@ -64,49 +84,77 @@ def active_agent_ids(group_body: dict[str, object]) -> set[str]:
 
 
 def positive_observation(
-    before: dict[str, object],
+    before_state: dict[str, object],
+    before_group: dict[str, object],
     status: int,
     seal: dict[str, object],
-    after: dict[str, object],
+    after_state: dict[str, object],
+    after_group: dict[str, object],
 ) -> dict[str, bool]:
-    revision = before.get("state_revision")
+    revision = before_state.get("state_revision")
     commit = seal.get("commit")
     incremented = (
-        isinstance(revision, int)
+        type(revision) is int
         and isinstance(commit, dict)
+        and type(commit.get("revision")) is int
         and commit.get("revision") == revision + 1
-        and after.get("state_revision") == revision + 1
+        and type(after_state.get("state_revision")) is int
+        and after_state.get("state_revision") == revision + 1
     )
     return {
         "status": status == 200 and seal.get("ok") is True,
-        "revision_increment": incremented,
-        "roster_unchanged": after.get("roster_root") == before.get("roster_root"),
+        "state_revision_increment": incremented,
+        "roster_revision_unchanged": (
+            type(before_group.get("roster_revision")) is int
+            and type(after_group.get("roster_revision")) is int
+            and after_group.get("roster_revision") == before_group.get("roster_revision")
+        ),
+        "roster_unchanged": (
+            after_state.get("roster_root") == before_state.get("roster_root")
+        ),
         "no_eviction": seal.get("evicted") == [],
     }
 
 
 def positive_hydration_observation(
-    before: dict[str, object],
+    before_state: dict[str, object],
+    before_group: dict[str, object],
     status: int,
     mutation: dict[str, object],
-    after: dict[str, object],
+    after_state: dict[str, object],
+    after_group: dict[str, object],
 ) -> dict[str, bool]:
-    revision = before.get("state_revision")
+    state_revision = before_state.get("state_revision")
+    roster_revision = before_group.get("roster_revision")
     return {
         "status": status == 200 and mutation.get("ok") is True,
-        "revision_increment": isinstance(revision, int)
-        and mutation.get("revision") == revision + 1
-        and after.get("state_revision") == revision + 1,
-        "roster_unchanged": after.get("roster_root") == before.get("roster_root"),
-        "description_updated": mutation.get("description") == "rt3-hydration-probe",
+        "state_revision_increment": type(state_revision) is int
+        and type(after_state.get("state_revision")) is int
+        and after_state.get("state_revision") == state_revision + 1,
+        "roster_revision_increment": type(roster_revision) is int
+        and type(after_group.get("roster_revision")) is int
+        and after_group.get("roster_revision") == roster_revision + 1,
+        "response_revision_matches_roster": (
+            type(mutation.get("revision")) is int
+            and mutation.get("revision") == after_group.get("roster_revision")
+        ),
+        "roster_unchanged": (
+            after_state.get("roster_root") == before_state.get("roster_root")
+        ),
+        "description_updated": (
+            mutation.get("description") == "rt3-hydration-probe"
+            and after_group.get("description") == "rt3-hydration-probe"
+        ),
     }
 
 
 def negative_hydration_observation(
-    before: dict[str, object],
+    before_state: dict[str, object],
+    before_group: dict[str, object],
     status: int,
     mutation: dict[str, object],
-    after: dict[str, object],
+    after_state: dict[str, object],
+    after_group: dict[str, object],
 ) -> dict[str, bool]:
     error = mutation.get("error")
     return {
@@ -114,17 +162,36 @@ def negative_hydration_observation(
         "pending_class": isinstance(error, str)
         and "pending certificate resolution" in error,
         "state_unchanged": all(
-            after.get(key) == before.get(key)
-            for key in ("state_revision", "state_hash", "roster_root")
+            after_state.get(key) == before_state.get(key)
+            for key in (
+                "state_revision",
+                "state_hash",
+                "prev_state_hash",
+                "security_binding",
+                "withdrawn",
+                "roster_root",
+                "policy_hash",
+                "public_meta_hash",
+            )
+        ),
+        "roster_revision_unchanged": (
+            type(before_group.get("roster_revision")) is int
+            and type(after_group.get("roster_revision")) is int
+            and after_group.get("roster_revision") == before_group.get("roster_revision")
+        ),
+        "description_unchanged": (
+            after_group.get("description") == before_group.get("description")
         ),
     }
 
 
 def negative_observation(
-    before: dict[str, object],
+    before_state: dict[str, object],
+    before_group: dict[str, object],
     status: int,
     seal: dict[str, object],
-    after: dict[str, object],
+    after_state: dict[str, object],
+    after_group: dict[str, object],
 ) -> dict[str, bool]:
     error = seal.get("error")
     return {
@@ -134,8 +201,22 @@ def negative_observation(
             "owner-certified group has members pending certificate resolution"
         ),
         "state_unchanged": all(
-            after.get(key) == before.get(key)
-            for key in ("state_revision", "state_hash", "roster_root")
+            after_state.get(key) == before_state.get(key)
+            for key in (
+                "state_revision",
+                "state_hash",
+                "prev_state_hash",
+                "security_binding",
+                "withdrawn",
+                "roster_root",
+                "policy_hash",
+                "public_meta_hash",
+            )
+        ),
+        "roster_revision_unchanged": (
+            type(before_group.get("roster_revision")) is int
+            and type(after_group.get("roster_revision")) is int
+            and after_group.get("roster_revision") == before_group.get("roster_revision")
         ),
     }
 
@@ -210,21 +291,28 @@ class Harness:
             "lane_difference_cache_only": False,
             "lane_identity_preserved": False,
             "positive_hydration_status": None,
-            "positive_hydration_revision_increment": False,
+            "positive_hydration_state_revision_increment": False,
+            "positive_hydration_roster_revision_increment": False,
+            "positive_hydration_response_revision_matches_roster": False,
             "positive_hydration_roster_unchanged": False,
             "positive_description_updated": False,
             "positive_seal_status": None,
-            "positive_seal_revision_increment": False,
+            "positive_seal_state_revision_increment": False,
+            "positive_seal_roster_revision_unchanged": False,
             "positive_seal_roster_unchanged": False,
             "positive_no_eviction": False,
             "negative_hydration_status": None,
             "negative_hydration_pending_class": False,
             "negative_hydration_state_unchanged": False,
+            "negative_hydration_roster_revision_unchanged": False,
+            "negative_hydration_description_unchanged": False,
             "negative_seal_status": None,
             "negative_seal_pending_class": False,
             "negative_seal_state_unchanged": False,
+            "negative_seal_roster_revision_unchanged": False,
             "negative_sidecar_unchanged": False,
         }
+        self.counters: dict[str, int | None] = {key: None for key in COUNTER_KEYS}
 
     def fail(self, error_class: str, message: str) -> None:
         raise DiagnosticFailure(error_class, message)
@@ -247,6 +335,12 @@ class Harness:
         self.observations[status_key] = status
         for key, value in predicates.items():
             self.observations[key] = value
+
+    def record_counters(self, values: dict[str, object]) -> None:
+        for key, value in values.items():
+            if key not in self.counters:
+                self.fail("unexpected", "attempted unknown counter")
+            self.counters[key] = value if type(value) is int and value >= 0 else None
 
     def run_checked(
         self,
@@ -766,17 +860,57 @@ class Harness:
             status, after_mutation = self.http(
                 "GET", *self.api[lane], f"/groups/{group}/state"
             )
-            self.require(status == 200, "lane state after hydration trigger")
+            group_status, after_mutation_group = self.http(
+                "GET", *self.api[lane], f"/groups/{group}"
+            )
+            self.record_counters(
+                {
+                    f"{lane}_hydration_state_before": before.get("state_revision"),
+                    f"{lane}_hydration_state_after": after_mutation.get(
+                        "state_revision"
+                    ),
+                    f"{lane}_hydration_roster_before": group_body.get(
+                        "roster_revision"
+                    ),
+                    f"{lane}_hydration_roster_after": after_mutation_group.get(
+                        "roster_revision"
+                    ),
+                    **(
+                        {
+                            "positive_hydration_roster_response": mutation.get(
+                                "revision"
+                            )
+                        }
+                        if lane == "positive"
+                        else {}
+                    ),
+                }
+            )
+            self.require(
+                status == 200 and group_status == 200,
+                "lane state after hydration trigger",
+            )
             if lane == "positive":
                 hydrated = positive_hydration_observation(
-                    before, mutation_status, mutation, after_mutation
+                    before,
+                    group_body,
+                    mutation_status,
+                    mutation,
+                    after_mutation,
+                    after_mutation_group,
                 )
                 self.record_result(
                     "positive_hydration_status",
                     mutation_status,
                     {
-                        "positive_hydration_revision_increment": hydrated[
-                            "revision_increment"
+                        "positive_hydration_state_revision_increment": hydrated[
+                            "state_revision_increment"
+                        ],
+                        "positive_hydration_roster_revision_increment": hydrated[
+                            "roster_revision_increment"
+                        ],
+                        "positive_hydration_response_revision_matches_roster": hydrated[
+                            "response_revision_matches_roster"
                         ],
                         "positive_hydration_roster_unchanged": hydrated[
                             "roster_unchanged"
@@ -787,7 +921,12 @@ class Harness:
                 self.require(all(hydrated.values()), "positive hydration observation incomplete")
             else:
                 refused = negative_hydration_observation(
-                    before, mutation_status, mutation, after_mutation
+                    before,
+                    group_body,
+                    mutation_status,
+                    mutation,
+                    after_mutation,
+                    after_mutation_group,
                 )
                 self.record_result(
                     "negative_hydration_status",
@@ -795,6 +934,12 @@ class Harness:
                     {
                         "negative_hydration_pending_class": refused["pending_class"],
                         "negative_hydration_state_unchanged": refused["state_unchanged"],
+                        "negative_hydration_roster_revision_unchanged": refused[
+                            "roster_revision_unchanged"
+                        ],
+                        "negative_hydration_description_unchanged": refused[
+                            "description_unchanged"
+                        ],
                     },
                 )
                 self.require(all(refused.values()), "negative hydration observation incomplete")
@@ -807,16 +952,56 @@ class Harness:
             status, after_seal = self.http(
                 "GET", *self.api[lane], f"/groups/{group}/state"
             )
-            self.require(status == 200, "lane state after explicit seal")
+            group_status, after_seal_group = self.http(
+                "GET", *self.api[lane], f"/groups/{group}"
+            )
+            commit = seal.get("commit")
+            self.record_counters(
+                {
+                    f"{lane}_seal_state_before": after_mutation.get("state_revision"),
+                    f"{lane}_seal_state_after": after_seal.get("state_revision"),
+                    f"{lane}_seal_roster_before": after_mutation_group.get(
+                        "roster_revision"
+                    ),
+                    f"{lane}_seal_roster_after": after_seal_group.get(
+                        "roster_revision"
+                    ),
+                    **(
+                        {
+                            "positive_seal_state_commit": (
+                                commit.get("revision")
+                                if isinstance(commit, dict)
+                                else None
+                            )
+                        }
+                        if lane == "positive"
+                        else {}
+                    ),
+                }
+            )
+            self.require(
+                status == 200 and group_status == 200,
+                "lane state after explicit seal",
+            )
             if lane == "positive":
                 sealed = positive_observation(
-                    after_mutation, seal_status, seal, after_seal
+                    after_mutation,
+                    after_mutation_group,
+                    seal_status,
+                    seal,
+                    after_seal,
+                    after_seal_group,
                 )
                 self.record_result(
                     "positive_seal_status",
                     seal_status,
                     {
-                        "positive_seal_revision_increment": sealed["revision_increment"],
+                        "positive_seal_state_revision_increment": sealed[
+                            "state_revision_increment"
+                        ],
+                        "positive_seal_roster_revision_unchanged": sealed[
+                            "roster_revision_unchanged"
+                        ],
                         "positive_seal_roster_unchanged": sealed["roster_unchanged"],
                         "positive_no_eviction": sealed["no_eviction"],
                     },
@@ -824,7 +1009,12 @@ class Harness:
                 self.require(all(sealed.values()), "positive seal observation incomplete")
             else:
                 sealed = negative_observation(
-                    after_mutation, seal_status, seal, after_seal
+                    after_mutation,
+                    after_mutation_group,
+                    seal_status,
+                    seal,
+                    after_seal,
+                    after_seal_group,
                 )
                 self.record_result(
                     "negative_seal_status",
@@ -832,6 +1022,9 @@ class Harness:
                     {
                         "negative_seal_pending_class": sealed["pending_class"],
                         "negative_seal_state_unchanged": sealed["state_unchanged"],
+                        "negative_seal_roster_revision_unchanged": sealed[
+                            "roster_revision_unchanged"
+                        ],
                     },
                 )
                 self.require(all(sealed.values()), "negative seal observation incomplete")
@@ -864,7 +1057,7 @@ class Harness:
     def write_receipt(self, status: int, cleanup_complete: bool) -> None:
         children = [child.receipt() for child in self.children.values()]
         receipt = {
-            "schema": 1,
+            "schema": 2,
             "stage": self.stage,
             "status": status,
             "error_class": self.error_class,
@@ -872,6 +1065,7 @@ class Harness:
             "cleanup_complete": cleanup_complete,
             "children": children,
             "observations": self.observations,
+            "counters": self.counters,
             "accepted": (
                 status == 0
                 and cleanup_complete
@@ -879,6 +1073,7 @@ class Harness:
                 and self.error_class == "none"
                 and self.error_line == 0
                 and children_accepted(children)
+                and all(type(value) is int and value >= 0 for value in self.counters.values())
                 and all(
                     value is True
                     for key, value in self.observations.items()

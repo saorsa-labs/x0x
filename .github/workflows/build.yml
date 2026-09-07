@@ -58,9 +58,9 @@ jobs:
               'src/bin/rt3_fixture.rs':
                   '5d14ba7f926dd70a59305632d50c25be5d0e6fe00dc9824f69f744c3f052e1bd',
               'tests/rt3_harness.py':
-                  '20bec0cb14a2bcc04ba834aecded4eeba1e6e6e418145e896da77f835df30d84',
+                  '5735043428aff45690524218728297ed3c121b65d29879b44db275c7665d80ee',
               'tests/rt3_harness_controls.py':
-                  '604f4f11764e8c50cb9c88029794b7c9676cc4db98e9aa7f08ad81391b0b1764',
+                  'd63124adbb4476e3071c4f08cf2313a748b5737cf2b7a5ae31076c3ede282792',
               'scripts/ci/isolated-runtime.py':
                   '2a0c2521c19d5054b6e77c995e1604e9e9e174208157bb4331b5b38783aedced',
               'scripts/ci/isolation-witness.py':
@@ -459,9 +459,9 @@ jobs:
               outcome = json.loads(outcome_path.read_text())
               assert set(outcome) == {
                   'schema', 'stage', 'status', 'error_class', 'error_line',
-                  'cleanup_complete', 'children', 'observations', 'accepted',
+                  'cleanup_complete', 'children', 'observations', 'counters', 'accepted',
               }
-              assert outcome['schema'] == 1 and outcome['stage'] in stages
+              assert outcome['schema'] == 2 and outcome['stage'] in stages
               assert type(outcome['status']) is int and 0 <= outcome['status'] <= 255
               assert outcome['error_class'] in error_classes
               assert type(outcome['error_line']) is int and outcome['error_line'] >= 0
@@ -471,13 +471,20 @@ jobs:
                   'same_owner', 'distinct_agents', 'distinct_machines',
                   'fixture_converged', 'cache_witness', 'lane_difference_cache_only',
                   'lane_identity_preserved',
-                  'positive_hydration_status', 'positive_hydration_revision_increment',
+                  'positive_hydration_status',
+                  'positive_hydration_state_revision_increment',
+                  'positive_hydration_roster_revision_increment',
+                  'positive_hydration_response_revision_matches_roster',
                   'positive_hydration_roster_unchanged', 'positive_description_updated',
-                  'positive_seal_status', 'positive_seal_revision_increment',
+                  'positive_seal_status', 'positive_seal_state_revision_increment',
+                  'positive_seal_roster_revision_unchanged',
                   'positive_seal_roster_unchanged', 'positive_no_eviction',
                   'negative_hydration_status', 'negative_hydration_pending_class',
-                  'negative_hydration_state_unchanged', 'negative_seal_status',
+                  'negative_hydration_state_unchanged',
+                  'negative_hydration_roster_revision_unchanged',
+                  'negative_hydration_description_unchanged', 'negative_seal_status',
                   'negative_seal_pending_class', 'negative_seal_state_unchanged',
+                  'negative_seal_roster_revision_unchanged',
                   'negative_sidecar_unchanged',
               }
               observations = outcome['observations']
@@ -487,6 +494,28 @@ jobs:
                       assert value is None or type(value) is int
                   else:
                       assert type(value) is bool
+              expected_counters = {
+                  'positive_hydration_state_before',
+                  'positive_hydration_state_after',
+                  'positive_hydration_roster_before',
+                  'positive_hydration_roster_response',
+                  'positive_hydration_roster_after',
+                  'positive_seal_state_before', 'positive_seal_state_commit',
+                  'positive_seal_state_after', 'positive_seal_roster_before',
+                  'positive_seal_roster_after',
+                  'negative_hydration_state_before',
+                  'negative_hydration_state_after',
+                  'negative_hydration_roster_before',
+                  'negative_hydration_roster_after',
+                  'negative_seal_state_before', 'negative_seal_state_after',
+                  'negative_seal_roster_before', 'negative_seal_roster_after',
+              }
+              counters = outcome['counters']
+              assert isinstance(counters, dict) and set(counters) == expected_counters
+              assert all(
+                  value is None or (type(value) is int and value >= 0)
+                  for value in counters.values()
+              )
               assert isinstance(outcome['children'], list)
               names = {'owner', 'device', 'positive', 'negative'}
               for child in outcome['children']:

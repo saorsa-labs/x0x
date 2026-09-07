@@ -190,6 +190,88 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
                 ),
             }
 
+    @classmethod
+    def run_inert_collector(cls, outcome: dict[str, object]) -> dict[str, object]:
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = Path(temporary)
+            root = runner / "root"
+            raw = root / "raw"
+            safe = root / "safe"
+            wrapper = runner / "wrapper"
+            for path in (raw, safe, wrapper):
+                path.mkdir(parents=True)
+            (root / "runtime.json").write_text(
+                json.dumps(
+                    {
+                        "harness_exit": 0,
+                        "source_unchanged": True,
+                        "wrapper_evidence": str(wrapper),
+                    }
+                )
+            )
+            (root / "source.json").write_text(
+                json.dumps({"head": "a" * 40, "tree": "b" * 40, "files": {}})
+            )
+            (root / "build.json").write_text(
+                json.dumps(
+                    {
+                        "exit": 0,
+                        "lock_sha256": "c" * 64,
+                        "rustc": "rustc inert",
+                        "cargo": "cargo inert",
+                        "binaries": {},
+                        "packages": [],
+                    }
+                )
+            )
+            (raw / "harness-outcome.json").write_text(json.dumps(outcome))
+            (wrapper / "admission.json").write_text(
+                json.dumps(
+                    {
+                        "namespace": "net:[2]",
+                        "links": [{"ifname": "lo"}],
+                        "routes": {"-4": [], "-6": []},
+                        "capabilities": {
+                            key: "0000000000000000"
+                            for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+                        },
+                        "no_new_privs": 1,
+                    }
+                )
+            )
+            (wrapper / "exit.json").write_text(json.dumps({"exit": 0}))
+            (wrapper / "supervisor.json").write_text(
+                json.dumps({"reason": None, "child_exit": 0, "child_reaped": True})
+            )
+            environment = {
+                **os.environ,
+                "RT3_ROOT": str(root),
+                "RT3_RAW": str(raw),
+                "RT3_SAFE": str(safe),
+                "RUNNER_TEMP": str(runner),
+            }
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    cls.workflow_step_script(
+                        "Collect privacy-safe receipts",
+                        "Enforce semantic acceptance",
+                    ),
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            collection = None
+            if (safe / "collection.json").is_file():
+                collection = json.loads((safe / "collection.json").read_text())
+            return {
+                "returncode": result.returncode,
+                "collection": collection,
+                "outcome_uploaded": (safe / "outcome.json").is_file(),
+            }
+
     @staticmethod
     def clean_children() -> list[dict[str, object]]:
         return [
@@ -288,22 +370,60 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
                     )
 
     def test_actual_positive_and_negative_predicates(self) -> None:
-        before = {"state_revision": 7, "state_hash": "aa", "roster_root": "bb"}
+        before = {
+            "state_revision": 7,
+            "state_hash": "aa",
+            "prev_state_hash": "00",
+            "security_binding": "gss:epoch=1",
+            "withdrawn": False,
+            "roster_root": "bb",
+            "policy_hash": "cc",
+            "public_meta_hash": "dd",
+        }
+        before_group = {"roster_revision": 19, "description": ""}
         positive = {
             "ok": True,
-            "commit": {"revision": 8},
+            "commit": {"revision": 9},
             "evicted": [],
         }
         after_positive = {
             "state_revision": 8,
             "state_hash": "cc",
+            "prev_state_hash": "aa",
+            "security_binding": "gss:epoch=1",
+            "withdrawn": False,
             "roster_root": "bb",
+            "policy_hash": "cc",
+            "public_meta_hash": "ee",
         }
+        after_positive_group = {
+            "roster_revision": 20,
+            "description": "rt3-hydration-probe",
+        }
+        after_seal = dict(after_positive, state_revision=9, state_hash="ff", prev_state_hash="cc")
         self.assertTrue(
-            all(HARNESS.positive_observation(before, 200, positive, after_positive).values())
+            all(
+                HARNESS.positive_observation(
+                    after_positive,
+                    after_positive_group,
+                    200,
+                    positive,
+                    after_seal,
+                    after_positive_group,
+                ).values()
+            )
         )
         self.assertFalse(
-            all(HARNESS.positive_observation(before, 409, positive, after_positive).values())
+            all(
+                HARNESS.positive_observation(
+                    after_positive,
+                    after_positive_group,
+                    409,
+                    positive,
+                    after_seal,
+                    after_positive_group,
+                ).values()
+            )
         )
 
         negative = {
@@ -311,25 +431,82 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
             "error": "owner-certified group has members pending certificate resolution: []",
         }
         self.assertTrue(
-            all(HARNESS.negative_observation(before, 409, negative, before.copy()).values())
+            all(
+                HARNESS.negative_observation(
+                    before,
+                    before_group,
+                    409,
+                    negative,
+                    before.copy(),
+                    before_group.copy(),
+                ).values()
+            )
         )
         mutated = dict(before, state_revision=8)
         self.assertFalse(
-            all(HARNESS.negative_observation(before, 409, negative, mutated).values())
+            all(
+                HARNESS.negative_observation(
+                    before,
+                    before_group,
+                    409,
+                    negative,
+                    mutated,
+                    before_group.copy(),
+                ).values()
+            )
         )
 
         hydration = {
             "ok": True,
-            "revision": 8,
+            "revision": 20,
             "description": "rt3-hydration-probe",
         }
         self.assertTrue(
             all(
                 HARNESS.positive_hydration_observation(
-                    before, 200, hydration, after_positive
+                    before,
+                    before_group,
+                    200,
+                    hydration,
+                    after_positive,
+                    after_positive_group,
                 ).values()
             )
         )
+        wrong_response = dict(hydration, revision=21)
+        wrong_response_result = HARNESS.positive_hydration_observation(
+            before,
+            before_group,
+            200,
+            wrong_response,
+            after_positive,
+            after_positive_group,
+        )
+        self.assertTrue(wrong_response_result["state_revision_increment"])
+        self.assertTrue(wrong_response_result["roster_revision_increment"])
+        self.assertFalse(wrong_response_result["response_revision_matches_roster"])
+        unchanged_state_result = HARNESS.positive_hydration_observation(
+            before,
+            before_group,
+            200,
+            hydration,
+            before.copy(),
+            after_positive_group,
+        )
+        self.assertFalse(unchanged_state_result["state_revision_increment"])
+        self.assertTrue(unchanged_state_result["roster_revision_increment"])
+        wrong_roster_group = dict(after_positive_group, roster_revision=21)
+        wrong_roster_result = HARNESS.positive_hydration_observation(
+            before,
+            before_group,
+            200,
+            dict(hydration, revision=21),
+            after_positive,
+            wrong_roster_group,
+        )
+        self.assertTrue(wrong_roster_result["state_revision_increment"])
+        self.assertFalse(wrong_roster_result["roster_revision_increment"])
+        self.assertTrue(wrong_roster_result["response_revision_matches_roster"])
         pending = {
             "ok": False,
             "error": "seal failed: owner-certified group has members pending certificate resolution",
@@ -337,7 +514,12 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
         self.assertTrue(
             all(
                 HARNESS.negative_hydration_observation(
-                    before, 500, pending, before.copy()
+                    before,
+                    before_group,
+                    500,
+                    pending,
+                    before.copy(),
+                    before_group.copy(),
                 ).values()
             )
         )
@@ -361,19 +543,37 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
                 fixture="/bin/false",
             )
             harness = HARNESS.Harness(args)
-            before = {"state_revision": 7, "state_hash": "aa", "roster_root": "bb"}
+            before = {
+                "state_revision": 7,
+                "state_hash": "aa",
+                "prev_state_hash": "00",
+                "security_binding": "gss:epoch=1",
+                "withdrawn": False,
+                "roster_root": "bb",
+                "policy_hash": "cc",
+                "public_meta_hash": "dd",
+            }
+            before_group = {"roster_revision": 19, "description": ""}
             unexpected_positive = HARNESS.positive_hydration_observation(
                 before,
+                before_group,
                 409,
                 {"ok": False, "error": "unexpected"},
                 before.copy(),
+                before_group.copy(),
             )
             harness.record_result(
                 "positive_hydration_status",
                 409,
                 {
-                    "positive_hydration_revision_increment": unexpected_positive[
-                        "revision_increment"
+                    "positive_hydration_state_revision_increment": unexpected_positive[
+                        "state_revision_increment"
+                    ],
+                    "positive_hydration_roster_revision_increment": unexpected_positive[
+                        "roster_revision_increment"
+                    ],
+                    "positive_hydration_response_revision_matches_roster": unexpected_positive[
+                        "response_revision_matches_roster"
                     ],
                     "positive_hydration_roster_unchanged": unexpected_positive[
                         "roster_unchanged"
@@ -385,15 +585,17 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
             )
             self.assertEqual(harness.observations["positive_hydration_status"], 409)
             self.assertFalse(
-                harness.observations["positive_hydration_revision_increment"]
+                harness.observations["positive_hydration_state_revision_increment"]
             )
             self.assertFalse(harness.observations["positive_description_updated"])
 
             wrong_negative = HARNESS.negative_hydration_observation(
                 before,
+                before_group,
                 500,
                 {"ok": False, "error": "different internal error"},
                 before.copy(),
+                before_group.copy(),
             )
             harness.record_result(
                 "negative_hydration_status",
@@ -402,6 +604,12 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
                     "negative_hydration_pending_class": wrong_negative["pending_class"],
                     "negative_hydration_state_unchanged": wrong_negative[
                         "state_unchanged"
+                    ],
+                    "negative_hydration_roster_revision_unchanged": wrong_negative[
+                        "roster_revision_unchanged"
+                    ],
+                    "negative_hydration_description_unchanged": wrong_negative[
+                        "description_unchanged"
                     ],
                 },
             )
@@ -609,6 +817,16 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
             for key in harness.observations:
                 if not key.endswith("_status"):
                     harness.observations[key] = True
+            harness.record_counters(
+                {
+                    "positive_hydration_state_before": True,
+                    "positive_hydration_state_after": 8,
+                }
+            )
+            self.assertIsNone(harness.counters["positive_hydration_state_before"])
+            self.assertEqual(harness.counters["positive_hydration_state_after"], 8)
+            for key in harness.counters:
+                harness.counters[key] = 1
             harness.observations["positive_hydration_status"] = 200
             harness.observations["positive_seal_status"] = 200
             harness.observations["negative_hydration_status"] = 500
@@ -616,6 +834,19 @@ for name in ('x0xd', 'x0x', 'rt3_fixture'):
             harness.write_receipt(0, True)
             receipt = json.loads((artifacts / "harness-outcome.json").read_text())
             self.assertTrue(receipt["accepted"])
+            self.assertEqual(receipt["schema"], 2)
+            collector = self.run_inert_collector(receipt)
+            self.assertEqual(collector["returncode"], 0)
+            self.assertTrue(collector["outcome_uploaded"])
+            self.assertTrue(collector["collection"]["accepted"])
+            harness.counters["positive_hydration_state_before"] = True
+            harness.write_receipt(0, True)
+            receipt = json.loads((artifacts / "harness-outcome.json").read_text())
+            self.assertFalse(receipt["accepted"])
+            collector = self.run_inert_collector(receipt)
+            self.assertNotEqual(collector["returncode"], 0)
+            self.assertFalse(collector["outcome_uploaded"])
+            harness.counters["positive_hydration_state_before"] = 1
             harness.observations["negative_seal_state_unchanged"] = False
             harness.write_receipt(0, True)
             receipt = json.loads((artifacts / "harness-outcome.json").read_text())
