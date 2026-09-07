@@ -586,6 +586,8 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "subscribed_topics": egress["subscribed_topics"],
                 "outbound_by_topic_named": egress["outbound_by_topic_named"],
                 "egress_budget": egress["egress_budget"],
+                "outer_signature_policy": state.agent.gossip_outer_signature_policy(),
+                "outer_v1_receipts": state.agent.gossip_outer_v1_receipts(),
                 "gossip_publish_zero_fanout": snap.publish_zero_fanout,
                 "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),

@@ -3971,6 +3971,37 @@ impl Agent {
             .map(|rt| rt.pubsub().egress_diagnostics())
     }
 
+    /// Outer saorsa-gossip signature policy (`reject_v1` / `accept_v1`).
+    ///
+    /// Returns `None` when the agent has no gossip runtime. Exposed through
+    /// `GET /diagnostics/gossip` as operational proof of the ADR-014 boundary.
+    #[must_use]
+    pub fn gossip_outer_signature_policy(&self) -> Option<&'static str> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().outer_signature_policy())
+    }
+
+    /// Cumulative outer v1 receipts (rejected under RejectV1 still count).
+    #[must_use]
+    pub fn gossip_outer_v1_receipts(&self) -> Option<u64> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().outer_v1_receipts())
+    }
+
+    /// Test-only: feed an outer gossip frame into the local PubSubManager.
+    #[cfg(test)]
+    pub async fn handle_gossip_incoming_for_test(
+        &self,
+        peer: saorsa_gossip_types::PeerId,
+        data: bytes::Bytes,
+    ) {
+        if let Some(rt) = &self.gossip_runtime {
+            rt.pubsub().handle_incoming(peer, data).await;
+        }
+    }
+
     /// Record a `fan_out == 0` group publish and return whether to `warn!`.
     ///
     /// Increments `publish_zero_fanout` (surfaced as

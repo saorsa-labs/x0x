@@ -1783,6 +1783,9 @@ pub struct NetworkNode {
     /// never receives another packet/connection. (Note: ant-quic frees the bound
     /// UDP socket only on process exit — saorsa-labs/ant-quic#196.)
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Test-only: capture PubSub `send_to_peer` payloads (recording transport).
+    #[cfg(test)]
+    pubsub_send_capture: Arc<Mutex<Vec<bytes::Bytes>>>,
 }
 
 impl NetworkNode {
@@ -1958,6 +1961,8 @@ impl NetworkNode {
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            pubsub_send_capture: Arc::new(Mutex::new(Vec::new())),
         };
 
         let receiver = network_node.spawn_receiver();
@@ -1995,6 +2000,15 @@ impl NetworkNode {
     /// A reference to the network configuration.
     pub fn config(&self) -> &NetworkConfig {
         &self.config
+    }
+
+    /// Test-only: drain captured PubSub outbound frames (recording transport).
+    #[cfg(test)]
+    pub fn take_pubsub_send_capture(&self) -> Vec<bytes::Bytes> {
+        match self.pubsub_send_capture.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        }
     }
 
     /// The bootstrap peer cache shared with the ant-quic endpoint.
@@ -4803,6 +4817,12 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         stream_type: saorsa_gossip_transport::GossipStreamType,
         data: bytes::Bytes,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if stream_type == saorsa_gossip_transport::GossipStreamType::PubSub {
+            if let Ok(mut guard) = self.pubsub_send_capture.lock() {
+                guard.push(data.clone());
+            }
+        }
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
         // Issue #292 invariant B: no gossip stream is opened toward a

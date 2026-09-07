@@ -20,7 +20,7 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
-use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
+use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub, SignaturePolicy};
 use saorsa_gossip_transport::GossipTransport;
 use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
@@ -540,8 +540,15 @@ impl PubSubManager {
             })?;
 
         let transport = Arc::new(PubSubTransport::new(Arc::clone(&network)));
-        let plumtree_inner =
+        let mut plumtree_inner =
             PlumtreePubSub::new(peer_id, Arc::clone(&transport), plumtree_signing_key);
+        // ADR-014 modern-only: reject outer v1 (header-only-signed) frames.
+        plumtree_inner.set_signature_policy(SignaturePolicy::RejectV1);
+        if plumtree_inner.signature_policy() != SignaturePolicy::RejectV1 {
+            return Err(NetworkError::NodeCreation(
+                "mandatory outer signature policy RejectV1 could not be installed".to_string(),
+            ));
+        }
         let plumtree_inner = match oracle {
             Some(oracle) => plumtree_inner.with_health_oracle(oracle),
             None => plumtree_inner,
@@ -690,6 +697,28 @@ impl PubSubManager {
                 }
             }
         })
+    }
+
+
+    /// Outer saorsa-gossip signature policy for `GET /diagnostics/gossip`.
+    ///
+    /// Explicit string mapping (not `Debug`) so operators and harnesses can
+    /// assert the modern-only RejectV1 boundary without parsing Rust enums.
+    #[must_use]
+    pub fn outer_signature_policy(&self) -> &'static str {
+        match self.plumtree.signature_policy() {
+            SignaturePolicy::RejectV1 => "reject_v1",
+            SignaturePolicy::AcceptV1 => "accept_v1",
+        }
+    }
+
+    /// Cumulative outer v1 (header-only-signed) receipts since startup.
+    ///
+    /// Counts rejected frames under RejectV1 as well — evidence of contact
+    /// with the sunset boundary, not acceptance.
+    #[must_use]
+    pub fn outer_v1_receipts(&self) -> u64 {
+        self.plumtree.v1_receipt_count()
     }
 
     /// Snapshot of Leaf vs Full participation for `GET /diagnostics/gossip`.
