@@ -492,7 +492,7 @@ fn test_task_list_add_performance() {
     for i in 0..TASK_COUNT {
         let task_id = task_id_from_counter(i);
         let meta = TaskMetadata {
-            title: format!("Task {}", i),
+            title: format!("Task {i}"),
             description: String::new(),
             priority: 128,
             created_by: agent_id_from_counter(i),
@@ -505,11 +505,17 @@ fn test_task_list_add_performance() {
     }
 
     let elapsed = start.elapsed();
+    // #503 (folded sibling): the per-task wall-clock budget below 1 ms had
+    // the same shared-runner failure mode as the merge assert — scheduling
+    // luck, not a code property. Timing is an observation; the semantic
+    // assertion (all TASK_COUNT distinct tasks retained) encodes intent.
     assert_eq!(list.tasks_ordered().len(), TASK_COUNT as usize);
     let per_task = elapsed.as_micros() / u128::from(TASK_COUNT);
 
-    println!("Added 1000 tasks in {:?} ({} μs/task)", elapsed, per_task);
-    assert!(per_task < 1000, "add_task should be < 1ms per task");
+    println!(
+        "Added {} tasks in {:?} ({} μs/task, observation only)",
+        TASK_COUNT, elapsed, per_task
+    );
 }
 
 #[test]
@@ -525,10 +531,16 @@ fn test_crdt_merge_performance() {
 
     const TASKS_PER_REPLICA: u64 = 100;
 
-    // Add 100 tasks to each
+    // Add 100 tasks to each replica with REPLICA-UNIQUE titles and distinct
+    // task ids, so post-merge content checks can attribute every task to its
+    // originating replica exactly (identical titles across replicas could
+    // not prove both replicas' content survived).
+    let mut expected: std::collections::HashMap<TaskId, String> = std::collections::HashMap::new();
     for i in 0..TASKS_PER_REPLICA {
-        let meta = TaskMetadata {
-            title: format!("Task {}", i),
+        let id1 = task_id_from_counter(i);
+        let id2 = task_id_from_counter(TASKS_PER_REPLICA + i);
+        let meta1 = TaskMetadata {
+            title: format!("P1 Task {i}"),
             description: String::new(),
             priority: 128,
             created_by: agent_id_from_counter(i),
@@ -536,25 +548,99 @@ fn test_crdt_merge_performance() {
             created_at: 1000 + i,
             tags: vec![],
         };
-        let task1 = TaskItem::new(task_id_from_counter(i), meta.clone(), peer1);
-        let task2 = TaskItem::new(task_id_from_counter(TASKS_PER_REPLICA + i), meta, peer2);
-        list1.add_task(task1, peer1, i).unwrap();
-        list2.add_task(task2, peer2, i).unwrap();
+        let meta2 = TaskMetadata {
+            title: format!("P2 Task {i}"),
+            ..meta1.clone()
+        };
+        list1
+            .add_task(TaskItem::new(id1, meta1, peer1), peer1, i)
+            .unwrap();
+        list2
+            .add_task(TaskItem::new(id2, meta2, peer2), peer2, i)
+            .unwrap();
+        expected.insert(id1, format!("P1 Task {i}"));
+        expected.insert(id2, format!("P2 Task {i}"));
     }
 
     assert_eq!(list1.tasks_ordered().len(), TASKS_PER_REPLICA as usize);
     assert_eq!(list2.tasks_ordered().len(), TASKS_PER_REPLICA as usize);
 
+    // #503: timing is an OBSERVATION, not a correctness assertion. A
+    // wall-clock budget is a property of the runner's scheduling, not of the
+    // merge — this exact assertion failed PR CI on the GUI-only #502 while
+    // passing locally with ~8x margin. The deliberate timing lane for merge
+    // cost is `benches/crdt_merge_throughput.rs` (criterion, never gates
+    // PRs).
+    let list1_pre_merge = list1.clone();
     let start = Instant::now();
     list1.merge(&list2).unwrap();
     let elapsed = start.elapsed();
-
-    assert_eq!(
-        list1.tasks_ordered().len(),
-        (TASKS_PER_REPLICA * 2) as usize
+    println!(
+        "Merged {} tasks into {} in {:?} (observation only; see benches/crdt_merge_throughput)",
+        TASKS_PER_REPLICA, TASKS_PER_REPLICA, elapsed
     );
-    println!("Merged 100 tasks in {:?}", elapsed);
-    assert!(elapsed.as_millis() < 10, "Merge should be < 10ms");
+
+    // Correctness at scale (#503): the merge is an EXACT bijection — the
+    // observed TaskId -> title map equals the union of both replicas' maps,
+    // proving every task from BOTH replicas survived, unmutated, with no
+    // drops, duplicates or id collisions.
+    let observed: std::collections::HashMap<TaskId, String> = list1
+        .tasks_ordered()
+        .into_iter()
+        .map(|task| (*task.id(), task.title().to_string()))
+        .collect();
+    assert_eq!(observed.len(), (TASKS_PER_REPLICA * 2) as usize);
+    let ordered_ids = |list: &TaskList| {
+        list.tasks_ordered()
+            .into_iter()
+            .map(|task| *task.id())
+            .collect::<Vec<_>>()
+    };
+    let merged_order = ordered_ids(&list1);
+    assert_eq!(
+        merged_order.len(),
+        expected.len(),
+        "merge must not duplicate tasks"
+    );
+    assert_eq!(
+        observed, expected,
+        "post-merge TaskId->title map must equal the exact union of both replicas"
+    );
+
+    // Merge is IDEMPOTENT: re-merging the same replica neither duplicates
+    // nor drops tasks nor mutates content.
+    list1.merge(&list2).unwrap();
+    let remerged: std::collections::HashMap<TaskId, String> = list1
+        .tasks_ordered()
+        .into_iter()
+        .map(|task| (*task.id(), task.title().to_string()))
+        .collect();
+    assert_eq!(remerged, expected, "re-merging must not change the union");
+    assert_eq!(
+        ordered_ids(&list1),
+        merged_order,
+        "re-merging must preserve task order"
+    );
+
+    // Merge is DIRECTION-INDEPENDENT (CRDT commutativity at this scale):
+    // merging the pre-merge replica-1 into replica-2 yields the identical
+    // exact map.
+    let mut reverse = list2.clone();
+    reverse.merge(&list1_pre_merge).unwrap();
+    let reverse_observed: std::collections::HashMap<TaskId, String> = reverse
+        .tasks_ordered()
+        .into_iter()
+        .map(|task| (*task.id(), task.title().to_string()))
+        .collect();
+    assert_eq!(
+        reverse_observed, expected,
+        "both merge directions must agree on the exact TaskId->title map"
+    );
+    assert_eq!(
+        ordered_ids(&reverse),
+        merged_order,
+        "both merge directions must agree on ordered task IDs"
+    );
 }
 
 // ============================================================================

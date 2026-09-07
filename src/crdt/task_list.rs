@@ -667,12 +667,17 @@ impl TaskList {
             .filter_map(|id| self.task_data.get(id))
             .collect();
 
-        // Append tasks that are in OR-Set but not in ordering
-        for task_id in &or_set_tasks {
-            if !ordered_ids.contains(task_id) {
-                if let Some(task) = self.task_data.get(task_id) {
-                    ordered.push(task);
-                }
+        // Concurrent replicas can add tasks absent from the winning LWW
+        // ordering. Keep its explicit order, then append missing tasks in a
+        // stable order so identical merged state renders identically.
+        let mut missing_ids: Vec<_> = or_set_tasks
+            .iter()
+            .filter(|id| !ordered_ids.contains(*id))
+            .collect();
+        missing_ids.sort_unstable_by_key(|id| id.as_bytes());
+        for task_id in missing_ids {
+            if let Some(task) = self.task_data.get(task_id) {
+                ordered.push(task);
             }
         }
 
