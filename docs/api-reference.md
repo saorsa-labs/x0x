@@ -444,6 +444,7 @@ agents).
 |---|---|---|---|---|
 | GET | `/home` | `x0x home` | bearer | Resolve the owner's Home space |
 | POST | `/home/rename` | `x0x home rename <NAME>` | durable-owner (#446) | Rename the Home (admin-gated, sealed into the state chain) |
+| POST | `/home/seat` | `x0x home seat <AGENT_ID>` | durable-owner | Mint an addressed invite for a named agent to join the canonical Home |
 
 The first start of an owned install provisions exactly one Home:
 `Hidden + OwnerCertified(owner) + MlsEncrypted + MembersOnly/MembersOnly`,
@@ -481,6 +482,44 @@ uncertified holder of a valid invite is refused (`403`).
   the GUI shows the owner chip only when true.
 - `warnings.no_roaming_agent` — ADR-0038 invariant: Home should always
   contain ≥ 1 Roaming agent.
+
+**POST `/home/seat`** implements the owner-driven adoption decision recorded in
+[ADR-0060](adr/0060-one-home-per-owner.md#adoption-eligibility--decided-2026-09-07-david-irvine).
+It requires the durable API token; session and rider tokens receive `403` before
+body extraction, with a matching handler-side check. The request is:
+
+```json
+{"agent_id":"<64 lowercase hex characters>"}
+```
+
+The target must not be this daemon's own agent. The daemon must be owned and
+must hold the elected canonical Home locally; a losing or remote Home cannot
+mint seats into its duplicate. A successful `200` response has this shape:
+
+```json
+{
+  "ok": true,
+  "group_id": "<canonical Home group id>",
+  "invite": "<signed addressed v4 invite link>",
+  "intended_joiner": "<requested agent id>",
+  "owner_user_id": "<Home OwnerCertified user id>",
+  "join_hint": "x0x group join <invite> --home --owner <owner_user_id>",
+  "seated": false,
+  "note": "an invite was minted; the device is NOT seated until it redeems the invite via the join path"
+}
+```
+
+`400` covers a malformed or self-targeting `agent_id`; `404` means an un-owned
+install with no loaded owner key. An owned install with unresolved Home state
+returns `409 unknown`, not `404`. `409` includes typed `reason` values
+`adoption_pending`, `elsewhere`, or `unknown`, with a nullable
+`canonical_group_id`. The underlying invite authority can additionally return
+its documented errors, including `409 owner_key_unavailable`, `413
+invite_too_large`, `429 invite_cap_reached`, and persistence failures. A
+successful call is **not idempotent**: it records a new single-use invite and
+consumes a live-invite slot. It does not deliver or redeem the invite, change
+membership, prove the target is online, or prove adoption completed; the named
+agent must redeem it through the pinned Home join shown in `join_hint`.
 
 **POST /home/rename** takes `{"name": "…"}`; it is a convenience wrapper over
 `PATCH /groups/:id` (admin-gated, sealed, persisted). Errors: `404` un-owned /
@@ -981,6 +1020,7 @@ helper API.
 | POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`). A replay's fate depends on where it lands: after the authority validated the original join, a replayed secret is rejected `invite_secret_consumed` and never seated; if the authority has NOT validated yet (event still in flight, or it restarted first) the secret is unburned; a replay by an already-active member is refused earlier as an idempotent no-op (and a same-node duplicate join is an idempotent local success, #188); an addressed invite replayed by the wrong joiner is refused without consuming the secret. None of these paths proves YOUR seat — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
+| POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a deterministic GSS encrypted KV store for an active group member |
 | POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
 | GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set display name in group. Body `{"name":"<display name>"}` |
@@ -1014,6 +1054,58 @@ helper API.
 | POST | `/groups/:id/secure/reseal` | `x0x group secure-reseal <group_id>` | Re-seal the current group shared secret to a named recipient (`SecureShareDelivered`-format envelope) |
 | POST | `/groups/secure/open-envelope` | `x0x group secure-open-envelope` | Attempt to open a `SecureShareDelivered` envelope with this daemon's KEM key (adversarial test) |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. A sole-member leave deletes the group (`{"ok":true,"deleted":...}`); otherwise the last admin is blocked — promote another admin first or use `x0x group delete` |
+
+### `POST /groups/:id/stores` — group encrypted store
+
+This bearer-authenticated owner route accepts either the durable API token or a
+session token. Rider tokens cannot reach it: the deny-by-default middleware
+returns `403` before the handler, regardless of a rider's group grants. The
+daemon's own agent must also be an active member of the requested group.
+
+The body is `{"name":"<store name>"}`. The name is trimmed and must remain
+non-empty. Store identity and topic are deterministic from the group's stable
+id plus that name, and ownership is anchored to the group creator. The group
+must be active, `MlsEncrypted`, and on the GSS secure plane; TreeKEM-plane
+groups are not supported by this endpoint.
+
+A new local store returns `201`; an already-open store returns `200` with the
+same identity. Both responses contain:
+
+```json
+{
+  "ok": true,
+  "id": "<topic>",
+  "store_id": "<hex store id>",
+  "group_id": "<stable group id>",
+  "topic": "<topic>",
+  "policy": "encrypted",
+  "epoch": 42,
+  "checkpoint_available": false,
+  "ownership": {
+    "owner": "<hex group creator agent id>",
+    "policy": "encrypted",
+    "version": 0,
+    "policy_version": 0,
+    "ownership_status": "anchored",
+    "announced_owner": null,
+    "durability_degraded": false
+  }
+}
+```
+
+The create is idempotent for the same stable group id and trimmed name, and
+concurrent opens are serialized. `400` covers an empty name or an incompatible
+confidentiality/secure plane; `403` covers a non-member (and middleware-denied
+riders); `404` means the group is absent; `409` means the group is withdrawn or
+a **new** store cannot obtain the local shared secret; `500` covers opening or
+persisting the local subscription registration.
+
+For an **existing** handle, unavailable secure context does not produce `409`:
+the route returns `200` metadata with `epoch: 0`. That response, and metadata
+such as `checkpoint_available` or `ownership`, does not establish that the
+store is ready to encrypt, publish, replicate, or read data. Treat it as an
+identity/registration response; prove operational readiness with the relevant
+store operation and its result.
 
 ### `GET /groups/:id` — `invite_lineage`
 
