@@ -732,15 +732,16 @@ fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
 /// existing unique history `msg_id` is the cache key so SQLite rowid reuse
 /// cannot attach an old projection to a new row.
 fn backfill_canonical_ids(conn: &Connection) -> HistoryResult<()> {
-    let tx = conn.unchecked_transaction()?;
     // Reconcile only missing keys: the existing unique artifact hash is
     // immutable for a history row, and the delete trigger removes its
     // projection when an older writer deletes that row. Keep each read
     // bounded so opening a large history cannot allocate all payloads at
     // once. Invalid rows still advance the id cursor and cannot stall this
-    // loop.
+    // loop. Commit each bounded batch independently so an interrupted open
+    // retains completed projection work and resumes on the next open.
     let mut after_id = 0_i64;
     loop {
+        let tx = conn.unchecked_transaction()?;
         let candidates = {
             let mut stmt = tx.prepare(
                 "SELECT h.id, h.msg_id, h.scope_id, h.payload, h.signed_artifact \
@@ -761,9 +762,10 @@ fn backfill_canonical_ids(conn: &Connection) -> HistoryResult<()> {
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let Some((last_id, _, _, _, _)) = candidates.last() else {
+            tx.rollback()?;
             break;
         };
-        after_id = *last_id;
+        let last_id = *last_id;
         for (_, history_msg_id, scope_id, payload, signed_artifact) in candidates {
             let Some(canonical_msg_id) =
                 canonical_group_msg_id(1, &scope_id, signed_artifact.as_deref(), &payload)
@@ -777,8 +779,9 @@ fn backfill_canonical_ids(conn: &Connection) -> HistoryResult<()> {
                 rusqlite::params![history_msg_id, &canonical_msg_id[..], scope_id],
             )?;
         }
+        tx.commit()?;
+        after_id = last_id;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -1515,6 +1518,95 @@ mod tests {
             })
             .unwrap();
         assert_eq!(indexed, 298);
+    }
+
+    #[test]
+    fn canonical_backfill_resumes_after_second_batch_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let store = Store::open(&path).unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        let mut abort_msg_hex = None;
+        for n in 0..600_u64 {
+            let (record, _) =
+                group_record("resume-legacy-group", &format!("resume body {n}"), n + 1);
+            if n == 257 {
+                // Row 258 is in the second 256-row candidate batch. The
+                // trigger below must abort that batch after row 257 has been
+                // attempted, proving the batch transaction rolls back as a
+                // unit while batch one remains committed.
+                abort_msg_hex = Some(hex::encode(record.msg_id));
+            }
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                 author_agent, direction, content_type, payload, signed_artifact, signature, \
+                 sig_context, provenance) \
+                 VALUES (?1, 1, ?2, ?3, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0)",
+                rusqlite::params![
+                    &record.msg_id[..],
+                    "resume-legacy-group",
+                    record.sent_at_ms,
+                    record.author_agent,
+                    record.content_type,
+                    record.payload,
+                    record.signed_artifact,
+                    record.signature,
+                    record.sig_context,
+                ],
+            )
+            .unwrap();
+        }
+        let abort_msg_hex = abort_msg_hex.unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER issue321_abort_second_batch BEFORE INSERT ON \
+             history_canonical_ids WHEN NEW.history_msg_id = X'{abort_msg_hex}' BEGIN \
+             SELECT RAISE(ABORT, 'issue321 injected second-batch failure'); END;"
+        ))
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            Store::open(&path).is_err(),
+            "the injected second-batch failure must make this open fail"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let indexed: i64 = conn
+            .query_row("SELECT count(*) FROM history_canonical_ids", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            indexed, 256,
+            "the first committed batch must survive while the failed second batch rolls back"
+        );
+        let aborted_indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM history_canonical_ids WHERE history_msg_id = ?1",
+                rusqlite::params![hex::decode(&abort_msg_hex).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(aborted_indexed, 0);
+        let history_rows: i64 = conn
+            .query_row("SELECT count(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(history_rows, 600, "backfill must never mutate history rows");
+        conn.execute_batch("DROP TRIGGER issue321_abort_second_batch")
+            .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        let indexed: i64 = lock_conn(&store.conn)
+            .unwrap()
+            .query_row("SELECT count(*) FROM history_canonical_ids", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 600, "a later open must resume all missing batches");
+        assert_eq!(stored_schema_version(&store), 4);
     }
 
     #[test]
