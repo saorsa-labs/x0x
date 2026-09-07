@@ -216,29 +216,22 @@ async fn history_message_point_lookup_serves_group_row_by_canonical_id() {
     assert_eq!(sent["ok"], true, "group send: {sent:?}");
     let msg_id = sent["msg_id"].as_str().expect("send msg_id").to_string();
 
-    // The route's contract: EVERY id `/history` exposes in a record's
-    // `msg_id` field is point-resolvable. Which id a sender-side row exposes
-    // is recorder-dependent (LocalSend rows expose the store dedupe id;
-    // self-ingested rows expose the canonical ADR-0029 id, and the two race)
-    // — so the test resolves every listed id rather than asserting a
-    // relationship to the send response's `msg_id`. The store-dedupe-id case
-    // exercises the fast path; a canonical id exercises the ?scope= scan.
+    // The send response is the canonical ADR-0029 id. The shared local
+    // recorder must expose that same id with LocalSend provenance, and the
+    // point lookup must return that exact row.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let listed_ids: Vec<String> = loop {
+    let local_send_record: Value = loop {
         let (status, body) = daemon
             .get_status(&format!("/history?scope=group:{group_id}&limit=10"))
             .await;
         if status == reqwest::StatusCode::OK {
-            let ids: Vec<String> = body["records"]
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|r| r["msg_id"].as_str().map(str::to_string))
-                        .collect()
+            if let Some(row) = body["records"].as_array().and_then(|rows| {
+                rows.iter().find(|row| {
+                    row["msg_id"].as_str() == Some(msg_id.as_str())
+                        && row["provenance"].as_str() == Some("LocalSend")
                 })
-                .unwrap_or_default();
-            if !ids.is_empty() {
-                break ids;
+            }) {
+                break row.clone();
             }
         }
         assert!(
@@ -248,37 +241,19 @@ async fn history_message_point_lookup_serves_group_row_by_canonical_id() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
-    for listed_id in &listed_ids {
-        let (status, body) = daemon
-            .get_status(&format!(
-                "/history/message/{listed_id}?scope=group:{group_id}"
-            ))
-            .await;
-        assert_eq!(
-            status,
-            reqwest::StatusCode::OK,
-            "point lookup of /history-exposed id {listed_id} must succeed; \
-             if this 404s while /history lists the row, the point-lookup \
-             route or its store lookup/scan was removed (revert of issue \
-             #319). body: {body:?}"
-        );
-        assert_eq!(body["ok"], true, "lookup body: {body:?}");
-        assert_eq!(
-            body["record"]["msg_id"].as_str(),
-            Some(listed_id.as_str()),
-            "point lookup must return the row whose exposed msg_id was \
-             requested: {body:?}"
-        );
-    }
-    // Keep the send-response id in play without asserting the racy
-    // relationship: it must never produce a 5xx.
-    let (status, _) = daemon
+    assert_eq!(local_send_record["msg_id"], msg_id);
+    assert_eq!(local_send_record["provenance"], "LocalSend");
+    let (status, body) = daemon
         .get_status(&format!("/history/message/{msg_id}?scope=group:{group_id}"))
         .await;
-    assert!(
-        status == reqwest::StatusCode::OK || status == reqwest::StatusCode::NOT_FOUND,
-        "send-response id lookup must be 200 or 404, never an error: {status}"
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "send-response canonical id must resolve after its LocalSend row is listed: {body:?}"
     );
+    assert_eq!(body["ok"], true, "lookup body: {body:?}");
+    assert_eq!(body["record"]["msg_id"], msg_id);
+    assert_eq!(body["record"]["provenance"], "LocalSend");
 
     // Unknown-but-well-formed id: clean 404, not 400/500.
     let (status, _) = daemon
