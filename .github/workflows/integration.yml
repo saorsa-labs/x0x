@@ -145,19 +145,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - name: 'Check issue #321 custody routing (inert)'
+        run: python3 scripts/ci/test_issue321_custody_routing.py
       - name: Run named group integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_integration -- --run-ignored ignored-only
       # The existing isolated nextest invocation resolves Cargo.lock and warms
       # the locked dependency graph before this offline daemon build.
-      - name: Build and pin x0xd for issue #321
+      - name: 'Build and pin x0xd for issue #321'
         run: |
           cargo build --offline --locked --all-features --bin x0xd
           test -x target/debug/x0xd
           sha256sum target/debug/x0xd
       # Each issue #321 selector gets its own RUNNER_TEMP subtree and typed
-      # acceptance receipt. The shared collector binds one test binary to one
+      # acceptance receipt. Use a task env name: Actions reserves RUNNER_TEMP,
+      # so bind it at command invocation for the collector as the producer does.
+      # The shared collector binds one test binary to one
       # build-custody scratch; combining binaries would make custody ambiguous.
-      - name: Run issue #321 verified history restart acceptance
+      - name: 'Run issue #321 verified history restart acceptance'
         run: |
           set -euo pipefail
           test -x target/debug/x0xd
@@ -176,25 +180,25 @@ jobs:
           cat "$root/command.log"
           printf '%s\n' "$status" > "$root/command.exit"
           exit "$status"
-      - name: Collect issue #321 verified history custody
+      - name: 'Collect issue #321 verified history custody'
         id: collect_issue321_history
         if: always()
         env:
-          RUNNER_TEMP: ${{ runner.temp }}/issue321-history-restart
-          GITHUB_SHA: ${{ github.sha }}
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue321-history-restart
           X0X_CUSTODY_EXPECT: success
           X0X_CUSTODY_MIN_RUNS: '1'
           X0X_CUSTODY_ROLES: acceptance
           X0X_CUSTODY_TARGET: named_group_e_live
-        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/safe"
-      - name: Upload issue #321 verified history custody
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/safe"
+      - name: 'Upload issue #321 verified history custody'
         if: always() && steps.collect_issue321_history.outputs.receipt_eligible == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: issue321-history-custody
-          path: ${{ runner.temp }}/issue321-history-restart/safe
+          path: ${{ runner.temp }}/issue321-history-restart/safe/custody-receipt.json
+          if-no-files-found: error
 
-      - name: Run issue #321 direct canonical point lookup
+      - name: 'Run issue #321 direct canonical point lookup'
         if: always()
         run: |
           set -euo pipefail
@@ -213,25 +217,25 @@ jobs:
           cat "$root/command.log"
           printf '%s\n' "$status" > "$root/command.exit"
           exit "$status"
-      - name: Collect issue #321 direct lookup custody
+      - name: 'Collect issue #321 direct lookup custody'
         id: collect_issue321_point
         if: always()
         env:
-          RUNNER_TEMP: ${{ runner.temp }}/issue321-history-point
-          GITHUB_SHA: ${{ github.sha }}
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue321-history-point
           X0X_CUSTODY_EXPECT: success
           X0X_CUSTODY_MIN_RUNS: '1'
           X0X_CUSTODY_ROLES: acceptance
           X0X_CUSTODY_TARGET: history_point_lookup_wiring
-        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/safe"
-      - name: Upload issue #321 direct lookup custody
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/safe"
+      - name: 'Upload issue #321 direct lookup custody'
         if: always() && steps.collect_issue321_point.outputs.receipt_eligible == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: issue321-history-point-custody
-          path: ${{ runner.temp }}/issue321-history-point/safe
+          path: ${{ runner.temp }}/issue321-history-point/safe/custody-receipt.json
+          if-no-files-found: error
 
-      - name: Run issue #321 delegation and cold-wake acceptance
+      - name: 'Run issue #321 delegation and cold-wake acceptance'
         if: always()
         run: |
           set -euo pipefail
@@ -251,25 +255,25 @@ jobs:
           cat "$root/command.log"
           printf '%s\n' "$status" > "$root/command.exit"
           exit "$status"
-      - name: Collect issue #321 delegation custody
+      - name: 'Collect issue #321 delegation custody'
         id: collect_issue321_delegation
         if: always()
         env:
-          RUNNER_TEMP: ${{ runner.temp }}/issue321-delegation
-          GITHUB_SHA: ${{ github.sha }}
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue321-delegation
           X0X_CUSTODY_EXPECT: success
           X0X_CUSTODY_MIN_RUNS: '1'
           X0X_CUSTODY_ROLES: acceptance
           X0X_CUSTODY_TARGET: delegation_spaces
-        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/safe"
-      - name: Upload issue #321 delegation custody
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/safe"
+      - name: 'Upload issue #321 delegation custody'
         if: always() && steps.collect_issue321_delegation.outputs.receipt_eligible == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: issue321-delegation-custody
-          path: ${{ runner.temp }}/issue321-delegation/safe
+          path: ${{ runner.temp }}/issue321-delegation/safe/custody-receipt.json
+          if-no-files-found: error
 
-      - name: Run issue #321 moderated transport control
+      - name: 'Run issue #321 moderated transport control'
         if: always()
         run: |
           set -euo pipefail
@@ -289,23 +293,23 @@ jobs:
           cat "$root/command.log"
           printf '%s\n' "$status" > "$root/command.exit"
           exit "$status"
-      - name: Collect issue #321 moderated custody
+      - name: 'Collect issue #321 moderated custody'
         id: collect_issue321_moderated
         if: always()
         env:
-          RUNNER_TEMP: ${{ runner.temp }}/issue321-moderated
-          GITHUB_SHA: ${{ github.sha }}
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue321-moderated
           X0X_CUSTODY_EXPECT: success
           X0X_CUSTODY_MIN_RUNS: '1'
           X0X_CUSTODY_ROLES: acceptance
           X0X_CUSTODY_TARGET: named_group_e_live
-        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/safe"
-      - name: Upload issue #321 moderated custody
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/safe"
+      - name: 'Upload issue #321 moderated custody'
         if: always() && steps.collect_issue321_moderated.outputs.receipt_eligible == 'true'
         uses: actions/upload-artifact@v5
         with:
           name: issue321-moderated-custody
-          path: ${{ runner.temp }}/issue321-moderated/safe
+          path: ${{ runner.temp }}/issue321-moderated/safe/custody-receipt.json
+          if-no-files-found: error
 
   # Issue #277 datagram-lane acceptance (ADR-0042 (c)). Loopback only:
   # every agent binds 127.0.0.1:0 and the lossy proxy binds 127.0.0.1:0,
