@@ -275,7 +275,7 @@ def nextest_receipt(value):
 
 
 def test_receipt(value, run_nonce, source):
-    empty = {"schema": 2, "present": False, "test": TEST_NAME,
+    empty = {"schema": 4, "present": False, "test": TEST_NAME,
              "run_nonce": run_nonce, "source_head": source["head"],
              "source_tree": source["tree"], "entered": False, "phase": "fixture_setup",
              "result": "missing", "failure_kind": "unknown_cause",
@@ -289,7 +289,7 @@ def test_receipt(value, run_nonce, source):
             "phase", "result", "failure_kind", "last_http_status", "cli_exit_code",
             "cli_signaled", "observation", "children"}
     exact_keys(value, keys, "test diagnostic")
-    if value["schema"] != 2 or value["test"] != TEST_NAME or value["run_nonce"] != run_nonce:
+    if value["schema"] != 4 or value["test"] != TEST_NAME or value["run_nonce"] != run_nonce:
         raise ValueError("test diagnostic binding mismatch")
     if value["source_head"] != source["head"] or value["source_tree"] != source["tree"]:
         raise ValueError("test diagnostic source mismatch")
@@ -331,8 +331,14 @@ def test_receipt(value, run_nonce, source):
         raise ValueError("invalid diagnostic child set")
     safe_children = {}
     cleanup_ok = True
+    shutdown_fields = {
+        "port_file_removed", "marker_parse_valid",
+        "api_shutdown_received", "shutdown_complete", "axum_grace_expired",
+        "server_tasks_grace_expired", "agent_tasks_grace_expired", "forced_exit",
+    }
+    five_second_states = {"not_attempted", "not_observed", "exited_before", "running"}
     for label, child in value["children"].items():
-        exact_keys(child, {"started", "cleanup", "exit_code", "signaled", "escalation"}, "diagnostic child")
+        exact_keys(child, {"started", "cleanup", "exit_code", "signaled", "escalation", "five_second_state"} | shutdown_fields, "diagnostic child")
         if type(child["started"]) is not bool or type(child["signaled"]) is not bool:
             raise ValueError("invalid diagnostic child booleans")
         if child["cleanup"] not in {"not_started", "running", "reaped", "cleanup_failed"}:
@@ -351,6 +357,19 @@ def test_receipt(value, run_nonce, source):
             raise ValueError("inconsistent reaped status")
         if child["cleanup"] == "cleanup_failed" and child["exit_code"] is not None:
             raise ValueError("failed cleanup has exit status")
+        if (not isinstance(child["five_second_state"], str)
+                or child["five_second_state"] not in five_second_states):
+            raise ValueError("invalid five-second observation state")
+        for field in shutdown_fields:
+            if child[field] is not None and type(child[field]) is not bool:
+                raise ValueError("invalid shutdown observation boolean")
+        has_shutdown_observation = child["five_second_state"] != "not_attempted"
+        if has_shutdown_observation != any(child[field] is not None for field in shutdown_fields):
+            raise ValueError("inconsistent shutdown observation state")
+        if has_shutdown_observation and not all(child[field] is not None for field in shutdown_fields):
+            raise ValueError("partial shutdown observation")
+        if has_shutdown_observation and child["cleanup"] != "reaped":
+            raise ValueError("shutdown observation without reaped child")
         cleanup_ok &= child["cleanup"] in {"not_started", "reaped"}
         safe_children[label] = child
     if value["result"] == "passed" and (value["phase"] != "complete" or value["failure_kind"] != "none"):
@@ -365,8 +384,15 @@ def test_receipt(value, run_nonce, source):
     children_ok = cleanup_ok and all(
         child["started"] is True and child["cleanup"] == "reaped"
         and child["exit_code"] == 0 and child["signaled"] is False
-        and child["escalation"] == "none" for child in safe_children.values())
-    result = {"schema": 2, "present": True, **{key: value[key] for key in value if key not in {"schema", "children"}}, "children": safe_children}
+        and child["escalation"] == "none"
+        and child["five_second_state"] in {"exited_before", "running"}
+        and child["port_file_removed"] is True
+        and child["marker_parse_valid"] is True
+        and child["api_shutdown_received"] is True
+        and child["shutdown_complete"] is True
+        and child["forced_exit"] is False
+        for child in safe_children.values())
+    result = {"schema": 4, "present": True, **{key: value[key] for key in value if key not in {"schema", "children"}}, "children": safe_children}
     return result, value["result"] == "passed" and cli_ok and children_ok, cleanup_ok
 
 

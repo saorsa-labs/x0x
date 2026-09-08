@@ -52,12 +52,12 @@ jobs:
           assert head == os.environ['GITHUB_SHA'] == os.environ['EXPECTED_COMMIT']
           assert not subprocess.check_output(['git', 'status', '--porcelain'], text=True)
           expected = {
-            'tests/home_onboarding_isolated.rs': 'e31cdfe80d088bb0b65dda264f431f18ae3357cd6667fcb874cc23dc2c59c148',
+            'tests/home_onboarding_isolated.rs': 'b2c33c395d7b8c6a37d503af3c2e928b0861355257d780423229b6740fac1780',
             'scripts/ci/isolated-runtime.py': '2a0c2521c19d5054b6e77c995e1604e9e9e174208157bb4331b5b38783aedced',
             'scripts/ci/isolation-witness.py': 'dbd753e24b3d082ed434813e575ed214aa70fd8d33b8872f70db1bedb5e0f5ec',
             'scripts/ci/nextest-reuse.py': '33a86e237d5ae5fb6d3ce694ccc5d92df08508068649216dd79a9048eb14596f',
-            'scripts/ci/home-onboarding-collect.py': 'ab18ac2d032868d82d82c644112ff8fe4e00be9e16b6ff0029b53fc1650ca258',
-            'scripts/ci/home-onboarding-collect-controls.py': '7e9eb30488a677fee71a8d3f495a4b451ba192dbefac80e1c68bb47c46f08689',
+            'scripts/ci/home-onboarding-collect.py': '209c1f49f9df23184fa709be76dab2240583e7caf923491caee33bb95e33154e',
+            'scripts/ci/home-onboarding-collect-controls.py': 'cada026713c11b7f3a7d7984290a994069e55e22a6ccc823ae66a666bfc2ea2c',
             'ci/home-onboarding/Cargo.lock.fixture': '83fc5316716b6240ffa470daa77d3e6a7ea9ed09baf6631320d472514e38b32f',
           }
           for name, digest in expected.items():

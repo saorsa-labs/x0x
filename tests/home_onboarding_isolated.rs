@@ -18,6 +18,8 @@ use tempfile::TempDir;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const ONBOARDING_TIMEOUT: Duration = Duration::from_secs(120);
+const API_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_FIVE_SECOND_OBSERVATION: Duration = Duration::from_secs(5);
 const DIAGNOSTIC_TEST: &str = "home_onboarding_single_announce_restart";
 const CHILD_LABELS: [&str; 4] = [
     "owner_initial",
@@ -33,6 +35,26 @@ struct ChildObservation {
     exit_code: Option<i32>,
     signaled: bool,
     escalation: &'static str,
+    five_second_state: &'static str,
+    port_file_removed: Option<bool>,
+    marker_parse_valid: Option<bool>,
+    api_shutdown_received: Option<bool>,
+    shutdown_complete: Option<bool>,
+    axum_grace_expired: Option<bool>,
+    server_tasks_grace_expired: Option<bool>,
+    agent_tasks_grace_expired: Option<bool>,
+    forced_exit: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ShutdownMarkers {
+    parse_valid: bool,
+    api_shutdown_received: bool,
+    shutdown_complete: bool,
+    axum_grace_expired: bool,
+    server_tasks_grace_expired: bool,
+    agent_tasks_grace_expired: bool,
+    forced_exit: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -144,6 +166,15 @@ impl TestDiagnostic {
             exit_code: None,
             signaled: false,
             escalation: "none",
+            five_second_state: "not_attempted",
+            port_file_removed: None,
+            marker_parse_valid: None,
+            api_shutdown_received: None,
+            shutdown_complete: None,
+            axum_grace_expired: None,
+            server_tasks_grace_expired: None,
+            agent_tasks_grace_expired: None,
+            forced_exit: None,
         };
         let diagnostic = Self {
             path: Arc::new(path),
@@ -182,12 +213,21 @@ impl TestDiagnostic {
                         "exit_code": child.exit_code,
                         "signaled": child.signaled,
                         "escalation": child.escalation,
+                        "five_second_state": child.five_second_state,
+                        "port_file_removed": child.port_file_removed,
+                        "marker_parse_valid": child.marker_parse_valid,
+                        "api_shutdown_received": child.api_shutdown_received,
+                        "shutdown_complete": child.shutdown_complete,
+                        "axum_grace_expired": child.axum_grace_expired,
+                        "server_tasks_grace_expired": child.server_tasks_grace_expired,
+                        "agent_tasks_grace_expired": child.agent_tasks_grace_expired,
+                        "forced_exit": child.forced_exit,
                     }),
                 )
             })
             .collect::<serde_json::Map<String, Value>>();
         let value = json!({
-            "schema": 2,
+            "schema": 4,
             "test": DIAGNOSTIC_TEST,
             "run_nonce": self.run_nonce.as_str(),
             "source_head": self.source_head.as_str(),
@@ -328,6 +368,28 @@ impl TestDiagnostic {
         }
     }
 
+    fn child_shutdown_observed(
+        &self,
+        label: &'static str,
+        five_second_state: &'static str,
+        port_file_removed: bool,
+        markers: ShutdownMarkers,
+    ) -> Result<()> {
+        let index = child_index(label)?;
+        self.update(|state| {
+            let child = &mut state.children[index];
+            child.five_second_state = five_second_state;
+            child.port_file_removed = Some(port_file_removed);
+            child.marker_parse_valid = Some(markers.parse_valid);
+            child.api_shutdown_received = Some(markers.api_shutdown_received);
+            child.shutdown_complete = Some(markers.shutdown_complete);
+            child.axum_grace_expired = Some(markers.axum_grace_expired);
+            child.server_tasks_grace_expired = Some(markers.server_tasks_grace_expired);
+            child.agent_tasks_grace_expired = Some(markers.agent_tasks_grace_expired);
+            child.forced_exit = Some(markers.forced_exit);
+        })
+    }
+
     fn finish(&self, passed: bool) -> Result<()> {
         self.update(|state| {
             state.result = if passed { "passed" } else { "failed" };
@@ -397,6 +459,7 @@ struct OwnedDaemon {
     token: String,
     data_dir: PathBuf,
     diagnostic: TestDiagnostic,
+    private_log: PathBuf,
 }
 
 impl OwnedDaemon {
@@ -408,11 +471,23 @@ impl OwnedDaemon {
         label: &'static str,
         diagnostic: TestDiagnostic,
     ) -> Result<Self> {
+        let private_log_dir = data_dir
+            .parent()
+            .context("owned daemon data directory has no parent")?
+            .join(".private-home-logs");
+        std::fs::create_dir_all(&private_log_dir)?;
+        let private_log = private_log_dir.join(format!("{label}.log"));
+        let log = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&private_log)
+            .context("create private daemon log")?;
+        let log_stderr = log.try_clone().context("clone private daemon log")?;
         let child = Command::new(binary)
             .args(["--config", &config.display().to_string()])
             .args(["--skip-update-check", "--no-port-mapping"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_stderr))
             .spawn()
             .with_context(|| format!("spawn owned daemon {}", binary.display()))?;
         let mut daemon = Self {
@@ -422,6 +497,7 @@ impl OwnedDaemon {
             token: String::new(),
             data_dir,
             diagnostic,
+            private_log,
         };
         daemon.record_started()?;
         daemon.wait_ready().await?;
@@ -577,25 +653,29 @@ impl OwnedDaemon {
         self.request(reqwest::Method::PUT, path, Some(body)).await
     }
 
-    async fn stop(&mut self) -> Result<()> {
+    async fn stop(&mut self, scenario_deadline: tokio::time::Instant) -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()?;
         self.diagnostic.clear_http_status()?;
-        let shutdown = client
-            .post(format!("http://{}/shutdown", self.api))
-            .bearer_auth(&self.token)
-            .send()
-            .await;
-        if let Ok(response) = shutdown {
-            self.diagnostic.http_status(response.status())?;
+        let shutdown = tokio::time::timeout_at(
+            scenario_deadline,
+            client
+                .post(format!("http://{}/shutdown", self.api))
+                .bearer_auth(&self.token)
+                .send(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let shutdown_status = shutdown.as_ref().map(reqwest::Response::status);
+        if let Some(status) = shutdown_status {
+            self.diagnostic.http_status(status)?;
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while self.is_running()? && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let (running, five_second_state) =
+            observe_shutdown_with_api_window(|| self.is_running(), scenario_deadline).await?;
         let mut escalation = "none";
-        if self.is_running()? {
+        if running {
             self.child.as_mut().context("owned child missing")?.kill()?;
             escalation = "kill";
         }
@@ -608,9 +688,164 @@ impl OwnedDaemon {
         };
         self.diagnostic
             .child_reaped(self.label, status, escalation)?;
+        let markers = parse_shutdown_markers(&self.private_log);
+        let port_file_removed = !self.data_dir.join("api.port").exists();
+        self.diagnostic.child_shutdown_observed(
+            self.label,
+            five_second_state,
+            port_file_removed,
+            markers,
+        )?;
+        ensure!(
+            shutdown_status == Some(StatusCode::OK),
+            "shutdown request failed"
+        );
+        ensure!(
+            escalation == "none",
+            "owned daemon exceeded shutdown deadline"
+        );
         ensure!(status.success(), "owned daemon exited with {status}");
+        ensure!(
+            shutdown_is_clean(status.success(), escalation, port_file_removed, markers),
+            "daemon did not complete a verified graceful shutdown"
+        );
         Ok(())
     }
+}
+
+async fn observe_shutdown_until(
+    mut is_running: impl FnMut() -> Result<bool>,
+    deadline: tokio::time::Instant,
+) -> Result<(bool, &'static str)> {
+    let five_seconds = tokio::time::Instant::now() + SHUTDOWN_FIVE_SECOND_OBSERVATION;
+    let mut five_second_state = "not_observed";
+    loop {
+        let running = is_running()?;
+        let now = tokio::time::Instant::now();
+        if !running {
+            return Ok((
+                false,
+                if five_second_state == "running" {
+                    "running"
+                } else {
+                    "exited_before"
+                },
+            ));
+        }
+        if five_second_state == "not_observed" && now >= five_seconds {
+            five_second_state = "running";
+        }
+        if now >= deadline {
+            return Ok((true, five_second_state));
+        }
+        let mut next = (now + Duration::from_millis(50)).min(deadline);
+        if five_second_state == "not_observed" {
+            next = next.min(five_seconds);
+        }
+        tokio::time::sleep_until(next).await;
+    }
+}
+
+async fn observe_shutdown_with_api_window(
+    is_running: impl FnMut() -> Result<bool>,
+    scenario_deadline: tokio::time::Instant,
+) -> Result<(bool, &'static str)> {
+    let deadline = (tokio::time::Instant::now() + API_SHUTDOWN_TIMEOUT).min(scenario_deadline);
+    observe_shutdown_until(is_running, deadline).await
+}
+
+fn shutdown_is_clean(
+    status_success: bool,
+    escalation: &str,
+    port_file_removed: bool,
+    markers: ShutdownMarkers,
+) -> bool {
+    status_success
+        && escalation == "none"
+        && port_file_removed
+        && markers.parse_valid
+        && markers.api_shutdown_received
+        && markers.shutdown_complete
+        && !markers.forced_exit
+}
+
+fn parse_shutdown_markers(path: &Path) -> ShutdownMarkers {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return ShutdownMarkers::default();
+    };
+    let mut markers = ShutdownMarkers {
+        parse_valid: true,
+        ..ShutdownMarkers::default()
+    };
+    // Coupled to `src/bin/x0xd.rs`'s `SHUTDOWN_EXIT_DEADLINE` debug formatting.
+    // Drift remains fail closed because an unmatched shutdown line invalidates parsing.
+    let forced = "x0xd: graceful shutdown exceeded 5s; forcing exit";
+    for line in contents.lines() {
+        if line == forced {
+            markers.forced_exit = true;
+            continue;
+        }
+        let parsed: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => {
+                if line.contains("shutdown") || line.contains("Shutdown") {
+                    markers.parse_valid = false;
+                }
+                continue;
+            }
+        };
+        let Some(message) = parsed.pointer("/fields/message").and_then(Value::as_str) else {
+            continue;
+        };
+        let target = parsed.get("target").and_then(Value::as_str);
+        let matched = match (target, message) {
+            (Some("x0x::server"), "Received API shutdown request") => {
+                markers.api_shutdown_received = true;
+                true
+            }
+            (Some("x0x::server"), "Shutdown complete") => {
+                markers.shutdown_complete = true;
+                true
+            }
+            (
+                Some("x0x::server"),
+                "API server did not shut down within 2s; aborting lingering connections",
+            ) => {
+                markers.axum_grace_expired = true;
+                true
+            }
+            (
+                Some("x0x::server"),
+                "background tasks did not stop within grace; aborting stragglers",
+            ) => {
+                markers.server_tasks_grace_expired = true;
+                true
+            }
+            (
+                Some("x0x"),
+                "Agent background tasks did not stop within grace; aborting stragglers",
+            ) => {
+                markers.agent_tasks_grace_expired = true;
+                true
+            }
+            _ => false,
+        };
+        if !matched && is_shutdown_marker_message(message) {
+            markers.parse_valid = false;
+        }
+    }
+    markers
+}
+
+fn is_shutdown_marker_message(message: &str) -> bool {
+    matches!(
+        message,
+        "Received API shutdown request"
+            | "Shutdown complete"
+            | "API server did not shut down within 2s; aborting lingering connections"
+            | "background tasks did not stop within grace; aborting stragglers"
+            | "Agent background tasks did not stop within grace; aborting stragglers"
+    )
 }
 
 fn advertised_matches(contents: &str, expected: SocketAddr) -> bool {
@@ -708,7 +943,7 @@ fn write_config(path: &Path, config: &NodeConfig<'_>) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     let contents = format!(
-        "bind_address = \"{}\"\napi_address = \"{}\"\ndata_dir = {}\nidentity_dir = {}\nuser_key_path = {}\nbootstrap_peers = [{peers}]\nnetwork_id = \"{}\"\nport_mapping_enabled = false\nrendezvous_enabled = false\nlog_level = \"warn\"\n",
+        "bind_address = \"{}\"\napi_address = \"{}\"\ndata_dir = {}\nidentity_dir = {}\nuser_key_path = {}\nbootstrap_peers = [{peers}]\nnetwork_id = \"{}\"\nport_mapping_enabled = false\nrendezvous_enabled = false\nlog_level = \"info\"\nlog_format = \"json\"\n",
         config.quic,
         config.api,
         toml_string(config.data_dir)?,
@@ -1339,8 +1574,8 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     ensure!(status == StatusCode::OK && sealed["ok"] == true);
 
     diagnostic.phase("initial_stop")?;
-    joiner.stop().await?;
-    owner.stop().await?;
+    joiner.stop(onboarding_deadline).await?;
+    owner.stop(onboarding_deadline).await?;
     diagnostic.phase("owner_restart")?;
     let mut owner = OwnedDaemon::start(
         &x0xd,
@@ -1417,8 +1652,8 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK && sealed_after["ok"] == true);
     diagnostic.phase("final_stop")?;
-    joiner.stop().await?;
-    owner.stop().await?;
+    joiner.stop(restart_deadline).await?;
+    owner.stop(restart_deadline).await?;
     Ok(())
 }
 
@@ -1671,11 +1906,13 @@ async fn diagnostic_records_spawned_child_when_readiness_fails() -> Result<()> {
     let path = root.path().join("diagnostic.json");
     let diagnostic = diagnostic_for_control(&root, "diagnostic.json")?;
     diagnostic.phase("owner_initial_start")?;
+    let data_dir = root.path().join("data");
+    std::fs::create_dir(&data_dir)?;
     let result = OwnedDaemon::start(
         Path::new("/usr/bin/false"),
         &root.path().join("unused.toml"),
         "127.0.0.1:9".parse()?,
-        root.path().to_path_buf(),
+        data_dir,
         "owner_initial",
         diagnostic,
     )
@@ -1703,6 +1940,7 @@ async fn diagnostic_receipt_failure_reaps_already_spawned_child() -> Result<()> 
         token: String::new(),
         data_dir: root.path().to_path_buf(),
         diagnostic,
+        private_log: root.path().join("unused-private.log"),
     };
     assert!(daemon.record_started().is_err());
     drop(daemon);
@@ -1727,4 +1965,163 @@ fn diagnostic_guard_preserves_unwind_phase() -> Result<()> {
     assert_eq!(value["failure_kind"], "stage_failed");
     assert_eq!(value["phase"], "profile_identity");
     Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_observation_keeps_waiting_after_five_seconds() -> Result<()> {
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let release = Arc::clone(&running);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        release.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    let deadline = tokio::time::Instant::now() + API_SHUTDOWN_TIMEOUT;
+    let (timed_out_running, five_second_state) = observe_shutdown_until(
+        || Ok(running.load(std::sync::atomic::Ordering::SeqCst)),
+        deadline,
+    )
+    .await?;
+    assert!(!timed_out_running);
+    assert_eq!(five_second_state, "running");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_observation_reports_deadline_without_turning_it_into_success() -> Result<()> {
+    let deadline = tokio::time::Instant::now() + API_SHUTDOWN_TIMEOUT;
+    let (timed_out_running, five_second_state) =
+        observe_shutdown_until(|| Ok(true), deadline).await?;
+    assert!(timed_out_running);
+    assert_eq!(five_second_state, "running");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn sequential_shutdowns_each_receive_their_own_api_window() -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let phase_deadline = start + Duration::from_secs(40);
+    let (first_running, first_five_second_state) = observe_shutdown_with_api_window(
+        || Ok(tokio::time::Instant::now() < start + Duration::from_secs(26)),
+        phase_deadline,
+    )
+    .await?;
+    assert!(!first_running);
+    assert_eq!(first_five_second_state, "running");
+
+    let (second_running, second_five_second_state) = observe_shutdown_with_api_window(
+        || Ok(tokio::time::Instant::now() < start + Duration::from_secs(33)),
+        phase_deadline,
+    )
+    .await?;
+    assert!(!second_running);
+    assert_eq!(second_five_second_state, "running");
+    assert!(tokio::time::Instant::now() <= phase_deadline);
+
+    let legacy_start = tokio::time::Instant::now();
+    let legacy_phase_deadline = legacy_start + Duration::from_secs(40);
+    let shared_deadline = (legacy_start + API_SHUTDOWN_TIMEOUT).min(legacy_phase_deadline);
+    let (legacy_first_running, _) = observe_shutdown_with_api_window(
+        || Ok(tokio::time::Instant::now() < legacy_start + Duration::from_secs(26)),
+        shared_deadline,
+    )
+    .await?;
+    assert!(!legacy_first_running);
+    let (legacy_second_running, legacy_second_state) = observe_shutdown_with_api_window(
+        || Ok(tokio::time::Instant::now() < legacy_start + Duration::from_secs(33)),
+        shared_deadline,
+    )
+    .await?;
+    assert!(legacy_second_running);
+    assert_eq!(legacy_second_state, "not_observed");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn shutdown_cutoff_before_five_seconds_is_persisted_honestly() -> Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let root = TempDir::new()?;
+    let path = root.path().join("diagnostic.json");
+    let diagnostic = diagnostic_for_control(&root, "diagnostic.json")?;
+    diagnostic.phase("initial_stop")?;
+    diagnostic.child_started("joiner_initial")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (running, five_second_state) = observe_shutdown_until(|| Ok(true), deadline).await?;
+    assert!(running);
+    assert_eq!(five_second_state, "not_observed");
+    diagnostic.child_reaped(
+        "joiner_initial",
+        std::process::ExitStatus::from_raw(9),
+        "kill",
+    )?;
+    diagnostic.child_shutdown_observed(
+        "joiner_initial",
+        five_second_state,
+        false,
+        ShutdownMarkers::default(),
+    )?;
+    diagnostic.finish(false)?;
+
+    let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let child = &value["children"]["joiner_initial"];
+    assert_eq!(child["five_second_state"], "not_observed");
+    assert_eq!(child["cleanup"], "reaped");
+    assert_eq!(child["signaled"], true);
+    assert_eq!(child["escalation"], "kill");
+    assert!(child["port_file_removed"].is_boolean());
+    assert!(child["forced_exit"].is_boolean());
+    Ok(())
+}
+
+#[test]
+fn shutdown_markers_require_exact_trusted_context() -> Result<()> {
+    let root = TempDir::new()?;
+    let valid = root.path().join("valid.log");
+    std::fs::write(
+        &valid,
+        concat!(
+            "{\"target\":\"x0x::server\",\"fields\":{\"message\":\"Received API shutdown request\"}}\n",
+            "{\"target\":\"x0x::server\",\"fields\":{\"message\":\"Shutdown complete\"}}\n"
+        ),
+    )?;
+    let markers = parse_shutdown_markers(&valid);
+    assert!(markers.parse_valid);
+    assert!(markers.api_shutdown_received && markers.shutdown_complete);
+    assert!(shutdown_is_clean(true, "none", true, markers));
+
+    let spoof = root.path().join("spoof.log");
+    std::fs::write(
+        &spoof,
+        "{\"target\":\"untrusted\",\"fields\":{\"message\":\"Shutdown complete\"}}\n",
+    )?;
+    assert!(!parse_shutdown_markers(&spoof).parse_valid);
+
+    let malformed = root.path().join("malformed.log");
+    std::fs::write(&malformed, "not-json Shutdown complete\n")?;
+    assert!(!parse_shutdown_markers(&malformed).parse_valid);
+    assert!(!parse_shutdown_markers(&root.path().join("missing.log")).parse_valid);
+    Ok(())
+}
+
+#[test]
+fn clean_shutdown_rejects_forced_exit_or_retained_port() {
+    let clean = ShutdownMarkers {
+        parse_valid: true,
+        api_shutdown_received: true,
+        shutdown_complete: true,
+        ..ShutdownMarkers::default()
+    };
+    assert!(shutdown_is_clean(true, "none", true, clean));
+    assert!(!shutdown_is_clean(
+        true,
+        "none",
+        true,
+        ShutdownMarkers {
+            forced_exit: true,
+            ..clean
+        }
+    ));
+    assert!(!shutdown_is_clean(true, "none", false, clean));
+    assert!(!shutdown_is_clean(true, "kill", true, clean));
 }

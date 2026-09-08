@@ -42,12 +42,17 @@ def pinned_nextest_09126_lines():
 
 def diagnostic(result="passed", phase="complete"):
     children = {label: {"started": True, "cleanup": "reaped", "exit_code": 0,
-                "signaled": False, "escalation": "none"}
+                "signaled": False, "escalation": "none",
+                "five_second_state": "exited_before", "port_file_removed": True,
+                "marker_parse_valid": True, "api_shutdown_received": True,
+                "shutdown_complete": True, "axum_grace_expired": False,
+                "server_tasks_grace_expired": False,
+                "agent_tasks_grace_expired": False, "forced_exit": False}
                 for label in collect.CHILD_LABELS}
     observation = {"check": "none", "side": "none",
                    **{field: None for field in collect.OBSERVATION_FIELDS},
                    "observed_count": None, "count_capped": False}
-    return {"schema": 2, "test": collect.TEST_NAME, "run_nonce": NONCE,
+    return {"schema": 4, "test": collect.TEST_NAME, "run_nonce": NONCE,
             "source_head": HEAD, "source_tree": TREE, "entered": True,
             "phase": phase, "result": result,
             "failure_kind": "none" if result != "failed" else "stage_failed",
@@ -214,9 +219,95 @@ def main():
         temp = Path(directory); run, safe, _ = fixture(temp)
         value = diagnostic("failed", "owner_initial_start")
         value["children"]["owner_initial"].update(cleanup="cleanup_failed", exit_code=None)
+        value["children"]["owner_initial"]["five_second_state"] = "not_attempted"
+        for field in ("port_file_removed", "marker_parse_valid",
+                      "api_shutdown_received", "shutdown_complete", "axum_grace_expired",
+                      "server_tasks_grace_expired", "agent_tasks_grace_expired", "forced_exit"):
+            value["children"]["owner_initial"][field] = None
         write(run / "test-diagnostic.json", value)
         assert not collect.sanitize(run, safe, temp, NONCE)
         assert json.loads((safe / "outcome.json").read_text())["failure_stage"] == "cleanup"
+
+    for field, value in (("forced_exit", True), ("port_file_removed", False),
+                         ("shutdown_complete", False), ("marker_parse_valid", False)):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory); run, safe, _ = fixture(temp)
+            receipt = diagnostic("failed", "initial_stop")
+            receipt["children"]["joiner_initial"][field] = value
+            write(run / "test-diagnostic.json", receipt)
+            assert not collect.sanitize(run, safe, temp, NONCE)
+            saved = json.loads((safe / "test-diagnostic.json").read_text())
+            assert saved["children"]["joiner_initial"][field] is value
+            assert json.loads((safe / "outcome.json").read_text())["failure_stage"] == "test"
+
+    rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
+        **json.loads((run / "test-diagnostic.json").read_text()),
+        "children": {
+            **json.loads((run / "test-diagnostic.json").read_text())["children"],
+            "joiner_initial": {
+                **json.loads((run / "test-diagnostic.json").read_text())["children"]["joiner_initial"],
+                "shutdown_complete": None,
+            },
+        },
+    }), "partial shutdown observation accepted")
+
+    rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
+        **json.loads((run / "test-diagnostic.json").read_text()),
+        "children": {
+            **json.loads((run / "test-diagnostic.json").read_text())["children"],
+            "joiner_initial": {
+                **json.loads((run / "test-diagnostic.json").read_text())["children"]["joiner_initial"],
+                "five_second_state": "invented",
+            },
+        },
+    }), "unknown five-second observation state accepted")
+
+    rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
+        **json.loads((run / "test-diagnostic.json").read_text()),
+        "children": {
+            **json.loads((run / "test-diagnostic.json").read_text())["children"],
+            "joiner_initial": {
+                **json.loads((run / "test-diagnostic.json").read_text())["children"]["joiner_initial"],
+                "five_second_state": 1,
+            },
+        },
+    }), "integer five-second observation state accepted")
+
+    rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
+        **json.loads((run / "test-diagnostic.json").read_text()),
+        "children": {
+            **json.loads((run / "test-diagnostic.json").read_text())["children"],
+            "joiner_initial": {
+                **json.loads((run / "test-diagnostic.json").read_text())["children"]["joiner_initial"],
+                "five_second_state": "not_attempted",
+            },
+        },
+    }), "unattempted state with shutdown observations accepted")
+
+    with tempfile.TemporaryDirectory() as directory:
+        temp = Path(directory); run, safe, wrapper = fixture(temp)
+        value = diagnostic("failed", "initial_stop")
+        value["children"]["joiner_initial"].update(
+            cleanup="reaped", exit_code=None, signaled=True, escalation="kill",
+            five_second_state="not_observed", port_file_removed=False,
+            marker_parse_valid=False, api_shutdown_received=False,
+            shutdown_complete=False, axum_grace_expired=False,
+            server_tasks_grace_expired=False, agent_tasks_grace_expired=False,
+            forced_exit=False)
+        write(run / "test-diagnostic.json", value)
+        write(run / "nextest.json", collect.nextest_receipt_from_lines(nextest_lines("failed")))
+        runtime = json.loads((run / "runtime.json").read_text()); runtime["wrapper_exit"] = 100
+        write(run / "runtime.json", runtime)
+        write(wrapper / "exit.json", {"exit": 100})
+        supervisor = json.loads((wrapper / "supervisor.json").read_text())
+        supervisor["child_exit"] = 100
+        write(wrapper / "supervisor.json", supervisor)
+        assert not collect.sanitize(run, safe, temp, NONCE)
+        saved = json.loads((safe / "test-diagnostic.json").read_text())
+        assert saved["children"]["joiner_initial"]["five_second_state"] == "not_observed"
+        assert saved["children"]["joiner_initial"]["cleanup"] == "reaped"
+        assert json.loads((safe / "outcome.json").read_text()) == {
+            "accepted": False, "failure_stage": "test", "schema": 1}
 
     with tempfile.TemporaryDirectory() as directory:
         temp = Path(directory); run, safe, _ = fixture(temp)
@@ -224,6 +315,11 @@ def main():
         value["cli_exit_code"] = None
         for child in value["children"].values():
             child.update(started=False, cleanup="not_started", exit_code=None)
+            child["five_second_state"] = "not_attempted"
+            for field in ("port_file_removed", "marker_parse_valid",
+                          "api_shutdown_received", "shutdown_complete", "axum_grace_expired",
+                          "server_tasks_grace_expired", "agent_tasks_grace_expired", "forced_exit"):
+                child[field] = None
         write(run / "test-diagnostic.json", value)
         assert not collect.sanitize(run, safe, temp, NONCE)
         assert json.loads((safe / "outcome.json").read_text())["failure_stage"] == "test"
@@ -236,7 +332,7 @@ def main():
 
     assert collect.admission_deadline_exit(915) is None
     assert collect.admission_deadline_exit(914.999) == 124
-    print("home onboarding collector controls: 27/27 passed")
+    print("home onboarding collector controls: 36/36 passed")
 
 
 if __name__ == "__main__":
