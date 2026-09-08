@@ -2136,7 +2136,8 @@ expired-retained base records, and present/fresh/expired-retained extension reco
 `totals.relay` counts distinct agents and fresh/expired-retained baselines. These are
 per-store counts, not an exact cross-store union total. Collection uses bounded
 auxiliary memory but scans retained entries in O(n) time; it does not cap, prune,
-refresh or insert into either store.
+refresh or insert into either store. The capability scan holds the same cache mutex
+used by the DM send path while examining retained entries.
 
 Each row contains:
 
