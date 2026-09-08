@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Component acceptance, not public fallback-trigger or durable-ACK coverage.
 //! Real Agent/socket test: never included in the locally admitted pure selectors.
 mod custody;
