@@ -415,3 +415,296 @@ fn scope_parse_roundtrip_and_rejects_garbage() {
     assert!(Scope::parse("dm:").is_err());
     assert!(Scope::parse("weird:x").is_err());
 }
+
+// ─── Issue #275: cross-scope search + scope discovery ───────────────────
+
+/// Seed three scopes that share the needle so a cross-scope search has
+/// something to merge and a scoped search has something to exclude.
+fn seed_cross_scope(store: &Store) {
+    for (scope, seen) in [
+        (Scope::Dm("peer-a".into()), 1_000),
+        (Scope::Group("g-1".into()), 2_000),
+        (Scope::Topic("chat".into()), 3_000),
+    ] {
+        let payload = format!("needle in {scope}");
+        store
+            .insert(&record(payload.as_bytes(), scope, seen))
+            .unwrap();
+    }
+}
+
+/// WHY (issue #275): the whole point of relaxing `scope` on
+/// `/history/search` is that a caller who does not yet know a scope string
+/// can still find their own rows. If a scope-less query silently kept a
+/// filter, discovery would be impossible; if a scoped query stopped
+/// filtering, the existing per-scope contract would leak rows.
+#[test]
+fn search_without_scope_spans_scopes_and_with_scope_stays_a_subset() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    seed_cross_scope(&store);
+
+    let all = store.search("needle", &HistoryQuery::default()).unwrap();
+    assert_eq!(all.len(), 3, "scope-less search must span every scope");
+    let mut kinds: Vec<i64> = all.iter().map(|r| r.record.scope.kind()).collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, vec![0, 1, 2], "one hit per scope kind");
+    assert!(
+        all.windows(2).all(|w| w[0].id > w[1].id),
+        "cross-scope results keep the newest-rowid-first order"
+    );
+
+    let scoped = store
+        .search(
+            "needle",
+            &HistoryQuery {
+                scope: Some(Scope::Group("g-1".into())),
+                ..HistoryQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(scoped.len(), 1, "scoped search still filters");
+    assert_eq!(scoped[0].record.scope, Scope::Group("g-1".into()));
+}
+
+/// WHY (issue #275): cross-scope search is only usable if it pages. The
+/// rowid keyset must walk every matching row exactly once — a page boundary
+/// that repeats or drops a row would make "search all my history" quietly
+/// lossy, and rowids are globally unique so the cursor cannot depend on
+/// which scope the previous page ended in.
+#[test]
+fn cross_scope_search_pages_by_rowid_without_gaps_or_repeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    // Interleave scopes so consecutive rowids cross scope boundaries.
+    let scopes = [
+        Scope::Dm("peer-a".into()),
+        Scope::Group("g-1".into()),
+        Scope::Topic("chat".into()),
+    ];
+    for n in 0..9_i64 {
+        let payload = format!("needle row {n:02}");
+        store
+            .insert(&record(
+                payload.as_bytes(),
+                scopes[n as usize % scopes.len()].clone(),
+                1_000 + n,
+            ))
+            .unwrap();
+    }
+
+    let mut seen_ids = Vec::new();
+    let mut before_id = None;
+    loop {
+        let page = store
+            .search(
+                "needle",
+                &HistoryQuery {
+                    limit: 2,
+                    before_id,
+                    ..HistoryQuery::default()
+                },
+            )
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "limit is honored on the search path");
+        before_id = page.last().map(|r| r.id);
+        seen_ids.extend(page.into_iter().map(|r| r.id));
+    }
+    let mut deduped = seen_ids.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(seen_ids.len(), 9, "every matching row is visited");
+    assert_eq!(deduped.len(), 9, "no row is served twice across pages");
+    assert!(
+        seen_ids.windows(2).all(|w| w[0] > w[1]),
+        "paging stays strictly descending by rowid"
+    );
+}
+
+/// WHY (issue #275): the enumeration cursor is `(scope_kind, scope_id)`.
+/// Scope ids are only unique WITHIN a kind, so `dm:same` and `group:same`
+/// are two distinct rows that must both appear — a cursor keyed on the id
+/// alone would swallow one. Ordering must not depend on time either, so
+/// identical `seen_at_ms` across scopes cannot perturb it.
+#[test]
+fn scopes_enumerate_equal_ids_across_kinds_and_ignore_equal_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    for (scope, body) in [
+        (Scope::Dm("same".into()), "dm body"),
+        (Scope::Group("same".into()), "group body"),
+        (Scope::Topic("same".into()), "topic body"),
+    ] {
+        // Identical seen_at_ms in all three scopes.
+        store
+            .insert(&record(body.as_bytes(), scope, 7_777))
+            .unwrap();
+    }
+
+    let all = store.scopes(None, 0).unwrap();
+    assert_eq!(
+        all.iter().map(|s| s.scope.canonical()).collect::<Vec<_>>(),
+        vec!["dm:same", "group:same", "topic:same"],
+        "ordering is (scope_kind, scope_id) ascending, not time"
+    );
+    assert!(all
+        .iter()
+        .all(|s| s.rows == 1 && s.newest_seen_at_ms == 7_777));
+
+    // Walk it one page at a time through the canonical cursor.
+    let mut walked = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store.scopes(after.as_ref(), 1).unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some(last.scope.clone());
+        walked.extend(page.into_iter().map(|s| s.scope.canonical()));
+    }
+    assert_eq!(
+        walked,
+        vec!["dm:same", "group:same", "topic:same"],
+        "keyset paging visits each (kind, id) exactly once"
+    );
+}
+
+/// WHY (issue #275): the enumeration is aggregated from the CURRENT rows,
+/// not from a scope registry. That is what makes it honest after deletion —
+/// a purged scope must vanish rather than linger with a stale count, and a
+/// retention eviction must lower the count it reports.
+#[test]
+fn scope_counts_track_purge_and_retention_of_retained_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    for n in 0..3_i64 {
+        store
+            .insert(&record(
+                format!("kept {n}").as_bytes(),
+                Scope::Group("keep".into()),
+                1_000 + n,
+            ))
+            .unwrap();
+    }
+    store
+        .insert(&record(b"doomed", Scope::Dm("gone".into()), 5_000))
+        .unwrap();
+
+    let before: Vec<_> = store
+        .scopes(None, 0)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.scope.canonical(), s.rows))
+        .collect();
+    assert_eq!(
+        before,
+        vec![("dm:gone".to_string(), 1), ("group:keep".to_string(), 3)]
+    );
+
+    assert_eq!(store.purge(&Scope::Dm("gone".into())).unwrap(), 1);
+    let after_purge: Vec<_> = store
+        .scopes(None, 0)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.scope.canonical())
+        .collect();
+    assert_eq!(
+        after_purge,
+        vec!["group:keep".to_string()],
+        "a scope with no retained rows leaves the enumeration entirely"
+    );
+
+    // Age retention: the three seeded rows are epoch-old, so a 1-day bound
+    // evicts exactly them and leaves the two fresh ones behind.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for n in 0..2_i64 {
+        store
+            .insert(&record(
+                format!("fresh {n}").as_bytes(),
+                Scope::Group("keep".into()),
+                now_ms + n,
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .retain(&RetentionPolicy {
+                max_bytes: u64::MAX,
+                max_age_days: 1,
+                scope_limits: Vec::new(),
+            })
+            .unwrap(),
+        3,
+        "only the epoch-old rows age out"
+    );
+    let survivors = store.scopes(None, 0).unwrap();
+    let kept = survivors
+        .iter()
+        .find(|s| s.scope == Scope::Group("keep".into()))
+        .expect("scope still has rows");
+    assert_eq!(kept.rows, 2, "the count reports retained rows only");
+    assert_eq!(
+        kept.newest_seen_at_ms,
+        now_ms + 1,
+        "the reported timestamp is the newest RETAINED row, not the evicted history"
+    );
+}
+
+/// WHY (issue #275): the limit is caller-supplied and must be bounded by
+/// the same convention the rest of the history read surface uses (0 ⇒ 100,
+/// clamped to MAX_QUERY_LIMIT) — an unbounded page would let one request
+/// materialize the entire scope space.
+#[test]
+fn scope_limit_defaults_to_100_and_clamps_to_max_query_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    for n in 0..120_i64 {
+        store
+            .insert(&record(
+                format!("row {n}").as_bytes(),
+                Scope::Topic(format!("t-{n:04}")),
+                1_000 + n,
+            ))
+            .unwrap();
+    }
+    assert_eq!(store.scopes(None, 0).unwrap().len(), 100, "0 ⇒ default 100");
+    assert_eq!(store.scopes(None, 5).unwrap().len(), 5);
+    assert_eq!(
+        store.scopes(None, usize::MAX).unwrap().len(),
+        120,
+        "an absurd limit is clamped, never rejected or unbounded"
+    );
+}
+
+/// WHY (issue #275): callers hit these two edges first — an install with no
+/// history at all, and a cursor pointing past the last scope. Both must be
+/// an empty page, not an error and not a wrap-around to the first scope.
+#[test]
+fn scopes_on_empty_store_and_past_the_end_cursor_are_empty_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    assert!(store.scopes(None, 0).unwrap().is_empty());
+
+    store
+        .insert(&record(b"only row", Scope::Dm("solo".into()), 1_000))
+        .unwrap();
+    assert_eq!(store.scopes(None, 0).unwrap().len(), 1);
+    assert!(
+        store
+            .scopes(Some(&Scope::Topic("zzzz".into())), 0)
+            .unwrap()
+            .is_empty(),
+        "a cursor past the last (kind, id) yields nothing, not the first page"
+    );
+    assert!(
+        store
+            .scopes(Some(&Scope::Dm("solo".into())), 0)
+            .unwrap()
+            .is_empty(),
+        "the cursor is exclusive — the scope it names is not repeated"
+    );
+}
