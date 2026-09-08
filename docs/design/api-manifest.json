@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 177,
+  "endpoint_count": 178,
   "endpoints": [
     {
       "category": "status",
@@ -955,17 +955,41 @@
     },
     {
       "category": "history",
+      "cli_name": "history scopes",
+      "description": "Enumerate history scopes holding retained rows, with row count and newest seen_at_ms",
+      "method": "GET",
+      "path": "/history/scopes",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "after_scope",
+            "required": false
+          },
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "limit",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "history",
       "cli_name": "history search",
-      "description": "Full-text search over text history payloads within a scope",
+      "description": "Full-text search over text history payloads (scope optional: omit to search all scopes)",
       "method": "GET",
       "path": "/history/search",
       "request": {
         "fields": [
           {
-            "cli": "SCOPE",
+            "cli": "SCOPE_OR_QUERY",
             "in": "query",
             "name": "scope",
-            "required": true
+            "required": false
           },
           {
             "cli": "QUERY",

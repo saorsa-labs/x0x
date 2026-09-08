@@ -2220,10 +2220,32 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     let owner_seed = [0x0E; 32];
 
     let loopback_addr: std::net::SocketAddr = "127.0.0.1:0".parse()?;
+    // Hermetic plane (#337/#417 class, mirroring
+    // `issue506_public_broadcast_control.rs`): `mdns_enabled` DEFAULTS TO TRUE
+    // (`network.rs::default_mdns_enabled`), so without this the agents below are
+    // mDNS-discoverable and auto-connectable by any co-located node — including
+    // the other agents this test binary spawns concurrently. The `network_id` is
+    // unique to this test AND this process, and is SHARED by the owner, the
+    // joiner, and the owner's post-restart rebuild, so those three still gossip
+    // with each other and with nothing else.
+    //
+    // This closes an isolation gap; it is NOT a proven root cause for the
+    // observed CI timeout. Whether cross-test discovery actually contributed
+    // there is unestablished, and a transport or gossip defect is not excluded.
+    let network_id = format!(
+        "hs-f2-restart-single-announce-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
     let loopback_cfg = move || x0x::network::NetworkConfig {
         bind_addr: Some(loopback_addr),
         bootstrap_nodes: Vec::new(),
         port_mapping_enabled: false,
+        mdns_enabled: false,
+        network_id: Some(network_id.clone()),
         ..x0x::network::NetworkConfig::default()
     };
 
@@ -2938,10 +2960,32 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     let joiner_dir = tempfile::tempdir()?;
     let owner_seed = [0x1E; 32];
     let loopback_addr: std::net::SocketAddr = "127.0.0.1:0".parse()?;
+    // Hermetic plane (#337/#417 class, mirroring
+    // `issue506_public_broadcast_control.rs`): `mdns_enabled` DEFAULTS TO TRUE
+    // (`network.rs::default_mdns_enabled`), so without this the agents below are
+    // mDNS-discoverable and auto-connectable by any co-located node — including
+    // the other agents this test binary spawns concurrently. The `network_id` is
+    // unique to this test AND this process, and is SHARED by the owner, the
+    // joiner, and the owner's post-restart rebuild, so those three still gossip
+    // with each other and with nothing else.
+    //
+    // This closes an isolation gap; it is NOT a proven root cause for the
+    // observed CI timeout. Whether cross-test discovery actually contributed
+    // there is unestablished, and a transport or gossip defect is not excluded.
+    let network_id = format!(
+        "hs-f2-real-home-provision-restart-join-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
     let loopback_cfg = move || x0x::network::NetworkConfig {
         bind_addr: Some(loopback_addr),
         bootstrap_nodes: Vec::new(),
         port_mapping_enabled: false,
+        mdns_enabled: false,
+        network_id: Some(network_id.clone()),
         ..x0x::network::NetworkConfig::default()
     };
 
