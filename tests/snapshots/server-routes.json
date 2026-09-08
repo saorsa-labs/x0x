@@ -500,6 +500,24 @@
     }
   },
   {
+    "method": "POST",
+    "path": "/home/seat",
+    "cli_name": "home seat",
+    "description": "Mint an addressed Home invite seating another of the owner's devices (#449)",
+    "category": "groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "AGENT_ID",
+          "in": "body",
+          "name": "agent_id",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
     "method": "GET",
     "path": "/owner/agents",
     "cli_name": "owner agents",
@@ -935,17 +953,41 @@
   },
   {
     "method": "GET",
-    "path": "/history/search",
-    "cli_name": "history search",
-    "description": "Full-text search over text history payloads within a scope",
+    "path": "/history/scopes",
+    "cli_name": "history scopes",
+    "description": "Enumerate history scopes holding retained rows, with row count and newest seen_at_ms",
     "category": "history",
     "request": {
       "fields": [
         {
-          "cli": "SCOPE",
+          "cli": "default",
+          "in": "query",
+          "name": "after_scope",
+          "required": false
+        },
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "limit",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/history/search",
+    "cli_name": "history search",
+    "description": "Full-text search over text history payloads (scope optional: omit to search all scopes)",
+    "category": "history",
+    "request": {
+      "fields": [
+        {
+          "cli": "SCOPE_OR_QUERY",
           "in": "query",
           "name": "scope",
-          "required": true
+          "required": false
         },
         {
           "cli": "QUERY",
@@ -2094,19 +2136,29 @@
           "required": false
         },
         {
-          "cli": "--home",
+          "cli": "derived",
           "in": "body",
           "name": "mode",
           "required": false
         },
         {
-          "cli": "--owner",
+          "cli": "derived",
           "in": "body",
           "name": "expected_owner_user_id",
           "required": false
         }
       ],
       "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/groups/:id/join-status",
+    "cli_name": "group join-status",
+    "description": "Pending-join status with the typed terminal outcome (#477)",
+    "category": "named-groups",
+    "request": {
+      "kind": "none"
     }
   },
   {
@@ -2720,6 +2772,24 @@
           "in": "body",
           "name": "policy",
           "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/stores",
+    "cli_name": "group store create",
+    "description": "Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane",
+    "category": "stores",
+    "request": {
+      "fields": [
+        {
+          "cli": "NAME",
+          "in": "body",
+          "name": "name",
+          "required": true
         }
       ],
       "kind": "fields"

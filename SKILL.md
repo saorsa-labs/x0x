@@ -215,7 +215,7 @@ Names surface in `/agent`, `x0x agent`, and on agent cards. The **display_name r
 
 ### 3.1 Home — the owner's space (ADR-0038)
 
-Every owned install auto-provisions exactly one **Home** at first daemon start:
+An owned install provisions one **Home** at first daemon start, but only when it can and should: it needs both a live owner key and a builder-issued agent certificate, and it yields without creating one if another of the owner's devices has already advertised a Home (that device then reports `state:"elsewhere"`). An un-synced or first device still provisions, so an offline install is never left without a Home. When it does provision:
 
 - Policy: `Hidden + OwnerCertified(owner) + MlsEncrypted + MembersOnly/MembersOnly`.
 - **`GroupAdmission::OwnerCertified(UserId)`**: a joiner is admitted ONLY with a valid, unexpired `AgentCertificate` chaining to the Home's owner — verified at invite-accept **and re-verified at every state-commit seal**, so a leaked invite or compromised admin cannot admit another human. Admin role is inert here; enforcement is cryptographic.
@@ -245,7 +245,47 @@ rather than with a consumed-secret error. In every case the replay proves
 nothing about YOUR join — mint a **fresh** invite on the owner
 (`POST /groups/<home-gid>/invite`) and join again.
 
-**Each device makes its own Home (#449).** Two machines sharing one `user.key` currently provision two separate Homes; SyncV1 (§5.1) does not yet reconcile them. Treat Home as per-device until #449 lands.
+**One Home per owner, elected — and seating a second device is a human act (#449, ADR-0060).** The owner's Home is the Tier-1 `("home")` register winner, not a per-install artifact. `GET /home` reports which Home this device actually serves — **three `200` shapes plus two `404`s**:
+
+| Answer | Meaning |
+|---|---|
+| `200 state:"local"` | this device holds the canonical Home (or is uncontested) — full payload |
+| `200 state:"adoption_pending"` | this device holds a Home that LOST the election; still usable until seated in `canonical_group_id`. Full payload **plus `next_step`** |
+| `200 state:"elsewhere"` | the owner's Home is on another device and this one is not a member. **Short** body (`owner_user_id`, `canonical_group_id`, `local_group_id`, `detail`, `next_step`) with no `group_id`/`members`/`duplicates`/`warnings` |
+| `404 no Home provisioned (un-owned install)` | no user key is loaded on this device at all |
+| `404 no Home provisioned` | owned, but no Home this device can see |
+
+`"elsewhere"` is deliberately a `200`, not a `404` — answering `404` there is what let a second device look Home-less and quietly provision a duplicate. `next_step` is carried on **both** `adoption_pending` and `elsewhere`, never on `local`.
+
+Seating is **owner-driven and never inferred**. Run it on the device that holds the canonical Home:
+
+Before seating works, the joining device must already be **owned by the same owner**. Home admission is `GroupAdmission::OwnerCertified(UserId)`, so the joiner needs a current certificate chaining to this Home's owner; an install with a different owner id can never be admitted.
+
+That setup is human-managed and documented in the README's [*Add a second device*](https://github.com/saorsa-labs/x0x/blob/main/README.md#quickstart) step: put the **same** user key on the new machine, either by re-deriving it from the 32-byte seed (`x0x user-id create <path> --from-seed <HEX>` — same seed, same `UserId` on any machine) or by copying the `user.key` file yourself. A plain `x0x user-id create` with no seed generates a **random** key and therefore a different owner. The seed and the key file are yours to hold and move; the daemon never fetches either, and no agent can retrieve them for you. If your existing key was generated randomly, there is no seed to recover — copy the file.
+
+Then, on the seating device:
+
+- read the joining device's agent id there with `x0x agent` (it must be a different agent);
+- use the **durable** `api-token` from the canonical device's data dir (§7.5), not a session token.
+
+`x0x home seat` mints an invite and nothing more: it does not copy keys, enroll machines, issue certificates, or deliver the invite. Owner keys are never auto-generated or auto-rotated — replacing one is the explicit `x0x user-id create --rotate-owner` (§2).
+
+```bash
+# On the CANONICAL device, as the human, with the DURABLE token (not a session token):
+x0x home seat <64-lowercase-hex agent id of the OTHER device>
+```
+
+- Requires the **durable owner token** — a session token a harness holds gets `403`. The human authorizes on the canonical device.
+- The `agent_id` must be a **different** agent; passing this daemon's own id is refused (it already holds the seat).
+- Run on a losing or Home-less device it refuses with a typed conflict (`adoption_pending` / `elsewhere` / `unknown`) naming where to run instead.
+- It mints an **addressed** invite (`intended_joiner` bound to that one agent) and returns `owner_user_id` plus a `join_hint`. The response carries **`"seated": false`** — a mint is an OFFER, not a seat.
+- The named device then joins with the **owner pin explicitly set**: `x0x group join <invite> --home --owner <owner_user_id>`. An unpinned Home join can be answered by any group.
+
+Adoption is only complete once that join is accepted and the joiner observes its own `MemberAdded`; a `pending` join is in-memory only and does not survive a restart (see the paragraph above). **A `200` from `x0x home seat` is not completion, and neither is a `pending` join — the durable proof is the joiner still seated after a restart.**
+
+Duplicate Homes are listed read-only under `duplicates` in `GET /home`, with `retirement: "manual_only"` and `evidence_against_deletion`. **Automatic retirement is not implemented, and an empty blocker list is not permission to delete** — nothing infers that a duplicate is safe to remove.
+
+Not yet runtime-accepted: #449 stays open until the seating command is shipped, reviewed and proven at runtime. No multi-device convergence claim is made here.
 
 ### 3.2 Sub-agents via the harness (ADR-0039)
 
@@ -562,12 +602,36 @@ x0x identity revoke --agent-id <64-hex> --machine-id <64-hex> --move-epoch <N>  
 Everything this daemon sent/received lands in `<data_dir>/history.db`; queries are purely LOCAL (§5.1 — no network backfill).
 
 ```bash
+x0x history scopes                                # GET /history/scopes — which scopes hold rows
 x0x history list "group:<gid>" --limit 50         # GET /history?scope&since_ms&until_ms&limit&before_id
 x0x history message <msg_id> --scope group:<gid>  # GET /history/message/:msg_id (scope hint for group ids)
-x0x history search "group:<gid>" <terms>          # GET /history/search?scope&q=
+x0x history search "group:<gid>" <terms>          # GET /history/search?scope&q= — one scope
+x0x history search <terms>                        # GET /history/search?q=      — ALL scopes
 x0x history stats                                 # GET /history/stats
 x0x history purge "dm:<agent_hex>"                # DELETE /history?scope= — destructive LOCAL purge
 ```
+
+**Discovery (issue #275).** Start from `x0x history scopes` when you do not
+already hold a scope string. Each row is `scope` (canonical),
+`scope_kind`/`scope_id` (the stored columns), `rows`, and
+`newest_seen_at_ms`, ordered by `(scope_kind, scope_id)`. Page with
+`--after-scope <canonical>` from the previous response's
+`next_after_scope`; `--limit` defaults to 100 and clamps to 500. Only
+scopes with **retained** rows appear, and counts are of retained rows only —
+retention and `history purge` shrink them and can remove a scope entirely.
+This describes local storage, never network completeness.
+
+`history search` has two forms, told apart by argument **count**: two
+positionals keep the legacy per-scope search, one positional searches every
+retained scope. Both paginate on the same rowid keyset as `history list`
+(`--before-id` in, `next_before_id` out). A malformed `--scope`/`SCOPE`
+is still `400`, and an empty query is still `400`.
+
+**Auth:** `GET /history/search` and `GET /history/scopes` are **owner-only**.
+The ADR-0039 rider allowlist admits `GET /history` and nothing else under
+`/history`, so a rider token gets `403` on both — cross-scope results and
+per-scope counts never reach a rider. Rider `GET /history` is unchanged:
+granted `group:` scopes only, limit clamped to 100.
 
 ---
 
@@ -587,7 +651,7 @@ x0x sync revoke <machine_id>       # DELETE /sync/devices/:machine_id — next s
 - **Tier 2 — pull-on-demand Home history: DESIGNED, NOT SHIPPED.** ADR-0041 defines it, but the current SyncV1 module implements Tier 1 only; there is no peer history backfill. `GET /history?scope=group:<gid>` is a purely LOCAL query against your own durable history.
 - **Tier 3 — never replicates:** non-Home group history, DM history, exec session state. Per-machine, full stop.
 
-Enrollment is the ADR-0043 direction: the daemon holding the owner key signs the enrollment; a non-enrolled machine's SyncV1 stream is rejected at accept (verified on the testnet), and each side proves possession of the owner key by signing a fresh nonce. **Trust prerequisite:** SyncV1 streams ride ADR-0022 byte streams through the same stream gate as every other protocol — BOTH sides must have each other as `trusted` contacts, or the dial is silently refused with `stream peer trust rejected: agent […]` (visible in the dialer's log as `Tier-1 dial skipped/failed until next pass`; set trust on both sides with `x0x trust set <agent_id> trusted`). Cross-machine Tier-1 convergence is proven in-process; daemon-level sync sessions currently share the #447 announce-visibility root cause — expect the second device to need its announce beats before the first session succeeds. (#449 also applies: each device still provisions its own Home; the Tier-1 Home pointer is stored for future cross-machine adoption, not merged.)
+Enrollment is the ADR-0043 direction: the daemon holding the owner key signs the enrollment; a non-enrolled machine's SyncV1 stream is rejected at accept (verified on the testnet), and each side proves possession of the owner key by signing a fresh nonce. **Trust prerequisite:** SyncV1 streams ride ADR-0022 byte streams through the same stream gate as every other protocol — BOTH sides must have each other as `trusted` contacts, or the dial is silently refused with `stream peer trust rejected: agent […]` (visible in the dialer's log as `Tier-1 dial skipped/failed until next pass`; set trust on both sides with `x0x trust set <agent_id> trusted`). Cross-machine Tier-1 convergence is proven in-process; daemon-level sync sessions depend on the same certificate visibility as Home joins; per #447 the admission re-check consults the announce-blob cache directly rather than waiting for the next 600 s announce heartbeat, so a single explicit `POST /announce` with `{"include_user_identity":true,"human_consent":true}` on the second device is what makes it visible. (#449: a device with no owner-visible Home still provisions its own, but the Tier-1 Home pointer is now **applied** — `effective_canonical_home` reads the `("home")` register and `resolve_home` reports a losing local Home as `adoption_pending` against `canonical_group_id`. Applying the pointer is not adoption: moving a device into the canonical Home is the owner-driven `x0x home seat` act in §3.1, and rosters are not merged.)
 
 ### 5.2 Placement: Pinned / Roaming (ADR-0037/0043)
 
@@ -695,7 +759,7 @@ Use the [full API reference](https://github.com/saorsa-labs/x0x/blob/main/docs/a
 | Symptom | Cause | Fix |
 |---|---|---|
 | Second device can't join owner's Home (`no agent certificate resolved` / `pending`) | a BODYLESS announce publishes the anonymous digest, which the owner can never resolve (#447 single-announce admission is fixed in v0.41.0) | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` once, then `x0x group join --home --owner <owner-user-id> <invite>`; a `pending` join clears once the joiner's owner-issued certificate reaches the Home authority and the committed add reaches the joiner |
-| Two Homes for one owner | #449: per-device provisioning, no reconciliation yet | expected until #449; use either Home, don't fight it |
+| Two Homes for one owner | this device holds a Home that lost the `("home")` election — `GET /home` shows `state:"adoption_pending"` and names `canonical_group_id` | on the device holding the canonical Home, as the human with the durable token: `x0x home seat <this device's agent id>`, then on this device `x0x group join <invite> --home --owner <owner_user_id>`. The local Home stays usable meanwhile. Duplicates are read-only inventory (`retirement:"manual_only"`) — do NOT delete one, an empty `evidence_against_deletion` is not a safe-delete signal |
 | Strict (durable-ack) DM → 409 `recipient_ack_semantics_unavailable` | no current usable signed, machine-bound v2 advert for the recipient after one refresh (missing/unconverged, expired, v1-only, gossip-unready, bad machine binding); v0.40.x peers interoperate via frozen v1 adverts (#448 fixed); no auto-fallback | retry later, or resend with `require_durable_app_ack:false` (v1 best-effort) |
 | Peer rejects your agent card | #450: ownerless cards interoperate with v0.40.x; owner-named v2 cards are rejected by pre-ADR-0036 peers by design | upgrade the verifying peer |
 | Daemon downgraded to v0.40.x on an owned install | #451 fixed in v0.41.0: the legacy store is readable, Home state waits in the sidecar | expected; Home features return on re-upgrade — keep a data-dir backup before upgrading |
@@ -782,7 +846,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Direct messages (durable ACK) | `/direct/send` `/direct/events` | `x0x direct send/events` | GA |
 | Identity + names | `/profile` `/agent` `/announce` | `x0x profile set` `agent` | GA |
 | Owner key + roster | `/owner/agents(+/issue,/:id)` | `x0x user-id create` `owner agents` | GA |
-| Home space | `/home` `/home/rename` | `x0x home` `home rename` | GA · joins #447, per-device #449 |
+| Home space | `/home` `/home/rename` `/home/seat` | `x0x home` `home rename` `home seat` | GA · elected canonical Home (ADR-0060); owner-driven seating implemented, #449 not yet runtime-accepted |
 | Sub-agents (ACP + rider) | `/owner/agents/issue` `/owner/riders*` | `x0x owner agents issue/revoke` · `owner riders issue --delegation-payload-b64/--delegation-signature` (mint) / list / revoke | GA |
 | Rider deny-by-default scopes | middleware (403 matrix) | — | GA |
 | Session tokens read-mostly | `/auth/session` | — | GA (owner-act routes refuse session tokens since v0.41.0) |
@@ -806,7 +870,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Relay (header v2, digest-bound) | `--relay` + `/diagnostics/relay` | — | GA |
 | Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
-| Durable history | `/history*` | `x0x history list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — §4.10, §5.1) |
+| Durable history | `/history*` | `x0x history scopes/list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — §4.10, §5.1) |
 | Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA |
 
 ---

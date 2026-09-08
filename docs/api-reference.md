@@ -356,7 +356,9 @@ authenticates as a distinct principal that may reach exactly:
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
-and `/shutdown` — answers `403`. Rider sends are signed by the daemon's
+`/shutdown`, and the rest of the `/history` family (`/history/search`,
+`/history/scopes`, `/history/stats`, `/history/message/:msg_id`,
+`DELETE /history`) — answers `403`. Rider sends are signed by the daemon's
 own agent key carrying a provenance envelope **inside the signed
 bytes** — `sub_agent_id`, `rider_token_id`, `rider_token_hash`,
 `scope`, and the sub-agent-signed delegation capability itself. The
@@ -446,9 +448,15 @@ agents).
 | POST | `/home/rename` | `x0x home rename <NAME>` | durable-owner (#446) | Rename the Home (admin-gated, sealed into the state chain) |
 | POST | `/home/seat` | `x0x home seat <AGENT_ID>` | durable-owner | Mint an addressed invite for a named agent to join the canonical Home |
 
-The first start of an owned install provisions exactly one Home:
+An owned install provisions one Home at first daemon start —
 `Hidden + OwnerCertified(owner) + MlsEncrypted + MembersOnly/MembersOnly`,
-named "Home". The daemon's own owner-certified agent is the founding member
+named "Home" — subject to two conditions: both an owner user key and a
+builder-issued agent certificate must be live (`OwnerCertified` admission
+needs a certifiable founding member), and no other device of this owner may
+have already advertised a Home. If one has, this device provisions nothing
+and `GET /home` answers `state:"elsewhere"`. An absent register value means
+"none advertised yet", not "none exists", so a first or un-synced device
+still provisions. The daemon's own owner-certified agent is the founding member
 and **primary agent** — the owner speaks *through* an agent; there is no human
 wire signer. Admission is cryptographic: joining requires an agent certificate
 chaining to the owner's user key, re-checked at every state seal. An
@@ -457,9 +465,14 @@ uncertified holder of a valid invite is refused (`403`).
 **GET /home response** (`404` with `no Home provisioned (un-owned install)` /
 `no Home provisioned` otherwise):
 
+A `state:"local"` response (the settled case):
+
 ```json
 {
   "ok": true,
+  "owner_user_id": "9f21bd…",
+  "state": "local",
+  "canonical_group_id": null,
   "group_id": "3277a3c3…",
   "name": "Home",
   "description": "Owner's personal space (auto-provisioned)",
@@ -472,16 +485,53 @@ uncertified holder of a valid invite is refused (`403`).
   "members": [
     {"agent_id":"414529…","role":"Admin","placement":"roaming","self_name":"Alice"}
   ],
-  "warnings": {"no_roaming_agent": false, "primary_agent_unverified": true}
+  "duplicates": [],
+  "warnings": {
+    "no_roaming_agent": false,
+    "primary_agent_unverified": true,
+    "unretired_duplicate_home": false
+  }
 }
 ```
 
+- `owner_user_id` is the Home's `OwnerCertified` admission axis — the value a
+  joining device must pin (`x0x group join … --home --owner <owner_user_id>`).
+- **There are three distinct `200` shapes**, keyed by `state`, plus two `404`s.
+  `get_home` matches on `resolve_home` and calls `home_elsewhere_response`
+  directly for the third:
+
+  | `state` | When | Body |
+  |---|---|---|
+  | `"local"` | this device holds the canonical Home, or is uncontested | the full payload above; `canonical_group_id` is `null` |
+  | `"adoption_pending"` | this device holds a Home that LOST the `("home")` election | the full payload above, `canonical_group_id` names the winner, **plus `next_step`** |
+  | `"elsewhere"` | the owner's Home is on another device and this one is not a member | a **short** body — `ok`, `state`, `owner_user_id`, `canonical_group_id`, `local_group_id` (nullable), `detail`, **`next_step`** — and **no** `group_id`, `name`, `members`, `duplicates` or `warnings` |
+
+  `next_step` is present on both `adoption_pending` and `elsewhere`, and absent
+  from `local`. `"elsewhere"` is a `200` rather than a `404` so a second device
+  is not misread as Home-less and does not provision a duplicate.
+
+  The two `404`s are distinct: `no Home provisioned (un-owned install)` when no
+  user key is loaded (checked before any resolution), and `no Home provisioned`
+  for `HomeResolution::Unknown` — an owned install with no Home this device can
+  see. Neither is the `elsewhere` case.
+
+  `POST /home/seat`'s `409 reason` values (`adoption_pending`, `elsewhere`,
+  `unknown`) are the **seat** endpoint's refusals, a separate surface from
+  these `GET` shapes — do not read one as documentation of the other.
 - `placement` per member: `"roaming"` | `"pinned"` (from Home metadata).
 - `primary_agent.verified` is the fail-closed trust check that the primary's
   certificate chains to the owner (a committed certificate must be present);
   the GUI shows the owner chip only when true.
+- `duplicates` is **read-only inventory** of other Home-shaped groups this
+  device is seated in. Each entry is
+  `{"group_id", "retirement": "manual_only", "evidence_against_deletion": [...]}`.
+  Automatic retirement is not implemented, and an **empty
+  `evidence_against_deletion` is not a safe-to-delete verdict** — a
+  `safe_to_retire` field was deliberately removed because no sound emptiness
+  proof exists. Never infer deletion from this list.
 - `warnings.no_roaming_agent` — ADR-0038 invariant: Home should always
   contain ≥ 1 Roaming agent.
+- `warnings.unretired_duplicate_home` — `duplicates` is non-empty.
 
 **POST `/home/seat`** implements the owner-driven adoption decision recorded in
 [ADR-0060](adr/0060-one-home-per-owner.md#adoption-eligibility--decided-2026-09-07-david-irvine).
@@ -530,13 +580,27 @@ presence, NEVER by its current policy axes, so a session cannot
 policy-flip around the rename gate. Ordinary groups keep the bearer
 PATCH paths.
 
-**Known limitation (#449):** Home dedup is per-machine — each of the owner's
-devices provisions its own Home (observed live: two daemons sharing one
-`user.key` minted two different `group_id`s). Cross-device reconciliation is
-ADR-0041 follow-up. **Known limitation (#447):** a certified second device
-becomes join-eligible only after its second announce beat (~600 s); a premature
-join is rejected (`MemberJoined: rejecting uncertified joiner`) and the joiner
-must locally delete + rejoin.
+**#449 status (ADR-0060).** The owner's Home is the winner of the Tier-1
+`("home")` register, not a per-install artifact. `effective_canonical_home`
+reads that register and `resolve_home` classifies this device as `Local`,
+`AdoptionPending { local, canonical }`, `Elsewhere { canonical }` or `Unknown`;
+`GET /home` surfaces the first two as `state` plus `canonical_group_id`. A
+device that still holds a losing Home keeps using it until the owner seats it.
+Moving a device is the owner-driven `POST /home/seat` act above — never
+inferred, and never a rule acting on hosting mode. **#449 remains open**: it
+closes only once the seating command is shipped, reviewed and runtime-accepted.
+No multi-device convergence or roster-merge claim is made.
+
+**Second owner device joining (#447).** A single explicit
+`POST /announce` with body `{"include_user_identity":true,"human_consent":true}`
+on the joining device is sufficient — a bodyless announce publishes the
+anonymous certificate digest, which the owner can never resolve. A join that
+arrives before the certificate is visible is retained in a typed `pending`
+state (`retain_pending_owner_cert_join`) and retried when the evidence lands
+(`retry_pending_owner_cert_joins`), rather than wedging. There is no
+delete-and-rejoin step, and no waiting for a second announce beat. A pending
+join is in-memory only: if the joining daemon restarts before it observes its
+own `MemberAdded`, mint a fresh invite rather than replaying the link.
 
 ## Device sync (ADR-0041, Tier 1)
 
@@ -592,8 +656,12 @@ enrollment. Set trust on **both** sides (`x0x trust set <agent_id> trusted` /
 `POST /contacts/trust`).
 
 **What Tier 1 actually applies today:** profile/names converge; the Home
-pointer is synced and **stored for future adoption — it is not applied**
-(each device keeps its own Home, #449); sub-agent issuance journal lines are
+pointer is synced **and applied** — `OwnerSyncStore::canonical_home()` feeds
+`effective_canonical_home`, so a device holding a losing Home reports
+`state:"adoption_pending"` against `canonical_group_id`. Applying the pointer
+is not adoption and not a roster merge: a device changes Home only through the
+owner-driven `POST /home/seat` + pinned join (#449, ADR-0060); sub-agent
+issuance journal lines are
 synced as the issuance fact only (digest + time) — `mode` defaults to `acp`,
 `label` is dropped, and **no certificate bytes travel Tier 1** (Tier-3
 boundary), so a synced roster row is not itself mint-capable for riders.
@@ -1721,15 +1789,74 @@ Local, per-daemon history store for `dm:` / `group:` / `topic:` scopes.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/history` | `x0x history list <SCOPE> [--limit N]` | List durable history for one scope, keyset-paginated |
+| GET | `/history` | `x0x history list <SCOPE> [--limit N]` | List durable history for one scope, keyset-paginated. `scope` is **required** (400 without it) |
+| GET | `/history/scopes` | `x0x history scopes [--after-scope S] [--limit N]` | Enumerate the scopes that hold retained rows, with per-scope row count and newest `seen_at_ms` |
 | GET | `/history/message/:msg_id` | `x0x history message <MSG_ID>` | Point lookup of one row by exposed `msg_id` (`?scope=` for canonical group ids; 404 when absent, 400 malformed) |
-| GET | `/history/search` | `x0x history search <SCOPE> <QUERY>` | Full-text search over text payloads within a scope |
+| GET | `/history/search` | `x0x history search [SCOPE] <QUERY>` | Full-text search over text payloads. `scope` is **optional**: omitted, it searches every retained scope |
 | GET | `/history/stats` | `x0x history stats` | Row counts, database size, retention bounds |
 | DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only) |
 
 Rider tokens may call `GET /history` for scopes they are granted, with the
 limit clamped to 100. Durable DM sends (`require_durable_app_ack: true`)
 commit here before the sender's `200` (ADR-0030).
+
+### Scope discovery — `GET /history/scopes` (issue #275)
+
+Answers "what can I query?" for a caller that does not already hold a scope
+string.
+
+```
+GET /history/scopes?after_scope=<canonical>&limit=<n>
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "next_after_scope": "group:g-1",
+  "scopes": [
+    {"scope": "dm:9f2c…", "scope_kind": 0, "scope_id": "9f2c…",
+     "rows": 128, "newest_seen_at_ms": 1788091312000},
+    {"scope": "group:g-1", "scope_kind": 1, "scope_id": "g-1",
+     "rows": 12, "newest_seen_at_ms": 1788091300000}
+  ]
+}
+```
+
+- **Ordering and paging.** Rows are ascending by `(scope_kind, scope_id)` —
+  the same tuple the store groups on, so the order is total and independent
+  of time. `after_scope` is the canonical scope string of the previous
+  page's last row (echoed as `next_after_scope`) and is **exclusive**. There
+  is no offset and no timestamp cursor, so paging is stable under concurrent
+  writes. It is **live**, not a cross-request snapshot: a later page reflects
+  the store as it is when that page is served.
+- **Bounds.** `limit` defaults to 100 and is clamped to 500 (the shared
+  history `MAX_QUERY_LIMIT`); an oversized value is clamped, not rejected. A
+  malformed `after_scope` is `400`. An empty store, or a cursor past the last
+  scope, is an empty page (`200`), not an error.
+- **Counts.** `rows` and `newest_seen_at_ms` are aggregated from the current
+  `history` rows, so they cover **locally retained rows only**. Retention and
+  `DELETE /history` lower them, and a scope whose last row is gone disappears
+  from the enumeration entirely. This is a statement about local storage, not
+  a claim of network or history completeness.
+
+### Cross-scope search — `GET /history/search` (issue #275)
+
+`scope` is optional. Omitted, the search runs across every retained scope;
+supplied, it narrows to that scope exactly as before. Relaxing `scope` does
+not relax validation: a supplied-but-malformed `scope` is still `400`, and a
+missing or blank `q` is still `400`.
+
+The response now carries `next_before_id` alongside `count`/`records`, the
+same newest-rowid-first keyset `GET /history` uses — feed it back as
+`before_id` to page. Rowids are globally unique, so the cursor works
+unchanged across a cross-scope result set.
+
+**Authorization.** `GET /history/search` and `GET /history/scopes` are
+owner-only. The ADR-0039 rider allowlist admits exactly `GET /history`, so
+the auth middleware answers `403` on both before the handler runs; a rider
+can neither read rows nor learn row counts for scopes outside its grants.
+That boundary is unchanged by this issue.
 
 ## Remote exec
 
@@ -1862,7 +1989,11 @@ marker are best-effort: no history runtime or a failed query can still produce
 the marker, and WebSocket replay rows plus the marker use the droppable control
 queue. Do not checkpoint completeness from `live`; reconcile durable messages
 through the retained local history for the relevant `dm:<agent_hex>`,
-`group:<stable_id>`, or `topic:<name>` scope:
+`group:<stable_id>`, or `topic:<name>` scope. A client that does not already
+hold that scope string can enumerate the scopes still holding retained rows
+with [`GET /history/scopes`](#scope-discovery--get-historyscopes-issue-275) —
+which reports local retention only and, like `live`, is not a completeness
+claim:
 
 ```text
 GET /history?scope=topic:topic-a&limit=100

@@ -30,7 +30,10 @@
 
 use super::GroupInfo;
 use crate::identity::AgentId;
-use crate::kv::encrypted::{encrypted_record_aad, store_record_key, KvSecureContext};
+use crate::kv::encrypted::{
+    encrypted_record_aad, seal_mutation_with_snapshot, store_record_key, AuthorSigning,
+    EncryptedKvStoreRecordV1, KvMutationKind, KvSecureContext,
+};
 use crate::kv::{KvError, KvStoreId, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -189,6 +192,37 @@ impl GssKvSecureContext {
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         })
     }
+
+    /// Seal bytes using one already-held GSS snapshot.
+    fn seal_snapshot(
+        state: &GssState,
+        store_id: &KvStoreId,
+        plaintext: &[u8],
+    ) -> Result<(u64, [u8; 24], Vec<u8>)> {
+        let secret = state.shared_secret.as_ref().ok_or_else(|| {
+            KvError::SecureRecord(
+                "local agent holds no group shared secret — cannot seal store record".to_string(),
+            )
+        })?;
+        let epoch = state.secret_epoch;
+        let group_id = state.stable_group_id.as_bytes();
+        let key = store_record_key(secret, epoch, group_id, store_id.as_bytes());
+        let mut nonce = [0u8; 24];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let aad = encrypted_record_aad(group_id, store_id.as_bytes(), epoch);
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| KvError::SecureRecord("AEAD seal failed".to_string()))?;
+        Ok((epoch, nonce, ciphertext))
+    }
 }
 
 impl KvSecureContext for GssKvSecureContext {
@@ -213,29 +247,35 @@ impl KvSecureContext for GssKvSecureContext {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let secret = state.shared_secret.as_ref().ok_or_else(|| {
-            KvError::SecureRecord(
-                "local agent holds no group shared secret — cannot seal store record".to_string(),
-            )
-        })?;
-        let epoch = state.secret_epoch;
-        let group_id = state.stable_group_id.as_bytes();
-        let key = store_record_key(secret, epoch, group_id, store_id.as_bytes());
-        let mut nonce = [0u8; 24];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let cipher = XChaCha20Poly1305::new((&key).into());
-        let aad = encrypted_record_aad(group_id, store_id.as_bytes(), epoch);
-        let ciphertext = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| KvError::SecureRecord("AEAD seal failed".to_string()))?;
-        Ok((epoch, nonce, ciphertext))
+        Self::seal_snapshot(&state, store_id, plaintext)
+    }
+
+    fn seal_authorized(
+        &self,
+        signing: &AuthorSigning,
+        kind: KvMutationKind,
+        store_id: &KvStoreId,
+        payload: &[u8],
+    ) -> Result<EncryptedKvStoreRecordV1> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.active_members.contains(&signing.agent_id) {
+            return Err(KvError::SecureRecord(
+                "encrypted publication refused: signing author is not an active group member"
+                    .to_string(),
+            ));
+        }
+        seal_mutation_with_snapshot(
+            state.stable_group_id.as_bytes().to_vec(),
+            state.secret_epoch,
+            signing,
+            kind,
+            store_id,
+            payload,
+            |plaintext| Self::seal_snapshot(&state, store_id, plaintext),
+        )
     }
 
     fn open(
@@ -347,6 +387,34 @@ mod tests {
 
         assert!(ctx.is_active_member(&member));
         assert!(!ctx.is_active_member(&outsider));
+    }
+
+    #[test]
+    fn seal_authorized_admits_member_and_rejects_removed_member() {
+        let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
+        let member = keypair.agent_id();
+        let mut info = group("authorized-g", member);
+        let ctx = GssKvSecureContext::from_group(&info).expect("context");
+        let signing = AuthorSigning::from_keypair(&keypair).expect("signing");
+        let store_id = KvStoreId::new([15; 32]);
+
+        let record = ctx
+            .seal_authorized(
+                &signing,
+                KvMutationKind::Delta,
+                &store_id,
+                b"authorized-payload",
+            )
+            .expect("active member can seal");
+        assert_eq!(record.epoch, ctx.current_epoch());
+        assert!(!record.ciphertext.is_empty());
+
+        info.remove_member(&hex::encode(member.as_bytes()), None);
+        ctx.update_from_group(&info);
+        let err = ctx
+            .seal_authorized(&signing, KvMutationKind::Delta, &store_id, b"must-not-seal")
+            .expect_err("removed member must fail atomic admission");
+        assert!(err.to_string().contains("not an active group member"));
     }
 
     #[test]

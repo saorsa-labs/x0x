@@ -68,7 +68,7 @@ x0x profile set --display-name "Alice" --machine-name "desk" --human-name "Alice
 x0x profile                        # GET /profile
 ```
 
-**4. Your Home appears.** The first start of an owned install provisions exactly one Home — `Hidden + OwnerCertified + MlsEncrypted`. Rename it if you like:
+**4. Your Home appears.** An owned install provisions one Home at first start — `Hidden + OwnerCertified + MlsEncrypted` — provided it has both an owner key and an agent certificate, and no other device of yours has already advertised one. If another has, this device provisions nothing and `x0x home` reports `state: "elsewhere"` with the command to join it. Rename it if you like:
 
 ```bash
 x0x home                           # GET /home -> group_id, primary agent, members, warnings
@@ -85,7 +85,15 @@ x0x owner riders                                 # GET /owner/riders — token r
 ```
 
 - **ACP mode** (default): the harness owns the certified key and connects as a full peer. The CLI covers this end-to-end.
-- **Rider mode:** a scoped API token instead of a key. Certify the key with `--mode rider` **via REST or CLI**, then the *harness* signs a delegation capability with the sub-agent's own key and you mint the token with `POST /owner/riders` including that `delegation` field. This mint is **REST/library-only today**: `x0x owner riders issue <AGENT_ID>` cannot send the required capability and answers `400` — use the REST endpoint (or the `x0x` crate's `sign_rider_delegation` helper harness-side). See [docs/api-reference.md](./docs/api-reference.md) for the full flow.
+- **Rider mode:** a scoped API token instead of a key. Certify the key with `--mode rider` **via REST or CLI**, then the *harness* signs a delegation capability with the sub-agent's own key and you mint the token with `POST /owner/riders` including that `delegation` field. The CLI supports this mint — both delegation flags are required:
+
+```bash
+x0x owner riders issue <AGENT_ID> --group <GROUP_ID> \
+  --delegation-payload-b64 <BASE64> --delegation-signature <HEX> \
+  [--label <LABEL>] [--ttl-secs <SECS>]
+```
+
+Build the payload harness-side with the `x0x` crate's `sign_rider_delegation` helper; the signature is the sub-agent's own ML-DSA-65 signature over it. Every group must be granted explicitly with a repeated `--group`, Home included. The REST endpoint takes the same capability. See [docs/api-reference.md](./docs/api-reference.md) for the full flow.
 
 A **rider token** reaches exactly three surfaces — `POST /groups/:id/send`, `POST /groups/:id/secure/encrypt`, and `GET /history` (limit ≤ 100) — and only for **groups explicitly named in its grant list**: there is no implicit Home grant; grant Home's group id like any other group. Everything else — `/agent/sign`, `/exec`, `/owner/*`, `/sync/*`, `/shutdown` — answers `403`. Every rider send is signed by your daemon with the sub-agent's authorization embedded *inside the signed bytes*, so receivers can verify attribution cryptographically. Revoking a rider (or its sub-agent) takes effect on the very next request.
 
@@ -118,7 +126,15 @@ x0x sync enroll <A_MACHINE_ID>
 x0x sync devices                   # GET /sync/devices — device set + last-sync status
 ```
 
-Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-agent issuance facts); DMs and other groups' history never replicate. As implemented today: the synced Home pointer is **stored for future adoption, not applied** (each device keeps its own Home, #449), and synced sub-agent journal lines record the issuance fact (digest + time) without mode, label, or certificate bytes. Joining one Home from a second device additionally needs the joiner to have announced twice (#447) — see [Known limitations](#known-limitations-v041-pre-release).
+To put the new machine in the **same Home** (rather than only syncing profile state), seat it — on the machine that holds the Home:
+
+```bash
+x0x home seat <NEW_MACHINE_AGENT_ID>   # POST /home/seat — needs the durable API token
+```
+
+That mints an invite addressed to that one agent and prints the join command; it does not join for you. On the new machine run the printed `x0x group join <invite> --home --owner <owner-user-id>`. The response says `"seated": false` until the join is accepted, and it is durable only once the new device is still seated after a restart.
+
+Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-agent issuance facts); DMs and other groups' history never replicate. As implemented today the synced Home pointer is **applied**: a device holding a Home that lost the election reports `state: "adoption_pending"` and names the winner, and a device with no Home reports `state: "elsewhere"`. Applying the pointer is not adoption — moving a device into the canonical Home is an explicit act by you (`x0x home seat <agent-id>` on the device holding it, then `x0x group join <invite> --home --owner <owner-user-id>` on the new one), and rosters are not merged. Synced sub-agent journal lines record the issuance fact (digest + time) without mode, label, or certificate bytes. The joining device needs one explicit `x0x announce` carrying its owner identity so its certificate is visible; a join that arrives first waits in a `pending` state rather than failing. Seating is not complete until that join is accepted and survives a restart on the new device — see [Known limitations](#known-limitations-v041-pre-release).
 
 **8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md). What is implemented today is **point-to-point (two-party) calls**: signaling over DMs (`x0x-voice-sig-v1`), audio over `WebRtcV1` streams with an opt-in unreliable-datagram lane (audio only, mutually negotiated) and reliable-stream fallback. It is a library surface behind the `voice` cargo feature (`x0x::voice`) — there is **no CLI or GUI call button yet**, and multi-party mesh (design-bounded at four participants), SFU, and browser access are recorded ADR follow-ups.
 
@@ -161,8 +177,8 @@ The Home Suite (ADRs 0036–0043) is on `main` ahead of a v0.41 release. Honest 
 | # | Limitation | Workaround |
 |---|---|---|
 | [#446](https://github.com/saorsa-labs/x0x/issues/446) — **fixed** | Owner-act surfaces require the durable API token: `/agent/sign`, `/exec/*`, `/shutdown`, `/upgrade/apply`, sync enrollment, delegation creation, `/home/rename`, and `/announce` with user identity are enforced at the route layer (typed `403` before body extraction); `/direct/send` + WS `send_direct` with reserved exec payloads and `PATCH /groups/:id` / `PATCH /groups/:id/policy` on a group carrying Home metadata are payload/target-conditional and enforced in the handler (Home is identified by metadata presence, never by its current policy axes — no policy-flip bypass). Plain `/announce` and non-Home group PATCHes stay session-allowed. | None: the boundary is enforced (DELETE /groups/:id additionally requires active membership for any group); the GUI prompts for the durable token on first owner act (tab-scoped `sessionStorage`, never a URL). |
-| [#447](https://github.com/saorsa-labs/x0x/issues/447) | A certified second device becomes join-eligible only after its **second** announce beat (~600 s); a premature join attempt wedges the joiner. | Wait for/re-trigger a second announce before joining Home; recovery from a wedge is local delete + rejoin. |
-| [#449](https://github.com/saorsa-labs/x0x/issues/449) | Each of your devices auto-provisions its **own** Home; no reconciliation yet. | Treat Home as per-device until fixed; don't market multi-device Home as one space. |
+| [#447](https://github.com/saorsa-labs/x0x/issues/447) — **fixed** | A certified second device is join-eligible after **one** explicit announce carrying its owner identity; the admission check reads the announce-blob cache directly instead of waiting for the next 600 s beat. A join that arrives before the certificate is visible waits in a typed `pending` state rather than wedging. | Run `x0x announce` with `{"include_user_identity":true,"human_consent":true}` once on the new device before joining. A `pending` join is in memory only — if that daemon restarts first, mint a fresh invite rather than replaying the link. |
+| [#449](https://github.com/saorsa-labs/x0x/issues/449) | Your Home is now elected rather than per-install: devices report `local`, `adoption_pending` or `elsewhere`, and a device yields instead of minting a duplicate. Moving a device into the canonical Home is an explicit human act (`x0x home seat`, then a pinned join) and depends on the same user key being present on both machines. Not yet runtime-accepted. | Follow *Add a second device* above; duplicate Homes from earlier versions are listed read-only under `duplicates` with `retirement: "manual_only"` — an empty blocker list is not a signal that one is safe to delete. |
 | [#448](https://github.com/saorsa-labs/x0x/issues/448) / [#450](https://github.com/saorsa-labs/x0x/issues/450) | Mixed old/new fleets: v0.40.x peers can't verify new capability adverts or AgentCards; old→new *strict* DMs answer `409` until the old side upgrades. | Upgrade peers together — avoid long mixed-fleet windows; `--no-durable-ack` reaches old peers when you must. |
 | [#451](https://github.com/saorsa-labs/x0x/issues/451) | **Fixed** for the durable roster: Home-Suite (owner-certified) group state persists in a sidecar (`home-suite-groups.json`) that v0.40.x never reads; `named_groups.json` carries only a legacy-safe placeholder an old binary can parse — no more downgrade crash loop. An old binary sees the Home as an inert invite-only shell, and changes it makes there during a downgrade window are discarded on re-upgrade (the sidecar is authoritative). | Downgrades of the group store are safe again; keep mixed windows short anyway ([#448](https://github.com/saorsa-labs/x0x/issues/448)/[#450](https://github.com/saorsa-labs/x0x/issues/450) still apply). |
 | — | Roaming-move ceremony is experimental and disabled (`[key_move] ceremony_enabled = false`); `/agent/move*` answer `501`. | None needed: no moves can occur in the shipped posture (the local Home agent is minted Roaming, inert without the ceremony); do not enable the ceremony in production. |

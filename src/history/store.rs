@@ -83,6 +83,21 @@ pub struct HistoryStats {
     pub newest_ms: Option<i64>,
 }
 
+/// One row of the scope-discovery enumeration ([`Store::scopes`]).
+///
+/// Aggregated from the CURRENT `history` rows, so a scope disappears from
+/// the enumeration as soon as retention or [`Store::purge`] removes its
+/// last retained row — there is no separate scope registry to go stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSummary {
+    /// The scope itself (reconstructed from `scope_kind`/`scope_id`).
+    pub scope: Scope,
+    /// Retained rows in this scope.
+    pub rows: i64,
+    /// Newest `seen_at_ms` among the retained rows.
+    pub newest_seen_at_ms: i64,
+}
+
 /// Per-scope retention override (ADR-0023 §6).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ScopeLimit {
@@ -390,6 +405,61 @@ impl Store {
             oldest_ms,
             newest_ms,
         })
+    }
+
+    /// Enumerate the scopes that still hold retained rows, ascending by
+    /// `(scope_kind, scope_id)` with a keyset cursor.
+    ///
+    /// The ordering key is the `GROUP BY` key itself, so it is total and
+    /// stable: two scopes with the same `scope_id` under different kinds are
+    /// distinct rows, and equal timestamps cannot perturb the order (time is
+    /// reported, never ordered on). Paging is therefore live — a later page
+    /// reflects the store as it is then, and no row is skipped or repeated
+    /// because of concurrent writes to an already-passed scope.
+    ///
+    /// `after` is the exclusive lower bound (the last scope of the previous
+    /// page). `limit` follows the history convention: 0 ⇒ 100, clamped to
+    /// [`MAX_QUERY_LIMIT`].
+    pub fn scopes(&self, after: Option<&Scope>, limit: usize) -> HistoryResult<Vec<ScopeSummary>> {
+        let limit = effective_limit(limit);
+        let mut sql =
+            String::from("SELECT scope_kind, scope_id, COUNT(*), MAX(seen_at_ms) FROM history");
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(after) = after {
+            // Explicit two-column keyset (not a row-value comparison) so the
+            // `(scope_kind, scope_id, seen_at_ms)` index drives the scan.
+            sql.push_str(" WHERE scope_kind > ?1 OR (scope_kind = ?1 AND scope_id > ?2)");
+            params.push(rusqlite::types::Value::from(after.kind()));
+            params.push(rusqlite::types::Value::from(after.id().to_string()));
+        }
+        sql.push_str(
+            " GROUP BY scope_kind, scope_id ORDER BY scope_kind ASC, scope_id ASC LIMIT ?",
+        );
+        params.push(rusqlite::types::Value::from(limit as i64));
+
+        let guard = lock_conn(&self.conn)?;
+        let mut stmt = guard
+            .prepare(&sql)
+            .map_err(|e| HistoryError::Database(format!("prepare failed: {e}")))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params),
+                |r| -> std::result::Result<(i64, String, i64, i64), rusqlite::Error> {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                },
+            )
+            .map_err(|e| HistoryError::Database(format!("query failed: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, id, count, newest) =
+                row.map_err(|e| HistoryError::Database(format!("row read failed: {e}")))?;
+            out.push(ScopeSummary {
+                scope: Scope::from_columns(kind, id)?,
+                rows: count,
+                newest_seen_at_ms: newest,
+            });
+        }
+        Ok(out)
     }
 
     /// Enforce retention (ADR-0023 §6). Returns rows evicted.
