@@ -22,15 +22,16 @@ v0.41.2 Windows Leaf, default config, ~35 min idle on the public mesh, ~25
 connected peers, one `public_open` group, one message, no file transfers
 (`x0x diagnostics gossip --json`):
 
-| kind | bytes | msgs | implied rate |
+| kind | bytes | msgs | implied send-attempt rate |
 |---|---|---|---|
 | eager | 1.54 GB | 97,744 | ~44 MB/min (~716 KiB/s) |
 | ihave | 118 MB | ~20.7k | ~3.4 MB/min |
 | iwant | 75 MB | — | smaller |
 | anti_entropy | 5.1 MB | — | noise |
 
-The residential impact is the point: ~6 Mbps sustained uplink on an idle
-desktop. #380 C0 already stopped **unsubscribed** pass-through. This leftover
+The reported residential impact is the concern. These counters imply ~6 Mbps
+of sustained send attempts on the idle desktop; actual wire occupancy was
+not measured. #380 C0 already stopped **unsubscribed** pass-through. This leftover
 is **subscribed-topic epidemic** — which C0's soak gate explicitly does not
 count (`docs/380-c0-soak-gate.md` gates only
 `participation.relay_bytes` = non-subscribed forward).
