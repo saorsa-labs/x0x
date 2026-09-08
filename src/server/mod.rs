@@ -526,6 +526,7 @@ pub async fn serve_with_options(
     let mut builder = Agent::builder()
         .with_network_config(network_config)
         .with_gossip_config(gossip_config)
+        .with_skip_legacy_dm_bus(config.skip_legacy_dm_bus)
         .with_peer_cache_dir(cache_dir)
         .with_contact_store_path(&contacts_path)
         .with_history(history_config)

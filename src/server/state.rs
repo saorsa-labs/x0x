@@ -296,6 +296,11 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) observed_prefix_enabled: bool,
 
+    /// Stay off the whole-network compatibility DM bus. This is an opt-in
+    /// daemon policy; the default keeps rolling compatibility unchanged.
+    #[serde(default)]
+    pub(super) skip_legacy_dm_bus: bool,
+
     /// Update configuration.
     #[serde(default)]
     pub(super) update: DaemonUpdateConfig,
@@ -646,6 +651,7 @@ impl Default for DaemonConfig {
             port_mapping_enabled: default_port_mapping_enabled(),
             peer_relay: x0x::network::PeerRelayConfig::default(),
             observed_prefix_enabled: false,
+            skip_legacy_dm_bus: false,
             update: DaemonUpdateConfig::default(),
             history: default_history_config(),
             gossip: x0x::gossip::GossipConfig::default(),
