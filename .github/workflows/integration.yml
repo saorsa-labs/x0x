@@ -168,7 +168,7 @@ jobs:
   # lossless clean lane; sharing a runner with a heavy suite would turn a
   # scheduling stall into a false counter mismatch.
   integration-voice-datagram:
-    name: Integration (voice datagram, #277)
+    name: 'Integration (voice datagram, #277)'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -201,7 +201,9 @@ jobs:
       # `--run-ignored ignored-only` selects them at all. Runs inside the
       # issue #417 namespace so discovery executes the test binaries on
       # `lo` only, never on the host network.
-      - name: Assert acceptance selection (structured nextest JSON)
+      - name: 'Assert acceptance selection (structured nextest JSON)'
+        env:
+          X0X_ISOLATION_ROLE: selection
         run: python3 scripts/ci/isolated-runtime.py python3 scripts/ci/voice-datagram-selection.py
       # Acceptance itself goes through the reviewed wrapper: cargo
       # metadata resolved once, binaries-only build with no discovery
@@ -209,12 +211,41 @@ jobs:
       # every binary hash plus Cargo.lock and the HEAD/tree SHAs, then
       # `run` re-verifying that custody inside the issue #417 namespace
       # before a single test executes.
-      - name: Run issue #277 datagram-lane acceptance
+      - name: 'Run issue #277 datagram-lane acceptance'
+        env:
+          X0X_ISOLATION_ROLE: acceptance
         run: |
           bash scripts/ci/nextest-isolated.sh --all-features \
             --test voice_datagram_e2e -- \
             --run-ignored ignored-only \
             --test-threads 1
+      # Retention. The wrapper chain writes its admission, teardown and
+      # build-custody receipts into $RUNNER_TEMP, which dies with the runner,
+      # so without this the only reviewable evidence is the free-text job log.
+      # The collector reads a fixed allowlist of those generated files and
+      # emits a fixed allowlist of fields: no argv, no environment, no
+      # absolute paths, no product output. It runs on failure too, so the
+      # namespace teardown receipt survives a failed acceptance step, and it
+      # exits non-zero when the job otherwise succeeded but a receipt is
+      # missing or inconsistent — a green test run cannot be reported without
+      # its custody. Min 2 runs: the selection proof and the acceptance run
+      # are each separately admitted.
+      - name: 'Collect issue #417 isolation custody'
+        id: collect_custody
+        if: always()
+        env:
+          X0X_CUSTODY_EXPECT: ${{ job.status }}
+          X0X_CUSTODY_MIN_RUNS: '2'
+          X0X_CUSTODY_ROLES: selection,acceptance
+          X0X_CUSTODY_TARGET: voice_datagram_e2e
+        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/x0x-custody-receipt"
+      - name: 'Upload issue #417 isolation custody receipt'
+        if: always() && steps.collect_custody.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: voice-datagram-isolation-custody
+          path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
+          if-no-files-found: error
 
   # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
   integration-net:
