@@ -94,6 +94,26 @@ test-recovery-e2e:
     cargo build --bin x0xd
     cargo nextest run --all-features --test crdt_subscription_persistence --run-ignored all
 
+# Issue #277 datagram-lane acceptance (ADR-0042 (c)) — #[ignore]d because it
+# binds real UDP sockets on loopback. Two independent halves in one suite:
+# the deterministic jitter-counter phase oracles (exact reordered /
+# late_dropped / duplicates_dropped deltas on a clean lane) and the
+# loss/resilience/SNR/latency/path-custody posture behind a lossy proxy.
+# Single-threaded: the phase oracles assert exact counters and must not
+# contend for the runner.
+#
+# This is the DEVELOPER path. The admitted path is the CI job
+# `integration-voice-datagram`, which runs the same suite inside the issue
+# #417 network namespace (`scripts/ci/isolated-runtime.py`: fresh netns,
+# `lo` only, unprivileged, no caps) behind the binary-custody wrapper
+# `scripts/ci/nextest-isolated.sh`. Results from this recipe are not an
+# acceptance receipt.
+test-voice-datagram-e2e:
+    cargo test --all-features --test voice_datagram_e2e --no-run
+    python3 scripts/ci/voice-datagram-selection.py
+    cargo nextest run --all-features --test voice_datagram_e2e \
+        --run-ignored ignored-only --test-threads 1
+
 # ── Test coverage (line/region) ───────────────────────────────────────────
 #
 # Uses cargo-llvm-cov + nextest. Install once with:
