@@ -1,0 +1,426 @@
+{
+  "producer": "cargo-nextest0.9.143/60fa45f638ffc3f35e74afa65737f45fcd32db2a",
+  "normalization": "Only discovery identity/selection retained; failure payloads and JSON stdout removed; non-kind XML output replaced by fixed inert text. Private originals stay under task /tmp. JUnit identities/status/timing/capture presence and JSON event ordering preserved.",
+  "cases": {
+    "kind": {
+      "listing": {
+        "rust-suites": {
+          "inert-kind-contract": {
+            "package-name": "inert-kind-contract",
+            "binary-name": "kind_contract",
+            "kind": "lib",
+            "status": "listed",
+            "testcases": {
+              "tests::excluded_case": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "tests::ignored_case": {
+                "kind": "test",
+                "ignored": true,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "ignored"
+                }
+              },
+              "tests::same_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              }
+            }
+          },
+          "inert-kind-contract::peer": {
+            "package-name": "inert-kind-contract",
+            "binary-name": "peer",
+            "kind": "test",
+            "status": "listed",
+            "testcases": {
+              "tests::excluded_case": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "tests::ignored_case": {
+                "kind": "test",
+                "ignored": true,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "ignored"
+                }
+              },
+              "tests::same_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              }
+            }
+          }
+        },
+        "test-count": 6
+      },
+      "jsonl": "{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 2, \"nextest\": {\"crate\": \"inert-kind-contract\", \"test_binary\": \"kind_contract\", \"kind\": \"lib\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-kind-contract::kind_contract$tests::ignored_case\"}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 0, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0, \"nextest\": {\"crate\": \"inert-kind-contract\", \"test_binary\": \"kind_contract\", \"kind\": \"lib\"}}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 2, \"nextest\": {\"crate\": \"inert-kind-contract\", \"test_binary\": \"peer\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-kind-contract::peer$tests::ignored_case\"}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 0, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0, \"nextest\": {\"crate\": \"inert-kind-contract\", \"test_binary\": \"peer\", \"kind\": \"test\"}}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 2, \"nextest\": {\"crate\": \"inert-kind-contract\", \"test_binary\": \"peer\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-kind-contract::peer$tests::same_name\"}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 2, \"nextest\": {\"crate\": \"inert-kind-contract\", \"test_binary\": \"kind_contract\", \"kind\": \"lib\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-kind-contract::kind_contract$tests::same_name\"}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-kind-contract::peer$tests::same_name\", \"exec_time\": 0.006381}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.006381, \"nextest\": {\"crate\": \"inert-kind-contract\", \"test_binary\": \"peer\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-kind-contract::kind_contract$tests::same_name\", \"exec_time\": 0.00641325}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.00641325, \"nextest\": {\"crate\": \"inert-kind-contract\", \"test_binary\": \"kind_contract\", \"kind\": \"lib\"}}\n",
+      "xml": "<testsuites name=\"nextest-run\" tests=\"6\" skipped=\"4\" failures=\"0\" errors=\"0\" uuid=\"15845b16-74dc-48ad-90e9-47e7135e7ad1\" timestamp=\"2026-09-08T10:58:39.149+01:00\" time=\"0.007\">\n    <testsuite name=\"inert-kind-contract\" tests=\"3\" skipped=\"2\" errors=\"0\" failures=\"0\">\n        <testcase name=\"tests::excluded_case\" classname=\"inert-kind-contract\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"tests::ignored_case\" classname=\"inert-kind-contract\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the run-ignored option\" />\n        </testcase>\n        <testcase name=\"tests::same_name\" classname=\"inert-kind-contract\" timestamp=\"2026-09-08T10:58:39.150+01:00\" time=\"0.006\">\n            <system-out>\nrunning 1 test\nDIAG lifecycle574 seq=1 elapsed_us=1 side=Owner marker=before_old_shutdown\nDIAG lifecycle574 stop=collectors_joined total=1 overflow=0 foreign=[0, 0] lagged=[0, 0] stream_closed=[false, false] pending_at_stop=[0, 0] collectors_dropped=[true, true] acceptance=not_evaluated\ntest tests::same_name ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n\n</system-out>\n            <system-err>(stdout and stderr are combined)</system-err>\n        </testcase>\n    </testsuite>\n    <testsuite name=\"inert-kind-contract::peer\" tests=\"3\" skipped=\"2\" errors=\"0\" failures=\"0\">\n        <testcase name=\"tests::excluded_case\" classname=\"inert-kind-contract::peer\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"tests::ignored_case\" classname=\"inert-kind-contract::peer\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the run-ignored option\" />\n        </testcase>\n        <testcase name=\"tests::same_name\" classname=\"inert-kind-contract::peer\" timestamp=\"2026-09-08T10:58:39.150+01:00\" time=\"0.006\" />\n    </testsuite>\n</testsuites>",
+      "target": [
+        "inert-kind-contract",
+        "kind_contract",
+        "lib",
+        "tests::same_name"
+      ],
+      "exit": 0,
+      "raw_sha256": {
+        "kind-list.stdout": "eca955cb966754bb3601c1af6d0a8a498fdb52beb01b85c84eebb25d12148cae",
+        "kind-run.stdout": "f7d90ac371e00d63c43d2640f6431e0f605996bada730a17e39c1efca657ffba",
+        "kind.junit.xml": "9ade57743f7bfedd58313c7e085e90c2a7b1fdf617deacc47fb2ee142657ca3a"
+      }
+    },
+    "mixed": {
+      "listing": {
+        "rust-suites": {
+          "inert-contract::alpha": {
+            "package-name": "inert-contract",
+            "binary-name": "alpha",
+            "kind": "test",
+            "status": "listed",
+            "testcases": {
+              "excluded_case": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "ignored_case": {
+                "kind": "test",
+                "ignored": true,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "ignored"
+                }
+              },
+              "quiet_pass": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              },
+              "reverse_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              },
+              "same_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              }
+            }
+          },
+          "inert-contract::beta": {
+            "package-name": "inert-contract",
+            "binary-name": "beta",
+            "kind": "test",
+            "status": "listed",
+            "testcases": {
+              "excluded_case": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "ignored_case": {
+                "kind": "test",
+                "ignored": true,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "ignored"
+                }
+              },
+              "quiet_pass": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              },
+              "reverse_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              },
+              "same_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              }
+            }
+          }
+        },
+        "test-count": 10
+      },
+      "jsonl": "{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 4, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$ignored_case\"}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 4, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::beta$ignored_case\"}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::beta$quiet_pass\"}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$quiet_pass\"}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$reverse_name\"}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$same_name\"}\n{\"type\": \"test\", \"event\": \"ignored\", \"name\": \"inert-contract::alpha$ignored_case\"}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-contract::alpha$quiet_pass\", \"exec_time\": 0.007019167}\n{\"type\": \"test\", \"event\": \"ignored\", \"name\": \"inert-contract::beta$ignored_case\"}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-contract::beta$quiet_pass\", \"exec_time\": 0.007041625}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::beta$reverse_name\"}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::beta$same_name\"}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-contract::alpha$same_name\", \"exec_time\": 0.162128167}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 2, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.169147334, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 4, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"failed\", \"name\": \"inert-contract::alpha$reverse_name\", \"exec_time\": 0.162127125}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-contract::beta$reverse_name\", \"exec_time\": 0.157417875}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 2, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.1644595, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 4, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"failed\", \"name\": \"inert-contract::beta$same_name\", \"exec_time\": 0.160405125}\n{\"type\": \"suite\", \"event\": \"failed\", \"passed\": 0, \"failed\": 1, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 3, \"exec_time\": 0.162127125, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"suite\", \"event\": \"failed\", \"passed\": 0, \"failed\": 1, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 3, \"exec_time\": 0.160405125, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n",
+      "xml": "<testsuites name=\"nextest-run\" tests=\"10\" skipped=\"4\" failures=\"2\" errors=\"0\" uuid=\"4f1a06a2-ea9e-4909-bb2c-10c9ddb3b96b\" timestamp=\"2026-09-08T10:40:23.280+01:00\" time=\"0.168\">\n    <testsuite name=\"inert-contract::alpha\" tests=\"5\" skipped=\"2\" errors=\"0\" failures=\"1\">\n        <testcase name=\"excluded_case\" classname=\"inert-contract::alpha\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"ignored_case\" classname=\"inert-contract::alpha\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the run-ignored option\" />\n        </testcase>\n        <testcase name=\"quiet_pass\" classname=\"inert-contract::alpha\" timestamp=\"2026-09-08T10:40:23.280+01:00\" time=\"0.007\" />\n        <testcase name=\"same_name\" classname=\"inert-contract::alpha\" timestamp=\"2026-09-08T10:40:23.280+01:00\" time=\"0.162\">\n            <system-out>inert captured output</system-out>\n            <system-err>(stdout and stderr are combined)</system-err>\n        </testcase>\n        <testcase name=\"reverse_name\" classname=\"inert-contract::alpha\" timestamp=\"2026-09-08T10:40:23.280+01:00\" time=\"0.162\">\n            <failure type=\"test failure with exit code 101\">inert expected failure</failure>\n            <system-out>inert captured output</system-out>\n            <system-err>(stdout and stderr are combined)</system-err>\n        </testcase>\n    </testsuite>\n    <testsuite name=\"inert-contract::beta\" tests=\"5\" skipped=\"2\" errors=\"0\" failures=\"1\">\n        <testcase name=\"excluded_case\" classname=\"inert-contract::beta\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"ignored_case\" classname=\"inert-contract::beta\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the run-ignored option\" />\n        </testcase>\n        <testcase name=\"quiet_pass\" classname=\"inert-contract::beta\" timestamp=\"2026-09-08T10:40:23.280+01:00\" time=\"0.007\" />\n        <testcase name=\"reverse_name\" classname=\"inert-contract::beta\" timestamp=\"2026-09-08T10:40:23.287+01:00\" time=\"0.157\">\n            <system-out>inert captured output</system-out>\n            <system-err>(stdout and stderr are combined)</system-err>\n        </testcase>\n        <testcase name=\"same_name\" classname=\"inert-contract::beta\" timestamp=\"2026-09-08T10:40:23.287+01:00\" time=\"0.160\">\n            <failure type=\"test failure with exit code 101\">inert expected failure</failure>\n            <system-out>inert captured output</system-out>\n            <system-err>(stdout and stderr are combined)</system-err>\n        </testcase>\n    </testsuite>\n</testsuites>",
+      "target": [
+        "inert-contract",
+        "alpha",
+        "test",
+        "same_name"
+      ],
+      "exit": 100,
+      "raw_sha256": {
+        "list-final.stdout": "4c2f7a43445acb204b6e325fae3a4a4424249601a496b6894404d8298ea80c86",
+        "mixed-final.stdout": "06b2d4b2ab7381bc9f404074b76be8882a270101e1e686fa36a7c546f7ebe137",
+        "mixed-final.junit.xml": "9b16697704e17c5afab3f3008ef615ade6e208378ef3c946459aee9a03547fb4"
+      }
+    },
+    "failfast": {
+      "listing": {
+        "rust-suites": {
+          "inert-contract::alpha": {
+            "package-name": "inert-contract",
+            "binary-name": "alpha",
+            "kind": "test",
+            "status": "listed",
+            "testcases": {
+              "excluded_case": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "ignored_case": {
+                "kind": "test",
+                "ignored": true,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "ignored"
+                }
+              },
+              "quiet_pass": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              },
+              "reverse_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              },
+              "same_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              }
+            }
+          },
+          "inert-contract::beta": {
+            "package-name": "inert-contract",
+            "binary-name": "beta",
+            "kind": "test",
+            "status": "listed",
+            "testcases": {
+              "excluded_case": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "ignored_case": {
+                "kind": "test",
+                "ignored": true,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "ignored"
+                }
+              },
+              "quiet_pass": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              },
+              "reverse_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              },
+              "same_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              }
+            }
+          }
+        },
+        "test-count": 10
+      },
+      "jsonl": "{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 4, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$ignored_case\"}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$quiet_pass\"}\n{\"type\": \"test\", \"event\": \"ignored\", \"name\": \"inert-contract::alpha$ignored_case\"}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-contract::alpha$quiet_pass\", \"exec_time\": 0.00668625}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$reverse_name\"}\n{\"type\": \"test\", \"event\": \"failed\", \"name\": \"inert-contract::alpha$reverse_name\", \"exec_time\": 0.163046791}\n{\"type\": \"suite\", \"event\": \"failed\", \"passed\": 1, \"failed\": 1, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.169733041, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 4, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::beta$ignored_case\"}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 0, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 3, \"exec_time\": 0, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n",
+      "xml": "<testsuites name=\"nextest-run\" tests=\"6\" skipped=\"4\" failures=\"1\" errors=\"0\" uuid=\"9212d11b-5127-4223-8398-fec596711da8\" timestamp=\"2026-09-08T10:41:31.792+01:00\" time=\"0.170\">\n    <testsuite name=\"inert-contract::alpha\" tests=\"4\" skipped=\"2\" errors=\"0\" failures=\"1\">\n        <testcase name=\"excluded_case\" classname=\"inert-contract::alpha\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"ignored_case\" classname=\"inert-contract::alpha\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the run-ignored option\" />\n        </testcase>\n        <testcase name=\"quiet_pass\" classname=\"inert-contract::alpha\" timestamp=\"2026-09-08T10:41:31.792+01:00\" time=\"0.007\" />\n        <testcase name=\"reverse_name\" classname=\"inert-contract::alpha\" timestamp=\"2026-09-08T10:41:31.799+01:00\" time=\"0.163\">\n            <failure type=\"test failure with exit code 101\">inert expected failure</failure>\n            <system-out>inert captured output</system-out>\n            <system-err>(stdout and stderr are combined)</system-err>\n        </testcase>\n    </testsuite>\n    <testsuite name=\"inert-contract::beta\" tests=\"2\" skipped=\"2\" errors=\"0\" failures=\"0\">\n        <testcase name=\"excluded_case\" classname=\"inert-contract::beta\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"ignored_case\" classname=\"inert-contract::beta\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the run-ignored option\" />\n        </testcase>\n    </testsuite>\n</testsuites>",
+      "target": [
+        "inert-contract",
+        "alpha",
+        "test",
+        "same_name"
+      ],
+      "exit": 100,
+      "raw_sha256": {
+        "failfast-list.stdout": "4c2f7a43445acb204b6e325fae3a4a4424249601a496b6894404d8298ea80c86",
+        "failfast-run.stdout": "e11a3992e5e2a89accbf676df52e49e3dddad48d307dfc4cf40fa4ff99d0297c",
+        "failfast.junit.xml": "c32aac85f5e96359ed9884901081874adb94031c4d71bf71c497a5143a1710b0"
+      }
+    },
+    "scoped": {
+      "listing": {
+        "rust-suites": {
+          "inert-contract::alpha": {
+            "package-name": "inert-contract",
+            "binary-name": "alpha",
+            "kind": "test",
+            "status": "listed",
+            "testcases": {
+              "excluded_case": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "ignored_case": {
+                "kind": "test",
+                "ignored": true,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "ignored"
+                }
+              },
+              "quiet_pass": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "reverse_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "same_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              }
+            }
+          },
+          "inert-contract::beta": {
+            "package-name": "inert-contract",
+            "binary-name": "beta",
+            "kind": "test",
+            "status": "listed",
+            "testcases": {
+              "excluded_case": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "ignored_case": {
+                "kind": "test",
+                "ignored": true,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "ignored"
+                }
+              },
+              "quiet_pass": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "reverse_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "mismatch",
+                  "reason": "expression"
+                }
+              },
+              "same_name": {
+                "kind": "test",
+                "ignored": false,
+                "filter-match": {
+                  "status": "matches"
+                }
+              }
+            }
+          }
+        },
+        "test-count": 10
+      },
+      "jsonl": "{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 2, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$ignored_case\"}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 0, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 3, \"exec_time\": 0, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 2, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::beta$ignored_case\"}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 0, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 3, \"exec_time\": 0, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 2, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::beta$same_name\"}\n{\"type\": \"suite\", \"event\": \"started\", \"test_count\": 2, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"started\", \"name\": \"inert-contract::alpha$same_name\"}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-contract::beta$same_name\", \"exec_time\": 0.157686709}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 3, \"exec_time\": 0.157686709, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"beta\", \"kind\": \"test\"}}\n{\"type\": \"test\", \"event\": \"ok\", \"name\": \"inert-contract::alpha$same_name\", \"exec_time\": 0.161079875}\n{\"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 3, \"exec_time\": 0.161079875, \"nextest\": {\"crate\": \"inert-contract\", \"test_binary\": \"alpha\", \"kind\": \"test\"}}\n",
+      "xml": "<testsuites name=\"nextest-run\" tests=\"10\" skipped=\"8\" failures=\"0\" errors=\"0\" uuid=\"1ea13268-7c2e-4778-8f0f-9bcf61d07f91\" timestamp=\"2026-09-08T10:47:41.243+01:00\" time=\"0.161\">\n    <testsuite name=\"inert-contract::alpha\" tests=\"5\" skipped=\"4\" errors=\"0\" failures=\"0\">\n        <testcase name=\"excluded_case\" classname=\"inert-contract::alpha\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"ignored_case\" classname=\"inert-contract::alpha\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the run-ignored option\" />\n        </testcase>\n        <testcase name=\"quiet_pass\" classname=\"inert-contract::alpha\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"reverse_name\" classname=\"inert-contract::alpha\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"same_name\" classname=\"inert-contract::alpha\" timestamp=\"2026-09-08T10:47:41.243+01:00\" time=\"0.161\">\n            <system-out>inert captured output</system-out>\n            <system-err>(stdout and stderr are combined)</system-err>\n        </testcase>\n    </testsuite>\n    <testsuite name=\"inert-contract::beta\" tests=\"5\" skipped=\"4\" errors=\"0\" failures=\"0\">\n        <testcase name=\"excluded_case\" classname=\"inert-contract::beta\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"ignored_case\" classname=\"inert-contract::beta\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the run-ignored option\" />\n        </testcase>\n        <testcase name=\"quiet_pass\" classname=\"inert-contract::beta\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"reverse_name\" classname=\"inert-contract::beta\" time=\"0.000\">\n            <skipped message=\"Skipped: test does not match the provided expression filters\" />\n        </testcase>\n        <testcase name=\"same_name\" classname=\"inert-contract::beta\" timestamp=\"2026-09-08T10:47:41.243+01:00\" time=\"0.158\" />\n    </testsuite>\n</testsuites>",
+      "target": [
+        "inert-contract",
+        "alpha",
+        "test",
+        "same_name"
+      ],
+      "exit": 0,
+      "raw_sha256": {
+        "scoped-list.stdout": "2e9b48d0ae075089d8511bc120f78def829a41bb8aec310b37605fea91b4726a",
+        "scoped-run.stdout": "2773e0cc2bd3136133c7c1377cdd9fbb3310484614ba84d121b86cb305658a57",
+        "scoped.junit.xml": "1b0ea56e32ebbcf6a4b7f87231f664c6a59977a66f478a25d70945ffa46af982"
+      }
+    }
+  }
+}
