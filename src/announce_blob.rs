@@ -484,15 +484,17 @@ async fn fetch_and_verify(
         let Some(response) = decode_blob_response(payload) else {
             continue;
         };
-        // The gate: digest match + pair verify + agent binding. A forged
-        // responder that controls both bytes and digest still fails here.
-        return verify_fetched_blob(
+        // Responses for concurrent requests share this topic. Ignore other
+        // digests; a matching candidate still passes the complete verifier.
+        let Some(result) = select_and_verify_fetched_blob(
             &response.announcement_bytes,
             digest,
             expected_agent_id,
             0,
-        )
-        .map_err(|e| {
+        ) else {
+            continue;
+        };
+        return result.map_err(|e| {
             tracing::warn!(
                 target: "announce.blob",
                 agent = %hex::encode(expected_agent_id.as_bytes()),
@@ -503,6 +505,26 @@ async fn fetch_and_verify(
             e
         });
     }
+}
+
+/// `None` means this shared-topic response belongs to another digest: keep
+/// waiting under the existing deadline. A matching candidate's verification
+/// error remains terminal, and only a fully verified blob can be cached.
+fn select_and_verify_fetched_blob(
+    blob_bytes: &[u8],
+    expected_digest: &[u8; 32],
+    expected_agent_id: &identity::AgentId,
+    payload_version: u64,
+) -> Option<Result<CachedBlob, String>> {
+    if blake3::hash(blob_bytes).as_bytes() != expected_digest {
+        return None;
+    }
+    Some(verify_fetched_blob(
+        blob_bytes,
+        expected_digest,
+        expected_agent_id,
+        payload_version,
+    ))
 }
 
 /// Verify a fetched blob against the expected digest and agent.
@@ -662,11 +684,9 @@ pub async fn spawn_blob_responder(
         loop {
             // Drain whichever carrier delivers first; both decode the same
             // domain-prefixed request shape.
-            let message = tokio::select! {
-                m = targeted.recv() => m,
-                m = warm.recv() => m,
+            let Some(message) = targeted.recv_from_either(&mut warm).await else {
+                break;
             };
-            let Some(message) = message else { continue };
             if !message.verified || message.sender.is_none() {
                 continue;
             }
@@ -765,6 +785,105 @@ mod tests {
     /// Bincode of the pair — the exact bytes the digest commits to.
     fn pair_bytes(user_id: &Option<identity::UserId>, cert: &Option<AgentCertificate>) -> Vec<u8> {
         bincode::serialize(&(user_id, cert)).expect("serialize pair")
+    }
+
+    #[test]
+    fn blob_response_selection_interleaved_requests_reach_their_own_match() {
+        let (cert_a, user_a, agent_a) = issued_cert();
+        let (cert_b, user_b, agent_b) = issued_cert();
+        let bytes_a = pair_bytes(&Some(user_a.user_id()), &Some(cert_a));
+        let bytes_b = pair_bytes(&Some(user_b.user_id()), &Some(cert_b));
+        let digest_a = *blake3::hash(&bytes_a).as_bytes();
+        let digest_b = *blake3::hash(&bytes_b).as_bytes();
+        assert_ne!(digest_a, digest_b);
+
+        // Both fetchers see the same interleaving, B then A. The former
+        // unconditional verification terminated fetch A on the first B.
+        for (digest, agent) in [
+            (digest_a, agent_a.agent_id()),
+            (digest_b, agent_b.agent_id()),
+        ] {
+            let selected = [&bytes_b, &bytes_a]
+                .into_iter()
+                .find_map(|bytes| select_and_verify_fetched_blob(bytes, &digest, &agent, 7))
+                .expect("each request selects its own response")
+                .expect("the matching pair verifies");
+            assert_eq!(selected.digest, digest);
+            assert_eq!(selected.payload_version, 7);
+            assert_eq!(
+                selected.agent_certificate.unwrap().agent_id().unwrap(),
+                agent
+            );
+        }
+    }
+
+    #[test]
+    fn blob_response_selection_unrelated_only_has_no_terminal_result() {
+        let (_, _, agent) = issued_cert();
+        let expected = *blake3::hash(b"requested blob").as_bytes();
+        for bytes in [
+            b"unrelated response".as_slice(),
+            b"another response".as_slice(),
+        ] {
+            assert!(
+                select_and_verify_fetched_blob(bytes, &expected, &agent.agent_id(), 0).is_none()
+            );
+        }
+        // Selection does not introduce a retry or own a clock: the caller
+        // continues to enforce the original response-wait deadline.
+    }
+
+    #[test]
+    fn blob_response_selection_matching_malformed_and_mixed_pairs_still_reject() {
+        let (_, user, agent) = issued_cert();
+        for bytes in [vec![0xff], pair_bytes(&Some(user.user_id()), &None)] {
+            let digest = *blake3::hash(&bytes).as_bytes();
+            let result = select_and_verify_fetched_blob(&bytes, &digest, &agent.agent_id(), 0)
+                .expect("matching digest must reach the verifier");
+            assert!(
+                result.is_err(),
+                "matching digest alone cannot authorize a blob"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_response_selection_matching_wrong_agent_and_forged_cert_still_reject() {
+        let (cert, user, agent) = issued_cert();
+        let other_agent = AgentKeypair::generate().expect("other agent");
+        let signature = cert.signature_bytes().to_vec();
+        let mut bytes = pair_bytes(&Some(user.user_id()), &Some(cert));
+        let digest = *blake3::hash(&bytes).as_bytes();
+        let result = select_and_verify_fetched_blob(&bytes, &digest, &other_agent.agent_id(), 0)
+            .expect("matching digest must reach agent binding");
+        assert!(result.unwrap_err().contains("another agent"));
+
+        // Locate actual signature data via its public accessor, not a guessed
+        // trailing offset (the final byte encodes the not_after Option).
+        let offsets: Vec<_> = bytes
+            .windows(signature.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == signature).then_some(offset))
+            .collect();
+        assert_eq!(offsets.len(), 1, "signature data must occur exactly once");
+        bytes[offsets[0]] ^= 0xff;
+        let (_, decoded_cert): (Option<identity::UserId>, Option<AgentCertificate>) =
+            bincode::deserialize(&bytes).expect("signature mutation preserves pair decoding");
+        let decoded_cert = decoded_cert.expect("mutated pair still contains a certificate");
+        assert_ne!(decoded_cert.signature_bytes(), signature);
+        assert!(
+            decoded_cert.verify().is_err(),
+            "mutated signature must fail verification"
+        );
+        let forged_digest = *blake3::hash(&bytes).as_bytes();
+        let result = select_and_verify_fetched_blob(&bytes, &forged_digest, &agent.agent_id(), 0)
+            .expect("matching forged digest must reach certificate verification");
+        assert!(
+            result
+                .unwrap_err()
+                .starts_with("certificate verification failed:"),
+            "matching forged certificate must fail the signature gate, not decoding"
+        );
     }
 
     /// CROSS-MODULE CONSISTENCY: the digest computed by
