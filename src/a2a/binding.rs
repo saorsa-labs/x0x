@@ -10,11 +10,16 @@
 //! ```json
 //! {
 //!   "x0xBinding": "a2a/1",
-//!   "corrId": "<uuid>",
+//!   "corrId": "<corr-id>",
 //!   "kind": "request",
-//!   "jsonrpc": { "jsonrpc": "2.0", "method": "message/send", "params": {}, "id": "<uuid>" }
+//!   "jsonrpc": { "jsonrpc": "2.0", "method": "message/send", "params": {}, "id": "<corr-id>" }
 //! }
 //! ```
+//!
+//! `<corr-id>` is an opaque correlation string chosen by the caller; peers
+//! must echo it verbatim and must not parse it. This implementation emits
+//! `<uuid>-<call-token>` (see [`BindingSession::call`]), and the JSON-RPC
+//! `id` is that same string.
 //!
 //! Forward-compat rules (both directions):
 //!
@@ -37,11 +42,13 @@
 use crate::dm::{DmError, DmSendConfig};
 use crate::identity::AgentId;
 use crate::Agent;
+use dashmap::mapref::entry::Entry as DashEntry;
 use dashmap::DashMap;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -309,6 +316,12 @@ pub enum BindingError {
     InvalidResponse(String),
     /// The session was shut down while a request was in flight.
     #[error("binding session closed")]
+    /// Also returned when this session can no longer open a correlation
+    /// slot for a new call: its call-token space is exhausted, or the
+    /// freshly generated correlation id is somehow already in flight.
+    /// Both mean the session cannot serve further requests, which is what
+    /// `Closed` denotes; no new variant is added, so the public enum stays
+    /// exhaustively matchable by existing consumers.
     Closed,
 }
 
@@ -349,8 +362,14 @@ struct SessionInner {
     agent: Arc<Agent>,
     /// method name → handler.
     handlers: DashMap<String, BindingHandler>,
-    /// corrId → waiter for the matching response.
-    in_flight: DashMap<String, oneshot::Sender<JsonRpcResponse>>,
+    /// corrId → the in-flight call authorised to consume that corrId.
+    in_flight: DashMap<String, InFlightCall>,
+    /// Monotonic per-session source of `InFlightCall::call_token`.
+    ///
+    /// Starts at 1 so 0 is never a live token, and `next_call_token`
+    /// refuses to wrap, so a token is never silently reused while an older
+    /// cleanup guard still holds it.
+    call_tokens: AtomicU64,
     /// Spawned per-request handler tasks; aborted on session drop.
     handler_tasks: Mutex<JoinSet<()>>,
     config: BindingConfig,
@@ -379,6 +398,7 @@ impl BindingSession {
             agent,
             handlers: DashMap::new(),
             in_flight: DashMap::new(),
+            call_tokens: AtomicU64::new(1),
             handler_tasks: Mutex::new(JoinSet::new()),
             config,
         });
@@ -412,10 +432,13 @@ impl BindingSession {
 
     /// Call a unary A2A method on `peer` and await its correlated response.
     ///
-    /// Correlation: a fresh `corrId` (uuid) is registered in the in-flight
-    /// map *before* the request DM is sent, so a fast peer's answer can
-    /// never be missed. On timeout the entry is removed and a late response
-    /// is skipped by the receive loop.
+    /// Correlation: a fresh `corrId` — an opaque string, emitted here as
+    /// `<uuid>-<call-token>` so it cannot collide with a live entry of this
+    /// session — is registered in the in-flight map *before* the request DM
+    /// is sent, so a fast peer's answer can never be missed. The JSON-RPC
+    /// `id` carries the same string and the response must echo it exactly.
+    /// On timeout the entry is removed and a late response is skipped by the
+    /// receive loop.
     ///
     /// # Errors
     ///
@@ -431,22 +454,47 @@ impl BindingSession {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, BindingError> {
-        let corr_id = Uuid::new_v4().to_string();
+        let call_token = next_call_token(&self.inner.call_tokens)?;
+        // The token is unique for the lifetime of this session, so the
+        // correlation id cannot collide with another live entry.
+        let corr_id = format!("{}-{call_token}", Uuid::new_v4());
         let request = JsonRpcRequest::new(method, params, Value::String(corr_id.clone()));
         let envelope = BindingEnvelope::new(KIND_REQUEST, corr_id.clone(), &request)?;
         let bytes = encode_envelope(&envelope)?;
 
         let (tx, rx) = oneshot::channel();
         // Insert BEFORE sending: a fast peer can answer before the send
-        // returns, and the receive loop must find the waiter.
-        self.inner.in_flight.insert(corr_id.clone(), tx);
+        // returns, and the receive loop must find the waiter. Insert via a
+        // VACANT entry only: overwriting an occupied corrId would silently
+        // strand another live call's waiter, so a collision is an error
+        // rather than a replacement.
+        match self.inner.in_flight.entry(corr_id.clone()) {
+            DashEntry::Occupied(_) => {
+                // Unreachable: `corr_id` embeds this session's unique
+                // `call_token`, so it cannot collide with a live entry.
+                // Refuse rather than overwrite another call's waiter.
+                warn!(%corr_id, "correlation id already in flight; refusing to overwrite");
+                return Err(BindingError::Closed);
+            }
+            DashEntry::Vacant(slot) => {
+                slot.insert(InFlightCall {
+                    expected_peer: *peer,
+                    expected_jsonrpc_id: Value::String(corr_id.clone()),
+                    call_token,
+                    waiter: tx,
+                });
+            }
+        }
         // Every exit path other than successful delivery — send failure,
         // timeout, or the caller dropping this future mid-flight — removes
         // the waiter via the guard. After successful delivery the receive
-        // loop already consumed the entry, so the removal is a no-op.
+        // loop already consumed the entry, so the removal is a no-op. The
+        // guard removes ONLY its own entry (matched on `call_token`), so a
+        // late drop cannot erase a newer call that reused this corrId.
         let _cleanup = InFlightCleanup {
             in_flight: &self.inner.in_flight,
             corr_id: corr_id.clone(),
+            call_token,
         };
 
         if let Err(err) = self
@@ -491,14 +539,37 @@ impl Drop for BindingSession {
 /// removal is a no-op. Without this, cancelled calls leak waiters and the
 /// map grows unboundedly.
 struct InFlightCleanup<'a> {
-    in_flight: &'a DashMap<String, oneshot::Sender<JsonRpcResponse>>,
+    in_flight: &'a DashMap<String, InFlightCall>,
     corr_id: String,
+    call_token: u64,
 }
 
 impl Drop for InFlightCleanup<'_> {
     fn drop(&mut self) {
-        self.in_flight.remove(&self.corr_id);
+        // Token-conditional and atomic: a separate get-then-remove pair
+        // could observe our token and then delete a newer call's entry
+        // inserted in between. `remove_if` evaluates the predicate under
+        // the shard lock, so an entry belonging to a newer call (different
+        // token) is left alone.
+        self.in_flight
+            .remove_if(&self.corr_id, |_, call| call.call_token == self.call_token);
     }
+}
+
+/// One registered, not-yet-answered `call`.
+///
+/// Holds the correlation authority for its corrId: only a response from
+/// `expected_peer`, with verified provenance and the exact echoed
+/// `expected_jsonrpc_id`, may consume it.
+struct InFlightCall {
+    /// The peer this request was addressed to. A verified response from
+    /// any other agent must not satisfy this call.
+    expected_peer: AgentId,
+    /// The exact JSON-RPC `id` sent; the response must echo it verbatim.
+    expected_jsonrpc_id: Value,
+    /// Identifies this call's ownership of the corrId slot.
+    call_token: u64,
+    waiter: oneshot::Sender<JsonRpcResponse>,
 }
 
 /// Translate a decoded response into the caller-visible result.
@@ -555,7 +626,7 @@ async fn receive_loop(inner: Arc<SessionInner>, mut rx: crate::direct::DirectMes
                     handler_inner.handle_request(sender, envelope).await;
                 });
             }
-            KIND_RESPONSE => inner.handle_response(envelope),
+            KIND_RESPONSE => inner.handle_response(msg.sender, msg.verified, envelope),
             other => {
                 // Additive evolution: newer peers may send kinds we do not
                 // know (stream, stream-end, …). Skip, don't fail.
@@ -612,24 +683,156 @@ impl SessionInner {
         }
     }
 
-    fn handle_response(&self, envelope: BindingEnvelope) {
-        let Some((_, waiter)) = self.in_flight.remove(&envelope.corr_id) else {
-            // Late answer to a timed-out request, duplicate, or not ours.
-            trace!(
+    /// Correlate an inbound response to its waiting `call`.
+    ///
+    /// Every admission condition is evaluated BEFORE the entry is consumed,
+    /// so a response that fails any of them leaves the waiter registered and
+    /// a later valid response can still satisfy the same call:
+    ///
+    /// 1. `verified` provenance — a self-asserted `sender` is not enough
+    ///    (see [`crate::direct::DirectMessage::sender`]).
+    /// 2. the verified sender is the peer this call was addressed to;
+    /// 3. literal `"jsonrpc": "2.0"`;
+    /// 4. `id` echoes the exact value sent;
+    /// 5. exactly one of `result` / `error` is present;
+    /// 6. a present `error` decodes to a real [`JsonRpcError`].
+    ///
+    /// A raw `result` of JSON `null` is a legal success and is preserved as
+    /// `Some(Value::Null)`, so the caller's `call` returns `Ok(Value::Null)`
+    /// rather than an `InvalidResponse`.
+    fn handle_response(&self, sender: AgentId, verified: bool, envelope: BindingEnvelope) {
+        // Occupied-entry validation: the shard lock is held across the
+        // checks and the removal, and nothing awaits inside, so no other
+        // task can consume or replace the entry mid-decision.
+        deliver_response(&self.in_flight, sender, verified, &envelope);
+    }
+}
+
+/// Admit or refuse `envelope` against the in-flight map, and on admission
+/// consume the entry and answer its waiter.
+///
+/// This is THE production correlation operation — [`SessionInner::handle_response`]
+/// does nothing else — factored to take `&DashMap` so the whole
+/// admit → remove → send sequence is drivable with a real map and a real
+/// `oneshot` receiver, with no session, agent, or network.
+///
+/// Ordering is load-bearing and is what the tests pin: the occupied entry is
+/// held (no await) across validation, the entry is removed ONLY after
+/// admission, and the response is sent from the removed entry. A refusal
+/// therefore leaves the entry occupied and its receiver pending, so a later
+/// valid response can still satisfy the same call.
+///
+/// Returns `true` when a response was admitted and the entry consumed.
+fn deliver_response(
+    in_flight: &DashMap<String, InFlightCall>,
+    sender: AgentId,
+    verified: bool,
+    envelope: &BindingEnvelope,
+) -> bool {
+    let DashEntry::Occupied(entry) = in_flight.entry(envelope.corr_id.clone()) else {
+        // Late answer to a timed-out request, duplicate, or not ours.
+        trace!(
+            corr_id = %envelope.corr_id,
+            "no in-flight request for A2A response; skipping"
+        );
+        return false;
+    };
+    let Some(response) = admit_response(entry.get(), sender, verified, envelope) else {
+        // Refused: the entry stays occupied and answerable.
+        return false;
+    };
+    // Admitted: consume the slot atomically, then answer.
+    let call = entry.remove();
+    // The waiter may have raced a timeout and gone away; that is fine.
+    let _ = call.waiter.send(response);
+    true
+}
+
+/// Reserve the next call token from `counter`, refusing to wrap.
+///
+/// Uses a checked compare-and-swap, not `fetch_add`: `fetch_add` at
+/// `u64::MAX` stores 0 *before* returning, so the following call would be
+/// handed token 0 and then 1 — silently reusing tokens a live
+/// [`InFlightCleanup`] still owns. On exhaustion the counter is left at
+/// `u64::MAX` permanently and every later call fails the same way.
+///
+/// # Errors
+///
+/// [`BindingError::Closed`] once the token space is exhausted.
+fn next_call_token(counter: &AtomicU64) -> Result<u64, BindingError> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_exhausted| BindingError::Closed)
+}
+
+/// Decide whether `envelope` may consume `call`, and build the
+/// caller-visible response if so.
+///
+/// `None` means "reject and leave the waiter registered". Split out of
+/// [`SessionInner::handle_response`] so the admission boundary is exercised
+/// directly with inert fixtures, with no session, agent, or network.
+fn admit_response(
+    call: &InFlightCall,
+    sender: AgentId,
+    verified: bool,
+    envelope: &BindingEnvelope,
+) -> Option<JsonRpcResponse> {
+    {
+        if !verified {
+            warn!(
                 corr_id = %envelope.corr_id,
-                "no in-flight request for A2A response; skipping"
+                "rejecting A2A response with unverified sender; waiter left in place"
             );
-            return;
+            return None;
+        }
+        if sender != call.expected_peer {
+            warn!(
+                corr_id = %envelope.corr_id,
+                "rejecting A2A response from a peer this call was not addressed to"
+            );
+            return None;
+        }
+        if envelope.jsonrpc.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_2_0) {
+            warn!(corr_id = %envelope.corr_id, "rejecting A2A response with wrong jsonrpc version");
+            return None;
+        }
+        if envelope.jsonrpc.get("id") != Some(&call.expected_jsonrpc_id) {
+            warn!(corr_id = %envelope.corr_id, "rejecting A2A response with mismatched id");
+            return None;
+        }
+
+        // Presence is checked on the RAW object: `JsonRpcResponse` cannot
+        // distinguish an absent `result` from `"result": null`.
+        let raw_result = envelope.jsonrpc.get("result");
+        let raw_error = envelope.jsonrpc.get("error");
+        let response = match (raw_result, raw_error) {
+            (Some(result), None) => {
+                JsonRpcResponse::result(result.clone(), call.expected_jsonrpc_id.clone())
+            }
+            (None, Some(raw)) => {
+                // A key named `error` is not an error object. Decode it
+                // fully before consuming the waiter; `error: null` and any
+                // other malformed shape leave the call answerable.
+                let Ok(error) = serde_json::from_value::<JsonRpcError>(raw.clone()) else {
+                    warn!(
+                        corr_id = %envelope.corr_id,
+                        "rejecting A2A response with malformed error object; waiter left in place"
+                    );
+                    return None;
+                };
+                JsonRpcResponse::error(error, call.expected_jsonrpc_id.clone())
+            }
+            _ => {
+                warn!(
+                    corr_id = %envelope.corr_id,
+                    "rejecting A2A response without exactly one of result/error"
+                );
+                return None;
+            }
         };
-        let response = match serde_json::from_value::<JsonRpcResponse>(envelope.jsonrpc) {
-            Ok(response) => response,
-            Err(err) => JsonRpcResponse::error(
-                JsonRpcError::internal(format!("unparseable JSON-RPC response: {err}")),
-                Value::Null,
-            ),
-        };
-        // The waiter may have raced a timeout and gone away; that is fine.
-        let _ = waiter.send(response);
+        Some(response)
     }
 }
 
@@ -723,6 +926,341 @@ mod tests {
             ),
             Some("a2a/1".to_string())
         );
+    }
+
+    // ---- #112 packet 1: authenticated response correlation ----
+    //
+    // These exercise the real production seams (`admit_response`, the real
+    // `InFlightCall`, and the real `InFlightCleanup` guard over a real
+    // `DashMap`) with inert signed-identity fixtures. Nothing here builds an
+    // Agent, NetworkNode, PubSub, socket, or daemon.
+
+    fn test_agent_id() -> AgentId {
+        crate::identity::AgentKeypair::generate()
+            .expect("inert keypair")
+            .agent_id()
+    }
+
+    fn in_flight(
+        peer: AgentId,
+        corr_id: &str,
+        token: u64,
+    ) -> (InFlightCall, oneshot::Receiver<JsonRpcResponse>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            InFlightCall {
+                expected_peer: peer,
+                expected_jsonrpc_id: Value::String(corr_id.to_string()),
+                call_token: token,
+                waiter: tx,
+            },
+            rx,
+        )
+    }
+
+    fn response_envelope(corr_id: &str, body: Value) -> BindingEnvelope {
+        BindingEnvelope {
+            binding: X0X_BINDING_VERSION.to_string(),
+            corr_id: corr_id.to_string(),
+            kind: KIND_RESPONSE.to_string(),
+            jsonrpc: body,
+        }
+    }
+
+    fn register(
+        map: &DashMap<String, InFlightCall>,
+        peer: AgentId,
+        corr_id: &str,
+        token: u64,
+    ) -> oneshot::Receiver<JsonRpcResponse> {
+        let (call, rx) = in_flight(peer, corr_id, token);
+        map.insert(corr_id.to_string(), call);
+        rx
+    }
+
+    /// Why: `fetch_add` at `u64::MAX` stores 0 before returning, so the next
+    /// call would be handed token 0 and then 1 — reusing tokens a live
+    /// cleanup guard still owns. The allocator must refuse without mutating
+    /// the counter, and stay refused.
+    #[test]
+    fn call_token_allocator_refuses_exhaustion_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_call_token(&counter).expect("last token"), u64::MAX - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        for _ in 0..3 {
+            assert!(
+                matches!(next_call_token(&counter), Err(BindingError::Closed)),
+                "exhausted allocator must keep refusing"
+            );
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                u64::MAX,
+                "a refused allocation must not mutate the counter"
+            );
+        }
+    }
+
+    /// Why (R1 review P2): the central invariant is that a refused response
+    /// leaves the ENTRY occupied and its WAITER pending, so a later valid
+    /// response still wins. Driven through the real map + real oneshot, so a
+    /// production regression that removed the entry before validating, or
+    /// stopped sending, fails here.
+    #[test]
+    fn refused_responses_preserve_the_entry_and_a_later_valid_null_is_delivered() {
+        let map: DashMap<String, InFlightCall> = DashMap::new();
+        let peer = test_agent_id();
+        let other = test_agent_id();
+        let mut rx = register(&map, peer, "k1", 1);
+
+        let refusals = [
+            (
+                other,
+                true,
+                json!({"jsonrpc": "2.0", "id": "k1", "result": 1}),
+            ),
+            (
+                peer,
+                false,
+                json!({"jsonrpc": "2.0", "id": "k1", "result": 1}),
+            ),
+            (
+                peer,
+                true,
+                json!({"jsonrpc": "2.1", "id": "k1", "result": 1}),
+            ),
+            (
+                peer,
+                true,
+                json!({"jsonrpc": "2.0", "id": "other", "result": 1}),
+            ),
+            (
+                peer,
+                true,
+                json!({"jsonrpc": "2.0", "id": "k1", "error": null}),
+            ),
+            (
+                peer,
+                true,
+                json!({"jsonrpc": "2.0", "id": "k1", "error": {"code": 1}}),
+            ),
+            (peer, true, json!({"jsonrpc": "2.0", "id": "k1"})),
+            (
+                peer,
+                true,
+                json!({"jsonrpc": "2.0", "id": "k1", "result": 1, "error": {"code": 1, "message": "m"}}),
+            ),
+        ];
+        for (from, verified, body) in refusals {
+            assert!(
+                !deliver_response(&map, from, verified, &response_envelope("k1", body.clone())),
+                "must refuse {body}"
+            );
+            assert!(
+                map.contains_key("k1"),
+                "refusal must leave the entry: {body}"
+            );
+            assert!(
+                matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "refusal must leave the waiter pending: {body}"
+            );
+        }
+
+        let ok = response_envelope("k1", json!({"jsonrpc": "2.0", "id": "k1", "result": null}));
+        assert!(deliver_response(&map, peer, true, &ok));
+        assert!(!map.contains_key("k1"), "admission must consume the entry");
+        let delivered = rx
+            .try_recv()
+            .expect("waiter must receive the admitted response");
+        assert_eq!(delivered.result, Some(Value::Null));
+        assert_eq!(response_into_result(delivered).expect("ok"), Value::Null);
+
+        // Duplicate: the slot is gone, so nothing else can be completed.
+        assert!(!deliver_response(&map, peer, true, &ok));
+    }
+
+    /// Why: an admitted error must reach the real waiter as `Remote`, and a
+    /// response for a corrId this session never registered must not complete
+    /// some other call.
+    #[test]
+    fn admitted_error_reaches_the_waiter_and_unknown_corr_id_completes_nothing() {
+        let map: DashMap<String, InFlightCall> = DashMap::new();
+        let peer = test_agent_id();
+        let mut rx = register(&map, peer, "k2", 7);
+        let stray = response_envelope("nope", json!({"jsonrpc": "2.0", "id": "nope", "result": 1}));
+        assert!(!deliver_response(&map, peer, true, &stray));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        let err = response_envelope(
+            "k2",
+            json!({"jsonrpc": "2.0", "id": "k2", "error": {"code": -32601, "message": "nope"}}),
+        );
+        assert!(deliver_response(&map, peer, true, &err));
+        let delivered = rx.try_recv().expect("waiter must receive the error");
+        assert!(matches!(
+            response_into_result(delivered),
+            Err(BindingError::Remote { code, .. }) if code == -32601
+        ));
+        assert!(!map.contains_key("k2"));
+    }
+
+    /// Why: a JSON-RPC `result` of `null` is a legal success. The raw
+    /// presence check must preserve it as `Some(Value::Null)` so the public
+    /// `call` returns `Ok(Value::Null)` — decoding into `JsonRpcResponse`
+    /// alone collapses it to `None` and would report `InvalidResponse`.
+    #[test]
+    fn null_result_reaches_the_caller_as_ok_null() {
+        let peer = test_agent_id();
+        let (call, _rx) = in_flight(peer, "c1", 1);
+        let env = response_envelope("c1", json!({"jsonrpc": "2.0", "id": "c1", "result": null}));
+        let response = admit_response(&call, peer, true, &env).expect("null result is admissible");
+        assert_eq!(response.result, Some(Value::Null));
+        assert_eq!(response_into_result(response).expect("ok"), Value::Null);
+    }
+
+    /// Why: an `error` key is not an error object. Malformed shapes must be
+    /// rejected BEFORE the waiter is consumed, so the call stays answerable
+    /// and a later valid response still wins.
+    #[test]
+    fn malformed_errors_leave_the_call_answerable_then_a_valid_one_wins() {
+        let peer = test_agent_id();
+        let (call, _rx) = in_flight(peer, "c2", 1);
+        for bad in [
+            json!({"jsonrpc": "2.0", "id": "c2", "error": null}),
+            json!({"jsonrpc": "2.0", "id": "c2", "error": "boom"}),
+            json!({"jsonrpc": "2.0", "id": "c2", "error": {"message": "no code"}}),
+            json!({"jsonrpc": "2.0", "id": "c2", "error": {"code": 1}}),
+            json!({"jsonrpc": "2.0", "id": "c2", "error": {"code": "x", "message": "m"}}),
+            json!({"jsonrpc": "2.0", "id": "c2", "result": 1, "error": {"code": 1, "message": "m"}}),
+            json!({"jsonrpc": "2.0", "id": "c2"}),
+        ] {
+            assert!(
+                admit_response(&call, peer, true, &response_envelope("c2", bad.clone())).is_none(),
+                "malformed response must not consume the waiter: {bad}"
+            );
+        }
+        let good = response_envelope(
+            "c2",
+            json!({"jsonrpc": "2.0", "id": "c2", "error": {"code": -32601, "message": "nope"}}),
+        );
+        let response = admit_response(&call, peer, true, &good).expect("valid error admitted");
+        assert!(matches!(
+            response_into_result(response),
+            Err(BindingError::Remote { code, .. }) if code == -32601
+        ));
+    }
+
+    /// Why: correlation authority is the peer the request was addressed to.
+    /// A verified response from a different agent must not satisfy the call.
+    #[test]
+    fn verified_wrong_peer_is_refused_and_expected_peer_is_admitted() {
+        let expected = test_agent_id();
+        let other = test_agent_id();
+        assert_ne!(expected, other);
+        let (call, _rx) = in_flight(expected, "c3", 1);
+        let env = response_envelope("c3", json!({"jsonrpc": "2.0", "id": "c3", "result": 7}));
+        assert!(admit_response(&call, other, true, &env).is_none());
+        assert!(admit_response(&call, expected, true, &env).is_some());
+    }
+
+    /// Why: `DirectMessage::sender` is self-asserted. Verified provenance is
+    /// required, so a claimed-but-unverified expected peer is refused.
+    #[test]
+    fn unverified_claimed_sender_is_refused() {
+        let peer = test_agent_id();
+        let (call, _rx) = in_flight(peer, "c4", 1);
+        let env = response_envelope("c4", json!({"jsonrpc": "2.0", "id": "c4", "result": 7}));
+        assert!(admit_response(&call, peer, false, &env).is_none());
+        assert!(admit_response(&call, peer, true, &env).is_some());
+    }
+
+    /// Why: literal `"2.0"` and the exact echoed id are the remaining
+    /// correlation invariants; near-misses must not be admitted.
+    #[test]
+    fn version_and_id_must_match_exactly() {
+        let peer = test_agent_id();
+        let (call, _rx) = in_flight(peer, "c5", 1);
+        for bad in [
+            json!({"jsonrpc": "2.1", "id": "c5", "result": 1}),
+            json!({"jsonrpc": 2.0, "id": "c5", "result": 1}),
+            json!({"id": "c5", "result": 1}),
+            json!({"jsonrpc": "2.0", "id": "c5 ", "result": 1}),
+            json!({"jsonrpc": "2.0", "id": 5, "result": 1}),
+            json!({"jsonrpc": "2.0", "result": 1}),
+        ] {
+            assert!(
+                admit_response(&call, peer, true, &response_envelope("c5", bad.clone())).is_none(),
+                "must reject {bad}"
+            );
+        }
+    }
+
+    /// Why: an authenticated inbox/loopback delivery is the positive case
+    /// the whole gate exists to let through, for both result and error.
+    #[test]
+    fn authenticated_delivery_positives_are_admitted() {
+        let peer = test_agent_id();
+        let (call, _rx) = in_flight(peer, "c6", 1);
+        let ok = response_envelope(
+            "c6",
+            json!({"jsonrpc": "2.0", "id": "c6", "result": {"a": 1}}),
+        );
+        assert_eq!(
+            response_into_result(admit_response(&call, peer, true, &ok).expect("result admitted"))
+                .expect("ok"),
+            json!({"a": 1})
+        );
+        let err = response_envelope(
+            "c6",
+            json!({"jsonrpc": "2.0", "id": "c6", "error": {"code": -32603, "message": "boom"}}),
+        );
+        assert!(matches!(
+            response_into_result(admit_response(&call, peer, true, &err).expect("error admitted")),
+            Err(BindingError::Remote { code, .. }) if code == -32603
+        ));
+    }
+
+    /// Why: the reply removes corrId X, then a (forced) id reuse inserts a
+    /// NEW call at X before the old call's cleanup guard drops. The old
+    /// guard must not erase the new entry.
+    #[test]
+    fn old_cleanup_drop_cannot_erase_a_reused_corr_id() {
+        let map: DashMap<String, InFlightCall> = DashMap::new();
+        let peer = test_agent_id();
+        let (first, _rx1) = in_flight(peer, "reused", 1);
+        map.insert("reused".to_string(), first);
+        let old_guard = InFlightCleanup {
+            in_flight: &map,
+            corr_id: "reused".to_string(),
+            call_token: 1,
+        };
+        // The response consumed the first call's entry.
+        assert!(map.remove("reused").is_some());
+        // A forced id reuse registers a NEW call in the same slot.
+        let (second, _rx2) = in_flight(peer, "reused", 2);
+        map.insert("reused".to_string(), second);
+        // The first call's guard now drops.
+        drop(old_guard);
+        let survivor = map.get("reused").expect("newer call must survive");
+        assert_eq!(survivor.call_token, 2);
+    }
+
+    /// Why: the guard must still clean up its OWN entry, or cancelled and
+    /// timed-out calls leak waiters.
+    #[test]
+    fn cleanup_drop_removes_its_own_entry() {
+        let map: DashMap<String, InFlightCall> = DashMap::new();
+        let peer = test_agent_id();
+        let (call, _rx) = in_flight(peer, "mine", 9);
+        map.insert("mine".to_string(), call);
+        drop(InFlightCleanup {
+            in_flight: &map,
+            corr_id: "mine".to_string(),
+            call_token: 9,
+        });
+        assert!(map.get("mine").is_none());
     }
 
     #[test]
