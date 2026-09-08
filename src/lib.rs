@@ -10105,7 +10105,6 @@ impl Agent {
     /// Returns an error if:
     /// - Gossip runtime is not initialized (configure agent with network first)
     /// - Message encoding or broadcast fails
-    ///
     pub async fn publish(&self, topic: &str, payload: Vec<u8>) -> error::Result<()> {
         self.publish_with_fanout(topic, payload).await.map(|_| ())
     }

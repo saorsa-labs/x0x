@@ -1722,8 +1722,6 @@ struct DirectionalFanoutDiagnostics {
     remote_seen: [bool; 2],
 }
 
-impl DirectionalFanoutDiagnostics {}
-
 // The real-agent wrapper and deterministic delayed-delivery regressions share
 // this entire readiness loop; the tests replace only publication/reception IO.
 async fn await_restart_gossip_ready_with(
@@ -1983,7 +1981,9 @@ async fn fanout_control_asymmetric_recorded_and_still_fails() {
 }
 
 /// Delayed EXACT remote probes in both directions still pass through the
-/// actual shared loop (exercising the issued-probe retention).
+/// actual shared loop at 50 ms (within one round's receive window).
+/// Cross-round retention (>1 s delivery) is exercised separately by the
+/// existing delayed-out-of-phase controls at 1200/2200 ms.
 #[tokio::test(start_paused = true)]
 async fn fanout_control_delayed_exact_remote_passes() {
     let (result, diag) = fanout_control_fixture(1, 1, Some(50), Some(50), true).await;
