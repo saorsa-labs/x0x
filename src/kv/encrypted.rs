@@ -227,6 +227,31 @@ pub trait KvSecureContext: Send + Sync {
     /// AEAD operation fails.
     fn seal(&self, store_id: &KvStoreId, plaintext: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)>;
 
+    /// Atomically admit an author and seal one mutation under the same
+    /// security snapshot.
+    ///
+    /// A backend that can refresh its membership/epoch concurrently MUST
+    /// override this method and hold its snapshot across both the active
+    /// member check and the seal.  The default is deliberately fail-closed:
+    /// checking [`is_active_member`](Self::is_active_member) and then calling
+    /// [`seal`](Self::seal) separately cannot establish that the two answers
+    /// came from one snapshot.  Existing custom contexts therefore continue
+    /// to compile, but must explicitly implement this capability before they
+    /// can publish encrypted mutations through
+    /// [`crate::kv::sync::KvStoreSync`].
+    fn seal_authorized(
+        &self,
+        signing: &AuthorSigning,
+        kind: KvMutationKind,
+        store_id: &KvStoreId,
+        payload: &[u8],
+    ) -> Result<EncryptedKvStoreRecordV1> {
+        let _ = (signing, kind, store_id, payload);
+        Err(KvError::SecureRecord(
+            "secure context lacks atomic author admission and sealing capability".to_string(),
+        ))
+    }
+
     /// Open a record sealed for this store at `epoch`.
     ///
     /// The implementation MUST reject a foreign `epoch` (one it holds no
@@ -355,6 +380,35 @@ pub fn seal_mutation(
 ) -> Result<EncryptedKvStoreRecordV1> {
     let group_id = ctx.group_id();
     let epoch = ctx.current_epoch();
+    seal_mutation_with_snapshot(
+        group_id,
+        epoch,
+        signing,
+        kind,
+        store_id,
+        payload,
+        |plaintext| ctx.seal(store_id, plaintext),
+    )
+}
+
+/// Build and seal a mutation from one caller-owned security snapshot.
+///
+/// The GSS backend uses this helper while holding its read lock, so a group
+/// refresh cannot change membership or epoch between admission and AEAD
+/// sealing.  The closure must use the same snapshot and return the epoch it
+/// actually sealed under.
+pub(crate) fn seal_mutation_with_snapshot<F>(
+    group_id: Vec<u8>,
+    epoch: u64,
+    signing: &AuthorSigning,
+    kind: KvMutationKind,
+    store_id: &KvStoreId,
+    payload: &[u8],
+    seal: F,
+) -> Result<EncryptedKvStoreRecordV1>
+where
+    F: FnOnce(&[u8]) -> Result<(u64, [u8; 24], Vec<u8>)>,
+{
     let mut mutation = SignedKvMutation {
         group_id: group_id.clone(),
         store_id: *store_id.as_bytes(),
@@ -369,7 +423,7 @@ pub fn seal_mutation(
     mutation.signature = signing.sign(&mutation.signing_bytes())?;
     let plaintext = bincode::serialize(&mutation)
         .map_err(|e| KvError::Gossip(format!("sealed mutation serialize failed: {e}")))?;
-    let (sealed_epoch, nonce, ciphertext) = ctx.seal(store_id, &plaintext)?;
+    let (sealed_epoch, nonce, ciphertext) = seal(&plaintext)?;
     // The envelope epoch and the signed epoch must agree; a context
     // re-keying between the two calls would otherwise produce an
     // unverifiable record.
@@ -666,6 +720,22 @@ mod tests {
         assert_eq!(mutation.payload, payload);
         assert_eq!(mutation.author_id, author.agent_id);
         assert_eq!(mutation.epoch, record.epoch);
+    }
+
+    #[test]
+    fn snapshot_sealer_rejects_epoch_change_during_seal() {
+        let author = signing(0);
+        let err = seal_mutation_with_snapshot(
+            b"group".to_vec(),
+            7,
+            &author,
+            KvMutationKind::Delta,
+            &test_store_id(),
+            b"payload",
+            |_plaintext| Ok((8, [0; 24], Vec::new())),
+        )
+        .expect_err("a seal result from another epoch must be rejected");
+        assert!(err.to_string().contains("epoch moved during seal"));
     }
 
     #[test]
