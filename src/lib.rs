@@ -156,6 +156,9 @@ pub mod dm;
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
 
+/// Bounded per-peer DM digest diagnostic observations.
+pub mod dm_digest_diagnostics;
+
 /// Background service that publishes this agent's capability advert and
 /// consumes peers' adverts into a shared [`dm_capability::CapabilityStore`].
 pub mod dm_capability_service;

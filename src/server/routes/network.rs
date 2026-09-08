@@ -936,10 +936,31 @@ pub(in crate::server) async fn groups_diagnostics(
     )
 }
 
+/// Exact-agent selection for the bounded digest listing; old fields are unfiltered.
+#[derive(serde::Deserialize, Default)]
+pub(in crate::server) struct DmDiagnosticsQuery {
+    agent: Option<String>,
+}
+
 /// GET /diagnostics/dm — direct-message send/receive diagnostics.
 pub(in crate::server) async fn dm_diagnostics(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<DmDiagnosticsQuery>,
 ) -> impl IntoResponse {
+    let agent = match query
+        .agent
+        .as_deref()
+        .map(x0x::dm_digest_diagnostics::parse_agent_filter)
+        .transpose()
+    {
+        Ok(agent) => agent,
+        Err(message) => return bad_request(message),
+    };
+    let digest = x0x::dm_digest_diagnostics::snapshot(
+        &state.agent.capability_store(),
+        state.agent.peer_relay(),
+        agent,
+    );
     let x0x::direct::DmDiagnosticsSnapshot {
         stats,
         per_peer,
@@ -955,6 +976,7 @@ pub(in crate::server) async fn dm_diagnostics(
         "subscriber_count": subscriber_count,
         "subscriber_capacity": subscriber_capacity,
         "capability_store_entries": state.agent.capability_store().len(),
+        "per_peer_digest": digest,
     });
     if let Some(stages) = last_durable_send {
         body["last_durable_send"] = stages.to_export_json();

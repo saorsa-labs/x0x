@@ -746,7 +746,11 @@ enum DiagnosticsSub {
     /// Print ADR-0035 relay metering: advert census, selection skew, inbound dialers.
     Relay,
     /// Print direct-message counters, fan-out health, and per-peer state.
-    Dm,
+    Dm {
+        /// Inspect one exact agent's retained digest state (64 hexadecimal characters).
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Print per-group ingest counters and drop-reason buckets.
     Groups,
     /// Print remote exec counters, warnings, and ACL summary.
@@ -2187,7 +2191,9 @@ async fn run(
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
             DiagnosticsSub::Transport => commands::network::diagnostics_transport(&client).await,
             DiagnosticsSub::Relay => commands::network::diagnostics_relay(&client).await,
-            DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
+            DiagnosticsSub::Dm { agent } => {
+                commands::network::diagnostics_dm_for_agent(&client, agent.as_deref()).await
+            }
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
             DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,

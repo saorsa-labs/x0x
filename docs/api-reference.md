@@ -2108,13 +2108,73 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
 | GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget`) |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
-| GET | `/diagnostics/dm` | `x0x diagnostics dm` | Direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`) |
+| GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
 | GET | `/diagnostics/relay` | `x0x diagnostics relay` | ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence |
 | GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023) |
+
+### `GET /diagnostics/dm`
+
+`x0x diagnostics dm [--agent <64-hex-agent-id>]` adds `per_peer_digest` (schema 2)
+to the existing DM diagnostics. Optional `?agent=<64-hex-agent-id>` selects exactly
+one agent in that object; malformed IDs return HTTP 400 (CLI validation also
+rejects them). Existing fields, including the unfiltered DM-health `per_peer` and
+`capability_store_entries` (retained base-advert count, including stale records),
+keep their meanings. Normal durable or valid session bearer authentication applies.
+
+Without a filter, `rows` contains at most the lexicographically first 512 distinct
+retained agent IDs across two separately sampled local stores. This is a bounded
+listing with exact-ID inspection, **not pagination or a fleet census**. There is no
+cursor. `truncated` indicates omitted retained IDs from the available samples;
+false does not prove completeness when a store is unavailable. Exact filtering can
+inspect an ID beyond this default bound and sets `truncated` false for that selection.
+`totals.capability` counts distinct agents (base and extension coalesced), fresh and
+expired-retained base records, and present/fresh/expired-retained extension records.
+`totals.relay` counts distinct agents and fresh/expired-retained baselines. These are
+per-store counts, not an exact cross-store union total. Collection uses bounded
+auxiliary memory but scans retained entries in O(n) time; it does not cap, prune,
+refresh or insert into either store.
+
+Each row contains:
+
+- `agent_id`, `capability_record_state` and `relay_record_state`: `retained`,
+  `absent_unknown_history` or `unavailable`. Exact selection of an absent ID returns
+  a row with explicit unknown-history states. Absence does not mean never observed,
+  legacy support or lack of capability: pruning, eviction and restart erase history.
+- `base_advert`: actual cached `digest_support`, stored `machine_id`,
+  `source: "advert"`, `advert_created_unix_ms`, `expires_in_ms` (saturating local
+  monotonic duration) and `state`. Here `advert` names the base-cache component,
+  not its ingress provenance: card imports can also populate this cache. Despite
+  the field name, `advert_created_unix_ms` is the stored creation/order timestamp:
+  signed sender time for adverts, local import time for the daemon's card-import
+  path. The cache retains no discriminator, so diagnostics cannot identify which
+  clock provenance applies to a row. This cached bit may come from a legacy v2
+  advert or stay true after a merged extension expires. It is not recomputed by
+  diagnostics.
+- `digest_extension`: its own stored `digest_support`, extension-sourced
+  `machine_id`, `source: "extension"`, sender-signed `created_at_unix_ms`,
+  `expires_in_ms`, `state`, and `machine_matches_base` (null with no base, false
+  for an actual mismatch). Extension-only and mismatched records remain visible.
+  Base and extension are fresh at their exact expiry instant, expired-retained
+  only after it. Missing records are null; expired-retained means still stored.
+- `v2_observed`: retained baseline `age_ms` from the local monotonic clock and
+  `state` (fresh strictly before the baseline TTL, expired-retained at equality).
+  This is agent-keyed, not machine-keyed. Ages are not UTC timestamps and cannot
+  be compared across restarts.
+- `fresh_forward_downgrade_baseline`: true only for an available, fresh relay
+  baseline; false for an available absent/expired baseline; null if unavailable.
+  This is only the conditional baseline check on the forward arm, after earlier
+  enabled/signature/freshness/contact/block gates and subject to later resource
+  limits. It is not an overall forwarding decision and does not apply to local delivery.
+
+`store_state_capability` and `store_state_relay` are independently `available` or
+`unavailable`. Poisoned locks are not recovered: the affected store contributes no
+rows and its totals are null, not zero. Missing row components remain null. Locks
+are released before wire serialization; the two samples are not an atomic view.
+This diagnostic supplies no transition-policy, fleet-coverage or end-to-end acceptance claim.
 
 ### `GET /diagnostics/groups`
 

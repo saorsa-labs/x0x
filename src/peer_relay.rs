@@ -1018,6 +1018,57 @@ impl PeerRelay {
         }
     }
 
+    /// Read the retained baseline without invoking its lazy-pruning lookup.
+    pub(crate) fn digest_diagnostic_snapshot(
+        &self,
+        now: Instant,
+        filter: Option<[u8; 32]>,
+    ) -> crate::dm_digest_diagnostics::StoreSnapshot<
+        crate::dm_digest_diagnostics::BaselineObservation,
+        crate::dm_digest_diagnostics::BaselineTotals,
+    > {
+        use crate::dm_digest_diagnostics::{
+            millis, select_key, BaselineObservation, BaselineTotals, StoreSnapshot,
+        };
+        let Ok(seen) = self.v2_observed_senders.lock() else {
+            return StoreSnapshot::unavailable();
+        };
+        let mut keys = std::collections::BTreeSet::new();
+        let mut totals = BaselineTotals::default();
+        for (key, at) in seen.iter() {
+            totals.distinct_agents += 1;
+            if now.saturating_duration_since(*at) < V2_BASELINE_TTL {
+                totals.fresh += 1;
+            } else {
+                totals.expired_retained += 1;
+            }
+            select_key(&mut keys, *key, filter);
+        }
+        let rows = keys
+            .into_iter()
+            .filter_map(|key| {
+                seen.get(&key).map(|at| {
+                    let age = now.saturating_duration_since(*at);
+                    (
+                        key,
+                        BaselineObservation {
+                            state: if age < V2_BASELINE_TTL {
+                                "fresh"
+                            } else {
+                                "expired_retained"
+                            },
+                            age_ms: millis(age),
+                        },
+                    )
+                })
+            })
+            .collect();
+        StoreSnapshot {
+            totals: Some(totals),
+            rows,
+        }
+    }
+
     fn limiter_lock(&self) -> std::sync::MutexGuard<'_, RelayLimiter> {
         match self.limiter.lock() {
             Ok(g) => g,
@@ -3192,5 +3243,88 @@ mod tests {
         let generous =
             RelayPolicy::enabled().with_forward_limits(10, 100, 1_024, Duration::from_secs(60));
         assert_eq!(generous.limit_window, Duration::from_secs(60));
+    }
+}
+
+#[cfg(test)]
+mod digest_diagnostic_tests {
+    use super::*;
+    use crate::dm_capability::CapabilityStore;
+    use crate::dm_digest_diagnostics::join_snapshots;
+
+    #[test]
+    fn baseline_boundary_and_nonmutating_snapshot() {
+        let relay = PeerRelay::default();
+        let now = Instant::now();
+        relay
+            .v2_observed_senders
+            .lock()
+            .unwrap()
+            .insert([1; 32], now);
+        let at = now + V2_BASELINE_TTL;
+        let fresh = relay.digest_diagnostic_snapshot(at - Duration::from_millis(1), None);
+        assert_eq!(fresh.totals.unwrap().fresh, 1);
+        let expired = relay.digest_diagnostic_snapshot(at, None);
+        assert_eq!(expired.totals.as_ref().unwrap().expired_retained, 1);
+        let view = join_snapshots(
+            CapabilityStore::new().digest_diagnostic_snapshot(at, None),
+            expired,
+            None,
+        );
+        assert_eq!(
+            view["rows"][0]["v2_observed"]["age_ms"],
+            crate::dm_digest_diagnostics::millis(V2_BASELINE_TTL)
+        );
+        assert_eq!(view["rows"][0]["fresh_forward_downgrade_baseline"], false);
+        assert_eq!(
+            view["rows"][0]["capability_record_state"],
+            "absent_unknown_history"
+        );
+        assert_eq!(
+            *relay
+                .v2_observed_senders
+                .lock()
+                .unwrap()
+                .get(&[1; 32])
+                .unwrap(),
+            now
+        );
+        assert_eq!(
+            relay
+                .digest_diagnostic_snapshot(now, None)
+                .totals
+                .unwrap()
+                .fresh,
+            1
+        );
+    }
+
+    #[test]
+    fn poisoned_baseline_is_unavailable_with_other_store_rows() {
+        let relay = PeerRelay::default();
+        let now = Instant::now();
+        let _ = std::panic::catch_unwind(|| {
+            let mut guard = relay.v2_observed_senders.lock().unwrap();
+            guard.insert([1; 32], now);
+            panic!("deliberate inert poison");
+        });
+        let cap = CapabilityStore::new();
+        assert!(cap.insert(
+            AgentId([2; 32]),
+            crate::identity::MachineId([3; 32]),
+            crate::dm::DmCapabilities::pending(),
+            crate::dm_capability::now_unix_ms()
+        ));
+        let view = join_snapshots(
+            cap.digest_diagnostic_snapshot(now, None),
+            relay.digest_diagnostic_snapshot(now, None),
+            None,
+        );
+        assert!(view["totals"]["relay"].is_null());
+        assert_eq!(view["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(view["rows"][0]["capability_record_state"], "retained");
+        assert_eq!(view["rows"][0]["relay_record_state"], "unavailable");
+        assert!(view["rows"][0]["fresh_forward_downgrade_baseline"].is_null());
+        assert_eq!(relay.digest_diagnostic_snapshot(now, None).rows.len(), 0);
     }
 }
