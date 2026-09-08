@@ -55,6 +55,7 @@ async function mountGui(page, routes, opts) {
     }
     const key = `${req.method()} ${url.pathname}`;
     seen.push(key);
+    if (opts && opts.onRequest) await opts.onRequest(key);
     const hit = routes[key];
     if (!hit) {
       return route.fulfill({
@@ -76,6 +77,7 @@ async function mountGui(page, routes, opts) {
         await hold.promise;
       }
     }
+    if (hit.abort) return route.abort();
     return route.fulfill({
       status: hit.status,
       contentType: 'application/json',
@@ -880,15 +882,11 @@ test('a FAILED policy PATCH is still treated as uncertain, not as no-op', async 
     .toBe('draft across an uncertain patch');
 });
 
-// ── R5: the handoff between resolver publication and the CALLER's request ─
+// ── R5 retained no-write/draft controls ──────────────────────────────────
+// The former caller-handoff P1 was withdrawn. Pending-mutation refusal now
+// finishes before a stores request; these controls await that terminal return
+// instead of the obsolete store-entry barrier. Both PATCH outcomes remain.
 //
-// Root/Sol P1: the R4 gates were all INSIDE openSpacePageStore. A PATCH
-// admitted while a resolution is pending, completing just AFTER that
-// resolution is published, leaves the caller holding a valid-looking entry —
-// and all six callers then issued their own store request with no re-check.
-// These controls drive the real handoff: the resolver publishes first, the
-// PATCH completes second, the caller's request third.
-
 /// Mount the policy form and START the PATCH without awaiting it.
 function startPolicyPatch(page, sid) {
   return page.evaluate((gid) => {
@@ -906,15 +904,9 @@ for (const [app, saver, contentId, editorId, errId] of [
 ]) {
   for (const patchOk of [true, false]) {
     const label = patchOk ? 'successful' : 'failed';
-    test(`${app}: a ${label} PATCH completing after the resolver published still blocks the caller's generic write`, async ({ page }) => {
-      // The PATCH is ADMITTED and held; the save then starts and reads the
-      // still-public policy; its resolver publishes the generic entry; the
-      // PATCH completes; only then does the caller reach its PUT.
-      const gate = makeGate([`PATCH /groups/${SID}/policy`, 'GET /stores']);
-      // The generic store ALREADY EXISTS, so the resolver publishes straight
-      // after the listing with no further await inside it — this is Root's
-      // sequence, and it is what makes the resolver-internal gates
-      // insufficient and the CALLER gate load-bearing.
+    test(`${app}: a ${label} pending PATCH blocks the caller before and after completion`, async ({ page }) => {
+      // A save during the admitted PATCH must settle without a page request.
+      const gate = makeGate([`PATCH /groups/${SID}/policy`]);
       const generic0 = `x0x-${app}-${SID.slice(0, 16)}`;
       const routes = {
         [`GET /groups/${SID}`]: publicGroup(),
@@ -936,17 +928,14 @@ for (const [app, saver, contentId, editorId, errId] of [
       const patch = startPolicyPatch(page, SID);
       await gate.holds[`PATCH /groups/${SID}/policy`].enteredPromise;
 
-      // 2. Save starts and its resolver reaches the generic listing.
+      // 2. Save settles by early refusal; no absent-store-request timeout.
       const save = page.evaluate(([sid, fn]) => window[fn](sid), [SID, saver]);
-      await gate.holds['GET /stores'].enteredPromise;
+      await save; // Pending mutations now refuse before any policy/store GET.
 
-      // 3. Let the resolver publish, then complete the PATCH, then let the
-      //    caller proceed to its own request.
-      // Release the listing, let the PATCH complete FIRST, then the caller.
-      const boundary = seen.length;
+      // 3. Complete PATCH; keep the original no-write/draft/error oracles.
+      const boundary = 0;
       gate.holds[`PATCH /groups/${SID}/policy`].release();
       await patch;                       // completion invalidation has landed
-      gate.holds['GET /stores'].release();
       await save;
       const after = seen.slice(boundary);
 
@@ -969,11 +958,9 @@ for (const [app, saver, contentId, editorId, errId] of [
 }
 
 test('a NEW resolver started after PATCH admission is still blocked when the PATCH completes', async ({ page }) => {
-  // Sol P2: every earlier control's resolver PREDATES admission, so they
-  // cannot discriminate the COMPLETION invalidator. Here the resolver starts
-  // AFTER admission, reads the old public policy, and is held at its listing
-  // until the PATCH completes.
-  const gate = makeGate([`PATCH /groups/${SID}/policy`, 'GET /stores']);
+  // Preserve the post-admission no-create/no-write oracle. Its former held
+  // listing barrier is replaced by terminal early refusal, which is stronger.
+  const gate = makeGate([`PATCH /groups/${SID}/policy`]);
   const routes = {
     [`GET /groups/${SID}`]: publicGroup(),
     'GET /stores': { status: 200, body: { ok: true, stores: [] } },
@@ -990,14 +977,13 @@ test('a NEW resolver started after PATCH admission is still blocked when the PAT
   const patch = startPolicyPatch(page, SID);
   await gate.holds[`PATCH /groups/${SID}/policy`].enteredPromise;
 
-  // NEW resolver, started strictly after admission, gets the old public policy.
+  // NEW resolver must now refuse without issuing that old-policy GET.
   const save = page.evaluate((sid) => window.saveWikiPage(sid), SID);
-  await gate.holds['GET /stores'].enteredPromise;
+  await save; // Early refusal replaces the former held-store barrier.
 
-  const boundary = seen.length;
+  const boundary = 0;
   gate.holds[`PATCH /groups/${SID}/policy`].release();
   await patch;                                   // COMPLETION invalidation
-  gate.holds['GET /stores'].release();
   await save;
   const after = seen.slice(boundary);
 
@@ -1100,3 +1086,145 @@ test('a read interrupted after its request cannot claim nothing was read', async
   expect(shown.toLowerCase()).toContain('may reflect the previous setting');
   expect(shown).not.toContain('page-a');          // the stale listing is not painted
 });
+
+// Pending-mutation controls use response-entry barriers, never sleeps or a
+// timeout waiting for a request that a correct early refusal will not issue.
+const pendingState = (page, sid = SID) => page.evaluate((id) => ({
+  pending: typeof spacePolicyPending === 'undefined' ? 0 : (spacePolicyPending[id] || 0),
+  observed: { ...spacePolicy[id] },
+}), sid);
+
+for (const app of ['wiki', 'web']) {
+  test(`pending mutation: ${app} refuses before delayed PATCH response and recovers through fresh GET`, async ({ page }) => {
+    const patchKey = `PATCH /groups/${SID}/policy`;
+    const groupKey = `GET /groups/${SID}`;
+    const generic = `x0x-${app}-${SID.slice(0, 16)}`;
+    const bound = `bound-${app}`;
+    const gate = makeGate([patchKey]);
+    let committed = false;
+    const trace = [];
+    const routes = {
+      [groupKey]: publicGroup(),
+      [patchKey]: { status: 200, body: { ok: true } },
+      'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic }] } },
+      [`PUT /stores/${generic}/`]: { status: 200, body: { ok: true } },
+      [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: bound } },
+    };
+    const seen = await mountGui(page, routes, { gate, onRequest: (key) => trace.push({ key, committed }) });
+    await page.evaluate((name) => document.body.insertAdjacentHTML('beforeend',
+      `<textarea id="${name}-content">kept pending draft</textarea>` +
+      `<div id="${name}-editor"></div><div id="${name}-error"></div>`), app);
+    const patch = startPolicyPatch(page, SID);
+    await gate.holds[patchKey].enteredPromise;
+    const admitted = await pendingState(page);
+    const boundary = seen.length;
+    // Model backend commit independently from response delivery. The existing
+    // GET route still offers its old public snapshot until PATCH is released.
+    committed = true;
+    await page.evaluate(([sid, name]) => window[name === 'wiki' ? 'saveWikiPage' : 'saveWebPage'](sid), [SID, app]);
+    const during = seen.slice(boundary);
+    const state = await page.evaluate((name) => ({
+      hidden: document.getElementById(name + '-editor').style.display === 'none',
+      text: document.getElementById(name + '-content').value,
+      error: document.getElementById(name + '-error').textContent,
+    }), app);
+    trace.push({ event: 'save settled before PATCH response', admitted, state: await pendingState(page) });
+    routes[groupKey] = privateGroup();
+    gate.holds[patchKey].release();
+    await patch;
+    const recovery = seen.length;
+    const result = await page.evaluate(([sid, name]) => openSpacePageStore(sid, name), [SID, app]);
+    console.log('PENDING_REPAIR_TRACE ' + JSON.stringify({ app, trace }));
+    expect(during).toEqual([]);
+    expect(admitted.pending).toBe(1);
+    expect(state).toMatchObject({ hidden: false, text: 'kept pending draft' });
+    expect(state.error).toContain('being updated');
+    expect(result).toMatchObject({ ok: true, id: bound });
+    expect(seen.slice(recovery)).toEqual([groupKey, `POST /groups/${SID}/stores`]);
+    expect((await pendingState(page)).pending).toBe(0);
+  });
+}
+
+for (const reverse of [false, true]) {
+  for (const outcome of ['success', 'failure', 'network-error']) {
+    test(`pending mutation: overlapping PATCHes settle ${reverse ? 'reverse' : 'forward'} with ${outcome}`, async ({ page }) => {
+      const key = `PATCH /groups/${SID}/policy`;
+      const groupKey = `GET /groups/${SID}`;
+      const other = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      const gate = makeGate([key + '#1', key + '#2']);
+      const routes = {
+        [key]: outcome === 'network-error' ? { abort: true } : {
+          status: outcome === 'success' ? 200 : 500,
+          body: { ok: outcome === 'success', error: 'fixture failure' },
+        },
+        [groupKey]: privateGroup(),
+        [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: 'after-pending' } },
+        [`GET /groups/${other}`]: privateGroup(),
+        [`POST /groups/${other}/stores`]: { status: 200, body: { ok: true, id: 'other-space' } },
+      };
+      // Abort happens after the explicit response barrier, like an errored fetch.
+      const seen = await mountGui(page, routes, { gate });
+      const first = startPolicyPatch(page, SID);
+      await gate.holds[key + '#1'].enteredPromise;
+      const second = startPolicyPatch(page, SID);
+      await gate.holds[key + '#2'].enteredPromise;
+      expect((await pendingState(page)).pending).toBe(2);
+      const otherResult = await page.evaluate((sid) => openSpacePageStore(sid, 'wiki'), other);
+      expect(otherResult).toMatchObject({ ok: true, id: 'other-space' });
+      const order = reverse ? [2, 1] : [1, 2];
+      gate.holds[key + '#' + order[0]].release();
+      await (order[0] === 1 ? first : second);
+      expect((await pendingState(page)).pending).toBe(1);
+      const before = seen.length;
+      for (const app of ['wiki', 'web']) {
+        const result = await page.evaluate(([sid, name]) => openSpacePageStore(sid, name), [SID, app]);
+        expect(result.ok).toBe(false);
+      }
+      expect(seen.slice(before)).toEqual([]);
+      gate.holds[key + '#' + order[1]].release();
+      await (order[1] === 1 ? first : second);
+      const settled = await pendingState(page);
+      expect(settled.pending).toBe(0);
+      expect(settled.observed.conf).toBe('\u0000uncertain');
+      const recovery = seen.length;
+      expect(await page.evaluate((sid) => openSpacePageStore(sid, 'wiki'), SID)).toMatchObject({ ok: true, id: 'after-pending' });
+      expect(seen.slice(recovery)).toEqual([groupKey, `POST /groups/${SID}/stores`]);
+    });
+  }
+}
+
+for (const settleFirst of [false, true]) {
+  test(`pending mutation: pre-admission GET cannot restore public policy ${settleFirst ? 'after' : 'during'} PATCH`, async ({ page }) => {
+    const groupKey = `GET /groups/${SID}`;
+    const patchKey = `PATCH /groups/${SID}/policy`;
+    const generic = `x0x-wiki-${SID.slice(0, 16)}`;
+    const gate = makeGate([groupKey + '#1', patchKey]);
+    const routes = {
+      [groupKey]: publicGroup(),
+      [patchKey]: { status: 200, body: { ok: true } },
+      'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic }] } },
+      [`PUT /stores/${generic}/`]: { status: 200, body: { ok: true } },
+      [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: 'private-after' } },
+    };
+    const seen = await mountGui(page, routes, { gate });
+    await page.evaluate(() => document.body.insertAdjacentHTML('beforeend',
+      '<textarea id="wiki-content">old GET draft</textarea><div id="wiki-editor"></div><div id="wiki-error"></div>'));
+    const save = page.evaluate((sid) => saveWikiPage(sid), SID);
+    await gate.holds[groupKey + '#1'].enteredPromise;
+    const patch = startPolicyPatch(page, SID);
+    await gate.holds[patchKey].enteredPromise;
+    // Captured old GET response is unchanged; future reads see committed private.
+    routes[groupKey] = privateGroup();
+    if (settleFirst) { gate.holds[patchKey].release(); await patch; }
+    const boundary = seen.length;
+    gate.holds[groupKey + '#1'].release();
+    await save;
+    expect(seen.slice(boundary)).toEqual([]);
+    expect(await page.inputValue('#wiki-content')).toBe('old GET draft');
+    expect(await page.evaluate(() => document.getElementById('wiki-editor').style.display)).not.toBe('none');
+    if (!settleFirst) { gate.holds[patchKey].release(); await patch; }
+    const recovery = seen.length;
+    expect(await page.evaluate((sid) => openSpacePageStore(sid, 'wiki'), SID)).toMatchObject({ ok: true, id: 'private-after' });
+    expect(seen.slice(recovery)).toEqual([groupKey, `POST /groups/${SID}/stores`]);
+  });
+}

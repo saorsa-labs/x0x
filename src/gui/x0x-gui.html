@@ -2879,6 +2879,9 @@ const spacePageStoreInflight={};
 /// caller's save lands outside the group-bound store. Every later step
 /// therefore re-checks the generation it started under.
 const spacePolicy={};
+// Local mutation custody is independent of GET tickets and shared by both apps.
+const spacePolicyPending={};
+const SPACE_POLICY_PENDING='This space’s privacy setting is being updated. No page request was sent. Wait for the update to finish, then reopen the tab.';
 /// Sentinel confidentiality for "the policy could not be read". It is a real
 /// observation — it supersedes an earlier one and invalidates work started
 /// under it — and it can never collide with a daemon-reported value.
@@ -2948,7 +2951,7 @@ function spacePageStoreCurrent(sid,st){
 
 /// `true` once the space's observed policy has moved on from `gen`.
 function spacePolicyStale(sid,gen){
-  return !spacePolicy[sid]||spacePolicy[sid].gen!==gen;
+  return !!spacePolicyPending[sid]||!spacePolicy[sid]||spacePolicy[sid].gen!==gen;
 }
 
 function spacePageStoreKey(sid,app){return sid+'|'+app}
@@ -2969,6 +2972,7 @@ function encSeg(s){return encodeURIComponent(String(s))}
 /// private, so an unexpected daemon response can never downgrade a private
 /// Space onto generic storage.
 async function openSpacePageStore(sid,app){
+  if(spacePolicyPending[sid])return {ok:false,reason:SPACE_POLICY_PENDING};
   const ck=spacePageStoreKey(sid,app);
   // POLICY IS READ FIRST, ALWAYS — the cache is never consulted before it.
   //
@@ -2982,6 +2986,7 @@ async function openSpacePageStore(sid,app){
   // only reused when the policy it was resolved UNDER still holds.
   const ticket=++spacePolicySeq;
   const g=await api('/groups/'+encSeg(sid));
+  if(spacePolicyPending[sid])return {ok:false,reason:SPACE_POLICY_PENDING};
   if(!g||!g.ok){
     // Fail closed AND RECORD IT. Returning here without observing would leave
     // the previous (e.g. public) generation valid, so a resolver still held
@@ -5436,11 +5441,18 @@ async function nagApplyPolicy(gid){
   nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="policy-feedback"]`,'Working…');
   // ADMISSION: from here the policy is uncertain, so no page-store resolution
   // started under the previous policy may complete.
+  spacePolicyPending[gid]=(spacePolicyPending[gid]||0)+1;
   invalidateSpacePolicy(gid);
-  const r=await api('/groups/'+gid+'/policy',{method:'PATCH',body:JSON.stringify(body)});
-  // COMPLETION: invalidate again on EVERY outcome. A failed or errored reply
-  // does not prove the mutation was not applied.
-  invalidateSpacePolicy(gid);
+  let r;
+  try{
+    r=await api('/groups/'+gid+'/policy',{method:'PATCH',body:JSON.stringify(body)});
+  }finally{
+    // Synchronous, exactly-once completion: one reply cannot unlock another
+    // pending PATCH. Failed/errored replies still require a fresh policy GET.
+    invalidateSpacePolicy(gid);
+    spacePolicyPending[gid]-=1;
+    if(spacePolicyPending[gid]===0)delete spacePolicyPending[gid];
+  }
   if(r&&r.ok){
     nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="policy-feedback"]`,'Policy updated.','ok');
     nagRenderAdmin(gid);
