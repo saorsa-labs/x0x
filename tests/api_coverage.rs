@@ -700,8 +700,9 @@ fn named_group_ci_contract_is_active(workflow: &str, helper: &str, reuse: &str) 
     let custody = helper_lines
         .iter()
         .position(|line| *line == r#"python3 scripts/ci/nextest-reuse.py record "$scratch""#);
+    // The custody receipt must describe the same scratch graph that is run.
     let isolated_run = helper_lines.iter().position(|line| {
-        *line == r#"python3 scripts/ci/isolated-runtime.py python3 scripts/ci/nextest-reuse.py run "$scratch" "$@""#
+        *line == r#"X0X_CUSTODY_SCRATCH="$scratch" python3 scripts/ci/isolated-runtime.py python3 scripts/ci/nextest-reuse.py run "$scratch" "$@""#
     });
     let reuse_lines: Vec<_> = reuse.lines().map(str::trim).collect();
     let verified = reuse_lines
@@ -761,6 +762,11 @@ fn named_group_ci_contract_rejects_missing_or_inert_execution() {
         NEXTEST_ISOLATED_HELPER.replace("--list-type binaries-only", "--list-type full"),
         NEXTEST_ISOLATED_HELPER.replace("--cargo-metadata", "--different-metadata"),
         NEXTEST_ISOLATED_HELPER.replace("nextest-reuse.py record", "nextest-reuse.py ignored"),
+        NEXTEST_ISOLATED_HELPER.replace(r#"X0X_CUSTODY_SCRATCH="$scratch" "#, ""),
+        NEXTEST_ISOLATED_HELPER.replace(
+            r#"X0X_CUSTODY_SCRATCH="$scratch" "#,
+            r#"X0X_CUSTODY_SCRATCH="$other_scratch" "#,
+        ),
         NEXTEST_ISOLATED_HELPER.replace("python3 scripts/ci/isolated-runtime.py ", ""),
         NEXTEST_ISOLATED_HELPER.replace(
             "python3 scripts/ci/isolated-runtime.py",
@@ -769,7 +775,7 @@ fn named_group_ci_contract_rejects_missing_or_inert_execution() {
     ] {
         assert!(
             !named_group_ci_contract_is_active(INTEGRATION_WORKFLOW, &broken_helper, NEXTEST_REUSE),
-            "binary-only preparation, graph/custody and isolated execution must remain active"
+            "binary-only preparation, matching graph/custody and isolated execution must remain active"
         );
     }
     for broken_reuse in [

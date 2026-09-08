@@ -56,6 +56,7 @@ const ROOT_OWNED_KEYS: &[&str] = &[
     "presence_offline_timeout_secs",
     "rendezvous_enabled",
     "rendezvous_validity_ms",
+    "skip_legacy_dm_bus",
     "user_key_path",
     "zero_peer_restart_secs",
 ];
@@ -222,6 +223,23 @@ enabled = false
              db_path = \"/var/lib/x0x/history.db\"\n",
         );
         assert!(diagnose_section_placement(&t).is_empty());
+    }
+
+    #[test]
+    fn skip_legacy_dm_bus_is_a_recognised_root_key() {
+        let (default_config, default_ignored) =
+            parse_with_ignored_keys("").expect("empty config parses");
+        assert!(!default_config.skip_legacy_dm_bus);
+        assert!(default_ignored.is_empty());
+
+        let (config, ignored) =
+            parse_with_ignored_keys("skip_legacy_dm_bus = true\n").expect("parses");
+        assert!(config.skip_legacy_dm_bus);
+        assert!(ignored.is_empty(), "got spurious ignored keys: {ignored:?}");
+
+        let findings = diagnose_section_placement(&root("[gossip]\nskip_legacy_dm_bus = true\n"));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].key, "skip_legacy_dm_bus");
     }
 
     #[test]
