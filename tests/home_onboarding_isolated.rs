@@ -7,14 +7,282 @@
 use anyhow::{ensure, Context, Result};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const ONBOARDING_TIMEOUT: Duration = Duration::from_secs(120);
+const DIAGNOSTIC_TEST: &str = "home_onboarding_single_announce_restart";
+const CHILD_LABELS: [&str; 4] = [
+    "owner_initial",
+    "joiner_initial",
+    "owner_restart",
+    "joiner_restart",
+];
+
+#[derive(Clone)]
+struct ChildObservation {
+    started: bool,
+    cleanup: &'static str,
+    exit_code: Option<i32>,
+    signaled: bool,
+    escalation: &'static str,
+}
+
+struct DiagnosticState {
+    phase: &'static str,
+    result: &'static str,
+    failure_kind: &'static str,
+    last_http_status: Option<u16>,
+    cli_exit_code: Option<i32>,
+    cli_signaled: bool,
+    children: [ChildObservation; 4],
+}
+
+#[derive(Clone)]
+struct TestDiagnostic {
+    path: Arc<PathBuf>,
+    run_nonce: Arc<String>,
+    source_head: Arc<String>,
+    source_tree: Arc<String>,
+    state: Arc<Mutex<DiagnosticState>>,
+}
+
+impl TestDiagnostic {
+    fn new() -> Result<Self> {
+        let path = PathBuf::from(
+            std::env::var_os("X0X_TEST_HOME_RECEIPT")
+                .context("X0X_TEST_HOME_RECEIPT is required")?,
+        );
+        let run_nonce = std::env::var("X0X_TEST_RUN_NONCE")?;
+        let source_head = std::env::var("X0X_TEST_SOURCE_HEAD")?;
+        let source_tree = std::env::var("X0X_TEST_SOURCE_TREE")?;
+        Self::new_bound(path, run_nonce, source_head, source_tree)
+    }
+
+    fn new_bound(
+        path: PathBuf,
+        run_nonce: String,
+        source_head: String,
+        source_tree: String,
+    ) -> Result<Self> {
+        ensure!(
+            path.is_absolute(),
+            "diagnostic receipt path must be absolute"
+        );
+        ensure!(
+            path.parent().is_some_and(Path::is_dir),
+            "diagnostic receipt parent must exist"
+        );
+        let nonce_parts = run_nonce.split(':').collect::<Vec<_>>();
+        ensure!(
+            nonce_parts.len() == 2
+                && nonce_parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+            "invalid public run nonce"
+        );
+        ensure!(is_lower_hex(&source_head, 40) && is_lower_hex(&source_tree, 40));
+        let empty = ChildObservation {
+            started: false,
+            cleanup: "not_started",
+            exit_code: None,
+            signaled: false,
+            escalation: "none",
+        };
+        let diagnostic = Self {
+            path: Arc::new(path),
+            run_nonce: Arc::new(run_nonce),
+            source_head: Arc::new(source_head),
+            source_tree: Arc::new(source_tree),
+            state: Arc::new(Mutex::new(DiagnosticState {
+                phase: "fixture_setup",
+                result: "running",
+                failure_kind: "none",
+                last_http_status: None,
+                cli_exit_code: None,
+                cli_signaled: false,
+                children: [empty.clone(), empty.clone(), empty.clone(), empty],
+            })),
+        };
+        diagnostic.persist(true)?;
+        Ok(diagnostic)
+    }
+
+    fn persist(&self, initial: bool) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("diagnostic lock poisoned"))?;
+        let children = CHILD_LABELS
+            .iter()
+            .zip(state.children.iter())
+            .map(|(label, child)| {
+                (
+                    (*label).to_string(),
+                    json!({
+                        "started": child.started,
+                        "cleanup": child.cleanup,
+                        "exit_code": child.exit_code,
+                        "signaled": child.signaled,
+                        "escalation": child.escalation,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        let value = json!({
+            "schema": 1,
+            "test": DIAGNOSTIC_TEST,
+            "run_nonce": self.run_nonce.as_str(),
+            "source_head": self.source_head.as_str(),
+            "source_tree": self.source_tree.as_str(),
+            "entered": true,
+            "phase": state.phase,
+            "result": state.result,
+            "failure_kind": state.failure_kind,
+            "last_http_status": state.last_http_status,
+            "cli_exit_code": state.cli_exit_code,
+            "cli_signaled": state.cli_signaled,
+            "children": children,
+        });
+        if initial {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.path.as_ref())
+                .context("create fresh diagnostic receipt")?;
+            serde_json::to_writer(&mut file, &value)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+        } else {
+            let temporary = self.path.with_extension("json.next");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .context("create fresh diagnostic update")?;
+            serde_json::to_writer(&mut file, &value)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, self.path.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn update(&self, change: impl FnOnce(&mut DiagnosticState)) -> Result<()> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("diagnostic lock poisoned"))?;
+            change(&mut state);
+        }
+        self.persist(false)
+    }
+
+    fn phase(&self, phase: &'static str) -> Result<()> {
+        self.update(|state| {
+            state.phase = phase;
+            state.last_http_status = None;
+        })
+    }
+
+    fn http_status(&self, status: StatusCode) -> Result<()> {
+        self.update(|state| state.last_http_status = Some(status.as_u16()))
+    }
+
+    fn clear_http_status(&self) -> Result<()> {
+        self.update(|state| state.last_http_status = None)
+    }
+
+    fn cli_status(&self, status: std::process::ExitStatus) -> Result<()> {
+        self.update(|state| {
+            state.cli_exit_code = status.code();
+            state.cli_signaled = status.code().is_none();
+        })
+    }
+
+    fn child_started(&self, label: &'static str) -> Result<()> {
+        let index = child_index(label)?;
+        self.update(|state| {
+            state.children[index].started = true;
+            state.children[index].cleanup = "running";
+        })
+    }
+
+    fn child_reaped(
+        &self,
+        label: &'static str,
+        status: std::process::ExitStatus,
+        escalation: &'static str,
+    ) -> Result<()> {
+        let index = child_index(label)?;
+        self.update(|state| {
+            state.children[index].cleanup = "reaped";
+            state.children[index].exit_code = status.code();
+            state.children[index].signaled = status.code().is_none();
+            state.children[index].escalation = escalation;
+        })
+    }
+
+    fn child_cleanup_failed(&self, label: &'static str, escalation: &'static str) {
+        if let Ok(index) = child_index(label) {
+            let _ = self.update(|state| {
+                state.children[index].cleanup = "cleanup_failed";
+                state.children[index].escalation = escalation;
+            });
+        }
+    }
+
+    fn finish(&self, passed: bool) -> Result<()> {
+        self.update(|state| {
+            state.result = if passed { "passed" } else { "failed" };
+            state.failure_kind = if passed { "none" } else { "stage_failed" };
+            if passed {
+                state.phase = "complete";
+            }
+        })
+    }
+
+    fn fail_if_running(&self) {
+        let running = self
+            .state
+            .lock()
+            .map(|state| state.result == "running")
+            .unwrap_or(false);
+        if running {
+            let _ = self.finish(false);
+        }
+    }
+}
+
+struct DiagnosticGuard(TestDiagnostic);
+
+impl Drop for DiagnosticGuard {
+    fn drop(&mut self) {
+        self.0.fail_if_running();
+    }
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn child_index(label: &str) -> Result<usize> {
+    CHILD_LABELS
+        .iter()
+        .position(|candidate| *candidate == label)
+        .with_context(|| format!("unknown diagnostic child label {label}"))
+}
 
 struct ReservedPorts {
     api: TcpListener,
@@ -36,9 +304,11 @@ impl ReservedPorts {
 
 struct OwnedDaemon {
     child: Option<Child>,
+    label: &'static str,
     api: SocketAddr,
     token: String,
     data_dir: PathBuf,
+    diagnostic: TestDiagnostic,
 }
 
 impl OwnedDaemon {
@@ -47,6 +317,8 @@ impl OwnedDaemon {
         config: &Path,
         api: SocketAddr,
         data_dir: PathBuf,
+        label: &'static str,
+        diagnostic: TestDiagnostic,
     ) -> Result<Self> {
         let child = Command::new(binary)
             .args(["--config", &config.display().to_string()])
@@ -57,12 +329,19 @@ impl OwnedDaemon {
             .with_context(|| format!("spawn owned daemon {}", binary.display()))?;
         let mut daemon = Self {
             child: Some(child),
+            label,
             api,
             token: String::new(),
             data_dir,
+            diagnostic,
         };
+        daemon.record_started()?;
         daemon.wait_ready().await?;
         Ok(daemon)
+    }
+
+    fn record_started(&self) -> Result<()> {
+        self.diagnostic.child_started(self.label)
     }
 
     async fn wait_ready(&mut self) -> Result<()> {
@@ -83,21 +362,31 @@ impl OwnedDaemon {
                 let token = token.trim();
                 if advertised_matches(&advertised, self.api) && !token.is_empty() {
                     let probes = async {
+                        self.diagnostic.clear_http_status()?;
                         let health = client
                             .get(format!("http://{}/health", self.api))
                             .send()
                             .await;
-                        if !health.is_ok_and(|value| value.status() == StatusCode::OK) {
-                            return false;
+                        let Ok(health) = health else {
+                            return Ok::<bool, anyhow::Error>(false);
+                        };
+                        self.diagnostic.http_status(health.status())?;
+                        if health.status() != StatusCode::OK {
+                            return Ok(false);
                         }
-                        client
+                        self.diagnostic.clear_http_status()?;
+                        let agent = client
                             .get(format!("http://{}/agent", self.api))
                             .bearer_auth(token)
                             .send()
-                            .await
-                            .is_ok_and(|value| value.status() == StatusCode::OK)
+                            .await;
+                        let Ok(agent) = agent else {
+                            return Ok(false);
+                        };
+                        self.diagnostic.http_status(agent.status())?;
+                        Ok(agent.status() == StatusCode::OK)
                     };
-                    if let Ok(true) = tokio::time::timeout_at(deadline, probes).await {
+                    if let Ok(Ok(true)) = tokio::time::timeout_at(deadline, probes).await {
                         if readiness_success_allowed(
                             tokio::time::Instant::now(),
                             deadline,
@@ -130,6 +419,7 @@ impl OwnedDaemon {
         path: &str,
         body: Option<Value>,
     ) -> Result<(StatusCode, Value)> {
+        self.diagnostic.clear_http_status()?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()?;
@@ -141,6 +431,7 @@ impl OwnedDaemon {
         }
         let response = request.send().await?;
         let status = response.status();
+        self.diagnostic.http_status(status)?;
         let body = response.json().await.context("decode API JSON")?;
         Ok((status, body))
     }
@@ -202,19 +493,33 @@ impl OwnedDaemon {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()?;
-        let _ = client
+        self.diagnostic.clear_http_status()?;
+        let shutdown = client
             .post(format!("http://{}/shutdown", self.api))
             .bearer_auth(&self.token)
             .send()
             .await;
+        if let Ok(response) = shutdown {
+            self.diagnostic.http_status(response.status())?;
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while self.is_running()? && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let mut escalation = "none";
         if self.is_running()? {
             self.child.as_mut().context("owned child missing")?.kill()?;
+            escalation = "kill";
         }
-        let status = self.child.take().context("owned child missing")?.wait()?;
+        let status = match self.child.take().context("owned child missing")?.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                self.diagnostic.child_cleanup_failed(self.label, escalation);
+                return Err(error.into());
+            }
+        };
+        self.diagnostic
+            .child_reaped(self.label, status, escalation)?;
         ensure!(status.success(), "owned daemon exited with {status}");
         Ok(())
     }
@@ -253,8 +558,24 @@ async fn sleep_before(deadline: tokio::time::Instant) -> Result<()> {
 impl Drop for OwnedDaemon {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let (escalation, waited) = match child.try_wait() {
+                Ok(Some(status)) => ("none", Ok(status)),
+                Ok(None) => {
+                    let escalation = if child.kill().is_ok() {
+                        "kill"
+                    } else {
+                        "kill_failed"
+                    };
+                    (escalation, child.wait())
+                }
+                Err(_) => ("kill_failed", child.wait()),
+            };
+            match waited {
+                Ok(status) => {
+                    let _ = self.diagnostic.child_reaped(self.label, status, escalation);
+                }
+                Err(_) => self.diagnostic.child_cleanup_failed(self.label, escalation),
+            }
         }
     }
 }
@@ -454,19 +775,20 @@ async fn wait_for_canonical_home(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires reviewed isolated-runtime admission; acceptance assertions are still incomplete"]
-async fn home_onboarding_single_announce_restart() -> Result<()> {
+async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> {
+    diagnostic.phase("fixture_setup")?;
     let x0xd = pinned_binary("X0X_TEST_X0XD_BIN", "x0xd")?;
     let x0x = pinned_binary("X0X_TEST_X0X_BIN", "x0x")?;
     let root = TempDir::new().context("create owned fixture root")?;
     let user_key = root.path().join("owner/user.key");
     std::fs::create_dir_all(user_key.parent().context("owner key parent")?)?;
+    diagnostic.phase("key_create")?;
     let key_status = Command::new(&x0x)
         .args(["user-id", "create"])
         .arg(&user_key)
         .status()
         .context("create shared owner key with pinned x0x")?;
+    diagnostic.cli_status(key_status)?;
     ensure!(key_status.success(), "x0x user-id create failed");
 
     let owner_ports = ReservedPorts::new()?;
@@ -503,23 +825,30 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         },
     )?;
 
+    diagnostic.phase("owner_initial_start")?;
     drop(owner_ports);
     let mut owner = OwnedDaemon::start(
         &x0xd,
         &root.path().join("owner/config.toml"),
         owner_api,
         root.path().join("owner/data"),
+        "owner_initial",
+        diagnostic.clone(),
     )
     .await?;
+    diagnostic.phase("joiner_initial_start")?;
     drop(joiner_ports);
     let mut joiner = OwnedDaemon::start(
         &x0xd,
         &root.path().join("joiner/config.toml"),
         joiner_api,
         root.path().join("joiner/data"),
+        "joiner_initial",
+        diagnostic.clone(),
     )
     .await?;
 
+    diagnostic.phase("profile_identity")?;
     let (status, _) = owner
         .put(
             "/profile",
@@ -556,6 +885,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
     assert_identity_contract(&owner_agent, &owner_profile, &owner_card)?;
     assert_identity_contract(&joiner_agent, &joiner_profile, &joiner_card)?;
 
+    diagnostic.phase("peer_connect")?;
     for (target, card) in [(&owner, &joiner_card), (&joiner, &owner_card)] {
         let (status, body) = target
             .post(
@@ -570,6 +900,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         .await?;
     ensure!(status == StatusCode::OK);
 
+    diagnostic.phase("consent_negative")?;
     let (status, _) = joiner
         .post(
             "/announce",
@@ -580,6 +911,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         status == StatusCode::BAD_REQUEST,
         "consent-negative announce was accepted"
     );
+    diagnostic.phase("announce")?;
     let onboarding_deadline = tokio::time::Instant::now() + ONBOARDING_TIMEOUT;
     let mut owner_explicit_announces = 0_u8;
     let mut joiner_explicit_announces = 0_u8;
@@ -598,6 +930,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         *count += 1;
     }
     ensure!(owner_explicit_announces == 1 && joiner_explicit_announces == 1);
+    diagnostic.phase("owner_sync")?;
     wait_for_owned_peer(
         &owner,
         &owner_user,
@@ -619,6 +952,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
     // local and peer machine on each daemon; the cross entries authorize the
     // dial and inbound stream, while the self entries make the owner device
     // set complete on both sides as documented by the API contract.
+    diagnostic.phase("device_enroll")?;
     for (daemon, machines) in [
         (&owner, [&owner_machine, &joiner_machine]),
         (&joiner, [&joiner_machine, &owner_machine]),
@@ -636,6 +970,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         }
     }
 
+    diagnostic.phase("canonical_home")?;
     let (canonical_side, home_id) = wait_for_canonical_home(
         &owner,
         &joiner,
@@ -649,6 +984,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         CanonicalSide::Owner => (&owner, &joiner, &joiner_id, "joiner-device"),
         CanonicalSide::Joiner => (&joiner, &owner, &owner_id, "owner-device"),
     };
+    diagnostic.phase("seat_invite")?;
     let (status, renamed) = canonical
         .post_before(
             onboarding_deadline,
@@ -668,6 +1004,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
     ensure!(seat["group_id"] == home_id && seat["owner_user_id"] == owner_user);
     let invite = string_field(&seat, "/invite")?.to_owned();
 
+    diagnostic.phase("wrong_owner_negative")?;
     let (status, wrong_pin) = adopting
         .post_before(
             onboarding_deadline,
@@ -676,6 +1013,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         )
         .await?;
     ensure!(status == StatusCode::CONFLICT && wrong_pin["error"] == "owner_mismatch");
+    diagnostic.phase("wrong_mode_negative")?;
     let (status, wrong_mode) = adopting
         .post_before(
             onboarding_deadline,
@@ -684,6 +1022,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         )
         .await?;
     ensure!(status == StatusCode::CONFLICT && wrong_mode["error"] == "use_home_mode");
+    diagnostic.phase("home_join")?;
     let (status, joined) = adopting
         .post_before(
             onboarding_deadline,
@@ -694,6 +1033,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
     ensure!(status == StatusCode::OK && joined["group_id"] == home_id);
     ensure!(joined["join_state"] == "pending_authority_commit" || joined["join_state"] == "active");
 
+    diagnostic.phase("active_home")?;
     let _ = wait_for_active_home(
         &owner,
         &home_id,
@@ -711,33 +1051,43 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
     )
     .await?;
     ensure_before_deadline(onboarding_deadline, "after both active Home observations")?;
+    diagnostic.phase("initial_seal")?;
     let (status, sealed) = canonical
         .post(&format!("/groups/{home_id}/state/seal"), json!({}))
         .await?;
     ensure!(status == StatusCode::OK && sealed["ok"] == true);
 
+    diagnostic.phase("initial_stop")?;
     joiner.stop().await?;
     owner.stop().await?;
+    diagnostic.phase("owner_restart")?;
     let mut owner = OwnedDaemon::start(
         &x0xd,
         &root.path().join("owner/config.toml"),
         owner_api,
         root.path().join("owner/data"),
+        "owner_restart",
+        diagnostic.clone(),
     )
     .await?;
+    diagnostic.phase("joiner_restart")?;
     let mut joiner = OwnedDaemon::start(
         &x0xd,
         &root.path().join("joiner/config.toml"),
         joiner_api,
         root.path().join("joiner/data"),
+        "joiner_restart",
+        diagnostic.clone(),
     )
     .await?;
+    diagnostic.phase("restart_identity")?;
     let owner_after = owner.get("/agent").await?;
     let joiner_after = joiner.get("/agent").await?;
     ensure!(string_field(&owner_after, "/data/agent_id")? == owner_id);
     ensure!(string_field(&owner_after, "/data/machine_id")? == owner_machine);
     ensure!(string_field(&joiner_after, "/data/agent_id")? == joiner_id);
     ensure!(string_field(&joiner_after, "/data/machine_id")? == joiner_machine);
+    diagnostic.phase("restart_home")?;
     let restart_deadline = tokio::time::Instant::now() + ONBOARDING_TIMEOUT;
     let owner_home = wait_for_active_home(
         &owner,
@@ -756,6 +1106,7 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
     )
     .await?;
     ensure!(owner_home["name"] == "Fixture Home" && joiner_home["name"] == "Fixture Home");
+    diagnostic.phase("restart_seal")?;
     let seal_daemon = match canonical_side {
         CanonicalSide::Owner => &owner,
         CanonicalSide::Joiner => &joiner,
@@ -764,9 +1115,21 @@ async fn home_onboarding_single_announce_restart() -> Result<()> {
         .post(&format!("/groups/{home_id}/state/seal"), json!({}))
         .await?;
     ensure!(status == StatusCode::OK && sealed_after["ok"] == true);
+    diagnostic.phase("final_stop")?;
     joiner.stop().await?;
     owner.stop().await?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires reviewed isolated-runtime admission"]
+async fn home_onboarding_single_announce_restart() -> Result<()> {
+    let diagnostic = TestDiagnostic::new()?;
+    let guard = DiagnosticGuard(diagnostic.clone());
+    let result = run_home_onboarding_scenario(diagnostic.clone()).await;
+    diagnostic.finish(result.is_ok())?;
+    drop(guard);
+    result
 }
 
 #[test]
@@ -791,4 +1154,120 @@ async fn readiness_rejects_success_at_or_after_absolute_deadline() {
         true
     ));
     assert!(!readiness_success_allowed(started, deadline, false));
+}
+
+fn diagnostic_for_control(root: &TempDir, name: &str) -> Result<TestDiagnostic> {
+    TestDiagnostic::new_bound(
+        root.path().join(name),
+        "34171638282:1".to_owned(),
+        "a".repeat(40),
+        "b".repeat(40),
+    )
+}
+
+#[test]
+fn diagnostic_refuses_preexisting_receipt() -> Result<()> {
+    let root = TempDir::new()?;
+    let path = root.path().join("diagnostic.json");
+    std::fs::write(&path, "preexisting")?;
+    assert!(TestDiagnostic::new_bound(
+        path,
+        "34171638282:1".to_owned(),
+        "a".repeat(40),
+        "b".repeat(40),
+    )
+    .is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostic_preserves_ordinary_error_and_early_child_reap() -> Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let root = TempDir::new()?;
+    let path = root.path().join("diagnostic.json");
+    let diagnostic = diagnostic_for_control(&root, "diagnostic.json")?;
+    let guard = DiagnosticGuard(diagnostic.clone());
+    diagnostic.phase("owner_initial_start")?;
+    diagnostic.child_started("owner_initial")?;
+    diagnostic.child_reaped(
+        "owner_initial",
+        std::process::ExitStatus::from_raw(7 << 8),
+        "none",
+    )?;
+    diagnostic.finish(false)?;
+    drop(guard);
+    let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    assert_eq!(value["result"], "failed");
+    assert_eq!(value["failure_kind"], "stage_failed");
+    assert_eq!(value["phase"], "owner_initial_start");
+    assert_eq!(value["children"]["owner_initial"]["cleanup"], "reaped");
+    assert_eq!(value["children"]["owner_initial"]["exit_code"], 7);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn diagnostic_records_spawned_child_when_readiness_fails() -> Result<()> {
+    let root = TempDir::new()?;
+    let path = root.path().join("diagnostic.json");
+    let diagnostic = diagnostic_for_control(&root, "diagnostic.json")?;
+    diagnostic.phase("owner_initial_start")?;
+    let result = OwnedDaemon::start(
+        Path::new("/usr/bin/false"),
+        &root.path().join("unused.toml"),
+        "127.0.0.1:9".parse()?,
+        root.path().to_path_buf(),
+        "owner_initial",
+        diagnostic,
+    )
+    .await;
+    assert!(result.is_err());
+    let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    assert_eq!(value["children"]["owner_initial"]["started"], true);
+    assert_eq!(value["children"]["owner_initial"]["cleanup"], "reaped");
+    assert_eq!(value["children"]["owner_initial"]["exit_code"], 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn diagnostic_receipt_failure_reaps_already_spawned_child() -> Result<()> {
+    let root = TempDir::new()?;
+    let diagnostic = diagnostic_for_control(&root, "diagnostic.json")?;
+    std::fs::write(root.path().join("diagnostic.json.next"), "occupied")?;
+    let child = Command::new("/bin/sleep").arg("30").spawn()?;
+    let pid = child.id().to_string();
+    let daemon = OwnedDaemon {
+        child: Some(child),
+        label: "owner_initial",
+        api: "127.0.0.1:9".parse()?,
+        token: String::new(),
+        data_dir: root.path().to_path_buf(),
+        diagnostic,
+    };
+    assert!(daemon.record_started().is_err());
+    drop(daemon);
+    let alive = Command::new("/bin/kill").args(["-0", &pid]).status()?;
+    assert!(!alive.success(), "receipt failure left owned child alive");
+    Ok(())
+}
+
+#[test]
+fn diagnostic_guard_preserves_unwind_phase() -> Result<()> {
+    let root = TempDir::new()?;
+    let path = root.path().join("diagnostic.json");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+        let diagnostic = diagnostic_for_control(&root, "diagnostic.json")?;
+        let _guard = DiagnosticGuard(diagnostic.clone());
+        diagnostic.phase("profile_identity")?;
+        panic!("inert diagnostic unwind control")
+    }));
+    assert!(result.is_err());
+    let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    assert_eq!(value["result"], "failed");
+    assert_eq!(value["failure_kind"], "stage_failed");
+    assert_eq!(value["phase"], "profile_identity");
+    Ok(())
 }
