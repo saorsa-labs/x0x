@@ -200,3 +200,51 @@ x0xd &
 ```
 
 If this command fails because there is no PID, run `x0xd &` directly.
+
+## 6) A space's Wiki or Web tab says pages are unavailable [working]
+
+**Symptom.** You open the **Wiki** or **Web** tab of a private space and instead
+of your pages you see a message such as *"Private pages are not available in
+this space yet"*, followed by the reason the daemon gave.
+
+**Why.** Pages in a private space have to live in storage that only that
+space's members can reach. If the daemon cannot open that storage for the
+space — because the space uses a kind of encryption this storage does not
+support yet, because you are not an active member, or because the space is
+still loading — the tab tells you and shows nothing.
+
+It deliberately does **not** fall back to ordinary storage. Ordinary storage is
+readable by anyone who has it and is handed out to your direct contacts
+regardless of who is in the space, so putting private pages there would be
+worse than showing nothing.
+
+**What to do.**
+
+- Read the reason shown after the message; it comes straight from the daemon.
+  *"not a member"* means your membership of that space is not active.
+- If it says the space's encryption is not supported yet, private pages for
+  that kind of space are **not built yet**. This is tracked as issue #565 and
+  is being worked on. There is no setting that turns it on.
+- Public spaces are unaffected. Switching a space to public is **not** a
+  workaround: it makes the pages readable by anyone.
+
+**Pages you saved with an earlier version.** They are still on disk, exactly
+where the older version put them, and nothing has been moved, copied,
+republished or deleted. They are simply no longer shown in a private space's
+tab, because that older location is not private. If you need one of them back,
+ask before the next release rather than re-saving it into a private space.
+
+### Who can edit pages
+
+- **Private space, where private pages work.** Pages are stored with the
+  space's members, and **any active member can save** — the daemon accepts a
+  write from any current member of the group.
+- **Private space using an encryption this storage does not support yet.** The
+  tab says pages are unavailable. That is the case tracked by issue #565.
+- **Public space.** This version has **not** been fixed yet. It still keeps
+  pages in a store held by **your own device**, not one shared with the space.
+  Two members of the same public space can each end up with their own copy, so
+  what you save may not be what another member sees. Treat public-space pages
+  as your own notes until this is fixed. Do not switch a space to public in
+  order to share pages — it does not share them, and it makes them readable by
+  anyone.

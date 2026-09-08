@@ -2828,14 +2828,125 @@ function renderFeedPosts(sid){
   </div>`).join('')||'<div style="color:var(--tx3);padding:12px;font-size:12px">No posts yet. Be the first!</div>';
 }
 
+// --- Space: Wiki / Web page stores ---
+//
+// #565 STAGE 1 CONTAINMENT (interim — does NOT close #565).
+//
+// Wiki and Web used to create an ordinary Signed store from a topic alias
+// built out of the Space id ('x0x-wiki-'+sid.slice(0,16)). A Signed store is
+// owner-write / anyone-read and is NOT bound to group membership, and the
+// unencrypted store PUT path hands the plaintext delta to every eligible
+// direct contact without any membership filter. For a private Space that is
+// the wrong place to put the page, so:
+//
+//   * A PRIVATE Space NEVER touches the generic /stores API — not to create,
+//     not to read, not to write, and not to list. The generic request is not
+//     issued at all; there is no fallback path to it.
+//   * A private Space uses the supported group-bound opener
+//     POST /groups/:id/stores and then addresses pages ONLY through the
+//     identifier that opener returns.
+//   * When the daemon cannot open a group store for this Space, the tab says
+//     so plainly and shows nothing. It does not fall back, and it does not
+//     surface any page from a legacy generic store.
+//
+// Legacy pages written by earlier builds stay exactly where they are. Nothing
+// here reads, copies, moves, republishes or deletes them.
+//
+// The full fix — Home/TreeKEM group stores and real collaborative
+// multi-writer sharing — is a separate backend change under independent
+// review. This patch is containment only.
+
+// Cache of resolved page stores, keyed `sid|app`. Values:
+//   {ok:true, id}            store is open; `id` is the daemon's identifier
+//   {ok:false, reason, pub}  unavailable; `reason` is shown to the user
+const spacePageStores={};
+
+function spacePageStoreKey(sid,app){return sid+'|'+app}
+
+/// Forget a cached resolution so the next render re-resolves.
+function resetSpacePageStore(sid,app){delete spacePageStores[spacePageStoreKey(sid,app)]}
+
+/// Encode one path segment. Page names are user text and may contain `/`,
+/// `?`, `#`, spaces or non-ASCII; each must arrive at the daemon as exactly
+/// ONE route segment, and the same encoding must be used on write, read and
+/// on the links rendered from returned keys.
+function encSeg(s){return encodeURIComponent(String(s))}
+
+/// Resolve the store that holds this Space's pages.
+///
+/// Returns `{ok:true,id}` or `{ok:false,reason}`. Fails closed: anything it
+/// cannot positively identify as an intentionally public Space is treated as
+/// private, so an unexpected daemon response can never downgrade a private
+/// Space onto generic storage.
+async function openSpacePageStore(sid,app){
+  const ck=spacePageStoreKey(sid,app);
+  if(spacePageStores[ck])return spacePageStores[ck];
+  // Only a SUCCESSFUL resolution is cached. A failure is re-resolved on the
+  // next attempt, so the tab recovers by itself once the daemon can open the
+  // store (e.g. after the space finishes loading).
+  const g=await api('/groups/'+encSeg(sid));
+  if(!g||!g.ok){
+    return {ok:false,reason:'This space could not be loaded, so its pages are unavailable. '+apiError(g)};
+  }
+  const conf=String((g.policy&&g.policy.confidentiality)||(g.policy_summary&&g.policy_summary.confidentiality)||'');
+  if(conf==='signed_public'){
+    // Intentionally public Space. This is the LEGACY generic store the
+    // older build used, kept as-is for containment.
+    //
+    // Be precise about what it is: `POST /stores` creates a Signed store
+    // whose identity is derived from the topic and THIS DAEMON'S OWN agent
+    // (`src/lib.rs:15724-15727` — `for_topic_owner(topic, &self.agent_id())`).
+    // The Space owner's identity is never obtained or anchored here. So each
+    // viewer that opens this tab gets a store owned by their OWN agent, and
+    // two members of the same public Space can end up with two different
+    // stores. Do not describe this as the Space owner's store, and do not
+    // tell anyone their view is read-only — locally it is not.
+    //
+    // Anchoring on the intended owner (and reconciling the differing local
+    // aliases that already exist) is part of the pending backend work, not
+    // of this containment patch.
+    const id='x0x-'+app+'-'+sid.slice(0,16);
+    const stores=await api('/stores');
+    if(!stores||!stores._http_ok){
+      return {ok:false,reason:'Could not list this space’s pages. '+apiError(stores),pub:true};
+    }
+    if(!((stores.stores||[]).find(s=>s.id===id))){
+      const c=await api('/stores',{method:'POST',body:JSON.stringify({name:app==='wiki'?'Wiki':'Web',topic:id})});
+      if(!c||!c._http_ok){
+        return {ok:false,reason:'Could not open this space’s page store. '+apiError(c),pub:true};
+      }
+    }
+    return spacePageStores[ck]={ok:true,id:id,pub:true,localOwned:true};
+  }
+  // Everything else — including a private Space and any confidentiality the
+  // daemon reports that this build does not recognise — is private. Use the
+  // group-bound opener and nothing else.
+  const r=await api('/groups/'+encSeg(sid)+'/stores',{method:'POST',body:JSON.stringify({name:app})});
+  if(!r||!r._http_ok||!r.ok){
+    return {ok:false,reason:'Private pages are not available in this space yet. '+apiError(r)};
+  }
+  const id=r.id||r.topic||r.store_id;
+  if(!id){
+    return {ok:false,reason:'Private pages are not available in this space yet: the daemon opened the store but did not name it.'};
+  }
+  return spacePageStores[ck]={ok:true,id:id};
+}
+
+/// Render an unavailable-pages message into `el`.
+function spacePagesUnavailable(el,reason){
+  if(!el)return;
+  el.innerHTML='<div class="card mb" style="font-size:12px;color:var(--tx3)">'+esc(reason)+'</div>';
+}
+
 // --- Space: Wiki ---
 function renderSpaceWiki(el,sid){
-  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Collaborative wiki pages stored in a KvStore. Create and edit markdown pages that sync across all space members.</p>
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Wiki pages for this space. In a private space, pages are stored with the space's members and any member can save. In a public space, this build still keeps pages in a store held by your own device, so what you save here may not be what another member sees.</p>
   <div class="row mb"><input id="wiki-slug" placeholder="Page name (e.g. getting-started)"><button class="pri" onclick="createWikiPage('${sid}')">Create Page</button></div>
   <div id="wiki-pages"></div>
   <div id="wiki-editor" style="display:none" class="mt">
     <h3 id="wiki-title"></h3>
     <textarea id="wiki-content" rows="12" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px"></textarea>
+    <div id="wiki-error" class="mt" style="display:none;font-size:12px;color:var(--rd)"></div>
     <div class="row mt"><button class="pri" onclick="saveWikiPage('${sid}')">Save</button><button onclick="document.getElementById('wiki-editor').style.display='none'">Cancel</button></div>
   </div>`;
   loadWikiPages(sid);
@@ -2852,26 +2963,42 @@ function createWikiPage(sid){
 }
 let currentWikiSlug='';
 
+function wikiError(msg){
+  const e=document.getElementById('wiki-error');
+  if(!e)return;
+  if(!msg){e.style.display='none';e.textContent='';return}
+  e.textContent=msg;e.style.display='block';
+}
+
 async function saveWikiPage(sid){
   const content=document.getElementById('wiki-content').value;
-  const storeId='x0x-wiki-'+sid.slice(0,16);
-  // Ensure store exists
-  const stores=await api('/stores');
-  if(!(stores&&stores.stores||[]).find(s=>s.id===storeId)){
-    await api('/stores',{method:'POST',body:JSON.stringify({name:'Wiki',topic:storeId})});
-  }
-  await api('/stores/'+storeId+'/'+currentWikiSlug,{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/markdown'})});
+  wikiError('');
+  const st=await openSpacePageStore(sid,'wiki');
+  // The editor and the typed content stay put on every failure below, so a
+  // failed save never costs the user their draft.
+  if(!st.ok){wikiError(st.reason);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(currentWikiSlug),{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/markdown'})});
+  if(!r||!r._http_ok){wikiError('Not saved. '+apiError(r));return}
   document.getElementById('wiki-editor').style.display='none';
-  toast('Page saved','success');
+  // The daemon confirms it stored the page on THIS machine. It does not
+  // report whether every other member has received it yet, so do not claim
+  // more than was actually confirmed.
+  toast('Page saved on this device','success');
   loadWikiPages(sid);
 }
 
 async function loadWikiPages(sid){
-  const storeId='x0x-wiki-'+sid.slice(0,16);
   const el=document.getElementById('wiki-pages');if(!el)return;
-  const r=await api('/stores/'+storeId+'/keys');
-  if(r&&r.keys&&r.keys.length>0){
-    const keys=r.keys.map(k=>typeof k==='string'?k:k.key||k);
+  const st=await openSpacePageStore(sid,'wiki');
+  if(!st.ok){spacePagesUnavailable(el,st.reason);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/keys');
+  if(!r||!r._http_ok){
+    // A failed listing is not an empty wiki. Say which it is.
+    spacePagesUnavailable(el,'Could not list the pages in this space. '+apiError(r));
+    return;
+  }
+  const keys=(r.keys||[]).map(k=>typeof k==='string'?k:k.key||k);
+  if(keys.length>0){
     el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-wiki-sid="${esc(sid)}" data-wiki-slug="${esc(k)}" onclick="editWikiPage(this.dataset.wikiSid,this.dataset.wikiSlug)">
       <div style="font:500 13px var(--sans);color:var(--cy)">${esc(k)}</div>
       <div style="font-size:11px;color:var(--tx3);margin-top:2px">Click to edit</div>
@@ -2882,28 +3009,40 @@ async function loadWikiPages(sid){
 }
 
 async function editWikiPage(sid,slug){
-  const storeId='x0x-wiki-'+sid.slice(0,16);
-  const r=await api('/stores/'+storeId+'/'+slug);
-  if(r&&r.value){
-    currentWikiSlug=slug;
-    document.getElementById('wiki-title').textContent=slug;
-    try{document.getElementById('wiki-content').value=u8decode(r.value)}catch(e){document.getElementById('wiki-content').value=r.value}
-    document.getElementById('wiki-editor').style.display='block';
+  const st=await openSpacePageStore(sid,'wiki');
+  if(!st.ok){spacePagesUnavailable(document.getElementById('wiki-pages'),st.reason);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(slug));
+  if(!r||!r._http_ok){
+    // A failed read must not cost the user the draft they already have open.
+    // Leave the editor, its text, its title and the save target exactly as
+    // they were, and report the failure next to the page list so the message
+    // is visible even when no editor is open. Selection only moves on a
+    // successful read.
+    spacePagesUnavailable(document.getElementById('wiki-pages'),'Could not open "'+slug+'". '+apiError(r));
+    return;
   }
+  currentWikiSlug=slug;
+  wikiError('');
+  document.getElementById('wiki-title').textContent=slug;
+  const v=r.value===undefined||r.value===null?'':r.value;
+  try{document.getElementById('wiki-content').value=u8decode(v)}catch(e){document.getElementById('wiki-content').value=String(v)}
+  document.getElementById('wiki-editor').style.display='block';
 }
 
 // --- Space: Web ---
 function renderSpaceWeb(el,sid){
-  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Publish web content through your Space. Stored in a KvStore, rendered as HTML/Markdown. This demonstrates how an organization can use pub/sub as their web presence.</p>
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Web pages for this space. In a private space, pages are stored with the space's members and any member can save. In a public space, this build still keeps pages in a store held by your own device, so what you save here may not be what another member sees.</p>
   <div class="row mb"><input id="web-path" placeholder="Page path (e.g. index, about)"><button class="pri" onclick="editWebPage('${sid}')">Edit Page</button></div>
   <div id="web-preview" class="card" style="min-height:200px;padding:20px">
     <div style="color:var(--tx3);text-align:center;padding:40px">Select or create a page to preview</div>
   </div>
   <div id="web-editor" style="display:none" class="mt">
     <textarea id="web-content" rows="10" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px" placeholder="HTML or Markdown content"></textarea>
-    <div class="row mt"><button class="pri" onclick="saveWebPage('${sid}')">Publish</button><button onclick="document.getElementById('web-editor').style.display='none'">Cancel</button></div>
+    <div id="web-error" class="mt" style="display:none;font-size:12px;color:var(--rd)"></div>
+    <div class="row mt"><button class="pri" onclick="saveWebPage('${sid}')">Save</button><button onclick="document.getElementById('web-editor').style.display='none'">Cancel</button></div>
   </div>
   <h3>Pages</h3><div id="web-pages"></div>`;
+  resetWebPreviewGen();
   loadWebPages(sid);
 }
 let currentWebPath='';
@@ -2911,54 +3050,99 @@ let currentWebPath='';
 function editWebPage(sid){
   const path=document.getElementById('web-path').value.trim()||'index';
   currentWebPath=path;
+  webError('');
   document.getElementById('web-editor').style.display='block';
   document.getElementById('web-content').value='';
   document.getElementById('web-path').value='';
 }
 
+function webError(msg){
+  const e=document.getElementById('web-error');
+  if(!e)return;
+  if(!msg){e.style.display='none';e.textContent='';return}
+  e.textContent=msg;e.style.display='block';
+}
+
+/// Replace the preview with an explicit message. Used so a failed read never
+/// leaves the previously-viewed page on screen as if it were the new one.
+function webPreviewNotice(msg){
+  const p=document.getElementById('web-preview');
+  if(!p)return;
+  p.innerHTML='<div style="color:var(--tx3);text-align:center;padding:40px;font-size:12px">'+esc(msg)+'</div>';
+}
+
 async function saveWebPage(sid){
   const content=document.getElementById('web-content').value;
-  const storeId='x0x-web-'+sid.slice(0,16);
-  const stores=await api('/stores');
-  if(!(stores&&stores.stores||[]).find(s=>s.id===storeId)){
-    await api('/stores',{method:'POST',body:JSON.stringify({name:'Web',topic:storeId})});
-  }
-  await api('/stores/'+storeId+'/'+currentWebPath,{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/html'})});
+  webError('');
+  const st=await openSpacePageStore(sid,'web');
+  if(!st.ok){webError(st.reason);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(currentWebPath),{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/html'})});
+  if(!r||!r._http_ok){webError('Not saved. '+apiError(r));return}
   document.getElementById('web-editor').style.display='none';
-  toast('Published','success');
+  toast('Page saved on this device','success');
   loadWebPages(sid);
 }
 
 async function loadWebPages(sid){
-  const storeId='x0x-web-'+sid.slice(0,16);
   const el=document.getElementById('web-pages');if(!el)return;
-  const r=await api('/stores/'+storeId+'/keys');
-  if(r&&r.keys&&r.keys.length>0){
-    const keys=r.keys.map(k=>typeof k==='string'?k:k.key||k);
+  const st=await openSpacePageStore(sid,'web');
+  if(!st.ok){spacePagesUnavailable(el,st.reason);webPreviewNotice(st.reason);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/keys');
+  if(!r||!r._http_ok){
+    const m='Could not list the pages in this space. '+apiError(r);
+    spacePagesUnavailable(el,m);webPreviewNotice(m);
+    return;
+  }
+  const keys=(r.keys||[]).map(k=>typeof k==='string'?k:k.key||k);
+  if(keys.length>0){
     el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-web-sid="${esc(sid)}" data-web-path="${esc(k)}" onclick="previewWebPage(this.dataset.webSid,this.dataset.webPath)">
       <span style="color:var(--cy)">${esc(k)}</span>
     </div>`).join('');
     previewWebPage(sid,keys[0]);
   }else{
     el.innerHTML='<div style="color:var(--tx3);font-size:12px">No pages published yet.</div>';
+    webPreviewNotice('Select or create a page to preview');
   }
 }
 
+/// Monotonic token for web-preview requests. Every selection takes the next
+/// value; a response is only allowed to touch the preview if its token is
+/// still the current one. Without this, a SLOW successful read of page A can
+/// land after a fast failure of page B and paint A's content under B's name —
+/// and the same applies after the tab or Space is re-rendered.
+let webPreviewGen=0;
+
+/// Invalidate any in-flight preview. Called when the Web tab is (re-)rendered
+/// so a response from a previous Space or mount cannot paint into the new one.
+function resetWebPreviewGen(){webPreviewGen++}
+
 async function previewWebPage(sid,path){
-  const storeId='x0x-web-'+sid.slice(0,16);
-  const r=await api('/stores/'+storeId+'/'+path);
-  const preview=document.getElementById('web-preview');
-  if(r&&r.value&&preview){
-    // Render in a sandboxed iframe to prevent XSS from stored HTML
-    let content='';
-    try{content=u8decode(r.value)}catch(e){content=esc(r.value)}
-    const iframe=document.createElement('iframe');
-    iframe.sandbox='allow-same-origin'; // no allow-scripts
-    iframe.style.cssText='width:100%;min-height:200px;border:none;background:var(--bg)';
-    iframe.srcdoc=content;
-    preview.innerHTML='';
-    preview.appendChild(iframe);
+  const gen=++webPreviewGen;
+  const current=()=>gen===webPreviewGen;
+  const st=await openSpacePageStore(sid,'web');
+  if(!current())return;
+  if(!st.ok){webPreviewNotice(st.reason);return}
+  // Clear the previous page BEFORE the read, so a failure cannot leave the
+  // last page visible under the newly-selected page's name.
+  webPreviewNotice('Loading “'+path+'”…');
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(path));
+  if(!current())return;
+  if(!r||!r._http_ok){
+    webPreviewNotice('Could not open “'+path+'”. '+apiError(r));
+    return;
   }
+  const preview=document.getElementById('web-preview');
+  if(!preview)return;
+  let content='';
+  const v=r.value===undefined||r.value===null?'':r.value;
+  try{content=u8decode(v)}catch(e){content=esc(String(v))}
+  // Render in a sandboxed iframe to prevent XSS from stored HTML
+  const iframe=document.createElement('iframe');
+  iframe.sandbox='allow-same-origin'; // no allow-scripts
+  iframe.style.cssText='width:100%;min-height:200px;border:none;background:var(--bg)';
+  iframe.srcdoc=content;
+  preview.innerHTML='';
+  preview.appendChild(iframe);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
