@@ -10087,13 +10087,6 @@ impl Agent {
     /// - Gossip runtime is not initialized (configure agent with network first)
     /// - Message encoding or broadcast fails
     ///
-    /// Returns the gossip pubsub manager backing this agent's publishes,
-    /// for fanout-observing test adapters (#510 diagnostics). Read-only
-    /// access; production behavior is unchanged.
-    pub fn gossip_pubsub(&self) -> Option<&std::sync::Arc<gossip::PubSubManager>> {
-        self.gossip_runtime.as_ref().map(|runtime| runtime.pubsub())
-    }
-
     pub async fn publish(&self, topic: &str, payload: Vec<u8>) -> error::Result<()> {
         self.publish_with_fanout(topic, payload).await.map(|_| ())
     }

@@ -1669,8 +1669,8 @@ async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()>
         };
         eprintln!(
             "DIAG hs_f2_restart phase=fanout_snapshot \\
-             owner_attempts={} owner_last_fanout={} owner_ever_nonzero={} \\
-             owner_remote_seen={} joiner_attempts={} joiner_last_fanout={} \\
+             owner_attempts={} owner_last_fanout={:?} owner_ever_nonzero={} \\
+             owner_remote_seen={} joiner_attempts={} joiner_last_fanout={:?} \\
              joiner_ever_nonzero={} joiner_remote_seen={} \\
              connectivity={} \\
              (fanout=attempted_eager_opportunity_not_delivery \\
@@ -1715,20 +1715,14 @@ fn restart_readiness_failure_diag(
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct DirectionalFanoutDiagnostics {
     attempts: [u64; 2],
-    last_fanout: [u32; 2],
+    /// None = unobserved (publish failed or never resolved); Some(n) = the
+    /// attempted eager-peer count from the most recent successful publish.
+    last_fanout: [Option<u32>; 2],
     ever_nonzero_fanout: [bool; 2],
     remote_seen: [bool; 2],
 }
 
-impl DirectionalFanoutDiagnostics {
-    fn record_publish(&mut self, side: usize, fanout: u32) {
-        self.attempts[side] += 1;
-        self.last_fanout[side] = fanout;
-        if fanout > 0 {
-            self.ever_nonzero_fanout[side] = true;
-        }
-    }
-}
+impl DirectionalFanoutDiagnostics {}
 
 // The real-agent wrapper and deterministic delayed-delivery regressions share
 // this entire readiness loop; the tests replace only publication/reception IO.
@@ -1766,8 +1760,16 @@ async fn await_restart_gossip_ready_with(
                 format!("hs-f2/restart-gossip-probe/{base}.{round}/joiner").into_bytes();
             owner_probes.insert(owner_probe.clone());
             joiner_probes.insert(joiner_probe.clone());
+            // #510: record the ATTEMPT before awaiting; if the publish
+            // fails or never resolves, attempts is still truthful.
+            diag.attempts[0] += 1;
             match owner_publish(owner_probe).await {
-                Ok(fanout) => diag.record_publish(0, fanout),
+                Ok(fanout) => {
+                    diag.last_fanout[0] = Some(fanout);
+                    if fanout > 0 {
+                        diag.ever_nonzero_fanout[0] = true;
+                    }
+                }
                 Err(error) => {
                     restart_readiness_failure_diag(
                         "owner_publish_error",
@@ -1782,8 +1784,14 @@ async fn await_restart_gossip_ready_with(
                 restart_readiness_diag("owner_probe_published", started);
                 owner_publish_reported = true;
             }
+            diag.attempts[1] += 1;
             match joiner_publish(joiner_probe).await {
-                Ok(fanout) => diag.record_publish(1, fanout),
+                Ok(fanout) => {
+                    diag.last_fanout[1] = Some(fanout);
+                    if fanout > 0 {
+                        diag.ever_nonzero_fanout[1] = true;
+                    }
+                }
                 Err(error) => {
                     restart_readiness_failure_diag(
                         "joiner_publish_error",
@@ -1816,6 +1824,7 @@ async fn await_restart_gossip_ready_with(
                         };
                         if joiner_probes.contains(&message) {
                             owner_got = true;
+                            diag.remote_seen[0] = true;
                             owner_last = "expected_remote_probe";
                             if !owner_remote_reported {
                                 restart_readiness_diag("owner_received_remote_probe", started);
@@ -1842,6 +1851,7 @@ async fn await_restart_gossip_ready_with(
                         };
                         if owner_probes.contains(&message) {
                             joiner_got = true;
+                            diag.remote_seen[1] = true;
                             joiner_last = "expected_remote_probe";
                             if !joiner_remote_reported {
                                 restart_readiness_diag("joiner_received_remote_probe", started);
@@ -1858,7 +1868,6 @@ async fn await_restart_gossip_ready_with(
                 }
             }
             if owner_got && joiner_got {
-                diag.remote_seen = [true, true];
                 restart_readiness_diag("ready", started);
                 return Ok(());
             }
@@ -1968,7 +1977,7 @@ async fn fanout_control_asymmetric_recorded_and_still_fails() {
     let (result, diag) = fanout_control_fixture(5, 0, None, None, false).await;
     assert!(result.is_err());
     assert!(diag.attempts[0] >= 1);
-    assert_eq!(diag.last_fanout[0], 5);
+    assert_eq!(diag.last_fanout[0], Some(5));
     assert_eq!(diag.ever_nonzero_fanout, [true, false]);
     assert_eq!(diag.remote_seen, [false, false]);
 }
@@ -1980,6 +1989,106 @@ async fn fanout_control_delayed_exact_remote_passes() {
     let (result, diag) = fanout_control_fixture(1, 1, Some(50), Some(50), true).await;
     assert!(result.is_ok(), "delayed bilateral remote probes must pass");
     assert_eq!(diag.remote_seen, [true, true]);
+}
+
+/// #510 truthful-diagnostics control A: a FAILED first publish returns
+/// immediately (existing error semantics preserved); attempts truthfully
+/// records 1, and last_fanout is None (unobserved, NOT a measured zero).
+#[tokio::test(start_paused = true)]
+async fn fanout_control_failed_publish_attempts_one_fanout_none() {
+    let (_to_owner, mut owner_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let (_to_joiner, mut joiner_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let (result, diag) = await_restart_gossip_ready_with(
+        async |_| anyhow::bail!("injected first-publish failure"),
+        async |_| Ok(0),
+        async || owner_rx.recv().await,
+        async || joiner_rx.recv().await,
+    )
+    .await;
+    assert!(result.is_err(), "publish error must fail immediately");
+    assert_eq!(
+        diag.attempts[0], 1,
+        "failed publish truthfully counted as attempt 1"
+    );
+    assert_eq!(
+        diag.last_fanout[0], None,
+        "unobserved fanout is None, not measured zero"
+    );
+    assert!(!diag.ever_nonzero_fanout[0]);
+    assert_eq!(diag.remote_seen, [false, false], "no delivery occurred");
+}
+
+/// #510 truthful-diagnostics control B: one-way successful owner→joiner
+/// traffic times out at 20 s; the receiving side's remote_seen is true,
+/// the opposite is false — per-side, not bilateral override.
+#[tokio::test(start_paused = true)]
+async fn fanout_control_one_way_remote_seen_per_side() {
+    let (_to_owner, mut owner_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let (to_joiner, mut joiner_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let (result, diag) = await_restart_gossip_ready_with(
+        {
+            let to_joiner = to_joiner.clone();
+            async move |probe: Vec<u8>| {
+                let _ = to_joiner.try_send(probe);
+                Ok(2)
+            }
+        },
+        async |_| Ok(0),
+        async || owner_rx.recv().await,
+        async || joiner_rx.recv().await,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "one-way delivery must fail at the 20 s deadline"
+    );
+    assert!(diag.attempts[0] >= 1);
+    assert_eq!(
+        diag.last_fanout[0],
+        Some(2),
+        "successful publish observed fanout"
+    );
+    assert!(diag.ever_nonzero_fanout[0]);
+    assert!(diag.attempts[1] >= 1);
+    assert_eq!(
+        diag.last_fanout[1],
+        Some(0),
+        "zero-fanout publish is a measured Some(0)"
+    );
+    assert!(!diag.ever_nonzero_fanout[1]);
+    assert!(
+        diag.remote_seen[1],
+        "joiner received owner probe: remote_seen[1] true"
+    );
+    assert!(
+        !diag.remote_seen[0],
+        "owner never received remote: remote_seen[0] false"
+    );
+}
+
+/// #510 truthful-diagnostics control C: a PENDING first publish (never
+/// resolves) still counts as attempt 1 with unobserved fanout at the 20 s
+/// deadline.
+#[tokio::test(start_paused = true)]
+async fn fanout_control_pending_publish_attempts_one_fanout_none() {
+    let (_to_owner, mut owner_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let (_to_joiner, mut joiner_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let (result, diag) = await_restart_gossip_ready_with(
+        async |_| std::future::pending().await,
+        async |_| Ok(0),
+        async || owner_rx.recv().await,
+        async || joiner_rx.recv().await,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "pending publish must hit the 20 s deadline"
+    );
+    assert_eq!(
+        diag.attempts[0], 1,
+        "pending publish truthfully counted as attempt 1"
+    );
+    assert_eq!(diag.last_fanout[0], None, "unresolved fanout is None");
 }
 
 async fn delayed_restart_probe(
