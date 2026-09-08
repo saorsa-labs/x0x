@@ -864,7 +864,15 @@
       "method": "GET",
       "path": "/diagnostics/dm",
       "request": {
-        "kind": "none"
+        "fields": [
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "agent",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {

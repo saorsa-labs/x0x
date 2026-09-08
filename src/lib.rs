@@ -156,6 +156,9 @@ pub mod dm;
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
 
+/// Bounded per-peer DM digest diagnostic observations.
+pub mod dm_digest_diagnostics;
+
 /// Background service that publishes this agent's capability advert and
 /// consumes peers' adverts into a shared [`dm_capability::CapabilityStore`].
 pub mod dm_capability_service;
@@ -360,6 +363,9 @@ pub struct Agent {
     /// KEM pubkey). `start_dm_inbox` upgrades via this sender to trigger
     /// immediate republish.
     dm_capabilities_tx: std::sync::Arc<tokio::sync::watch::Sender<dm::DmCapabilities>>,
+    #[cfg(test)]
+    capability_convergence_observer:
+        std::sync::Mutex<Option<std::sync::Arc<dm_capability_service::ConvergenceServiceObserver>>>,
     /// In-flight DM ACK waiters shared between `send_direct` and the inbox.
     dm_inflight_acks: std::sync::Arc<dm::InFlightAcks>,
     /// Receiver-side dedupe cache.
@@ -6488,6 +6494,9 @@ impl Agent {
             .as_ref()
             .ok_or_else(|| dm::DmError::NoConnectivity("no network for relay send".to_string()))?;
         let relay_peer_id = ant_quic::PeerId(relay_machine_id.0);
+        #[cfg(test)]
+        self.peer_relay
+            .observe_convergence_sent(&wire, relay_agent.0);
         network
             .send_direct_typed(
                 &relay_peer_id,
@@ -9795,7 +9804,15 @@ impl Agent {
         // L3 retirement: the periodic caps advert only runs on the legacy
         // escape hatch. On-demand mode still answers targeted/warm requests
         // and publishes on capability upgrades.
-        let service = dm_capability_service::CapabilityAdvertService::spawn(
+        #[cfg(test)]
+        let convergence_observer = self
+            .capability_convergence_observer
+            .lock()
+            .map_err(|_| {
+                error::IdentityError::Storage(std::io::Error::other("service observer poisoned"))
+            })?
+            .clone();
+        let service = dm_capability_service::CapabilityAdvertService::spawn_observed(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
@@ -9804,6 +9821,8 @@ impl Agent {
             std::sync::Arc::clone(&self.capability_store),
             std::time::Duration::from_secs(dm_capability::ADVERT_PUBLISH_INTERVAL_SECS),
             self.legacy_announce,
+            #[cfg(test)]
+            convergence_observer,
         )
         .await
         .map_err(|e| {
@@ -15097,6 +15116,8 @@ impl AgentBuilder {
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
+            #[cfg(test)]
+            capability_convergence_observer: std::sync::Mutex::new(None),
             dm_capabilities_tx: std::sync::Arc::new({
                 let (tx, _rx) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
                 tx
@@ -17003,6 +17024,14 @@ fn spawn_relay_dm_listener(
                 now_ms,
                 is_sender_contact,
                 is_sender_blocked,
+            );
+
+            #[cfg(test)]
+            peer_relay.observe_convergence_received(
+                &relayed,
+                relay_peer_id.0,
+                _relay_sender_agent_id,
+                disposition,
             );
 
             // Revocation gate (PR #177 review, fix 1): the inner envelope's
@@ -24913,3 +24942,6 @@ mod peer_connected_handler_integration_tests {
         assert_eq!(back.move_protocol, unsigned.move_protocol);
     }
 }
+
+#[cfg(test)]
+mod asymmetric_capability_convergence_tests;

@@ -128,7 +128,24 @@ pub async fn diagnostics_transport(client: &DaemonClient) -> Result<()> {
 /// Prints direct-message send/receive counters, subscriber fan-out health, and
 /// per-peer timing/path state.
 pub async fn diagnostics_dm(client: &DaemonClient) -> Result<()> {
-    client.run_get("/diagnostics/dm").await
+    diagnostics_dm_for_agent(client, None).await
+}
+
+/// Print DM diagnostics with an optional exact-agent digest filter.
+pub async fn diagnostics_dm_for_agent(client: &DaemonClient, agent: Option<&str>) -> Result<()> {
+    let path = dm_diagnostics_path(agent)?;
+    client.run_get(&path).await
+}
+
+fn dm_diagnostics_path(agent: Option<&str>) -> Result<String> {
+    match agent {
+        None => Ok("/diagnostics/dm".to_string()),
+        Some(agent) => {
+            let bytes = crate::dm_digest_diagnostics::parse_agent_filter(agent)
+                .map_err(anyhow::Error::msg)?;
+            Ok(format!("/diagnostics/dm?agent={}", hex::encode(bytes)))
+        }
+    }
 }
 
 /// `x0x diagnostics groups` — GET /diagnostics/groups
@@ -422,4 +439,20 @@ async fn peers_health_returns_mock_response() {
 
     let result = peers_health(&client, "abc123").await;
     assert!(result.is_ok(), "peers_health should succeed: {:?}", result);
+}
+
+#[cfg(test)]
+mod digest_diagnostic_tests {
+    use super::dm_diagnostics_path;
+
+    #[test]
+    fn exact_filter_path_and_invalid_input() {
+        assert_eq!(dm_diagnostics_path(None).unwrap(), "/diagnostics/dm");
+        assert_eq!(
+            dm_diagnostics_path(Some(&"AB".repeat(32))).unwrap(),
+            format!("/diagnostics/dm?agent={}", "ab".repeat(32))
+        );
+        assert!(dm_diagnostics_path(Some("short")).is_err());
+        assert!(dm_diagnostics_path(Some(&"z".repeat(64))).is_err());
+    }
 }

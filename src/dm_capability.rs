@@ -578,6 +578,88 @@ impl CapabilityStore {
         now.checked_add(Duration::from_millis(remaining_ms))
     }
 
+    /// Read retained records without invoking the pruning capability lookup.
+    pub(crate) fn digest_diagnostic_snapshot(
+        &self,
+        now: Instant,
+        filter: Option<[u8; 32]>,
+    ) -> crate::dm_digest_diagnostics::StoreSnapshot<
+        crate::dm_digest_diagnostics::CapabilityObservation,
+        crate::dm_digest_diagnostics::CapabilityTotals,
+    > {
+        use crate::dm_digest_diagnostics::{
+            millis, select_key, CachedCapabilityObservation, CapabilityObservation,
+            CapabilityTotals, ExtensionObservation, StoreSnapshot,
+        };
+        let Ok(inner) = self.inner.lock() else {
+            return StoreSnapshot::unavailable();
+        };
+        let mut keys = std::collections::BTreeSet::new();
+        let mut totals = CapabilityTotals::default();
+        for (key, base) in &inner.adverts {
+            totals.distinct_agents += 1;
+            if now <= base.expires_at {
+                totals.base_fresh += 1;
+            } else {
+                totals.base_expired_retained += 1;
+            }
+            select_key(&mut keys, *key, filter);
+        }
+        for (key, ext) in &inner.digest_exts {
+            if !inner.adverts.contains_key(key) {
+                totals.distinct_agents += 1;
+            }
+            totals.extension_present += 1;
+            if now <= ext.expires_at {
+                totals.extension_fresh += 1;
+            } else {
+                totals.extension_expired_retained += 1;
+            }
+            select_key(&mut keys, *key, filter);
+        }
+        let rows = keys
+            .into_iter()
+            .map(|key| {
+                let base = inner.adverts.get(&key);
+                let ext = inner.digest_exts.get(&key);
+                (
+                    key,
+                    CapabilityObservation {
+                        base_advert: base.map(|b| CachedCapabilityObservation {
+                            digest_support: b.capabilities.digest_support,
+                            machine_id: b.machine_id,
+                            source: "advert",
+                            state: if now <= b.expires_at {
+                                "fresh"
+                            } else {
+                                "expired_retained"
+                            },
+                            advert_created_unix_ms: b.created_at_unix_ms,
+                            expires_in_ms: millis(b.expires_at.saturating_duration_since(now)),
+                        }),
+                        digest_extension: ext.map(|e| ExtensionObservation {
+                            digest_support: e.digest_support,
+                            machine_id: e.machine_id,
+                            source: "extension",
+                            state: if now <= e.expires_at {
+                                "fresh"
+                            } else {
+                                "expired_retained"
+                            },
+                            created_at_unix_ms: e.created_at_unix_ms,
+                            expires_in_ms: millis(e.expires_at.saturating_duration_since(now)),
+                            machine_matches_base: base.map(|b| b.machine_id == e.machine_id),
+                        }),
+                    },
+                )
+            })
+            .collect();
+        StoreSnapshot {
+            totals: Some(totals),
+            rows,
+        }
+    }
+
     /// Current cache size (diagnostic).
     pub fn len(&self) -> usize {
         self.inner
@@ -1209,5 +1291,188 @@ mod tests {
                 .digest_support,
             "an extension from another machine must not ride a card import"
         );
+    }
+}
+
+#[cfg(test)]
+mod digest_diagnostic_tests {
+    use super::*;
+    use crate::dm_digest_diagnostics::{join_snapshots, MAX_PER_PEER_ROWS};
+    use crate::peer_relay::PeerRelay;
+
+    fn key(i: u16) -> [u8; 32] {
+        let mut key = [0; 32];
+        key[30..].copy_from_slice(&i.to_be_bytes());
+        key
+    }
+
+    fn base(expires_at: Instant, digest_support: bool) -> CachedAdvert {
+        CachedAdvert {
+            capabilities: DmCapabilities {
+                digest_support,
+                ..DmCapabilities::pending()
+            },
+            machine_id: [7; 32],
+            expires_at,
+            created_at_unix_ms: 123,
+        }
+    }
+
+    fn wire(store: &CapabilityStore, now: Instant, filter: Option<[u8; 32]>) -> serde_json::Value {
+        join_snapshots(
+            store.digest_diagnostic_snapshot(now, filter),
+            PeerRelay::default().digest_diagnostic_snapshot(now, filter),
+            filter,
+        )
+    }
+
+    #[test]
+    fn sticky_base_and_independent_extension_metadata() {
+        let store = CapabilityStore::new();
+        let now = Instant::now();
+        // Actual production insert and merge: a legacy true base needs no extension.
+        let timestamp = now_unix_ms();
+        assert!(store.insert(
+            AgentId(key(1)),
+            MachineId([7; 32]),
+            DmCapabilities {
+                digest_support: true,
+                ..DmCapabilities::pending()
+            },
+            timestamp
+        ));
+        assert!(store.insert(
+            AgentId(key(2)),
+            MachineId([7; 32]),
+            DmCapabilities::pending(),
+            timestamp
+        ));
+        assert!(store.apply_digest_extension(AgentId(key(2)), MachineId([7; 32]), true, timestamp));
+        // Deterministic expiry of the independent extension, with the base still fresh.
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .digest_exts
+            .get_mut(&key(2))
+            .unwrap()
+            .expires_at = now;
+        let view = wire(&store, now + Duration::from_millis(1), None);
+        assert_eq!(view["rows"][0]["base_advert"]["digest_support"], true);
+        assert!(view["rows"][0]["digest_extension"].is_null());
+        assert_eq!(view["rows"][1]["base_advert"]["digest_support"], true);
+        assert_eq!(view["rows"][1]["base_advert"]["state"], "fresh");
+        assert_eq!(
+            view["rows"][1]["digest_extension"]["state"],
+            "expired_retained"
+        );
+        assert_eq!(
+            view["rows"][1]["digest_extension"]["machine_matches_base"],
+            true
+        );
+        assert_eq!(view["rows"][1]["digest_extension"]["source"], "extension");
+    }
+
+    #[test]
+    fn extension_only_mismatch_expiry_and_snapshot_purity() {
+        let store = CapabilityStore::new();
+        let now = Instant::now();
+        {
+            let mut inner = store.inner.lock().unwrap();
+            inner.adverts.insert(key(2), base(now, true));
+            for i in [1, 2] {
+                inner.digest_exts.insert(
+                    key(i),
+                    CachedDigestExt {
+                        machine_id: [8; 32],
+                        digest_support: false,
+                        expires_at: now,
+                        created_at_unix_ms: 456,
+                    },
+                );
+            }
+        }
+        let at = wire(&store, now, None);
+        assert!(at["rows"][0]["base_advert"].is_null());
+        assert!(at["rows"][0]["digest_extension"]["machine_matches_base"].is_null());
+        assert_eq!(
+            at["rows"][1]["digest_extension"]["machine_matches_base"],
+            false
+        );
+        assert_eq!(
+            at["rows"][1]["digest_extension"]["machine_id"],
+            hex::encode([8; 32])
+        );
+        assert_eq!(at["rows"][1]["base_advert"]["advert_created_unix_ms"], 123);
+        assert_eq!(at["rows"][1]["digest_extension"]["created_at_unix_ms"], 456);
+        assert_eq!(at["totals"]["capability"]["base_fresh"], 1);
+        assert_eq!(at["totals"]["capability"]["extension_fresh"], 2);
+        let later = now + Duration::from_millis(1);
+        let expired = wire(&store, later, None);
+        assert_eq!(
+            expired["rows"][1]["base_advert"]["state"],
+            "expired_retained"
+        );
+        assert_eq!(
+            expired["rows"][1]["digest_extension"]["state"],
+            "expired_retained"
+        );
+        assert_eq!(at, wire(&store, now, None)); // every exported field unchanged at the same clock
+        assert_eq!(expired, wire(&store, later, None));
+        assert_eq!(store.inner.lock().unwrap().adverts.len(), 1);
+        assert_eq!(store.inner.lock().unwrap().digest_exts.len(), 2);
+        assert!(store.lookup_binding_at(&AgentId(key(2)), later).is_none());
+        assert!(wire(&store, later, None)["rows"][1]["base_advert"].is_null());
+    }
+
+    #[test]
+    fn bounded_distinct_selection_and_exact_omitted_agent() {
+        let store = CapabilityStore::new();
+        let now = Instant::now();
+        {
+            let mut inner = store.inner.lock().unwrap();
+            for i in (0..513).rev() {
+                inner.adverts.insert(key(i), base(now, false));
+                inner.digest_exts.insert(
+                    key(i),
+                    CachedDigestExt {
+                        machine_id: [7; 32],
+                        digest_support: true,
+                        expires_at: now,
+                        created_at_unix_ms: 456,
+                    },
+                );
+            }
+        }
+        let snapshot = store.digest_diagnostic_snapshot(now, None);
+        assert_eq!(snapshot.rows.len(), MAX_PER_PEER_ROWS);
+        assert_eq!(snapshot.totals.as_ref().unwrap().distinct_agents, 513);
+        let view = wire(&store, now, None);
+        assert_eq!(view["totals"]["capability"]["extension_present"], 513);
+        assert_eq!(view["truncated"], true);
+        assert_eq!(view["rows"][511]["agent_id"], hex::encode(key(511)));
+        let exact = wire(&store, now, Some(key(512)));
+        assert_eq!(exact["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(exact["rows"][0]["agent_id"], hex::encode(key(512)));
+        assert_eq!(exact["rows"][0]["capability_record_state"], "retained");
+        assert_eq!(exact["truncated"], false);
+    }
+
+    #[test]
+    fn poisoned_capability_is_unavailable_not_empty() {
+        let store = CapabilityStore::new();
+        let now = Instant::now();
+        let _ = std::panic::catch_unwind(|| {
+            let mut guard = store.inner.lock().unwrap();
+            guard.adverts.insert(key(1), base(now, true));
+            panic!("deliberate inert poison");
+        });
+        let view = wire(&store, now, Some(key(1)));
+        assert!(view["totals"]["capability"].is_null());
+        assert_eq!(view["store_state_capability"], "unavailable");
+        assert_eq!(view["rows"][0]["capability_record_state"], "unavailable");
+        assert!(view["rows"][0]["base_advert"].is_null());
+        assert_eq!(view["rows"][0]["fresh_forward_downgrade_baseline"], false);
+        assert_eq!(store.digest_diagnostic_snapshot(now, None).rows.len(), 0);
     }
 }
