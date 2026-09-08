@@ -332,6 +332,23 @@ impl Subscription {
     pub async fn recv(&mut self) -> Option<PubSubMessage> {
         self.receiver.recv().await
     }
+
+    /// Receive from either subscription until both are closed and drained.
+    pub(crate) async fn recv_from_either(&mut self, other: &mut Self) -> Option<PubSubMessage> {
+        recv_from_either(&mut self.receiver, &mut other.receiver).await
+    }
+}
+
+/// A closed carrier must not terminate or repeatedly wake a live carrier's wait.
+async fn recv_from_either<T>(
+    first: &mut mpsc::Receiver<T>,
+    second: &mut mpsc::Receiver<T>,
+) -> Option<T> {
+    tokio::select! {
+        Some(message) = first.recv() => Some(message),
+        Some(message) = second.recv() => Some(message),
+        else => None,
+    }
 }
 
 impl Drop for Subscription {
@@ -4807,5 +4824,117 @@ mod tests {
                 "{reason} must refuse valid outer V1"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod closed_input_tests {
+    use super::recv_from_either;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Wake, Waker};
+    use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn assert_pending<F: Future>(future: Pin<&mut F>, wake: &Arc<WakeCount>) {
+        let waker = Waker::from(Arc::clone(wake));
+        assert!(future.poll(&mut Context::from_waker(&waker)).is_pending());
+    }
+
+    async fn closed_carrier_preserves_survivor(close_first: bool) {
+        let (first_tx, mut first) = mpsc::channel(2);
+        let (second_tx, mut second) = mpsc::channel(2);
+        let live_tx = if close_first {
+            drop(first_tx);
+            second_tx
+        } else {
+            drop(second_tx);
+            first_tx
+        };
+        let wake = Arc::new(WakeCount::default());
+        {
+            let mut next = std::pin::pin!(recv_from_either(&mut first, &mut second));
+            assert_pending(next.as_mut(), &wake);
+            live_tx
+                .try_send(17)
+                .expect("live carrier accepts a message");
+            assert_eq!(next.await, Some(17));
+        }
+        live_tx.try_send(23).expect("survivor remains usable");
+        assert_eq!(recv_from_either(&mut first, &mut second).await, Some(23));
+        drop(live_tx);
+        assert_eq!(recv_from_either(&mut first, &mut second).await, None);
+    }
+
+    #[tokio::test]
+    async fn first_closed_waits_for_live_second() {
+        closed_carrier_preserves_survivor(true).await;
+    }
+
+    #[tokio::test]
+    async fn second_closed_waits_for_live_first() {
+        closed_carrier_preserves_survivor(false).await;
+    }
+
+    #[tokio::test]
+    async fn both_closed_and_empty_terminate() {
+        let (first_tx, mut first) = mpsc::channel::<u8>(1);
+        let (second_tx, mut second) = mpsc::channel::<u8>(1);
+        drop((first_tx, second_tx));
+        assert_eq!(recv_from_either(&mut first, &mut second).await, None);
+        assert_eq!(recv_from_either(&mut first, &mut second).await, None);
+    }
+
+    #[tokio::test]
+    async fn closed_carriers_drain_buffered_values_before_terminating() {
+        let (first_tx, mut first) = mpsc::channel(2);
+        let (second_tx, mut second) = mpsc::channel(2);
+        for value in [1, 2] {
+            first_tx.try_send((0, value)).expect("first capacity");
+            second_tx.try_send((1, value)).expect("second capacity");
+        }
+        drop((first_tx, second_tx));
+        let mut received = [Vec::new(), Vec::new()];
+        while let Some((carrier, value)) = recv_from_either(&mut first, &mut second).await {
+            received[carrier].push(value);
+        }
+        assert_eq!(received, [vec![1, 2], vec![1, 2]]);
+    }
+
+    #[tokio::test]
+    async fn closing_pending_carriers_wakes_and_terminates() {
+        let (first_tx, mut first) = mpsc::channel::<u8>(1);
+        let (second_tx, mut second) = mpsc::channel::<u8>(1);
+        let wake = Arc::new(WakeCount::default());
+        let mut next = std::pin::pin!(recv_from_either(&mut first, &mut second));
+        assert_pending(next.as_mut(), &wake);
+        let before = wake.0.load(Ordering::Relaxed);
+        drop((first_tx, second_tx));
+        assert!(wake.0.load(Ordering::Relaxed) > before);
+        assert_eq!(next.await, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_preserves_both_live_carriers() {
+        let (first_tx, mut first) = mpsc::channel(1);
+        let (second_tx, mut second) = mpsc::channel(1);
+        {
+            let mut next = std::pin::pin!(recv_from_either(&mut first, &mut second));
+            assert_pending(next.as_mut(), &Arc::new(WakeCount::default()));
+        }
+        first_tx.try_send(31).expect("first still live");
+        assert_eq!(recv_from_either(&mut first, &mut second).await, Some(31));
+        second_tx.try_send(47).expect("second still live");
+        assert_eq!(recv_from_either(&mut first, &mut second).await, Some(47));
     }
 }
