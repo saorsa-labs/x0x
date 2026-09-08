@@ -18,7 +18,7 @@
 //!
 //! `<corr-id>` is an opaque correlation string chosen by the caller; peers
 //! must echo it verbatim and must not parse it. This implementation emits
-//! `<uuid>-<call-token>` (see [`BindingSession::call`]), and the JSON-RPC
+//! `<uuid>-<call-token>` (see [`BindingSession::call`](crate::a2a::binding::BindingSession::call)), and the JSON-RPC
 //! `id` is that same string.
 //!
 //! Forward-compat rules (both directions):
