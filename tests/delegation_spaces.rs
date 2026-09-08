@@ -306,6 +306,34 @@ async fn get_messages(d: &AgentInstance, group_id: &str) -> Value {
         .expect("get messages json")
 }
 
+async fn get_history(d: &AgentInstance, group_id: &str) -> Value {
+    authed_client(d)
+        .get(d.url(&format!("/history?scope=group:{group_id}&limit=100")))
+        .send()
+        .await
+        .expect("get history request")
+        .json()
+        .await
+        .expect("get history json")
+}
+
+async fn get_history_point(
+    d: &AgentInstance,
+    group_id: &str,
+    canonical_id: &str,
+) -> (reqwest::StatusCode, Value) {
+    let response = authed_client(d)
+        .get(d.url(&format!(
+            "/history/message/{canonical_id}?scope=group:{group_id}"
+        )))
+        .send()
+        .await
+        .expect("get history point request");
+    let status = response.status();
+    let body = response.json().await.expect("get history point json");
+    (status, body)
+}
+
 // ─────────────────── 1. send-as + forge rejections ───────────────────────
 
 /// Positive send-as flow plus every REST-exercisable forge from the ADR-0040
@@ -693,6 +721,36 @@ async fn delegation_survives_restart_via_history() {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        let carrier_id = djson["msg_id"]
+            .as_str()
+            .expect("delegation response canonical carrier id")
+            .to_string();
+        assert_eq!(carrier_id.len(), 64, "carrier canonical id is 32-byte hex");
+
+        // The delegation response's canonical carrier id must address the
+        // owner's LocalSend row before and after the cold registry rebuild.
+        let carrier_listed = wait_until(Duration::from_secs(5), || async {
+            let history = get_history(alice, &alice_local).await;
+            history["records"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["msg_id"].as_str() == Some(carrier_id.as_str())
+                        && row["provenance"].as_str() == Some("LocalSend")
+                })
+            })
+        })
+        .await;
+        assert!(
+            carrier_listed,
+            "delegation carrier never reached owner history"
+        );
+        let (status, point) = get_history_point(alice, &alice_local, &carrier_id).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "owner carrier lookup: {point:?}"
+        );
+        assert_eq!(point["record"]["msg_id"], carrier_id);
+        assert_eq!(point["record"]["provenance"], "LocalSend");
 
         // Pre-restart: listed as effective.
         let before = delegations(alice, &alice_local).await;
@@ -713,6 +771,14 @@ async fn delegation_survives_restart_via_history() {
                 .any(|d| d["delegation_digest"].as_str() == Some(digest.as_str()))),
             "delegation survives restart via durable history: {after:?}"
         );
+        let (status, point) = get_history_point(alice, &alice_local, &carrier_id).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "owner carrier lookup after restart: {point:?}"
+        );
+        assert_eq!(point["record"]["msg_id"], carrier_id);
+        assert_eq!(point["record"]["provenance"], "LocalSend");
 
         // And it still WORKS: bob sends-as with the pre-restart digest and
         // the restarted daemon's send gate authorizes it.
@@ -730,6 +796,118 @@ async fn delegation_survives_restart_via_history() {
             200,
             "send-as authorized against re-derived history: {still_valid:?}"
         );
+    })
+    .catch_unwind()
+    .await;
+    drop(pair);
+    if let Err(panic) = proof {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// The delegation carrier must be usable from the receiving daemon's
+/// VerifiedEnvelope history after that daemon is rebuilt.  This is the
+/// receiver-side complement to `delegation_survives_restart_via_history`:
+/// the owner LocalSend row and the same signed carrier are checked through
+/// the point-lookup route on both daemons, then Bob is restarted.
+#[tokio::test]
+#[ignore]
+async fn delegation_carrier_verified_history_survives_receiver_restart() {
+    let _guard = suite_lock().await;
+    let mut pair = pair().await;
+    let proof = AssertUnwindSafe(async {
+        mesh_pair(&pair.alice, &pair.bob).await;
+        let (alice_local, _) =
+            create_signed_public_group(&pair.alice, "adr0040-receiver-restart").await;
+        let bob_id = pair.bob.agent_id().await;
+        join_group(&pair.alice, &pair.bob, &alice_local).await;
+        let warmup = send_message(
+            &pair.alice,
+            &alice_local,
+            serde_json::json!({"body": "warmup"}),
+        )
+        .await;
+        assert_eq!(warmup.status(), 200);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let delegated = delegate(
+            &pair.alice,
+            &alice_local,
+            &bob_id,
+            "send_as",
+            now + 300_000,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(delegated.status(), 200);
+        let djson: Value = delegated.json().await.expect("delegate json");
+        let carrier_id = djson["msg_id"]
+            .as_str()
+            .expect("delegation response canonical carrier id")
+            .to_string();
+        assert_eq!(carrier_id.len(), 64, "carrier canonical id is 32-byte hex");
+
+        let owner_listed = wait_until(Duration::from_secs(10), || async {
+            let history = get_history(&pair.alice, &alice_local).await;
+            history["records"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["msg_id"].as_str() == Some(carrier_id.as_str())
+                        && row["provenance"].as_str() == Some("LocalSend")
+                })
+            })
+        })
+        .await;
+        assert!(owner_listed, "owner never listed delegation carrier");
+        let receiver_listed = wait_until(Duration::from_secs(10), || async {
+            let history = get_history(&pair.bob, &alice_local).await;
+            history["records"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["msg_id"].as_str() == Some(carrier_id.as_str())
+                        && row["provenance"].as_str() == Some("VerifiedEnvelope")
+                })
+            })
+        })
+        .await;
+        assert!(receiver_listed, "receiver never listed delegation carrier");
+
+        let (owner_status, owner_point) =
+            get_history_point(&pair.alice, &alice_local, &carrier_id).await;
+        assert_eq!(owner_status, reqwest::StatusCode::OK);
+        let (receiver_status, receiver_point) =
+            get_history_point(&pair.bob, &alice_local, &carrier_id).await;
+        assert_eq!(receiver_status, reqwest::StatusCode::OK);
+        assert_eq!(owner_point["record"]["msg_id"], carrier_id);
+        assert_eq!(receiver_point["record"]["msg_id"], carrier_id);
+        assert_eq!(
+            owner_point["record"]["scope"],
+            receiver_point["record"]["scope"]
+        );
+        assert_eq!(
+            owner_point["record"]["payload"],
+            receiver_point["record"]["payload"]
+        );
+        assert_eq!(owner_point["record"]["provenance"], "LocalSend");
+        assert_eq!(receiver_point["record"]["provenance"], "VerifiedEnvelope");
+
+        // Rebuild Bob's registry from the same data directory and identity.
+        pair.bob.restart().await;
+        let (status, after_restart) = get_history_point(&pair.bob, &alice_local, &carrier_id).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(after_restart["record"]["msg_id"], carrier_id);
+        assert_eq!(
+            after_restart["record"]["scope"],
+            owner_point["record"]["scope"]
+        );
+        assert_eq!(
+            after_restart["record"]["payload"],
+            owner_point["record"]["payload"]
+        );
+        assert_eq!(after_restart["record"]["provenance"], "VerifiedEnvelope");
     })
     .catch_unwind()
     .await;

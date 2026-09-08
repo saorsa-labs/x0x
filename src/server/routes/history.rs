@@ -410,7 +410,7 @@ pub(in crate::server) async fn history_diagnostics(
 mod tests {
     use super::*;
     use x0x::groups::{GroupPublicMessage, GroupPublicMessageKind};
-    use x0x::history::{Direction, HistoryRecord, Provenance, Store};
+    use x0x::history::{Direction, HistoryRecord, InsertOutcome, Provenance, Store};
 
     #[test]
     fn group_history_json_uses_canonical_message_id_and_thread_ancestry() {
@@ -606,5 +606,230 @@ mod tests {
         .expect("local canonical target");
         assert_eq!(local_resolved.record.msg_id, local_target.msg_id);
         assert_eq!(local_resolved.record.provenance, Provenance::LocalSend);
+    }
+
+    #[test]
+    fn canonical_projection_rejects_scope_and_body_mismatches() {
+        let dir = tempfile::tempdir().expect("temporary history directory");
+        let store = Store::open(&dir.path().join("history.db")).expect("open history store");
+        let message = GroupPublicMessage {
+            group_id: "canonical-guard".to_string(),
+            state_hash_at_send: "state".to_string(),
+            revision_at_send: 1,
+            author_agent_id: "author".to_string(),
+            author_public_key: "key".to_string(),
+            author_user_id: None,
+            kind: GroupPublicMessageKind::Chat,
+            body: "canonical body".to_string(),
+            timestamp: 1,
+            thread_root: None,
+            thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
+            rider_provenance: None,
+            signature: "signature".to_string(),
+        };
+        let artifact = serde_json::to_vec(&message).expect("serialize artifact");
+        let canonical = message.msg_id();
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical)
+            .expect("canonical hex")
+            .try_into()
+            .expect("canonical length");
+
+        let record = |scope: Scope, payload: Vec<u8>, seen_at_ms: i64| HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope,
+            author_agent: Some("author".to_string()),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: seen_at_ms,
+            seen_at_ms,
+            direction: Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: Some(artifact.clone()),
+            signature: Some(vec![1]),
+            sig_context: Some("x0x.group.public-message.v2".to_string()),
+            provenance: Provenance::VerifiedEnvelope,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        let wrong_scope = record(
+            Scope::Group("other-group".to_string()),
+            message.body.as_bytes().to_vec(),
+            1,
+        );
+        let wrong_body = record(
+            Scope::Group(message.group_id.clone()),
+            b"tampered body".to_vec(),
+            2,
+        );
+        let wrong_scope_id = wrong_scope.msg_id;
+        let wrong_body_id = wrong_body.msg_id;
+        store.insert(&wrong_scope).expect("insert scope mismatch");
+        store.insert(&wrong_body).expect("insert body mismatch");
+
+        for (id, scope) in [
+            (wrong_scope_id, "other-group"),
+            (wrong_body_id, "canonical-guard"),
+        ] {
+            assert!(store.get_by_msg_id(id).expect("dedupe lookup").is_some());
+            assert!(
+                resolve_history_message(
+                    &store,
+                    canonical_bytes,
+                    &canonical,
+                    Some(Scope::Group(scope.to_string())),
+                )
+                .expect("canonical lookup")
+                .is_none(),
+                "mismatched artifact must never resolve as canonical group {scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_projection_dedupes_local_and_verified_recorders() {
+        let dir = tempfile::tempdir().expect("temporary history directory");
+        let store = Store::open(&dir.path().join("history.db")).expect("open history store");
+        let message = GroupPublicMessage {
+            group_id: "recorder-order".to_string(),
+            state_hash_at_send: "state".to_string(),
+            revision_at_send: 1,
+            author_agent_id: "author".to_string(),
+            author_public_key: "key".to_string(),
+            author_user_id: None,
+            kind: GroupPublicMessageKind::Chat,
+            body: "same signed body".to_string(),
+            timestamp: 1,
+            thread_root: None,
+            thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
+            rider_provenance: None,
+            signature: "signature".to_string(),
+        };
+        let artifact = serde_json::to_vec(&message).expect("serialize artifact");
+        let payload = message.body.as_bytes().to_vec();
+        let make_record = |provenance| HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope: Scope::Group(message.group_id.clone()),
+            author_agent: Some(message.author_agent_id.clone()),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1,
+            seen_at_ms: 1,
+            direction: Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload: payload.clone(),
+            signed_artifact: Some(artifact.clone()),
+            signature: Some(vec![1]),
+            sig_context: Some("x0x.group.public-message.v2".to_string()),
+            provenance,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        let local = make_record(Provenance::LocalSend);
+        let verified = make_record(Provenance::VerifiedEnvelope);
+        assert_eq!(
+            store.insert(&local).expect("insert LocalSend"),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            store.insert(&verified).expect("insert VerifiedEnvelope"),
+            InsertOutcome::Duplicate,
+            "same signed artifact/body must not create competing history rows"
+        );
+        let canonical = message.msg_id();
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical)
+            .expect("canonical hex")
+            .try_into()
+            .expect("canonical length");
+        let resolved = resolve_history_message(
+            &store,
+            canonical_bytes,
+            &canonical,
+            Some(Scope::Group(message.group_id)),
+        )
+        .expect("canonical lookup")
+        .expect("deduped canonical row");
+        assert_eq!(resolved.record.provenance, Provenance::LocalSend);
+    }
+
+    #[test]
+    fn canonical_projection_backfills_after_auxiliary_table_loss() {
+        let dir = tempfile::tempdir().expect("temporary history directory");
+        let db = dir.path().join("history.db");
+        let message = GroupPublicMessage {
+            group_id: "backfill-group".to_string(),
+            state_hash_at_send: "state".to_string(),
+            revision_at_send: 1,
+            author_agent_id: "author".to_string(),
+            author_public_key: "key".to_string(),
+            author_user_id: None,
+            kind: GroupPublicMessageKind::Chat,
+            body: "backfill body".to_string(),
+            timestamp: 1,
+            thread_root: None,
+            thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
+            rider_provenance: None,
+            signature: "signature".to_string(),
+        };
+        let artifact = serde_json::to_vec(&message).expect("serialize artifact");
+        let payload = message.body.as_bytes().to_vec();
+        let row = HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope: Scope::Group(message.group_id.clone()),
+            author_agent: Some(message.author_agent_id.clone()),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1,
+            seen_at_ms: 1,
+            direction: Direction::Outbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: Some(artifact),
+            signature: Some(vec![1]),
+            sig_context: Some("x0x.group.public-message.v2".to_string()),
+            provenance: Provenance::LocalSend,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        let canonical = message.msg_id();
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical)
+            .expect("canonical hex")
+            .try_into()
+            .expect("canonical length");
+        {
+            let store = Store::open(&db).expect("open history store");
+            store.insert(&row).expect("insert history row");
+        }
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open legacy-shaped database");
+            conn.execute_batch("DROP TABLE history_canonical_ids;")
+                .expect("drop derived table");
+        }
+        let reopened = Store::open(&db).expect("reopen and backfill history store");
+        let resolved = resolve_history_message(
+            &reopened,
+            canonical_bytes,
+            &canonical,
+            Some(Scope::Group(message.group_id)),
+        )
+        .expect("canonical lookup after backfill")
+        .expect("backfill must restore valid projection");
+        assert_eq!(resolved.record.msg_id, row.msg_id);
+        assert_eq!(resolved.record.provenance, Provenance::LocalSend);
     }
 }
