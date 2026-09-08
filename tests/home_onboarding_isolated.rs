@@ -669,15 +669,21 @@ async fn wait_for_active_home(
 }
 
 fn assert_identity_contract(agent: &Value, profile: &Value, card: &Value) -> Result<()> {
-    let agent_id = string_field(agent, "/data/agent_id")?;
-    let machine_id = string_field(agent, "/data/machine_id")?;
-    let user_id = string_field(agent, "/data/user_id")?;
+    let agent_id = string_field(agent, "/agent_id")?;
+    let machine_id = string_field(agent, "/machine_id")?;
+    let user_id = string_field(agent, "/user_id")?;
     ensure!(agent_id.len() == 64 && machine_id.len() == 64 && user_id.len() == 64);
     ensure!(card["card"]["agent_id"] == agent_id);
     ensure!(card["card"]["machine_id"] == machine_id);
     ensure!(card["card"]["user_id"] == user_id);
-    ensure!(card["card"]["display_name"] == profile["data"]["display_name"]);
-    ensure!(card["card"]["owner_name"] == profile["data"]["human_name"]);
+    ensure!(card["card"]["display_name"] == profile["display_name"]);
+    ensure!(card["card"]["owner_name"] == profile["human_name"]);
+    Ok(())
+}
+
+fn assert_enrollment_contract(body: &Value, machine_id: &str) -> Result<()> {
+    ensure!(body["ok"] == true);
+    ensure!(body["machine_id"] == machine_id);
     Ok(())
 }
 
@@ -866,13 +872,13 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
 
     let owner_agent = owner.get("/agent").await?;
     let joiner_agent = joiner.get("/agent").await?;
-    let owner_id = string_field(&owner_agent, "/data/agent_id")?.to_owned();
-    let joiner_id = string_field(&joiner_agent, "/data/agent_id")?.to_owned();
-    let owner_machine = string_field(&owner_agent, "/data/machine_id")?.to_owned();
-    let joiner_machine = string_field(&joiner_agent, "/data/machine_id")?.to_owned();
-    let owner_user = string_field(&owner_agent, "/data/user_id")?.to_owned();
+    let owner_id = string_field(&owner_agent, "/agent_id")?.to_owned();
+    let joiner_id = string_field(&joiner_agent, "/agent_id")?.to_owned();
+    let owner_machine = string_field(&owner_agent, "/machine_id")?.to_owned();
+    let joiner_machine = string_field(&joiner_agent, "/machine_id")?.to_owned();
+    let owner_user = string_field(&owner_agent, "/user_id")?.to_owned();
     ensure!(owner_id != joiner_id && owner_machine != joiner_machine);
-    ensure!(owner_user == string_field(&joiner_agent, "/data/user_id")?);
+    ensure!(owner_user == string_field(&joiner_agent, "/user_id")?);
 
     let owner_profile = owner.get("/profile").await?;
     let joiner_profile = joiner.get("/profile").await?;
@@ -965,8 +971,8 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
                     json!({"machine_id":machine_id}),
                 )
                 .await?;
-            ensure!(status == StatusCode::OK && body["ok"] == true);
-            ensure!(body["data"]["machine_id"] == machine_id.as_str());
+            ensure!(status == StatusCode::OK);
+            assert_enrollment_contract(&body, machine_id)?;
         }
     }
 
@@ -1083,10 +1089,10 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     diagnostic.phase("restart_identity")?;
     let owner_after = owner.get("/agent").await?;
     let joiner_after = joiner.get("/agent").await?;
-    ensure!(string_field(&owner_after, "/data/agent_id")? == owner_id);
-    ensure!(string_field(&owner_after, "/data/machine_id")? == owner_machine);
-    ensure!(string_field(&joiner_after, "/data/agent_id")? == joiner_id);
-    ensure!(string_field(&joiner_after, "/data/machine_id")? == joiner_machine);
+    ensure!(string_field(&owner_after, "/agent_id")? == owner_id);
+    ensure!(string_field(&owner_after, "/machine_id")? == owner_machine);
+    ensure!(string_field(&joiner_after, "/agent_id")? == joiner_id);
+    ensure!(string_field(&joiner_after, "/machine_id")? == joiner_machine);
     diagnostic.phase("restart_home")?;
     let restart_deadline = tokio::time::Instant::now() + ONBOARDING_TIMEOUT;
     let owner_home = wait_for_active_home(
@@ -1139,6 +1145,47 @@ fn partial_or_wrong_port_advertisement_never_allows_http_probe() -> Result<()> {
     assert!(!advertised_matches("127.0.0.1:", expected));
     assert!(!advertised_matches("127.0.0.1:12601", expected));
     assert!(advertised_matches("127.0.0.1:12600\n", expected));
+    Ok(())
+}
+
+#[test]
+fn flattened_api_contracts_are_required_for_identity_and_enrollment() -> Result<()> {
+    let agent_id = "a".repeat(64);
+    let machine_id = "b".repeat(64);
+    let user_id = "c".repeat(64);
+    let agent = json!({
+        "ok": true,
+        "agent_id": agent_id.clone(),
+        "machine_id": machine_id.clone(),
+        "user_id": user_id.clone(),
+    });
+    let profile = json!({
+        "ok": true,
+        "human_name": "Fixture Owner",
+        "display_name": "owner-device",
+        "machine_name": "owner-machine",
+    });
+    let card = json!({
+        "ok": true,
+        "card": {
+            "agent_id": agent_id,
+            "machine_id": machine_id.clone(),
+            "user_id": user_id,
+            "display_name": "owner-device",
+            "owner_name": "Fixture Owner",
+        },
+        "link": "x0x://agent/inert",
+    });
+    assert_identity_contract(&agent, &profile, &card)?;
+
+    let enrollment = json!({"ok": true, "machine_id": machine_id});
+    assert_enrollment_contract(&enrollment, &machine_id)?;
+
+    let nested_agent = json!({"ok": true, "data": agent});
+    let nested_profile = json!({"ok": true, "data": profile});
+    let nested_enrollment = json!({"ok": true, "data": enrollment});
+    assert!(assert_identity_contract(&nested_agent, &nested_profile, &card).is_err());
+    assert!(assert_enrollment_contract(&nested_enrollment, &machine_id).is_err());
     Ok(())
 }
 
