@@ -25,6 +25,9 @@ class Routes(unittest.TestCase):
         self.fail = None
         self.failure_code = 23
         self.interrupt = False
+        self.report_bytes = None
+        self.before_threshold = None
+        self.real_threshold = False
         self.addCleanup(patch.stopall)
         patch.object(launcher.sys, 'platform', 'linux').start()
         patch.object(launcher.os, 'getuid', return_value=self.root.stat().st_uid).start()
@@ -39,6 +42,17 @@ class Routes(unittest.TestCase):
             raise KeyboardInterrupt()
         if self.fail and self.fail(command):
             raise subprocess.CalledProcessError(self.failure_code, command)
+        if command[:2] == ['bash', '-c'] and '--output-path' in command and self.report_bytes is not None:
+            output = Path(command[command.index('--output-path') + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(self.report_bytes)
+        if command[:2] == ['python3', 'scripts/check-coverage-thresholds.py']:
+            if self.before_threshold is not None:
+                callback, self.before_threshold = self.before_threshold, None
+                callback()
+            if self.real_threshold:
+                return subprocess.run(['python3', str(REPOSITORY / command[1]), *command[2:]],
+                                      cwd=root, env=env, check=True, capture_output=True, text=True)
         return subprocess.CompletedProcess(command, 0, stdout='export CARGO_LLVM_COV=1\n')
 
     def invoke(self, *args):
@@ -215,7 +229,7 @@ class Routes(unittest.TestCase):
         self.assertNotIn('cargo nextest run', just.stderr)
 
     def test_coverage_recipes_select_workspace_only_before_report_separator(self):
-        for recipe in ('coverage', 'coverage-summary', 'coverage-lcov', 'coverage-check'):
+        for recipe in ('coverage', 'coverage-summary'):
             with self.subTest(recipe=recipe):
                 result = subprocess.run(['just', '--dry-run', recipe], cwd=REPOSITORY, capture_output=True, text=True, check=True)
                 command = next(shlex.split(line) for line in result.stderr.splitlines()
@@ -237,8 +251,8 @@ class Routes(unittest.TestCase):
             'test-voice-datagram-e2e': 'scripts/dev/test-isolated.py voice',
             'coverage': "--workspace -- --package '*' --html",
             'coverage-summary': "--workspace -- --package '*' --summary-only",
-            'coverage-lcov': "--workspace -- --package '*' --lcov --output-path lcov.info",
-            'coverage-check': '--fail-under-lines 48',
+            'coverage-lcov': 'scripts/dev/test-isolated.py coverage-lcov',
+            'coverage-check': 'scripts/dev/test-isolated.py coverage-check',
         }
         for recipe, fragment in expected.items():
             with self.subTest(recipe=recipe):
@@ -246,7 +260,139 @@ class Routes(unittest.TestCase):
                 self.assertIn(fragment, result.stderr)
                 self.assertNotIn('cargo nextest run', result.stderr)
         result = subprocess.run(['just', '--dry-run', 'coverage-check'], cwd=REPOSITORY, capture_output=True, text=True, check=True)
-        self.assertIn('scripts/check-coverage-thresholds.py', result.stderr)
+        self.assertNotIn('scripts/check-coverage-thresholds.py', result.stderr)
+        self.assertNotIn('--output-path lcov.info', result.stderr)
+
+
+    def test_private_modes_bind_report_helper_and_preserve_both_gates(self):
+        self.report_bytes = b'SF:src/example.rs\nLF:100\nLH:80\nend_of_record\n'
+        reports = []
+        for mode in ('coverage-lcov', 'coverage-check'):
+            self.calls.clear()
+            self.invoke(mode)
+            shell = next(c for c in self.calls if c[0][:2] == ['bash', '-c'])
+            command, _, env = shell
+            report = Path(command[command.index('--output-path') + 1])
+            reports.append(report)
+            self.assertEqual(report, Path(env['CARGO_TARGET_DIR']) / 'reports/lcov.info')
+            self.assertTrue(report.is_absolute())
+            expected = ['2', '--all-features', '--workspace', '--package', '*', '--lcov', '--output-path', str(report)]
+            helpers = [c for c in self.calls if c[0][:2] == ['python3', 'scripts/check-coverage-thresholds.py']]
+            if mode == 'coverage-check':
+                expected += ['--fail-under-lines', '48']
+                self.assertEqual(helpers[0][0], ['python3', 'scripts/check-coverage-thresholds.py', '--lcov', str(report), '--thresholds', 'coverage-thresholds.toml', '--enforce-global'])
+            else:
+                self.assertEqual(helpers, [])
+            self.assertEqual(command[5:], expected)
+            self.assertEqual((self.root / 'lcov.info').read_bytes(), report.read_bytes())
+            self.assertFalse(json.loads((Path(env['RUNNER_TEMP']) / 'coverage-owner.json').read_text())['active'])
+        self.assertNotEqual(*reports)
+        for mode in ('coverage-lcov', 'coverage-check'):
+            with self.assertRaises(ValueError):
+                self.invoke(mode, '--output-path', 'elsewhere')
+
+    def test_interleaving_shared_mirror_cannot_change_private_threshold_result(self):
+        # Real pure helper, tiny LCOV/TOML inputs; no Cargo or network execution.
+        (self.root / 'coverage-thresholds.toml').write_text('[global]\nline_floor = 65.7\n')
+        self.real_threshold = True
+        for a_hits, b_hits in ((50, 90), (90, 50)):
+            with self.subTest(a=a_hits, b=b_hits):
+                make = lambda hits: f'SF:src/example.rs\nLF:100\nLH:{hits}\nend_of_record\n'.encode()
+                self.report_bytes = make(a_hits)
+                legacy_results = []
+                def publish_b():
+                    self.report_bytes = make(b_hits)
+                    self.invoke('coverage-lcov')
+                    old = subprocess.run(['python3', str(REPOSITORY / 'scripts/check-coverage-thresholds.py'), '--lcov', 'lcov.info', '--thresholds', 'coverage-thresholds.toml', '--enforce-global'], cwd=self.root, capture_output=True)
+                    legacy_results.append(old.returncode)
+                self.before_threshold = publish_b
+                if a_hits < 65.7:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        self.invoke('coverage-check')
+                else:
+                    self.invoke('coverage-check')
+                self.assertEqual(legacy_results, [0 if b_hits > 65.7 else 1])
+                # The old shared-path helper gives the opposite answer to A.
+                self.assertEqual((self.root / 'lcov.info').read_bytes(), make(b_hits if a_hits < 65.7 else a_hits))
+
+    def test_private_report_failures_keep_marker_active_and_skip_later_steps(self):
+        for failure in ('missing', 'helper', 'mirror', 'shell', 'signal', 'interrupt'):
+            with self.subTest(failure=failure):
+                self.calls.clear()
+                self.report_bytes = None if failure == 'missing' else b'report'
+                self.failure_code = -15 if failure == 'signal' else 23
+                self.interrupt = failure == 'interrupt'
+                self.fail = (lambda c: c[:2] == ['python3', 'scripts/check-coverage-thresholds.py']) if failure == 'helper' else ((lambda c: c[:2] == ['bash', '-c']) if failure in ('shell', 'signal') else None)
+                with patch.object(launcher, 'mirror_report', side_effect=OSError('mirror fault') if failure == 'mirror' else launcher.mirror_report) as mirror:
+                    with self.assertRaises((OSError, subprocess.CalledProcessError, KeyboardInterrupt)):
+                        self.invoke('coverage-check')
+                    if failure in ('helper', 'shell', 'signal', 'interrupt'):
+                        mirror.assert_not_called()
+                shell = next(c for c in self.calls if c[0][:2] == ['bash', '-c'])
+                scratch = Path(shell[2]['RUNNER_TEMP'])
+                self.assertTrue(json.loads((scratch / 'coverage-owner.json').read_text())['active'])
+                if failure in ('shell', 'signal', 'interrupt'):
+                    self.assertFalse(any(c[0][:2] == ['python3', 'scripts/check-coverage-thresholds.py'] for c in self.calls))
+                with patch.object(launcher.shutil, 'rmtree') as remove:
+                    with self.assertRaises(ValueError):
+                        launcher.clean_coverage(self.root, str(scratch))
+                    remove.assert_not_called()
+
+    def test_success_cleanup_removes_private_report_preserves_mirror_and_marker(self):
+        self.report_bytes = b'complete private report'
+        self.invoke('coverage-lcov')
+        scratch = Path(self.calls[-1][2]['RUNNER_TEMP'])
+        marker = scratch / 'coverage-owner.json'
+        before = marker.read_bytes()
+        launcher.clean_coverage(self.root, str(scratch))
+        self.assertFalse((scratch / 'coverage-target').exists())
+        self.assertEqual(marker.read_bytes(), before)
+        self.assertEqual((self.root / 'lcov.info').read_bytes(), self.report_bytes)
+
+    def test_ci_selects_only_known_inert_module_after_just_install(self):
+        workflow = (REPOSITORY / '.github/workflows/ci.yml').read_text()
+        job = workflow[workflow.index('  deployment-authority:'):]
+        install = job.index('uses: taiki-e/install-action@just')
+        controls = job.index('python3 scripts/dev/test_test_isolated.py')
+        authority = job.index('run: python3 scripts/ci/isolated-runtime.py just deploy-check')
+        self.assertLess(install, controls)
+        self.assertLess(controls, authority)
+        self.assertIn('sys.version_info >= (3, 9)', job[install:controls])
+        self.assertNotIn('unittest discover', job[install:authority])
+
+
+class Mirror(unittest.TestCase):
+    def test_atomic_replacement_preserves_symlink_referent_and_other_private_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a, b, destination, outside = (root / name for name in ('a.info', 'b.info', 'lcov.info', 'outside.info'))
+            a.write_bytes(b'A' * 1000)
+            b.write_bytes(b'B' * 2000)
+            outside.write_bytes(b'untouched')
+            destination.symlink_to(outside)
+            original_replace = os.replace
+            observations = []
+            def replace(source, target):
+                self.assertEqual(source.parent, target.parent)
+                self.assertNotEqual(source, target)
+                observations.append(source.read_bytes())
+                original_replace(source, target)
+            with patch.object(launcher.os, 'replace', side_effect=replace):
+                launcher.mirror_report(a, destination)
+                launcher.mirror_report(b, destination)
+            self.assertEqual(observations, [a.read_bytes(), b.read_bytes()])
+            self.assertEqual(destination.read_bytes(), b.read_bytes())
+            self.assertEqual(outside.read_bytes(), b'untouched')
+            self.assertFalse(destination.is_symlink())
+            self.assertEqual(list(root.glob('.lcov-*.tmp')), [])
+            sentinel = root / '.lcov-foreign.tmp'
+            sentinel.write_bytes(b'foreign')
+            with patch.object(launcher.os, 'replace', side_effect=OSError('replace failed')):
+                with self.assertRaises(OSError):
+                    launcher.mirror_report(a, destination)
+            self.assertEqual(destination.read_bytes(), b.read_bytes())
+            self.assertEqual(list(root.glob('.lcov-*.tmp')), [sentinel])
+            self.assertEqual(a.read_bytes(), b'A' * 1000)
 
 
 class CoverageShell(unittest.TestCase):

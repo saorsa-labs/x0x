@@ -124,14 +124,13 @@ coverage:
 coverage-summary:
     python3 scripts/dev/test-isolated.py coverage --all-features --workspace -- --package '*' --summary-only
 
-# Emit lcov.info for editors (e.g. Coverage Gutters) and future CI uploads.
+# Retain a private LCOV report and atomically mirror lcov.info for editors.
 coverage-lcov:
-    python3 scripts/dev/test-isolated.py coverage --all-features --workspace -- --package '*' --lcov --output-path lcov.info
+    python3 scripts/dev/test-isolated.py coverage-lcov
 
 # Run the CI-style floor gate and advisory per-module threshold report.
 coverage-check:
-    python3 scripts/dev/test-isolated.py coverage --all-features --workspace -- --package '*' --lcov --output-path lcov.info --fail-under-lines 48
-    python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
+    python3 scripts/dev/test-isolated.py coverage-check
 
 # Remove only a completed developer run's coverage target; preserve custody.
 coverage-clean RUN:

@@ -110,7 +110,12 @@ admission still belongs to that wrapper. Evidence remains under the printed
 the configured Cargo target. Coverage uses a fresh owned target in each run;
 `just coverage-clean /absolute/path/to/run-*` removes only that completed run's
 coverage target (including reports inside it) after ownership checks, retaining
-custody evidence. Reports explicitly select every workspace package with
+custody evidence. The LCOV/check recipes generate a private report inside that
+owned target; the check recipe's threshold helper reads that same private file.
+After success, they atomically replace workspace `lcov.info` as a shared editor
+mirror (last writer wins). It is not evidence for an individual run, and cleanup
+leaves it alone. Use the printed run-owned report path for that run's evidence.
+Reports explicitly select every workspace package with
 `--package '*'`; build selection retains `--workspace`. Only successful completion
 unlocks cleanup; failed, active or interrupted runs are refused rather than
 guessed safe to delete. No general

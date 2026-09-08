@@ -88,26 +88,41 @@ def clean_coverage(root, argument):
     print(f'Cleaned owned coverage target: {target}')
 
 
+def mirror_report(report, destination):
+    """Replace the shared editor mirror with one complete private report."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.lcov-', suffix='.tmp',
+                                         dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            with report.open('rb') as source:
+                shutil.copyfileobj(source, output)
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main(arguments=None, root=None):
     args = list(sys.argv[1:] if arguments is None else arguments)
     root = (Path(__file__).resolve().parents[2] if root is None else root).resolve()
     if not args:
-        raise ValueError('usage: test-isolated.py nextest|voice|coverage|check|coverage-clean ...')
+        raise ValueError('usage: test-isolated.py nextest|voice|coverage|coverage-lcov|coverage-check|check|coverage-clean ...')
     mode, args = args[0], args[1:]
     if mode == 'coverage-clean':
         if len(args) != 1:
             raise ValueError('coverage-clean requires one explicitly named run directory')
         clean_coverage(root, args[0])
         return 0
-    if mode not in ('nextest', 'voice', 'coverage', 'check'):
+    if mode not in ('nextest', 'voice', 'coverage', 'coverage-lcov', 'coverage-check', 'check'):
         raise ValueError(f'unknown mode: {mode}')
     build, runtime = split_arguments(args) if mode in ('nextest', 'coverage') else ([], [])
-    if mode in ('voice', 'check') and args:
+    if mode in ('voice', 'check', 'coverage-lcov', 'coverage-check') and args:
         raise ValueError(f'{mode} does not accept extra arguments')
     env = os.environ.copy()
     env.pop('X0X_CUSTODY_SCRATCH', None)
     env.pop('X0X_ISOLATION_ROLE', None)
-    preflight(root, env, coverage=mode == 'coverage')
+    preflight(root, env, coverage=mode in ('coverage', 'coverage-lcov', 'coverage-check'))
     if mode == 'check':
         return 0
     parent = scratch_parent(root)
@@ -135,6 +150,15 @@ def main(arguments=None, root=None):
         marker = scratch / 'coverage-owner.json'
         marker.write_text(json.dumps(owner) + '\n')
         try:
+            report = None
+            if mode in ('coverage-lcov', 'coverage-check'):
+                build = ['--all-features', '--workspace']
+                report = target / 'reports' / 'lcov.info'
+                report.parent.mkdir(parents=True)
+                runtime = ['--package', '*', '--lcov', '--output-path', str(report)]
+                if mode == 'coverage-check':
+                    runtime += ['--fail-under-lines', '48']
+                print(f'Run-owned coverage report: {report}', flush=True)
             instrument = run(['cargo', 'llvm-cov', 'show-env', '--sh'], root, env, capture=True)
             exports = scratch / 'coverage-env.sh'
             exports.write_text(instrument.stdout)
@@ -142,6 +166,12 @@ def main(arguments=None, root=None):
             # instrumentation, isolated execution and reporting share one env.
             run(['bash', '-c', COVERAGE_SCRIPT, 'dev-coverage', str(exports),
                  str(len(build)), *build, *runtime], root, env)
+            if report is not None:
+                if mode == 'coverage-check':
+                    run(['python3', 'scripts/check-coverage-thresholds.py', '--lcov', str(report),
+                         '--thresholds', 'coverage-thresholds.toml', '--enforce-global'], root, env)
+                mirror_report(report, root / 'lcov.info')
+                print('Shared editor mirror: lcov.info (last writer wins; not run evidence)', flush=True)
         except BaseException:
             # A failed/killed shell may have live descendants. Only successful
             # completion unlocks cleanup; preserve active custody on failure.
