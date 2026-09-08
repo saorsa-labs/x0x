@@ -662,11 +662,9 @@ pub async fn spawn_blob_responder(
         loop {
             // Drain whichever carrier delivers first; both decode the same
             // domain-prefixed request shape.
-            let message = tokio::select! {
-                m = targeted.recv() => m,
-                m = warm.recv() => m,
+            let Some(message) = targeted.recv_from_either(&mut warm).await else {
+                break;
             };
-            let Some(message) = message else { continue };
             if !message.verified || message.sender.is_none() {
                 continue;
             }
