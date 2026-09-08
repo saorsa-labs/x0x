@@ -602,12 +602,36 @@ x0x identity revoke --agent-id <64-hex> --machine-id <64-hex> --move-epoch <N>  
 Everything this daemon sent/received lands in `<data_dir>/history.db`; queries are purely LOCAL (§5.1 — no network backfill).
 
 ```bash
+x0x history scopes                                # GET /history/scopes — which scopes hold rows
 x0x history list "group:<gid>" --limit 50         # GET /history?scope&since_ms&until_ms&limit&before_id
 x0x history message <msg_id> --scope group:<gid>  # GET /history/message/:msg_id (scope hint for group ids)
-x0x history search "group:<gid>" <terms>          # GET /history/search?scope&q=
+x0x history search "group:<gid>" <terms>          # GET /history/search?scope&q= — one scope
+x0x history search <terms>                        # GET /history/search?q=      — ALL scopes
 x0x history stats                                 # GET /history/stats
 x0x history purge "dm:<agent_hex>"                # DELETE /history?scope= — destructive LOCAL purge
 ```
+
+**Discovery (issue #275).** Start from `x0x history scopes` when you do not
+already hold a scope string. Each row is `scope` (canonical),
+`scope_kind`/`scope_id` (the stored columns), `rows`, and
+`newest_seen_at_ms`, ordered by `(scope_kind, scope_id)`. Page with
+`--after-scope <canonical>` from the previous response's
+`next_after_scope`; `--limit` defaults to 100 and clamps to 500. Only
+scopes with **retained** rows appear, and counts are of retained rows only —
+retention and `history purge` shrink them and can remove a scope entirely.
+This describes local storage, never network completeness.
+
+`history search` has two forms, told apart by argument **count**: two
+positionals keep the legacy per-scope search, one positional searches every
+retained scope. Both paginate on the same rowid keyset as `history list`
+(`--before-id` in, `next_before_id` out). A malformed `--scope`/`SCOPE`
+is still `400`, and an empty query is still `400`.
+
+**Auth:** `GET /history/search` and `GET /history/scopes` are **owner-only**.
+The ADR-0039 rider allowlist admits `GET /history` and nothing else under
+`/history`, so a rider token gets `403` on both — cross-scope results and
+per-scope counts never reach a rider. Rider `GET /history` is unchanged:
+granted `group:` scopes only, limit clamped to 100.
 
 ---
 
@@ -846,7 +870,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Relay (header v2, digest-bound) | `--relay` + `/diagnostics/relay` | — | GA |
 | Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
-| Durable history | `/history*` | `x0x history list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — §4.10, §5.1) |
+| Durable history | `/history*` | `x0x history scopes/list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — §4.10, §5.1) |
 | Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA |
 
 ---

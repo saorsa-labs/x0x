@@ -40,6 +40,70 @@ fn run_cli(args: &[&str]) -> Result<std::process::Output, String> {
         .map_err(|e| format!("failed to spawn {}: {e}", bin_path()))
 }
 
+/// Spawn the CLI with `--dump-request` and a fully scratch environment.
+///
+/// WHY: the three `exec` cases below invoke REAL verbs, not `--help`.
+/// Without `--dump-request`, `DaemonClient::ensure_running` (src/cli/mod.rs)
+/// short-circuits only in dump mode, so those verbs would perform a real
+/// loopback `GET /health` and then their own request against whatever daemon
+/// happens to be listening. With it, every verb returns `emit_dump` output
+/// and no socket is opened.
+///
+/// `--dump-request` and `--api` are `global = true` in `src/bin/x0x.rs`, but
+/// they are inserted BEFORE the subcommand deliberately: appending them after
+/// `exec <agent> -- echo hi` would place them past the `--` boundary and turn
+/// them into exec argv, silently disarming the isolation.
+///
+/// `--api` pins a dummy base URL so `discover_api` never reads a real
+/// `api.port`. `X0X_API_TOKEN` is set to a dummy NON-SECRET value rather than
+/// removed, because removing it alone still permits the token-file fallback.
+/// HOME/X0X_HOME/XDG_DATA_HOME/TMPDIR point at a caller-supplied scratch dir
+/// (each test owns one; a test may reuse it across its own invocations), and
+/// proxy vars are cleared so nothing can be redirected outward.
+fn run_cli_hermetic(scratch: &std::path::Path, tokens: &[&str]) -> std::process::Output {
+    let mut args: Vec<&str> = vec!["--dump-request", "--api", "http://127.0.0.1:1"];
+    args.extend_from_slice(tokens);
+    let scratch_str = scratch.to_string_lossy().to_string();
+    let mut cmd = Command::new(bin_path());
+    cmd.args(&args)
+        .env("HOME", &scratch_str)
+        .env("X0X_HOME", &scratch_str)
+        .env("XDG_DATA_HOME", &scratch_str)
+        .env("TMPDIR", &scratch_str)
+        .env("X0X_API_TOKEN", "dummy-not-a-secret")
+        .stdin(std::process::Stdio::null());
+    for proxy in [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ] {
+        cmd.env_remove(proxy);
+    }
+    cmd.output()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin_path()))
+}
+
+/// The single `{"method","path","body"}` line `emit_dump` prints.
+fn dumped(out: &std::process::Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with('{') && l.contains("\"method\""))
+        .unwrap_or_else(|| {
+            panic!(
+                "no request dump on stdout (status {:?})\nstderr: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+        });
+    serde_json::from_str(line).expect("dump line is JSON")
+}
+
 fn probe_help(tokens: &[&str]) -> Result<(), String> {
     let mut args: Vec<&str> = tokens.to_vec();
     args.push("--help");
@@ -157,29 +221,71 @@ fn exec_sub_actions_are_discoverable_subcommands() {
         "exec --help must list the sessions/cancel subcommands:\n{text}"
     );
 
-    // `sessions` and `cancel <id>` must parse (they fail later only because no
-    // daemon is running, never with a clap usage error).
-    for args in [vec!["exec", "sessions"], vec!["exec", "cancel", "req-1"]] {
-        let out = run_cli(&args).expect("spawn x0x exec sub-action");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !stderr.contains("Usage:") && !stderr.contains("unexpected argument"),
-            "`x0x {}` should parse as a subcommand, got clap error:\n{stderr}",
-            args.join(" ")
-        );
-    }
+    // `sessions` and `cancel <id>` must parse AS SUBCOMMANDS and build the
+    // documented request. Asserting the emitted method/path (not merely the
+    // absence of a clap usage error) is what proves they dispatched to the
+    // right verb rather than failing somewhere earlier for another reason.
+    let scratch = tempfile::tempdir().expect("scratch home");
+    let out = run_cli_hermetic(scratch.path(), &["exec", "sessions"]);
+    let dump = dumped(&out);
+    assert_eq!(dump["method"], "GET", "exec sessions: {dump}");
+    assert_eq!(dump["path"], "/exec/sessions", "exec sessions: {dump}");
+
+    let out = run_cli_hermetic(scratch.path(), &["exec", "cancel", "req-1"]);
+    let dump = dumped(&out);
+    assert_eq!(dump["method"], "POST", "exec cancel: {dump}");
+    assert_eq!(dump["path"], "/exec/cancel", "exec cancel: {dump}");
+    assert_eq!(
+        dump["body"]["request_id"], "req-1",
+        "the positional id must reach the body: {dump}"
+    );
 }
 
 #[test]
 fn exec_run_form_still_parses_with_flags() {
+    let scratch = tempfile::tempdir().expect("scratch home");
     let agent = "a".repeat(64);
-    // run form with `--` argv and a typed `--timeout` flag must parse.
-    let out = run_cli(&["exec", &agent, "--timeout", "5", "--", "echo", "hi"])
-        .expect("spawn x0x exec run form");
+    // Run form with `--` argv and a typed `--timeout` flag. The global
+    // isolation flags go BEFORE `exec`; after the `--` they would become argv.
+    let out = run_cli_hermetic(
+        scratch.path(),
+        &["exec", &agent, "--timeout", "5", "--", "echo", "hi"],
+    );
+    let dump = dumped(&out);
+    assert_eq!(dump["method"], "POST", "exec run: {dump}");
+    assert_eq!(dump["path"], "/exec/run", "exec run: {dump}");
+    assert_eq!(dump["body"]["agent_id"], agent.as_str(), "{dump}");
+    assert_eq!(
+        dump["body"]["argv"],
+        serde_json::json!(["echo", "hi"]),
+        "argv after `--` must survive verbatim: {dump}"
+    );
+    assert_eq!(
+        dump["body"]["timeout_ms"], 5000,
+        "the typed flag must reach the body as milliseconds (exec.rs converts \
+         --timeout seconds via saturating_mul(1000)), not fall into argv: {dump}"
+    );
+}
+
+/// WHY: the isolation must not hide a real validation. `exec` with no argv
+/// bails in the CLI (src/cli/commands/exec.rs `argv.is_empty()`) before any
+/// request is built, so no dump is emitted even in dump mode — the control
+/// that proves the dump above came from dispatch, not from a stub.
+#[test]
+fn exec_run_without_argv_bails_before_building_a_request() {
+    let scratch = tempfile::tempdir().expect("scratch home");
+    let agent = "a".repeat(64);
+    let out = run_cli_hermetic(scratch.path(), &["exec", &agent]);
+    assert!(!out.status.success(), "empty argv must fail");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("\"path\""),
+        "no request may be built when argv is empty: {stdout}"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("Usage:") && !stderr.contains("unexpected argument"),
-        "exec run form with --timeout should parse, got clap error:\n{stderr}"
+        stderr.contains("usage: x0x exec <agent_id>"),
+        "expected the CLI's own usage bail, got: {stderr}"
     );
 }
 

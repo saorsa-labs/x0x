@@ -27,8 +27,8 @@ use crate::error::HistoryResult;
 
 pub use record::{Direction, HistoryRecord, MessageClass, Provenance, Scope};
 pub use store::{
-    HistoryQuery, HistoryStats, InsertOutcome, RetentionPolicy, ScopeLimit, Store, StoredRecord,
-    MAX_QUERY_LIMIT,
+    HistoryQuery, HistoryStats, InsertOutcome, RetentionPolicy, ScopeLimit, ScopeSummary, Store,
+    StoredRecord, MAX_QUERY_LIMIT,
 };
 pub use writer::{HistoryCounters, WriterHandle, WRITER_QUEUE_CAPACITY};
 
