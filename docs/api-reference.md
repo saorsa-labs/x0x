@@ -896,6 +896,17 @@ Reusing a `logical_id` for *different* payload bytes is a **409
 > reinterpreted. Choose receipt semantics with `require_durable_app_ack`
 > instead.
 
+### Direct send ACK transport diagnostics
+
+On a successful `POST /direct/send`, `path` names the payload send strategy.
+It does not identify the transport that carried the winning application ACK.
+When a verified durable (v2) ACK has a known ingress, the response also includes
+`observed_ack_ingress`: `direct_typed` for the direct typed/raw-QUIC ACK path,
+or `subscription` for the gossip inbox subscription. This field describes the
+ACK's return transport, not the payload's route or whether a human read it.
+It is omitted for v1/non-durable ACKs, publish-only responses, and unknown
+ingress; absence is not evidence that a particular transport was used.
+
 ### Direct send error codes
 
 `/direct/send` failures answer with

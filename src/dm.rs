@@ -885,8 +885,11 @@ impl DmLogicalId {
 
 // ─── Receipt and caller-configurable send behaviour ────────────────────────
 
-/// Result of a successful `send_direct`. `path` lets callers observe which
-/// transport actually delivered.
+/// Result of a successful `send_direct`. `path` is the SEND STRATEGY the
+/// sender chose (loopback / gossip inbox / raw-QUIC lane), NOT proof of the
+/// transport that actually delivered a durable ACK — for the observed ACK
+/// ingress of durable sends, see the #461 provenance exposed by the
+/// direct-send route (absent when unknown).
 #[derive(Debug, Clone)]
 pub struct DmReceipt {
     pub request_id: [u8; 16],
@@ -895,7 +898,7 @@ pub struct DmReceipt {
     pub path: DmPath,
 }
 
-/// Which transport delivered the DM.
+/// The send strategy the sender chose for the DM (not delivery proof).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmPath {
     /// Local loopback path for messages addressed to this same agent.
@@ -1832,6 +1835,28 @@ struct InFlightAck {
     expected_machine: Option<MachineId>,
     protocol_version: u16,
     reply: tokio::sync::oneshot::Sender<DmAckOutcome>,
+    /// #461: locally stamped ingress of the transport that actually carried
+    /// the winning ACK. Written immediately before `reply.send`, read after
+    /// `recv` (send/recv happens-before makes the plain Mutex safe). `None`
+    /// until a winning authenticated ACK completes — unknown stays `None`,
+    /// never fabricated.
+    ingress_cell: ProvenanceCell,
+}
+
+/// Shared ingress-stamp cell handed back alongside the waiter receiver
+/// (`register_for_protocol_with_provenance`).
+pub type ProvenanceCell = std::sync::Arc<std::sync::Mutex<Option<DmAckIngress>>>;
+
+/// #461: the ingress class of the transport that actually delivered an
+/// authenticated durable ACK to this daemon — distinct from the send
+/// *strategy* (`DmReceipt::path`), which names how the payload was published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmAckIngress {
+    /// Arrived over the direct typed/raw-QUIC hedge path
+    /// (`try_ingest_direct_ack` -> synthetic message -> shared handler).
+    DirectTyped,
+    /// Arrived over the gossip subscription the inbox maintains.
+    Subscription,
 }
 
 impl Clone for InFlightAcks {
@@ -1887,9 +1912,36 @@ impl InFlightAcks {
                 expected_machine,
                 protocol_version,
                 reply: tx,
+                ingress_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             },
         );
         rx
+    }
+
+    /// #461: register a waiter and also return its ingress-provenance cell.
+    /// Additive internal API; the public `register_for_protocol` signature is
+    /// unchanged. After the receiver completes, the cell holds the ingress of
+    /// the winning authenticated ACK, or `None` if none was stamped (unknown).
+    pub fn register_for_protocol_with_provenance(
+        &self,
+        request_id: [u8; 16],
+        protocol_version: u16,
+        expected_recipient: AgentId,
+        expected_machine: Option<MachineId>,
+    ) -> (tokio::sync::oneshot::Receiver<DmAckOutcome>, ProvenanceCell) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ingress_cell: ProvenanceCell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.inner.insert(
+            request_id,
+            InFlightAck {
+                expected_recipient,
+                expected_machine,
+                protocol_version,
+                reply: tx,
+                ingress_cell: std::sync::Arc::clone(&ingress_cell),
+            },
+        );
+        (rx, ingress_cell)
     }
 
     /// Resolve a v1-semantics waiter for `request_id`.
@@ -1920,6 +1972,50 @@ impl InFlightAcks {
         ack_machine: MachineId,
         outcome: DmAckOutcome,
     ) -> bool {
+        self.resolve_inner(
+            request_id,
+            protocol_version,
+            ack_sender,
+            ack_machine,
+            outcome,
+            None,
+        )
+    }
+
+    /// #461: like [`Self::resolve_for_protocol`], stamping the ingress of the
+    /// transport that carried this authenticated ACK so the receipt layer can
+    /// report observed provenance separately from the send strategy. The
+    /// stamp is written only when the binding matches AND the waiter is
+    /// resolved (first-valid-matching-ACK wins); failed attempts stamp
+    /// nothing.
+    pub fn resolve_for_ingress(
+        &self,
+        request_id: &[u8; 16],
+        protocol_version: u16,
+        ack_sender: AgentId,
+        ack_machine: MachineId,
+        outcome: DmAckOutcome,
+        ingress: DmAckIngress,
+    ) -> bool {
+        self.resolve_inner(
+            request_id,
+            protocol_version,
+            ack_sender,
+            ack_machine,
+            outcome,
+            Some(ingress),
+        )
+    }
+
+    fn resolve_inner(
+        &self,
+        request_id: &[u8; 16],
+        protocol_version: u16,
+        ack_sender: AgentId,
+        ack_machine: MachineId,
+        outcome: DmAckOutcome,
+        ingress: Option<DmAckIngress>,
+    ) -> bool {
         use dashmap::mapref::entry::Entry;
 
         match self.inner.entry(*request_id) {
@@ -1931,9 +2027,21 @@ impl InFlightAcks {
                     ack_machine,
                 ) =>
             {
-                // If the receiver was dropped we silently swallow the send
-                // error — caller already moved on.
-                let _ = entry.remove().reply.send(outcome);
+                let waiter = entry.remove();
+                // #563 P2: provenance describes the transport that carried the
+                // DURABLE ACK. A v1 waiter resolves normally (no v1 failure,
+                // no negotiation change) but its receipt must not claim
+                // durable-ACK ingress — stamp only when the resolved
+                // waiter negotiated at least DM_PROTOCOL_DURABLE_ACK.
+                if let Some(ingress) =
+                    ingress.filter(|_| waiter.protocol_version >= DM_PROTOCOL_DURABLE_ACK)
+                {
+                    if let Ok(mut cell) = waiter.ingress_cell.lock() {
+                        *cell = Some(ingress);
+                    }
+                }
+                // Stamp BEFORE send so the receiver observes it after recv.
+                let _ = waiter.reply.send(outcome);
                 true
             }
             Entry::Occupied(_) | Entry::Vacant(_) => false,
@@ -2324,6 +2432,115 @@ mod tests {
         ));
         assert_eq!(cfg.raw_quic_receive_ack_timeout, None);
         assert!(!cfg.stop_fallback_on_raw_error);
+    }
+
+    /// #461 phase 1: the winning authenticated ACK's ingress is stamped;
+    /// first-valid-matching-ACK wins in BOTH arrival orders, and a losing
+    /// second attempt stamps nothing.
+    #[test]
+    fn in_flight_acks_stamp_winning_ingress_both_orders() {
+        let acks = InFlightAcks::new();
+        let recipient = AgentId([9u8; 32]);
+        let machine = MachineId([8u8; 32]);
+        let rid = [3u8; 16];
+
+        // Direct first, subscription second.
+        let (rx, cell) =
+            acks.register_for_protocol_with_provenance(rid, 2, recipient, Some(machine));
+        assert!(acks.resolve_for_ingress(
+            &rid,
+            2,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+            DmAckIngress::DirectTyped
+        ));
+        assert!(!acks.resolve_for_ingress(
+            &rid,
+            2,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+            DmAckIngress::Subscription
+        ));
+        let outcome = tokio::runtime::Runtime::new().expect("rt").block_on(rx);
+        assert_eq!(outcome.expect("ok"), DmAckOutcome::Accepted);
+        assert_eq!(*cell.lock().expect("cell"), Some(DmAckIngress::DirectTyped));
+
+        // Subscription first, direct second.
+        let (rx, cell) =
+            acks.register_for_protocol_with_provenance(rid, 2, recipient, Some(machine));
+        assert!(acks.resolve_for_ingress(
+            &rid,
+            2,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+            DmAckIngress::Subscription
+        ));
+        assert!(!acks.resolve_for_ingress(
+            &rid,
+            2,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+            DmAckIngress::DirectTyped
+        ));
+        let outcome = tokio::runtime::Runtime::new().expect("rt").block_on(rx);
+        assert_eq!(outcome.expect("ok"), DmAckOutcome::Accepted);
+        assert_eq!(
+            *cell.lock().expect("cell"),
+            Some(DmAckIngress::Subscription)
+        );
+    }
+
+    /// #461 phase 1: an invalid (wrong-binding) ACK attempt resolves nothing
+    /// and stamps nothing; the subsequent VALID ACK wins and its ingress is
+    /// reported. A resolution without an ingress stamp leaves unknown as
+    /// `None` — never fabricated.
+    #[test]
+    fn in_flight_acks_invalid_first_then_valid_and_unknown_stays_none() {
+        let acks = InFlightAcks::new();
+        let recipient = AgentId([9u8; 32]);
+        let machine = MachineId([8u8; 32]);
+        let wrong_machine = MachineId([7u8; 32]);
+        let rid = [4u8; 16];
+
+        let (rx, cell) =
+            acks.register_for_protocol_with_provenance(rid, 2, recipient, Some(machine));
+        // Wrong machine: binding fails, no stamp, waiter still pending.
+        assert!(!acks.resolve_for_ingress(
+            &rid,
+            2,
+            recipient,
+            wrong_machine,
+            DmAckOutcome::Accepted,
+            DmAckIngress::DirectTyped
+        ));
+        assert_eq!(*cell.lock().expect("cell"), None);
+        // Valid ACK over the subscription transport wins.
+        assert!(acks.resolve_for_ingress(
+            &rid,
+            2,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+            DmAckIngress::Subscription
+        ));
+        let outcome = tokio::runtime::Runtime::new().expect("rt").block_on(rx);
+        assert_eq!(outcome.expect("ok"), DmAckOutcome::Accepted);
+        assert_eq!(
+            *cell.lock().expect("cell"),
+            Some(DmAckIngress::Subscription)
+        );
+
+        // Unstamped resolution (legacy/public API path): unknown stays None.
+        let (rx, cell) =
+            acks.register_for_protocol_with_provenance(rid, 2, recipient, Some(machine));
+        assert!(acks.resolve_for_protocol(&rid, 2, recipient, machine, DmAckOutcome::Accepted));
+        let outcome = tokio::runtime::Runtime::new().expect("rt").block_on(rx);
+        assert_eq!(outcome.expect("ok"), DmAckOutcome::Accepted);
+        assert_eq!(*cell.lock().expect("cell"), None);
     }
 
     #[test]

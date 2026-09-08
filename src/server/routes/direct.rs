@@ -379,10 +379,10 @@ pub(in crate::server) async fn direct_send(
 
     match state
         .agent
-        .send_direct_with_config(&agent_id, payload, send_config)
+        .send_direct_with_config_with_provenance(&agent_id, payload, send_config)
         .await
     {
-        Ok(receipt) => {
+        Ok((receipt, observed_ack_ingress)) => {
             let path_str = match receipt.path {
                 x0x::dm::DmPath::Loopback => "loopback",
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",
@@ -449,6 +449,16 @@ pub(in crate::server) async fn direct_send(
                 "request_id": hex::encode(receipt.request_id),
                 "require_ack": ack_result,
             });
+            // #461: observed ingress of the transport that actually carried
+            // the winning durable ACK, when known. Optional: absent for
+            // publish-only/unknown outcomes; `path` above remains the send
+            // strategy.
+            if let Some(ingress) = observed_ack_ingress {
+                body["observed_ack_ingress"] = serde_json::json!(match ingress {
+                    x0x::dm::DmAckIngress::DirectTyped => "direct_typed",
+                    x0x::dm::DmAckIngress::Subscription => "subscription",
+                });
+            }
             attach_recipient_ack_diagnostics(
                 &mut body,
                 snap.last_ack_publish_ms,
