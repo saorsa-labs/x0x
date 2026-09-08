@@ -3,9 +3,11 @@
 import importlib.util
 import json
 import os
+import shutil
 import shlex
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -123,6 +125,52 @@ class Routes(unittest.TestCase):
             self.invoke('nextest', '--')
         self.assertEqual(self.calls, [])
         self.assertEqual(list(external.iterdir()), [])
+
+    def test_doctest_wraps_whole_cargo_invocation_and_sanitizes_custody(self):
+        with patch.dict(os.environ, {'X0X_CUSTODY_SCRATCH': '/foreign',
+                                     'X0X_ISOLATION_ROLE': 'acceptance',
+                                     'CARGO_TARGET_DIR': '/unchanged-target'}):
+            self.invoke('doctest')
+        command, root, env = self.calls[-1]
+        self.assertEqual(command, ['python3', 'scripts/ci/isolated-runtime.py',
+                                  'cargo', 'test', '--offline', '--locked',
+                                  '--doc', '--all-features'])
+        self.assertEqual(root, self.root)
+        self.assertNotIn('X0X_CUSTODY_SCRATCH', env)
+        self.assertNotIn('X0X_ISOLATION_ROLE', env)
+        self.assertEqual(env['CARGO_TARGET_DIR'], '/unchanged-target')
+        scratch = Path(env['RUNNER_TEMP'])
+        self.assertEqual(scratch.parent, self.root / 'target/dev-isolation')
+        self.assertFalse((scratch / 'coverage-owner.json').exists())
+        self.assertFalse(any(c[0][:2] == ['cargo', 'test'] for c in self.calls))
+        self.invoke('doctest')
+        self.assertNotEqual(self.calls[-1][2]['RUNNER_TEMP'], str(scratch))
+
+    def test_doctest_rejects_arguments_before_commands(self):
+        for arguments in (['--'], ['--all-features'], ['--', '--ignored']):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                self.invoke('doctest', *arguments)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.root / 'target').exists())
+
+    def test_doctest_refuses_unsupported_host_without_fallback(self):
+        with patch.object(launcher.sys, 'platform', 'darwin'):
+            with self.assertRaises(ValueError):
+                self.invoke('doctest')
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.root / 'target').exists())
+
+    def test_doctest_supervisor_failure_or_signal_propagates(self):
+        self.fail = lambda c: c[:2] == ['python3', 'scripts/ci/isolated-runtime.py']
+        for code in (23, -15):
+            with self.subTest(code=code):
+                self.calls.clear()
+                self.failure_code = code
+                with self.assertRaises(subprocess.CalledProcessError) as error:
+                    self.invoke('doctest')
+                self.assertEqual(error.exception.returncode, code)
+                self.assertEqual(len(self.calls), 3)  # sudo probe, version, supervisor
+                self.assertTrue(self.fail(self.calls[-1][0]))
 
     def test_voice_prepares_then_wraps_selection_and_execution(self):
         self.invoke('voice')
@@ -421,6 +469,164 @@ class CoverageShell(unittest.TestCase):
                     self.assertEqual(rows[1], ['cargo', 'llvm-cov', 'report', '--package', '*', '--lcov', '--output-path', 'space name.info', '--fail-under-lines', '48'])
                 else:
                     self.assertEqual(len(rows), 1)
+
+
+
+class SequentialRunner(unittest.TestCase):
+    """Run only a copied shell script, with a closed PATH of inert stubs."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='x0x-sequential-stub-', dir='/var/tmp')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        (self.root / 'tests').mkdir()
+        for name in ('beta.rs', 'alpha.rs'):
+            (self.root / 'tests' / name).write_text('// inert filename; never compiled\n')
+        self.script = self.root / 'tests/run_full_suite.sh'
+        self.script.write_bytes((REPOSITORY / 'tests/run_full_suite.sh').read_bytes())
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.record = self.root / 'commands.jsonl'
+        # No ambient PATH: only named file/text utilities are executable.
+        for name in ('dirname', 'date', 'basename', 'mkdir', 'mktemp', 'tee', 'tail'):
+            tool = shutil.which(name)
+            self.assertIsNotNone(tool, name)
+            (self.bin / name).symlink_to(tool)
+        self.real_tee = str((self.bin / 'tee').resolve())
+        self.real_mktemp = str((self.bin / 'mktemp').resolve())
+        stub = '#!' + sys.executable + '\n' + r"""
+import json, os, sys
+from pathlib import Path
+name = Path(sys.argv[0]).name
+row = [name, *sys.argv[1:]]
+with open(os.environ['RECORD'], 'a') as record:
+    record.write(json.dumps(row) + '\n')
+print('Developer isolation evidence (stub only): /inert/evidence')
+print('stub output before final tail')
+print('stub output 3')
+print('stub output 4')
+print('stub output 5')
+fail = json.loads(os.environ.get('FAIL_COMMAND', 'null'))
+raise SystemExit(23 if row == fail else 0)
+"""
+        for name in ('python3', 'cargo'):
+            path = self.bin / name
+            path.write_text(stub)
+            path.chmod(0o755)
+        # Forbidden executables have no PATH entry: sudo/unshare/rustdoc and
+        # repository binaries cannot be reached by this fixture.
+        self.env = dict(PATH=str(self.bin), RECORD=str(self.record),
+                        HOME=str(self.root), TMPDIR=str(self.root))
+
+    def execute(self, arguments=(), fail=None):
+        self.record.unlink(missing_ok=True)
+        self.env['FAIL_COMMAND'] = json.dumps(fail)
+        result = subprocess.run(['/bin/bash', str(self.script), *arguments],
+                                cwd=self.root, env=self.env, capture_output=True,
+                                text=True, timeout=15)
+        rows = ([json.loads(line) for line in self.record.read_text().splitlines()]
+                if self.record.exists() else [])
+        return result, rows
+
+    @staticmethod
+    def expected_commands():
+        launcher_path = 'scripts/dev/test-isolated.py'
+        return [
+            ['python3', launcher_path, 'check'],
+            ['cargo', 'build', '--tests', '--all-features'],
+            ['python3', launcher_path, 'nextest', '--lib', '--bins', '--all-features', '--', '--no-fail-fast'],
+            ['python3', launcher_path, 'doctest'],
+            ['python3', launcher_path, 'nextest', '--test', 'alpha', '--all-features', '--', '--no-fail-fast'],
+            ['python3', launcher_path, 'nextest', '--test', 'beta', '--all-features', '--', '--no-fail-fast'],
+        ]
+
+    def assert_isolated_sequence(self, rows):
+        self.assertEqual(rows, self.expected_commands())
+        self.assertFalse(any(row[:3] == ['cargo', 'nextest', 'run'] for row in rows))
+        self.assertFalse(any(row[:2] == ['cargo', 'test'] for row in rows))
+
+    def test_exact_order_selection_and_retained_full_logs(self):
+        result, rows = self.execute()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_isolated_sequence(rows)
+        self.assertIn('Summary: pass=4 fail=0 skipped=0', result.stdout)
+        runs = list((self.root / 'target/dev-isolation').glob('full-suite-*'))
+        self.assertEqual(len(runs), 1)
+        logs = sorted(runs[0].glob('*.log'))
+        self.assertEqual([p.name for p in logs], ['001.log', '002.log', '003.log', '004.log', '005.log'])
+        for log in logs:
+            self.assertIn('Developer isolation evidence (stub only): /inert/evidence', log.read_text())
+            self.assertIn(str(log), result.stdout)
+        self.assertIn(str(runs[0]), result.stdout)
+
+    def test_no_ignored_option_does_not_change_actual_selection(self):
+        first, rows = self.execute()
+        second, other_rows = self.execute(['--no-ignored'])
+        self.assertEqual((first.returncode, second.returncode), (0, 0))
+        self.assert_isolated_sequence(rows)
+        self.assertEqual(rows, other_rows)
+        self.assertFalse(any('--run-ignored' in row for row in rows))
+        self.assertEqual(len(list((self.root / 'target/dev-isolation').glob('full-suite-*'))), 2)
+
+    def test_preflight_failure_stops_before_build(self):
+        result, rows = self.execute(fail=self.expected_commands()[0])
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(rows, self.expected_commands()[:1])
+        self.assertFalse((self.root / 'target').exists())
+
+    def test_build_failure_stops_before_runtime(self):
+        result, rows = self.execute(fail=self.expected_commands()[1])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(rows, self.expected_commands()[:2])
+        self.assertIn('build failed', result.stdout)
+
+    def test_each_runtime_failure_is_reported_and_later_stages_continue(self):
+        for index, name in ((2, 'lib+bins'), (3, 'doc'), (4, 'alpha'), (5, 'beta')):
+            with self.subTest(name=name):
+                result, rows = self.execute(fail=self.expected_commands()[index])
+                self.assertEqual(result.returncode, 1)
+                self.assert_isolated_sequence(rows)
+                self.assertIn('Summary: pass=3 fail=1 skipped=0', result.stdout)
+                self.assertIn(f'  - {name}', result.stdout)
+
+    def test_log_open_failure_prevents_command_execution(self):
+        path = self.bin / 'mktemp'
+        path.unlink()
+        path.write_text('#!' + sys.executable + '\n' +
+                        'import os,subprocess,sys\nfrom pathlib import Path\n' +
+                        f'p=subprocess.check_output([{self.real_mktemp!r},*sys.argv[1:]],text=True).strip()\n' +
+                        'Path(p,"001.log").mkdir()\nprint(p)\n')
+        path.chmod(0o755)
+        result, rows = self.execute()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(rows, self.expected_commands()[:1])
+        self.assertIn('cannot create stage log', result.stdout)
+
+    def test_failed_log_writer_cannot_turn_successful_stage_green(self):
+        path = self.bin / 'tee'
+        path.unlink()
+        # A controlled late writer failure: real tee writes the full stream,
+        # then the injected writer reports failure. The producer succeeds.
+        path.write_text('#!' + sys.executable + '\n' +
+                        'import subprocess,sys\n' +
+                        f'subprocess.run([{self.real_tee!r},*sys.argv[1:]],check=True)\n' +
+                        'raise SystemExit(74 if sys.argv[1].endswith("002.log") else 0)\n')
+        path.chmod(0o755)
+        result, rows = self.execute()
+        self.assertEqual(result.returncode, 1)
+        self.assert_isolated_sequence(rows)
+        self.assertIn('stage log write failed', result.stdout)
+        self.assertIn('Summary: pass=3 fail=1 skipped=0', result.stdout)
+        self.assertIn('  - lib+bins', result.stdout)
+
+    def test_failed_log_display_cannot_turn_successful_stage_green(self):
+        path = self.bin / 'tail'
+        path.unlink()
+        path.write_text('#!' + sys.executable + '\nraise SystemExit(74)\n')
+        path.chmod(0o755)
+        result, rows = self.execute()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(rows, self.expected_commands()[:2])
+        self.assertIn('cannot display stage log', result.stdout)
 
 
 if __name__ == '__main__':
