@@ -65,7 +65,17 @@ async function mountGui(page, routes, opts) {
     }
     // A route may be held open so a slow response can be released after a
     // later, faster one has already completed.
-    if (gate && gate.holds[key]) await gate.holds[key].promise;
+    // Per-REQUEST holds: `KEY#N` holds the Nth occurrence of KEY only, so a
+    // test can complete a NEWER request while an OLDER one of the same key is
+    // still held. A bare KEY holds every occurrence.
+    if (gate) {
+      gate.counts[key] = (gate.counts[key] || 0) + 1;
+      const hold = gate.holds[`${key}#${gate.counts[key]}`] || gate.holds[key];
+      if (hold) {
+        hold.markEntered();
+        await hold.promise;
+      }
+    }
     return route.fulfill({
       status: hit.status,
       contentType: 'application/json',
@@ -89,11 +99,18 @@ async function mountGui(page, routes, opts) {
 function makeGate(keys) {
   const holds = {};
   for (const k of keys) {
-    let release;
-    holds[k] = { promise: new Promise((r) => { release = r; }) };
+    let release, entered;
+    holds[k] = {
+      promise: new Promise((r) => { release = r; }),
+      // Resolved when the route handler actually REACHES this hold, so a
+      // test can wait on the real request boundary instead of guessing.
+      // `waitForFunction(() => true)` is not a barrier. (Root P2.)
+      enteredPromise: new Promise((r) => { entered = r; }),
+    };
     holds[k].release = release;
+    holds[k].markEntered = entered;
   }
-  return { holds };
+  return { holds, counts: {} };
 }
 
 const SID = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -381,4 +398,705 @@ test('an unrecognised confidentiality is treated as private (fails closed)', asy
   }, SID);
   expect(await page.innerHTML('#web-pages')).toContain('not available in this space yet');
   expect(seen.filter((k) => /\s\/stores(\/|$)/.test(k))).toEqual([]);
+});
+
+// ── #565 / Greptile P1: the warm cache must not outlive the policy ────────
+//
+// `PATCH /groups/:id/policy` lets any admin set `confidentiality` on a LIVE
+// group (`named_groups.rs` update_group_policy — only the owner axis of
+// `admission` is immutable). A Space warm-cached while `signed_public` can
+// therefore become `mls_encrypted` under an open tab. WHY these controls
+// matter: if the resolver answers from cache before re-reading the policy,
+// list/read/WRITE stay pointed at the generic unbound Signed store, so pages
+// written AFTER the space went private land outside the group-bound store.
+
+/// Warm the resolver as a public space, then flip the fixture to private.
+async function warmPublicThenGoPrivate(page, app, extra) {
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    ...(extra || {}),
+  };
+  const seen = await mountGui(page, routes);
+  const loader = app === 'wiki' ? 'loadWikiPages' : 'loadWebPages';
+  await page.evaluate(([sid, fn]) => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div><div id="web-pages"></div>');
+    return window[fn](sid);
+  }, [SID, loader]);
+  expect(seen).toContain('GET /stores');       // warmed on the public lane
+  routes[`GET /groups/${SID}`] = privateGroup();
+  seen.length = 0;
+  return { seen, routes };
+}
+
+for (const app of ['wiki', 'web']) {
+  const RETURNED = `grp-store-${app}-transition`;
+  const loader = app === 'wiki' ? 'loadWikiPages' : 'loadWebPages';
+
+  test(`${app}: a live public -> private transition re-resolves the listing onto the group store`, async ({ page }) => {
+    const { seen } = await warmPublicThenGoPrivate(page, app, {
+      [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+      [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
+    });
+
+    await page.evaluate(([sid, fn]) => window[fn](sid), [SID, loader]);
+
+    // The policy MUST be re-read, and the listing MUST move to the
+    // group-bound opener. A stale warm cache shows up as a second
+    // `GET /stores` (the generic lane) and no group-store open.
+    expect(seen).toContain(`GET /groups/${SID}`);
+    expect(seen).toContain(`POST /groups/${SID}/stores`);
+    expect(seen).not.toContain('GET /stores');
+  });
+
+  test(`${app}: a save after the space goes private never writes to the generic store`, async ({ page }) => {
+    const { seen } = await warmPublicThenGoPrivate(page, app, {
+      [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+      [`PUT /stores/${RETURNED}/`]: { status: 200, body: { ok: true } },
+    });
+
+    // Real editor DOM: the save handlers read `<app>-content` and hide
+    // `<app>-editor` (x0x-gui.html saveWikiPage/saveWebPage).
+    await page.evaluate(([a, slug]) => {
+      document.body.insertAdjacentHTML('beforeend',
+        `<textarea id="${a}-content">after going private</textarea>` +
+        `<div id="${a}-editor"></div><div id="${a}-error"></div>`);
+      // The slug is module-scoped and irrelevant here: the assertion is on
+      // WHICH STORE the PUT addresses, not which page.
+      void slug;
+    }, [app, 'secret']);
+    const saver = app === 'wiki' ? 'saveWikiPage' : 'saveWebPage';
+    await page.evaluate(([sid, fn]) => window[fn](sid), [SID, saver]);
+
+    // The write must land on the EXACT intended group-bound store, not merely
+    // avoid the generic alias — "no PUT at all" would otherwise pass.
+    const generic = `x0x-${app}-${SID.slice(0, 16)}`;
+    expect(seen.some((k) => k.startsWith('PUT ') && k.includes(`/stores/${RETURNED}/`))).toBe(true);
+    expect(seen.some((k) => k.includes(generic))).toBe(false);
+  });
+
+  test(`${app}: an unreadable policy fails closed instead of reusing the warm public store`, async ({ page }) => {
+    const { seen, routes } = await warmPublicThenGoPrivate(page, app, {});
+    routes[`GET /groups/${SID}`] = { status: 500, body: { ok: false, error: 'policy unavailable' } };
+
+    await page.evaluate(([sid, fn]) => window[fn](sid), [SID, loader]);
+
+    // Fail closed: NO store traffic of any kind on an unreadable policy —
+    // including sub-paths such as `/stores/<id>/keys`. The previously cached
+    // public resolution must NOT be used as a fallback. (Root: the earlier
+    // assertion only forbade the exact `GET /stores` key.)
+    expect(seen).toContain(`GET /groups/${SID}`);
+    expect(seen.filter((k) => / \/stores(\/|$)/.test(k))).toEqual([]);
+    expect(seen).not.toContain(`POST /groups/${SID}/stores`);
+  });
+}
+
+test('an old-policy resolution released after private is observed cannot save to the generic store', async ({ page }) => {
+  // Root's negative, as a browser control: hold the OLD public `GET /stores`
+  // at its real entry barrier, let another operation observe `private` and
+  // open the group store, then release the old one. The released resolver
+  // must not issue a generic POST/PUT, must not publish a public cache entry,
+  // and must not report a false save success to its own caller.
+  const RETURNED = 'grp-store-stale-inflight';
+  const gate = makeGate(['GET /stores']);
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+    [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
+    [`PUT /stores/${RETURNED}/`]: { status: 200, body: { ok: true } },
+  };
+  const seen = await mountGui(page, routes, { gate });
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend',
+      '<textarea id="wiki-content">secret after transition</textarea>' +
+      '<div id="wiki-editor"></div><div id="wiki-error"></div><div id="wiki-pages"></div>');
+  });
+
+  // Start a real SAVE under the public policy; it blocks inside its resolver.
+  const save = page.evaluate((sid) => window.saveWikiPage(sid), SID);
+  await gate.holds['GET /stores'].enteredPromise;   // REAL request boundary
+
+  // The space goes private and another operation observes it.
+  routes[`GET /groups/${SID}`] = privateGroup();
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  expect(seen).toContain(`POST /groups/${SID}/stores`);
+
+  // Everything recorded from here on is strictly AFTER private was observed.
+  const boundary = seen.length;
+  gate.holds['GET /stores'].release();
+  await save;
+  const after = seen.slice(boundary);
+
+  const generic = `x0x-wiki-${SID.slice(0, 16)}`;
+  // The generic creation POSTs to EXACTLY `/stores` (the alias is in the
+  // BODY, not the path), so matching the alias in the path can never fire.
+  // (Root P2.) Assert the real method+path, and the generic write by path.
+  expect(after).not.toContain('POST /stores');
+  expect(after.some((k) => k.startsWith('PUT ') && k.includes(`/stores/${generic}/`))).toBe(false);
+
+  // Real publication behaviour: the shared cache must not have been
+  // downgraded back to the public store by the released resolver. A fresh
+  // render must still resolve PRIVATELY — if the stale entry had been
+  // published, this would take the generic lane instead.
+  seen.length = 0;
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  // It legitimately REUSES the valid private entry (same generation), so it
+  // addresses the private store directly rather than re-opening it. What must
+  // never appear is the generic lane — that is what a downgraded cache from
+  // the released stale resolver would produce.
+  expect(seen.some((k) => k.includes(`/stores/${RETURNED}/`))).toBe(true);
+  expect(seen).not.toContain('POST /stores');
+  expect(seen).not.toContain('GET /stores');
+  expect(seen.some((k) => k.includes(generic))).toBe(false);
+  // The stale resolver must not claim success: either it rerouted to the
+  // group store, or it failed closed with the draft preserved.
+  const state = await page.evaluate(() => ({
+    editorHidden: document.getElementById('wiki-editor').style.display === 'none',
+    draft: document.getElementById('wiki-content').value,
+    err: document.getElementById('wiki-error').textContent || '',
+  }));
+  expect(state.draft).toBe('secret after transition');   // draft preserved
+  if (!state.editorHidden) {
+    expect(state.err).not.toBe('');                      // failed closed, told the user
+  } else {
+    // If it did report success, the write must have gone to the GROUP store.
+    expect(seen.some((k) => k.startsWith('PUT ') && k.includes(`/stores/${RETURNED}/`))).toBe(true);
+  }
+});
+
+test('a policy change observed in the Wiki also invalidates a warm Web resolution', async ({ page }) => {
+  const RETURNED = 'grp-store-crossapp';
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+    [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
+  };
+  const seen = await mountGui(page, routes);
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div><div id="web-pages"></div>');
+  });
+  // Warm BOTH apps on the public lane.
+  await page.evaluate((sid) => window.loadWebPages(sid), SID);
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+
+  // The space goes private; only the WIKI observes it.
+  routes[`GET /groups/${SID}`] = privateGroup();
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  seen.length = 0;
+
+  // The Web tab must now resolve privately too — its warm public entry was
+  // invalidated by the Wiki's observation, not left for it to reuse.
+  await page.evaluate((sid) => window.loadWebPages(sid), SID);
+  expect(seen).toContain(`POST /groups/${SID}/stores`);
+  expect(seen.some((k) => k.includes(`x0x-web-${SID.slice(0, 16)}`))).toBe(false);
+});
+
+// ── R3: policy-response ordering and the unavailable observation ──────────
+
+test('a save held under public cannot complete generically after the policy read fails', async ({ page }) => {
+  // Root R2 P2: the unavailable branch returned WITHOUT observing, so the old
+  // public generation stayed valid and the held resolver still went generic.
+  const gate = makeGate(['GET /stores']);
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+  };
+  const seen = await mountGui(page, routes, { gate });
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend',
+      '<textarea id="wiki-content">draft under unavailable policy</textarea>' +
+      '<div id="wiki-editor"></div><div id="wiki-error"></div><div id="wiki-pages"></div>');
+  });
+
+  const save = page.evaluate((sid) => window.saveWikiPage(sid), SID);
+  await gate.holds['GET /stores'].enteredPromise;          // real boundary
+
+  // A newer policy read FAILS while the save is held.
+  routes[`GET /groups/${SID}`] = { status: 500, body: { ok: false, error: 'policy unavailable' } };
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+
+  const boundary = seen.length;
+  gate.holds['GET /stores'].release();
+  await save;
+  const after = seen.slice(boundary);
+
+  // No generic creation and no write may follow an unavailable observation.
+  expect(after).not.toContain('POST /stores');
+  expect(after.some((k) => k.startsWith('PUT '))).toBe(false);
+  // Fail closed, draft kept, user told.
+  const state = await page.evaluate(() => ({
+    hidden: document.getElementById('wiki-editor').style.display === 'none',
+    draft: document.getElementById('wiki-content').value,
+    err: document.getElementById('wiki-error').textContent || '',
+  }));
+  expect(state.draft).toBe('draft under unavailable policy');
+  expect(state.hidden).toBe(false);
+  expect(state.err).not.toBe('');
+});
+
+test('an older public policy reply landing after a newer private one is ignored', async ({ page }) => {
+  // TRUE ordering: hold the FIRST policy read, let the SECOND complete
+  // privately end-to-end, and only THEN release the first. The older reply
+  // must not overwrite the newer observation. Removing the ticket guard in
+  // observeSpacePolicy makes this fail.
+  const RETURNED = 'grp-store-late-public';
+  const gate = makeGate([`GET /groups/${SID}#1`]);
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+    [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
+  };
+  const seen = await mountGui(page, routes, { gate });
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div>');
+  });
+
+  const older = page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  await gate.holds[`GET /groups/${SID}#1`].enteredPromise;
+
+  // NEWER read completes FIRST, privately, while the older is still held.
+  routes[`GET /groups/${SID}`] = privateGroup();
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  expect(seen).toContain(`POST /groups/${SID}/stores`);
+
+  // Boundary BEFORE the release, so the released resolver's OWN traffic is
+  // inside the measured window — that traffic is exactly what a missing
+  // ticket guard produces.
+  const boundary = seen.length;
+  gate.holds[`GET /groups/${SID}#1`].release();
+  await older;
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  const after = seen.slice(boundary);
+  // The late public reply must have left nothing behind: still private, and
+  // the stale resolver itself must not have taken the public lane.
+  expect(after.some((k) => k.includes(`/stores/${RETURNED}/`))).toBe(true);
+  expect(after).not.toContain('POST /stores');
+  expect(after).not.toContain('GET /stores');
+});
+
+test('an older FAILED policy reply cannot erase a newer valid observation', async ({ page }) => {
+  // TRUE ordering: the FAILING read is held, a newer VALID private read
+  // completes, then the failure is released. Its stale ticket must be dropped.
+  const RETURNED = 'grp-store-late-fail';
+  const gate = makeGate([`GET /groups/${SID}#1`]);
+  const routes = {
+    [`GET /groups/${SID}`]: { status: 500, body: { ok: false, error: 'unavailable' } },
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+    [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
+  };
+  const seen = await mountGui(page, routes, { gate });
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div>');
+  });
+
+  const older = page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  await gate.holds[`GET /groups/${SID}#1`].enteredPromise;
+
+  routes[`GET /groups/${SID}`] = privateGroup();
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  expect(seen).toContain(`POST /groups/${SID}/stores`);
+
+  // Boundary BEFORE the release, for the same reason as above.
+  const boundary = seen.length;
+  gate.holds[`GET /groups/${SID}#1`].release();
+  await older;
+  await page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  const after = seen.slice(boundary);
+  // The late FAILURE must not have downgraded the valid private observation:
+  // the next render must still reuse the private store, never re-open it.
+  expect(after.some((k) => k.includes(`/stores/${RETURNED}/`))).toBe(true);
+  expect(after).not.toContain('POST /stores');
+  expect(after).not.toContain('GET /stores');
+  expect(after.filter((k) => k === `POST /groups/${SID}/stores`).length).toBe(0);
+});
+
+test('two concurrent renders under the SAME policy still share one resolution', async ({ page }) => {
+  // The ticket/generation logic must not break legitimate same-policy dedup.
+  const RETURNED = 'grp-store-dedup';
+  const routes = {
+    [`GET /groups/${SID}`]: privateGroup(),
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+    [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
+  };
+  const seen = await mountGui(page, routes);
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div>');
+  });
+  await page.evaluate((sid) => Promise.all([
+    window.loadWikiPages(sid), window.loadWikiPages(sid), window.loadWikiPages(sid),
+  ]), SID);
+  // One shared resolution: the group opener is not issued three times.
+  expect(seen.filter((k) => k === `POST /groups/${SID}/stores`).length).toBe(1);
+});
+
+// ── R4: the GUI's OWN policy mutation must invalidate held resolutions ────
+//
+// Root/Senior P1: a save that already passed its public policy GET and is held
+// at `GET /stores` released into a still-valid generation after the user made
+// the space private through the real admin form (`nagApplyPolicy` PATCH), so
+// the generic POST and PUT happened AFTER the private mutation succeeded. No
+// read-replica lag and no GET-after-PATCH is assumed anywhere here.
+
+/// Mount the admin policy form the real handler reads, and apply `private`.
+async function applyPrivateThroughTheRealForm(page, sid) {
+  await page.evaluate((gid) => {
+    document.body.insertAdjacentHTML('beforeend',
+      `<div data-nag-policy="${gid}">` +
+      '<select data-k="confidentiality"><option value="mls_encrypted" selected>mls_encrypted</option></select>' +
+      '<div data-k="policy-feedback"></div></div>');
+    return window.nagApplyPolicy(gid);      // the ACTUAL handler
+  }, sid);
+}
+
+for (const app of ['wiki', 'web']) {
+  test(`${app}: a held save cannot go generic after the real policy form makes the space private`, async ({ page }) => {
+    const RETURNED = `grp-store-patch-${app}`;
+    const gate = makeGate(['GET /stores']);
+    const routes = {
+      [`GET /groups/${SID}`]: publicGroup(),
+      'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+      'POST /stores': { status: 200, body: { ok: true } },
+      [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
+      [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+      [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
+      [`PUT /stores/${RETURNED}/`]: { status: 200, body: { ok: true } },
+    };
+    const seen = await mountGui(page, routes, { gate });
+    await page.evaluate((a) => {
+      document.body.insertAdjacentHTML('beforeend',
+        `<textarea id="${a}-content">draft across a policy change</textarea>` +
+        `<div id="${a}-editor"></div><div id="${a}-error"></div>` +
+        '<div id="wiki-pages"></div><div id="web-pages"></div>');
+    }, app);
+
+    const saver = app === 'wiki' ? 'saveWikiPage' : 'saveWebPage';
+    const save = page.evaluate(([sid, fn]) => window[fn](sid), [SID, saver]);
+    await gate.holds['GET /stores'].enteredPromise;      // real boundary
+
+    // The user makes the space private through the REAL admin form, and the
+    // PATCH SUCCEEDS, before the held save is released.
+    await applyPrivateThroughTheRealForm(page, SID);
+    expect(seen).toContain(`PATCH /groups/${SID}/policy`);
+
+    const boundary = seen.length;
+    gate.holds['GET /stores'].release();
+    await save;
+    const after = seen.slice(boundary);
+
+    const generic = `x0x-${app}-${SID.slice(0, 16)}`;
+    // Exact absence: no generic creation, no generic write, after the PATCH.
+    expect(after).not.toContain('POST /stores');
+    expect(after.some((k) => k.startsWith('PUT ') && k.includes(`/stores/${generic}/`))).toBe(false);
+    // Draft truth: nothing was saved, the draft is intact and the user is told.
+    const state = await page.evaluate((a) => ({
+      hidden: document.getElementById(`${a}-editor`).style.display === 'none',
+      draft: document.getElementById(`${a}-content`).value,
+      err: document.getElementById(`${a}-error`).textContent || '',
+    }), app);
+    expect(state.draft).toBe('draft across a policy change');
+    expect(state.hidden).toBe(false);
+    expect(state.err).not.toBe('');
+
+    // Valid private positive. The PATCH mutated server state, so the fixture
+    // now reports private. NOTE: the absence assertions above needed no GET at
+    // all — the invalidation is driven by the mutation itself, not by any
+    // GET-after-PATCH. This flip only makes the POSITIVE meaningful.
+    routes[`GET /groups/${SID}`] = privateGroup();
+    seen.length = 0;
+    const loader = app === 'wiki' ? 'loadWikiPages' : 'loadWebPages';
+    await page.evaluate(([sid, fn]) => window[fn](sid), [SID, loader]);
+    expect(seen).toContain(`POST /groups/${SID}/stores`);
+    expect(seen).not.toContain('POST /stores');
+    expect(seen.some((k) => k.includes(generic))).toBe(false);
+  });
+}
+
+test('the real policy form invalidates the OTHER app’s warm resolution too', async ({ page }) => {
+  const RETURNED = 'grp-store-patch-crossapp';
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
+    [`POST /groups/${SID}/stores`]: { status: 200, body: { ok: true, id: RETURNED } },
+    [`GET /stores/${RETURNED}/keys`]: { status: 200, body: { ok: true, keys: [] } },
+  };
+  const seen = await mountGui(page, routes);
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div><div id="web-pages"></div>');
+  });
+  await page.evaluate((sid) => window.loadWebPages(sid), SID);   // warm WEB, public
+
+  await applyPrivateThroughTheRealForm(page, SID);
+  routes[`GET /groups/${SID}`] = privateGroup();
+  seen.length = 0;
+
+  // The Web tab's warm public entry must have been invalidated by the PATCH.
+  await page.evaluate((sid) => window.loadWebPages(sid), SID);
+  expect(seen).toContain(`POST /groups/${SID}/stores`);
+  expect(seen).not.toContain('POST /stores');
+  expect(seen.some((k) => k.includes(`x0x-web-${SID.slice(0, 16)}`))).toBe(false);
+});
+
+test('a FAILED policy PATCH is still treated as uncertain, not as no-op', async ({ page }) => {
+  const gate = makeGate(['GET /stores']);
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    [`PATCH /groups/${SID}/policy`]: { status: 500, body: { ok: false, error: 'patch failed' } },
+  };
+  const seen = await mountGui(page, routes, { gate });
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend',
+      '<textarea id="wiki-content">draft across an uncertain patch</textarea>' +
+      '<div id="wiki-editor"></div><div id="wiki-error"></div>');
+  });
+
+  const save = page.evaluate((sid) => window.saveWikiPage(sid), SID);
+  await gate.holds['GET /stores'].enteredPromise;
+  await applyPrivateThroughTheRealForm(page, SID);   // PATCH errors
+
+  const boundary = seen.length;
+  gate.holds['GET /stores'].release();
+  await save;
+  const after = seen.slice(boundary);
+
+  // A failed PATCH does not prove the mutation was not applied, so the held
+  // save must still not go generic.
+  expect(after).not.toContain('POST /stores');
+  expect(after.some((k) => k.startsWith('PUT '))).toBe(false);
+  expect(await page.evaluate(() => document.getElementById('wiki-content').value))
+    .toBe('draft across an uncertain patch');
+});
+
+// ── R5: the handoff between resolver publication and the CALLER's request ─
+//
+// Root/Sol P1: the R4 gates were all INSIDE openSpacePageStore. A PATCH
+// admitted while a resolution is pending, completing just AFTER that
+// resolution is published, leaves the caller holding a valid-looking entry —
+// and all six callers then issued their own store request with no re-check.
+// These controls drive the real handoff: the resolver publishes first, the
+// PATCH completes second, the caller's request third.
+
+/// Mount the policy form and START the PATCH without awaiting it.
+function startPolicyPatch(page, sid) {
+  return page.evaluate((gid) => {
+    document.body.insertAdjacentHTML('beforeend',
+      `<div data-nag-policy="${gid}">` +
+      '<select data-k="confidentiality"><option value="mls_encrypted" selected>mls_encrypted</option></select>' +
+      '<div data-k="policy-feedback"></div></div>');
+    return window.nagApplyPolicy(gid);      // NOT awaited by the caller
+  }, sid);
+}
+
+for (const [app, saver, contentId, editorId, errId] of [
+  ['wiki', 'saveWikiPage', 'wiki-content', 'wiki-editor', 'wiki-error'],
+  ['web', 'saveWebPage', 'web-content', 'web-editor', 'web-error'],
+]) {
+  for (const patchOk of [true, false]) {
+    const label = patchOk ? 'successful' : 'failed';
+    test(`${app}: a ${label} PATCH completing after the resolver published still blocks the caller's generic write`, async ({ page }) => {
+      // The PATCH is ADMITTED and held; the save then starts and reads the
+      // still-public policy; its resolver publishes the generic entry; the
+      // PATCH completes; only then does the caller reach its PUT.
+      const gate = makeGate([`PATCH /groups/${SID}/policy`, 'GET /stores']);
+      // The generic store ALREADY EXISTS, so the resolver publishes straight
+      // after the listing with no further await inside it — this is Root's
+      // sequence, and it is what makes the resolver-internal gates
+      // insufficient and the CALLER gate load-bearing.
+      const generic0 = `x0x-${app}-${SID.slice(0, 16)}`;
+      const routes = {
+        [`GET /groups/${SID}`]: publicGroup(),
+        'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic0 }] } },
+        'POST /stores': { status: 200, body: { ok: true } },
+        [`PUT /stores/${generic0}/`]: { status: 200, body: { ok: true } },
+        [`PATCH /groups/${SID}/policy`]: patchOk
+          ? { status: 200, body: { ok: true } }
+          : { status: 500, body: { ok: false, error: 'patch failed' } },
+      };
+      const seen = await mountGui(page, routes, { gate });
+      await page.evaluate(([c, e, x]) => {
+        document.body.insertAdjacentHTML('beforeend',
+          `<textarea id="${c}">draft across the handoff</textarea>` +
+          `<div id="${e}"></div><div id="${x}"></div>`);
+      }, [contentId, editorId, errId]);
+
+      // 1. PATCH admitted, held in flight.
+      const patch = startPolicyPatch(page, SID);
+      await gate.holds[`PATCH /groups/${SID}/policy`].enteredPromise;
+
+      // 2. Save starts and its resolver reaches the generic listing.
+      const save = page.evaluate(([sid, fn]) => window[fn](sid), [SID, saver]);
+      await gate.holds['GET /stores'].enteredPromise;
+
+      // 3. Let the resolver publish, then complete the PATCH, then let the
+      //    caller proceed to its own request.
+      // Release the listing, let the PATCH complete FIRST, then the caller.
+      const boundary = seen.length;
+      gate.holds[`PATCH /groups/${SID}/policy`].release();
+      await patch;                       // completion invalidation has landed
+      gate.holds['GET /stores'].release();
+      await save;
+      const after = seen.slice(boundary);
+
+      const generic = `x0x-${app}-${SID.slice(0, 16)}`;
+      // No generic write may follow, on EITHER PATCH outcome — a failed PATCH
+      // does not prove the mutation was not applied.
+      expect(after.some((k) => k.startsWith('PUT ') && k.includes(`/stores/${generic}/`))).toBe(false);
+      expect(after.some((k) => k.startsWith('PUT '))).toBe(false);
+      // Draft truth: nothing saved, editor still open, user told.
+      const state = await page.evaluate(([c, e, x]) => ({
+        hidden: document.getElementById(e).style.display === 'none',
+        draft: document.getElementById(c).value,
+        err: document.getElementById(x).textContent || '',
+      }), [contentId, editorId, errId]);
+      expect(state.draft).toBe('draft across the handoff');
+      expect(state.hidden).toBe(false);
+      expect(state.err).not.toBe('');
+    });
+  }
+}
+
+test('a NEW resolver started after PATCH admission is still blocked when the PATCH completes', async ({ page }) => {
+  // Sol P2: every earlier control's resolver PREDATES admission, so they
+  // cannot discriminate the COMPLETION invalidator. Here the resolver starts
+  // AFTER admission, reads the old public policy, and is held at its listing
+  // until the PATCH completes.
+  const gate = makeGate([`PATCH /groups/${SID}/policy`, 'GET /stores']);
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
+  };
+  const seen = await mountGui(page, routes, { gate });
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend',
+      '<textarea id="wiki-content">draft after admission</textarea>' +
+      '<div id="wiki-editor"></div><div id="wiki-error"></div>');
+  });
+
+  const patch = startPolicyPatch(page, SID);
+  await gate.holds[`PATCH /groups/${SID}/policy`].enteredPromise;
+
+  // NEW resolver, started strictly after admission, gets the old public policy.
+  const save = page.evaluate((sid) => window.saveWikiPage(sid), SID);
+  await gate.holds['GET /stores'].enteredPromise;
+
+  const boundary = seen.length;
+  gate.holds[`PATCH /groups/${SID}/policy`].release();
+  await patch;                                   // COMPLETION invalidation
+  gate.holds['GET /stores'].release();
+  await save;
+  const after = seen.slice(boundary);
+
+  expect(after).not.toContain('POST /stores');
+  expect(after.some((k) => k.startsWith('PUT '))).toBe(false);
+  const state = await page.evaluate(() => ({
+    hidden: document.getElementById('wiki-editor').style.display === 'none',
+    draft: document.getElementById('wiki-content').value,
+  }));
+  expect(state.draft).toBe('draft after admission');
+  expect(state.hidden).toBe(false);
+});
+
+// ── R6: truthful outcome after a WRITE that may already have landed ───────
+//
+// Root R5 P2: the post-PUT stale guard reused a message claiming "nothing was
+// read or written" AFTER the PUT had been issued and returned HTTP success.
+// That is false, and it invites a blind retry that could duplicate the page.
+// These controls hold the PUT RESPONSE until after the real policy form's
+// PATCH completes, so the write is observed by the fixture and succeeds.
+
+for (const [app, saver, contentId, editorId, errId] of [
+  ['wiki', 'saveWikiPage', 'wiki-content', 'wiki-editor', 'wiki-error'],
+  ['web', 'saveWebPage', 'web-content', 'web-editor', 'web-error'],
+]) {
+  test(`${app}: a save whose PUT already succeeded is reported truthfully, not as unwritten`, async ({ page }) => {
+    const generic = `x0x-${app}-${SID.slice(0, 16)}`;
+    const PUTKEY = `PUT /stores/${generic}/`;
+    const gate = makeGate([PUTKEY]);
+    const routes = {
+      [`GET /groups/${SID}`]: publicGroup(),
+      'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic }] } },
+      'POST /stores': { status: 200, body: { ok: true } },
+      [PUTKEY]: { status: 200, body: { ok: true } },      // the write SUCCEEDS
+      [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
+    };
+    const seen = await mountGui(page, routes, { gate });
+    await page.evaluate(([c, e, x]) => {
+      document.body.insertAdjacentHTML('beforeend',
+        `<textarea id="${c}">text that may already be stored</textarea>` +
+        `<div id="${e}"></div><div id="${x}"></div>`);
+    }, [contentId, editorId, errId]);
+
+    // Save runs; its PUT is OBSERVED by the fixture and then held.
+    const save = page.evaluate(([sid, fn]) => window[fn](sid), [SID, saver]);
+    await gate.holds[PUTKEY].enteredPromise;
+    expect(seen).toContain(PUTKEY);                       // the write happened
+
+    // The policy changes through the REAL form while the PUT is in flight.
+    await applyPrivateThroughTheRealForm(page, SID);
+    gate.holds[PUTKEY].release();                          // ...and succeeds
+    await save;
+
+    const state = await page.evaluate(([c, e, x]) => ({
+      hidden: document.getElementById(e).style.display === 'none',
+      draft: document.getElementById(c).value,
+      err: document.getElementById(x).textContent || '',
+    }), [contentId, editorId, errId]);
+
+    // Draft and editor retained — the user does not lose their text.
+    expect(state.draft).toBe('text that may already be stored');
+    expect(state.hidden).toBe(false);
+    // MESSAGE ORACLE. It must NOT claim the page is unwritten...
+    expect(state.err).not.toBe('');
+    expect(state.err.toLowerCase()).not.toContain('nothing was read or written');
+    expect(state.err.toLowerCase()).not.toContain('nothing was written');
+    // ...it must say the save MAY have completed, and tell the user to CHECK
+    // before saving again rather than implying a safe retry.
+    expect(state.err.toLowerCase()).toContain('may already have completed');
+    expect(state.err.toLowerCase()).toContain('check');
+    // No automatic re-send: exactly one PUT for this page.
+    expect(seen.filter((k) => k === PUTKEY).length).toBe(1);
+  });
+}
+
+test('a read interrupted after its request cannot claim nothing was read', async ({ page }) => {
+  const generic = `x0x-wiki-${SID.slice(0, 16)}`;
+  const KEYS = `GET /stores/${generic}/keys`;
+  const gate = makeGate([KEYS]);
+  const routes = {
+    [`GET /groups/${SID}`]: publicGroup(),
+    'GET /stores': { status: 200, body: { ok: true, stores: [{ id: generic }] } },
+    'POST /stores': { status: 200, body: { ok: true } },
+    [KEYS]: { status: 200, body: { ok: true, keys: ['page-a'] } },
+    [`PATCH /groups/${SID}/policy`]: { status: 200, body: { ok: true } },
+  };
+  await mountGui(page, routes, { gate });
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="wiki-pages"></div>');
+  });
+
+  const load = page.evaluate((sid) => window.loadWikiPages(sid), SID);
+  await gate.holds[KEYS].enteredPromise;
+  await applyPrivateThroughTheRealForm(page, SID);
+  gate.holds[KEYS].release();
+  await load;
+
+  const shown = await page.innerHTML('#wiki-pages');
+  expect(shown.toLowerCase()).not.toContain('nothing was read or written');
+  expect(shown.toLowerCase()).toContain('may reflect the previous setting');
+  expect(shown).not.toContain('page-a');          // the stale listing is not painted
 });

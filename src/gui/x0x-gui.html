@@ -2861,6 +2861,96 @@ function renderFeedPosts(sid){
 //   {ok:false, reason, pub}  unavailable; `reason` is shown to the user
 const spacePageStores={};
 
+/// In-flight resolutions, keyed by `sid|app|policy-generation`. Two renders
+/// racing under the SAME observed policy generation share one resolution; a
+/// render that observes a NEWER generation never joins the outgoing one's
+/// promise.
+const spacePageStoreInflight={};
+
+/// The policy this tab has most recently OBSERVED per space, and a generation
+/// that increments on every observed change.
+///
+/// Reading the policy once at the top of a resolution is not enough: the
+/// resolution then performs further requests (`GET /stores`, `POST /stores`,
+/// the group opener), and the policy can change while those are in flight. A
+/// resolver that started under `signed_public` must not issue a generic store
+/// side effect, publish a cache entry, or return a generic store to its
+/// caller once a NEWER observation says the space is private — otherwise the
+/// caller's save lands outside the group-bound store. Every later step
+/// therefore re-checks the generation it started under.
+const spacePolicy={};
+/// Sentinel confidentiality for "the policy could not be read". It is a real
+/// observation — it supersedes an earlier one and invalidates work started
+/// under it — and it can never collide with a daemon-reported value.
+const SPACE_POLICY_UNAVAILABLE='\u0000unavailable';
+/// Monotonic ticket handed out BEFORE each policy request, so a late reply
+/// from an older request cannot overwrite a newer observation.
+let spacePolicySeq=0;
+
+/// Record an observed policy. Returns the authoritative current observation.
+function observeSpacePolicy(sid,conf,ticket){
+  const cur=spacePolicy[sid];
+  // A newer policy read has already landed — this reply is stale, drop it.
+  if(cur&&cur.ticket>ticket)return cur;
+  if(cur&&cur.conf===conf){cur.ticket=ticket;return cur}
+  // The policy CHANGED. Invalidate every cached resolution for this space,
+  // across BOTH apps: private observed while rendering the Wiki must not
+  // leave a stale public resolution behind for the Web tab.
+  for(const k of Object.keys(spacePageStores)){
+    if(k.slice(0,k.indexOf('|'))===sid)delete spacePageStores[k];
+  }
+  return spacePolicy[sid]={conf:conf,gen:(cur?cur.gen:0)+1,ticket:ticket};
+}
+
+/// Sentinel for "this tab initiated a policy mutation and the space's policy
+/// is no longer known". A PATCH is uncertain from the moment it is ADMITTED:
+/// in flight the outcome is unknown, and a FAILED or errored reply may still
+/// have applied server-side. Either way no resolution started under the old
+/// policy may proceed.
+const SPACE_POLICY_UNCERTAIN='\u0000uncertain';
+
+/// Invalidate every resolution for `sid` because this tab is mutating (or has
+/// just mutated) the space's policy.
+///
+/// This is the authoritative LOCAL observation. Waiting for the next policy
+/// GET to notice is not enough: a save that already passed its policy read and
+/// is held at `GET /stores` would otherwise release into a still-valid
+/// generation and write to the generic store AFTER the space went private.
+/// Takes a FRESH ticket so it supersedes any older in-flight read, and so a
+/// later real read can supersede it in turn.
+function invalidateSpacePolicy(sid){
+  observeSpacePolicy(sid,SPACE_POLICY_UNCERTAIN,++spacePolicySeq);
+}
+
+/// Message shown when a resolution is invalidated under a caller's feet.
+/// PRE-request: the store request was never issued, so "nothing happened" is
+/// literally true here and nowhere else.
+const SPACE_POLICY_MOVED_BEFORE='This space’s privacy setting changed before this request was sent, so nothing was read or written. Reopen the tab and try again.';
+/// POST-request, WRITE: the PUT was already issued and may have SUCCEEDED
+/// against the store that was current when it was sent. Do not claim the page
+/// is unwritten, and do not invite a blind retry — a retry could duplicate the
+/// page under the new privacy setting.
+const SPACE_POLICY_MOVED_AFTER_WRITE='This space’s privacy setting changed while this page was being saved. The save may already have completed under the previous setting. Your text has been kept here — reopen the tab and check whether the page is present before saving again.';
+/// POST-request, READ: the read was issued and may have returned content from
+/// the store that was current when it was sent, so it is not "nothing read".
+const SPACE_POLICY_MOVED_AFTER_READ='This space’s privacy setting changed while this was loading, so what came back may reflect the previous setting and is not being shown. Reopen the tab to continue.';
+
+/// `true` when a resolution handed to a CALLER is still current.
+///
+/// The resolver's own gates cannot cover this: once it returns, the caller
+/// awaits and then issues its OWN store request, and the policy can change in
+/// between (e.g. a PATCH admitted while the resolution was pending completes
+/// just after publication). Every caller therefore re-checks immediately
+/// before its store request, and again before painting or claiming success.
+function spacePageStoreCurrent(sid,st){
+  return !!st&&st.ok===true&&!spacePolicyStale(sid,st.gen);
+}
+
+/// `true` once the space's observed policy has moved on from `gen`.
+function spacePolicyStale(sid,gen){
+  return !spacePolicy[sid]||spacePolicy[sid].gen!==gen;
+}
+
 function spacePageStoreKey(sid,app){return sid+'|'+app}
 
 /// Forget a cached resolution so the next render re-resolves.
@@ -2880,15 +2970,47 @@ function encSeg(s){return encodeURIComponent(String(s))}
 /// Space onto generic storage.
 async function openSpacePageStore(sid,app){
   const ck=spacePageStoreKey(sid,app);
-  if(spacePageStores[ck])return spacePageStores[ck];
-  // Only a SUCCESSFUL resolution is cached. A failure is re-resolved on the
-  // next attempt, so the tab recovers by itself once the daemon can open the
-  // store (e.g. after the space finishes loading).
+  // POLICY IS READ FIRST, ALWAYS — the cache is never consulted before it.
+  //
+  // `PATCH /groups/:id/policy` lets any admin set `confidentiality` on a LIVE
+  // group (`named_groups.rs` update_group_policy; only the owner axis of
+  // `admission` is immutable). So a Space warm-cached while `signed_public`
+  // can become `mls_encrypted` underneath this tab. Returning the cached
+  // entry before re-reading the policy would keep list/read/WRITE pointed at
+  // the generic unbound Signed store, so pages written after the transition
+  // would land outside the group-bound store. The cached entry is therefore
+  // only reused when the policy it was resolved UNDER still holds.
+  const ticket=++spacePolicySeq;
   const g=await api('/groups/'+encSeg(sid));
   if(!g||!g.ok){
+    // Fail closed AND RECORD IT. Returning here without observing would leave
+    // the previous (e.g. public) generation valid, so a resolver still held
+    // at the old `GET /stores` would release, POST the generic store, publish
+    // it and answer ok. An unavailable policy is its own observation: it
+    // supersedes the old one and invalidates work started under it. Ticket
+    // ordering still applies, so a LATE failure from an older read cannot
+    // erase a newer valid observation.
+    observeSpacePolicy(sid,SPACE_POLICY_UNAVAILABLE,ticket);
     return {ok:false,reason:'This space could not be loaded, so its pages are unavailable. '+apiError(g)};
   }
   const conf=String((g.policy&&g.policy.confidentiality)||(g.policy_summary&&g.policy_summary.confidentiality)||'');
+  const obs=observeSpacePolicy(sid,conf,ticket);
+  if(obs.conf!==conf){
+    // Our own policy reply arrived AFTER a newer one. Do not act on it.
+    return {ok:false,reason:'This space’s privacy setting changed while its pages were loading. Reopen the tab to continue.'};
+  }
+  const gen=obs.gen;
+  const stale=()=>spacePolicyStale(sid,gen);
+  const staleAnswer={ok:false,reason:'This space’s privacy setting changed while its pages were loading. Reopen the tab to continue.'};
+  const cached=spacePageStores[ck];
+  if(cached&&cached.gen===gen)return cached;
+  // Different generation (or first resolution): drop the stale entry before
+  // resolving, so a failure below cannot leave the outgoing policy's store
+  // cached for the next caller.
+  if(cached)delete spacePageStores[ck];
+  const ik=ck+'|'+gen;
+  if(spacePageStoreInflight[ik])return spacePageStoreInflight[ik];
+  const run=(async()=>{
   if(conf==='signed_public'){
     // Intentionally public Space. This is the LEGACY generic store the
     // older build used, kept as-is for containment.
@@ -2906,22 +3028,33 @@ async function openSpacePageStore(sid,app){
     // aliases that already exist) is part of the pending backend work, not
     // of this containment patch.
     const id='x0x-'+app+'-'+sid.slice(0,16);
+    // GENERIC SIDE EFFECT GATE: never touch the unbound Signed store once a
+    // newer observation says this space is private.
+    if(stale())return staleAnswer;
     const stores=await api('/stores');
+    if(stale())return staleAnswer;
     if(!stores||!stores._http_ok){
       return {ok:false,reason:'Could not list this space’s pages. '+apiError(stores),pub:true};
     }
     if(!((stores.stores||[]).find(s=>s.id===id))){
+      if(stale())return staleAnswer;
       const c=await api('/stores',{method:'POST',body:JSON.stringify({name:app==='wiki'?'Wiki':'Web',topic:id})});
+      if(stale())return staleAnswer;
       if(!c||!c._http_ok){
         return {ok:false,reason:'Could not open this space’s page store. '+apiError(c),pub:true};
       }
     }
-    return spacePageStores[ck]={ok:true,id:id,pub:true,localOwned:true};
+    // PUBLICATION + RETURN GATE: a stale resolver must neither poison the
+    // shared cache nor hand a generic store back to its own caller.
+    if(stale())return staleAnswer;
+    return spacePageStores[ck]={ok:true,id:id,pub:true,localOwned:true,gen:gen};
   }
   // Everything else — including a private Space and any confidentiality the
   // daemon reports that this build does not recognise — is private. Use the
   // group-bound opener and nothing else.
+  if(stale())return staleAnswer;
   const r=await api('/groups/'+encSeg(sid)+'/stores',{method:'POST',body:JSON.stringify({name:app})});
+  if(stale())return staleAnswer;
   if(!r||!r._http_ok||!r.ok){
     return {ok:false,reason:'Private pages are not available in this space yet. '+apiError(r)};
   }
@@ -2929,7 +3062,11 @@ async function openSpacePageStore(sid,app){
   if(!id){
     return {ok:false,reason:'Private pages are not available in this space yet: the daemon opened the store but did not name it.'};
   }
-  return spacePageStores[ck]={ok:true,id:id};
+  if(stale())return staleAnswer;
+  return spacePageStores[ck]={ok:true,id:id,gen:gen};
+  })();
+  spacePageStoreInflight[ik]=run;
+  try{return await run}finally{delete spacePageStoreInflight[ik]}
 }
 
 /// Render an unavailable-pages message into `el`.
@@ -2977,8 +3114,10 @@ async function saveWikiPage(sid){
   // The editor and the typed content stay put on every failure below, so a
   // failed save never costs the user their draft.
   if(!st.ok){wikiError(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){wikiError(SPACE_POLICY_MOVED_BEFORE);return}
   const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(currentWikiSlug),{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/markdown'})});
   if(!r||!r._http_ok){wikiError('Not saved. '+apiError(r));return}
+  if(!spacePageStoreCurrent(sid,st)){wikiError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   document.getElementById('wiki-editor').style.display='none';
   // The daemon confirms it stored the page on THIS machine. It does not
   // report whether every other member has received it yet, so do not claim
@@ -2991,7 +3130,9 @@ async function loadWikiPages(sid){
   const el=document.getElementById('wiki-pages');if(!el)return;
   const st=await openSpacePageStore(sid,'wiki');
   if(!st.ok){spacePagesUnavailable(el,st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_BEFORE);return}
   const r=await api('/stores/'+encSeg(st.id)+'/keys');
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_AFTER_READ);return}
   if(!r||!r._http_ok){
     // A failed listing is not an empty wiki. Say which it is.
     spacePagesUnavailable(el,'Could not list the pages in this space. '+apiError(r));
@@ -3011,7 +3152,9 @@ async function loadWikiPages(sid){
 async function editWikiPage(sid,slug){
   const st=await openSpacePageStore(sid,'wiki');
   if(!st.ok){spacePagesUnavailable(document.getElementById('wiki-pages'),st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(document.getElementById('wiki-pages'),SPACE_POLICY_MOVED_BEFORE);return}
   const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(slug));
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(document.getElementById('wiki-pages'),SPACE_POLICY_MOVED_AFTER_READ);return}
   if(!r||!r._http_ok){
     // A failed read must not cost the user the draft they already have open.
     // Leave the editor, its text, its title and the save target exactly as
@@ -3076,8 +3219,10 @@ async function saveWebPage(sid){
   webError('');
   const st=await openSpacePageStore(sid,'web');
   if(!st.ok){webError(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_BEFORE);return}
   const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(currentWebPath),{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/html'})});
   if(!r||!r._http_ok){webError('Not saved. '+apiError(r));return}
+  if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   document.getElementById('web-editor').style.display='none';
   toast('Page saved on this device','success');
   loadWebPages(sid);
@@ -3087,7 +3232,9 @@ async function loadWebPages(sid){
   const el=document.getElementById('web-pages');if(!el)return;
   const st=await openSpacePageStore(sid,'web');
   if(!st.ok){spacePagesUnavailable(el,st.reason);webPreviewNotice(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_BEFORE);webPreviewNotice(SPACE_POLICY_MOVED_BEFORE);return}
   const r=await api('/stores/'+encSeg(st.id)+'/keys');
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_AFTER_READ);webPreviewNotice(SPACE_POLICY_MOVED_AFTER_READ);return}
   if(!r||!r._http_ok){
     const m='Could not list the pages in this space. '+apiError(r);
     spacePagesUnavailable(el,m);webPreviewNotice(m);
@@ -3122,11 +3269,13 @@ async function previewWebPage(sid,path){
   const st=await openSpacePageStore(sid,'web');
   if(!current())return;
   if(!st.ok){webPreviewNotice(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){webPreviewNotice(SPACE_POLICY_MOVED_BEFORE);return}
   // Clear the previous page BEFORE the read, so a failure cannot leave the
   // last page visible under the newly-selected page's name.
   webPreviewNotice('Loading “'+path+'”…');
   const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(path));
   if(!current())return;
+  if(!spacePageStoreCurrent(sid,st)){webPreviewNotice(SPACE_POLICY_MOVED_AFTER_READ);return}
   if(!r||!r._http_ok){
     webPreviewNotice('Could not open “'+path+'”. '+apiError(r));
     return;
@@ -5285,7 +5434,13 @@ async function nagApplyPolicy(gid){
     return;
   }
   nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="policy-feedback"]`,'Working…');
+  // ADMISSION: from here the policy is uncertain, so no page-store resolution
+  // started under the previous policy may complete.
+  invalidateSpacePolicy(gid);
   const r=await api('/groups/'+gid+'/policy',{method:'PATCH',body:JSON.stringify(body)});
+  // COMPLETION: invalidate again on EVERY outcome. A failed or errored reply
+  // does not prove the mutation was not applied.
+  invalidateSpacePolicy(gid);
   if(r&&r.ok){
     nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="policy-feedback"]`,'Policy updated.','ok');
     nagRenderAdmin(gid);
