@@ -26,6 +26,61 @@ PHASES = {
     "restart_identity", "restart_home", "restart_seal", "final_stop", "complete",
 }
 CHILD_LABELS = {"owner_initial", "joiner_initial", "owner_restart", "joiner_restart"}
+OBSERVATION_FIELDS = {
+    "status_match", "ok_match", "owner_match", "agent_match", "machine_match",
+    "revoked_match", "group_match", "state_match", "primary_member_match",
+    "secondary_member_match", "name_match",
+}
+CHECK_FIELDS = {
+    "none": set(),
+    "profile_update": {"status_match"},
+    "identity_distinct": {"agent_match", "machine_match", "owner_match"},
+    "identity_contract": {"ok_match", "owner_match", "agent_match", "machine_match", "name_match"},
+    "card_import": {"status_match", "ok_match"},
+    "peer_connect": {"status_match"},
+    "consent_negative": {"status_match"},
+    "announce": {"status_match", "ok_match"},
+    "owner_sync": {"owner_match", "agent_match", "machine_match", "revoked_match"},
+    "device_enroll": {"status_match", "ok_match", "machine_match"},
+    "canonical_home": {"owner_match", "group_match", "state_match", "primary_member_match", "secondary_member_match"},
+    "home_rename": {"status_match", "ok_match"},
+    "seat_invite": {"status_match", "ok_match", "group_match", "owner_match"},
+    "wrong_owner_negative": {"status_match", "ok_match"},
+    "wrong_mode_negative": {"status_match", "ok_match"},
+    "home_join": {"status_match", "group_match", "state_match"},
+    "active_home": {"owner_match", "group_match", "state_match", "primary_member_match", "secondary_member_match"},
+    "seal": {"status_match", "ok_match"},
+    "restart_identity": {"agent_match", "machine_match"},
+    "restart_home_name": {"name_match"},
+    "restart_seal": {"status_match", "ok_match"},
+}
+CHECK_SIDES = {
+    "none": {"none"}, "profile_update": {"owner", "joiner"},
+    "identity_distinct": {"both"}, "identity_contract": {"owner", "joiner"},
+    "card_import": {"owner", "joiner"}, "peer_connect": {"owner"},
+    "consent_negative": {"joiner"}, "announce": {"owner", "joiner"},
+    "owner_sync": {"owner", "joiner"}, "device_enroll": {"owner", "joiner"},
+    "canonical_home": {"none", "owner", "joiner"}, "home_rename": {"canonical"},
+    "seat_invite": {"canonical"}, "wrong_owner_negative": {"adopting"},
+    "wrong_mode_negative": {"adopting"}, "home_join": {"adopting"},
+    "active_home": {"owner", "joiner"}, "seal": {"canonical"},
+    "restart_identity": {"both"}, "restart_home_name": {"both"},
+    "restart_seal": {"canonical"},
+}
+CHECK_PHASES = {
+    "profile_update": {"profile_identity"},
+    "identity_distinct": {"profile_identity"},
+    "identity_contract": {"profile_identity"},
+    "card_import": {"peer_connect"}, "peer_connect": {"peer_connect"},
+    "consent_negative": {"consent_negative"}, "announce": {"announce"},
+    "owner_sync": {"owner_sync"}, "device_enroll": {"device_enroll"},
+    "canonical_home": {"canonical_home"}, "home_rename": {"seat_invite"},
+    "seat_invite": {"seat_invite"}, "wrong_owner_negative": {"wrong_owner_negative"},
+    "wrong_mode_negative": {"wrong_mode_negative"}, "home_join": {"home_join"},
+    "active_home": {"active_home", "restart_home"}, "seal": {"initial_seal"},
+    "restart_identity": {"restart_identity"}, "restart_home_name": {"restart_home"},
+    "restart_seal": {"restart_seal"},
+}
 
 
 def admission_deadline_exit(remaining):
@@ -220,19 +275,21 @@ def nextest_receipt(value):
 
 
 def test_receipt(value, run_nonce, source):
-    empty = {"schema": 1, "present": False, "test": TEST_NAME,
+    empty = {"schema": 2, "present": False, "test": TEST_NAME,
              "run_nonce": run_nonce, "source_head": source["head"],
              "source_tree": source["tree"], "entered": False, "phase": "fixture_setup",
              "result": "missing", "failure_kind": "unknown_cause",
              "last_http_status": None, "cli_exit_code": None, "cli_signaled": False,
-             "children": {}}
+             "observation": {"check": "none", "side": "none",
+                 **{field: None for field in OBSERVATION_FIELDS},
+                 "observed_count": None, "count_capped": False}, "children": {}}
     if value is None:
         return empty, False, False
     keys = {"schema", "test", "run_nonce", "source_head", "source_tree", "entered",
             "phase", "result", "failure_kind", "last_http_status", "cli_exit_code",
-            "cli_signaled", "children"}
+            "cli_signaled", "observation", "children"}
     exact_keys(value, keys, "test diagnostic")
-    if value["schema"] != 1 or value["test"] != TEST_NAME or value["run_nonce"] != run_nonce:
+    if value["schema"] != 2 or value["test"] != TEST_NAME or value["run_nonce"] != run_nonce:
         raise ValueError("test diagnostic binding mismatch")
     if value["source_head"] != source["head"] or value["source_tree"] != source["tree"]:
         raise ValueError("test diagnostic source mismatch")
@@ -248,6 +305,28 @@ def test_receipt(value, run_nonce, source):
         raise ValueError("invalid diagnostic CLI exit")
     if type(value["cli_signaled"]) is not bool:
         raise ValueError("invalid diagnostic CLI signal flag")
+    observation = value["observation"]
+    observation_keys = {"check", "side", "observed_count", "count_capped"} | OBSERVATION_FIELDS
+    exact_keys(observation, observation_keys, "predicate observation")
+    check, side = observation["check"], observation["side"]
+    if check not in CHECK_FIELDS or side not in CHECK_SIDES[check]:
+        raise ValueError("invalid predicate observation selector")
+    if check != "none" and value["phase"] not in CHECK_PHASES[check]:
+        raise ValueError("predicate observation does not belong to phase")
+    for field in OBSERVATION_FIELDS:
+        item = observation[field]
+        if item is not None and type(item) is not bool:
+            raise ValueError("invalid predicate observation boolean")
+        if (field in CHECK_FIELDS[check]) != (item is not None):
+            raise ValueError("invalid predicate observation shape")
+    count = observation["observed_count"]
+    count_expected = check in {"owner_sync", "active_home"}
+    if count_expected != (type(count) is int and 0 <= count <= 256):
+        raise ValueError("invalid predicate observation count")
+    if type(observation["count_capped"]) is not bool:
+        raise ValueError("invalid predicate observation count flag")
+    if observation["count_capped"] and (not count_expected or count != 256):
+        raise ValueError("inconsistent predicate observation count flag")
     if not isinstance(value["children"], dict) or set(value["children"]) != CHILD_LABELS:
         raise ValueError("invalid diagnostic child set")
     safe_children = {}
@@ -276,6 +355,8 @@ def test_receipt(value, run_nonce, source):
         safe_children[label] = child
     if value["result"] == "passed" and (value["phase"] != "complete" or value["failure_kind"] != "none"):
         raise ValueError("inconsistent passed diagnostic")
+    if value["result"] == "passed" and check != "none":
+        raise ValueError("passed diagnostic retained incomplete predicate observation")
     if value["result"] == "failed" and value["failure_kind"] not in {"stage_failed", "unknown_cause"}:
         raise ValueError("inconsistent failed diagnostic")
     if value["result"] == "running" and value["failure_kind"] != "none":
@@ -285,7 +366,7 @@ def test_receipt(value, run_nonce, source):
         child["started"] is True and child["cleanup"] == "reaped"
         and child["exit_code"] == 0 and child["signaled"] is False
         and child["escalation"] == "none" for child in safe_children.values())
-    result = {"schema": 1, "present": True, **{key: value[key] for key in value if key not in {"schema", "children"}}, "children": safe_children}
+    result = {"schema": 2, "present": True, **{key: value[key] for key in value if key not in {"schema", "children"}}, "children": safe_children}
     return result, value["result"] == "passed" and cli_ok and children_ok, cleanup_ok
 
 

@@ -35,6 +35,54 @@ struct ChildObservation {
     escalation: &'static str,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PredicateObservation {
+    check: &'static str,
+    side: &'static str,
+    status_match: Option<bool>,
+    ok_match: Option<bool>,
+    owner_match: Option<bool>,
+    agent_match: Option<bool>,
+    machine_match: Option<bool>,
+    revoked_match: Option<bool>,
+    group_match: Option<bool>,
+    state_match: Option<bool>,
+    primary_member_match: Option<bool>,
+    secondary_member_match: Option<bool>,
+    name_match: Option<bool>,
+    observed_count: Option<u16>,
+    count_capped: bool,
+}
+
+impl PredicateObservation {
+    fn new(check: &'static str, side: &'static str) -> Self {
+        Self {
+            check,
+            side,
+            status_match: None,
+            ok_match: None,
+            owner_match: None,
+            agent_match: None,
+            machine_match: None,
+            revoked_match: None,
+            group_match: None,
+            state_match: None,
+            primary_member_match: None,
+            secondary_member_match: None,
+            name_match: None,
+            observed_count: None,
+            count_capped: false,
+        }
+    }
+
+    fn count(mut self, count: usize) -> Self {
+        const MAX_REPORTED_COUNT: usize = 256;
+        self.observed_count = Some(count.min(MAX_REPORTED_COUNT) as u16);
+        self.count_capped = count > MAX_REPORTED_COUNT;
+        self
+    }
+}
+
 struct DiagnosticState {
     phase: &'static str,
     result: &'static str,
@@ -42,6 +90,7 @@ struct DiagnosticState {
     last_http_status: Option<u16>,
     cli_exit_code: Option<i32>,
     cli_signaled: bool,
+    observation: PredicateObservation,
     children: [ChildObservation; 4],
 }
 
@@ -108,6 +157,7 @@ impl TestDiagnostic {
                 last_http_status: None,
                 cli_exit_code: None,
                 cli_signaled: false,
+                observation: PredicateObservation::new("none", "none"),
                 children: [empty.clone(), empty.clone(), empty.clone(), empty],
             })),
         };
@@ -137,7 +187,7 @@ impl TestDiagnostic {
             })
             .collect::<serde_json::Map<String, Value>>();
         let value = json!({
-            "schema": 1,
+            "schema": 2,
             "test": DIAGNOSTIC_TEST,
             "run_nonce": self.run_nonce.as_str(),
             "source_head": self.source_head.as_str(),
@@ -149,6 +199,23 @@ impl TestDiagnostic {
             "last_http_status": state.last_http_status,
             "cli_exit_code": state.cli_exit_code,
             "cli_signaled": state.cli_signaled,
+            "observation": {
+                "check": state.observation.check,
+                "side": state.observation.side,
+                "status_match": state.observation.status_match,
+                "ok_match": state.observation.ok_match,
+                "owner_match": state.observation.owner_match,
+                "agent_match": state.observation.agent_match,
+                "machine_match": state.observation.machine_match,
+                "revoked_match": state.observation.revoked_match,
+                "group_match": state.observation.group_match,
+                "state_match": state.observation.state_match,
+                "primary_member_match": state.observation.primary_member_match,
+                "secondary_member_match": state.observation.secondary_member_match,
+                "name_match": state.observation.name_match,
+                "observed_count": state.observation.observed_count,
+                "count_capped": state.observation.count_capped,
+            },
             "children": children,
         });
         if initial {
@@ -190,7 +257,28 @@ impl TestDiagnostic {
         self.update(|state| {
             state.phase = phase;
             state.last_http_status = None;
+            state.observation = PredicateObservation::new("none", "none");
         })
+    }
+
+    fn observation(&self, observation: PredicateObservation) -> Result<()> {
+        let changed = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("diagnostic lock poisoned"))?;
+            if state.observation == observation {
+                false
+            } else {
+                state.observation = observation;
+                true
+            }
+        };
+        if changed {
+            self.persist(false)
+        } else {
+            Ok(())
+        }
     }
 
     fn http_status(&self, status: StatusCode) -> Result<()> {
@@ -646,6 +734,7 @@ fn member_is_active(home: &Value, agent_id: &str) -> bool {
 
 async fn wait_for_active_home(
     daemon: &OwnedDaemon,
+    side: &'static str,
     group_id: &str,
     owner_id: &str,
     member_ids: &[&str],
@@ -653,9 +742,27 @@ async fn wait_for_active_home(
 ) -> Result<Value> {
     loop {
         if let Ok(home) = daemon.get_before(deadline, "/home").await {
-            let matches = home["group_id"] == group_id
-                && home["owner_user_id"] == owner_id
-                && home["state"] == "local"
+            let members = home["members"].as_array();
+            let group_match = home["group_id"] == group_id;
+            let owner_match = home["owner_user_id"] == owner_id;
+            let state_match = home["state"] == "local";
+            let primary_member_match = member_ids
+                .first()
+                .is_some_and(|id| member_is_active(&home, id));
+            let secondary_member_match = member_ids
+                .get(1)
+                .is_none_or(|id| member_is_active(&home, id));
+            let mut observation = PredicateObservation::new("active_home", side);
+            observation.group_match = Some(group_match);
+            observation.owner_match = Some(owner_match);
+            observation.state_match = Some(state_match);
+            observation.primary_member_match = Some(primary_member_match);
+            observation.secondary_member_match = Some(secondary_member_match);
+            observation = observation.count(members.map_or(0, Vec::len));
+            daemon.diagnostic.observation(observation)?;
+            let matches = group_match
+                && owner_match
+                && state_match
                 && member_ids.iter().all(|id| member_is_active(&home, id));
             if matches {
                 ensure_before_deadline(deadline, "after active Home observation")?;
@@ -668,16 +775,41 @@ async fn wait_for_active_home(
     }
 }
 
+fn identity_contract_observation(
+    side: &'static str,
+    agent: &Value,
+    profile: &Value,
+    card: &Value,
+) -> PredicateObservation {
+    let agent_id = agent.pointer("/agent_id").and_then(Value::as_str);
+    let machine_id = agent.pointer("/machine_id").and_then(Value::as_str);
+    let user_id = agent.pointer("/user_id").and_then(Value::as_str);
+    let mut observation = PredicateObservation::new("identity_contract", side);
+    observation.ok_match = Some(
+        agent_id.is_some_and(|value| value.len() == 64)
+            && machine_id.is_some_and(|value| value.len() == 64)
+            && user_id.is_some_and(|value| value.len() == 64),
+    );
+    observation.agent_match = Some(agent_id.is_some_and(|value| card["card"]["agent_id"] == value));
+    observation.machine_match =
+        Some(machine_id.is_some_and(|value| card["card"]["machine_id"] == value));
+    observation.owner_match = Some(user_id.is_some_and(|value| card["card"]["user_id"] == value));
+    observation.name_match = Some(
+        card["card"]["display_name"] == profile["display_name"]
+            && card["card"]["owner_name"] == profile["human_name"],
+    );
+    observation
+}
+
 fn assert_identity_contract(agent: &Value, profile: &Value, card: &Value) -> Result<()> {
-    let agent_id = string_field(agent, "/agent_id")?;
-    let machine_id = string_field(agent, "/machine_id")?;
-    let user_id = string_field(agent, "/user_id")?;
-    ensure!(agent_id.len() == 64 && machine_id.len() == 64 && user_id.len() == 64);
-    ensure!(card["card"]["agent_id"] == agent_id);
-    ensure!(card["card"]["machine_id"] == machine_id);
-    ensure!(card["card"]["user_id"] == user_id);
-    ensure!(card["card"]["display_name"] == profile["display_name"]);
-    ensure!(card["card"]["owner_name"] == profile["human_name"]);
+    let observation = identity_contract_observation("none", agent, profile, card);
+    ensure!(
+        observation.ok_match == Some(true)
+            && observation.agent_match == Some(true)
+            && observation.machine_match == Some(true)
+            && observation.owner_match == Some(true)
+            && observation.name_match == Some(true)
+    );
     Ok(())
 }
 
@@ -689,6 +821,7 @@ fn assert_enrollment_contract(body: &Value, machine_id: &str) -> Result<()> {
 
 async fn wait_for_owned_peer(
     daemon: &OwnedDaemon,
+    side: &'static str,
     owner_user_id: &str,
     peer_agent_id: &str,
     peer_machine_id: &str,
@@ -696,14 +829,18 @@ async fn wait_for_owned_peer(
 ) -> Result<()> {
     loop {
         if let Ok(roster) = daemon.get_before(deadline, "/owner/agents").await {
-            let ready = roster["owner_user_id"] == owner_user_id
-                && roster["agents"].as_array().is_some_and(|agents| {
-                    agents.iter().any(|agent| {
-                        agent["agent_id"] == peer_agent_id
-                            && agent["machine_id"] == peer_machine_id
-                            && agent["revoked"] == false
-                    })
-                });
+            let observation = owned_peer_observation(
+                side,
+                &roster,
+                owner_user_id,
+                peer_agent_id,
+                peer_machine_id,
+            );
+            let ready = observation.owner_match == Some(true)
+                && observation.agent_match == Some(true)
+                && observation.machine_match == Some(true)
+                && observation.revoked_match == Some(true);
+            daemon.diagnostic.observation(observation)?;
             if ready {
                 ensure_before_deadline(deadline, "after owner roster observation")?;
                 return Ok(());
@@ -713,6 +850,37 @@ async fn wait_for_owned_peer(
             .await
             .context("owner-certified peer readiness did not converge")?;
     }
+}
+
+fn owned_peer_observation(
+    side: &'static str,
+    roster: &Value,
+    owner_user_id: &str,
+    peer_agent_id: &str,
+    peer_machine_id: &str,
+) -> PredicateObservation {
+    let agents = roster["agents"].as_array();
+    let peer = agents.and_then(|agents| {
+        agents
+            .iter()
+            .find(|agent| {
+                agent["agent_id"] == peer_agent_id
+                    && agent["machine_id"] == peer_machine_id
+                    && agent["revoked"] == false
+            })
+            .or_else(|| {
+                agents
+                    .iter()
+                    .find(|agent| agent["agent_id"] == peer_agent_id)
+            })
+    });
+    let mut observation = PredicateObservation::new("owner_sync", side);
+    observation.owner_match = Some(roster["owner_user_id"] == owner_user_id);
+    observation.agent_match = Some(peer.is_some());
+    observation.machine_match =
+        Some(peer.is_some_and(|agent| agent["machine_id"] == peer_machine_id));
+    observation.revoked_match = Some(peer.is_some_and(|agent| agent["revoked"] == false));
+    observation.count(agents.map_or(0, Vec::len))
 }
 
 #[derive(Clone, Copy)]
@@ -760,12 +928,38 @@ async fn wait_for_canonical_home(
         let owner_home = owner.get_before(deadline, "/home").await;
         let joiner_home = joiner.get_before(deadline, "/home").await;
         if let (Ok(owner_home), Ok(joiner_home)) = (owner_home, joiner_home) {
-            if owner_home["owner_user_id"] == owner_user_id
-                && joiner_home["owner_user_id"] == owner_user_id
+            let owner_match = owner_home["owner_user_id"] == owner_user_id;
+            let joiner_owner_match = joiner_home["owner_user_id"] == owner_user_id;
+            let side = canonical_side(&owner_home, &joiner_home, owner_agent_id, joiner_agent_id);
+            let owner_state_candidate =
+                owner_home["state"] == "local" && joiner_home["state"] == "adoption_pending";
+            let joiner_state_candidate =
+                joiner_home["state"] == "local" && owner_home["state"] == "adoption_pending";
+            let observed_side = if side.is_some_and(|value| matches!(value, CanonicalSide::Owner))
+                || owner_state_candidate
             {
-                if let Some(side) =
-                    canonical_side(&owner_home, &joiner_home, owner_agent_id, joiner_agent_id)
-                {
+                "owner"
+            } else if side.is_some_and(|value| matches!(value, CanonicalSide::Joiner))
+                || joiner_state_candidate
+            {
+                "joiner"
+            } else {
+                "none"
+            };
+            let mut observation = PredicateObservation::new("canonical_home", observed_side);
+            observation.owner_match = Some(owner_match && joiner_owner_match);
+            observation.group_match = Some(match observed_side {
+                "owner" => joiner_home["canonical_group_id"] == owner_home["group_id"],
+                "joiner" => owner_home["canonical_group_id"] == joiner_home["group_id"],
+                _ => false,
+            });
+            observation.state_match = Some(owner_state_candidate || joiner_state_candidate);
+            observation.primary_member_match = Some(member_is_active(&owner_home, owner_agent_id));
+            observation.secondary_member_match =
+                Some(member_is_active(&joiner_home, joiner_agent_id));
+            owner.diagnostic.observation(observation)?;
+            if owner_match && joiner_owner_match {
+                if let Some(side) = side {
                     let group_id = match side {
                         CanonicalSide::Owner => string_field(&owner_home, "/group_id")?,
                         CanonicalSide::Joiner => string_field(&joiner_home, "/group_id")?,
@@ -861,6 +1055,9 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
             json!({"human_name":"Fixture Owner","display_name":"owner-device","machine_name":"owner-machine"}),
         )
         .await?;
+    let mut observation = PredicateObservation::new("profile_update", "owner");
+    observation.status_match = Some(status == StatusCode::OK);
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK, "owner profile update failed");
     let (status, _) = joiner
         .put(
@@ -868,6 +1065,9 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
             json!({"human_name":"Fixture Owner","display_name":"joiner-device","machine_name":"joiner-machine"}),
         )
         .await?;
+    let mut observation = PredicateObservation::new("profile_update", "joiner");
+    observation.status_match = Some(status == StatusCode::OK);
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK, "joiner profile update failed");
 
     let owner_agent = owner.get("/agent").await?;
@@ -877,6 +1077,11 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     let owner_machine = string_field(&owner_agent, "/machine_id")?.to_owned();
     let joiner_machine = string_field(&joiner_agent, "/machine_id")?.to_owned();
     let owner_user = string_field(&owner_agent, "/user_id")?.to_owned();
+    let mut observation = PredicateObservation::new("identity_distinct", "both");
+    observation.agent_match = Some(owner_id != joiner_id);
+    observation.machine_match = Some(owner_machine != joiner_machine);
+    observation.owner_match = Some(owner_user == string_field(&joiner_agent, "/user_id")?);
+    diagnostic.observation(observation)?;
     ensure!(owner_id != joiner_id && owner_machine != joiner_machine);
     ensure!(owner_user == string_field(&joiner_agent, "/user_id")?);
 
@@ -888,8 +1093,14 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     let joiner_card = joiner
         .get("/agent/card?include_local_addresses=true")
         .await?;
-    assert_identity_contract(&owner_agent, &owner_profile, &owner_card)?;
-    assert_identity_contract(&joiner_agent, &joiner_profile, &joiner_card)?;
+    for (side, agent, profile, card) in [
+        ("owner", &owner_agent, &owner_profile, &owner_card),
+        ("joiner", &joiner_agent, &joiner_profile, &joiner_card),
+    ] {
+        let observation = identity_contract_observation(side, agent, profile, card);
+        diagnostic.observation(observation)?;
+        assert_identity_contract(agent, profile, card)?;
+    }
 
     diagnostic.phase("peer_connect")?;
     for (target, card) in [(&owner, &joiner_card), (&joiner, &owner_card)] {
@@ -899,11 +1110,25 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
                 json!({"card": string_field(card, "/link")?, "trust_level":"trusted"}),
             )
             .await?;
+        let mut observation = PredicateObservation::new(
+            "card_import",
+            if std::ptr::eq(target, &owner) {
+                "owner"
+            } else {
+                "joiner"
+            },
+        );
+        observation.status_match = Some(status == StatusCode::OK);
+        observation.ok_match = Some(body["ok"] == true);
+        diagnostic.observation(observation)?;
         ensure!(status == StatusCode::OK && body["ok"] == true);
     }
     let (status, _) = owner
         .post("/agents/connect", json!({"agent_id":joiner_id}))
         .await?;
+    let mut observation = PredicateObservation::new("peer_connect", "owner");
+    observation.status_match = Some(status == StatusCode::OK);
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK);
 
     diagnostic.phase("consent_negative")?;
@@ -913,6 +1138,9 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
             json!({"include_user_identity":true,"human_consent":false}),
         )
         .await?;
+    let mut observation = PredicateObservation::new("consent_negative", "joiner");
+    observation.status_match = Some(status == StatusCode::BAD_REQUEST);
+    diagnostic.observation(observation)?;
     ensure!(
         status == StatusCode::BAD_REQUEST,
         "consent-negative announce was accepted"
@@ -932,6 +1160,15 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
                 json!({"include_user_identity":true,"human_consent":true}),
             )
             .await?;
+        let side = if std::ptr::eq(daemon, &owner) {
+            "owner"
+        } else {
+            "joiner"
+        };
+        let mut observation = PredicateObservation::new("announce", side);
+        observation.status_match = Some(status == StatusCode::OK);
+        observation.ok_match = Some(body["include_user_identity"] == true);
+        diagnostic.observation(observation)?;
         ensure!(status == StatusCode::OK && body["include_user_identity"] == true);
         *count += 1;
     }
@@ -939,6 +1176,7 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     diagnostic.phase("owner_sync")?;
     wait_for_owned_peer(
         &owner,
+        "owner",
         &owner_user,
         &joiner_id,
         &joiner_machine,
@@ -947,6 +1185,7 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     .await?;
     wait_for_owned_peer(
         &joiner,
+        "joiner",
         &owner_user,
         &owner_id,
         &owner_machine,
@@ -959,9 +1198,9 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     // dial and inbound stream, while the self entries make the owner device
     // set complete on both sides as documented by the API contract.
     diagnostic.phase("device_enroll")?;
-    for (daemon, machines) in [
-        (&owner, [&owner_machine, &joiner_machine]),
-        (&joiner, [&joiner_machine, &owner_machine]),
+    for (side, daemon, machines) in [
+        ("owner", &owner, [&owner_machine, &joiner_machine]),
+        ("joiner", &joiner, [&joiner_machine, &owner_machine]),
     ] {
         for machine_id in machines {
             let (status, body) = daemon
@@ -971,6 +1210,11 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
                     json!({"machine_id":machine_id}),
                 )
                 .await?;
+            let mut observation = PredicateObservation::new("device_enroll", side);
+            observation.status_match = Some(status == StatusCode::OK);
+            observation.ok_match = Some(body["ok"] == true);
+            observation.machine_match = Some(body["machine_id"] == machine_id.as_str());
+            diagnostic.observation(observation)?;
             ensure!(status == StatusCode::OK);
             assert_enrollment_contract(&body, machine_id)?;
         }
@@ -998,6 +1242,10 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
             json!({"name":"Fixture Home"}),
         )
         .await?;
+    let mut observation = PredicateObservation::new("home_rename", "canonical");
+    observation.status_match = Some(status == StatusCode::OK);
+    observation.ok_match = Some(renamed["ok"] == true);
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK && renamed["ok"] == true);
     let (status, seat) = canonical
         .post_before(
@@ -1006,6 +1254,12 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
             json!({"agent_id":adopting_id}),
         )
         .await?;
+    let mut observation = PredicateObservation::new("seat_invite", "canonical");
+    observation.status_match = Some(status == StatusCode::OK);
+    observation.ok_match = Some(seat["seated"] == false);
+    observation.group_match = Some(seat["group_id"] == home_id);
+    observation.owner_match = Some(seat["owner_user_id"] == owner_user);
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK && seat["seated"] == false);
     ensure!(seat["group_id"] == home_id && seat["owner_user_id"] == owner_user);
     let invite = string_field(&seat, "/invite")?.to_owned();
@@ -1018,6 +1272,10 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
             json!({"invite":invite,"mode":"home","expected_owner_user_id":"00".repeat(32)}),
         )
         .await?;
+    let mut observation = PredicateObservation::new("wrong_owner_negative", "adopting");
+    observation.status_match = Some(status == StatusCode::CONFLICT);
+    observation.ok_match = Some(wrong_pin["error"] == "owner_mismatch");
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::CONFLICT && wrong_pin["error"] == "owner_mismatch");
     diagnostic.phase("wrong_mode_negative")?;
     let (status, wrong_mode) = adopting
@@ -1027,6 +1285,10 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
             json!({"invite":invite,"mode":"group"}),
         )
         .await?;
+    let mut observation = PredicateObservation::new("wrong_mode_negative", "adopting");
+    observation.status_match = Some(status == StatusCode::CONFLICT);
+    observation.ok_match = Some(wrong_mode["error"] == "use_home_mode");
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::CONFLICT && wrong_mode["error"] == "use_home_mode");
     diagnostic.phase("home_join")?;
     let (status, joined) = adopting
@@ -1036,12 +1298,20 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
             json!({"invite":invite,"display_name":adopting_name,"mode":"home","expected_owner_user_id":owner_user}),
         )
         .await?;
+    let mut observation = PredicateObservation::new("home_join", "adopting");
+    observation.status_match = Some(status == StatusCode::OK);
+    observation.group_match = Some(joined["group_id"] == home_id);
+    observation.state_match = Some(
+        joined["join_state"] == "pending_authority_commit" || joined["join_state"] == "active",
+    );
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK && joined["group_id"] == home_id);
     ensure!(joined["join_state"] == "pending_authority_commit" || joined["join_state"] == "active");
 
     diagnostic.phase("active_home")?;
     let _ = wait_for_active_home(
         &owner,
+        "owner",
         &home_id,
         &owner_user,
         &[&owner_id, &joiner_id],
@@ -1050,6 +1320,7 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     .await?;
     let _ = wait_for_active_home(
         &joiner,
+        "joiner",
         &home_id,
         &owner_user,
         &[&owner_id, &joiner_id],
@@ -1061,6 +1332,10 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     let (status, sealed) = canonical
         .post(&format!("/groups/{home_id}/state/seal"), json!({}))
         .await?;
+    let mut observation = PredicateObservation::new("seal", "canonical");
+    observation.status_match = Some(status == StatusCode::OK);
+    observation.ok_match = Some(sealed["ok"] == true);
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK && sealed["ok"] == true);
 
     diagnostic.phase("initial_stop")?;
@@ -1089,6 +1364,16 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     diagnostic.phase("restart_identity")?;
     let owner_after = owner.get("/agent").await?;
     let joiner_after = joiner.get("/agent").await?;
+    let mut observation = PredicateObservation::new("restart_identity", "both");
+    observation.agent_match = Some(
+        string_field(&owner_after, "/agent_id")? == owner_id
+            && string_field(&joiner_after, "/agent_id")? == joiner_id,
+    );
+    observation.machine_match = Some(
+        string_field(&owner_after, "/machine_id")? == owner_machine
+            && string_field(&joiner_after, "/machine_id")? == joiner_machine,
+    );
+    diagnostic.observation(observation)?;
     ensure!(string_field(&owner_after, "/agent_id")? == owner_id);
     ensure!(string_field(&owner_after, "/machine_id")? == owner_machine);
     ensure!(string_field(&joiner_after, "/agent_id")? == joiner_id);
@@ -1097,6 +1382,7 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     let restart_deadline = tokio::time::Instant::now() + ONBOARDING_TIMEOUT;
     let owner_home = wait_for_active_home(
         &owner,
+        "owner",
         &home_id,
         &owner_user,
         &[&owner_id, &joiner_id],
@@ -1105,12 +1391,17 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     .await?;
     let joiner_home = wait_for_active_home(
         &joiner,
+        "joiner",
         &home_id,
         &owner_user,
         &[&owner_id, &joiner_id],
         restart_deadline,
     )
     .await?;
+    let mut observation = PredicateObservation::new("restart_home_name", "both");
+    observation.name_match =
+        Some(owner_home["name"] == "Fixture Home" && joiner_home["name"] == "Fixture Home");
+    diagnostic.observation(observation)?;
     ensure!(owner_home["name"] == "Fixture Home" && joiner_home["name"] == "Fixture Home");
     diagnostic.phase("restart_seal")?;
     let seal_daemon = match canonical_side {
@@ -1120,6 +1411,10 @@ async fn run_home_onboarding_scenario(diagnostic: TestDiagnostic) -> Result<()> 
     let (status, sealed_after) = seal_daemon
         .post(&format!("/groups/{home_id}/state/seal"), json!({}))
         .await?;
+    let mut observation = PredicateObservation::new("restart_seal", "canonical");
+    observation.status_match = Some(status == StatusCode::OK);
+    observation.ok_match = Some(sealed_after["ok"] == true);
+    diagnostic.observation(observation)?;
     ensure!(status == StatusCode::OK && sealed_after["ok"] == true);
     diagnostic.phase("final_stop")?;
     joiner.stop().await?;
@@ -1187,6 +1482,121 @@ fn flattened_api_contracts_are_required_for_identity_and_enrollment() -> Result<
     assert!(assert_identity_contract(&nested_agent, &nested_profile, &card).is_err());
     assert!(assert_enrollment_contract(&nested_enrollment, &machine_id).is_err());
     Ok(())
+}
+
+#[test]
+fn owner_sync_observation_distinguishes_each_closed_predicate() {
+    let owner = "a".repeat(64);
+    let agent = "b".repeat(64);
+    let machine = "c".repeat(64);
+    let roster = |owner_id: &str, machine_id: Value, revoked: bool| {
+        json!({
+            "ok": true,
+            "owner_user_id": owner_id,
+            "agents": [{
+                "agent_id": agent,
+                "machine_id": machine_id,
+                "revoked": revoked,
+            }],
+        })
+    };
+
+    let ready = owned_peer_observation(
+        "owner",
+        &roster(&owner, json!(machine), false),
+        &owner,
+        &agent,
+        &machine,
+    );
+    assert_eq!(ready.owner_match, Some(true));
+    assert_eq!(ready.agent_match, Some(true));
+    assert_eq!(ready.machine_match, Some(true));
+    assert_eq!(ready.revoked_match, Some(true));
+    assert_eq!(ready.observed_count, Some(1));
+
+    let wrong_owner = owned_peer_observation(
+        "owner",
+        &roster(&"d".repeat(64), json!(machine), false),
+        &owner,
+        &agent,
+        &machine,
+    );
+    assert_eq!(wrong_owner.owner_match, Some(false));
+    assert_eq!(wrong_owner.agent_match, Some(true));
+
+    let missing_machine = owned_peer_observation(
+        "owner",
+        &roster(&owner, Value::Null, false),
+        &owner,
+        &agent,
+        &machine,
+    );
+    assert_eq!(missing_machine.agent_match, Some(true));
+    assert_eq!(missing_machine.machine_match, Some(false));
+    assert_eq!(missing_machine.revoked_match, Some(true));
+
+    let revoked = owned_peer_observation(
+        "owner",
+        &roster(&owner, json!(machine), true),
+        &owner,
+        &agent,
+        &machine,
+    );
+    assert_eq!(revoked.machine_match, Some(true));
+    assert_eq!(revoked.revoked_match, Some(false));
+
+    let duplicate_with_later_valid = json!({
+        "ok": true,
+        "owner_user_id": owner,
+        "agents": [
+            {
+                "agent_id": agent,
+                "machine_id": "wrong-machine",
+                "revoked": true,
+            },
+            {
+                "agent_id": agent,
+                "machine_id": machine,
+                "revoked": false,
+            },
+        ],
+    });
+    let later_valid = owned_peer_observation(
+        "owner",
+        &duplicate_with_later_valid,
+        &owner,
+        &agent,
+        &machine,
+    );
+    assert_eq!(later_valid.agent_match, Some(true));
+    assert_eq!(later_valid.machine_match, Some(true));
+    assert_eq!(later_valid.revoked_match, Some(true));
+    assert_eq!(later_valid.observed_count, Some(2));
+
+    let duplicate_without_valid = json!({
+        "ok": true,
+        "owner_user_id": owner,
+        "agents": [
+            {
+                "agent_id": agent,
+                "machine_id": "wrong-machine",
+                "revoked": false,
+            },
+            {
+                "agent_id": agent,
+                "machine_id": machine,
+                "revoked": true,
+            },
+        ],
+    });
+    let only_invalid =
+        owned_peer_observation("owner", &duplicate_without_valid, &owner, &agent, &machine);
+    assert_eq!(only_invalid.agent_match, Some(true));
+    assert!(
+        only_invalid.machine_match != Some(true) || only_invalid.revoked_match != Some(true),
+        "separate invalid rows must not combine into one ready peer"
+    );
+    assert_eq!(only_invalid.observed_count, Some(2));
 }
 
 #[tokio::test(start_paused = true)]

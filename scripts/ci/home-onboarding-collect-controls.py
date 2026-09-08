@@ -44,12 +44,26 @@ def diagnostic(result="passed", phase="complete"):
     children = {label: {"started": True, "cleanup": "reaped", "exit_code": 0,
                 "signaled": False, "escalation": "none"}
                 for label in collect.CHILD_LABELS}
-    return {"schema": 1, "test": collect.TEST_NAME, "run_nonce": NONCE,
+    observation = {"check": "none", "side": "none",
+                   **{field: None for field in collect.OBSERVATION_FIELDS},
+                   "observed_count": None, "count_capped": False}
+    return {"schema": 2, "test": collect.TEST_NAME, "run_nonce": NONCE,
             "source_head": HEAD, "source_tree": TREE, "entered": True,
             "phase": phase, "result": result,
             "failure_kind": "none" if result != "failed" else "stage_failed",
             "last_http_status": 200, "cli_exit_code": 0, "cli_signaled": False,
-            "children": children}
+            "observation": observation, "children": children}
+
+
+def owner_sync_observation(owner=True, agent=True, machine=True, not_revoked=True,
+                           count=1, side="owner"):
+    observation = {"check": "owner_sync", "side": side,
+                   **{field: None for field in collect.OBSERVATION_FIELDS},
+                   "observed_count": count, "count_capped": count > 256}
+    observation["observed_count"] = min(count, 256)
+    observation.update(owner_match=owner, agent_match=agent,
+                       machine_match=machine, revoked_match=not_revoked)
+    return observation
 
 
 def fixture(root: Path):
@@ -136,6 +150,22 @@ def main():
     rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
         **json.loads((run / "test-diagnostic.json").read_text()), "last_http_status": True}),
         "forged HTTP status accepted")
+    rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
+        **json.loads((run / "test-diagnostic.json").read_text()),
+        "observation": {**owner_sync_observation(), "raw_peer_id": "secret"}}),
+        "raw predicate field accepted")
+    rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
+        **json.loads((run / "test-diagnostic.json").read_text()),
+        "observation": {**owner_sync_observation(), "observed_count": 257}}),
+        "unbounded roster count accepted")
+    rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
+        **json.loads((run / "test-diagnostic.json").read_text()),
+        "observation": {**owner_sync_observation(), "machine_match": None}}),
+        "missing owner-sync operand accepted")
+    rejected(lambda run, wrapper: write(run / "test-diagnostic.json", {
+        **json.loads((run / "test-diagnostic.json").read_text()),
+        "observation": owner_sync_observation()}),
+        "out-of-phase predicate observation accepted")
     rejected(lambda run, wrapper: write(run / "nextest.json", {
         **json.loads((run / "nextest.json").read_text()), "raw_output": "secret"}),
         "raw nextest field accepted")
@@ -165,6 +195,21 @@ def main():
         assert result["phase"] == "announce" and result["failure_kind"] == "stage_failed"
         assert json.loads((safe / "outcome.json").read_text())["failure_stage"] == "test"
 
+    for field in ("owner_match", "machine_match", "revoked_match"):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory); run, safe, _ = fixture(temp)
+            value = diagnostic("failed", "owner_sync")
+            kwargs = {"owner": True, "agent": True, "machine": True,
+                      "not_revoked": True}
+            kwargs[{"owner_match": "owner", "machine_match": "machine",
+                    "revoked_match": "not_revoked"}[field]] = False
+            value["observation"] = owner_sync_observation(**kwargs)
+            write(run / "test-diagnostic.json", value)
+            assert not collect.sanitize(run, safe, temp, NONCE)
+            saved = json.loads((safe / "test-diagnostic.json").read_text())
+            assert saved["observation"][field] is False
+            assert saved["observation"]["observed_count"] == 1
+
     with tempfile.TemporaryDirectory() as directory:
         temp = Path(directory); run, safe, _ = fixture(temp)
         value = diagnostic("failed", "owner_initial_start")
@@ -191,7 +236,7 @@ def main():
 
     assert collect.admission_deadline_exit(915) is None
     assert collect.admission_deadline_exit(914.999) == 124
-    print("home onboarding collector controls: 20/20 passed")
+    print("home onboarding collector controls: 27/27 passed")
 
 
 if __name__ == "__main__":
