@@ -28,6 +28,7 @@
 //! which enforces the same gates in both directions. There is no voice
 //! bypass.
 
+use super::observation::{Cause, Stage};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -131,6 +132,7 @@ const RELIABLE_WRITE_BOUND: std::time::Duration = std::time::Duration::from_secs
 /// [`StreamType`]. The recv half is parked alongside so the peer's stream
 /// state stays open for the lane's lifetime.
 struct OutboundLane {
+    observation: super::observation::Token,
     send: ant_quic::HighLevelSendStream,
     _recv: ant_quic::HighLevelRecvStream,
 }
@@ -176,6 +178,7 @@ struct DatagramSession {
 /// [`LinkTransport`] over x0x `WebRtcV1` peer streams.
 pub struct X0xLinkTransport {
     agent: Arc<Agent>,
+    observation: Option<super::observation::Observation>,
     remote: AgentId,
     remote_addr_hint: std::sync::Mutex<SocketAddr>,
     running: AtomicBool,
@@ -212,6 +215,7 @@ impl X0xLinkTransport {
         let (accepted_tx, accepted_rx) = mpsc::channel(16);
         Self {
             agent,
+            observation: None,
             remote,
             remote_addr_hint: std::sync::Mutex::new(placeholder_addr()),
             running: AtomicBool::new(false),
@@ -229,6 +233,14 @@ impl X0xLinkTransport {
             datagram_frames_received: Arc::new(AtomicU64::new(0)),
             datagram_rate_limited: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Attach bounded passive diagnostics before starting this transport.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_observation(mut self, observation: super::observation::Observation) -> Self {
+        self.observation = Some(observation);
+        self
     }
 
     /// Pin which lane carries encoded audio (ADR-0042 c).
@@ -320,12 +332,16 @@ impl X0xLinkTransport {
             })?;
         let inbound_tx = self.inbound_tx.clone();
         let accepted_tx = self.accepted_peers_tx.clone();
+        let observation = self.observation.clone();
         let task = tokio::spawn(async move {
-            while let Some(stream) = acceptor.next().await {
+            while let Some(mut stream) = acceptor.next().await {
+                let token = super::observation::Token::new(observation.clone(), true, None);
+                token.identity(stream.peer().0, u64::from(stream.recv_mut().id()));
                 tokio::spawn(Self::drive_inbound_stream(
                     stream,
                     inbound_tx.clone(),
                     accepted_tx.clone(),
+                    token,
                 ));
             }
         });
@@ -371,6 +387,7 @@ impl X0xLinkTransport {
         mut stream: PeerStream,
         inbound_tx: mpsc::Sender<(PeerConnection, StreamType, Vec<u8>)>,
         accepted_tx: mpsc::Sender<PeerConnection>,
+        mut observation: super::observation::Token,
     ) {
         let peer_conn = PeerConnection {
             peer_id: hex::encode(stream.agent().0),
@@ -379,37 +396,50 @@ impl X0xLinkTransport {
         let recv = stream.recv_mut();
 
         let mut ty = [0u8; 1];
-        if recv.read_exact(&mut ty).await.is_err() {
+        if let Err(error) = recv.read_exact(&mut ty).await {
+            observation.read_error(Stage::TypePrefix, &error);
             return;
         }
         let Some(stream_type) = StreamType::try_from_u8(ty[0]) else {
+            observation.end(Cause::InvalidType);
             tracing::warn!(target: "voice", byte = ty[0], "unknown media StreamType; lane dropped");
             return;
         };
         // Surface the accepted peer once per inbound lane (accept() feed).
+        observation.prefix_complete(stream_type.as_u8());
         let _ = accepted_tx.try_send(peer_conn.clone());
 
         loop {
+            observation.stage(Stage::FrameLength);
             let mut len_buf = [0u8; 4];
-            if recv.read_exact(&mut len_buf).await.is_err() {
+            if let Err(error) = recv.read_exact(&mut len_buf).await {
+                observation.read_error(Stage::FrameLength, &error);
                 return; // peer closed the lane
             }
             let len = u32::from_be_bytes(len_buf);
             if len == 0 || len > MAX_FRAME_BYTES {
+                observation.end(Cause::InvalidLength);
                 tracing::warn!(target: "voice", len, "invalid frame length; lane dropped");
                 return;
             }
+            observation.valid_length();
+            observation.stage(Stage::FramePayload);
             let mut frame = vec![0u8; len as usize];
-            if recv.read_exact(&mut frame).await.is_err() {
+            if let Err(error) = recv.read_exact(&mut frame).await {
+                observation.read_error(Stage::FramePayload, &error);
                 return;
             }
+            observation.fully_read();
+            observation.stage(Stage::Forwarding);
             if inbound_tx
                 .send((peer_conn.clone(), stream_type, frame))
                 .await
                 .is_err()
             {
+                observation.end(Cause::ConsumerClosed);
                 return; // transport dropped
             }
+            observation.forwarded();
         }
     }
 
@@ -745,31 +775,49 @@ impl X0xLinkTransport {
                 LinkTransportError::SendError(format!("frame length {} out of range", data.len()))
             })?;
 
+        if let Some(observation) = &self.observation {
+            observation.logical_send();
+        }
         let mut lanes = self.lanes.lock().await;
         // First attempt on the cached lane (opening it if absent); on a
         // write failure evict and re-open once on the current
         // connection.
         for attempt in 0..2 {
+            let mut observation_attempt;
             if let std::collections::hash_map::Entry::Vacant(slot) =
                 lanes.entry(stream_type.as_u8())
             {
+                let mut observation = super::observation::Token::new(
+                    self.observation.clone(),
+                    false,
+                    Some(stream_type.as_u8()),
+                );
+                observation_attempt = observation.attempt();
                 let mut stream = self
                     .agent
                     .open_peer_stream(&self.remote, StreamProtocol::WebRtcV1)
                     .await
                     .map_err(|e| {
+                        observation_attempt.fail(Cause::OpenError);
+                        observation.end(Cause::OpenError);
                         LinkTransportError::SendError(format!("open WebRtcV1 lane: {e}"))
                     })?;
+                observation.identity(stream.peer().0, u64::from(stream.send_mut().id()));
+                observation_attempt.stage(Stage::TypePrefix);
                 match tokio::time::timeout(
                     RELIABLE_WRITE_BOUND,
                     stream.send_mut().write_all(&[stream_type.as_u8()]),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        observation.prefix_complete(stream_type.as_u8());
+                    }
                     // A stream whose open/prefix write already failed is
                     // useless — do not cache it.
                     Ok(Err(e)) if attempt == 0 => {
+                        observation_attempt.write_error(&e);
+                        observation.end(Cause::PrefixDiscard);
                         tracing::warn!(
                             target: "voice",
                             error = %e,
@@ -777,8 +825,14 @@ impl X0xLinkTransport {
                         );
                         continue; // evicted by not inserting; retry open
                     }
-                    Ok(Err(e)) => return Err(lt_err("write StreamType byte", e)),
+                    Ok(Err(e)) => {
+                        observation_attempt.write_error(&e);
+                        observation.end(Cause::PrefixDiscard);
+                        return Err(lt_err("write StreamType byte", e));
+                    }
                     Err(_) if attempt == 0 => {
+                        observation_attempt.fail(Cause::Timeout);
+                        observation.end(Cause::PrefixDiscard);
                         tracing::warn!(
                             target: "voice",
                             "lane prefix write exceeded bound; reopening on the current connection"
@@ -786,13 +840,25 @@ impl X0xLinkTransport {
                         continue;
                     }
                     Err(_) => {
+                        observation_attempt.fail(Cause::Timeout);
+                        observation.end(Cause::PrefixDiscard);
                         return Err(LinkTransportError::SendError(
                             "lane prefix write timed out — connection likely replaced".to_owned(),
                         ));
                     }
                 }
                 let (send, recv) = stream.into_split();
-                slot.insert(OutboundLane { send, _recv: recv });
+                slot.insert(OutboundLane {
+                    send,
+                    _recv: recv,
+                    observation,
+                });
+            } else if let Some(lane) = lanes.get(&stream_type.as_u8()) {
+                observation_attempt = lane.observation.attempt();
+            } else {
+                // Preserve the existing vanished-lane error below; no stream
+                // operation is added by the unattached diagnostic token.
+                observation_attempt = super::observation::Token::new(None, false, None).attempt();
             }
             let Some(lane) = lanes.get_mut(&stream_type.as_u8()) else {
                 return Err(LinkTransportError::SendError(
@@ -804,13 +870,20 @@ impl X0xLinkTransport {
             // write_all awaits forever. The bound converts that stall
             // into an eviction + reopen.
             let written = tokio::time::timeout(RELIABLE_WRITE_BOUND, async {
+                observation_attempt.stage(Stage::FrameLength);
                 lane.send.write_all(&len.to_be_bytes()).await?;
+                observation_attempt.stage(Stage::FramePayload);
                 lane.send.write_all(data).await
             })
             .await;
             match written {
-                Ok(Ok(())) => return Ok(()),
+                Ok(Ok(())) => {
+                    observation_attempt.complete(data.len());
+                    return Ok(());
+                }
                 Ok(Err(e)) if attempt == 0 => {
+                    observation_attempt.write_error(&e);
+                    lane.observation.end(Cause::EvictedWriteError);
                     tracing::warn!(
                         target: "voice",
                         error = %e,
@@ -818,8 +891,13 @@ impl X0xLinkTransport {
                     );
                     lanes.remove(&stream_type.as_u8());
                 }
-                Ok(Err(e)) => return Err(lt_err("write frame", e)),
+                Ok(Err(e)) => {
+                    observation_attempt.write_error(&e);
+                    return Err(lt_err("write frame", e));
+                }
                 Err(_) if attempt == 0 => {
+                    observation_attempt.fail(Cause::Timeout);
+                    lane.observation.end(Cause::EvictedTimeout);
                     tracing::warn!(
                         target: "voice",
                         "reliable lane write exceeded bound; evicting and reopening on the current connection"
@@ -827,6 +905,7 @@ impl X0xLinkTransport {
                     lanes.remove(&stream_type.as_u8());
                 }
                 Err(_) => {
+                    observation_attempt.fail(Cause::Timeout);
                     return Err(LinkTransportError::SendError(
                         "reliable lane write timed out — connection likely replaced".to_owned(),
                     ));
@@ -977,7 +1056,13 @@ impl LinkTransport for X0xLinkTransport {
             lane.advert_listener.abort();
         }
         self.peer_datagram_capable.store(false, Ordering::SeqCst);
-        self.lanes.lock().await.clear();
+        {
+            let mut lanes = self.lanes.lock().await;
+            for lane in lanes.values_mut() {
+                lane.observation.end(Cause::Stop);
+            }
+            lanes.clear();
+        }
         Ok(())
     }
 

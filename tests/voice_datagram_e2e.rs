@@ -1380,6 +1380,24 @@ async fn connection_churn_falls_back_to_reliable() {
         .with_audio_lane_mode(AudioLaneMode::Datagram);
     let mut bob_link = X0xLinkTransport::new(Arc::clone(&bob), alice.agent_id())
         .with_audio_lane_mode(AudioLaneMode::Datagram);
+    // Declare after the transports so unwind freezes before their Drop hooks.
+    use x0x::voice::observation::{FailureCapture, Phase};
+    let mut capture = FailureCapture::new(bob.machine_id().0, alice.machine_id().0);
+    let alice_observation = capture.alice();
+    let bob_observation = capture.bob();
+    alice_link = alice_link.with_observation(alice_observation.clone());
+    bob_link = bob_link.with_observation(bob_observation.clone());
+    let alice_events = match alice.network() {
+        Some(network) => network.subscribe_all_peer_events().await,
+        None => None,
+    };
+    capture.subscribe(alice_observation, alice_events);
+    let bob_events = match bob.network() {
+        Some(network) => network.subscribe_all_peer_events().await,
+        None => None,
+    };
+    capture.subscribe(bob_observation.clone(), bob_events);
+    capture.phase(Phase::PreChurn);
     bob_link.start().await.expect("bob link");
     alice_link.start().await.expect("alice link");
     assert!(
@@ -1410,6 +1428,7 @@ async fn connection_churn_falls_back_to_reliable() {
             .await
             .expect("bob bound"),
     );
+    capture.phase(Phase::Disconnect);
     alice_network
         .disconnect(&bob_peer)
         .await
@@ -1418,6 +1437,7 @@ async fn connection_churn_falls_back_to_reliable() {
         .connect_addr(bob_addr)
         .await
         .expect("replacement connection");
+    capture.phase(Phase::Reconnected);
     // Let the replacement converge on BOTH sides (same discipline as
     // `trusted_pair`): a stream opened into a half-torn-down connection
     // gets reset by the teardown, not by the peer's accept loop.
@@ -1444,6 +1464,7 @@ async fn connection_churn_falls_back_to_reliable() {
         "reader exit on connection close must clear the capability flag"
     );
     let sent_at_churn = alice_link.datagram_frames_sent();
+    capture.phase(Phase::PostSendStart);
 
     // Post-churn audio: reliable lane, still delivered — the primed
     // cached stream from the dead connection must be evicted and
@@ -1468,15 +1489,19 @@ async fn connection_churn_falls_back_to_reliable() {
             .expect("post-churn send must fall back to the reliable lane");
     }
 
+    capture.phase(Phase::PostSendEnd);
+
     // Count AUDIO frames only: the primed + evicted Data-lane frames
     // also surface here (same inbound queue) and prove their own
     // delivery by arriving at all.
     let mut received = 0usize;
+    capture.phase(Phase::ReceiveStart);
     let deadline = Instant::now() + Duration::from_secs(30);
     while received < POST && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, bob_link.receive()).await {
             Ok(Ok((_, ty, _))) => {
+                bob_observation.consumed(ty.as_u8());
                 if ty == StreamType::Audio {
                     received += 1;
                 }
@@ -1485,6 +1510,7 @@ async fn connection_churn_falls_back_to_reliable() {
             Err(_) => break,
         }
     }
+    capture.phase(Phase::ReceiveEnd);
     assert_eq!(
         received, POST,
         "post-churn audio frames must arrive via the reliable lane"
@@ -1495,6 +1521,7 @@ async fn connection_churn_falls_back_to_reliable() {
         "no post-churn frame may leave as a datagram"
     );
 
+    capture.passed();
     let _ = alice_link.stop().await;
     let _ = bob_link.stop().await;
     alice.shutdown().await;

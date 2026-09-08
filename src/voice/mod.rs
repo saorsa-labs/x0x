@@ -28,6 +28,8 @@
 //! the gates in both directions.
 
 mod link_transport;
+#[doc(hidden)]
+pub mod observation;
 mod signaling;
 
 pub use link_transport::{VoiceLaneError, X0xLinkTransport};
