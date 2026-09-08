@@ -118,6 +118,8 @@ jobs:
         run: bash scripts/ci/nextest-isolated.sh --all-features --test daemon_api_integration -- -- --ignored
       - name: Run named group D4 signed commit integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_d4_apply -- -- --ignored
+      - name: Run bound-port forwarding regression
+        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
 
   # Groups: the heavy named-group daemon suite (28 daemon-backed tests),
   # isolated on its own runner so it cannot stack on core's cold build.
