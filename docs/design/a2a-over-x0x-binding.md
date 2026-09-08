@@ -1,6 +1,7 @@
 # A2A-over-x0x Transport Binding
 
-> **Status:** Design sketch.
+> **Status:** Unary packet 1 implemented; streaming, push and large-artifact
+> sections remain design sketches, not implemented binding guarantees.
 > **Date:** 2026-06-15
 > **Relates to:** A2A spec §5 (Protocol Binding Requirements) and §12 (Custom
 > Binding Guidelines); `x0x-transport-protocol-id.md`; `a2a-agent-card-adapter.md`.
@@ -28,8 +29,10 @@ Tagline: **"A2A semantics, x0x delivery."**
 | Push notifications | webhook POST | x0x gossip topic the client subscribes to (§6) |
 | **Data model (Task/Message/Part/Artifact)** | unchanged | **unchanged** |
 
-The A2A JSON-RPC envelope is reused verbatim as the payload; only the carriage
-changes. This keeps the binding thin and conformant.
+The A2A data model is carried inside a JSON-RPC envelope. Unary packet 1 sets
+the JSON-RPC `id` to the same opaque string as the binding `corrId`; response
+admission requires an exact echo (§4). Later capabilities in the table are
+design targets, not a claim of complete binding conformance.
 
 ## 3. Addressing & Discovery
 
@@ -43,27 +46,51 @@ changes. This keeps the binding thin and conformant.
 
 ## 4. Unary methods (message/send, tasks/get, tasks/cancel, …)
 
-Carried as request/response over a `RawQuicAcked` direct message:
+Packet 1 carries unary request/response through `send_direct_with_config`,
+preferring `RawQuicAcked` and retaining the configured delivery fallback:
 
 ```
 A2A client                                   A2A server (x0x agent)
    │  DM payload = {                              │
    │    "x0xBinding": "a2a/1",                    │
-   │    "corrId": "<uuid>",                       │
+   │    "corrId": "<opaque-corr-id>",                       │
    │    "kind": "request",                        │
-   │    "jsonrpc": { ...verbatim A2A JSON-RPC... }│
+   │    "jsonrpc": { "id": "<opaque-corr-id>", ... }│
    │  }                                           │
    ├─────── send_direct(serverAgentId) ──────────▶
    │                                              │ process; produce A2A result
    ◀────── DM { corrId, kind:"response", jsonrpc:{result|error} } ─┤
 ```
 
-- Correlation: `corrId` ties response to request (DM has no native req/resp).
-- Delivery proof: `RawQuicAcked` provides application-layer ACK; on timeout the
-  client MAY retry with the same `corrId` (idempotent on the server by `corrId`).
-- Max payload: 16 MB per `MAX_DIRECT_PAYLOAD_SIZE`. Larger artifacts use §7.
+- Correlation: `corrId` is opaque. Peers echo it verbatim and must not parse it
+  as a bare UUID. `BindingSession::call` emits `<uuid>-<call-token>` and uses
+  that exact string as the JSON-RPC `id`. Every public `call` allocates a fresh
+  ID; the API does not accept a caller-supplied ID for retries.
+- Response admission: a pending call accepts only a response with verified
+  provenance from the expected peer, literal `"jsonrpc": "2.0"`, the exact
+  echoed JSON-RPC `id`, and exactly one of `result` or a well-formed `error`.
+  JSON `null` is a valid result. A refused response leaves the waiter pending;
+  an unverified response cannot complete a call even from the claimed peer.
+  A legitimate raw response from an as-yet-unlearned peer can carry
+  `verified=false` and leave the call to time out until real authenticated
+  AgentId→MachineId identity evidence is available. A successful connection
+  or a connected-registry route alone does not establish that evidence.
+  Later discovery does not retroactively admit an already discarded response;
+  the handler may already have run, so retrying can duplicate side effects.
+- Lifetime: the waiter is registered before sending and removed on completion,
+  send failure, timeout or cancellation. A late response without a pending
+  call is ignored. This is in-flight correlation, not a durable replay cache.
+- Delivery and retries: a DM ACK is not proof that the A2A handler completed.
+  A timeout leaves the application outcome unknown: the request may be
+  unapplied, or its side effects may already have happened without an admitted
+  response. Packet 1 provides no server-side durable deduplication or
+  idempotency guarantee by `corrId`; a new call, or a replayed request with the
+  same ID, can duplicate side effects. Applications must decide whether an
+  operation is safe to retry or provide their own idempotency mechanism.
+- Max payload: 16 MB per `MAX_DIRECT_PAYLOAD_SIZE`; the larger-artifact mapping
+  in §7 remains a future binding design.
 
-## 5. Streaming (message/stream)
+## 5. Streaming (message/stream) — future increment
 
 A2A streaming yields a sequence of `Task` / `statusUpdate` / `artifactUpdate`
 events. Over x0x:
@@ -76,7 +103,7 @@ events. Over x0x:
 - `seq` gives ordering/gap detection; `RawQuicAcked` gives reliability. This is
   the x0x equivalent of A2A's SSE event stream.
 
-## 6. Push notifications (long-running tasks, disconnected client)
+## 6. Push notifications (long-running tasks, disconnected client) — future increment
 
 A2A push config (`CreateTaskPushNotificationConfig`, …) maps to a **gossip
 topic** instead of a webhook URL:
@@ -89,14 +116,14 @@ topic** instead of a webhook URL:
 - Authenticity: push events are signed by the server agent; client verifies via
   `/agent/verify`.
 
-## 7. Large artifacts
+## 7. Large artifacts — future increment
 
 Artifacts exceeding the DM cap are published to a KvStore topic (`/stores`,
 existing CardStore mechanism) and referenced from the A2A `Artifact` as a
 `FilePart` whose URI is `x0x://store/<topic>/<key>`. Recipient fetches via the
 KvStore API. Keeps the control path small and reuses replicated storage.
 
-## 8. Conformance to A2A §5
+## 8. Intended conformance to A2A §5
 
 - **Method coverage:** all A2A core methods (`message/send`, `message/stream`,
   `tasks/get`, `tasks/cancel`, push-config CRUD) are representable (§4-6).
@@ -106,7 +133,7 @@ KvStore API. Keeps the control path small and reuses replicated storage.
   (adapter doc), so an A2A client that lacks the x0x binding can fall back to a
   declared HTTP interface if the agent also exposes one (dual-stack agents).
 
-## 9. Implementation surface (reuse, don't add)
+## 9. Implementation surface
 
 | Need | Existing x0x surface |
 |------|----------------------|
@@ -117,8 +144,11 @@ KvStore API. Keeps the control path small and reuses replicated storage.
 | Sender authenticity | `DirectMessage.verified` + `trust_decision`; `/agent/verify` |
 | Connection | `POST /agents/connect` |
 
-A reference implementation is mostly an A2A JSON-RPC envelope codec plus the
-correlation/seq bookkeeping in §4-6 — no new transport machinery.
+`src/a2a/binding.rs` implements the envelope codec and unary correlation in
+§4. Streaming/sequence bookkeeping, push notifications and large-artifact
+transfer in §5-7 are not implemented by packet 1; its served Agent Card keeps
+`streaming` and `pushNotifications` false. The existing transport surfaces in
+the table do not themselves establish those later binding contracts.
 
 ## 10. Open questions
 

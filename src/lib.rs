@@ -255,9 +255,10 @@ pub struct Agent {
     network: Option<std::sync::Arc<network::NetworkNode>>,
     /// The gossip runtime for pub/sub messaging.
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
-    /// Opt-out for the whole-network legacy DM bus. Installed on the
-    /// pub/sub manager during build, before `join_network` can start event
-    /// listeners and reverse-ACK pre-warm tasks.
+    /// Disable the inbox's legacy-bus subscription, reverse-ACK bus pre-warm,
+    /// and legacy ACK hedge. Installed during build before network listeners.
+    /// Default false; sender bus fallback is unchanged. Bus-only senders
+    /// cannot reach this inbox when enabled.
     skip_legacy_dm_bus: bool,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
@@ -2836,8 +2837,9 @@ pub struct AgentBuilder {
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
     gossip_config: Option<gossip::GossipConfig>,
-    /// Keep the DM inbox off the compatibility bus. Default is false for
-    /// rolling compatibility; the daemon exposes this as an opt-in setting.
+    /// Opt out of the inbox's legacy-bus subscription, reverse-ACK bus
+    /// pre-warm, and legacy ACK hedge. Default false; sender bus fallback
+    /// stays enabled, but bus-only senders cannot reach the opted-out inbox.
     skip_legacy_dm_bus: bool,
     peer_cache_dir: Option<std::path::PathBuf>,
     /// When true, skip opening the bootstrap peer cache entirely.
@@ -14280,9 +14282,13 @@ impl AgentBuilder {
         self
     }
 
-    /// Opt out of the whole-network compatibility DM bus. The choice is
-    /// installed before any network event listener starts, so reverse-ACK
-    /// pre-warming cannot rejoin the bus after startup.
+    /// Opt out of the inbox's compatibility-bus subscription, reverse-ACK
+    /// bus pre-warming, and legacy ACK hedge. Installed before network event
+    /// listeners start. Defaults to false for rolling compatibility.
+    ///
+    /// Sender-side fallback to the bus is deliberately unchanged. With this
+    /// enabled, bus-only senders no longer reach this inbox; targeted inbox
+    /// delivery and targeted/Direct ACK routes remain available.
     #[must_use]
     pub fn with_skip_legacy_dm_bus(mut self, skip: bool) -> Self {
         self.skip_legacy_dm_bus = skip;

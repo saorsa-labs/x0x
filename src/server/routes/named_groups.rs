@@ -41244,6 +41244,198 @@ pub(in crate::server) mod tests {
         }
     }
 
+    async fn wait_for_public_history_row(
+        state: &AppState,
+        stable_group_id: &str,
+        canonical_id: &str,
+        provenance: x0x::history::Provenance,
+    ) -> x0x::history::StoredRecord {
+        for _ in 0..40 {
+            if let Some(history) = state.agent.history() {
+                let rows = history
+                    .store()
+                    .query(&x0x::history::HistoryQuery {
+                        scope: Some(x0x::history::Scope::Group(stable_group_id.to_string())),
+                        ..Default::default()
+                    })
+                    .expect("query public history");
+                if let Some(row) = rows.into_iter().find(|row| {
+                    row.record.provenance == provenance
+                        && row
+                            .record
+                            .signed_artifact
+                            .as_deref()
+                            .and_then(|artifact| {
+                                serde_json::from_slice::<x0x::groups::GroupPublicMessage>(artifact)
+                                    .ok()
+                            })
+                            .is_some_and(|message| message.msg_id() == canonical_id)
+                }) {
+                    return row;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!(
+            "public history row did not commit: group={stable_group_id} canonical={canonical_id} provenance={provenance:?}"
+        );
+    }
+
+    fn is_public_history_row(row: &x0x::history::StoredRecord, canonical_id: &str) -> bool {
+        row.record
+            .signed_artifact
+            .as_deref()
+            .and_then(|artifact| {
+                serde_json::from_slice::<x0x::groups::GroupPublicMessage>(artifact).ok()
+            })
+            .is_some_and(|message| message.msg_id() == canonical_id)
+    }
+
+    fn public_history_rows(
+        state: &AppState,
+        stable_group_id: &str,
+        canonical_id: &str,
+    ) -> Vec<x0x::history::StoredRecord> {
+        let Some(history) = state.agent.history() else {
+            return Vec::new();
+        };
+        history
+            .store()
+            .query(&x0x::history::HistoryQuery {
+                scope: Some(x0x::history::Scope::Group(stable_group_id.to_string())),
+                ..Default::default()
+            })
+            .expect("query public history")
+            .into_iter()
+            .filter(|row| is_public_history_row(row, canonical_id))
+            .collect()
+    }
+
+    async fn exercise_public_recorder_order(
+        sender: &AppState,
+        remote: &AppState,
+        sender_group_key: &str,
+        remote_group_key: &str,
+        stable_group_id: &str,
+        message: x0x::groups::GroupPublicMessage,
+        cache_first: bool,
+    ) {
+        let canonical_id = message.msg_id();
+        if cache_first {
+            cache_public_message(sender, message.clone()).await;
+        } else {
+            ingest_public_message(sender, message.clone(), sender_group_key).await;
+        }
+        // The first real recorder must commit a LocalSend row on its own;
+        // otherwise the second entry point could mask a no-op implementation.
+        let first_row = wait_for_public_history_row(
+            sender,
+            stable_group_id,
+            &canonical_id,
+            x0x::history::Provenance::LocalSend,
+        )
+        .await;
+        assert_eq!(first_row.record.payload, message.body.as_bytes());
+
+        if cache_first {
+            ingest_public_message(sender, message.clone(), sender_group_key).await;
+        } else {
+            cache_public_message(sender, message.clone()).await;
+        }
+        // Keep the receiver separate so this same signed artifact takes the
+        // verified-envelope provenance path.
+        ingest_public_message(remote, message.clone(), remote_group_key).await;
+        let sender_rows = public_history_rows(sender, stable_group_id, &canonical_id);
+        assert_eq!(
+            sender_rows.len(),
+            1,
+            "both sender recorders must deduplicate to one canonical row"
+        );
+        let sender_row = sender_rows.into_iter().next().expect("one sender row");
+        let remote_row = wait_for_public_history_row(
+            remote,
+            stable_group_id,
+            &canonical_id,
+            x0x::history::Provenance::VerifiedEnvelope,
+        )
+        .await;
+        assert_eq!(
+            sender_row.record.scope.canonical(),
+            format!("group:{stable_group_id}")
+        );
+        assert_eq!(
+            remote_row.record.scope.canonical(),
+            format!("group:{stable_group_id}")
+        );
+        assert_eq!(sender_row.record.payload, message.body.as_bytes());
+        assert_eq!(remote_row.record.payload, message.body.as_bytes());
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical_id)
+            .expect("canonical id hex")
+            .try_into()
+            .expect("canonical id length");
+        let indexed = sender
+            .agent
+            .history()
+            .expect("sender history")
+            .store()
+            .get_by_canonical_group_msg_id(canonical_bytes, stable_group_id)
+            .expect("canonical lookup")
+            .expect("canonical row after competing recorders");
+        assert_eq!(indexed.record.msg_id, sender_row.record.msg_id);
+        assert_eq!(indexed.record.payload, message.body.as_bytes());
+        assert_eq!(sender_group_key, remote_group_key);
+    }
+
+    /// Issue #321: exercise the actual sender cache and receiver ingest entry
+    /// points in both arrival orders without constructing a daemon or opening
+    /// a socket. The sender invokes both entry points against the same store;
+    /// a separate offline receiver records the same artifact as a verified
+    /// envelope, while provenance follows daemon role.
+    #[tokio::test]
+    async fn public_history_recorders_converge_in_both_arrival_orders() -> Result<()> {
+        let (local, _local_dir) = secure_endpoint_test_state().await?;
+        let (remote, _remote_dir) = secure_endpoint_test_state().await?;
+        let creator = local.agent.agent_id();
+        let local_group_key = insert_public_group(local.as_ref(), creator, "issue321-order").await;
+        let remote_group_key =
+            insert_public_group(remote.as_ref(), creator, "issue321-order").await;
+        let stable_group_id = local
+            .named_groups
+            .read()
+            .await
+            .get(&local_group_key)
+            .expect("local group")
+            .stable_group_id()
+            .to_string();
+        let signing_key = local.agent.identity().agent_keypair();
+        for (body, cache_first) in [("cache-first", true), ("ingest-first", false)] {
+            let message = x0x::groups::GroupPublicMessage::sign(
+                stable_group_id.clone(),
+                "issue321-state".to_string(),
+                1,
+                signing_key,
+                None,
+                x0x::groups::GroupPublicMessageKind::Chat,
+                body.to_string(),
+                if cache_first { 1 } else { 2 },
+                None,
+                None,
+                None,
+            )?;
+            exercise_public_recorder_order(
+                local.as_ref(),
+                remote.as_ref(),
+                &local_group_key,
+                &remote_group_key,
+                &stable_group_id,
+                message,
+                cache_first,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     /// Why (#296): callers detect the gossip black-hole from `fan_out`.
     /// A send body without the field must never be produced.
     #[test]

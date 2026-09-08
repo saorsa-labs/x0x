@@ -296,8 +296,9 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) observed_prefix_enabled: bool,
 
-    /// Stay off the whole-network compatibility DM bus. This is an opt-in
-    /// daemon policy; the default keeps rolling compatibility unchanged.
+    /// Opt out of the inbox's legacy-bus subscription, reverse-ACK bus
+    /// pre-warm, and legacy ACK hedge. Default false. Sender bus fallback
+    /// is unchanged; bus-only senders cannot reach this inbox when enabled.
     #[serde(default)]
     pub(super) skip_legacy_dm_bus: bool,
 
