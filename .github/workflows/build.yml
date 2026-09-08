@@ -1,134 +1,78 @@
+# Disposable #574 diagnostic ONLY. NEVER MERGE to main.
+# Reuses registered Build workflow ID 231263941; no release/build matrix path.
 name: Build
-
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
-
-env:
-  CARGO_TERM_COLOR: always
-
+    inputs:
+      expected_commit:
+        description: Exact reviewed 40-hex diagnostic commit
+        required: true
+        type: string
+permissions:
+  contents: read
 jobs:
-  validate-release-metadata:
-    name: Validate release metadata
-    runs-on: ubuntu-latest
+  lifecycle-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: never
+      PYTHONDONTWRITEBYTECODE: 1
     steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Test release metadata validation
-        run: python3 .github/scripts/test_release_metadata.py
-
-      - name: Validate release metadata (pull request)
-        if: github.event_name == 'pull_request'
+      - name: Establish private roots and admission deadline
         run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode pull_request \
-            --base-sha "${{ github.event.pull_request.base.sha }}"
-
-      - name: Validate release metadata (push or dispatch)
-        if: github.event_name != 'pull_request'
+          python3 - <<'PY'
+          import os, re, tempfile, time
+          from pathlib import Path
+          assert re.fullmatch('[0-9a-f]{40}', os.environ['EXPECTED_COMMIT'])
+          assert os.environ['GITHUB_REF'] == 'refs/heads/codex/574-lifecycle-diagnostic'
+          root = Path(tempfile.mkdtemp(prefix='lifecycle574-', dir=os.environ['RUNNER_TEMP']))
+          root.chmod(0o700)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'L574_ROOT={root}\nL574_SAFE={root}/safe\n')
+              env.write(f'L574_DEADLINE={time.monotonic() + 27 * 60}\n')
+          PY
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Guard exact source and materialize frozen lock
+        run: python3 scripts/ci/lifecycle574.py prep "$L574_ROOT"
+      - name: Install pinned build tools
         run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode push_main
-
-  build-matrix:
-    name: Build ${{ matrix.platform }}
-    needs: validate-release-metadata
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux x86_64 GNU
-          - platform: linux-x64-gnu
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cross: false
-
-          # Linux x86_64 musl (static linking)
-          - platform: linux-x64-musl
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cross: true
-
-          # Linux ARM64
-          - platform: linux-arm64-gnu
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            cross: true
-
-          # macOS x86_64 (cross-compiled on Apple Silicon)
-          - platform: macos-x64
-            os: macos-14
-            target: x86_64-apple-darwin
-            cross: false
-
-          # macOS ARM64 (Apple Silicon)
-          - platform: macos-arm64
-            os: macos-14
-            target: aarch64-apple-darwin
-            cross: false
-
-          # Windows x86_64
-          - platform: windows-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+          set -euo pipefail
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+          sudo -n apt-get update
+          sudo -n apt-get install -y libasound2-dev libdbus-1-dev pkg-config
+          cargo install cargo-nextest --version 0.9.126 --locked
+          cargo fetch --locked
+      - name: Check inert collectors and route contracts
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/test_isolation_custody_collect.py
+          python3 scripts/ci/test_nextest_reuse.py
+          python3 scripts/ci/test_lifecycle574.py
+      - name: Fresh locked library build and custody
+        run: |
+          set -euo pipefail
+          test ! -e "$GITHUB_WORKSPACE/target"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          python3 scripts/ci/lifecycle574.py build "$L574_ROOT"
+      - name: One exact isolated restart diagnostic
+        id: runtime
+        run: python3 scripts/ci/lifecycle574.py runtime "$L574_ROOT"
+      - name: Collect closed diagnostic evidence even on failure
+        id: collect
+        if: always()
+        run: python3 scripts/ci/lifecycle574.py collect "$L574_ROOT" "$L574_SAFE"
+      - name: Upload only collector-created closed receipt
+        if: always() && steps.collect.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-registry-
-
-      - name: Cache cargo index
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-git-
-
-      - name: Cache target directory
-        uses: actions/cache@v5
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-target-
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v5
-        with:
-          name: x0x-${{ matrix.platform }}
-          path: |
-            target/${{ matrix.target }}/release/x0x*
-            !target/${{ matrix.target }}/release/*.d
-            !target/${{ matrix.target }}/release/*.pdb
+          name: lifecycle574-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.L574_SAFE }}/diagnostic.json
           if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7

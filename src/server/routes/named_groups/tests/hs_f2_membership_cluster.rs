@@ -6,6 +6,10 @@
 
 use super::*;
 
+#[path = "hs_f2_lifecycle_diagnostic.rs"]
+mod lifecycle_diagnostic;
+use lifecycle_diagnostic::{Side as DiagnosticSide, Trace as LifecycleTrace};
+
 use crate::groups::policy::{GroupAdmission, GroupPolicy};
 use crate::groups::{GroupConfidentiality, GroupDiscoverability};
 use crate::identity::{AgentKeypair, UserKeypair};
@@ -1605,6 +1609,14 @@ async fn drive_joiner_welcome_install(
 /// (`spawn_blob_responder`), and announce traffic never matches a probe
 /// nonce.
 async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()> {
+    await_restart_gossip_ready_observed(owner, joiner, None).await
+}
+
+async fn await_restart_gossip_ready_observed(
+    owner: &Agent,
+    joiner: &Agent,
+    trace: Option<&LifecycleTrace>,
+) -> Result<()> {
     let started = std::time::Instant::now();
     let topic = crate::announce_blob::ANNOUNCE_BLOB_TOPIC;
     let mut owner_sub = owner.subscribe(topic).await?;
@@ -1614,16 +1626,34 @@ async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()>
     // Fanout = attempted eager-peer opportunity, never confirmed delivery.
     let (result, diag) = await_restart_gossip_ready_with(
         async |probe| {
-            owner
-                .publish_with_fanout(topic, probe)
-                .await
-                .map_err(anyhow::Error::from)
+            if let (Some(trace), Some(network)) = (trace, owner.network()) {
+                let peer = ant_quic::PeerId(joiner.machine_id().0);
+                trace.snapshot(DiagnosticSide::Owner, async {
+                    let connected = network.is_connected(&peer).await;
+                    let send_ready = network.send_ready_peers().await.contains(&peer);
+                    (connected, send_ready)
+                });
+            }
+            let result = owner.publish_with_fanout(topic, probe).await;
+            if let Some(trace) = trace {
+                trace.published(DiagnosticSide::Owner, result.as_ref().ok().copied());
+            }
+            result.map_err(anyhow::Error::from)
         },
         async |probe| {
-            joiner
-                .publish_with_fanout(topic, probe)
-                .await
-                .map_err(anyhow::Error::from)
+            if let (Some(trace), Some(network)) = (trace, joiner.network()) {
+                let peer = ant_quic::PeerId(owner.machine_id().0);
+                trace.snapshot(DiagnosticSide::Joiner, async {
+                    let connected = network.is_connected(&peer).await;
+                    let send_ready = network.send_ready_peers().await.contains(&peer);
+                    (connected, send_ready)
+                });
+            }
+            let result = joiner.publish_with_fanout(topic, probe).await;
+            if let Some(trace) = trace {
+                trace.published(DiagnosticSide::Joiner, result.as_ref().ok().copied());
+            }
+            result.map_err(anyhow::Error::from)
         },
         async || {
             owner_sub
@@ -2361,6 +2391,17 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     .into_response();
     assert_eq!(response.status(), StatusCode::OK, "rename must succeed");
 
+    // Disposable #574 observer: subscribe on the surviving peer BEFORE
+    // shutdown so old/new generation ordering is retained. No trace field
+    // participates in the readiness result.
+    let mut lifecycle_trace = LifecycleTrace::new();
+    lifecycle_trace.attach(
+        DiagnosticSide::Joiner,
+        joiner_net.subscribe_all_peer_events().await,
+        ant_quic::PeerId(owner_agent.machine_id().0),
+    );
+    lifecycle_trace.marker(DiagnosticSide::Owner, "before_old_shutdown");
+
     // RESTART the owner daemon: same dirs, agent key persisted, AppState
     // rebuilt, production snapshot restore, listeners re-armed.
     drop(owner_state);
@@ -2382,6 +2423,12 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         .network()
         .expect("restarted owner network")
         .clone();
+    lifecycle_trace.attach(
+        DiagnosticSide::Owner,
+        owner_net.subscribe_all_peer_events().await,
+        joiner_peer,
+    );
+    lifecycle_trace.marker(DiagnosticSide::Owner, "before_new_dial");
     let reconnect_started = std::time::Instant::now();
     owner_net.connect_addr(joiner_addr).await?;
     let reconnect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -2401,7 +2448,13 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     // reconnect above proves TRANSPORT only — prove gossip pubsub routes
     // in BOTH directions before the one-shot certified announce depends
     // on it.
-    await_restart_gossip_ready(&owner_agent, &joiner_agent).await?;
+    lifecycle_trace.marker(DiagnosticSide::Owner, "reconnected");
+    let readiness =
+        await_restart_gossip_ready_observed(&owner_agent, &joiner_agent, Some(&lifecycle_trace))
+            .await;
+    lifecycle_trace.marker(DiagnosticSide::Owner, "readiness_returned");
+    lifecycle_trace.finish().await;
+    readiness?;
     // Evidence channel, subscribed before ANY announce activity on the
     // restarted owner: the verified-certificate broadcast fires the
     // instant a fetched announce blob is patched into the discovery
@@ -4550,4 +4603,27 @@ async fn issue458r4_adoption_hydrates_reconstructed_digest_only_seats() -> Resul
         "the hydrated certificate persisted with the adopted roster"
     );
     Ok(())
+}
+
+// Positive transport/fanout observations must never turn missing
+// remote payloads into acceptance. Exercises the SAME unchanged 20s loop.
+#[tokio::test(start_paused = true)]
+async fn lifecycle574_observations_cannot_accept_missing_remote_probes() {
+    let trace = LifecycleTrace::new();
+    let started = tokio::time::Instant::now();
+    let (result, diag) = await_restart_gossip_ready_with(
+        async |_| {
+            trace.snapshot(DiagnosticSide::Owner, async { (true, true) });
+            trace.published(DiagnosticSide::Owner, Some(1));
+            Ok(1)
+        },
+        async |_| Ok(1),
+        async || std::future::pending().await,
+        async || std::future::pending().await,
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(diag.remote_seen, [false, false]);
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(20));
+    trace.finish().await;
 }

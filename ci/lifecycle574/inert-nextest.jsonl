@@ -1,0 +1,4 @@
+{"type":"suite","event":"started","test_count":3,"nextest":{"crate":"x0x","test_binary":"x0x","kind":"lib"}}
+{"type":"test","event":"started","name":"x0x::x0x$server::routes::named_groups::tests::hs_f2_membership_cluster::lifecycle_diagnostic::lifecycle574_pending_snapshot_drops_without_advancing_deadline"}
+{"type":"test","event":"ok","name":"x0x::x0x$server::routes::named_groups::tests::hs_f2_membership_cluster::lifecycle_diagnostic::lifecycle574_pending_snapshot_drops_without_advancing_deadline","exec_time":0.014682083}
+{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":2,"measured":0,"filtered_out":2787,"exec_time":0.014682083,"nextest":{"crate":"x0x","test_binary":"x0x","kind":"lib"}}
