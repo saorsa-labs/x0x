@@ -385,13 +385,14 @@ const DM_INBOX_TOPIC_NAME_PREFIX: &str = "x0x/dm/v1/inbox/";
 
 /// Topic ids that may receive one Full/bootstrap eager prefer (C5b).
 ///
-/// C0 stays: this list is inbox + compatibility bus only. Unsubscribed
-/// pass-through / GRAFT piggyback is not re-enabled here.
-pub(crate) fn ack_publish_eager_topics(recipient: &AgentId) -> [TopicId; 2] {
-    [
-        dm_inbox_topic(recipient),
-        TopicId::from_entity(DM_BUS_TOPIC.as_bytes()),
-    ]
+/// C0 stays: this list is inbox plus (unless opted out) the compatibility bus.
+/// Unsubscribed pass-through / GRAFT piggyback is not re-enabled here.
+pub(crate) fn ack_publish_eager_topics(recipient: &AgentId, skip_legacy_bus: bool) -> Vec<TopicId> {
+    let mut topics = vec![dm_inbox_topic(recipient)];
+    if !skip_legacy_bus {
+        topics.push(TopicId::from_entity(DM_BUS_TOPIC.as_bytes()));
+    }
+    topics
 }
 
 impl DmInboxService {
@@ -462,13 +463,64 @@ impl DmInboxService {
         history: Option<crate::history::HistoryHandle>,
         direct_hedge: Option<Arc<dyn DirectAckHedge>>,
     ) -> NetworkResult<Self> {
+        Self::spawn_with_hedge_options(
+            pubsub,
+            signing,
+            self_agent_id,
+            self_machine_id,
+            machine_keypair,
+            kem_keypair,
+            dm,
+            contacts,
+            inflight,
+            cache,
+            config,
+            revocation_set,
+            move_state,
+            authenticated_machine_bindings,
+            history,
+            direct_hedge,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_with_hedge_options(
+        pubsub: Arc<PubSubManager>,
+        signing: Arc<SigningContext>,
+        self_agent_id: AgentId,
+        self_machine_id: MachineId,
+        machine_keypair: Arc<MachineKeypair>,
+        kem_keypair: Arc<AgentKemKeypair>,
+        dm: Arc<DirectMessaging>,
+        contacts: Arc<RwLock<ContactStore>>,
+        inflight: Arc<InFlightAcks>,
+        cache: Arc<RecentDeliveryCache>,
+        config: DmInboxConfig,
+        revocation_set: Arc<RwLock<RevocationSet>>,
+        move_state: Arc<RwLock<crate::key_move::MoveState>>,
+        authenticated_machine_bindings: AuthenticatedMachineBindings,
+        history: Option<crate::history::HistoryHandle>,
+        direct_hedge: Option<Arc<dyn DirectAckHedge>>,
+        skip_legacy_bus: bool,
+    ) -> NetworkResult<Self> {
         let topic = Self::inbox_topic_name(&self_agent_id);
         let subscription = pubsub
             .subscribe_topic_id(topic.clone(), dm_inbox_topic(&self_agent_id))
             .await;
-        let legacy_subscription = pubsub.subscribe(DM_BUS_TOPIC.to_string()).await;
-        let (ack_publisher, ack_worker) =
-            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm), direct_hedge);
+        pubsub.set_skip_legacy_dm_bus(skip_legacy_bus);
+        let legacy_subscription = if skip_legacy_bus {
+            None
+        } else {
+            Some(pubsub.subscribe(DM_BUS_TOPIC.to_string()).await)
+        };
+        let (ack_publisher, ack_worker) = spawn_durable_ack_publisher(
+            Arc::clone(&pubsub),
+            Arc::clone(&dm),
+            direct_hedge,
+            skip_legacy_bus,
+        );
 
         let pipeline = InboxPipeline {
             pubsub: Arc::clone(&pubsub),
@@ -490,19 +542,28 @@ impl DmInboxService {
             ack_publisher,
         };
 
-        let primary_handle =
-            spawn_subscription_loop(topic.clone(), false, subscription, pipeline.clone());
-        let legacy_handle = spawn_subscription_loop(
-            DM_BUS_TOPIC.to_string(),
-            true,
-            legacy_subscription,
+        let mut handles = vec![spawn_subscription_loop(
+            topic.clone(),
+            false,
+            subscription,
             pipeline.clone(),
-        );
+        )];
+        if let Some(legacy_subscription) = legacy_subscription {
+            handles.push(spawn_subscription_loop(
+                DM_BUS_TOPIC.to_string(),
+                true,
+                legacy_subscription,
+                pipeline.clone(),
+            ));
+        }
 
         Ok(Self {
             // Aborting the worker drops its JoinSet, which aborts all owned
             // route publications. A graceful channel close drains them.
-            handles: vec![primary_handle, legacy_handle, ack_worker],
+            handles: {
+                handles.push(ack_worker);
+                handles
+            },
             topic,
             pipeline,
         })
@@ -579,6 +640,7 @@ fn spawn_durable_ack_publisher(
     pubsub: Arc<PubSubManager>,
     dm: Arc<DirectMessaging>,
     direct_hedge: Option<Arc<dyn DirectAckHedge>>,
+    skip_legacy_bus: bool,
 ) -> (AckPublisherHandle, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
     let worker = spawn_ack_publish_worker(receiver, move |job| {
@@ -586,7 +648,7 @@ fn spawn_durable_ack_publisher(
         let dm = Arc::clone(&dm);
         let direct_hedge = direct_hedge.clone();
         async move {
-            publish_durable_ack_job(pubsub, dm, direct_hedge, job).await;
+            publish_durable_ack_job(pubsub, dm, direct_hedge, skip_legacy_bus, job).await;
         }
     });
     (AckPublisherHandle { sender }, worker)
@@ -654,12 +716,13 @@ async fn publish_durable_ack_job(
     pubsub: Arc<PubSubManager>,
     dm: Arc<DirectMessaging>,
     direct_hedge: Option<Arc<dyn DirectAckHedge>>,
+    skip_legacy_bus: bool,
     job: AckPublishJob,
 ) {
     // C5b: prefer one Full/bootstrap eager on inbox+bus only. Does not
     // re-enable unsubscribed pass-through / GRAFT piggyback (C0).
     pubsub
-        .prefer_one_full_bootstrap_eager(&ack_publish_eager_topics(&job.recipient))
+        .prefer_one_full_bootstrap_eager(&ack_publish_eager_topics(&job.recipient, skip_legacy_bus))
         .await;
 
     let topic = DmInboxService::inbox_topic_name(&job.recipient);
@@ -676,10 +739,11 @@ async fn publish_durable_ack_job(
             .publish_topic_id(topic, topic_id, encoded_primary)
             .await
     };
-    // The durable path always hedges onto the compatibility bus, even when the
-    // payload did not arrive there. A v2 sender has already been promised a
-    // committed row; a second route costs one small publish and removes a
-    // whole class of "committed but never acked" outcomes.
+    // The default durable path hedges onto the compatibility bus, even when
+    // the payload did not arrive there. A v2 sender has already been promised
+    // a committed row; a second route costs one small publish and removes a
+    // whole class of "committed but never acked" outcomes. Opt-out keeps only
+    // the targeted route here so this node does not rejoin the bus.
     let legacy = async move {
         legacy_pubsub
             .publish(DM_BUS_TOPIC.to_string(), encoded_legacy)
@@ -713,8 +777,15 @@ async fn publish_durable_ack_job(
         }
     };
     let publish_started = Instant::now();
+    let gossip_routes = async {
+        if skip_legacy_bus {
+            publish_ack_route_with_timeout("targeted", DURABLE_ACK_ROUTE_TIMEOUT, primary).await
+        } else {
+            publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await
+        }
+    };
     let (gossip, direct_outcome) = tokio::join!(
-        publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy),
+        gossip_routes,
         publish_ack_route_with_timeout("direct-typed", DURABLE_ACK_ROUTE_TIMEOUT, direct),
     );
     dm.record_ack_publish_ms(crate::dm::millis_since(publish_started));
@@ -792,10 +863,10 @@ pub(crate) fn direct_ack_hedge_outcome(
 /// durable send to `peer`.
 ///
 /// Joins (1) this agent's inbox (where ACKs land), (2) the peer's inbox,
-/// and (3) the compatibility bus. C2 refreshes those topic ids on the
-/// subscribed path. C4 also pre-subscribes the peer inbox so the first
-/// durable POST is not a cold `publish_topic_id` join. Does not walk
-/// pass-through topics (Leaf-safe; C0/#395 hygiene).
+/// and (unless the manager opted out) (3) the compatibility bus. C2 refreshes
+/// those topic ids on the subscribed path. C4 also pre-subscribes the peer
+/// inbox so the first durable POST is not a cold `publish_topic_id` join.
+/// Does not walk pass-through topics (Leaf-safe; C0/#395 hygiene).
 pub(crate) async fn warm_reverse_ack_topics(
     pubsub: &PubSubManager,
     self_agent: &AgentId,
@@ -818,6 +889,9 @@ pub(crate) async fn warm_reverse_ack_topics(
             dm_inbox_topic(peer),
         )
         .await;
+    if pubsub.skip_legacy_dm_bus() {
+        return;
+    }
     pubsub
         .ensure_subscribed_topic_id(
             DM_BUS_TOPIC,
@@ -2331,6 +2405,23 @@ mod tests {
         revoked_machine: Option<&MachineKeypair>,
         direct_hedge: Option<Arc<dyn DirectAckHedge>>,
     ) -> InboxHarness {
+        make_inbox_harness_with_hedge_options(
+            sender,
+            authenticated_machine,
+            revoked_machine,
+            direct_hedge,
+            false,
+        )
+        .await
+    }
+
+    async fn make_inbox_harness_with_hedge_options(
+        sender: &AgentKeypair,
+        authenticated_machine: Option<MachineId>,
+        revoked_machine: Option<&MachineKeypair>,
+        direct_hedge: Option<Arc<dyn DirectAckHedge>>,
+        skip_legacy_bus: bool,
+    ) -> InboxHarness {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let mut contacts = ContactStore::new(tempdir.path().join("contacts.json"));
         contacts.set_trust(&sender.agent_id(), TrustLevel::Trusted);
@@ -2374,8 +2465,12 @@ mod tests {
                 .expect("insert machine revocation");
         }
 
-        let (ack_publisher, ack_worker) =
-            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm), direct_hedge);
+        let (ack_publisher, ack_worker) = spawn_durable_ack_publisher(
+            Arc::clone(&pubsub),
+            Arc::clone(&dm),
+            direct_hedge,
+            skip_legacy_bus,
+        );
         let pipeline = InboxPipeline {
             pubsub,
             signing: Arc::new(SigningContext::from_keypair(&recipient)),
@@ -2404,6 +2499,54 @@ mod tests {
             recipient_agent_id,
             recipient_kem,
             receiver,
+            _tempdir: tempdir,
+        }
+    }
+
+    struct SpawnedInboxService {
+        pubsub: Arc<PubSubManager>,
+        self_agent_id: AgentId,
+        service: DmInboxService,
+        _tempdir: tempfile::TempDir,
+    }
+
+    async fn spawn_inbox_service_for_bus_control(skip_legacy_bus: bool) -> SpawnedInboxService {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let recipient = AgentKeypair::generate().expect("recipient keygen");
+        let self_agent_id = recipient.agent_id();
+        let node = Arc::new(
+            NetworkNode::new(NetworkConfig::default(), None, None)
+                .await
+                .expect("network node"),
+        );
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let service = DmInboxService::spawn_with_hedge_options(
+            Arc::clone(&pubsub),
+            Arc::new(SigningContext::from_keypair(&recipient)),
+            self_agent_id,
+            MachineId([0xEE; 32]),
+            Arc::new(MachineKeypair::generate().expect("machine keygen")),
+            Arc::new(AgentKemKeypair::generate().expect("recipient KEM")),
+            Arc::new(DirectMessaging::new()),
+            Arc::new(RwLock::new(ContactStore::new(
+                tempdir.path().join("contacts.json"),
+            ))),
+            Arc::new(InFlightAcks::new()),
+            Arc::new(RecentDeliveryCache::with_defaults()),
+            DmInboxConfig::default(),
+            Arc::new(RwLock::new(RevocationSet::new())),
+            Arc::new(RwLock::new(crate::key_move::MoveState::new())),
+            Arc::new(RwLock::new(AuthenticatedMachineBindingCache::default())),
+            None,
+            None,
+            skip_legacy_bus,
+        )
+        .await
+        .expect("inbox service spawns");
+        SpawnedInboxService {
+            pubsub,
+            self_agent_id,
+            service,
             _tempdir: tempdir,
         }
     }
@@ -3962,7 +4105,7 @@ mod tests {
     #[test]
     fn ack_publish_eager_topics_are_inbox_and_bus_only() {
         let recipient = AgentId([0xC5; 32]);
-        let topics = ack_publish_eager_topics(&recipient);
+        let topics = ack_publish_eager_topics(&recipient, false);
         assert_eq!(topics[0], dm_inbox_topic(&recipient));
         assert_eq!(topics[1], TopicId::from_entity(DM_BUS_TOPIC.as_bytes()));
         assert_eq!(
@@ -3970,6 +4113,13 @@ mod tests {
             2,
             "C5b must not prefer eager on any topic except inbox+bus"
         );
+    }
+
+    #[test]
+    fn ack_publish_eager_topics_leave_only_targeted_inbox_when_opted_out() {
+        let recipient = AgentId([0xC6; 32]);
+        let topics = ack_publish_eager_topics(&recipient, true);
+        assert_eq!(topics, vec![dm_inbox_topic(&recipient)]);
     }
 
     #[test]
@@ -4885,6 +5035,107 @@ mod tests {
         let debug = format!("{:?}", config);
         assert!(debug.contains("silent_reject"));
         assert!(debug.contains("typed_payload_routes"));
+    }
+
+    #[tokio::test]
+    async fn production_optout_service_joins_inbox_but_not_legacy_bus() {
+        let inbox = spawn_inbox_service_for_bus_control(true).await;
+        assert!(
+            inbox
+                .pubsub
+                .is_topic_subscribed(inbox.service.topic())
+                .await
+        );
+        assert!(!inbox.pubsub.is_topic_subscribed(DM_BUS_TOPIC).await);
+        assert!(inbox.pubsub.skip_legacy_dm_bus());
+    }
+
+    #[tokio::test]
+    async fn production_default_service_keeps_legacy_bus_subscription() {
+        let inbox = spawn_inbox_service_for_bus_control(false).await;
+        assert!(
+            inbox
+                .pubsub
+                .is_topic_subscribed(inbox.service.topic())
+                .await
+        );
+        assert!(inbox.pubsub.is_topic_subscribed(DM_BUS_TOPIC).await);
+        assert!(!inbox.pubsub.skip_legacy_dm_bus());
+    }
+
+    #[tokio::test]
+    async fn production_optout_reverse_ack_prewarm_keeps_bus_unsubscribed() {
+        let inbox = spawn_inbox_service_for_bus_control(true).await;
+        let peer = AgentId([0xAB; 32]);
+        warm_reverse_ack_topics(&inbox.pubsub, &inbox.self_agent_id, &peer).await;
+        assert!(
+            inbox
+                .pubsub
+                .is_topic_subscribed(&DmInboxService::inbox_topic_name(&peer))
+                .await
+        );
+        assert!(!inbox.pubsub.is_topic_subscribed(DM_BUS_TOPIC).await);
+    }
+
+    #[tokio::test]
+    async fn production_optout_durable_ack_keeps_targeted_and_direct_routes() {
+        let sender = test_keypair();
+        let machine = MachineId([0xDB; 32]);
+        let (tx, mut direct_rx) = mpsc::unbounded_channel();
+        let hedge = Arc::new(RecordingDirectHedge {
+            tx,
+            outcome: DirectAckHedgeOutcome::Sent,
+        });
+        let mut harness =
+            make_inbox_harness_with_hedge_options(&sender, Some(machine), None, Some(hedge), true)
+                .await;
+        let _history = attach_history(&mut harness);
+        let mut bus = harness
+            .pipeline
+            .pubsub
+            .subscribe(DM_BUS_TOPIC.to_string())
+            .await;
+        let mut targeted = harness
+            .pipeline
+            .pubsub
+            .subscribe_topic_id(
+                DmInboxService::inbox_topic_name(&sender.agent_id()),
+                dm_inbox_topic(&sender.agent_id()),
+            )
+            .await;
+
+        harness
+            .pipeline
+            .publish_ack_for_protocol(
+                sender.agent_id(),
+                [0xDB; 16],
+                DmAckOutcome::Accepted,
+                DM_PROTOCOL_DURABLE_ACK,
+                false,
+            )
+            .await
+            .expect("optout durable ACK schedules");
+
+        let targeted_message = tokio::time::timeout(Duration::from_secs(5), targeted.recv())
+            .await
+            .expect("targeted ACK route must receive the envelope")
+            .expect("targeted subscription stays open");
+        let targeted_envelope = DmEnvelope::from_wire_bytes(&targeted_message.payload)
+            .expect("targeted payload decodes");
+        assert_eq!(targeted_envelope.protocol_version, DM_PROTOCOL_DURABLE_ACK);
+        let (_, direct_bytes) = tokio::time::timeout(Duration::from_secs(5), direct_rx.recv())
+            .await
+            .expect("Direct hedge must be called")
+            .expect("Direct hedge channel stays open");
+        let direct_envelope =
+            DmEnvelope::from_wire_bytes(&direct_bytes).expect("Direct payload decodes");
+        assert_eq!(direct_envelope.protocol_version, DM_PROTOCOL_DURABLE_ACK);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), bus.recv())
+                .await
+                .is_err(),
+            "optout durable ACK must not publish on the compatibility bus"
+        );
     }
 
     // ── Unverified drop path instrumentation (issue #296) ─────────────
