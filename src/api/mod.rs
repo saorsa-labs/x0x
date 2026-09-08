@@ -648,7 +648,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics dm",
         description: "Direct-message send/receive counters and per-peer health",
         category: "network",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::query("agent", false)]),
     },
     EndpointDef {
         method: Method::Get,

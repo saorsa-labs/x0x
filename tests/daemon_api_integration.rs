@@ -2447,6 +2447,51 @@ async fn daemon_api_diagnostics_dm() {
     assert!(r["per_peer"].is_object());
     assert!(r["subscriber_count"].is_number());
     assert!(r["subscriber_capacity"].is_number());
+    assert!(r["capability_store_entries"].is_number());
+    let digest = &r["per_peer_digest"];
+    assert_eq!(digest["schema"], 2);
+    assert!(digest["rows"].as_array().unwrap().len() <= 512);
+    assert!(digest["truncated"].is_boolean());
+    assert_eq!(digest["store_state_capability"], "available");
+    assert_eq!(digest["store_state_relay"], "available");
+    assert!(digest["totals"]["capability"]["distinct_agents"].is_number());
+    assert!(digest["totals"]["relay"]["distinct_agents"].is_number());
+    assert!(digest.get("next_cursor").is_none());
+    let agent = "00".repeat(32);
+    let filtered: Value = ca(&d)
+        .get(d.url(&format!("/diagnostics/dm?agent={agent}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered["per_peer_digest"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(filtered["per_peer_digest"]["rows"][0]["agent_id"], agent);
+    assert_eq!(
+        filtered["per_peer_digest"]["rows"][0]["capability_record_state"],
+        "absent_unknown_history"
+    );
+    assert_eq!(
+        filtered["per_peer_digest"]["rows"][0]["relay_record_state"],
+        "absent_unknown_history"
+    );
+    assert!(filtered["stats"].is_object());
+    assert!(filtered["per_peer"].is_object());
+    for invalid in ["bad".to_string(), "z".repeat(64), "a".repeat(66)] {
+        let response = ca(&d)
+            .get(d.url(&format!("/diagnostics/dm?agent={invalid}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]
