@@ -5212,6 +5212,7 @@ fn authorized_treekem_membership_event_for_queue(
                 && treekem_epoch.is_some();
             let self_leave = sender_hex == agent_id
                 && actor == sender_hex
+                && info.has_active_member(sender_hex)
                 && treekem_commit_b64.is_none()
                 && treekem_epoch.is_none();
             admin_remove || self_leave
@@ -5247,6 +5248,53 @@ fn authorized_treekem_membership_event_for_queue(
         }
         _ => false,
     }
+}
+
+/// Queue eligibility must not depend on the missing predecessor, but it must
+/// authenticate the commit before consuming queue or catch-up resources.
+fn validated_treekem_queue_event(
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    sender: &AgentId,
+) -> bool {
+    let sender_hex = hex::encode(sender.as_bytes());
+    if !authorized_treekem_membership_event_for_queue(info, event, &sender_hex) {
+        return false;
+    }
+    let Some(frontier) = treekem_membership_event_frontier(event) else {
+        return false;
+    };
+    if (frontier.group_id != group_key && frontier.group_id != info.stable_group_id())
+        || frontier.commit.group_id != info.stable_group_id()
+        || frontier.commit.committed_by != *frontier.actor
+        || frontier.commit.withdrawn
+    {
+        return false;
+    }
+    // Metadata-only self-leave cannot rotate either secure plane. The final
+    // apply arm enforces this too; do not defer rejection until replay.
+    if matches!(event, NamedGroupMetadataEvent::MemberRemoved {
+        actor, agent_id, secret_epoch, treekem_commit_b64, treekem_epoch, ..
+    } if actor == agent_id && (secret_epoch.is_some() || treekem_commit_b64.is_some() || treekem_epoch.is_some()))
+    {
+        return false;
+    }
+    frontier.commit.verify_structure().is_ok()
+}
+
+/// Keep only authenticated, currently eligible entries with a real gap.
+/// Full predecessor/transition validation remains the ordinary apply's job.
+fn retain_pending_treekem_event(
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    pending: &PendingTreeKemMetadataEvent,
+    local_agent_hex: &str,
+    local_epoch: Option<u64>,
+) -> bool {
+    validated_treekem_queue_event(group_key, info, &pending.event, &pending.sender)
+        && treekem_state_frontier_gap_reason(info, &pending.event, local_agent_hex, local_epoch)
+            .is_some()
 }
 
 /// #482 (design r2 item 1): adopt an incoming membership-event roster
@@ -6739,44 +6787,21 @@ async fn queue_treekem_membership_event(
     sender: AgentId,
     reason: &str,
 ) {
-    {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let peers = {
         let groups = state.named_groups.read().await;
-        if has_withdrawn_group_record(&groups, group_id) {
-            tracing::debug!(
-                target: "treekem.trace",
-                stage = "queue_treekem_membership_event_reject",
-                reason = "withdrawn_group",
-                group_id = %LogHexId::group(&group_id),
-            );
+        let Some(info) = groups.get(group_id) else {
             return;
-        }
-    }
-    let queued = PendingTreeKemMetadataEvent {
-        event: event.clone(),
-        sender,
-        queued_at: Instant::now(),
-    };
-    let key = treekem_membership_event_key(&event);
-    {
+        };
         let mut pending = state.treekem_pending_events.write().await;
         let queue = pending.entry(group_id.to_string()).or_default();
-        if let Some(key) = key.as_deref() {
-            if queue
-                .iter()
-                .filter_map(|pending| treekem_membership_event_key(&pending.event))
-                .any(|existing| existing == key)
-            {
-                return;
-            }
-        }
-        queue.push_back(queued);
-        queue
-            .make_contiguous()
-            .sort_by_key(|pending| treekem_membership_event_sort_key(&pending.event));
-        while queue.len() > TREEKEM_PENDING_EVENTS_PER_GROUP_CAP {
-            queue.pop_front();
-        }
-    }
+        let Some(peers) =
+            admit_treekem_pending_event(group_id, info, queue, &event, sender, &local_agent_hex)
+        else {
+            return;
+        };
+        peers
+    };
     if reason == "revision_gap" {
         // #482 (design r3 item 4): the counter measures the NAMED failure
         // mode (revision-gap wedges), not every queued reason.
@@ -6785,65 +6810,68 @@ async fn queue_treekem_membership_event(
             .record_membership_event_queued_revision_gap(group_id);
     }
     tracing::warn!(group_id = %LogHexId::group(&group_id), reason, "queued TreeKEM membership event pending catch-up/replay");
-    request_treekem_catchup_for_gap(state, group_id, &event, sender).await;
+    request_treekem_catchup_for_gap(state, group_id, &event, peers).await;
 }
 
-async fn request_treekem_catchup_for_gap(
-    state: &Arc<AppState>,
-    group_id: &str,
+/// Validate before insertion, eviction, or preparing any catch-up destination.
+/// Returning None means the caller must not dispatch catch-up for this event.
+fn admit_treekem_pending_event(
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    queue: &mut VecDeque<PendingTreeKemMetadataEvent>,
     event: &NamedGroupMetadataEvent,
     sender: AgentId,
-) {
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let Some(frontier) = treekem_membership_event_frontier(event) else {
-        return;
-    };
-    let (from_revision, from_epoch, current_state_hash, other_members) = {
-        let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(group_id) else {
-            return;
-        };
-        if info.withdrawn {
-            return;
+    local_agent_hex: &str,
+) -> Option<Vec<AgentId>> {
+    if !validated_treekem_queue_event(group_key, info, event, &sender) {
+        return None;
+    }
+    let frontier = treekem_membership_event_frontier(event)?;
+    let key = treekem_membership_event_key(event)?;
+    if queue
+        .iter()
+        .filter_map(|pending| treekem_membership_event_key(&pending.event))
+        .any(|existing| existing == key)
+    {
+        return None;
+    }
+    queue.push_back(PendingTreeKemMetadataEvent {
+        event: event.clone(),
+        sender,
+        queued_at: Instant::now(),
+    });
+    queue
+        .make_contiguous()
+        .sort_by_key(|pending| treekem_membership_event_sort_key(&pending.event));
+    while queue.len() > TREEKEM_PENDING_EVENTS_PER_GROUP_CAP {
+        queue.pop_front();
+    }
+    // Preserve actor/sender plus at most two deterministic active peers;
+    // exclude local and the departing target from the additional peers.
+    let event_target_hex = match event {
+        NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+        | NamedGroupMetadataEvent::MemberBanned { agent_id, .. } => {
+            Some(agent_id.to_ascii_lowercase())
         }
-        // #482: also fan the catch-up out to OTHER active members (up to
-        // 2, deterministic order) — the event's author/sender may be the
-        // departed leaver itself, which previously left the gap
-        // unfillable.
-        // #482 (design r2 item 2): exclude local, the actor, the SENDER,
-        // and the removal/ban TARGET (for MemberRemoved/MemberBanned the
-        // target is departing/unreachable — a wasted redundancy slot).
-        let event_target_hex = match event {
-            NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
-            | NamedGroupMetadataEvent::MemberBanned { agent_id, .. } => {
-                Some(agent_id.to_ascii_lowercase())
-            }
-            _ => None,
-        };
-        let sender_hex_pre = hex::encode(sender.as_bytes());
-        let mut others: Vec<AgentId> = info
-            .active_members()
-            .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
-            .filter(|peer| {
-                let hex = hex::encode(peer.as_bytes());
-                hex != local_agent_hex
-                    && hex != sender_hex_pre
-                    && !frontier.actor.eq_ignore_ascii_case(hex.as_str())
-                    && event_target_hex.as_deref() != Some(hex.as_str())
-            })
-            .collect();
-        others.sort_by_key(|peer| hex::encode(peer.as_bytes()));
-        others.dedup();
-        others.truncate(2);
-        (
-            info.state_revision,
-            info.secret_epoch,
-            info.state_hash.clone(),
-            others,
-        )
+        _ => None,
     };
+    let sender_hex_pre = hex::encode(sender.as_bytes());
+    let mut others: Vec<AgentId> = info
+        .active_members()
+        .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
+        .filter(|peer| {
+            let hex = hex::encode(peer.as_bytes());
+            hex != local_agent_hex
+                && hex != sender_hex_pre
+                && !frontier.actor.eq_ignore_ascii_case(hex.as_str())
+                && event_target_hex.as_deref() != Some(hex.as_str())
+        })
+        .collect();
+    others.sort_by_key(|peer| hex::encode(peer.as_bytes()));
+    others.dedup();
+    others.truncate(2);
     let mut peers = Vec::new();
-    if !frontier.actor.eq_ignore_ascii_case(&local_agent_hex) {
+    if !frontier.actor.eq_ignore_ascii_case(local_agent_hex) {
         if let Ok(peer) = parse_agent_id_hex(frontier.actor) {
             peers.push(peer);
         }
@@ -6852,11 +6880,38 @@ async fn request_treekem_catchup_for_gap(
     if sender_hex != local_agent_hex && !peers.contains(&sender) {
         peers.push(sender);
     }
-    for peer in other_members {
+    for peer in others {
         if !peers.contains(&peer) {
             peers.push(peer);
         }
     }
+    Some(peers)
+}
+
+async fn request_treekem_catchup_for_gap(
+    state: &Arc<AppState>,
+    group_id: &str,
+    event: &NamedGroupMetadataEvent,
+    peers: Vec<AgentId>,
+) {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let Some(frontier) = treekem_membership_event_frontier(event) else {
+        return;
+    };
+    let (from_revision, from_epoch, current_state_hash) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return;
+        };
+        if info.withdrawn {
+            return;
+        }
+        (
+            info.state_revision,
+            info.secret_epoch,
+            info.state_hash.clone(),
+        )
+    };
     for peer in peers {
         let peer_hex = hex::encode(peer.as_bytes());
         let throttle_key = format!("{group_id}:{peer_hex}:{from_revision}:{from_epoch}");
@@ -6927,30 +6982,65 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
                 groups.get(group_id).cloned()
             };
             if let Some(info) = info {
-                if should_queue_treekem_membership_event(
-                    state,
+                let local_epoch = current_treekem_epoch(state, group_id).await;
+                if retain_pending_treekem_event(
                     group_id,
                     &info,
-                    &pending.event,
+                    &pending,
                     &local_agent_hex,
-                )
-                .await
-                .is_some()
-                {
+                    local_epoch,
+                ) {
                     still_pending.push_back(pending);
                 }
             }
         }
     }
     if !still_pending.is_empty() {
+        // Recheck at reinsertion, not only against a clone taken before
+        // another membership apply could remove the queued author.
+        let membership = group_membership_lock(state, group_id).await;
+        let _membership_guard = membership.lock().await;
+        let local_epoch = current_treekem_epoch(state, group_id).await;
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return;
+        };
         let mut pending = state.treekem_pending_events.write().await;
         let queue = pending.entry(group_id.to_string()).or_default();
-        for item in still_pending {
+        requeue_treekem_pending_events(
+            group_id,
+            info,
+            queue,
+            still_pending,
+            &local_agent_hex,
+            local_epoch,
+            &revoked,
+        );
+    }
+}
+
+/// The final replay reinsertion seam, called while membership is serialized.
+fn requeue_treekem_pending_events(
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    queue: &mut VecDeque<PendingTreeKemMetadataEvent>,
+    entries: VecDeque<PendingTreeKemMetadataEvent>,
+    local_agent_hex: &str,
+    local_epoch: Option<u64>,
+    revoked: &x0x::revocation::RevocationSet,
+) {
+    for item in entries {
+        if !revoked.is_agent_revoked(&item.sender)
+            && retain_pending_treekem_event(group_key, info, &item, local_agent_hex, local_epoch)
+        {
             queue.push_back(item);
         }
-        while queue.len() > TREEKEM_PENDING_EVENTS_PER_GROUP_CAP {
-            queue.pop_front();
-        }
+    }
+    while queue.len() > TREEKEM_PENDING_EVENTS_PER_GROUP_CAP {
+        queue.pop_front();
     }
 }
 
@@ -29892,6 +29982,7 @@ pub(in crate::server) mod tests {
     mod cache_hardening_followup;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
+    mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod pr291_restart_marker_matrix;
     mod wp_c;
@@ -39907,6 +39998,12 @@ pub(in crate::server) mod tests {
             admin_hex.clone(),
             x0x::groups::GroupRole::Admin,
             Some(creator_hex.clone()),
+            None,
+        );
+        info.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
             None,
         );
         let group_id = info.stable_group_id().to_string();
