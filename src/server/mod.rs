@@ -54,8 +54,8 @@ use routes::{
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_file_message,
     handle_join_result_message, handle_treekem_catchup_request, handle_treekem_catchup_response,
     handle_welcome_blob_message, health, history_diagnostics, history_list, history_message,
-    history_purge, history_search, history_stats, identity_revocations, identity_revoke,
-    import_agent_card, import_group_card, ingest_public_message, introduction,
+    history_purge, history_scopes, history_search, history_stats, identity_revocations,
+    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
     join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
     list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
     list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
@@ -1951,6 +1951,7 @@ pub async fn serve_with_options(
         // ADR-0023 durable-history read surface
         .route("/history", get(history_list).delete(history_purge))
         .route("/history/message/:msg_id", get(history_message))
+        .route("/history/scopes", get(history_scopes))
         .route("/history/search", get(history_search))
         .route("/history/stats", get(history_stats))
         .route("/diagnostics/ack", get(ack_diagnostics))

@@ -356,7 +356,9 @@ authenticates as a distinct principal that may reach exactly:
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
-and `/shutdown` — answers `403`. Rider sends are signed by the daemon's
+`/shutdown`, and the rest of the `/history` family (`/history/search`,
+`/history/scopes`, `/history/stats`, `/history/message/:msg_id`,
+`DELETE /history`) — answers `403`. Rider sends are signed by the daemon's
 own agent key carrying a provenance envelope **inside the signed
 bytes** — `sub_agent_id`, `rider_token_id`, `rider_token_hash`,
 `scope`, and the sub-agent-signed delegation capability itself. The
@@ -1721,15 +1723,74 @@ Local, per-daemon history store for `dm:` / `group:` / `topic:` scopes.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/history` | `x0x history list <SCOPE> [--limit N]` | List durable history for one scope, keyset-paginated |
+| GET | `/history` | `x0x history list <SCOPE> [--limit N]` | List durable history for one scope, keyset-paginated. `scope` is **required** (400 without it) |
+| GET | `/history/scopes` | `x0x history scopes [--after-scope S] [--limit N]` | Enumerate the scopes that hold retained rows, with per-scope row count and newest `seen_at_ms` |
 | GET | `/history/message/:msg_id` | `x0x history message <MSG_ID>` | Point lookup of one row by exposed `msg_id` (`?scope=` for canonical group ids; 404 when absent, 400 malformed) |
-| GET | `/history/search` | `x0x history search <SCOPE> <QUERY>` | Full-text search over text payloads within a scope |
+| GET | `/history/search` | `x0x history search [SCOPE] <QUERY>` | Full-text search over text payloads. `scope` is **optional**: omitted, it searches every retained scope |
 | GET | `/history/stats` | `x0x history stats` | Row counts, database size, retention bounds |
 | DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only) |
 
 Rider tokens may call `GET /history` for scopes they are granted, with the
 limit clamped to 100. Durable DM sends (`require_durable_app_ack: true`)
 commit here before the sender's `200` (ADR-0030).
+
+### Scope discovery — `GET /history/scopes` (issue #275)
+
+Answers "what can I query?" for a caller that does not already hold a scope
+string.
+
+```
+GET /history/scopes?after_scope=<canonical>&limit=<n>
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "next_after_scope": "group:g-1",
+  "scopes": [
+    {"scope": "dm:9f2c…", "scope_kind": 0, "scope_id": "9f2c…",
+     "rows": 128, "newest_seen_at_ms": 1788091312000},
+    {"scope": "group:g-1", "scope_kind": 1, "scope_id": "g-1",
+     "rows": 12, "newest_seen_at_ms": 1788091300000}
+  ]
+}
+```
+
+- **Ordering and paging.** Rows are ascending by `(scope_kind, scope_id)` —
+  the same tuple the store groups on, so the order is total and independent
+  of time. `after_scope` is the canonical scope string of the previous
+  page's last row (echoed as `next_after_scope`) and is **exclusive**. There
+  is no offset and no timestamp cursor, so paging is stable under concurrent
+  writes. It is **live**, not a cross-request snapshot: a later page reflects
+  the store as it is when that page is served.
+- **Bounds.** `limit` defaults to 100 and is clamped to 500 (the shared
+  history `MAX_QUERY_LIMIT`); an oversized value is clamped, not rejected. A
+  malformed `after_scope` is `400`. An empty store, or a cursor past the last
+  scope, is an empty page (`200`), not an error.
+- **Counts.** `rows` and `newest_seen_at_ms` are aggregated from the current
+  `history` rows, so they cover **locally retained rows only**. Retention and
+  `DELETE /history` lower them, and a scope whose last row is gone disappears
+  from the enumeration entirely. This is a statement about local storage, not
+  a claim of network or history completeness.
+
+### Cross-scope search — `GET /history/search` (issue #275)
+
+`scope` is optional. Omitted, the search runs across every retained scope;
+supplied, it narrows to that scope exactly as before. Relaxing `scope` does
+not relax validation: a supplied-but-malformed `scope` is still `400`, and a
+missing or blank `q` is still `400`.
+
+The response now carries `next_before_id` alongside `count`/`records`, the
+same newest-rowid-first keyset `GET /history` uses — feed it back as
+`before_id` to page. Rowids are globally unique, so the cursor works
+unchanged across a cross-scope result set.
+
+**Authorization.** `GET /history/search` and `GET /history/scopes` are
+owner-only. The ADR-0039 rider allowlist admits exactly `GET /history`, so
+the auth middleware answers `403` on both before the handler runs; a rider
+can neither read rows nor learn row counts for scopes outside its grants.
+That boundary is unchanged by this issue.
 
 ## Remote exec
 
@@ -1862,7 +1923,11 @@ marker are best-effort: no history runtime or a failed query can still produce
 the marker, and WebSocket replay rows plus the marker use the droppable control
 queue. Do not checkpoint completeness from `live`; reconcile durable messages
 through the retained local history for the relevant `dm:<agent_hex>`,
-`group:<stable_id>`, or `topic:<name>` scope:
+`group:<stable_id>`, or `topic:<name>` scope. A client that does not already
+hold that scope string can enumerate the scopes still holding retained rows
+with [`GET /history/scopes`](#scope-discovery--get-historyscopes-issue-275) —
+which reports local retention only and, like `live`, is not a completeness
+claim:
 
 ```text
 GET /history?scope=topic:topic-a&limit=100

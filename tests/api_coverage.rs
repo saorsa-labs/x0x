@@ -166,6 +166,11 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Get,
+        "/history/scopes",
+        owner_scopes_enumerates_and_pages_by_canonical_cursor
+    ),
+    covered!(
+        Get,
         "/history/search",
         rest_history_list_search_stats_purge_roundtrip
     ),
@@ -557,6 +562,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
         include_str!("history_point_lookup_wiring.rs"),
     ),
     ("tests/profile_api.rs", include_str!("profile_api.rs")),
+    (
+        "src/server/routes/history.rs",
+        include_str!("../src/server/routes/history.rs"),
+    ),
     (
         "src/server/routes/home.rs",
         include_str!("../src/server/routes/home.rs"),
