@@ -146,7 +146,12 @@ def trace_rows(text):
             elif re.fullmatch(r'publish_attempted=(None|Some\(\d+\))', detail):
                 val = detail.split('=')[1]
                 row.update(event='publish', attempted=None if val == 'None' else int(val[5:-1]))
+            elif detail == 'transport=unobserved send_ready=unobserved admission=unobserved':
+                row.update(event='unobserved', transport='unobserved',
+                           send_ready='unobserved', admission='unobserved')
             else:
+                # Historical R2 evidence remains parseable. R3 never queries
+                # connectivity; these values are not causally passive samples.
                 snap = re.fullmatch(r'transport_send_ready=(None|Some\(\((true|false), (true|false)\)\)) admission=unavailable', detail)
                 require(snap)
                 row.update(event='snapshot', transport=None if snap[1] == 'None' else snap[2] == 'true',

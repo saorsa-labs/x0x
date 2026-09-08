@@ -1,7 +1,5 @@
 //! Disposable #574 observation only. Never used to decide readiness.
-use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use ant_quic::{PeerId, PeerLifecycleEvent};
@@ -35,7 +33,7 @@ enum Observation {
     StreamUnavailable,
     CaptureLimit,
     CaptureDeadline,
-    Snapshot(Option<(bool, bool)>),
+    Unobserved,
     Publish(Option<u32>),
     Marker(&'static str),
 }
@@ -184,19 +182,11 @@ impl Trace {
         self.journal.record(side, Observation::Marker(marker));
     }
 
-    /// A single poll only: a contended network lock produces UNKNOWN and the
-    /// future is dropped immediately. No timer, sleep, task or retained waker.
-    /// Transport and send-ready are sequential observations, NOT an atomic pair.
-    pub(super) fn snapshot(&self, side: Side, future: impl Future<Output = (bool, bool)>) {
-        let mut future = std::pin::pin!(future);
-        let value = match future
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-        {
-            Poll::Ready(value) => Some(value),
-            Poll::Pending => None,
-        };
-        self.journal.record(side, Observation::Snapshot(value));
+    /// Deliberately do not query transport: ant-quic connectivity/health
+    /// getters can retire connections and promote survivors. Record only the
+    /// observation limit; no future or network handle enters this observer.
+    pub(super) fn unobserved(&self, side: Side) {
+        self.journal.record(side, Observation::Unobserved);
     }
 
     pub(super) fn published(&self, side: Side, fanout: Option<u32>) {
@@ -233,7 +223,7 @@ impl Trace {
                     Observation::StreamUnavailable => "stream_unavailable".to_string(),
                     Observation::CaptureLimit => "capture_event_limit".to_string(),
                     Observation::CaptureDeadline => "capture_deadline".to_string(),
-                    Observation::Snapshot(value) => format!("transport_send_ready={value:?} admission=unavailable"),
+                    Observation::Unobserved => "transport=unobserved send_ready=unobserved admission=unobserved".to_string(),
                     Observation::Publish(value) => format!("publish_attempted={value:?}"),
                     Observation::Marker(value) => format!("marker={value}"),
                 };
@@ -385,28 +375,14 @@ async fn lifecycle574_drop_cancels_unpolled_and_waiting_receivers() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn lifecycle574_pending_snapshot_drops_without_advancing_deadline() {
-    struct Pending(Arc<std::sync::atomic::AtomicBool>);
-    impl Future for Pending {
-        type Output = (bool, bool);
-        fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-            Poll::Pending
-        }
-    }
-    impl Drop for Pending {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
+async fn lifecycle574_unobserved_records_no_transport_value_or_deadline_advance() {
     let trace = Trace::new();
-    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started = tokio::time::Instant::now();
-    trace.snapshot(Side::Owner, Pending(Arc::clone(&dropped)));
-    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    trace.unobserved(Side::Owner);
     assert_eq!(started.elapsed(), std::time::Duration::ZERO);
     assert!(matches!(
         trace.journal.state.lock().unwrap().rows[0].observation,
-        Observation::Snapshot(None)
+        Observation::Unobserved
     ));
     trace.finish().await;
 }
@@ -481,12 +457,9 @@ async fn lifecycle574_capture_deadline_and_event_limit_leave_explicit_gaps() {
         assert!(state.collectors_dropped[1]);
         assert!(!state.closed[1]);
     });
-    trace.snapshot(Side::Owner, async { (true, false) });
-    trace.journal.update(|state| {
-        assert!(matches!(
-            state.rows[1].observation,
-            Observation::Snapshot(Some((true, false)))
-        ))
-    });
+    trace.unobserved(Side::Owner);
+    trace
+        .journal
+        .update(|state| assert!(matches!(state.rows[1].observation, Observation::Unobserved)));
     trace.finish().await;
 }

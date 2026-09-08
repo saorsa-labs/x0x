@@ -105,6 +105,16 @@ class Guards(unittest.TestCase):
                      TRACE.replace('total=1 ', 'total=2 '), TRACE.replace('admission=unavailable','admission=admitted')+'\n'+PREFIX+'junk']:
             with self.assertRaises(ValueError): m.trace_rows(text)
 
+    def test_r3_unobserved_is_explicit_and_cannot_be_positive_transport(self):
+        token = 'transport=unobserved send_ready=unobserved admission=unobserved'
+        value = m.trace_rows(TRACE.replace('marker=before_old_shutdown', token))
+        self.assertEqual(value['rows'][0]['event'], 'unobserved')
+        for field in ['transport', 'send_ready', 'admission']:
+            self.assertEqual(value['rows'][0][field], 'unobserved')
+            with self.assertRaises(ValueError):
+                m.trace_rows(TRACE.replace('marker=before_old_shutdown', token.replace(field+'=unobserved', field+'=true')))
+        self.assertFalse(value['general_acceptance'])
+
     def test_gap_flags_never_general_acceptance(self):
         for token, replacement in [('overflow=0','overflow=1'),('lagged=[0, 0]','lagged=[1, 0]'),
                                    ('pending_at_stop=[0, 0]','pending_at_stop=[0, 1]'),
@@ -180,6 +190,17 @@ class ProducerCollector(unittest.TestCase):
         self.assertEqual(self.outputs.read_text(),'receipt_eligible=true\n')
         self.assertEqual(list(p.name for p in self.out.iterdir()),['diagnostic.json'])
         text=(self.out/'diagnostic.json').read_text();self.assertNotIn('SECRET',text);self.assertNotIn('/Users/',text)
+
+    def test_r3_producer_unobserved_survives_closed_collector_without_transport_credit(self):
+        row = 'transport=unobserved send_ready=unobserved admission=unobserved'
+        (self.root/'nextest.stderr').write_text(TRACE.replace('marker=before_old_shutdown', row))
+        self.assertEqual(self.call(), 0)
+        value = m.read(self.out/'diagnostic.json')
+        self.assertTrue(value['diagnostic_test_passed'])
+        self.assertEqual(value['trace']['rows'][0]['transport'], 'unobserved')
+        self.assertEqual(value['trace']['rows'][0]['send_ready'], 'unobserved')
+        self.assertEqual(value['trace']['rows'][0]['admission'], 'unobserved')
+        self.assertFalse(value['general_acceptance'])
 
     def test_failed_test_retains_valid_evidence_without_pass_credit(self):
         for p in [self.root/'runtime.json',self.iso/'exit.json']:self.put(p,{'exit':100})

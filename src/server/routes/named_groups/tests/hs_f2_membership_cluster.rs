@@ -1626,13 +1626,8 @@ async fn await_restart_gossip_ready_observed(
     // Fanout = attempted eager-peer opportunity, never confirmed delivery.
     let (result, diag) = await_restart_gossip_ready_with(
         async |probe| {
-            if let (Some(trace), Some(network)) = (trace, owner.network()) {
-                let peer = ant_quic::PeerId(joiner.machine_id().0);
-                trace.snapshot(DiagnosticSide::Owner, async {
-                    let connected = network.is_connected(&peer).await;
-                    let send_ready = network.send_ready_peers().await.contains(&peer);
-                    (connected, send_ready)
-                });
+            if let Some(trace) = trace {
+                trace.unobserved(DiagnosticSide::Owner);
             }
             let result = owner.publish_with_fanout(topic, probe).await;
             if let Some(trace) = trace {
@@ -1641,13 +1636,8 @@ async fn await_restart_gossip_ready_observed(
             result.map_err(anyhow::Error::from)
         },
         async |probe| {
-            if let (Some(trace), Some(network)) = (trace, joiner.network()) {
-                let peer = ant_quic::PeerId(owner.machine_id().0);
-                trace.snapshot(DiagnosticSide::Joiner, async {
-                    let connected = network.is_connected(&peer).await;
-                    let send_ready = network.send_ready_peers().await.contains(&peer);
-                    (connected, send_ready)
-                });
+            if let Some(trace) = trace {
+                trace.unobserved(DiagnosticSide::Joiner);
             }
             let result = joiner.publish_with_fanout(topic, probe).await;
             if let Some(trace) = trace {
@@ -4605,7 +4595,7 @@ async fn issue458r4_adoption_hydrates_reconstructed_digest_only_seats() -> Resul
     Ok(())
 }
 
-// Positive transport/fanout observations must never turn missing
+// Unobserved transport and positive fanout must never turn missing
 // remote payloads into acceptance. Exercises the SAME unchanged 20s loop.
 #[tokio::test(start_paused = true)]
 async fn lifecycle574_observations_cannot_accept_missing_remote_probes() {
@@ -4613,7 +4603,7 @@ async fn lifecycle574_observations_cannot_accept_missing_remote_probes() {
     let started = tokio::time::Instant::now();
     let (result, diag) = await_restart_gossip_ready_with(
         async |_| {
-            trace.snapshot(DiagnosticSide::Owner, async { (true, true) });
+            trace.unobserved(DiagnosticSide::Owner);
             trace.published(DiagnosticSide::Owner, Some(1));
             Ok(1)
         },
