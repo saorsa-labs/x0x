@@ -51,7 +51,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus (UPnP / NAT / relay / mDNS) |
 | GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters |
-| GET | `/diagnostics/dm` | `x0x diagnostics dm` | DM send/receive counters, per-peer health, and last durable-send stage timers |
+| GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <64-hex-id>]` | DM counters/health/timers plus bounded local retained digest state; exact `?agent=` inspection, unknown-history absence, unavailable-store nulls ([semantics](api-reference.md#get-diagnosticsdm)) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters and drop buckets |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting: active conns, x0x peers, churn lifecycle, orphan closes, buffered bytes (#368) |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote-exec counters, warnings, ACL summary |

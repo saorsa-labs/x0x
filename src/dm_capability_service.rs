@@ -233,6 +233,33 @@ impl CapabilityAdvertService {
         publish_interval: Duration,
         periodic: bool,
     ) -> NetworkResult<Self> {
+        Self::spawn_observed(
+            pubsub,
+            signing,
+            self_agent_id,
+            self_machine_id,
+            caps_rx,
+            store,
+            publish_interval,
+            periodic,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_observed(
+        pubsub: Arc<PubSubManager>,
+        signing: Arc<SigningContext>,
+        self_agent_id: AgentId,
+        self_machine_id: MachineId,
+        caps_rx: tokio::sync::watch::Receiver<DmCapabilities>,
+        store: Arc<CapabilityStore>,
+        publish_interval: Duration,
+        periodic: bool,
+        #[cfg(test)] observation: Option<Arc<ConvergenceServiceObserver>>,
+    ) -> NetworkResult<Self> {
         let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
         // #448: new peers additionally consume the signed digest
         // extension; v0.40.4 peers never subscribe to this topic.
@@ -253,6 +280,8 @@ impl CapabilityAdvertService {
         let (reannounce_tx, mut reannounce_rx) = tokio::sync::mpsc::channel::<()>(16);
         let warm_reannounce_tx = reannounce_tx.clone();
 
+        #[cfg(test)]
+        let warm_observation = observation.clone();
         let subscriber = tokio::spawn(async move {
             while let Some(message) = subscription.recv().await {
                 let sender = message.sender;
@@ -270,7 +299,11 @@ impl CapabilityAdvertService {
                         carrier = "warm",
                         requester = sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
                     );
-                    let _ = warm_reannounce_tx.try_send(());
+                    let _result = warm_reannounce_tx.try_send(());
+                    #[cfg(test)]
+                    if let Some(observer) = &warm_observation {
+                        observer.enqueue(&message, "warm", _result.is_ok());
+                    }
                     continue;
                 }
                 if ingest_verified_capability_advert(&store_sub, self_agent_for_sub, &message) {
@@ -320,6 +353,8 @@ impl CapabilityAdvertService {
             tracing::debug!("targeted capability advert response subscriber exited");
         });
 
+        #[cfg(test)]
+        let critical_observation = observation.clone();
         let targeted_request_responder = tokio::spawn(async move {
             while let Some(message) = targeted_request_subscription.recv().await {
                 if !message.verified
@@ -339,7 +374,11 @@ impl CapabilityAdvertService {
                     carrier = "critical",
                     requester = message.sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
                 );
-                let _ = reannounce_tx.try_send(());
+                let _result = reannounce_tx.try_send(());
+                #[cfg(test)]
+                if let Some(observer) = &critical_observation {
+                    observer.enqueue(&message, "critical", _result.is_ok());
+                }
             }
             tracing::debug!("targeted capability advert request responder exited");
         });
@@ -364,6 +403,10 @@ impl CapabilityAdvertService {
             let mut requests_open = true;
             loop {
                 while reannounce_rx.try_recv().is_ok() {
+                    #[cfg(test)]
+                    if let Some(observer) = &observation {
+                        observer.record(ServiceEvent::Consumed);
+                    }
                     targeted_response_pending = true;
                 }
                 let caps_snapshot = publisher_caps_rx.borrow().clone();
@@ -374,6 +417,10 @@ impl CapabilityAdvertService {
                 // `changed()` arm below restarts the burst as soon as the
                 // caps watch upgrades, so readiness still propagates fast.
                 if !advert_is_publishable(&caps_snapshot) {
+                    #[cfg(test)]
+                    if let Some(observer) = &observation {
+                        observer.record(ServiceEvent::PendingSkip);
+                    }
                     tracing::debug!("capability advert pending (no inbox/KEM yet); not publishing");
                     tokio::select! {
                         _ = tokio::time::sleep(publish_interval) => {}
@@ -388,7 +435,11 @@ impl CapabilityAdvertService {
                             // immediately, so there is nothing to answer with
                             // yet — just remember that someone asked.
                             match request {
-                                Some(()) => targeted_response_pending = true,
+                                Some(()) => {
+                                    #[cfg(test)]
+                                    if let Some(observer) = &observation { observer.record(ServiceEvent::Consumed); }
+                                    targeted_response_pending = true;
+                                },
                                 None => requests_open = false,
                             }
                         }
@@ -492,6 +543,8 @@ impl CapabilityAdvertService {
                             match request {
                                 None => requests_open = false,
                                 Some(()) => {
+                                    #[cfg(test)]
+                                    if let Some(observer) = &observation { observer.record(ServiceEvent::Consumed); }
                                     targeted_response_pending = true;
                                     let now = tokio::time::Instant::now();
                                     let earliest = last_targeted_response_at.map_or(now, |last| {
@@ -1356,5 +1409,306 @@ mod tests {
         assert!(caps.supports_durable_app_ack());
 
         service.abort();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceEvent {
+    Enqueue {
+        requester: [u8; 32],
+        carrier: &'static str,
+        payload_hash: [u8; 32],
+        accepted: bool,
+    },
+    Consumed,
+    PendingSkip,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ConvergenceServiceObserver(std::sync::Mutex<(Vec<ServiceEvent>, bool)>);
+
+#[cfg(test)]
+impl ConvergenceServiceObserver {
+    fn record(&self, event: ServiceEvent) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        if state.0.len() == 16 {
+            state.1 = true;
+        } else {
+            state.0.push(event);
+        }
+    }
+    fn enqueue(&self, message: &PubSubMessage, carrier: &'static str, accepted: bool) {
+        use sha2::{Digest, Sha256};
+        if let Some(requester) = message.sender {
+            self.record(ServiceEvent::Enqueue {
+                requester: requester.0,
+                carrier,
+                payload_hash: Sha256::digest(&message.payload).into(),
+                accepted,
+            });
+        }
+    }
+    pub(crate) fn snapshot(&self) -> Result<Vec<ServiceEvent>, &'static str> {
+        let state = self.0.lock().map_err(|_| "service observer poisoned")?;
+        if state.1 {
+            return Err("service observer overflow");
+        }
+        Ok(state.0.clone())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn convergence_request_bytes(agent: AgentId) -> Vec<u8> {
+    encode_targeted_capability_request(agent).expect("encode fixed-size fixture request")
+}
+
+#[cfg(test)]
+mod asymmetric_ingress_tests {
+    use super::*;
+    use crate::{
+        dm,
+        identity::{AgentKeypair, MachineKeypair},
+        peer_relay::{PeerRelay, RelayDisposition, RelayPolicy, RelayRefusal},
+    };
+
+    fn message(signing: &SigningContext, extension: bool) -> PubSubMessage {
+        let caps = DmCapabilities::v1_gossip_ready(vec![1; 1184]);
+        let payload = if extension {
+            build_signed_digest_extension(signing, signing.agent_id, MachineId([4; 32]), &caps)
+                .unwrap()
+                .unwrap()
+        } else {
+            build_signed_advert(signing, signing.agent_id, MachineId([4; 32]), caps).unwrap()
+        };
+        // Unit boundary only: these are controlled verified outer metadata,
+        // not evidence that a live PubSub transport authenticated the message.
+        PubSubMessage {
+            topic: if extension {
+                crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC
+            } else {
+                DM_CAPABILITY_TOPIC
+            }
+            .into(),
+            payload: payload.into(),
+            sender: Some(signing.agent_id),
+            sender_public_key: Some(signing.public_key_bytes.clone()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        }
+    }
+
+    fn frame(signing: &SigningContext, bound: bool) -> crate::peer_relay::RelayedDm {
+        let machine = MachineKeypair::generate().unwrap();
+        let kem = crate::groups::kem_envelope::AgentKemKeypair::generate().unwrap();
+        let now = dm::now_unix_ms();
+        let inner = dm::EnvelopeBuilder::build_payload_envelope(
+            [7; 16],
+            &signing.agent_id,
+            &machine.machine_id(),
+            &machine,
+            &AgentId([9; 32]),
+            &kem.public_bytes,
+            now,
+            now + 60_000,
+            b"unit payload".to_vec(),
+            |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+        )
+        .unwrap();
+        PeerRelay::new()
+            .build_relayed_dm(
+                &AgentId([9; 32]),
+                &signing.agent_id,
+                signing.public_key_bytes.clone(),
+                now,
+                inner,
+                bound,
+                |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn asymmetric_signed_ingress_preserves_legacy_until_observed_v2() {
+        let s = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let r = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let at_r = CapabilityStore::new();
+        let at_s = CapabilityStore::new();
+        assert!(ingest_verified_capability_advert(
+            &at_r,
+            r.agent_id,
+            &message(&s, false)
+        ));
+        assert!(ingest_verified_digest_extension(
+            &at_r,
+            r.agent_id,
+            &message(&s, true)
+        ));
+        assert!(ingest_verified_capability_advert(
+            &at_s,
+            s.agent_id,
+            &message(&r, false)
+        ));
+        assert!(at_r.lookup(&s.agent_id).unwrap().digest_support);
+        assert!(!crate::peer_relay::peer_advertises_inner_digest(
+            at_s.lookup(&r.agent_id).as_ref()
+        ));
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        assert_eq!(
+            relay.disposition_for(
+                &frame(&s, false),
+                &r.agent_id,
+                dm::now_unix_ms(),
+                true,
+                false
+            ),
+            RelayDisposition::Forward {
+                dst_agent_id: [9; 32]
+            }
+        );
+        assert!(relay
+            .digest_diagnostic_snapshot(std::time::Instant::now(), None)
+            .rows
+            .is_empty());
+        assert_eq!(
+            relay.disposition_for(
+                &frame(&s, true),
+                &r.agent_id,
+                dm::now_unix_ms(),
+                true,
+                false
+            ),
+            RelayDisposition::Forward {
+                dst_agent_id: [9; 32]
+            }
+        );
+        assert_eq!(
+            relay.disposition_for(
+                &frame(&s, false),
+                &r.agent_id,
+                dm::now_unix_ms(),
+                true,
+                false
+            ),
+            RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest)
+        );
+    }
+
+    #[test]
+    fn asymmetric_signed_ingress_extension_order_and_rejection() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let base = message(&signing, false);
+        let extension = message(&signing, true);
+        assert!(ingest_verified_digest_extension(&store, local, &extension));
+        assert!(store.lookup(&signing.agent_id).is_none());
+        assert!(ingest_verified_capability_advert(&store, local, &base));
+        assert!(store.lookup(&signing.agent_id).unwrap().digest_support);
+        let mut unverified = extension.clone();
+        unverified.verified = false;
+        assert!(!ingest_verified_digest_extension(
+            &CapabilityStore::new(),
+            local,
+            &unverified
+        ));
+        let mut forged =
+            crate::dm_capability::DigestSupportExtension::from_postcard(&extension.payload)
+                .unwrap();
+        forged.signature[0] ^= 1;
+        let mut forged_message = extension;
+        forged_message.payload = postcard::to_stdvec(&forged).unwrap().into();
+        assert!(!ingest_verified_digest_extension(
+            &CapabilityStore::new(),
+            local,
+            &forged_message
+        ));
+        let foreign = AgentKeypair::generate().unwrap();
+        let mut wrong_sender = base.clone();
+        wrong_sender.sender = Some(foreign.agent_id());
+        assert!(!ingest_verified_capability_advert(
+            &CapabilityStore::new(),
+            local,
+            &wrong_sender
+        ));
+    }
+
+    #[test]
+    fn asymmetric_signed_ingress_observation_does_not_refresh() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let store = CapabilityStore::new();
+        let local = AgentId([3; 32]);
+        assert!(ingest_verified_capability_advert(
+            &store,
+            local,
+            &message(&signing, false)
+        ));
+        assert!(ingest_verified_digest_extension(
+            &store,
+            local,
+            &message(&signing, true)
+        ));
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        let v2 = frame(&signing, true);
+        assert_eq!(
+            relay.disposition_for(&v2, &local, dm::now_unix_ms(), true, false),
+            RelayDisposition::Forward {
+                dst_agent_id: [9; 32]
+            }
+        );
+        let at = std::time::Instant::now();
+        let before = crate::dm_digest_diagnostics::join_snapshots(
+            store.digest_diagnostic_snapshot(at, None),
+            relay.digest_diagnostic_snapshot(at, None),
+            None,
+        );
+        let after = crate::dm_digest_diagnostics::join_snapshots(
+            store.digest_diagnostic_snapshot(at, None),
+            relay.digest_diagnostic_snapshot(at, None),
+            None,
+        );
+        assert_eq!(before, after);
+        assert_eq!(
+            relay.disposition_for(
+                &frame(&signing, false),
+                &local,
+                dm::now_unix_ms(),
+                true,
+                false
+            ),
+            RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest)
+        );
+    }
+
+    #[test]
+    fn service_observer_bounds_poison_and_pending_predicate() {
+        let observer = ConvergenceServiceObserver::default();
+        assert!(!advert_is_publishable(&DmCapabilities::pending()));
+        assert!(advert_is_publishable(&DmCapabilities::v1_gossip_ready(
+            vec![1; 1184]
+        )));
+        for _ in 0..16 {
+            observer.record(ServiceEvent::PendingSkip);
+        }
+        assert_eq!(observer.snapshot().unwrap().len(), 16);
+        observer.record(ServiceEvent::Consumed);
+        assert_eq!(
+            observer.snapshot().unwrap_err(),
+            "service observer overflow"
+        );
+        let observer = ConvergenceServiceObserver::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = observer.0.lock().unwrap();
+            panic!("inert service poison");
+        });
+        observer.record(ServiceEvent::Consumed);
+        assert_eq!(
+            observer.snapshot().unwrap_err(),
+            "service observer poisoned"
+        );
     }
 }

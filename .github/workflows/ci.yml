@@ -103,13 +103,36 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
+      - name: Prepare bounded convergence custody
+        id: prepare_convergence
+        run: python3 scripts/ci/issue442-convergence-custody.py prepare
+
       - name: Run tests
+        id: tests
+        env:
+          X0X_ISOLATION_ROLE: acceptance
         # x0x_0041_synthetic_kill_restart is a documented timing-flaky test
         # (500ms kill/restart bound) — filtered in CI as it is in local dev
         # runs. Tracked separately; do not let it gate unrelated PRs.
         # NB: `binary()` (test-binary name), not `test()` — `test()` would
         # match the test function name, which is different from the binary.
         run: bash scripts/ci/nextest-isolated.sh --all-features --workspace -- -E '!binary(x0x_0041_synthetic_kill_restart)'
+
+      - name: Collect bounded convergence custody
+        if: always()
+        id: collect_convergence
+        env:
+          X0X_CUSTODY_EXPECT: ${{ steps.tests.outcome }}
+          X0X_ISSUE442_NONCE: ${{ steps.prepare_convergence.outputs.run_nonce }}
+        run: python3 scripts/ci/issue442-convergence-custody.py collect
+
+      - name: Upload bounded convergence custody
+        if: always() && steps.collect_convergence.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue442-convergence-custody
+          path: ${{ runner.temp }}/x0x-issue442-receipt/custody-receipt.json
+          if-no-files-found: error
 
       - name: Upload test results
         if: always()
@@ -334,6 +357,11 @@ jobs:
         run: |
           python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ required"'
           python3 scripts/dev/test_test_isolated.py
+
+      - name: Convergence custody inert controls
+        run: |
+          python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
+          python3 scripts/ci/test_issue442_convergence_custody.py
 
       - name: Authority check (same recipe as `just check`)
         run: python3 scripts/ci/isolated-runtime.py just deploy-check
