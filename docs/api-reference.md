@@ -448,9 +448,15 @@ agents).
 | POST | `/home/rename` | `x0x home rename <NAME>` | durable-owner (#446) | Rename the Home (admin-gated, sealed into the state chain) |
 | POST | `/home/seat` | `x0x home seat <AGENT_ID>` | durable-owner | Mint an addressed invite for a named agent to join the canonical Home |
 
-The first start of an owned install provisions exactly one Home:
+An owned install provisions one Home at first daemon start —
 `Hidden + OwnerCertified(owner) + MlsEncrypted + MembersOnly/MembersOnly`,
-named "Home". The daemon's own owner-certified agent is the founding member
+named "Home" — subject to two conditions: both an owner user key and a
+builder-issued agent certificate must be live (`OwnerCertified` admission
+needs a certifiable founding member), and no other device of this owner may
+have already advertised a Home. If one has, this device provisions nothing
+and `GET /home` answers `state:"elsewhere"`. An absent register value means
+"none advertised yet", not "none exists", so a first or un-synced device
+still provisions. The daemon's own owner-certified agent is the founding member
 and **primary agent** — the owner speaks *through* an agent; there is no human
 wire signer. Admission is cryptographic: joining requires an agent certificate
 chaining to the owner's user key, re-checked at every state seal. An
@@ -459,9 +465,14 @@ uncertified holder of a valid invite is refused (`403`).
 **GET /home response** (`404` with `no Home provisioned (un-owned install)` /
 `no Home provisioned` otherwise):
 
+A `state:"local"` response (the settled case):
+
 ```json
 {
   "ok": true,
+  "owner_user_id": "9f21bd…",
+  "state": "local",
+  "canonical_group_id": null,
   "group_id": "3277a3c3…",
   "name": "Home",
   "description": "Owner's personal space (auto-provisioned)",
@@ -474,16 +485,53 @@ uncertified holder of a valid invite is refused (`403`).
   "members": [
     {"agent_id":"414529…","role":"Admin","placement":"roaming","self_name":"Alice"}
   ],
-  "warnings": {"no_roaming_agent": false, "primary_agent_unverified": true}
+  "duplicates": [],
+  "warnings": {
+    "no_roaming_agent": false,
+    "primary_agent_unverified": true,
+    "unretired_duplicate_home": false
+  }
 }
 ```
 
+- `owner_user_id` is the Home's `OwnerCertified` admission axis — the value a
+  joining device must pin (`x0x group join … --home --owner <owner_user_id>`).
+- **There are three distinct `200` shapes**, keyed by `state`, plus two `404`s.
+  `get_home` matches on `resolve_home` and calls `home_elsewhere_response`
+  directly for the third:
+
+  | `state` | When | Body |
+  |---|---|---|
+  | `"local"` | this device holds the canonical Home, or is uncontested | the full payload above; `canonical_group_id` is `null` |
+  | `"adoption_pending"` | this device holds a Home that LOST the `("home")` election | the full payload above, `canonical_group_id` names the winner, **plus `next_step`** |
+  | `"elsewhere"` | the owner's Home is on another device and this one is not a member | a **short** body — `ok`, `state`, `owner_user_id`, `canonical_group_id`, `local_group_id` (nullable), `detail`, **`next_step`** — and **no** `group_id`, `name`, `members`, `duplicates` or `warnings` |
+
+  `next_step` is present on both `adoption_pending` and `elsewhere`, and absent
+  from `local`. `"elsewhere"` is a `200` rather than a `404` so a second device
+  is not misread as Home-less and does not provision a duplicate.
+
+  The two `404`s are distinct: `no Home provisioned (un-owned install)` when no
+  user key is loaded (checked before any resolution), and `no Home provisioned`
+  for `HomeResolution::Unknown` — an owned install with no Home this device can
+  see. Neither is the `elsewhere` case.
+
+  `POST /home/seat`'s `409 reason` values (`adoption_pending`, `elsewhere`,
+  `unknown`) are the **seat** endpoint's refusals, a separate surface from
+  these `GET` shapes — do not read one as documentation of the other.
 - `placement` per member: `"roaming"` | `"pinned"` (from Home metadata).
 - `primary_agent.verified` is the fail-closed trust check that the primary's
   certificate chains to the owner (a committed certificate must be present);
   the GUI shows the owner chip only when true.
+- `duplicates` is **read-only inventory** of other Home-shaped groups this
+  device is seated in. Each entry is
+  `{"group_id", "retirement": "manual_only", "evidence_against_deletion": [...]}`.
+  Automatic retirement is not implemented, and an **empty
+  `evidence_against_deletion` is not a safe-to-delete verdict** — a
+  `safe_to_retire` field was deliberately removed because no sound emptiness
+  proof exists. Never infer deletion from this list.
 - `warnings.no_roaming_agent` — ADR-0038 invariant: Home should always
   contain ≥ 1 Roaming agent.
+- `warnings.unretired_duplicate_home` — `duplicates` is non-empty.
 
 **POST `/home/seat`** implements the owner-driven adoption decision recorded in
 [ADR-0060](adr/0060-one-home-per-owner.md#adoption-eligibility--decided-2026-09-07-david-irvine).
@@ -532,13 +580,27 @@ presence, NEVER by its current policy axes, so a session cannot
 policy-flip around the rename gate. Ordinary groups keep the bearer
 PATCH paths.
 
-**Known limitation (#449):** Home dedup is per-machine — each of the owner's
-devices provisions its own Home (observed live: two daemons sharing one
-`user.key` minted two different `group_id`s). Cross-device reconciliation is
-ADR-0041 follow-up. **Known limitation (#447):** a certified second device
-becomes join-eligible only after its second announce beat (~600 s); a premature
-join is rejected (`MemberJoined: rejecting uncertified joiner`) and the joiner
-must locally delete + rejoin.
+**#449 status (ADR-0060).** The owner's Home is the winner of the Tier-1
+`("home")` register, not a per-install artifact. `effective_canonical_home`
+reads that register and `resolve_home` classifies this device as `Local`,
+`AdoptionPending { local, canonical }`, `Elsewhere { canonical }` or `Unknown`;
+`GET /home` surfaces the first two as `state` plus `canonical_group_id`. A
+device that still holds a losing Home keeps using it until the owner seats it.
+Moving a device is the owner-driven `POST /home/seat` act above — never
+inferred, and never a rule acting on hosting mode. **#449 remains open**: it
+closes only once the seating command is shipped, reviewed and runtime-accepted.
+No multi-device convergence or roster-merge claim is made.
+
+**Second owner device joining (#447).** A single explicit
+`POST /announce` with body `{"include_user_identity":true,"human_consent":true}`
+on the joining device is sufficient — a bodyless announce publishes the
+anonymous certificate digest, which the owner can never resolve. A join that
+arrives before the certificate is visible is retained in a typed `pending`
+state (`retain_pending_owner_cert_join`) and retried when the evidence lands
+(`retry_pending_owner_cert_joins`), rather than wedging. There is no
+delete-and-rejoin step, and no waiting for a second announce beat. A pending
+join is in-memory only: if the joining daemon restarts before it observes its
+own `MemberAdded`, mint a fresh invite rather than replaying the link.
 
 ## Device sync (ADR-0041, Tier 1)
 
@@ -594,8 +656,12 @@ enrollment. Set trust on **both** sides (`x0x trust set <agent_id> trusted` /
 `POST /contacts/trust`).
 
 **What Tier 1 actually applies today:** profile/names converge; the Home
-pointer is synced and **stored for future adoption — it is not applied**
-(each device keeps its own Home, #449); sub-agent issuance journal lines are
+pointer is synced **and applied** — `OwnerSyncStore::canonical_home()` feeds
+`effective_canonical_home`, so a device holding a losing Home reports
+`state:"adoption_pending"` against `canonical_group_id`. Applying the pointer
+is not adoption and not a roster merge: a device changes Home only through the
+owner-driven `POST /home/seat` + pinned join (#449, ADR-0060); sub-agent
+issuance journal lines are
 synced as the issuance fact only (digest + time) — `mode` defaults to `acp`,
 `label` is dropped, and **no certificate bytes travel Tier 1** (Tier-3
 boundary), so a synced roster row is not itself mint-capable for riders.
