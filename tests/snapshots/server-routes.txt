@@ -38,6 +38,7 @@ POST  /sync/devices/enroll                                sync enroll           
 DELETE  /sync/devices/:machine_id                           sync revoke                                             Remove a machine from the owner device set (ADR-0041 Tier-1; owner-gated)
 GET  /home                                               home                                                    ADR-0038 Home space: group id, primary agent, members, warnings
 POST  /home/rename                                        home rename               body: name                    Rename the Home space (admin-gated, sealed)
+POST  /home/seat                                          home seat                 body: agent_id                Mint an addressed Home invite seating another of the owner's devices (#449)
 POST  /mls/groups                                         groups create             body: group_id                Create encrypted group
 GET  /mls/groups                                         groups list                                             List groups
 GET  /mls/groups/:id                                     groups get                                              Get group details
@@ -69,7 +70,8 @@ GET  /presence/status/:id                                presence status        
 GET  /presence/events                                    presence events                                         Server-Sent Events stream of presence online/offline events
 GET  /history                                            history list              query: scope,since_ms,until_ms,limit,before_id  List durable history for one scope (dm:/group:/topic:), keyset-paginated
 GET  /history/message/:msg_id                            history message           query: scope                  Point lookup of one durable history row by exposed msg_id (canonical group ids need ?scope=)
-GET  /history/search                                     history search            query: scope,q,since_ms,until_ms,limit,before_id  Full-text search over text history payloads within a scope
+GET  /history/scopes                                     history scopes            query: after_scope,limit      Enumerate history scopes holding retained rows, with row count and newest seen_at_ms
+GET  /history/search                                     history search            query: scope,q,since_ms,until_ms,limit,before_id  Full-text search over text history payloads (scope optional: omit to search all scopes)
 GET  /history/stats                                      history stats                                           History row counts, database size, and retention bounds
 DELETE  /history                                            history purge             query: scope                  Purge one scope from the local history store (local-only)
 GET  /diagnostics/exec                                   diagnostics exec                                        Remote exec counters, warnings, active sessions, and ACL summary
@@ -124,6 +126,7 @@ POST  /groups/:id/delegate                                group delegate        
 GET  /groups/:id/delegations                             group delegations                                       List effective delegations re-derived from durable history
 POST  /groups/:id/invite                                  group invite              body: expiry_secs             Generate invite link
 POST  /groups/join                                        group join                body: invite,display_name,mode,expected_owner_user_id  Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)
+GET  /groups/:id/join-status                             group join-status                                       Pending-join status with the typed terminal outcome (#477)
 PUT  /groups/:id/display-name                            group set-name            body: name                    Set display name in group
 DELETE  /groups/:id                                         group leave                                             Leave a group (sole-member leave deletes the group)
 GET  /groups/:id/state                                   group state                                             Inspect the signed state-commit chain for a group
@@ -159,6 +162,7 @@ PATCH  /task-lists/:id/tasks/:tid                          tasks claim / tasks c
 GET  /stores                                             store list                                              List key-value stores
 POST  /stores                                             store create              body: name,topic,policy       Create key-value store
 POST  /stores/:id/join                                    store join                body: expected_owner,policy   Join existing store
+POST  /groups/:id/stores                                  group store create        body: name                    Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane
 GET  /stores/:id/keys                                    store keys                                              List keys in store
 PUT  /stores/:id/:key                                    store put                 body: value,content_type      Put value in store
 GET  /stores/:id/:key                                    store get                                               Get value from store
@@ -175,4 +179,4 @@ GET  /ws/direct                                          ws direct              
 GET  /ws/sessions                                        ws sessions                                             List WebSocket sessions
 GET  /gui                                                gui                                                     Open the embedded GUI
 
-174 endpoints total
+178 endpoints total
