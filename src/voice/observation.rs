@@ -113,6 +113,7 @@ struct Totals {
 #[derive(Clone, Debug, Serialize)]
 struct Row {
     instance: u64,
+    dispatch_id: Option<usize>,
     inbound: bool,
     peer_machine: Option<[u8; 32]>,
     quic_stream: Option<u64>,
@@ -151,6 +152,7 @@ struct Lifecycle {
 #[derive(Clone, Debug, Serialize)]
 struct SideState {
     side: &'static str,
+    dispatch: DispatchState,
     expected_peer: [u8; 32],
     sequence: u64,
     generation_hint: Option<u64>,
@@ -172,6 +174,7 @@ impl SideState {
     fn new(side: &'static str, expected_peer: [u8; 32]) -> Self {
         Self {
             side,
+            dispatch: DispatchState::default(),
             expected_peer,
             sequence: 0,
             generation_hint: None,
@@ -315,17 +318,18 @@ pub struct FailureCapture {
     shared: Arc<Mutex<Capture>>,
     observers: Vec<tokio::task::JoinHandle<()>>,
     passed: bool,
+    dispatch_registrations: Vec<(usize, DispatchRegistration)>,
 }
 
 impl FailureCapture {
     /// Create before starting the observed voice transports.
     pub fn new(alice_remote: [u8; 32], bob_remote: [u8; 32]) -> Self {
         Self { shared: Arc::new(Mutex::new(Capture {
-            epoch: Instant::now(), schema: "x0x.voice-churn-observation/1",
+            epoch: Instant::now(), schema: "x0x.voice-churn-observation/2",
             limitations: "direction unknown; generation association temporal only; write completion is not delivery; failed write/read progress unknown except FinishedEarly; active rows are incomplete; post-cut updates excluded",
             closed_micros: None, after_cut_updates: 0,
             sides: [SideState::new("alice", alice_remote), SideState::new("bob", bob_remote)], phases: Vec::new(), omitted_phases: 0,
-        })), observers: Vec::new(), passed: false }
+        })), observers: Vec::new(), passed: false, dispatch_registrations: Vec::new() }
     }
 
     pub fn alice(&self) -> Observation {
@@ -338,6 +342,61 @@ impl FailureCapture {
         Observation {
             shared: Arc::clone(&self.shared),
             side: 1,
+        }
+    }
+
+    /// Attach dispatch diagnostics synchronously. Failure is recorded as unavailable;
+    /// it does not change network or voice setup and is not acceptance evidence.
+    pub fn observe_dispatch(&mut self, agent: &crate::Agent, observation: Observation) {
+        self.observe_dispatch_slot(agent.dispatch_observation_slot(), observation);
+    }
+
+    fn observe_dispatch_slot(&mut self, slot: Arc<DispatchSlot>, observation: Observation) {
+        let same = Arc::ptr_eq(&self.shared, &observation.shared);
+        let closed = self
+            .shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .closed_micros
+            .is_some();
+        let failure = if !same {
+            Some("foreign_capture")
+        } else if closed {
+            Some("capture_closed")
+        } else if self
+            .dispatch_registrations
+            .iter()
+            .any(|(side, _)| *side == observation.side)
+        {
+            Some("side_already_attached")
+        } else {
+            None
+        };
+        let registration = if failure.is_none() {
+            slot.reserve(observation.clone())
+        } else {
+            None
+        };
+        if let Some(registration) = registration {
+            observation.update(|s, _| {
+                s.dispatch.attachment = Some("attached");
+                s.dispatch.initial_loop_state = Some("unknown_before_attachment");
+            });
+            self.dispatch_registrations
+                .push((observation.side, registration));
+        } else {
+            // Record on this capture, never mutate a foreign capture supplied by a caller.
+            let own = Observation {
+                shared: Arc::clone(&self.shared),
+                side: observation.side,
+            };
+            own.update(|s, _| {
+                s.dispatch.attachment_failures = s.dispatch.attachment_failures.saturating_add(1);
+                s.dispatch.last_attachment_failure = Some(failure.unwrap_or("agent_slot_occupied"));
+                if s.dispatch.attachment.is_none() {
+                    s.dispatch.attachment = Some("unavailable");
+                }
+            });
         }
     }
 
@@ -410,6 +469,7 @@ impl FailureCapture {
             capture.closed_micros = Some(capture.epoch.elapsed().as_micros());
         }
         drop(capture);
+        self.dispatch_registrations.clear();
         for observer in self.observers.drain(..) {
             observer.abort();
         }
@@ -426,6 +486,330 @@ impl Drop for FailureCapture {
                 let _ = writeln!(std::io::stderr().lock(), "VOICE_CHURN_OBSERVATION {json}");
             }
         }
+    }
+}
+
+// Dispatch observations share the voice recorder's clock and atomic cut.
+const DISPATCH_CAP: usize = 64;
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DispatchStage {
+    GatePending,
+    PrefixTaskCreated,
+    PrefixReadPending,
+    RoutePending,
+    EnqueueAttempt,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+pub(crate) enum DispatchEnd {
+    NotVerified,
+    TrustRejected,
+    Revoked,
+    AclRejected,
+    GateOther,
+    UnknownProtocol,
+    PrefixReadError,
+    PrefixTimeout,
+    QueueFull,
+    QueueClosed,
+    DroppedUnknownOwner,
+}
+
+impl DispatchEnd {
+    pub(crate) fn gate(error: &crate::error::NetworkError) -> Self {
+        use crate::error::NetworkError::*;
+        match error {
+            PeerNotVerified { .. } => Self::NotVerified,
+            PeerTrustRejected { .. } => Self::TrustRejected,
+            PeerRevoked { .. } => Self::Revoked,
+            PeerNotInConnectAcl { .. } => Self::AclRejected,
+            _ => Self::GateOther,
+        }
+    }
+
+    pub(crate) fn prefix(error: &crate::error::NetworkError) -> Self {
+        if matches!(
+            error,
+            crate::error::NetworkError::StreamProtocolUnknown { .. }
+        ) {
+            Self::UnknownProtocol
+        } else {
+            Self::PrefixReadError
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+pub(crate) enum LoopEvent {
+    AcceptAwaitEntered,
+    AcceptReturned,
+    AcceptError,
+    ShutdownSelected,
+    DroppedUnknownOwner,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DispatchRow {
+    id: usize,
+    accepted: Stamp,
+    stage: DispatchStage,
+    stage_at: Stamp,
+    protocol: Option<u8>,
+    registered_route: Option<bool>,
+    send_succeeded: Option<Stamp>,
+    dequeued: Option<Stamp>,
+    voice_link: Option<bool>,
+    terminal: Option<(DispatchEnd, Stamp)>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct DispatchState {
+    attachment: Option<&'static str>,
+    attachment_failures: u64,
+    last_attachment_failure: Option<&'static str>,
+    initial_loop_state: Option<&'static str>,
+    loop_events: Vec<(LoopEvent, Stamp)>,
+    omitted_loop_events: u64,
+    accepted: u64,
+    foreign_accepted: u64,
+    omitted_rows: u64,
+    rows: Vec<DispatchRow>,
+}
+
+/// Agent-local exclusive registration; never a network or acceptor handle.
+#[derive(Default)]
+pub(crate) struct DispatchSlot {
+    active: Mutex<Option<(Arc<()>, Observation)>>,
+}
+
+impl DispatchSlot {
+    pub(crate) fn observation(&self) -> Option<Observation> {
+        self.active
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(_, obs)| obs.clone())
+    }
+
+    fn reserve(self: &Arc<Self>, observation: Observation) -> Option<DispatchRegistration> {
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if active.is_some() {
+            return None;
+        }
+        let cookie = Arc::new(());
+        *active = Some((Arc::clone(&cookie), observation));
+        Some(DispatchRegistration {
+            slot: Arc::downgrade(self),
+            cookie,
+        })
+    }
+}
+
+struct DispatchRegistration {
+    slot: std::sync::Weak<DispatchSlot>,
+    cookie: Arc<()>,
+}
+
+impl Drop for DispatchRegistration {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.upgrade() {
+            let mut active = slot.active.lock().unwrap_or_else(|p| p.into_inner());
+            if active
+                .as_ref()
+                .is_some_and(|(cookie, _)| Arc::ptr_eq(cookie, &self.cookie))
+            {
+                *active = None;
+            }
+        }
+    }
+}
+
+/// Does not own a production task. An unended interval has unknown destruction.
+pub(crate) struct DispatchLoop {
+    observation: Option<Observation>,
+    ended: bool,
+}
+
+impl DispatchLoop {
+    pub(crate) fn new(observation: Option<Observation>) -> Self {
+        let token = Self {
+            observation,
+            ended: false,
+        };
+        token.record(LoopEvent::AcceptAwaitEntered);
+        token
+    }
+    fn record(&self, event: LoopEvent) {
+        if let Some(obs) = &self.observation {
+            obs.update(|s, at| {
+                if s.dispatch.loop_events.len() < EVENT_CAP {
+                    s.dispatch.loop_events.push((event, at));
+                } else {
+                    s.dispatch.omitted_loop_events =
+                        s.dispatch.omitted_loop_events.saturating_add(1);
+                }
+            });
+        }
+    }
+    pub(crate) fn end(&mut self, event: LoopEvent) {
+        if !self.ended {
+            self.record(event);
+            self.ended = true;
+        }
+    }
+}
+impl Drop for DispatchLoop {
+    fn drop(&mut self) {
+        self.end(LoopEvent::DroppedUnknownOwner);
+    }
+}
+
+/// Cloneable update reference has no destruction semantics. The token alone owns Drop.
+#[derive(Clone)]
+pub(crate) struct DispatchRef {
+    observation: Observation,
+    row: usize,
+}
+
+impl DispatchRef {
+    fn update(&self, f: impl FnOnce(&mut DispatchRow, Stamp)) {
+        self.observation.update(|s, at| {
+            if let Some(row) = s.dispatch.rows.get_mut(self.row) {
+                f(row, at);
+            }
+        });
+    }
+    pub(crate) fn sent(&self) {
+        self.update(|row, at| {
+            // Independent of dequeue and owner-drop: either may race this stamp.
+            if row.send_succeeded.is_none() {
+                row.send_succeeded = Some(at);
+            }
+        });
+    }
+}
+
+pub(crate) struct DispatchToken {
+    reference: DispatchRef,
+    ended: bool,
+}
+
+impl DispatchToken {
+    /// Observe the original nonblocking send result, retaining its returned payload
+    /// and destruction behavior. Shared by the production call and inert queue controls.
+    pub(crate) fn observe_send_result<T>(
+        reference: Option<DispatchRef>,
+        result: Result<(), tokio::sync::mpsc::error::TrySendError<T>>,
+        token: impl FnOnce(&mut T) -> Option<&mut Self>,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<T>> {
+        use tokio::sync::mpsc::error::TrySendError;
+        match result {
+            Ok(()) => {
+                if let Some(reference) = reference {
+                    reference.sent();
+                }
+                Ok(())
+            }
+            Err(mut error) => {
+                let (cause, payload) = match &mut error {
+                    TrySendError::Full(payload) => (DispatchEnd::QueueFull, payload),
+                    TrySendError::Closed(payload) => (DispatchEnd::QueueClosed, payload),
+                };
+                if let Some(token) = token(payload) {
+                    token.end(cause);
+                }
+                Err(error)
+            }
+        }
+    }
+    pub(crate) fn accepted(observation: Option<Observation>, peer: [u8; 32]) -> Option<Self> {
+        let observation = observation?;
+        let mut index = None;
+        observation.update(|s, at| {
+            if peer != s.expected_peer {
+                s.dispatch.foreign_accepted = s.dispatch.foreign_accepted.saturating_add(1);
+                return;
+            }
+            s.dispatch.accepted = s.dispatch.accepted.saturating_add(1);
+            if s.dispatch.rows.len() == DISPATCH_CAP {
+                s.dispatch.omitted_rows = s.dispatch.omitted_rows.saturating_add(1);
+                return;
+            }
+            let id = s.dispatch.rows.len();
+            index = Some(id);
+            s.dispatch.rows.push(DispatchRow {
+                id,
+                accepted: at,
+                stage: DispatchStage::GatePending,
+                stage_at: at,
+                protocol: None,
+                registered_route: None,
+                send_succeeded: None,
+                dequeued: None,
+                voice_link: None,
+                terminal: None,
+            });
+        });
+        index.map(|row| Self {
+            reference: DispatchRef { observation, row },
+            ended: false,
+        })
+    }
+    pub(crate) fn stage(&self, stage: DispatchStage) {
+        self.reference.update(|r, at| {
+            if r.terminal.is_none() && r.dequeued.is_none() && stage > r.stage {
+                r.stage = stage;
+                r.stage_at = at;
+            }
+        });
+    }
+    pub(crate) fn routed(&self, protocol: crate::streams::StreamProtocol, registered: bool) {
+        self.reference.update(|r, _| {
+            r.protocol = Some(protocol.as_u8());
+            r.registered_route = Some(registered);
+        });
+    }
+    pub(crate) fn send_reference(&self) -> DispatchRef {
+        self.reference.clone()
+    }
+    pub(crate) fn end(&mut self, end: DispatchEnd) {
+        if self.ended {
+            return;
+        }
+        self.reference.update(|r, at| {
+            if r.terminal.is_none() && r.dequeued.is_none() {
+                r.terminal = Some((end, at));
+            }
+        });
+        self.ended = true;
+    }
+    pub(crate) fn dequeued(mut self, voice: &Token) {
+        let same = voice.observation.as_ref().is_some_and(|obs| {
+            obs.side == self.reference.observation.side
+                && Arc::ptr_eq(&obs.shared, &self.reference.observation.shared)
+        });
+        // One update joins both rows under the same clock/cut. No cross-capture ID.
+        self.reference.observation.update(|s, at| {
+            if let Some(r) = s.dispatch.rows.get_mut(self.reference.row) {
+                if r.terminal.is_none() && r.dequeued.is_none() {
+                    r.dequeued = Some(at);
+                    r.voice_link = Some(same && voice.row.is_some());
+                    if same {
+                        if let Some(row) = voice.row.and_then(|i| s.rows.get_mut(i)) {
+                            row.dispatch_id = Some(r.id);
+                        }
+                    }
+                }
+            }
+        });
+        self.ended = true;
+    }
+}
+
+impl Drop for DispatchToken {
+    fn drop(&mut self) {
+        self.end(DispatchEnd::DroppedUnknownOwner);
     }
 }
 
@@ -462,6 +846,7 @@ impl Token {
                 row = Some(s.rows.len());
                 s.rows.push(Row {
                     instance,
+                    dispatch_id: None,
                     inbound,
                     peer_machine: None,
                     quic_stream: None,
@@ -1006,5 +1391,308 @@ mod tests {
             state.sides[0].rows[0].terminal,
             Some((Stage::FramePayload, Cause::DroppedUnknownOwner))
         );
+    }
+    fn inert_token_mut(token: &mut DispatchToken) -> Option<&mut DispatchToken> {
+        Some(token)
+    }
+
+    fn dispatch(obs: &Observation) -> DispatchToken {
+        let peer = obs.shared.lock().unwrap().sides[obs.side].expected_peer;
+        DispatchToken::accepted(Some(obs.clone()), peer).unwrap()
+    }
+
+    #[test]
+    fn voice_dispatch_reservation_conflict_foreign_side_and_stale_clear() {
+        let mut a = capture();
+        let mut b = capture();
+        let slot = Arc::new(DispatchSlot::default());
+        a.observe_dispatch_slot(slot.clone(), a.alice());
+        b.observe_dispatch_slot(slot.clone(), b.bob());
+        assert_eq!(
+            b.shared.lock().unwrap().sides[1].dispatch.attachment,
+            Some("unavailable")
+        );
+        assert!(Arc::ptr_eq(&slot.observation().unwrap().shared, &a.shared));
+        a.observe_dispatch_slot(Arc::new(DispatchSlot::default()), a.alice());
+        a.observe_dispatch_slot(Arc::new(DispatchSlot::default()), b.bob());
+        assert_eq!(a.dispatch_registrations.len(), 1);
+        assert_eq!(
+            a.shared.lock().unwrap().sides[0]
+                .dispatch
+                .last_attachment_failure,
+            Some("side_already_attached")
+        );
+        assert_eq!(
+            a.shared.lock().unwrap().sides[1]
+                .dispatch
+                .last_attachment_failure,
+            Some("foreign_capture")
+        );
+        // Simulate stale guard custody explicitly; its cookie must not clear a successor.
+        let stale = DispatchRegistration {
+            slot: Arc::downgrade(&slot),
+            cookie: Arc::new(()),
+        };
+        drop(stale);
+        assert!(slot.observation().is_some());
+        a.close();
+        assert!(slot.observation().is_none());
+        b.observe_dispatch_slot(slot.clone(), b.bob());
+        assert!(Arc::ptr_eq(&slot.observation().unwrap().shared, &b.shared));
+        a.close(); // repeated older capture cleanup cannot clear the new owner
+        assert!(slot.observation().is_some());
+    }
+
+    #[test]
+    fn voice_dispatch_unknown_initial_loop_and_drop_intervals() {
+        let mut c = capture();
+        let slot = Arc::new(DispatchSlot::default());
+        // This await predates attachment: no retroactive waiting record.
+        let mut old = DispatchLoop::new(slot.observation());
+        c.observe_dispatch_slot(slot.clone(), c.alice());
+        old.end(LoopEvent::AcceptReturned);
+        assert!(c.shared.lock().unwrap().sides[0]
+            .dispatch
+            .loop_events
+            .is_empty());
+        assert_eq!(
+            c.shared.lock().unwrap().sides[0]
+                .dispatch
+                .initial_loop_state,
+            Some("unknown_before_attachment")
+        );
+        drop(DispatchLoop::new(slot.observation()));
+        let mut next = DispatchLoop::new(slot.observation());
+        next.end(LoopEvent::ShutdownSelected);
+        drop(next);
+        let state = c.shared.lock().unwrap();
+        let events = &state.sides[0].dispatch.loop_events;
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[1].0, LoopEvent::DroppedUnknownOwner);
+        assert_eq!(events[3].0, LoopEvent::ShutdownSelected);
+    }
+
+    #[test]
+    fn voice_dispatch_drop_before_poll_and_entered_prefix_remain_distinct() {
+        let c = capture();
+        let obs = c.alice();
+        let first = dispatch(&obs);
+        first.stage(DispatchStage::PrefixTaskCreated);
+        let never_polled = async move {
+            first.stage(DispatchStage::PrefixReadPending);
+        };
+        drop(never_polled);
+        let second = dispatch(&obs);
+        second.stage(DispatchStage::PrefixReadPending);
+        second.stage(DispatchStage::PrefixTaskCreated); // cannot regress
+        drop(second);
+        let state = c.shared.lock().unwrap();
+        let rows = &state.sides[0].dispatch.rows;
+        assert_eq!(rows[0].stage, DispatchStage::PrefixTaskCreated);
+        assert_eq!(rows[1].stage, DispatchStage::PrefixReadPending);
+        assert_ne!(rows[0].id, rows[1].id);
+        assert!(rows
+            .iter()
+            .all(|r| r.terminal.unwrap().0 == DispatchEnd::DroppedUnknownOwner));
+    }
+
+    #[test]
+    fn voice_dispatch_actual_gate_prefix_classification_and_idempotent_end() {
+        use crate::error::NetworkError;
+        let c = capture();
+        let obs = c.alice();
+        let cases = [
+            (
+                NetworkError::PeerNotVerified { agent_id: [0; 32] },
+                DispatchEnd::NotVerified,
+            ),
+            (
+                NetworkError::PeerTrustRejected { agent_id: [0; 32] },
+                DispatchEnd::TrustRejected,
+            ),
+            (
+                NetworkError::PeerRevoked { agent_id: [0; 32] },
+                DispatchEnd::Revoked,
+            ),
+            (
+                NetworkError::PeerNotInConnectAcl { agent_id: [0; 32] },
+                DispatchEnd::AclRejected,
+            ),
+            (
+                NetworkError::StreamError("private diagnostic error".into()),
+                DispatchEnd::GateOther,
+            ),
+        ];
+        for (e, cause) in cases {
+            assert_eq!(DispatchEnd::gate(&e), cause);
+            let mut t = dispatch(&obs);
+            t.end(cause);
+            t.end(DispatchEnd::DroppedUnknownOwner);
+        }
+        assert_eq!(
+            DispatchEnd::prefix(&NetworkError::StreamProtocolUnknown { protocol_byte: 0 }),
+            DispatchEnd::UnknownProtocol
+        );
+        assert_eq!(
+            DispatchEnd::prefix(&NetworkError::StreamError("private".into())),
+            DispatchEnd::PrefixReadError
+        );
+        for cause in [
+            DispatchEnd::UnknownProtocol,
+            DispatchEnd::PrefixReadError,
+            DispatchEnd::PrefixTimeout,
+        ] {
+            let mut t = dispatch(&obs);
+            t.stage(DispatchStage::PrefixReadPending);
+            t.end(cause);
+        }
+        let state = c.shared.lock().unwrap();
+        assert_eq!(state.sides[0].dispatch.rows.len(), 8);
+        assert_eq!(
+            state.sides[0].dispatch.rows[0].terminal.unwrap().0,
+            DispatchEnd::NotVerified
+        );
+        let json = serde_json::to_string(&state.sides[0].dispatch).unwrap();
+        assert!(!json.contains("private"));
+        assert!(!json.contains("peer"));
+        assert!(!json.contains("quic"));
+    }
+
+    #[test]
+    fn voice_dispatch_real_queue_full_closed_and_queued_owner_drop() {
+        let c = capture();
+        let obs = c.alice();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let first = dispatch(&obs);
+        let first_ref = first.send_reference();
+        assert!(DispatchToken::observe_send_result(
+            Some(first_ref),
+            tx.try_send(first),
+            inert_token_mut
+        )
+        .is_ok());
+        let full = dispatch(&obs);
+        let full_ref = full.send_reference();
+        let error =
+            DispatchToken::observe_send_result(Some(full_ref), tx.try_send(full), inert_token_mut)
+                .err()
+                .unwrap();
+        assert!(matches!(
+            error,
+            tokio::sync::mpsc::error::TrySendError::Full(_)
+        ));
+        drop(error);
+        drop(rx); // Drop the queued owner, not an invented dequeue.
+        let closed = dispatch(&obs);
+        let closed_ref = closed.send_reference();
+        let error = DispatchToken::observe_send_result(
+            Some(closed_ref),
+            tx.try_send(closed),
+            inert_token_mut,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            error,
+            tokio::sync::mpsc::error::TrySendError::Closed(_)
+        ));
+        drop(error);
+        let state = c.shared.lock().unwrap();
+        let rows = &state.sides[0].dispatch.rows;
+        assert!(rows[0].send_succeeded.is_some());
+        assert!(rows[0].dequeued.is_none());
+        assert_eq!(
+            rows[0].terminal.unwrap().0,
+            DispatchEnd::DroppedUnknownOwner
+        );
+        assert_eq!(rows[1].terminal.unwrap().0, DispatchEnd::QueueFull);
+        assert_eq!(rows[2].terminal.unwrap().0, DispatchEnd::QueueClosed);
+        assert!(rows[1..].iter().all(|r| r.send_succeeded.is_none()));
+    }
+
+    #[test]
+    fn voice_dispatch_dequeue_precedes_sender_stamp_without_regression() {
+        let c = capture();
+        let obs = c.alice();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let t = dispatch(&obs);
+        let r = t.send_reference();
+        t.routed(crate::streams::StreamProtocol::WebRtcV1, true);
+        t.stage(DispatchStage::EnqueueAttempt);
+        let result = tx.try_send(t);
+        let voice = Token::new(Some(obs.clone()), true, None);
+        rx.try_recv().unwrap().dequeued(&voice);
+        assert!(DispatchToken::observe_send_result(Some(r), result, inert_token_mut).is_ok());
+        let state = c.shared.lock().unwrap();
+        let row = &state.sides[0].dispatch.rows[0];
+        assert!(row.dequeued.unwrap().sequence < row.send_succeeded.unwrap().sequence);
+        assert!(row.terminal.is_none());
+        assert_eq!(row.voice_link, Some(true));
+        assert_eq!(
+            row.protocol,
+            Some(crate::streams::StreamProtocol::WebRtcV1.as_u8())
+        );
+        assert_eq!(row.registered_route, Some(true));
+        assert_eq!(state.sides[0].rows[0].dispatch_id, Some(row.id));
+    }
+
+    #[test]
+    fn voice_dispatch_cut_between_dequeue_and_send_and_foreign_voice() {
+        let mut c = capture();
+        let other = capture();
+        let obs = c.alice();
+        for foreign in [Some(c.bob()), Some(other.alice()), None] {
+            let t = dispatch(&obs);
+            let voice = Token::new(foreign, true, None);
+            t.dequeued(&voice);
+        }
+        let t = dispatch(&obs);
+        let r = t.send_reference();
+        let voice = Token::new(Some(obs.clone()), true, None);
+        t.dequeued(&voice);
+        c.phase(Phase::ReceiveEnd);
+        c.close();
+        r.sent(); // real concurrent ordering represented by a surviving update handle
+        assert!(DispatchToken::accepted(Some(obs.clone()), [1; 32]).is_none());
+        let state = c.shared.lock().unwrap();
+        assert!(state.sides[0].dispatch.rows[..3]
+            .iter()
+            .all(|r| r.voice_link == Some(false)));
+        let row = &state.sides[0].dispatch.rows[3];
+        assert!(row.dequeued.is_some());
+        assert!(row.send_succeeded.is_none());
+        assert!(row.dequeued.unwrap().micros <= state.closed_micros.unwrap());
+        assert!(state.phases[0].micros <= state.closed_micros.unwrap());
+        assert_eq!(state.after_cut_updates, 2);
+    }
+
+    #[test]
+    fn voice_dispatch_bounds_foreign_filter_and_shared_cut() {
+        let mut c = capture();
+        let obs = c.alice();
+        for _ in 0..DISPATCH_CAP + 3 {
+            drop(DispatchToken::accepted(Some(obs.clone()), [1; 32]));
+        }
+        assert!(DispatchToken::accepted(Some(obs.clone()), [99; 32]).is_none());
+        for _ in 0..EVENT_CAP {
+            drop(DispatchLoop::new(Some(obs.clone())));
+        }
+        let voice = Token::new(Some(obs.clone()), true, None);
+        c.close();
+        drop(voice);
+        drop(DispatchLoop::new(Some(obs.clone())));
+        let state = c.shared.lock().unwrap();
+        let d = &state.sides[0].dispatch;
+        assert_eq!(d.accepted, (DISPATCH_CAP + 3) as u64);
+        assert_eq!(d.rows.len(), DISPATCH_CAP);
+        assert_eq!(d.omitted_rows, 3);
+        assert_eq!(d.foreign_accepted, 1);
+        assert_eq!(d.loop_events.len(), EVENT_CAP);
+        assert_eq!(d.omitted_loop_events, EVENT_CAP as u64);
+        assert!(state.after_cut_updates >= 3);
+        assert!(d
+            .rows
+            .iter()
+            .all(|r| r.accepted.micros <= state.closed_micros.unwrap()));
     }
 }

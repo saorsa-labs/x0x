@@ -13200,6 +13200,13 @@ impl Agent {
         std::sync::Arc::clone(&guard)
     }
 
+    #[cfg(feature = "voice")]
+    pub(crate) fn dispatch_observation_slot(
+        &self,
+    ) -> std::sync::Arc<voice::observation::DispatchSlot> {
+        std::sync::Arc::clone(&self.stream_accept.dispatch_observation)
+    }
+
     /// Start the inbound byte-stream accept loop (idempotent).
     ///
     /// Called automatically by [`Agent::join_network`]. The loop is the SOLE
@@ -13230,18 +13237,33 @@ impl Agent {
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::streams", "byte-stream accept loop started");
             loop {
+                #[cfg(feature = "voice")]
+                let mut dispatch_loop = voice::observation::DispatchLoop::new(incoming.dispatch_observation.observation());
                 let accepted = tokio::select! {
-                    _ = token.cancelled() => break,
+                    _ = token.cancelled() => {
+                        #[cfg(feature = "voice")]
+                        dispatch_loop.end(voice::observation::LoopEvent::ShutdownSelected);
+                        break;
+                    },
                     r = network.accept_bi() => r,
                 };
                 let (ant_peer_id, send, mut recv) = match accepted {
-                    Ok(triple) => triple,
+                    Ok(triple) => {
+                        #[cfg(feature = "voice")]
+                        dispatch_loop.end(voice::observation::LoopEvent::AcceptReturned);
+                        triple
+                    },
                     Err(e) => {
+                        #[cfg(feature = "voice")]
+                        dispatch_loop.end(voice::observation::LoopEvent::AcceptError);
                         tracing::warn!(target: "x0x::streams", error=%e, "accept_bi failed; continuing");
                         continue;
                     }
                 };
                 let machine_id = identity::MachineId(ant_peer_id.0);
+                #[cfg(feature = "voice")]
+                let mut dispatch = voice::observation::DispatchToken::accepted(
+                    incoming.dispatch_observation.observation(), ant_peer_id.0);
 
                 // Identity gate + connect-ACL gate — the shared inbound
                 // posture (also used by the datagram lane) resolves every
@@ -13262,7 +13284,13 @@ impl Agent {
                 .await
                 {
                     Ok(agents) => agents,
-                    Err(_) => continue,
+                    Err(_error) => {
+                        #[cfg(feature = "voice")]
+                        if let Some(observation) = &mut dispatch {
+                            observation.end(voice::observation::DispatchEnd::gate(&_error));
+                        }
+                        continue;
+                    },
                 };
 
 
@@ -13273,7 +13301,15 @@ impl Agent {
                 // The identity gate above already cleared; this task owns the
                 // stream halves and drops them (→ QUIC reset) on any failure.
                 let incoming_for_task = std::sync::Arc::clone(&incoming);
+                #[cfg(feature = "voice")]
+                if let Some(observation) = &dispatch {
+                    observation.stage(voice::observation::DispatchStage::PrefixTaskCreated);
+                }
                 tokio::spawn(async move {
+                    #[cfg(feature = "voice")]
+                    if let Some(observation) = &dispatch {
+                        observation.stage(voice::observation::DispatchStage::PrefixReadPending);
+                    }
                     // Belt-and-braces: bound the prefix read so a silent peer
                     // holds the task/stream for at most PREFIX_READ_TIMEOUT.
                     let protocol = match tokio::time::timeout(
@@ -13284,6 +13320,10 @@ impl Agent {
                     {
                         Ok(Ok(p)) => p,
                         Ok(Err(e)) => {
+                            #[cfg(feature = "voice")]
+                            if let Some(observation) = &mut dispatch {
+                                observation.end(voice::observation::DispatchEnd::prefix(&e));
+                            }
                             tracing::info!(
                                 target: "x0x::streams",
                                 machine = %hex::encode(machine_id.as_bytes()),
@@ -13294,6 +13334,10 @@ impl Agent {
                             return;
                         }
                         Err(_) => {
+                            #[cfg(feature = "voice")]
+                            if let Some(observation) = &mut dispatch {
+                                observation.end(voice::observation::DispatchEnd::PrefixTimeout);
+                            }
                             tracing::info!(
                                 target: "x0x::streams",
                                 machine = %hex::encode(machine_id.as_bytes()),
@@ -13303,17 +13347,38 @@ impl Agent {
                             return;
                         }
                     };
+                    #[cfg(feature = "voice")]
+                    if let Some(observation) = &dispatch {
+                        observation.stage(voice::observation::DispatchStage::RoutePending);
+                    }
                     let peer_stream =
                         streams::PeerStream::new(agents, machine_id, protocol, send, recv);
                     // Route by protocol byte to the registered acceptor (or
                     // the default sink), then try_send so a slow consumer
                     // cannot pile up accepted streams in memory; a full
                     // channel drops (resets) the stream.
-                    if incoming_for_task
-                        .sender_for(protocol)
-                        .try_send(peer_stream)
-                        .is_err()
-                    {
+                    #[cfg(feature = "voice")]
+                    let (sender, peer_stream, dispatch_result) = {
+                        let (sender, registered) = incoming_for_task.sender_and_route(protocol);
+                        if let Some(observation) = &dispatch {
+                            observation.routed(protocol, registered);
+                            observation.stage(voice::observation::DispatchStage::EnqueueAttempt);
+                        }
+                        let result = dispatch.as_ref().map(voice::observation::DispatchToken::send_reference);
+                        let mut peer_stream = peer_stream;
+                        peer_stream.dispatch_observation = dispatch;
+                        (sender, peer_stream, result)
+                    };
+                    #[cfg(not(feature = "voice"))]
+                    let sender = incoming_for_task.sender_for(protocol);
+                    let result = sender.try_send(peer_stream);
+                    #[cfg(feature = "voice")]
+                    let result = voice::observation::DispatchToken::observe_send_result(
+                        dispatch_result, result, |stream| stream.dispatch_observation.as_mut());
+                    let failed = result.is_err();
+                    // As before, release any failed-send payload before logging.
+                    drop(result);
+                    if failed {
                         tracing::debug!(
                             target: "x0x::streams",
                             protocol = ?protocol,

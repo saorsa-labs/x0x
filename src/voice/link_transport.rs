@@ -337,6 +337,9 @@ impl X0xLinkTransport {
             while let Some(mut stream) = acceptor.next().await {
                 let token = super::observation::Token::new(observation.clone(), true, None);
                 token.identity(stream.peer().0, u64::from(stream.recv_mut().id()));
+                if let Some(dispatch) = stream.dispatch_observation.take() {
+                    dispatch.dequeued(&token);
+                }
                 tokio::spawn(Self::drive_inbound_stream(
                     stream,
                     inbound_tx.clone(),

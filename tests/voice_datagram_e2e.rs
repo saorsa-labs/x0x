@@ -1385,6 +1385,8 @@ async fn connection_churn_falls_back_to_reliable() {
     let mut capture = FailureCapture::new(bob.machine_id().0, alice.machine_id().0);
     let alice_observation = capture.alice();
     let bob_observation = capture.bob();
+    capture.observe_dispatch(&alice, alice_observation.clone());
+    capture.observe_dispatch(&bob, bob_observation.clone());
     alice_link = alice_link.with_observation(alice_observation.clone());
     bob_link = bob_link.with_observation(bob_observation.clone());
     let alice_events = match alice.network() {

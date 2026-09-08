@@ -94,6 +94,8 @@ pub const STREAM_ACCEPTOR_CAPACITY: usize = 64;
 /// channel drops (resets) the stream — backpressure is never hidden behind
 /// unbounded buffering.
 pub(crate) struct StreamAccept {
+    #[cfg(feature = "voice")]
+    pub(crate) dispatch_observation: std::sync::Arc<crate::voice::observation::DispatchSlot>,
     tx: tokio::sync::mpsc::Sender<PeerStream>,
     rx: std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<PeerStream>>>,
     /// Live per-protocol acceptor senders, keyed by the protocol-prefix byte.
@@ -109,6 +111,10 @@ impl StreamAccept {
     pub(crate) fn new(capacity: usize) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         Self {
+            #[cfg(feature = "voice")]
+            dispatch_observation: std::sync::Arc::new(
+                crate::voice::observation::DispatchSlot::default(),
+            ),
             tx,
             rx: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
             acceptors: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -137,18 +143,27 @@ impl StreamAccept {
     /// the per-stream dispatch task (after the prefix read), so registration
     /// ordering relative to in-flight streams is well-defined: a stream
     /// routes by the registry state at dispatch time.
+    #[cfg(any(not(feature = "voice"), test))]
     pub(crate) fn sender_for(
         &self,
         protocol: StreamProtocol,
     ) -> tokio::sync::mpsc::Sender<PeerStream> {
+        self.sender_and_route(protocol).0
+    }
+
+    /// Return the actual route decision under the same single registry lookup.
+    pub(crate) fn sender_and_route(
+        &self,
+        protocol: StreamProtocol,
+    ) -> (tokio::sync::mpsc::Sender<PeerStream>, bool) {
         let acceptors = self
             .acceptors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        acceptors
-            .get(&protocol.as_u8())
-            .cloned()
-            .unwrap_or_else(|| self.tx.clone())
+        match acceptors.get(&protocol.as_u8()) {
+            Some(sender) => (sender.clone(), true),
+            None => (self.tx.clone(), false),
+        }
     }
 
     /// Register the single acceptor for `protocol` (bounded channel of
@@ -423,6 +438,8 @@ impl StreamProtocol {
 /// after the identity gate has cleared; consumers can rely on them without
 /// re-checking.
 pub struct PeerStream {
+    #[cfg(feature = "voice")]
+    pub(crate) dispatch_observation: Option<crate::voice::observation::DispatchToken>,
     /// All agent identities known (announced) to run on the peer machine
     /// (≥1). On the inbound path these are resolved from the transport-
     /// authenticated `MachineId` via the identity discovery cache; on the
@@ -453,6 +470,8 @@ impl PeerStream {
         recv: ant_quic::HighLevelRecvStream,
     ) -> Self {
         Self {
+            #[cfg(feature = "voice")]
+            dispatch_observation: None,
             agents,
             peer,
             protocol,
