@@ -107,17 +107,17 @@ def main(arguments=None, root=None):
     args = list(sys.argv[1:] if arguments is None else arguments)
     root = (Path(__file__).resolve().parents[2] if root is None else root).resolve()
     if not args:
-        raise ValueError('usage: test-isolated.py nextest|voice|coverage|coverage-lcov|coverage-check|check|coverage-clean ...')
+        raise ValueError('usage: test-isolated.py nextest|doctest|voice|coverage|coverage-lcov|coverage-check|check|coverage-clean ...')
     mode, args = args[0], args[1:]
     if mode == 'coverage-clean':
         if len(args) != 1:
             raise ValueError('coverage-clean requires one explicitly named run directory')
         clean_coverage(root, args[0])
         return 0
-    if mode not in ('nextest', 'voice', 'coverage', 'coverage-lcov', 'coverage-check', 'check'):
+    if mode not in ('nextest', 'doctest', 'voice', 'coverage', 'coverage-lcov', 'coverage-check', 'check'):
         raise ValueError(f'unknown mode: {mode}')
     build, runtime = split_arguments(args) if mode in ('nextest', 'coverage') else ([], [])
-    if mode in ('voice', 'check', 'coverage-lcov', 'coverage-check') and args:
+    if mode in ('doctest', 'voice', 'check', 'coverage-lcov', 'coverage-check') and args:
         raise ValueError(f'{mode} does not accept extra arguments')
     env = os.environ.copy()
     env.pop('X0X_CUSTODY_SCRATCH', None)
@@ -133,6 +133,11 @@ def main(arguments=None, root=None):
     wrapper = ['bash', 'scripts/ci/nextest-isolated.sh']
     if mode == 'nextest':
         run([*wrapper, *build, '--', *runtime], root, env)
+    elif mode == 'doctest':
+        # Rustdoc compiles and executes snippets: keep the entire invocation
+        # inside the supervisor, without claiming nextest binary custody.
+        run(['python3', 'scripts/ci/isolated-runtime.py', 'cargo', 'test',
+             '--offline', '--locked', '--doc', '--all-features'], root, env)
     elif mode == 'voice':
         run(['cargo', 'test', '--all-features', '--test', 'voice_datagram_e2e', '--no-run'], root, env)
         env['X0X_ISOLATION_ROLE'] = 'selection'
