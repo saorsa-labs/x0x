@@ -456,6 +456,12 @@ impl KvStoreSync {
         if let Some(refresh) = refresh {
             refresh().await;
         }
+        if !ctx.is_active_member(&signing.agent_id) {
+            return Err(KvError::SecureRecord(
+                "encrypted publication refused: signing author is not an active group member"
+                    .to_string(),
+            ));
+        }
         let store_id = { *store.read().await.id() };
         let payload = bincode::serialize(delta)
             .map_err(|e| KvError::Gossip(format!("sealed delta serialize failed: {e}")))?;
@@ -500,6 +506,16 @@ impl KvStoreSync {
                 return false;
             }
         };
+        if !matches!(
+            mutation.kind,
+            KvMutationKind::Delta | KvMutationKind::FullState
+        ) {
+            tracing::warn!(
+                "rejected sealed main-topic record for store {store_id}: wrong kind {:?}",
+                mutation.kind
+            );
+            return false;
+        }
         // Membership IS the v1 write rule — enforce before merge, with the
         // verified author identity (never the transport sender).
         if !ctx.is_active_member(&mutation.author_id) {
@@ -2272,6 +2288,181 @@ mod tests {
             wait_for_key(sync, key).await,
             "encrypted listener did not consume sealed barrier {key}"
         );
+    }
+
+    #[tokio::test]
+    async fn encrypted_publication_rejects_removed_signer_before_encoding() {
+        // The public sync seam must fail closed even when a removed signer
+        // still has the old usable group secret. This avoids emitting an
+        // authenticated record that every receiver would have to discard.
+        let kp_a = AgentKeypair::generate().expect("kp a");
+        let kp_b = AgentKeypair::generate().expect("kp b");
+        let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
+        let (mut info, mut ctxs, group_id) = encrypted_group(&[a, b]);
+        let ctx_a = ctxs.remove(0);
+        info.remove_member(&hex::encode(a.as_bytes()), Some(hex::encode(b.as_bytes())));
+        ctx_a.update_from_group(&info);
+        assert!(!ctx_a.is_active_member(&a));
+
+        let store = KvStore::new_encrypted(
+            store_id(9),
+            "Enc".to_string(),
+            a,
+            group_id,
+            ctx_a.clone() as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        let store = Arc::new(RwLock::new(store));
+        let signing = Arc::new(AuthorSigning::from_keypair(&kp_a).expect("author signing"));
+        let err = KvStoreSync::seal_publication(
+            &store,
+            &(ctx_a.clone() as SharedKvSecureContext),
+            None,
+            &signing,
+            KvMutationKind::Delta,
+            peer(1),
+            &KvStoreDelta::new(1),
+        )
+        .await
+        .expect_err("removed signer must not produce a sealed payload");
+        assert!(
+            matches!(err, KvError::SecureRecord(message) if message.contains("not an active group member"))
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_publication_rechecks_membership_after_refresh() {
+        // The refresh hook is authoritative and runs before sealing. This
+        // control makes the signer active in the initial context, then
+        // removes it only from the state returned by that hook.
+        let kp_a = AgentKeypair::generate().expect("kp a");
+        let kp_b = AgentKeypair::generate().expect("kp b");
+        let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
+        let (info, mut ctxs, group_id) = encrypted_group(&[a, b]);
+        let ctx_a = ctxs.remove(0);
+        assert!(ctx_a.is_active_member(&a));
+        let mut refreshed_info = info.clone();
+        refreshed_info.remove_member(&hex::encode(a.as_bytes()), Some(hex::encode(b.as_bytes())));
+        let refreshed_info = Arc::new(refreshed_info);
+        let refresh_ctx = Arc::clone(&ctx_a);
+        let refresh: SecureRefreshFn = Arc::new(move || {
+            let ctx = Arc::clone(&refresh_ctx);
+            let info = Arc::clone(&refreshed_info);
+            Box::pin(async move {
+                ctx.update_from_group(&info);
+            })
+        });
+
+        let store = KvStore::new_encrypted(
+            store_id(12),
+            "Enc".to_string(),
+            a,
+            group_id,
+            ctx_a.clone() as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        let store = Arc::new(RwLock::new(store));
+        let signing = Arc::new(AuthorSigning::from_keypair(&kp_a).expect("author signing"));
+        let shared: SharedKvSecureContext = ctx_a;
+        let err = KvStoreSync::seal_publication(
+            &store,
+            &shared,
+            Some(&refresh),
+            &signing,
+            KvMutationKind::Delta,
+            peer(1),
+            &KvStoreDelta::new(1),
+        )
+        .await
+        .expect_err("refresh-removal must block the publication");
+        assert!(
+            matches!(err, KvError::SecureRecord(message) if message.contains("not an active group member"))
+        );
+        assert!(!shared.is_active_member(&a));
+    }
+
+    #[tokio::test]
+    async fn encrypted_main_topic_rejects_authenticated_control_kind() {
+        // A valid encrypted Control payload must not be interpreted as a
+        // main-topic delta. The payload is deliberately a valid delta so the
+        // assertion exercises the kind gate rather than deserialization.
+        let kp = AgentKeypair::generate().expect("kp");
+        let a = kp.agent_id();
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a]);
+        let ctx = ctxs.pop().expect("ctx");
+        let shared: SharedKvSecureContext = ctx.clone();
+        let store = KvStore::new_encrypted(
+            store_id(10),
+            "Enc".to_string(),
+            a,
+            group_id,
+            ctx.clone() as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        let store = Arc::new(RwLock::new(store));
+        let delta = KvStoreDelta::for_put(
+            "wrong-kind".to_string(),
+            KvEntry::new(
+                "wrong-kind".to_string(),
+                b"must-not-merge".to_vec(),
+                "text/plain".to_string(),
+            ),
+            (peer(1), 1),
+            1,
+        );
+        let signing = AuthorSigning::from_keypair(&kp).expect("author signing");
+        let record = seal_mutation(
+            shared.as_ref(),
+            &signing,
+            KvMutationKind::Control,
+            &store_id(10),
+            &bincode::serialize(&delta).expect("delta bytes"),
+        )
+        .expect("control envelope");
+        let encoded = encode_delta(peer(1), &record).expect("encoded envelope");
+        assert!(
+            !KvStoreSync::merge_encrypted_record(&shared, None, &store, &store_id(10), &encoded,)
+                .await
+        );
+        assert!(store.read().await.get("wrong-kind").is_none());
+    }
+
+    #[tokio::test]
+    async fn encrypted_publication_allows_active_delta_and_full_state() {
+        // Positive controls retain both legitimate main-topic mutation kinds.
+        let kp = AgentKeypair::generate().expect("kp");
+        let a = kp.agent_id();
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a]);
+        let ctx = ctxs.pop().expect("ctx");
+        let shared: SharedKvSecureContext = ctx.clone();
+        let store = KvStore::new_encrypted(
+            store_id(11),
+            "Enc".to_string(),
+            a,
+            group_id,
+            ctx.clone() as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        let store = Arc::new(RwLock::new(store));
+        let signing = Arc::new(AuthorSigning::from_keypair(&kp).expect("author signing"));
+        for kind in [KvMutationKind::Delta, KvMutationKind::FullState] {
+            let encoded = KvStoreSync::seal_publication(
+                &store,
+                &shared,
+                None,
+                &signing,
+                kind,
+                peer(1),
+                &KvStoreDelta::new(1),
+            )
+            .await
+            .expect("active member publication");
+            let (_, record) =
+                decode_delta::<EncryptedKvStoreRecordV1>(&encoded).expect("sealed envelope");
+            let opened = open_mutation(shared.as_ref(), &store_id(11), &record)
+                .expect("open sealed envelope");
+            assert_eq!(opened.kind, kind);
+        }
     }
 
     #[tokio::test]
