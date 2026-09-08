@@ -26,7 +26,7 @@ use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
@@ -425,6 +425,10 @@ pub struct PubSubManager {
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
     /// Live subscribed transport ids for the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// Whether the DM inbox opted out of the compatibility bus.  This is
+    /// installed by `AgentBuilder` before network listeners can run so a
+    /// trusted connect event cannot undo the opt-out with an ACK pre-warm.
+    skip_legacy_dm_bus: AtomicBool,
     /// Inbound unsubscribed pass-through frames this Leaf refused.
     unsubscribed_refused_frames: AtomicU64,
     unsubscribed_refused_bytes: AtomicU64,
@@ -576,6 +580,7 @@ impl PubSubManager {
             passthrough_refresh_runs: AtomicU64::new(0),
             topic_id_by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
             subscribed_topic_ids: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            skip_legacy_dm_bus: AtomicBool::new(false),
             unsubscribed_refused_frames: AtomicU64::new(0),
             unsubscribed_refused_bytes: AtomicU64::new(0),
             unsubscribed_refused_graft_equiv: AtomicU64::new(0),
@@ -1504,6 +1509,18 @@ impl PubSubManager {
         holds.insert(topic.to_string(), hold);
         drop(holds);
         self.refresh_subscribed_topic_id(topic, topic_id).await;
+    }
+
+    /// Set the compatibility DM-bus policy before network listeners start.
+    /// The manager owns this immutable-at-runtime choice because reverse-ACK
+    /// pre-warming receives only a pub/sub handle.
+    pub(crate) fn set_skip_legacy_dm_bus(&self, skip: bool) {
+        self.skip_legacy_dm_bus.store(skip, Ordering::Release);
+    }
+
+    /// Whether this manager's DM inbox opted out of the compatibility bus.
+    pub(crate) fn skip_legacy_dm_bus(&self) -> bool {
+        self.skip_legacy_dm_bus.load(Ordering::Acquire)
     }
 
     /// Topic ids currently known to PlumTree. Test helper for proving a

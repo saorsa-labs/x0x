@@ -177,6 +177,10 @@ required-features = ["voice"]
 name = "voice_e2e"
 required-features = ["voice"]
 
+[[test]]
+name = "voice_datagram_e2e"
+required-features = ["voice"]
+
 [workspace]
 members = [
     ".",
