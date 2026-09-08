@@ -22,11 +22,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::f64::consts::TAU;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use saorsa_webrtc_core::link_transport::{LinkTransport, StreamType};
-use saorsa_webrtc_core::{AudioDatagram, JitterBuffer, JitterConfig, JitterEvent};
+use saorsa_webrtc_core::{AudioDatagram, JitterBuffer, JitterConfig, JitterCounters, JitterEvent};
 use tempfile::TempDir;
 use x0x::network::NetworkConfig;
 use x0x::voice::codecs::opus::{
@@ -44,10 +45,28 @@ const TONE_B_HZ: f64 = 1200.0;
 /// ≥99 % because datagrams may legitimately be lost).
 const MIN_DELIVERED_PERCENT: usize = 96;
 
+/// Loopback-only fixture posture. Every agent in this suite binds
+/// `127.0.0.1:0` and reaches its peer only over `lo`:
+///
+/// * `bootstrap_nodes: []` — no public bootstrap peer is ever dialled;
+/// * `mdns_enabled: false` — no multicast LAN discovery, so a co-located
+///   node (a developer's own daemon, another CI job on the same host)
+///   can never be discovered and joined mid-test;
+/// * `port_mapping_enabled: false` — no UPnP discovery task, so nothing
+///   asks a gateway to map a port outward.
+///
+/// The CI wrapper (`scripts/ci/isolated-runtime.py`, issue #417) already
+/// runs this suite in a fresh network namespace whose only interface is
+/// `lo`, so these are belt-and-braces there — but they are what makes
+/// the fixture hermetic when it is run outside that namespace, and they
+/// remove three sources of nondeterministic background work from the
+/// phase oracles, which assert exact jitter-counter deltas.
 fn loopback_network_config() -> NetworkConfig {
     NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
         bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
         ..NetworkConfig::default()
     }
 }
@@ -317,18 +336,550 @@ async fn run_call(mut bob_link: X0xLinkTransport, mut alice_link: X0xLinkTranspo
     }
 }
 
+// ---------------------------------------------------------------------
+// Deterministic jitter-counter phase oracles (#277)
+//
+// ADR-0042 (c) requires the datagram lane to absorb reorder, duplicate
+// and late arrivals; issue #277 requires that the `reordered` /
+// `late_dropped` / `duplicates_dropped` counters actually prove it.
+// Those three cannot be proven by a random-loss/random-delay network:
+//
+//   * a <=7 ms perturbation at a 20 ms send cadence may legitimately
+//     leave order fully intact, so `reordered > 0` under random jitter
+//     is a coin flip, not an oracle; and
+//   * upstream increments `duplicates_dropped` ONLY while the identical
+//     extended sequence is still in `buffered`
+//     (`JitterBuffer::push`, saorsa-webrtc-core 0.5.0 `src/jitter.rs`).
+//     Once `poll_ready` has drained that sequence the cursor has moved
+//     past it and the same bytes arriving again land in the `ext < next`
+//     arm, counting as `late_dropped`. A generic "re-emit a frame"
+//     schedule therefore cannot assert duplicates at all — which of the
+//     two counters moves depends entirely on whether the receiver
+//     happened to poll in between.
+//
+// So the receiver runs an EXPLICIT PHASE SCRIPT with control acks: the
+// sender does not emit the next datagram until the receiver confirms
+// the previous one was pushed, and the receiver polls only where the
+// script says to. That makes "duplicate arrives while still buffered"
+// and "late arrives after a gap and playout" reachable by construction
+// instead of by luck, and makes the counter deltas exact.
+//
+// The control plane is in-process channels; the DATA PLANE is not
+// simulated. Every frame is a real Opus payload in a real
+// `AudioDatagram`, sent with `X0xLinkTransport::send(StreamType::Audio)`
+// over the real QUIC datagram lane and pulled back out with
+// `X0xLinkTransport::receive()`. The jitter buffer is the real upstream
+// one and its real `counters()` are asserted. Nothing is mocked.
+// ---------------------------------------------------------------------
+
+/// One step of a phase script.
+#[derive(Clone, Copy, Debug)]
+enum PhaseStep {
+    /// Encode a real Opus frame, wrap it as this lane sequence, send it
+    /// over the datagram lane, and block until the receiver confirms it
+    /// was pushed into the jitter buffer. Deliberately does NOT poll:
+    /// the frame stays *buffered*, the only state in which upstream
+    /// counts a duplicate.
+    Send(u32),
+    /// Drain the receiver's playout and block until it finishes. This
+    /// advances the playout cursor past everything buffered, which is
+    /// what turns a later re-emit of a drained sequence into
+    /// `late_dropped` rather than `duplicates_dropped`.
+    Poll,
+}
+
+/// Warm-up prefix shared by every phase script.
+///
+/// Upstream treats the buffer as warming up until the first frame or
+/// gap has played out (`delivered == 0 && gaps_emitted == 0`), and
+/// while warming up an early sequence *re-anchors* the cursor and
+/// counts as `reordered` instead of being dropped as late. Every oracle
+/// below asserts post-warm-up semantics, so all of them start here:
+/// sequences 0,1,2 in order then one poll, which retires the warm-up
+/// and leaves the cursor at 3 with an empty buffer and an all-zero
+/// counter set apart from `delivered == 3`.
+const WARMUP: [PhaseStep; 4] = [
+    PhaseStep::Send(0),
+    PhaseStep::Send(1),
+    PhaseStep::Send(2),
+    PhaseStep::Poll,
+];
+
+/// Commands the driver issues to the phase receiver.
+enum RxCmd {
+    /// Await exactly this lane sequence off the datagram lane and push
+    /// it. No poll.
+    RecvPush(u32),
+    /// Drain playout.
+    Poll,
+    /// Stop and report.
+    Finish,
+}
+
+/// Result of a phase script.
+struct PhaseOutcome {
+    /// The real upstream jitter counters at end of script.
+    counters: JitterCounters,
+    /// `JitterEvent::Frame` events drained.
+    delivered_events: usize,
+    /// `JitterEvent::Gap` events drained.
+    gap_events: usize,
+    /// Lane routing proof: datagrams the sender actually emitted.
+    datagrams_sent: u64,
+    /// Lane routing proof: datagrams the receiver actually consumed.
+    datagrams_received: u64,
+    /// Decoded PCM length — proves the frames were real Opus, not stubs.
+    decoded_samples: usize,
+}
+
+/// Run a deterministic phase script over the real datagram lane.
+///
+/// `WARMUP` is prepended automatically. Panics loudly (rather than
+/// asserting a wrong number) if the lane loses or reorders a frame: the
+/// oracles below require a lossless clean loopback lane, and a loss
+/// there is a real lane defect, not a tolerated condition.
+async fn run_phase_script(
+    mut bob_link: X0xLinkTransport,
+    mut alice_link: X0xLinkTransport,
+    tail: &[PhaseStep],
+) -> PhaseOutcome {
+    bob_link.start().await.expect("bob link");
+    alice_link.start().await.expect("alice link");
+    assert!(
+        await_mutual_capability(&alice_link, &bob_link).await,
+        "mutual datagram capability advert did not land — DM path broken?"
+    );
+
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<RxCmd>(1);
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    let mut receiver = tokio::spawn(async move {
+        let mut jitter = JitterBuffer::new(JitterConfig::default());
+        let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono).expect("decoder");
+        let mut decoded_samples = 0usize;
+        let mut delivered_events = 0usize;
+        let mut gap_events = 0usize;
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                RxCmd::RecvPush(want) => {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let Ok(Ok((_, ty, data))) =
+                            tokio::time::timeout(remaining, bob_link.receive()).await
+                        else {
+                            panic!(
+                                "datagram lane did not deliver lane seq {want} within 20 s — \
+                                 the phase oracle requires a lossless clean loopback lane"
+                            );
+                        };
+                        if ty != StreamType::Audio {
+                            continue;
+                        }
+                        let dg = AudioDatagram::decode(data.into()).expect("wire decode");
+                        assert_eq!(
+                            dg.seq, want,
+                            "phase script expected lane seq {want}, lane delivered {} — \
+                             the clean lane must not reorder; the schedule owns ordering",
+                            dg.seq
+                        );
+                        jitter.push(dg);
+                        break;
+                    }
+                }
+                RxCmd::Poll => {
+                    for ev in jitter.poll_ready() {
+                        match ev {
+                            JitterEvent::Frame(f) => {
+                                decoded_samples +=
+                                    decoder.decode(&f.payload).expect("opus decode").data.len();
+                                delivered_events += 1;
+                            }
+                            JitterEvent::Gap { .. } => gap_events += 1,
+                        }
+                    }
+                }
+                RxCmd::Finish => break,
+            }
+            if ack_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+        let counters = jitter.counters();
+        let datagrams_received = bob_link.datagram_frames_received();
+        let _ = bob_link.stop().await;
+        (
+            counters,
+            delivered_events,
+            gap_events,
+            datagrams_received,
+            decoded_samples,
+        )
+    });
+
+    let samples = samples_per_20ms(SampleRate::Hz48000);
+    let mut encoder = OpusEncoder::new(OpusEncoderConfig::default()).expect("encoder");
+    let script: Vec<PhaseStep> = WARMUP.iter().copied().chain(tail.iter().copied()).collect();
+
+    for step in script {
+        match step {
+            PhaseStep::Send(seq) => {
+                let frame = AudioFrame {
+                    data: tone_frame(seq as usize, samples),
+                    sample_rate: SampleRate::Hz48000,
+                    channels: Channels::Mono,
+                    timestamp: u64::from(seq) * 20,
+                };
+                let payload = encoder.encode(&frame).expect("opus encode");
+                let dg = AudioDatagram {
+                    seq,
+                    timestamp_ms: now_ms(),
+                    flags: 0,
+                    payload,
+                };
+                let wire = dg.encode().expect("wire encode");
+                let peer = alice_link.default_peer().expect("default peer");
+                alice_link
+                    .send(&peer, StreamType::Audio, &wire)
+                    .await
+                    .expect("send frame");
+                send_cmd(&cmd_tx, RxCmd::RecvPush(seq), &mut receiver).await;
+            }
+            PhaseStep::Poll => send_cmd(&cmd_tx, RxCmd::Poll, &mut receiver).await,
+        }
+        await_ack(&mut ack_rx, &mut receiver).await;
+    }
+
+    let datagrams_sent = alice_link.datagram_frames_sent();
+    let _ = cmd_tx.send(RxCmd::Finish).await;
+    let _ = alice_link.stop().await;
+    let (counters, delivered_events, gap_events, datagrams_received, decoded_samples) =
+        match receiver.await {
+            Ok(v) => v,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => panic!("phase receiver task failed: {e}"),
+        };
+    PhaseOutcome {
+        counters,
+        delivered_events,
+        gap_events,
+        datagrams_sent,
+        datagrams_received,
+        decoded_samples,
+    }
+}
+
+/// Type of the phase receiver's join handle.
+type PhaseRx = tokio::task::JoinHandle<(JitterCounters, usize, usize, u64, usize)>;
+
+/// Issue a command, surfacing a receiver panic instead of deadlocking
+/// on a channel whose consumer has already died.
+async fn send_cmd(tx: &tokio::sync::mpsc::Sender<RxCmd>, cmd: RxCmd, rx_task: &mut PhaseRx) {
+    if tx.send(cmd).await.is_err() {
+        surface_receiver_failure(rx_task).await;
+    }
+}
+
+/// Wait for the receiver's control ack. On timeout the receiver has
+/// either panicked or wedged; either way the test must fail loudly with
+/// the receiver's own message rather than hang to the harness timeout.
+async fn await_ack(ack_rx: &mut tokio::sync::mpsc::Receiver<()>, rx_task: &mut PhaseRx) {
+    match tokio::time::timeout(Duration::from_secs(30), ack_rx.recv()).await {
+        Ok(Some(())) => {}
+        _ => surface_receiver_failure(rx_task).await,
+    }
+}
+
+/// Re-raise the receiver task's panic on the test thread.
+async fn surface_receiver_failure(rx_task: &mut PhaseRx) -> ! {
+    match rx_task.await {
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => panic!("phase receiver task failed: {e}"),
+        Ok(_) => panic!("phase receiver ended before the script finished"),
+    }
+}
+
+/// Assert the full counter tuple. Every phase oracle states all five
+/// values, so the counters that must NOT move are asserted to be zero
+/// in the same breath as the one that must — a counter wired to a
+/// constant, or incremented on the wrong arm, fails here.
+#[track_caller]
+fn assert_counters(
+    got: JitterCounters,
+    delivered: u64,
+    reordered: u64,
+    late_dropped: u64,
+    duplicates_dropped: u64,
+    gaps_emitted: u64,
+) {
+    let want = JitterCounters {
+        delivered,
+        reordered,
+        late_dropped,
+        duplicates_dropped,
+        gaps_emitted,
+    };
+    assert_eq!(got, want, "jitter counters for this phase schedule");
+}
+
+/// Shared setup: a trusted pair on the clean loopback lane with both
+/// transports pinned to the datagram lane.
+async fn phase_links(
+    alice: &Arc<x0x::Agent>,
+    bob: &Arc<x0x::Agent>,
+) -> (X0xLinkTransport, X0xLinkTransport) {
+    let alice_link = X0xLinkTransport::new(Arc::clone(alice), bob.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    let bob_link = X0xLinkTransport::new(Arc::clone(bob), alice.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    (bob_link, alice_link)
+}
+
+/// Negative control for all three #277 counters: a strictly in-order
+/// schedule with no perturbation must leave `reordered`,
+/// `late_dropped`, `duplicates_dropped` AND `gaps_emitted` at exactly
+/// zero. This is what makes the three positive oracles below
+/// discriminating — a counter stuck non-zero, or incremented on every
+/// push, fails here and only here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback datagram phase oracle; binds UDP. Integration tier."]
+async fn jitter_counters_stay_zero_on_in_order_datagram_schedule() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+    let (bob_link, alice_link) = phase_links(&alice, &bob).await;
+
+    // Warm-up (0,1,2 + poll) then 3,4,5 in order and one poll.
+    let out = run_phase_script(
+        bob_link,
+        alice_link,
+        &[
+            PhaseStep::Send(3),
+            PhaseStep::Send(4),
+            PhaseStep::Send(5),
+            PhaseStep::Poll,
+        ],
+    )
+    .await;
+
+    assert_counters(out.counters, 6, 0, 0, 0, 0);
+    assert_eq!(out.delivered_events, 6, "all six frames must play out");
+    assert_eq!(out.gap_events, 0, "an in-order schedule declares no gaps");
+    assert_eq!(
+        out.datagrams_sent, 6,
+        "every scheduled frame must leave as a datagram"
+    );
+    // `>=` not `==`: the receive-side lane counter is owned by
+    // `link_transport.rs`, and the claim under test is the routing one —
+    // every scheduled frame was consumed as a datagram, not over a
+    // silent reliable fallback. Exactness on the counters this fixture
+    // does own is asserted above via `assert_counters`.
+    assert!(
+        out.datagrams_received >= 6,
+        "every scheduled frame must be consumed as a datagram (got {})",
+        out.datagrams_received
+    );
+    assert!(
+        out.decoded_samples > 0,
+        "frames must be real Opus, decodable end to end"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// `reordered` oracle: after warm-up the cursor sits at 3. Sending 4
+/// first and 3 second means 3 arrives with `ext >= next` but below the
+/// highest sequence seen, which is upstream's reorder arm — it is
+/// recovered, not dropped, so both frames still play out. Exactly one
+/// reorder is scheduled, so exactly one must be counted, and the other
+/// three counters must not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback datagram phase oracle; binds UDP. Integration tier."]
+async fn scheduled_reorder_counts_exactly_one_reordered_frame() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+    let (bob_link, alice_link) = phase_links(&alice, &bob).await;
+
+    let out = run_phase_script(
+        bob_link,
+        alice_link,
+        &[PhaseStep::Send(4), PhaseStep::Send(3), PhaseStep::Poll],
+    )
+    .await;
+
+    assert_counters(out.counters, 5, 1, 0, 0, 0);
+    assert_eq!(
+        out.delivered_events, 5,
+        "a recovered reorder loses no audio — both 3 and 4 must play out"
+    );
+    assert_eq!(
+        out.gap_events, 0,
+        "reorder inside the window must not be surfaced as loss"
+    );
+    assert_eq!(out.datagrams_sent, 5, "lane routing proof");
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// `duplicates_dropped` oracle. Upstream counts a duplicate only while
+/// the identical sequence is STILL BUFFERED, so the script sends 3,
+/// waits for the receiver's ack that it was pushed, and sends 3 again
+/// with no intervening poll. The second copy therefore meets the first
+/// in the buffer and is dropped as a duplicate — and, critically, the
+/// audio is not double-played: `delivered` is 4, not 5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback datagram phase oracle; binds UDP. Integration tier."]
+async fn duplicate_arriving_while_buffered_counts_as_duplicate_not_late() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+    let (bob_link, alice_link) = phase_links(&alice, &bob).await;
+
+    let out = run_phase_script(
+        bob_link,
+        alice_link,
+        &[PhaseStep::Send(3), PhaseStep::Send(3), PhaseStep::Poll],
+    )
+    .await;
+
+    // delivered=4, reordered=0, late_dropped=0, duplicates_dropped=1,
+    // gaps_emitted=0. The zero on `late_dropped` is the discriminating
+    // half of this oracle: it is the counter the same re-emit would move
+    // if the receiver had polled in between.
+    assert_counters(out.counters, 4, 0, 0, 1, 0);
+    assert_eq!(
+        out.delivered_events, 4,
+        "the duplicate must be dropped, not played out twice"
+    );
+    assert_eq!(out.gap_events, 0, "a duplicate is not a loss");
+    assert_eq!(
+        out.datagrams_sent, 5,
+        "both copies must actually leave over the datagram lane"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// `late_dropped` oracle: a re-emit AFTER a gap and playout.
+///
+/// The script sends 4,5,6 with 3 missing; three newer frames exceed the
+/// reorder window, so 3 is declared a gap and 4,5,6 play out, leaving
+/// the cursor at 7. Sequence 3 then arrives behind the cursor and is
+/// dropped as late — the same bytes that count as a *duplicate* in the
+/// test above count as *late* here purely because playout intervened,
+/// which is exactly why the receiver phases have to be explicit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback datagram phase oracle; binds UDP. Integration tier."]
+async fn frame_arriving_after_gap_and_playout_counts_as_late() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+    let (bob_link, alice_link) = phase_links(&alice, &bob).await;
+
+    let out = run_phase_script(
+        bob_link,
+        alice_link,
+        &[
+            PhaseStep::Send(4),
+            PhaseStep::Send(5),
+            PhaseStep::Send(6),
+            PhaseStep::Poll,
+            PhaseStep::Send(3),
+            PhaseStep::Poll,
+        ],
+    )
+    .await;
+
+    assert_counters(out.counters, 6, 0, 1, 0, 1);
+    assert_eq!(
+        out.gap_events, 1,
+        "the missing sequence must reach playout-loss concealment as one gap"
+    );
+    assert_eq!(
+        out.delivered_events, 6,
+        "the late frame must not be played out behind the cursor"
+    );
+    assert_eq!(out.datagrams_sent, 7, "lane routing proof");
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
 /// Lossy, reordering UDP proxy: two-party (1:1 call scope) — side B is
 /// pinned to `bob_addr` at construction (bob otherwise never sends to
 /// the proxy, so it could never be learned from traffic); the first
 /// OTHER source address to send becomes side A. Every packet between
 /// the sides is forwarded with `drop_pct` % loss and 0–7 ms of
-/// per-packet jitter. Jittered per-packet delays are what create
-/// reordering (a fixed delay would preserve order). QUIC's own loss
-/// recovery retransmits the reliable traffic (handshake, signaling DMs,
-/// stream lanes); the datagram lane must eat the loss with the jitter
-/// buffer — exactly the condition ADR-0042 (c) exists for.
+/// per-packet jitter. QUIC's own loss recovery retransmits the reliable
+/// traffic (handshake, signaling DMs, stream lanes); the datagram lane
+/// must eat the loss with the jitter buffer — exactly the condition
+/// ADR-0042 (c) exists for.
+///
+/// The counters here are **diagnostics only, never a pass condition**.
+/// A dropped UDP packet may be a handshake, an ACK, a signalling DM or
+/// a stream frame, and QUIC may discard a duplicated packet before
+/// anything reaches the jitter buffer, so proxy packet counts cannot be
+/// reconciled against `AudioDatagram` counts. Likewise a ≤7 ms
+/// perturbation at a 20 ms send cadence may legitimately leave order
+/// fully intact, so no reordering is asserted here. The deterministic
+/// counter oracles live in the phase tests on the clean lane; this test
+/// owns network realism (loss, resilience, SNR, latency) only.
 struct LossyUdpProxy {
     addr: std::net::SocketAddr,
+    stats: Arc<ProxyStats>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Proxy packet diagnostics. Reported on failure to aid triage; never
+/// asserted on (see [`LossyUdpProxy`]).
+#[derive(Default)]
+struct ProxyStats {
+    forwarded: AtomicU64,
+    dropped: AtomicU64,
+    delayed: AtomicU64,
+}
+
+impl LossyUdpProxy {
+    /// `(forwarded, dropped, delayed)` — diagnostics only.
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.stats.forwarded.load(Ordering::Relaxed),
+            self.stats.dropped.load(Ordering::Relaxed),
+            self.stats.delayed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Graceful stop: signal the loop, then join it, so the socket and
+    /// every still-pending forward in the in-loop delay queue are
+    /// reclaimed before the test returns.
+    async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Abort-on-unwind backstop: an assertion failure between `spawn` and
+/// `shutdown` must not leave the recv loop, its socket, or the pending
+/// forward queue running for the rest of the process.
+impl Drop for LossyUdpProxy {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Tiny LCG — deterministic, no rand dependency.
@@ -350,8 +901,10 @@ async fn spawn_lossy_udp_proxy(drop_pct: u64, bob_addr: std::net::SocketAddr) ->
             .expect("proxy bind"),
     );
     let addr = sock.local_addr().expect("proxy addr");
-    let recv = Arc::clone(&sock);
-    tokio::spawn(async move {
+    let stats = Arc::new(ProxyStats::default());
+    let task_stats = Arc::clone(&stats);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
         // PQC handshakes can carry multi-kilobyte datagrams; size the
         // buffer for the UDP maximum so nothing is truncated silently.
         let mut buf = vec![0u8; 65_507];
@@ -359,35 +912,134 @@ async fn spawn_lossy_udp_proxy(drop_pct: u64, bob_addr: std::net::SocketAddr) ->
         // address to send becomes side A (alice's QUIC socket).
         let mut sides: [Option<std::net::SocketAddr>; 2] = [None, Some(bob_addr)];
         let mut rng = Lcg(0x5EED_1234_ABCD_0001);
+        // The delay queue lives *inside* the proxy task. A detached
+        // `tokio::spawn` per packet would outlive the proxy and keep
+        // forwarding after shutdown; owning it here means one abort or
+        // one graceful stop reclaims the socket and every pending
+        // forward together.
+        let mut pending: Vec<(tokio::time::Instant, Vec<u8>, std::net::SocketAddr)> = Vec::new();
         loop {
-            let (n, from) = match recv.recv_from(&mut buf).await {
-                Ok(x) => x,
-                Err(_) => break,
-            };
-            if sides.contains(&Some(from)) {
-                // known side
-            } else if from == bob_addr || sides[0].is_some() {
-                continue; // third party — two-party proxy by contract
-            } else {
-                sides[0] = Some(from);
+            let next_due = pending.iter().map(|(due, _, _)| *due).min();
+            let mut due_now: Vec<(Vec<u8>, std::net::SocketAddr)> = Vec::new();
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                () = async {
+                    match next_due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let now = tokio::time::Instant::now();
+                    pending.retain(|(due, data, to)| {
+                        if *due <= now {
+                            due_now.push((data.clone(), *to));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                res = sock.recv_from(&mut buf) => {
+                    let Ok((n, from)) = res else { break };
+                    if sides.contains(&Some(from)) {
+                        // known side
+                    } else if from == bob_addr || sides[0].is_some() {
+                        continue; // third party — two-party proxy by contract
+                    } else {
+                        sides[0] = Some(from);
+                    }
+                    let (Some(a), Some(b)) = (sides[0], sides[1]) else {
+                        continue; // only one side seen yet
+                    };
+                    let to = if from == a { b } else { a };
+                    if rng.next() % 100 < drop_pct {
+                        task_stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        continue; // injected loss
+                    }
+                    let delay_ms = rng.next() % 8; // 0–7 ms
+                    if delay_ms > 0 {
+                        task_stats.delayed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    pending.push((
+                        tokio::time::Instant::now() + Duration::from_millis(delay_ms),
+                        buf[..n].to_vec(),
+                        to,
+                    ));
+                }
             }
-            let (Some(a), Some(b)) = (sides[0], sides[1]) else {
-                continue; // only one side seen yet
-            };
-            let to = if from == a { b } else { a };
-            if rng.next() % 100 < drop_pct {
-                continue; // injected loss
+            for (data, to) in due_now {
+                let _ = sock.send_to(&data, to).await;
+                task_stats.forwarded.fetch_add(1, Ordering::Relaxed);
             }
-            let delay_ms = rng.next() % 8; // 0–7 ms → reordering
-            let data = buf[..n].to_vec();
-            let fwd = Arc::clone(&recv);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                let _ = fwd.send_to(&data, to).await;
-            });
         }
     });
-    LossyUdpProxy { addr }
+    LossyUdpProxy {
+        addr,
+        stats,
+        shutdown: Some(shutdown_tx),
+        handle: Some(handle),
+    }
+}
+
+/// Render a 32-byte id the way `TransportPeerEntry::peer_id` does,
+/// without pulling a hex dependency into the test.
+fn peer_id_hex(id: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in id {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Assert that the live connection `network` holds to `peer` really
+/// terminates on `expected`.
+///
+/// Uses `NetworkNode::transport_diagnostics()`, whose `peer_entries`
+/// carry the x0x-visible remote transport address rendered as
+/// `udp://<ip>:<port>`. `observed_peer_origin` is deliberately NOT used
+/// here: it is documented to return `None` when the observed IP carries
+/// no origin information (loopback / unspecified), so on this fixture it
+/// could never tell a proxied path from a direct one and would pass
+/// vacuously.
+///
+/// Unknown must not pass. If there is no entry for the peer, or the
+/// entry's address is not in the form this assertion knows how to read,
+/// this panics with the raw value instead of skipping the check.
+async fn assert_path_custody(
+    network: &Arc<x0x::network::NetworkNode>,
+    peer: &[u8; 32],
+    expected: std::net::SocketAddr,
+    label: &str,
+) {
+    let want = peer_id_hex(peer);
+    let snapshot = network.transport_diagnostics().await;
+    let entry = snapshot
+        .peer_entries
+        .iter()
+        .find(|e| e.peer_id == want)
+        .unwrap_or_else(|| {
+            panic!(
+                "{label}: no x0x-visible connection to peer {want}; path custody unproven — \
+                 entries: {:?}",
+                snapshot.peer_entries
+            )
+        });
+    let raw = entry.remote_addr.as_str();
+    let stripped = raw.strip_prefix("udp://").unwrap_or_else(|| {
+        panic!(
+            "{label}: remote address {raw:?} is not a UDP transport address; \
+             path custody cannot be established from it"
+        )
+    });
+    let got: std::net::SocketAddr = stripped.parse().unwrap_or_else(|e| {
+        panic!("{label}: remote address {raw:?} did not parse as a socket address: {e}")
+    });
+    assert_eq!(
+        normalize_loopback(got),
+        normalize_loopback(expected),
+        "{label}: connection must terminate on the lossy proxy, not on a direct path"
+    );
 }
 
 /// Clean-loopback datagram parity with the reliable path: the full Opus
@@ -489,19 +1141,33 @@ async fn datagram_lane_survives_injected_loss_and_reorder() {
         "connection through the lossy proxy must converge (QUIC loss recovery)"
     );
 
-    let alice_addr = normalize_loopback(alice_network.bound_addr().await.expect("alice bound"));
-    let bob_addr = normalize_loopback(bob_network.bound_addr().await.expect("bob bound"));
+    // Path custody, by construction: BOTH discovery hints point at the
+    // proxy, never at a real bound address. Seeding the peers' real
+    // addresses here would advertise a clean, loss-free path alongside
+    // the lossy one, and the lane could then carry the audio over it
+    // while this test still asserted a loss-resilience posture it never
+    // exercised.
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
         .as_secs();
     alice
-        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr, now_secs))
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, proxy.addr, now_secs))
         .await;
     alice.set_contact_trusted_for_testing(bob.agent_id()).await;
-    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr, now_secs))
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, proxy.addr, now_secs))
         .await;
     bob.set_contact_trusted_for_testing(alice.agent_id()).await;
+
+    // ...and by observation: the live connection alice holds to bob must
+    // really terminate on the proxy.
+    assert_path_custody(
+        &alice_network,
+        &bob.machine_id().0,
+        proxy.addr,
+        "alice -> bob",
+    )
+    .await;
 
     let alice_link = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id())
         .with_audio_lane_mode(AudioLaneMode::Datagram);
@@ -529,6 +1195,12 @@ async fn datagram_lane_survives_injected_loss_and_reorder() {
 
     alice.shutdown().await;
     bob.shutdown().await;
+    let (forwarded, dropped, delayed) = proxy.snapshot();
+    eprintln!(
+        "lossy proxy diagnostics (not a pass condition): \
+         forwarded={forwarded} dropped={dropped} delayed={delayed}"
+    );
+    proxy.shutdown().await;
 }
 
 /// Flood defense (ADR-0042 addendum): the per-connection inbound byte

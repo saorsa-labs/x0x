@@ -255,6 +255,11 @@ pub struct Agent {
     network: Option<std::sync::Arc<network::NetworkNode>>,
     /// The gossip runtime for pub/sub messaging.
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
+    /// Disable the inbox's legacy-bus subscription, reverse-ACK bus pre-warm,
+    /// and legacy ACK hedge. Installed during build before network listeners.
+    /// Default false; sender bus fallback is unchanged. Bus-only senders
+    /// cannot reach this inbox when enabled.
+    skip_legacy_dm_bus: bool,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
@@ -2832,6 +2837,10 @@ pub struct AgentBuilder {
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
     gossip_config: Option<gossip::GossipConfig>,
+    /// Opt out of the inbox's legacy-bus subscription, reverse-ACK bus
+    /// pre-warm, and legacy ACK hedge. Default false; sender bus fallback
+    /// stays enabled, but bus-only senders cannot reach the opted-out inbox.
+    skip_legacy_dm_bus: bool,
     peer_cache_dir: Option<std::path::PathBuf>,
     /// When true, skip opening the bootstrap peer cache entirely.
     /// Useful for fully isolated embedders and test harnesses.
@@ -3829,6 +3838,7 @@ impl Agent {
             user_key_path: None,
             network_config: None,
             gossip_config: None,
+            skip_legacy_dm_bus: false,
             peer_cache_dir: None,
             disable_peer_cache: false,
             heartbeat_interval_secs: None,
@@ -9886,7 +9896,7 @@ impl Agent {
                 sender_agent_id: self.identity.agent_id(),
             }) as std::sync::Arc<dyn dm_inbox::DirectAckHedge>
         });
-        let service = dm_inbox::DmInboxService::spawn_with_hedge(
+        let service = dm_inbox::DmInboxService::spawn_with_hedge_options(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
@@ -9903,6 +9913,7 @@ impl Agent {
             std::sync::Arc::clone(&self.authenticated_machine_bindings),
             self.history_handle.clone(),
             direct_hedge,
+            self.skip_legacy_dm_bus,
         )
         .await
         .map_err(|e| {
@@ -14271,6 +14282,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Opt out of the inbox's compatibility-bus subscription, reverse-ACK
+    /// bus pre-warming, and legacy ACK hedge. Installed before network event
+    /// listeners start. Defaults to false for rolling compatibility.
+    ///
+    /// Sender-side fallback to the bus is deliberately unchanged. With this
+    /// enabled, bus-only senders no longer reach this inbox; targeted inbox
+    /// delivery and targeted/Direct ACK routes remain available.
+    #[must_use]
+    pub fn with_skip_legacy_dm_bus(mut self, skip: bool) -> Self {
+        self.skip_legacy_dm_bus = skip;
+        self
+    }
+
     /// Set the directory for the bootstrap peer cache.
     ///
     /// The cache persists peer quality metrics across restarts, enabling
@@ -14938,7 +14962,15 @@ impl AgentBuilder {
                     e
                 )))
             })?;
-            Some(std::sync::Arc::new(runtime))
+            let runtime = std::sync::Arc::new(runtime);
+            // This must happen during build, before `join_network` starts
+            // the network-event listener. A later inbox-only setter would
+            // leave a race where the first trusted PeerConnected event warms
+            // the bus permanently.
+            runtime
+                .pubsub()
+                .set_skip_legacy_dm_bus(self.skip_legacy_dm_bus);
+            Some(runtime)
         } else {
             None
         };
@@ -15033,6 +15065,7 @@ impl AgentBuilder {
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,
+            skip_legacy_dm_bus: self.skip_legacy_dm_bus,
             bootstrap_cache,
             gossip_cache_adapter,
             machine_kem,
