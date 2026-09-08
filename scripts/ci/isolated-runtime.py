@@ -44,6 +44,7 @@ def namespace_state(parent):
 
 def admitted(config):
     state = namespace_state(config['parent_netns'])
+    state['namespace_changed'] = True
     status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines()
                   if ':' in line)
     if os.getuid() != config['uid'] or os.geteuid() == 0 or os.getgroups():
@@ -57,6 +58,10 @@ def admitted(config):
         key: status[key].strip() for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')},
         no_new_privs=1)
     (Path(config['evidence']) / 'admission.json').write_text(json.dumps(state, indent=2) + '\n')
+    if config.get('role'):
+        (Path(config['evidence']) / 'role.json').write_text(json.dumps({
+            'role': config['role'], 'scratch': config.get('scratch')
+        }) + '\n')
     result = subprocess.run(config['command'], env=config['env'], close_fds=True)
     (Path(config['evidence']) / 'exit.json').write_text(json.dumps({'exit': result.returncode}) + '\n')
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
@@ -176,9 +181,13 @@ def main():
     evidence = Path(tempfile.mkdtemp(prefix='x0x-isolation-', dir=os.environ['RUNNER_TEMP'])).resolve()
     if evidence.is_relative_to('/tmp'):
         raise RuntimeError('RUNNER_TEMP must remain visible outside private /tmp')
+    role = os.environ.get('X0X_ISOLATION_ROLE')
+    scratch = os.environ.get('X0X_CUSTODY_SCRATCH')
     config = dict(command=command, env=env, uid=os.getuid(), gid=os.getgid(),
                   parent_netns=os.readlink('/proc/self/ns/net'), evidence=str(evidence),
                   timeout_seconds=int(os.environ.get('X0X_RUNTIME_TIMEOUT_SECONDS', '21600')))
+    if role:
+        config.update(role=role, scratch=Path(scratch).name if scratch else None)
     if not 1 <= config['timeout_seconds'] <= 21600:
         raise RuntimeError('runtime deadline must be1..21600 seconds')
     config_file = evidence / 'runtime.json'

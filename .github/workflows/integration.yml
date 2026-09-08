@@ -152,14 +152,158 @@ jobs:
           cargo build --offline --locked --all-features --bin x0xd
           test -x target/debug/x0xd
           sha256sum target/debug/x0xd
+      # Each issue #321 selector gets its own RUNNER_TEMP subtree and typed
+      # acceptance receipt. The shared collector binds one test binary to one
+      # build-custody scratch; combining binaries would make custody ambiguous.
       - name: Run issue #321 verified history restart acceptance
         run: |
+          set -euo pipefail
           test -x target/debug/x0xd
-          sha256sum target/debug/x0xd
-          bash scripts/ci/nextest-isolated.sh --all-features \
-            --test named_group_e_live -- \
-            --run-ignored ignored-only \
-            -E 'test(=e_verified_envelope_history_lookup_survives_restart)'
+          root="$RUNNER_TEMP/issue321-history-restart"
+          mkdir -p "$root"
+          sha256sum target/debug/x0xd > "$root/x0xd.sha256"
+          set +e
+          X0X_ISOLATION_ROLE=acceptance RUNNER_TEMP="$root" \
+            bash scripts/ci/nextest-isolated.sh --all-features \
+              --test named_group_e_live -- \
+              --run-ignored ignored-only \
+              -E 'test(=e_verified_envelope_history_lookup_survives_restart)' \
+              > "$root/command.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/command.log"
+          printf '%s\n' "$status" > "$root/command.exit"
+          exit "$status"
+      - name: Collect issue #321 verified history custody
+        id: collect_issue321_history
+        if: always()
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}/issue321-history-restart
+          GITHUB_SHA: ${{ github.sha }}
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: named_group_e_live
+        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/safe"
+      - name: Upload issue #321 verified history custody
+        if: always() && steps.collect_issue321_history.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue321-history-custody
+          path: ${{ runner.temp }}/issue321-history-restart/safe
+
+      - name: Run issue #321 direct canonical point lookup
+        if: always()
+        run: |
+          set -euo pipefail
+          test -x target/debug/x0xd
+          root="$RUNNER_TEMP/issue321-history-point"
+          mkdir -p "$root"
+          sha256sum target/debug/x0xd > "$root/x0xd.sha256"
+          set +e
+          X0X_ISOLATION_ROLE=acceptance RUNNER_TEMP="$root" \
+            bash scripts/ci/nextest-isolated.sh --all-features \
+              --test history_point_lookup_wiring -- \
+              -E 'test(=history_message_point_lookup_serves_group_row_by_canonical_id)' \
+              > "$root/command.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/command.log"
+          printf '%s\n' "$status" > "$root/command.exit"
+          exit "$status"
+      - name: Collect issue #321 direct lookup custody
+        id: collect_issue321_point
+        if: always()
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}/issue321-history-point
+          GITHUB_SHA: ${{ github.sha }}
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: history_point_lookup_wiring
+        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/safe"
+      - name: Upload issue #321 direct lookup custody
+        if: always() && steps.collect_issue321_point.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue321-history-point-custody
+          path: ${{ runner.temp }}/issue321-history-point/safe
+
+      - name: Run issue #321 delegation and cold-wake acceptance
+        if: always()
+        run: |
+          set -euo pipefail
+          test -x target/debug/x0xd
+          root="$RUNNER_TEMP/issue321-delegation"
+          mkdir -p "$root"
+          sha256sum target/debug/x0xd > "$root/x0xd.sha256"
+          set +e
+          X0X_ISOLATION_ROLE=acceptance RUNNER_TEMP="$root" \
+            bash scripts/ci/nextest-isolated.sh --all-features \
+              --test delegation_spaces -- \
+              --run-ignored ignored-only \
+              -E 'test(=delegation_survives_restart_via_history) | test(=delegation_carrier_verified_history_survives_receiver_restart) | test(=delegated_child_cold_wake_rehydrates_carrier_and_sends_as)' \
+              > "$root/command.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/command.log"
+          printf '%s\n' "$status" > "$root/command.exit"
+          exit "$status"
+      - name: Collect issue #321 delegation custody
+        id: collect_issue321_delegation
+        if: always()
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}/issue321-delegation
+          GITHUB_SHA: ${{ github.sha }}
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: delegation_spaces
+        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/safe"
+      - name: Upload issue #321 delegation custody
+        if: always() && steps.collect_issue321_delegation.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue321-delegation-custody
+          path: ${{ runner.temp }}/issue321-delegation/safe
+
+      - name: Run issue #321 moderated transport control
+        if: always()
+        run: |
+          set -euo pipefail
+          test -x target/debug/x0xd
+          root="$RUNNER_TEMP/issue321-moderated"
+          mkdir -p "$root"
+          sha256sum target/debug/x0xd > "$root/x0xd.sha256"
+          set +e
+          X0X_ISOLATION_ROLE=acceptance RUNNER_TEMP="$root" \
+            bash scripts/ci/nextest-isolated.sh --all-features \
+              --test named_group_e_live -- \
+              --run-ignored ignored-only \
+              -E 'test(=e_moderated_public_positive_cross_daemon_receive)' \
+              > "$root/command.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/command.log"
+          printf '%s\n' "$status" > "$root/command.exit"
+          exit "$status"
+      - name: Collect issue #321 moderated custody
+        id: collect_issue321_moderated
+        if: always()
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}/issue321-moderated
+          GITHUB_SHA: ${{ github.sha }}
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: named_group_e_live
+        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/safe"
+      - name: Upload issue #321 moderated custody
+        if: always() && steps.collect_issue321_moderated.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue321-moderated-custody
+          path: ${{ runner.temp }}/issue321-moderated/safe
 
   # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
   integration-net:

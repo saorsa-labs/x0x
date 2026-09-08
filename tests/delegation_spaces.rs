@@ -11,6 +11,7 @@
 //! `mention_routing_surfaces_ws_event` back the `/groups/:id/delegate` +
 //! `/groups/:id/delegations` registry entries in `tests/api_coverage.rs`.
 
+use base64::Engine;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::Value;
 use std::future::Future;
@@ -908,6 +909,158 @@ async fn delegation_carrier_verified_history_survives_receiver_restart() {
             owner_point["record"]["payload"]
         );
         assert_eq!(after_restart["record"]["provenance"], "VerifiedEnvelope");
+    })
+    .catch_unwind()
+    .await;
+    drop(pair);
+    if let Err(panic) = proof {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Issue #321 child cold-wake acceptance: stop Bob before the owner publishes
+/// the delegation carrier, rebuild him from the same identity/data directory,
+/// and prove the missed carrier is recovered and its re-derived grant
+/// authorizes an actual post-restart send-as operation. The carrier's
+/// VerifiedEnvelope row and the resulting message are both checked through
+/// canonical point lookup; a warm receiver row alone cannot make this pass.
+#[tokio::test]
+#[ignore]
+async fn delegated_child_cold_wake_rehydrates_carrier_and_sends_as() {
+    let _guard = suite_lock().await;
+    let mut pair = pair().await;
+    let proof = AssertUnwindSafe(async {
+        mesh_pair(&pair.alice, &pair.bob).await;
+        let (alice_local, stable) =
+            create_signed_public_group(&pair.alice, "issue321-child-cold-wake").await;
+        join_group(&pair.alice, &pair.bob, &alice_local).await;
+        let warmup = send_message(
+            &pair.alice,
+            &alice_local,
+            serde_json::json!({"body": "issue321-child-warmup"}),
+        )
+        .await;
+        assert_eq!(warmup.status(), 200);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let bob_id = pair.bob.agent_id().await;
+        let bob_before = bob_id.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // Stop the delegate before the carrier is published. The subsequent
+        // start must recover the missed carrier through the normal persisted
+        // group/gossip path; a warm receiver row cannot satisfy this proof.
+        pair.bob.stop();
+        let delegated = delegate(
+            &pair.alice,
+            &alice_local,
+            &bob_id,
+            "send_as",
+            now + 300_000,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(delegated.status(), 200);
+        let delegated_json: Value = delegated.json().await.expect("delegation json");
+        let digest = delegated_json["delegation_digest"]
+            .as_str()
+            .expect("delegation digest")
+            .to_owned();
+        let carrier_id = delegated_json["msg_id"]
+            .as_str()
+            .expect("delegation carrier canonical id")
+            .to_owned();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(carrier_id.len(), 64);
+        let (status, owner_carrier) =
+            get_history_point(&pair.alice, &alice_local, &carrier_id).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(owner_carrier["record"]["msg_id"], carrier_id);
+        assert_eq!(owner_carrier["record"]["scope"], format!("group:{stable}"));
+        assert_eq!(owner_carrier["record"]["provenance"], "LocalSend");
+
+        pair.bob.start().await;
+        assert_eq!(pair.bob.agent_id().await, bob_before);
+
+        let learned = wait_until(Duration::from_secs(20), || async {
+            delegations(&pair.bob, &alice_local).await["delegations"]
+                .as_array()
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry["delegation_digest"].as_str() == Some(digest.as_str()))
+                })
+        })
+        .await;
+        assert!(
+            learned,
+            "delegated child did not recover the carrier after cold restart"
+        );
+        let rehydrated = delegations(&pair.bob, &alice_local).await;
+        assert!(rehydrated["delegations"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry["delegation_digest"].as_str() == Some(digest.as_str()))
+        }));
+        let (status, before) = get_history_point(&pair.bob, &alice_local, &carrier_id).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(before["record"]["msg_id"], carrier_id);
+        assert_eq!(before["record"]["scope"], owner_carrier["record"]["scope"]);
+        assert_eq!(
+            before["record"]["payload"],
+            owner_carrier["record"]["payload"]
+        );
+        assert_eq!(before["record"]["provenance"], "VerifiedEnvelope");
+        let (status, after) = get_history_point(&pair.bob, &alice_local, &carrier_id).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(after["record"]["msg_id"], carrier_id);
+        assert_eq!(after["record"]["scope"], before["record"]["scope"]);
+        assert_eq!(after["record"]["payload"], before["record"]["payload"]);
+        assert_eq!(after["record"]["provenance"], "VerifiedEnvelope");
+
+        let body = "issue321-child-cold-wake-send-as";
+        let sent = send_message(
+            &pair.bob,
+            &alice_local,
+            serde_json::json!({"body": body, "delegation_digest": digest}),
+        )
+        .await;
+        assert_eq!(sent.status(), 200, "rehydrated child send-as failed");
+        let sent_json: Value = sent.json().await.expect("post-restart send response json");
+        assert_eq!(sent_json["ok"], true);
+        let sent_id = sent_json["msg_id"]
+            .as_str()
+            .expect("post-restart send canonical id")
+            .to_owned();
+        assert_eq!(sent_id.len(), 64);
+
+        let received = wait_until(Duration::from_secs(15), || async {
+            get_history(&pair.alice, &alice_local).await["records"]
+                .as_array()
+                .is_some_and(|records| {
+                    records.iter().any(|record| {
+                        record["msg_id"].as_str() == Some(sent_id.as_str())
+                            && record["provenance"].as_str() == Some("VerifiedEnvelope")
+                    })
+                })
+        })
+        .await;
+        assert!(
+            received,
+            "owner never received post-restart delegated message"
+        );
+        let (status, point) = get_history_point(&pair.alice, &alice_local, &sent_id).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(point["record"]["msg_id"], sent_id);
+        assert_eq!(point["record"]["scope"], format!("group:{stable}"));
+        assert_eq!(point["record"]["provenance"], "VerifiedEnvelope");
+        assert_eq!(
+            point["record"]["payload"],
+            base64::engine::general_purpose::STANDARD.encode(body.as_bytes())
+        );
     })
     .catch_unwind()
     .await;
