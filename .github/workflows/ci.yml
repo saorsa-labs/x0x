@@ -330,6 +330,11 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@just
 
+      - name: Developer launcher inert controls
+        run: |
+          python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ required"'
+          python3 scripts/dev/test_test_isolated.py
+
       - name: Authority check (same recipe as `just check`)
         run: python3 scripts/ci/isolated-runtime.py just deploy-check
 
