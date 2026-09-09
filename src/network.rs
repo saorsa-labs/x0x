@@ -3199,6 +3199,25 @@ impl NetworkNode {
             .map(|s| s.set_at)
     }
 
+    /// Install reverse Admin suppression for the single controlling task of
+    /// the current-thread diamond fixture. This synchronous sequence is not
+    /// an atomic absent-entry API for concurrent cross-thread callers.
+    #[cfg(test)]
+    pub(crate) fn suppress_admin_reconnect_for_testing(
+        &self,
+        peer_id: [u8; 32],
+    ) -> Option<Instant> {
+        {
+            // Reject even expired occupancy, and never recover a poisoned lock.
+            let map = self.reconnect_suppressions.lock().ok()?;
+            if map.contains_key(&peer_id) {
+                return None;
+            }
+        } // Release the inspection guard before the existing mechanism relocks.
+        self.suppress_reconnect(peer_id, DisconnectReason::Admin);
+        self.reconnect_suppression_set_at(peer_id)
+    }
+
     /// Outbound dial choke point, pre-socket half (issue #292, invariant C).
     ///
     /// Every id-known outbound seam — [`Self::connect_peer`],

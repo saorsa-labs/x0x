@@ -22,14 +22,40 @@ def fixture():
                            "egress_budget": {"byte_policy": "observe_only", "repair": {"tracking_overflow": 0}}},
                 "participation": {"mode": "leaf", "relay_bytes": 0},
                 "stages": {"peer_scores": [{"topic": module.BUS, "role": "eager", "eager_eligible": True, "peer_id": "44" * 8}]}}
-    return {"schema": 1, "selector": module.SELECTOR, "phase": "complete", "outcome": "PASS", "pid": 10,
+    record = {"schema": 2, "selector": module.SELECTOR, "phase": "complete", "outcome": "PASS", "pid": 10,
             "identities": [{"agent": b * 32, "machine": b * 32} for b in ("11", "22", "33", "44")],
             "generator_peer_hex8": "11" * 8, "binary_sha256": "ab" * 32,
             "build_lock_sha256": hashlib.sha256(LOCK).hexdigest(),
             "universe": [{"name": "synthetic-bus", "full_id_hex": module.BUS + "0" * 48, "topic_id_hex8": module.BUS}],
-            "samples": {"D5": {"t0": sample(1, 0, True), "t1": sample(10000000001, 100, True)},
-                        "O5": {"t0": sample(1, 0, False), "t1": sample(10000000001, 0, False)}},
+            "samples": {"D5": {"t0": sample(2_000_000_000, 0, True), "t1": sample(12_000_000_000, 100, True)},
+                        "O5": {"t0": sample(2_000_000_000, 0, False), "t1": sample(12_000_000_000, 0, False)}},
             "load": {"sent": 200, "payload_bytes": 4096, "period_ms": 50, "elapsed_ns": 10000000000, "fanouts": [3] * 200, "witness_observed_during_load": 170}}
+
+    ids = {label: record["identities"][i]["machine"] for i, label in enumerate(module.LABELS)}
+    def check(at):
+        return {"begin_ns": at, "end_ns": at + 2, "set_at_ns": 100,
+                "check_ns": at + 1, "age_ns": at + 1 - 100, "live": True, "verdict": "Suppressed"}
+    record["topology"] = {"expected_allowed": copy.deepcopy(module.EXPECTED),
+        "forbidden_pairs": [["G5", "W5"], ["D5", "O5"]], "peer_ids": ids,
+        "intervening_allowed_edge_state": "unknown",
+        "configuration": "two reverse test Admin installations and two public forward disconnects; gossip admission only",
+        "observations": {phase: {label: {"begin_ns": at, "end_ns": at + 1,
+                            "admitted": [ids[v] for v in module.EXPECTED[label]]}
+                         for label in module.LABELS}
+                         for phase, at in (("pre_cut", 1_000_000_000), ("t1", 13_000_000_000))},
+        "suppression": {edge: {"initial_set_at_ns": 100, "pre_check": check(1_000_000_000),
+                               "final_check": check(13_000_000_000), "set_at_stable": True,
+                               "ttl_ns": module.TTL_NS, "margin_ns": module.MARGIN_NS}
+                        for edge in module.EDGES}}
+    record["topology"]["operations"] = {}
+    for owner, peer in (("G5", "W5"), ("D5", "O5")):
+        record["topology"]["operations"][owner + "|" + peer] = {
+            kind: {"owner": source, "peer": target, "owner_peer_id": ids[source], "peer_id": ids[target],
+                   "begin_ns": begin, "end_ns": end, "set_at_ns": 100, "result": result}
+            for kind, source, target, begin, end, result in (
+                ("reverse_install", peer, owner, 99, 100, "Installed"),
+                ("forward_disconnect", owner, peer, 100, 101, "Ok"))}
+    return record
 
 
 def output(record):
@@ -68,11 +94,13 @@ class DerivationControls(unittest.TestCase):
         with self.assertRaisesRegex(module.Inconclusive, "NONINJECTIVE_UNIVERSE"):
             module.derive(r, LOCK)
 
-    def test_missing_opportunity_never_passing_zero(self):
+    def test_peer_scores_are_diagnostic_and_zero_default_fails(self):
         r = fixture()
-        r["samples"]["D5"]["t1"]["stages"]["peer_scores"][0]["peer_id"] = r["generator_peer_hex8"]
-        with self.assertRaisesRegex(module.Inconclusive, "OPPORTUNITY_ABSENT"):
-            module.derive(r, LOCK)
+        for cut in ("t0", "t1"):
+            r["samples"]["D5"][cut]["stages"]["peer_scores"] = []
+        self.assertEqual(module.derive(r, LOCK)["derivation"], "CONSISTENT")
+        r["samples"]["D5"]["t1"]["egress"]["outbound_by_topic_named"][0]["outbound"]["eager"]["bytes"] = 0
+        self.assertEqual(module.derive(r, LOCK)["oracle_failures"], ["D5_EAGER_ORACLE"])
 
     def test_nonzero_optout_is_failure(self):
         r = fixture()
@@ -119,6 +147,79 @@ class DerivationControls(unittest.TestCase):
         r["load"]["sent"] = True
         with self.assertRaisesRegex(module.Inconclusive, "INVALID_COUNTER"):
             module.derive(r, LOCK)
+
+    def test_literal_graph_and_full_peer_sets(self):
+        for mutation in ("graph", "mapping", "unknown", "duplicate", "reverse", "extra", "short"):
+            r = fixture(); t = r["topology"]
+            if mutation == "graph": t["expected_allowed"]["G5"] = ["W5"]
+            elif mutation == "mapping": t["peer_ids"]["G5"] = "ff" * 32
+            elif mutation == "unknown": t["observations"]["t1"]["D5"]["admitted"].append("ff" * 32)
+            elif mutation == "duplicate": t["observations"]["pre_cut"]["G5"]["admitted"] *= 2
+            elif mutation == "reverse": del t["suppression"]["W5|G5"]
+            elif mutation == "extra": t["suppression"]["G5|D5"] = t["suppression"]["G5|W5"]
+            else: t["peer_ids"]["D5"] = "22" * 8
+            with self.subTest(mutation=mutation), self.assertRaises(module.Inconclusive): module.derive(r, LOCK)
+
+    def test_suppression_identity_clock_and_literal_margin(self):
+        for mutation in ("refresh", "stable", "age", "ttl", "margin", "expired", "bool", "overflow", "notlive", "checkoutside"):
+            r = fixture(); row = r["topology"]["suppression"]["O5|D5"]; c = row["final_check"]
+            if mutation == "refresh": c["set_at_ns"] += 1
+            elif mutation == "stable": row["set_at_stable"] = False
+            elif mutation == "age": c["age_ns"] += 1
+            elif mutation == "ttl": row["ttl_ns"] += 1
+            elif mutation == "margin": row["margin_ns"] = 0
+            elif mutation == "expired":
+                c.update(begin_ns=116_000_000_100, check_ns=116_000_000_100, end_ns=116_000_000_100, age_ns=116_000_000_000)
+            elif mutation == "bool": c["age_ns"] = True
+            elif mutation == "overflow": c["age_ns"] = 2**64
+            elif mutation == "notlive": c["live"] = False
+            else: c["check_ns"] = c["end_ns"] + 1
+            with self.subTest(mutation=mutation), self.assertRaises(module.Inconclusive): module.derive(r, LOCK)
+
+    def test_both_cut_brackets_and_interval_order(self):
+        for mutation in ("earlyfinal", "latepre", "unionD", "unionO", "reverse", "cutbool"):
+            r = fixture()
+            if mutation == "earlyfinal": r["topology"]["suppression"]["G5|W5"]["final_check"]["begin_ns"] = 0
+            elif mutation == "latepre": r["topology"]["observations"]["pre_cut"]["W5"]["end_ns"] = 3_000_000_000
+            elif mutation == "unionD": r["samples"]["D5"]["t1"]["end_ns"] = 14_000_000_000
+            elif mutation == "unionO": r["samples"]["O5"]["t0"]["begin_ns"] = 0
+            elif mutation == "reverse": r["samples"]["O5"]["t0"]["end_ns"] = 0
+            else: r["samples"]["D5"]["t0"]["begin_ns"] = False
+            with self.subTest(mutation=mutation), self.assertRaises(module.Inconclusive): module.derive(r, LOCK)
+
+    def test_phase_topology_recapture_and_old_schema_refused(self):
+        for index, field in ((1, "pre"), (2, "final"), (3, "identity")):
+            lines = output(fixture()).splitlines()
+            r = json.loads(lines[index][len(module.PREFIX):])
+            if field == "pre": r["topology"]["observations"]["pre_cut"]["G5"]["end_ns"] += 1
+            elif field == "final": r["topology"]["suppression"]["D5|O5"]["set_at_stable"] = False
+            else: r["topology"]["peer_ids"]["G5"] = "ff" * 32
+            lines[index] = module.PREFIX + json.dumps(r).encode()
+            with self.subTest(field=field), self.assertRaises(module.Inconclusive): module.parse(b"\n".join(lines))
+        r = fixture(); r["schema"] = 1
+        with self.assertRaises(module.Inconclusive): module.derive(r, LOCK)
+        with self.assertRaises(module.Inconclusive): module.parse(output(r))
+
+    def test_exact_shaping_operations_and_timestamp_binding(self):
+        for mutation in ("missing", "extra", "reverseclose", "failed", "binding", "timestamp", "order", "boolean"):
+            r = fixture(); ops = r["topology"]["operations"]
+            if mutation == "missing": del ops["D5|O5"]
+            elif mutation == "extra": ops["W5|G5"] = {}
+            elif mutation == "reverseclose": ops["G5|W5"]["reverse_disconnect"] = {}
+            elif mutation == "failed": ops["G5|W5"]["forward_disconnect"]["result"] = "Err"
+            elif mutation == "binding": ops["D5|O5"]["reverse_install"]["peer_id"] = "ff" * 32
+            elif mutation == "timestamp": ops["G5|W5"]["reverse_install"]["set_at_ns"] = 99
+            elif mutation == "order": ops["G5|W5"]["forward_disconnect"]["begin_ns"] = 99
+            else: ops["G5|W5"]["reverse_install"]["set_at_ns"] = True
+            with self.subTest(mutation=mutation), self.assertRaises(module.Inconclusive): module.derive(r, LOCK)
+
+    def test_operation_capture_cannot_be_replaced(self):
+        lines = output(fixture()).splitlines()
+        r = json.loads(lines[1][len(module.PREFIX):])
+        r["topology"]["operations"]["G5|W5"]["forward_disconnect"]["result"] = "Err"
+        lines[1] = module.PREFIX + json.dumps(r).encode()
+        with self.assertRaisesRegex(module.Inconclusive, "TOPOLOGY_IDENTITY_DRIFT"):
+            module.parse(b"\n".join(lines))
 
 
 if __name__ == "__main__":

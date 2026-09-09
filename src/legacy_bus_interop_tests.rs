@@ -505,8 +505,445 @@ fn topic_universe(agents: &[Agent]) -> serde_json::Value {
         .collect::<Vec<_>>())
 }
 
+// The graph and time contract are checker constants, never record-selected.
+const DIAMOND_LABELS: [&str; 4] = ["G5", "D5", "O5", "W5"];
+const DIAMOND_EDGES: [(usize, usize); 4] = [(0, 3), (3, 0), (1, 2), (2, 1)];
+const DIAMOND_TTL_NS: u64 = 120_000_000_000;
+const DIAMOND_MARGIN_NS: u64 = 5_000_000_000;
+
+fn diamond_expected() -> serde_json::Value {
+    serde_json::json!({"G5":["D5","O5"],"D5":["G5","W5"],"O5":["G5","W5"],"W5":["D5","O5"]})
+}
+
+fn diamond_offset(clock: std::time::Instant, at: std::time::Instant) -> Option<u64> {
+    u64::try_from(at.checked_duration_since(clock)?.as_nanos()).ok()
+}
+
+fn diamond_now(clock: std::time::Instant) -> u64 {
+    diamond_offset(clock, std::time::Instant::now())
+        .expect("INCONCLUSIVE: same-process clock range")
+}
+
+async fn diamond_observations(agents: &[Agent], clock: std::time::Instant) -> serde_json::Value {
+    let mut observations = serde_json::Map::new();
+    for (label, agent) in DIAMOND_LABELS.iter().zip(agents) {
+        let begin = diamond_now(clock);
+        let peers = agent.network().expect("network").gossip_plane_peers().await;
+        let end = diamond_now(clock);
+        // Full, unfiltered returned IDs: an unknown peer is not silently lost.
+        let admitted = peers.iter().map(|p| hex::encode(p.0)).collect::<Vec<_>>();
+        observations.insert(
+            (*label).into(),
+            serde_json::json!({"admitted":admitted,"begin_ns":begin,"end_ns":end}),
+        );
+    }
+    observations.into()
+}
+
+async fn diamond_suppression_check(
+    agent: &Agent,
+    peer: [u8; 32],
+    clock: std::time::Instant,
+) -> (serde_json::Value, Option<std::time::Instant>) {
+    let begin = diamond_now(clock);
+    let network = agent.network().expect("network");
+    let set_at = network.reconnect_suppression_set_at(peer);
+    let live = network.is_reconnect_suppressed(peer);
+    let suppressed =
+        network.peer_admission(&ant_quic::PeerId(peer)).await == network::PeerAdmission::Suppressed;
+    let checked_at = std::time::Instant::now();
+    let age = set_at
+        .and_then(|at| checked_at.checked_duration_since(at))
+        .and_then(|age| u64::try_from(age.as_nanos()).ok());
+    let checked = diamond_offset(clock, checked_at);
+    let end = diamond_now(clock);
+    (
+        serde_json::json!({"begin_ns":begin,"end_ns":end,"live":live,
+        "verdict":if suppressed {"Suppressed"} else {"Other"},
+        "set_at_ns":set_at.and_then(|at|diamond_offset(clock,at)),"check_ns":checked,"age_ns":age}),
+        set_at,
+    )
+}
+
+async fn shape_diamond(
+    agents: &[Agent],
+    raw: &mut serde_json::Value,
+    clock: std::time::Instant,
+) -> Vec<std::time::Instant> {
+    let expected = diamond_expected();
+    let peer_ids: serde_json::Map<String, serde_json::Value> = DIAMOND_LABELS
+        .iter()
+        .zip(agents)
+        .map(|(label, a)| {
+            (
+                (*label).to_owned(),
+                serde_json::json!(hex::encode(a.machine_id().0)),
+            )
+        })
+        .collect();
+    raw["topology"] = serde_json::json!({"expected_allowed":expected,
+        "forbidden_pairs":[["G5","W5"],["D5","O5"]],"peer_ids":peer_ids,
+        "operations":{},"observations":{},"suppression":{},"intervening_allowed_edge_state":"unknown",
+        "configuration":"two reverse test Admin installations and two public forward disconnects; gossip admission only"});
+    let mut originals = Vec::new();
+    bounded("fifth-only administrative diamond shaping", SETUP, async {
+        for (from, to) in [(0, 3), (1, 2)] {
+            let forward = agents[from].network().expect("network");
+            let reverse = agents[to].network().expect("network");
+            let reverse_begin = diamond_now(clock);
+            let installed = reverse.suppress_admin_reconnect_for_testing(agents[from].machine_id().0)
+                .expect("INCONCLUSIVE: reverse Admin installation refused");
+            let reverse_end = diamond_now(clock);
+            let forward_begin = diamond_now(clock);
+            forward.disconnect_with_reason(&ant_quic::PeerId(agents[to].machine_id().0), network::DisconnectReason::Admin)
+                .await.expect("INCONCLUSIVE: actual forward administrative disconnect failed");
+            let forward_at = forward.reconnect_suppression_set_at(agents[to].machine_id().0)
+                .expect("INCONCLUSIVE: forward administrative tombstone unavailable");
+            let reverse_at = reverse.reconnect_suppression_set_at(agents[from].machine_id().0)
+                .expect("INCONCLUSIVE: reverse administrative tombstone unavailable");
+            assert_eq!(reverse_at,installed,"INCONCLUSIVE: reverse installation timestamp changed");
+            let forward_end = diamond_now(clock);
+            let pair = format!("{}|{}",DIAMOND_LABELS[from],DIAMOND_LABELS[to]);
+            raw["topology"]["operations"][&pair] = serde_json::json!({
+                "reverse_install":{"owner":DIAMOND_LABELS[to],"peer":DIAMOND_LABELS[from],
+                    "owner_peer_id":hex::encode(agents[to].machine_id().0),"peer_id":hex::encode(agents[from].machine_id().0),
+                    "begin_ns":reverse_begin,"end_ns":reverse_end,"set_at_ns":diamond_offset(clock,installed),"result":"Installed"},
+                "forward_disconnect":{"owner":DIAMOND_LABELS[from],"peer":DIAMOND_LABELS[to],
+                    "owner_peer_id":hex::encode(agents[from].machine_id().0),"peer_id":hex::encode(agents[to].machine_id().0),
+                    "begin_ns":forward_begin,"end_ns":forward_end,"set_at_ns":diamond_offset(clock,forward_at),"result":"Ok"}});
+            originals.extend([forward_at,reverse_at]);
+        }
+    })
+    .await;
+    bounded(
+        "fifth-only exact admitted diamond readiness",
+        SETUP,
+        async {
+            loop {
+                let observed = diamond_observations(agents, clock).await;
+                if diamond_peer_sets(&raw["topology"], &observed).is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await;
+    for agent in agents {
+        pubsub(agent).refresh_topic_peers().await;
+    }
+    raw["topology"]["observations"]["pre_cut"] = bounded(
+        "pre-cut diamond observation",
+        SETUP,
+        diamond_observations(agents, clock),
+    )
+    .await;
+    for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(&originals) {
+        let (check, _) = bounded(
+            "pre-cut directed suppression check",
+            SETUP,
+            diamond_suppression_check(&agents[from], agents[to].machine_id().0, clock),
+        )
+        .await;
+        raw["topology"]["suppression"]
+            [format!("{}|{}", DIAMOND_LABELS[from], DIAMOND_LABELS[to])] = serde_json::json!({
+            "initial_set_at_ns":diamond_offset(clock,*original),"pre_check":check,
+            "ttl_ns":DIAMOND_TTL_NS,"margin_ns":DIAMOND_MARGIN_NS});
+    }
+    originals
+}
+
+fn diamond_keys(value: &serde_json::Value, expected: &[&str]) -> Result<(), String> {
+    let object = value.as_object().ok_or("topology object missing")?;
+    let actual = object
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != expected.iter().copied().collect() {
+        return Err("topology keys mismatch".into());
+    }
+    Ok(())
+}
+
+fn diamond_peer_sets(
+    topology: &serde_json::Value,
+    observed: &serde_json::Value,
+) -> Result<(), String> {
+    diamond_keys(observed, &DIAMOND_LABELS)?;
+    let expected = diamond_expected();
+    for label in DIAMOND_LABELS {
+        let actual = observed[label]["admitted"]
+            .as_array()
+            .ok_or("admitted peers missing")?;
+        let ids = actual
+            .iter()
+            .map(|v| v.as_str().ok_or("admitted peer invalid"))
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        let desired = expected[label]
+            .as_array()
+            .ok_or("literal graph")?
+            .iter()
+            .map(|v| {
+                topology["peer_ids"][v.as_str().ok_or("literal label")?]
+                    .as_str()
+                    .ok_or("mapped peer missing")
+            })
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        if ids.len() != actual.len() || ids != desired {
+            return Err("admitted set differs from literal diamond".into());
+        }
+    }
+    Ok(())
+}
+
+fn topology_u64(value: &serde_json::Value) -> Result<u64, String> {
+    value.as_u64().ok_or("invalid topology/cut u64".into())
+}
+
+fn topology_interval(value: &serde_json::Value) -> Result<(u64, u64), String> {
+    let begin = topology_u64(&value["begin_ns"])?;
+    let end = topology_u64(&value["end_ns"])?;
+    if begin > end {
+        return Err("reversed topology interval".into());
+    }
+    Ok((begin, end))
+}
+
+fn validate_topology(raw: &serde_json::Value, final_required: bool) -> Result<(), String> {
+    use serde_json::json;
+    if raw["schema"].as_u64() != Some(2) {
+        return Err("measurement schema2 required".into());
+    }
+    let t = &raw["topology"];
+    diamond_keys(
+        t,
+        &[
+            "expected_allowed",
+            "forbidden_pairs",
+            "peer_ids",
+            "observations",
+            "suppression",
+            "intervening_allowed_edge_state",
+            "configuration",
+            "operations",
+        ],
+    )?;
+    if t["expected_allowed"] != diamond_expected()
+        || t["forbidden_pairs"] != json!([["G5", "W5"], ["D5", "O5"]])
+        || t["intervening_allowed_edge_state"] != "unknown"
+        || t["configuration"] != "two reverse test Admin installations and two public forward disconnects; gossip admission only"
+    {
+        return Err("literal topology contract changed".into());
+    }
+    diamond_keys(&t["peer_ids"], &DIAMOND_LABELS)?;
+    let identities = raw["identities"]
+        .as_array()
+        .ok_or("identity array missing")?;
+    if identities.len() != 4 {
+        return Err("four identities required".into());
+    }
+    let mut distinct = std::collections::BTreeSet::new();
+    for (i, label) in DIAMOND_LABELS.iter().enumerate() {
+        let id = t["peer_ids"][label]
+            .as_str()
+            .ok_or("full machine ID missing")?;
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || identities[i]["machine"] != id
+            || !distinct.insert(id)
+        {
+            return Err("full peer mapping invalid".into());
+        }
+    }
+    let mut first_cut = u64::MAX;
+    let mut last_cut = 0;
+    for arm in ["D5", "O5"] {
+        let (begin, end) = topology_interval(&raw["samples"][arm]["t0"])?;
+        first_cut = first_cut.min(begin);
+        if final_required {
+            let (b, e) = topology_interval(&raw["samples"][arm]["t1"])?;
+            if end >= b {
+                return Err("nonmonotonic measurement cut".into());
+            }
+            last_cut = last_cut.max(e);
+        }
+    }
+    diamond_keys(
+        &t["observations"],
+        if final_required {
+            &["pre_cut", "t1"]
+        } else {
+            &["pre_cut"]
+        },
+    )?;
+    for phase in if final_required {
+        &["pre_cut", "t1"][..]
+    } else {
+        &["pre_cut"][..]
+    } {
+        diamond_peer_sets(t, &t["observations"][phase])?;
+        for label in DIAMOND_LABELS {
+            let observation = &t["observations"][phase][label];
+            diamond_keys(observation, &["admitted", "begin_ns", "end_ns"])?;
+            let (begin, end) = topology_interval(observation)?;
+            if (*phase == "pre_cut" && end > first_cut) || (*phase == "t1" && begin < last_cut) {
+                return Err("adjacency does not bracket both cuts".into());
+            }
+        }
+    }
+    diamond_keys(&t["suppression"], &["G5|W5", "W5|G5", "D5|O5", "O5|D5"])?;
+    for edge in ["G5|W5", "W5|G5", "D5|O5", "O5|D5"] {
+        let record = &t["suppression"][edge];
+        diamond_keys(
+            record,
+            if final_required {
+                &[
+                    "initial_set_at_ns",
+                    "pre_check",
+                    "final_check",
+                    "set_at_stable",
+                    "ttl_ns",
+                    "margin_ns",
+                ]
+            } else {
+                &["initial_set_at_ns", "pre_check", "ttl_ns", "margin_ns"]
+            },
+        )?;
+        let original = topology_u64(&record["initial_set_at_ns"])?;
+        if topology_u64(&record["ttl_ns"])? != DIAMOND_TTL_NS
+            || topology_u64(&record["margin_ns"])? != DIAMOND_MARGIN_NS
+        {
+            return Err("TTL/margin differs from Admin contract".into());
+        }
+        for phase in if final_required {
+            &["pre_check", "final_check"][..]
+        } else {
+            &["pre_check"][..]
+        } {
+            let check = &record[phase];
+            diamond_keys(
+                check,
+                &[
+                    "begin_ns",
+                    "end_ns",
+                    "set_at_ns",
+                    "check_ns",
+                    "age_ns",
+                    "live",
+                    "verdict",
+                ],
+            )?;
+            let (begin, end) = topology_interval(check)?;
+            let at = topology_u64(&check["set_at_ns"])?;
+            let now = topology_u64(&check["check_ns"])?;
+            let age = topology_u64(&check["age_ns"])?;
+            if check["live"] != true
+                || check["verdict"] != "Suppressed"
+                || at != original
+                || at > begin
+                || now < begin
+                || now > end
+                || now.checked_sub(at) != Some(age)
+                || age
+                    .checked_add(DIAMOND_MARGIN_NS)
+                    .is_none_or(|n| n > DIAMOND_TTL_NS)
+                || (*phase == "pre_check" && end > first_cut)
+                || (*phase == "final_check" && begin < last_cut)
+            {
+                return Err("suppression chronology/liveness/age premise failed".into());
+            }
+        }
+        if final_required && record["set_at_stable"] != true {
+            return Err("actual same-process set_at changed".into());
+        }
+    }
+    validate_shaping_operations(t)?;
+    Ok(())
+}
+
+fn validate_shaping_operations(t: &serde_json::Value) -> Result<(), String> {
+    diamond_keys(&t["operations"], &["G5|W5", "D5|O5"])?;
+    for (from, to) in [("G5", "W5"), ("D5", "O5")] {
+        let pair = format!("{from}|{to}");
+        let reverse = format!("{to}|{from}");
+        let ops = &t["operations"][&pair];
+        diamond_keys(ops, &["reverse_install", "forward_disconnect"])?;
+        let mut reverse_end = 0;
+        for (kind, owner, peer, edge, result) in [
+            ("reverse_install", to, from, reverse.as_str(), "Installed"),
+            ("forward_disconnect", from, to, pair.as_str(), "Ok"),
+        ] {
+            let op = &ops[kind];
+            diamond_keys(
+                op,
+                &[
+                    "owner",
+                    "peer",
+                    "owner_peer_id",
+                    "peer_id",
+                    "begin_ns",
+                    "end_ns",
+                    "set_at_ns",
+                    "result",
+                ],
+            )?;
+            let (begin, end) = topology_interval(op)?;
+            let at = topology_u64(&op["set_at_ns"])?;
+            if op["owner"] != owner
+                || op["peer"] != peer
+                || op["owner_peer_id"] != t["peer_ids"][owner]
+                || op["peer_id"] != t["peer_ids"][peer]
+                || op["result"] != result
+                || at < begin
+                || at > end
+                || at != topology_u64(&t["suppression"][edge]["initial_set_at_ns"])?
+                || end > topology_u64(&t["suppression"][edge]["pre_check"]["begin_ns"])?
+            {
+                return Err("shaping operation binding/timestamp/result invalid".into());
+            }
+            if kind == "reverse_install" {
+                reverse_end = end;
+            } else if begin < reverse_end {
+                return Err("forward close precedes reverse installation".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_topology_capture(
+    pre: &serde_json::Value,
+    later: &serde_json::Value,
+) -> Result<(), String> {
+    for field in [
+        "expected_allowed",
+        "forbidden_pairs",
+        "peer_ids",
+        "intervening_allowed_edge_state",
+        "configuration",
+        "operations",
+    ] {
+        if pre[field] != later[field] {
+            return Err("topology identity replaced".into());
+        }
+    }
+    if pre["observations"]["pre_cut"] != later["observations"]["pre_cut"] {
+        return Err("pre-cut topology replaced".into());
+    }
+    for edge in ["G5|W5", "W5|G5", "D5|O5", "O5|D5"] {
+        for field in ["initial_set_at_ns", "pre_check", "ttl_ns", "margin_ns"] {
+            if pre["suppression"][edge][field] != later["suppression"][edge][field] {
+                return Err("pre-cut suppression replaced".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
-    let begin = clock.elapsed().as_nanos() as u64;
+    let begin = diamond_now(clock);
     let egress = agent
         .gossip_egress_diagnostics()
         .expect("actual egress getter");
@@ -514,7 +951,7 @@ fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
         .gossip_participation()
         .expect("actual participation getter");
     let stages = pubsub(agent).stage_stats();
-    serde_json::json!({"begin_ns":begin,"end_ns":clock.elapsed().as_nanos() as u64,
+    serde_json::json!({"begin_ns":begin,"end_ns":diamond_now(clock),
         "egress":egress,"participation":participation,"stages":stages})
 }
 
@@ -539,6 +976,7 @@ fn sample_rows(
 
 fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
     use std::collections::BTreeSet;
+    validate_topology(raw, true)?;
     let u = raw["universe"].as_array().ok_or("unavailable universe")?;
     if u.is_empty() || u.len() > 64 {
         return Err("universe cardinality premise".into());
@@ -573,7 +1011,7 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
             return Err(format!("{arm}: observed topic outside admitted universe"));
         }
         if before["egress"]["subscribed_topics"] != after["egress"]["subscribed_topics"] {
-            return Err(format!("{arm}: membership changed"));
+            return Err(format!("{arm}: local subscribed-topic state changed"));
         }
         for sample in [before, after] {
             if sample["participation"]["mode"] != "leaf"
@@ -619,26 +1057,9 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
             if !b.contains_key(&bus) {
                 return Err("D5 positive bus row/attempt not observed".into());
             }
-            let origin = raw["generator_peer_hex8"]
-                .as_str()
-                .ok_or("generator identity missing")?;
-            for sample in [before, after] {
-                let peers = sample["stages"]["peer_scores"]
-                    .as_array()
-                    .ok_or("peer scores absent")?;
-                if !peers.iter().any(|p| {
-                    p["topic"] == bus
-                        && p["role"] == "eager"
-                        && p["eager_eligible"] == true
-                        && p["peer_id"].as_str().is_some_and(|id| id != origin)
-                }) {
-                    return Err("D5 lacks recorded non-origin eager opportunity".into());
-                }
-            }
+            // Cached endpoint peer_scores are diagnostic only.
             if delta == 0 {
-                return Err(
-                    "FAIL: D5 recorded no bus eager attempts despite endpoint opportunity".into(),
-                );
+                return Err("FAIL: D5 recorded no bus eager attempts".into());
             }
         } else if delta != 0 {
             return Err("FAIL: O5 recorded bus eager attempts".into());
@@ -672,7 +1093,7 @@ async fn measure(agents: &[Agent]) -> serde_json::Value {
         hash.update(&buffer[..n]);
     }
     let binary_hash = hex::encode(hash.finalize());
-    let mut raw = json!({"schema":1,"selector":"legacy_bus_interop_tests::paired_controlled_load_bus_eager_attempts_default_vs_optout",
+    let mut raw = json!({"schema":2,"selector":"legacy_bus_interop_tests::paired_controlled_load_bus_eager_attempts_default_vs_optout",
         "phase":"setup","outcome":"UNRUN","pid":std::process::id(),
         "claim":"controlled bus eager send attempts; not forwarding, wire occupancy or field reduction",
         "universe":topic_universe(agents),"samples":{},"load":{},
@@ -680,7 +1101,6 @@ async fn measure(agents: &[Agent]) -> serde_json::Value {
         "generator_peer_hex8":saorsa_gossip_types::PeerId::new(agents[0].machine_id().0).to_string(),
         "binary_sha256":binary_hash,
         "build_lock_sha256":hex::encode(Sha256::digest(include_bytes!("../Cargo.lock")))});
-    emit_measurement(&raw);
     let lock: toml::Value =
         toml::from_str(include_str!("../Cargo.lock")).expect("actual build lock");
     let pinned = lock["package"]
@@ -702,11 +1122,22 @@ async fn measure(agents: &[Agent]) -> serde_json::Value {
     // W5 already has a real bus inbox; retain an additional raw subscription
     // to count observed generator messages without attributing their path.
     let mut witness = pubsub(&agents[3]).subscribe(DM_BUS_TOPIC.to_owned()).await;
-    // The design's declared settle follows the labelled plane-readiness barrier.
+    // Front-load binary hashing, lock/universe/identity work and witness setup.
+    // Only this fifth case now shapes the already prepared full mesh.
+    let originals = shape_diamond(agents, &mut raw, clock).await;
+    let captured_pre = raw["topology"].clone();
+    emit_measurement(&raw);
+    // This fixed settle follows the separate labelled diamond readiness barrier.
     tokio::time::sleep(Duration::from_secs(2)).await;
     raw["samples"] =
         json!({"D5":{"t0":raw_sample(&agents[1],clock)},"O5":{"t0":raw_sample(&agents[2],clock)}});
     raw["phase"] = json!("t0");
+    if let Err(reason) = validate_topology(&raw, false) {
+        raw["outcome"] = json!("INCONCLUSIVE");
+        raw["reason"] = json!(reason);
+        emit_measurement(&raw);
+        panic!("INCONCLUSIVE: {reason}");
+    }
     emit_measurement(&raw);
     let started = tokio::time::Instant::now();
     let mut timer = tokio::time::interval_at(started, Duration::from_millis(50));
@@ -736,9 +1167,28 @@ async fn measure(agents: &[Agent]) -> serde_json::Value {
     raw["samples"]["D5"]["t1"] = raw_sample(&agents[1], clock);
     raw["samples"]["O5"]["t1"] = raw_sample(&agents[2], clock);
     raw["load"] = json!({"sent":sent,"payload_bytes":4096,"period_ms":50,"elapsed_ns":started.elapsed().as_nanos() as u64,"fanouts":fanouts,"witness_observed_during_load":observed.len(),"witness_attribution":"none"});
+    raw["topology"]["observations"]["t1"] = bounded(
+        "final diamond observation",
+        SETUP,
+        diamond_observations(agents, clock),
+    )
+    .await;
+    for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(&originals) {
+        let (check, returned) = bounded(
+            "final directed suppression check",
+            SETUP,
+            diamond_suppression_check(&agents[from], agents[to].machine_id().0, clock),
+        )
+        .await;
+        let edge = format!("{}|{}", DIAMOND_LABELS[from], DIAMOND_LABELS[to]);
+        raw["topology"]["suppression"][&edge]["set_at_stable"] = json!(returned == Some(*original));
+        raw["topology"]["suppression"][&edge]["final_check"] = check;
+    }
     raw["phase"] = json!("t1");
     emit_measurement(&raw);
-    match validate_measurement(&raw) {
+    match validate_topology_capture(&captured_pre, &raw["topology"])
+        .and_then(|()| validate_measurement(&raw))
+    {
         Ok(()) => {
             raw["outcome"] = json!("OBSERVED");
             raw["phase"] = json!("validated");
@@ -757,4 +1207,166 @@ async fn measure(agents: &[Agent]) -> serde_json::Value {
         }
     }
     raw
+}
+
+// JSON-only controls: no Agent, socket, runtime or transport construction.
+fn synthetic_diamond_evidence() -> serde_json::Value {
+    use serde_json::json;
+    let mut raw = json!({"schema":2,"identities":[],"samples":{},"topology":{
+        "expected_allowed":diamond_expected(),"forbidden_pairs":[["G5","W5"],["D5","O5"]],
+        "peer_ids":{},"observations":{"pre_cut":{},"t1":{}},"suppression":{},
+        "intervening_allowed_edge_state":"unknown",
+        "configuration":"two reverse test Admin installations and two public forward disconnects; gossip admission only"}});
+    for (i, label) in DIAMOND_LABELS.into_iter().enumerate() {
+        let id = format!("{:064x}", i + 1);
+        raw["identities"]
+            .as_array_mut()
+            .expect("array")
+            .push(json!({"machine":id}));
+        raw["topology"]["peer_ids"][label] = json!(id);
+    }
+    for label in DIAMOND_LABELS {
+        let peers = diamond_expected()[label]
+            .as_array()
+            .expect("literal")
+            .iter()
+            .map(|v| raw["topology"]["peer_ids"][v.as_str().expect("label")].clone())
+            .collect::<Vec<_>>();
+        for (phase, at) in [("pre_cut", 1_000_000_000u64), ("t1", 13_000_000_000)] {
+            raw["topology"]["observations"][phase][label] =
+                json!({"begin_ns":at,"end_ns":at+1,"admitted":peers});
+        }
+    }
+    for arm in ["D5", "O5"] {
+        raw["samples"][arm] = json!({"t0":{"begin_ns":2_000_000_000u64,"end_ns":2_000_000_001u64},
+            "t1":{"begin_ns":12_000_000_000u64,"end_ns":12_000_000_001u64}});
+    }
+    for edge in ["G5|W5", "W5|G5", "D5|O5", "O5|D5"] {
+        let mut row = json!({"initial_set_at_ns":100,"ttl_ns":DIAMOND_TTL_NS,"margin_ns":DIAMOND_MARGIN_NS,"set_at_stable":true});
+        for (phase, at) in [
+            ("pre_check", 1_000_000_000u64),
+            ("final_check", 13_000_000_000),
+        ] {
+            row[phase] = json!({"begin_ns":at,"end_ns":at+2,"set_at_ns":100,"check_ns":at+1,
+                "age_ns":at+1-100,"live":true,"verdict":"Suppressed"});
+        }
+        raw["topology"]["suppression"][edge] = row;
+    }
+    for (from, to) in [("G5", "W5"), ("D5", "O5")] {
+        let pair = format!("{from}|{to}");
+        for (kind, owner, peer, begin, end, result) in [
+            ("reverse_install", to, from, 99, 100, "Installed"),
+            ("forward_disconnect", from, to, 100, 101, "Ok"),
+        ] {
+            raw["topology"]["operations"][&pair][kind] = json!({"owner":owner,"peer":peer,
+                "owner_peer_id":raw["topology"]["peer_ids"][owner],"peer_id":raw["topology"]["peer_ids"][peer],
+                "begin_ns":begin,"end_ns":end,"set_at_ns":100,"result":result});
+        }
+    }
+    raw
+}
+
+#[test]
+fn diamond_validator_literal_graph_and_full_peer_sets() {
+    use serde_json::json;
+    let good = synthetic_diamond_evidence();
+    assert_eq!(validate_topology(&good, true), Ok(()));
+    for mutation in 0..7 {
+        let mut raw = good.clone();
+        let t = &mut raw["topology"];
+        match mutation {
+            0 => t["expected_allowed"]["G5"] = json!(["W5"]),
+            1 => {
+                t["suppression"]
+                    .as_object_mut()
+                    .expect("object")
+                    .remove("W5|G5");
+            }
+            2 => t["peer_ids"]["G5"] = json!("ff".repeat(32)),
+            3 => t["observations"]["pre_cut"]["G5"]["admitted"]
+                .as_array_mut()
+                .expect("array")
+                .push(json!("ff".repeat(32))),
+            4 => {
+                let duplicate = t["observations"]["t1"]["D5"]["admitted"][0].clone();
+                t["observations"]["t1"]["D5"]["admitted"]
+                    .as_array_mut()
+                    .expect("array")
+                    .push(duplicate);
+            }
+            5 => t["peer_ids"]["W5"] = json!("00".repeat(8)),
+            _ => t["suppression"]["G5|D5"] = json!({}),
+        }
+        assert!(
+            validate_topology(&raw, true).is_err(),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn diamond_validator_suppression_chronology_and_union_brackets() {
+    use serde_json::json;
+    for mutation in 0..13 {
+        let mut raw = synthetic_diamond_evidence();
+        let row = &mut raw["topology"]["suppression"]["O5|D5"];
+        match mutation {
+            0 => row["final_check"]["set_at_ns"] = json!(101),
+            1 => row["set_at_stable"] = json!(false),
+            2 => row["final_check"]["age_ns"] = json!(0),
+            3 => row["ttl_ns"] = json!(DIAMOND_TTL_NS + 1),
+            4 => row["margin_ns"] = json!(0),
+            5 => row["final_check"]["age_ns"] = json!(u64::MAX),
+            6 => row["pre_check"]["begin_ns"] = json!(true),
+            7 => row["final_check"]["live"] = json!(false),
+            8 => row["final_check"]["begin_ns"] = json!(0),
+            9 => raw["samples"]["D5"]["t1"]["end_ns"] = json!(14_000_000_000u64),
+            10 => raw["samples"]["O5"]["t0"]["begin_ns"] = json!(0),
+            11 => {
+                raw["topology"]["observations"]["pre_cut"]["G5"]["end_ns"] = json!(3_000_000_000u64)
+            }
+            _ => raw["samples"]["O5"]["t0"]["end_ns"] = json!(0),
+        }
+        assert!(
+            validate_topology(&raw, true).is_err(),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn diamond_validator_preserves_captured_pre_facts() {
+    let raw = synthetic_diamond_evidence();
+    let pre = &raw["topology"];
+    assert_eq!(validate_topology_capture(pre, pre), Ok(()));
+    let mut changed = pre.clone();
+    changed["suppression"]["D5|O5"]["pre_check"]["age_ns"] = serde_json::json!(0);
+    assert!(validate_topology_capture(pre, &changed).is_err());
+    let mut changed = pre.clone();
+    changed["observations"]["pre_cut"]["D5"]["begin_ns"] = serde_json::json!(0);
+    assert!(validate_topology_capture(pre, &changed).is_err());
+}
+
+#[test]
+fn diamond_validator_closed_shaping_operations() {
+    use serde_json::json;
+    for mutation in 0..7 {
+        let mut raw = synthetic_diamond_evidence();
+        let ops = &mut raw["topology"]["operations"];
+        match mutation {
+            0 => {
+                ops.as_object_mut().expect("object").remove("D5|O5");
+            }
+            1 => ops["W5|G5"] = json!({}),
+            2 => ops["G5|W5"]["forward_disconnect"]["result"] = json!("Err"),
+            3 => ops["G5|W5"]["reverse_install"]["set_at_ns"] = json!(99),
+            4 => ops["D5|O5"]["reverse_install"]["peer_id"] = json!("ff".repeat(32)),
+            5 => ops["D5|O5"]["forward_disconnect"]["begin_ns"] = json!(99),
+            _ => ops["G5|W5"]["reverse_disconnect"] = json!({}),
+        }
+        assert!(
+            validate_topology(&raw, true).is_err(),
+            "operation mutation {mutation}"
+        );
+    }
 }

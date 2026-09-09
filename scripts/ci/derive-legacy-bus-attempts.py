@@ -37,6 +37,107 @@ def integer(value):
     return value
 
 
+LABELS = ("G5", "D5", "O5", "W5")
+EXPECTED = {"G5": ["D5", "O5"], "D5": ["G5", "W5"], "O5": ["G5", "W5"], "W5": ["D5", "O5"]}
+EDGES = ("G5|W5", "W5|G5", "D5|O5", "O5|D5")
+TTL_NS, MARGIN_NS = 120_000_000_000, 5_000_000_000
+STATIC = ("expected_allowed", "forbidden_pairs", "peer_ids", "intervening_allowed_edge_state", "configuration", "operations")
+
+
+def keys(value, expected):
+    require(type(value) is dict and set(value) == set(expected), "TOPOLOGY_KEYS")
+
+
+def interval(value):
+    begin, end = integer(value["begin_ns"]), integer(value["end_ns"])
+    require(begin <= end, "TOPOLOGY_INTERVAL")
+    return begin, end
+
+
+def validate_topology(record):
+    require(type(record["schema"]) is int and record["schema"] == 2, "SCHEMA2_REQUIRED")
+    t = record["topology"]
+    keys(t, (*STATIC, "observations", "suppression"))
+    require(t["expected_allowed"] == EXPECTED and t["forbidden_pairs"] == [["G5", "W5"], ["D5", "O5"]], "LITERAL_DIAMOND")
+    require(t["intervening_allowed_edge_state"] == "unknown" and t["configuration"] == "two reverse test Admin installations and two public forward disconnects; gossip admission only", "TOPOLOGY_SCOPE")
+    keys(t["peer_ids"], LABELS)
+    require(len(record["identities"]) == 4, "FOUR_PEER_TOPOLOGY")
+    ids = [t["peer_ids"][label] for label in LABELS]
+    require(all(type(v) is str and HEX64.fullmatch(v) for v in ids) and len(set(ids)) == 4, "FULL_PEER_MAPPING")
+    require(ids == [i["machine"] for i in record["identities"]], "FULL_PEER_MAPPING")
+    cuts = [record["samples"][arm] for arm in ("D5", "O5")]
+    for cut in cuts:
+        require(interval(cut["t0"])[1] < interval(cut["t1"])[0], "NONMONOTONIC_CUT")
+    first = min(interval(c["t0"])[0] for c in cuts)
+    last = max(interval(c["t1"])[1] for c in cuts)
+    keys(t["observations"], ("pre_cut", "t1"))
+    for phase in ("pre_cut", "t1"):
+        observed = t["observations"][phase]
+        keys(observed, LABELS)
+        for label in LABELS:
+            row = observed[label]
+            keys(row, ("begin_ns", "end_ns", "admitted"))
+            begin, end = interval(row)
+            require(end <= first if phase == "pre_cut" else begin >= last, "ADJACENCY_BRACKET")
+            actual = row["admitted"]
+            require(type(actual) is list and all(type(v) is str for v in actual), "ADMITTED_SET")
+            require(len(actual) == len(set(actual)) and set(actual) == {t["peer_ids"][v] for v in EXPECTED[label]}, "ADMITTED_SET")
+    keys(t["suppression"], EDGES)
+    for edge in EDGES:
+        row = t["suppression"][edge]
+        keys(row, ("initial_set_at_ns", "pre_check", "final_check", "set_at_stable", "ttl_ns", "margin_ns"))
+        original = integer(row["initial_set_at_ns"])
+        require(integer(row["ttl_ns"]) == TTL_NS and integer(row["margin_ns"]) == MARGIN_NS, "TTL_MARGIN_CONTRACT")
+        require(row["set_at_stable"] is True, "SET_AT_CHANGED")
+        for phase in ("pre_check", "final_check"):
+            check = row[phase]
+            keys(check, ("begin_ns", "end_ns", "set_at_ns", "check_ns", "age_ns", "live", "verdict"))
+            begin, end = interval(check)
+            at, now, age = (integer(check[k]) for k in ("set_at_ns", "check_ns", "age_ns"))
+            require(check["live"] is True and check["verdict"] == "Suppressed", "SUPPRESSION_NOT_LIVE")
+            require(at == original <= begin <= now <= end and now - at == age, "SUPPRESSION_CHRONOLOGY")
+            require(age + MARGIN_NS < 2**64 and age + MARGIN_NS <= TTL_NS, "SUPPRESSION_MARGIN")
+            require(end <= first if phase == "pre_check" else begin >= last, "SUPPRESSION_BRACKET")
+
+    validate_operations(t)
+
+
+def validate_operations(t):
+    keys(t["operations"], ("G5|W5", "D5|O5"))
+    for owner, peer in (("G5", "W5"), ("D5", "O5")):
+        pair, reverse = owner + "|" + peer, peer + "|" + owner
+        ops = t["operations"][pair]
+        keys(ops, ("reverse_install", "forward_disconnect"))
+        reverse_end = None
+        for kind, source, target, edge, result in (("reverse_install", peer, owner, reverse, "Installed"),
+                                                  ("forward_disconnect", owner, peer, pair, "Ok")):
+            op = ops[kind]
+            keys(op, ("owner", "peer", "owner_peer_id", "peer_id", "begin_ns", "end_ns", "set_at_ns", "result"))
+            begin, end = interval(op)
+            at = integer(op["set_at_ns"])
+            require(op["owner"] == source and op["peer"] == target and op["owner_peer_id"] == t["peer_ids"][source]
+                    and op["peer_id"] == t["peer_ids"][target] and op["result"] == result, "OPERATION_BINDING_RESULT")
+            require(begin <= at <= end and at == integer(t["suppression"][edge]["initial_set_at_ns"])
+                    and end <= integer(t["suppression"][edge]["pre_check"]["begin_ns"]), "OPERATION_TIMESTAMP")
+            if kind == "reverse_install":
+                reverse_end = end
+            else:
+                require(begin >= reverse_end, "OPERATION_ORDER")
+
+
+def preserve_topology(records):
+    first, final = records[0]["topology"], records[-1]["topology"]
+    for record in records[1:]:
+        t = record["topology"]
+        require(all(t[k] == first[k] for k in STATIC), "TOPOLOGY_IDENTITY_DRIFT")
+        require(t["observations"]["pre_cut"] == first["observations"]["pre_cut"], "PRE_TOPOLOGY_REPLACED")
+        for edge in EDGES:
+            require(all(t["suppression"][edge][k] == first["suppression"][edge][k]
+                        for k in ("initial_set_at_ns", "pre_check", "ttl_ns", "margin_ns")), "PRE_SUPPRESSION_REPLACED")
+    for record in records[2:]:
+        require(record["topology"] == final, "FINAL_TOPOLOGY_REPLACED")
+
+
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -53,7 +154,7 @@ def parse(raw):
             require(len(records) < 8, "EXCESS_RECORDS")
             records.append(json.loads(line[len(PREFIX):], object_pairs_hook=unique_object))
     require(bool(records), "NO_RECORDS")
-    require(all(r["schema"] == 1 and r["selector"] == SELECTOR for r in records), "WRONG_SELECTOR")
+    require(all(type(r["schema"]) is int and r["schema"] == 2 and r["selector"] == SELECTOR for r in records), "WRONG_SELECTOR")
     require([r["phase"] for r in records] == ["setup", "t0", "t1", "validated", "complete"], "INCOMPLETE_OR_DUPLICATE_PHASES")
     require(records[-1]["outcome"] == "PASS", "NO_COMPLETED_OBSERVATION")
     # Successful completion changes only the phase and outcome; the captured
@@ -67,6 +168,8 @@ def parse(raw):
     for arm in ("D5", "O5"):
         require(records[1]["samples"][arm]["t0"] == final["samples"][arm]["t0"], "T0_REPLACED")
         require(records[2]["samples"][arm] == final["samples"][arm], "T1_REPLACED")
+    preserve_topology(records)
+    validate_topology(final)
     return final
 
 
@@ -81,6 +184,7 @@ def rows(sample, allowed):
 
 
 def derive(record, lock_bytes):
+    validate_topology(record)
     require(hashlib.sha256(lock_bytes).hexdigest() == record["build_lock_sha256"], "BUILD_LOCK_MISMATCH")
     require(HEX64.fullmatch(record["binary_sha256"]) is not None, "BINARY_HASH_MISSING")
     packages = [p for p in tomllib.loads(lock_bytes.decode())["package"] if p["name"] == "saorsa-gossip-pubsub"]
@@ -131,9 +235,7 @@ def derive(record, lock_bytes):
                     deltas[key][kind][field] = y - x
         if arm == "D5":
             require(BUS in after, "POSITIVE_BUS_ROW_ABSENT")
-            for sample in (a, b):
-                require(any(p["topic"] == BUS and p["role"] == "eager" and p["eager_eligible"] is True and
-                            p["peer_id"] != record["generator_peer_hex8"] for p in sample["stages"]["peer_scores"]), "NONORIGIN_EAGER_OPPORTUNITY_ABSENT")
+            # Endpoint peer_scores are retained diagnostics, not a send premise.
         delta = deltas.get(BUS, {}).get("eager", {}).get("bytes", 0)
         if (arm == "D5" and delta == 0) or (arm == "O5" and delta != 0):
             oracle_failures.append(arm + "_EAGER_ORACLE")
