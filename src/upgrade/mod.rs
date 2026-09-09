@@ -336,6 +336,12 @@ pub enum UpgradeError {
     #[error("failed to fetch manifest: {0}")]
     ManifestFetchFailed(String),
 
+    /// The restart contract could not be resolved, or names two restart
+    /// owners, so the apply was refused before any binary was replaced
+    /// (ADR-0061 §1/§2).
+    #[error(transparent)]
+    RestartOwnership(#[from] restart::RestartOwnershipError),
+
     #[error("{0}")]
     Other(String),
 }

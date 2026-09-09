@@ -4,7 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (managed installs): self-update refuses a conflicting restart
+  contract instead of spawning a helper — ADR-0061, issues #493/#415.**
+  ADR-0061 is Accepted (2026-09-09, option 4). Two changes follow.
+
+  1. *Resolve before mutation.* `apply_upgrade_from_manifest` now resolves and
+     validates the whole restart contract — restart owner, intended exit
+     behaviour, executable/argv, cwd and effective data root — **before** it
+     downloads or replaces the daemon or its `x0x` companion, and carries that
+     `RestartPlan` through replacement and restart rather than re-deriving it
+     from a process whose binary has since changed. An unresolvable contract
+     returns the new `UpgradeError::RestartOwnership` with the current process
+     still serving and the installed binaries untouched.
+  2. *Refuse a known conflict.* A daemon under recognized supervision
+     (`INVOCATION_ID`, parent `systemd`, or `X0X_SUPERVISED=1`) whose config
+     sets `[update] stop_on_upgrade = false` now **refuses** self-update. That
+     combination gave one data root two restart owners: launchd/systemd
+     respawned its child while the transactional handoff helper started
+     another (#493). This replaces the previously documented and unit-tested
+     "`false` always means transactional handoff" behaviour **for managed runs
+     only** — genuinely unsupervised terminal/nohup runs are unchanged.
+     Affected installs will see updates stop applying, with an error naming
+     the supervision signal and the setting to correct, until the deployment
+     is fixed.
+
+  **Upgrading x0x does not repair an existing hand-written launchd job.** A
+  job with no `X0X_SUPERVISED=1` marker keeps taking the handoff path and
+  keeps producing the #493 duplicate daemon; a missing marker cannot prove a
+  custom job is unsupervised, so the fix is migration, not detection. Run
+  `x0x autostart --repair` and reload the job with the `launchctl` pair it
+  prints. ADR-0061 §3 is recorded **not met** and §5 **partially met** — see
+  the implementation-status table in the ADR.
+
+  `upgrade::restart::plan_restart_mode` and
+  `AutoApplyUpgrader::restart_mode{,_with}` now return
+  `Result<RestartMode, RestartOwnershipError>`; `UpgradeHandoff::capture` is
+  replaced by `UpgradeHandoff::from_plan`, which cannot re-sample argv/roots
+  after a swap. Supervised exit logs now state explicitly that it is a restart
+  *request* — not health acceptance, and not an automatic rollback (ADR-0061
+  §6). Windows (#415) is unchanged and still has no supported managed policy.
+
 ### Added
+
+- **`x0x autostart --repair`** migrates an existing hand-written macOS launchd
+  job to the supervised-upgrade contract (ADR-0061, #493). It inspects the
+  jobs in `~/Library/LaunchAgents` without changing service state and adds
+  only `EnvironmentVariables.X0X_SUPERVISED = "1"`, after backing up the plist
+  and verifying the readback; the job's label, executable, arguments, roots
+  and other environment are preserved. It refuses jobs that are not x0xd and
+  jobs without `KeepAlive: true` (a one-shot or conditional job is not a
+  guaranteed respawn), and never installs a default job beside a running
+  custom one. The change takes effect on the job's next load — the command
+  prints the `launchctl unload`/`load` pair rather than stopping a live
+  daemon itself.
 
 - **Encrypted group-scoped KvStore — issue #341 Phase B.** The #88 design
   (`docs/design/encrypted-kvstore.md`) is now implemented for the GSS
