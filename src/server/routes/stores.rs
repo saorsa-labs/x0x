@@ -1327,6 +1327,18 @@ mod tests {
         }
     }
 
+    /// Explicit test-only network config (#417/#337): loopback bind, no
+    /// seeds, discovery/port-mapping off. Still a real socket constructor.
+    fn test_network_config() -> x0x::network::NetworkConfig {
+        x0x::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        }
+    }
+
     /// Agent + AppState over a temp dir, WITH an in-process gossip runtime
     /// (the encrypted-store happy path spawns real sync loops).
     async fn encrypted_store_test_state() -> (Arc<AppState>, tempfile::TempDir) {
@@ -1337,7 +1349,7 @@ mod tests {
                 .with_machine_key(data_dir.join("machine.key"))
                 .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
                 .with_contact_store_path(data_dir.join("contacts.json"))
-                .with_network_config(x0x::network::NetworkConfig::default())
+                .with_network_config(test_network_config())
                 .build()
                 .await
                 .unwrap(),

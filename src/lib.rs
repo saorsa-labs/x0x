@@ -5555,8 +5555,9 @@ impl Agent {
                 let mut guard = self.capability_advert_service.lock().await;
                 guard.take()
             };
-            if let Some(service) = service {
+            if let Some(mut service) = service {
                 service.abort();
+                service.stop_blob_responder().await;
             }
         }
 
@@ -9839,26 +9840,51 @@ impl Agent {
             service.abort();
             return Ok(());
         }
-        if let Some(prev) = guard.take() {
+        if let Some(mut prev) = guard.take() {
             prev.abort();
+            // Retain the old owner and the start mutex until its responder is
+            // joined. Cancelling this future still drops an aborting owner.
+            // Shutdown can contend on this mutex until cancellation completes;
+            // abort-and-join is not a hard wall-clock bound for non-yielding work.
+            prev.stop_blob_responder().await;
         }
-        *guard = Some(service);
+        // Replacement now awaits cancellation. Shutdown may have started
+        // during that join; do not install the still-local new service then.
+        if self.shutdown_token.is_cancelled() {
+            service.abort();
+            return Ok(());
+        }
+        let service = guard.insert(service);
         tracing::info!("Capability advert service started");
 
-        // L3: serve cert-blob fetches for peers that see our V3 announce
-        // digest but lack the cached pair. Same lifecycle as the caps
-        // service; the handle is detached (task ends with the pubsub).
+        // L3: the capability service owns the responder, including replacement,
+        // ordinary shutdown and Drop. Subscription cleanup is asynchronous.
         if self.shutdown_token.is_cancelled() {
             return Ok(());
         }
-        if let Err(e) = announce_blob::spawn_blob_responder(
+        match announce_blob::spawn_blob_responder(
             std::sync::Arc::clone(runtime.pubsub()),
             std::sync::Arc::clone(&self.announce_blob_cache),
             std::sync::Arc::clone(&self.own_cert_pair),
         )
         .await
         {
-            tracing::warn!("announce blob responder spawn failed: {e}");
+            Ok(handle) => {
+                // Cancellation-safety invariant: the factory must not await
+                // between spawning and returning this handle, and attachment
+                // here must be synchronous. A future reordering requires
+                // abort-on-drop custody at spawn before any intervening await.
+                let rejected = service.attach_blob_responder(handle).err();
+                let cancelled = service.abort_blob_responder_if_cancelled(&self.shutdown_token);
+                if let Some(mut rejected) = rejected {
+                    tracing::warn!("announce blob responder slot already occupied");
+                    rejected.stop().await;
+                }
+                if cancelled {
+                    service.stop_blob_responder().await;
+                }
+            }
+            Err(e) => tracing::warn!("announce blob responder spawn failed: {e}"),
         }
         Ok(())
     }
@@ -10159,6 +10185,30 @@ impl Agent {
         runtime
             .pubsub()
             .publish_with_fanout(topic.to_string(), bytes::Bytes::from(payload))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "publish failed: {}",
+                    e
+                )))
+            })
+    }
+
+    // Same publish path and error mapping; test-only send-stage observation.
+    #[cfg(test)]
+    pub(crate) async fn publish_with_observed_fanout(
+        &self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> error::Result<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        runtime
+            .pubsub()
+            .publish_with_observed_fanout(topic.to_string(), bytes::Bytes::from(payload))
             .await
             .map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
@@ -21847,7 +21897,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_machine_signature_verifies() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21863,7 +21919,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_requires_human_consent() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21878,7 +21940,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_with_user_requires_user_identity() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21894,7 +21962,13 @@ mod tests {
     async fn announce_identity_populates_discovery_cache() {
         let user_key = identity::UserKeypair::generate().unwrap();
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_user_key(user_key)
             .build()
             .await
@@ -21917,7 +21991,13 @@ mod tests {
     #[tokio::test]
     async fn relay_census_classifies_bootstrap_and_skips_stale() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21994,7 +22074,13 @@ mod tests {
         // evicts a valid member as NoCertificate. A later announce carrying
         // the resolved certificate must promote it into the existing entry.
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22086,7 +22172,13 @@ mod tests {
     #[tokio::test]
     async fn verified_certificate_events_fire_on_landing_not_on_replay() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22175,7 +22267,13 @@ mod tests {
         // live identity cache without bound — every OwnerCertified evidence
         // pass walks it. At the cap the stalest entry is evicted.
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22335,7 +22433,13 @@ mod tests {
     #[tokio::test]
     async fn retired_announce_publishes_v3_only() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22386,7 +22490,13 @@ mod tests {
     #[tokio::test]
     async fn named_agent_announces_self_name_on_v3_beat() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22456,7 +22566,13 @@ mod tests {
     #[tokio::test]
     async fn legacy_escape_hatch_publishes_v2_and_v3() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_legacy_announce(true)
             .build()
             .await
@@ -22511,7 +22627,13 @@ mod tests {
     async fn revoked_agent_fails_machine_verification_even_when_cached() {
         let user_key = identity::UserKeypair::generate().unwrap();
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_user_key(user_key)
             .build()
             .await
@@ -24283,7 +24405,13 @@ async fn dm_capability_advert_tracks_durable_history_presence() {
             .with_machine_key(dir.path().join("machine.key"))
             .with_agent_key_path(dir.path().join("agent.key"))
             .with_peer_cache_dir(dir.path().join("peers"))
-            .with_network_config(network::NetworkConfig::default());
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            });
         if with_history {
             builder = builder.with_history(history::HistoryConfig {
                 db_path: Some(dir.path().join("history.db")),
@@ -24336,7 +24464,13 @@ async fn dm_inbox_capability_upgrade_visible_to_late_subscriber() {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_peer_cache_dir(dir.path().join("peers"))
-        .with_network_config(network::NetworkConfig::default())
+        .with_network_config(network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..network::NetworkConfig::default()
+        })
         .build()
         .await
         .expect("agent");
@@ -25147,3 +25281,6 @@ mod peer_connected_handler_integration_tests {
 
 #[cfg(test)]
 mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod legacy_bus_interop_tests;

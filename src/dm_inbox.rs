@@ -2346,6 +2346,18 @@ mod tests {
     use crate::network::{NetworkConfig, NetworkNode};
     use std::time::Duration;
 
+    /// Explicit test-only network config (#417/#337): loopback bind, no
+    /// seeds, discovery/port-mapping off. Still a real socket constructor.
+    fn test_network_config() -> NetworkConfig {
+        NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        }
+    }
+
     fn test_keypair() -> AgentKeypair {
         AgentKeypair::generate().expect("keygen")
     }
@@ -2433,7 +2445,7 @@ mod tests {
         let dm = Arc::new(DirectMessaging::new());
         let receiver = dm.subscribe();
         let node = Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
+            NetworkNode::new(test_network_config(), None, None)
                 .await
                 .expect("network node"),
         );
@@ -2515,7 +2527,7 @@ mod tests {
         let recipient = AgentKeypair::generate().expect("recipient keygen");
         let self_agent_id = recipient.agent_id();
         let node = Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
+            NetworkNode::new(test_network_config(), None, None)
                 .await
                 .expect("network node"),
         );
@@ -3330,7 +3342,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_ack_prewarm_joins_inbox_and_bus_before_any_publish() {
         let node = Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
+            NetworkNode::new(test_network_config(), None, None)
                 .await
                 .expect("network node"),
         );
@@ -3401,7 +3413,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_reverse_ack_warmers_create_a_single_membership_hold() {
         let node = Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
+            NetworkNode::new(test_network_config(), None, None)
                 .await
                 .expect("network node"),
         );
@@ -3443,7 +3455,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_ack_prewarm_presubscribes_peer_inbox_before_first_publish() {
         let node = Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
+            NetworkNode::new(test_network_config(), None, None)
                 .await
                 .expect("network node"),
         );
