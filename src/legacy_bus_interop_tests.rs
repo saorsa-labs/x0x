@@ -334,6 +334,7 @@ async fn run(case: Case) {
     let mut agents = Vec::new();
     let mut measurement = None;
     let outcome = AssertUnwindSafe(async {
+        let measurement_preparation = matches!(case, Case::Measurement).then(prepare_measurement);
         let roles: &[(&str, bool)] = match case {
             Case::BusPair => &[("L", false), ("D", false), ("O", true)],
             Case::Fallback => &[("O2", true), ("L2", false)],
@@ -402,7 +403,7 @@ async fn run(case: Case) {
                 assert!(!pubsub(o).is_topic_subscribed(DM_BUS_TOPIC).await);
                 eprintln!("ISSUE501 checkpoint=modern_targeted result=observed");
             }
-            Case::Measurement => measurement = Some(measure(&agents).await),
+            Case::Measurement => measurement = Some(measure(&agents, measurement_preparation.expect("measurement preparation")).await),
             Case::Subscription => {
                 assert!(pubsub(&agents[0]).is_topic_subscribed(DM_BUS_TOPIC).await);
                 assert!(!pubsub(&agents[1]).is_topic_subscribed(DM_BUS_TOPIC).await);
@@ -1387,10 +1388,14 @@ fn emit_measurement(raw: &serde_json::Value) {
     );
 }
 
-async fn measure(agents: &[Agent]) -> serde_json::Value {
-    use serde_json::json;
+struct MeasurementPreparation {
+    binary_sha256: String,
+    build_lock_sha256: String,
+    build_lock: Result<toml::Value, toml::de::Error>,
+}
+
+fn prepare_measurement() -> MeasurementPreparation {
     use sha2::{Digest, Sha256};
-    let clock = std::time::Instant::now();
     let binary = std::env::current_exe().expect("executing test binary");
     let mut reader = std::fs::File::open(binary).expect("read executing binary");
     let mut hash = Sha256::new();
@@ -1403,16 +1408,25 @@ async fn measure(agents: &[Agent]) -> serde_json::Value {
         hash.update(&buffer[..n]);
     }
     let binary_hash = hex::encode(hash.finalize());
+    MeasurementPreparation {
+        binary_sha256: binary_hash,
+        build_lock_sha256: hex::encode(Sha256::digest(include_bytes!("../Cargo.lock"))),
+        build_lock: toml::from_str(include_str!("../Cargo.lock")),
+    }
+}
+
+async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde_json::Value {
+    use serde_json::json;
+    let clock = std::time::Instant::now();
     let mut raw = json!({"schema":2,"selector":"legacy_bus_interop_tests::paired_controlled_load_bus_eager_attempts_default_vs_optout",
         "phase":"setup","outcome":"UNRUN","pid":std::process::id(),
         "claim":"controlled bus eager send attempts; not forwarding, wire occupancy or field reduction",
         "universe":topic_universe(agents),"samples":{},"load":{},
         "identities":agents.iter().map(|a|json!({"agent":hex::encode(a.agent_id().0),"machine":hex::encode(a.machine_id().0)})).collect::<Vec<_>>(),
         "generator_peer_hex8":saorsa_gossip_types::PeerId::new(agents[0].machine_id().0).to_string(),
-        "binary_sha256":binary_hash,
-        "build_lock_sha256":hex::encode(Sha256::digest(include_bytes!("../Cargo.lock")))});
-    let lock: toml::Value =
-        toml::from_str(include_str!("../Cargo.lock")).expect("actual build lock");
+        "binary_sha256":preparation.binary_sha256,
+        "build_lock_sha256":preparation.build_lock_sha256});
+    let lock = preparation.build_lock.expect("actual build lock");
     let pinned = lock["package"]
         .as_array()
         .expect("lock packages")
@@ -1432,7 +1446,8 @@ async fn measure(agents: &[Agent]) -> serde_json::Value {
     // W5 already has a real bus inbox; retain an additional raw subscription
     // to count observed generator messages without attributing their path.
     let mut witness = pubsub(&agents[3]).subscribe(DM_BUS_TOPIC.to_owned()).await;
-    // Front-load binary hashing, lock/universe/identity work and witness setup.
+    // Provenance preparation ran before Agent construction; agent-dependent
+    // universe/identity work and witness setup remain before shaping.
     // Only this fifth case now shapes the already prepared full mesh.
     let originals = match shape_diamond(agents, &mut raw, clock).await {
         Ok(originals) => originals,
