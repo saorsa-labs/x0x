@@ -2193,6 +2193,12 @@ async fn member_joined_lost_initial_volley_recovers_via_poll_resend() {
 /// Compressed stand-in for the production 6/15/30/60s resend schedule, so a
 /// regression test observes the repair in seconds rather than a minute. Four
 /// attempts, same shape.
+// #531: controls cannot be driven by top-level env. pair_with_alice_env
+// (tests/harness/src/cluster.rs:527) layers its slice ON TOP of the inherited
+// process environment and the isolation namespace filters env besides, so each
+// control needs its own fixture and its own compiled selector.
+const NO_REDELIVERY_SCHEDULE_MS: &str = "";
+
 const FAST_REDELIVERY_SCHEDULE_MS: &str = "500,1500,4000,8000";
 
 /// Drive alice and bob to a converged two-member private_secure group and
@@ -2419,6 +2425,164 @@ async fn group_deleted_lost_initial_volley_recovers_via_bounded_resend() {
     );
 }
 
+/// #531 NEGATIVE CONTROL, DIAGNOSTIC. Initial volley dropped and the resend
+/// schedule empty. This does NOT assert that nothing can propagate the ban:
+/// `remember_treekem_membership_event` is deliberately outside both drop gates,
+/// so an alternate legitimate delivery path is not excluded by source. A ban
+/// observed here is a finding to classify, not a broken control. The value is
+/// the validity checks below: absence of a ban is only meaningful when the
+/// roster probe itself succeeded and still lists bob as active.
+#[tokio::test]
+#[ignore]
+async fn member_banned_control_no_resend_never_recovers() {
+    let pair = pair_with_alice_env(&[
+        ("X0X_TEST_DROP_INITIAL_MEMBER_BANNED", "1"),
+        (
+            "X0X_TEST_GROUP_REDELIVERY_SCHEDULE_MS",
+            NO_REDELIVERY_SCHEDULE_MS,
+        ),
+    ])
+    .await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let (group_id, bob_group_id, bob_agent_id) =
+        converged_pair_group(alice, bob, "Lost MemberBanned").await;
+
+    let ban: Value = alice
+        .post(
+            &format!("/groups/{group_id}/ban/{bob_agent_id}"),
+            serde_json::json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ban["ok"], true, "ban response: {ban:?}");
+
+    // Delivery proof: bob's own roster can only show him banned if the event
+    // reached and was applied by bob — alice's local state says nothing about
+    // bob's copy.
+    let ban_seen = wait_until(Duration::from_secs(30), || async {
+        // #531 I5: record status and body every poll so "applied but not
+        // projected" is separable from "never applied".
+        let resp = bob.get(&format!("/groups/{bob_group_id}/members")).await;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("#531 poll members status={status} body={body}");
+        let members: Value = serde_json::from_str(&body).unwrap_or_default();
+        members["members"]
+            .as_array()
+            .map(|ms| {
+                ms.iter()
+                    .any(|m| m["agent_id"] == bob_agent_id && m["state"] == "banned")
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    // Oracle validity: "not banned" must be a successful, parseable roster that
+    // still lists bob as active — never an HTTP error, timeout or malformed body.
+    let resp = bob.get(&format!("/groups/{bob_group_id}/members")).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "negative control oracle invalid: roster probe returned {status}, body={body}"
+    );
+    let members: Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!("negative control oracle invalid: roster body did not parse ({e}): {body}")
+    });
+    let entry = members["members"]
+        .as_array()
+        .and_then(|ms| ms.iter().find(|m| m["agent_id"] == bob_agent_id))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("negative control oracle invalid: bob absent from his own roster: {body}")
+        });
+    // CLASSIFY, never assert absence. The whole ignored suite runs in CI, so a
+    // control that fails on legitimate alternate propagation would break CI for
+    // correct behaviour. Only an invalid observation is a failure here.
+    let state = entry["state"].as_str().unwrap_or_default().to_string();
+    match state.as_str() {
+        "active" => eprintln!(
+            "#531 DIAGNOSTIC: volley dropped, resends disabled, ban NOT observed \
+             (ban_seen={ban_seen}). No alternate delivery path exercised."
+        ),
+        "banned" => eprintln!(
+            "#531 DIAGNOSTIC: volley dropped and resends disabled, yet bob is \
+             BANNED (ban_seen={ban_seen}). An alternate path delivered it — \
+             remembered TreeKEM metadata is outside both drop gates. This is a \
+             finding to classify, NOT a failure of this control."
+        ),
+        other => panic!(
+            "negative control oracle invalid: bob's state is {other:?}, neither \
+             active nor banned: {body}"
+        ),
+    }
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+/// #531 POSITIVE CONTROL. Initial volley delivered normally, with the bounded
+/// resend schedule DISABLED so a later repair cannot masquerade as first-volley
+/// success. A pass therefore means the ban path succeeds with bounded resends
+/// disabled. It does NOT establish that the first volley was the delivering
+/// path: this fixture does not exclude other propagation, and no causal claim
+/// about which path delivered is made here.
+#[tokio::test]
+#[ignore]
+async fn member_banned_control_initial_volley_delivers() {
+    let pair = pair_with_alice_env(&[(
+        "X0X_TEST_GROUP_REDELIVERY_SCHEDULE_MS",
+        NO_REDELIVERY_SCHEDULE_MS,
+    )])
+    .await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let (group_id, bob_group_id, bob_agent_id) =
+        converged_pair_group(alice, bob, "Lost MemberBanned").await;
+
+    let ban: Value = alice
+        .post(
+            &format!("/groups/{group_id}/ban/{bob_agent_id}"),
+            serde_json::json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ban["ok"], true, "ban response: {ban:?}");
+
+    // Delivery proof: bob's own roster can only show him banned if the event
+    // reached and was applied by bob — alice's local state says nothing about
+    // bob's copy.
+    let ban_seen = wait_until(Duration::from_secs(30), || async {
+        // #531 I5: record status and body every poll so "applied but not
+        // projected" is separable from "never applied".
+        let resp = bob.get(&format!("/groups/{bob_group_id}/members")).await;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("#531 poll members status={status} body={body}");
+        let members: Value = serde_json::from_str(&body).unwrap_or_default();
+        members["members"]
+            .as_array()
+            .map(|ms| {
+                ms.iter()
+                    .any(|m| m["agent_id"] == bob_agent_id && m["state"] == "banned")
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        ban_seen,
+        "positive control: with the initial volley delivered, bob must observe \
+         his ban. Failing here means the ban path itself is broken, not the \
+         bounded resend repair."
+    );
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
 /// Why: a lost `MemberBanned` is the same security-adjacent gap as a lost
 /// removal (#344) — the banned peer keeps its roster entry and its TreeKEM
 /// key material, and unlike the removed member it was never sent a share of
@@ -2466,12 +2630,13 @@ async fn member_banned_lost_initial_volley_recovers_via_bounded_resend() {
     // reached and was applied by bob — alice's local state says nothing about
     // bob's copy.
     let ban_seen = wait_until(Duration::from_secs(30), || async {
-        let members: Value = bob
-            .get(&format!("/groups/{bob_group_id}/members"))
-            .await
-            .json()
-            .await
-            .unwrap_or_default();
+        // #531 I5: record status and body every poll so "applied but not
+        // projected" is separable from "never applied".
+        let resp = bob.get(&format!("/groups/{bob_group_id}/members")).await;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("#531 poll members status={status} body={body}");
+        let members: Value = serde_json::from_str(&body).unwrap_or_default();
         members["members"]
             .as_array()
             .map(|ms| {
