@@ -142,34 +142,220 @@ fn stdin_is_tty() -> bool {
     false
 }
 
-/// Whether one of the three supervision signals is present.
+/// Which recognized supervision signal fired, if any.
 ///
 /// `INVOCATION_ID`, parent comm `systemd`, or `X0X_SUPERVISED=1`. Nothing else
 /// qualifies: not-a-TTY, nohup, detached stdin, and launchd ancestry are all
-/// unsupervised.
+/// unsupervised. The name is carried into the refusal message so an operator
+/// is told *which* signal made this instance managed (ADR-0061 §2).
+pub fn supervision_signal_name(signals: &SupervisionSignals) -> Option<&'static str> {
+    if signals.invocation_id {
+        Some("INVOCATION_ID")
+    } else if signals.x0x_supervised {
+        Some("X0X_SUPERVISED=1")
+    } else if signals
+        .parent_comm
+        .as_deref()
+        // /proc/<pid>/comm carries a trailing newline.
+        .is_some_and(|comm| comm.trim() == "systemd")
+    {
+        Some("parent process `systemd`")
+    } else {
+        None
+    }
+}
+
+/// Whether one of the three supervision signals is present.
 pub fn is_supervised(signals: &SupervisionSignals) -> bool {
-    signals.invocation_id
-        || signals.x0x_supervised
-        || signals
-            .parent_comm
-            .as_deref()
-            // /proc/<pid>/comm carries a trailing newline.
-            .is_some_and(|comm| comm.trim() == "systemd")
+    supervision_signal_name(signals).is_some()
+}
+
+/// Exit status a supervisor is expected to restart the daemon on. Unix 0,
+/// Windows 100 — the platform statuses ADR-0061 §3 binds the contract to.
+pub const fn supervised_exit_code() -> i32 {
+    if cfg!(windows) {
+        100
+    } else {
+        0
+    }
+}
+
+/// The instance's restart contract could not be resolved, so no bytes may be
+/// replaced (ADR-0061 §1: failure "leaves the current process and installed
+/// binaries unchanged and reports the unresolved contract").
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RestartOwnershipError {
+    /// Recognized supervision plus `stop_on_upgrade = false` names two restart
+    /// owners for one instance. Refused before replacement (ADR-0061 §2).
+    #[error(
+        "refusing self-update: this instance is supervised ({signal} is present) but \
+         `[update] stop_on_upgrade` is false, which asks x0xd to restart itself through the \
+         transactional handoff helper. That gives one instance two restart owners — the \
+         supervisor and the helper would each start a daemon on the same data root. \
+         Correct the deployment, then retry: either set `[update] stop_on_upgrade = true` in \
+         the daemon config so the supervisor owns the restart (x0xd exits {exit_code} and the \
+         supervisor re-execs the new binary), or, if this instance is not actually supervised, \
+         remove {signal} from its environment. No binaries were replaced."
+    )]
+    SupervisedRestartConflict {
+        /// The recognized signal that made this instance managed.
+        signal: String,
+        /// Exit status the supervisor would have to restart on.
+        exit_code: i32,
+    },
+
+    /// An input the restart plan depends on could not be resolved or validated.
+    #[error(
+        "refusing self-update: cannot resolve the restart contract ({what}: {detail}). \
+         No binaries were replaced."
+    )]
+    Unresolved {
+        /// Which part of the contract is unresolved.
+        what: &'static str,
+        /// Why it could not be resolved.
+        detail: String,
+    },
 }
 
 /// I0 classification: pick the restart mode before anything destructive runs.
 ///
-/// `SupervisedExit` requires `stop_on_upgrade == true` **and** real
-/// supervision. Everything else — including unsupervised runs with the
-/// default `stop_on_upgrade = true`, and every `stop_on_upgrade = false` run —
-/// goes through [`RestartMode::TransactionalHandoff`] (the old `exec()` path
-/// could not roll back and is gone).
-pub fn plan_restart_mode(stop_on_upgrade: bool, signals: &SupervisionSignals) -> RestartMode {
-    if stop_on_upgrade && is_supervised(signals) {
-        RestartMode::SupervisedExit
-    } else {
-        RestartMode::TransactionalHandoff
+/// - `SupervisedExit` requires `stop_on_upgrade == true` **and** real
+///   supervision: the external owner re-execs the new bytes.
+/// - `TransactionalHandoff` covers genuinely unsupervised runs, including the
+///   default `stop_on_upgrade = true` terminal launch (the old `exec()` path
+///   could not roll back and is gone).
+/// - Supervision with `stop_on_upgrade == false` is **refused** rather than
+///   classified: see [`RestartOwnershipError::SupervisedRestartConflict`].
+pub fn plan_restart_mode(
+    stop_on_upgrade: bool,
+    signals: &SupervisionSignals,
+) -> Result<RestartMode, RestartOwnershipError> {
+    match (stop_on_upgrade, supervision_signal_name(signals)) {
+        (true, Some(_)) => Ok(RestartMode::SupervisedExit),
+        (false, Some(signal)) => Err(RestartOwnershipError::SupervisedRestartConflict {
+            signal: signal.to_string(),
+            exit_code: supervised_exit_code(),
+        }),
+        (_, None) => Ok(RestartMode::TransactionalHandoff),
     }
+}
+
+/// A fully resolved restart contract for this instance (ADR-0061 §1).
+///
+/// Every field is resolved and validated **before** any byte on disk changes,
+/// then carried unchanged through replacement and restart. The plan is never
+/// re-derived after the swap, so a conflicting plan cannot be discovered with
+/// new bytes already installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartPlan {
+    /// Who owns the respawn.
+    pub mode: RestartMode,
+    /// Status the process exits with for the supervisor; `None` when the
+    /// helper owns the restart instead.
+    pub supervised_exit_code: Option<i32>,
+    /// Recognized supervision signal, recorded for diagnosis.
+    pub supervision_signal: Option<String>,
+    /// Binary that will be replaced and (re)started.
+    pub executable: PathBuf,
+    /// Full argv of the running process, `argv[0]` included. Together with
+    /// `cwd` this is what determines the instance's effective identity/data
+    /// roots (`--config`, `--name`), which is why it is captured pre-swap.
+    pub argv: Vec<String>,
+    /// Working directory of the running process.
+    pub cwd: PathBuf,
+    /// Effective data root: where the handoff/intent record and durable
+    /// history live. Two daemons must never share it.
+    pub data_root: PathBuf,
+    /// Pre-upgrade API address the replacement must serve `/health` on.
+    pub api_addr: SocketAddr,
+}
+
+impl RestartPlan {
+    /// Where the handoff/intent record for this instance goes.
+    pub fn handoff_path(&self) -> PathBuf {
+        self.data_root.join(HANDOFF_FILE_NAME)
+    }
+
+    /// Whether this plan starts a detached replacement helper.
+    ///
+    /// ADR-0061 §5 keeps restart ownership singular: the managed path requests
+    /// restart through its external owner and must launch no helper, so no
+    /// second process can start a daemon on `data_root`.
+    pub fn spawns_helper(&self) -> bool {
+        matches!(self.mode, RestartMode::TransactionalHandoff)
+    }
+}
+
+/// Resolve and validate the full restart contract before mutation (ADR-0061 §1).
+///
+/// `executable` is the binary that will be replaced; `data_root_hint` is the
+/// daemon's data directory (`None` falls back to the install directory for
+/// non-daemon callers). `api_addr` is the pre-upgrade API address.
+///
+/// Returns `Err` — leaving the caller to abort before replacing anything — on
+/// a conflicting managed configuration, or on any input that cannot be
+/// resolved or validated.
+pub fn resolve_restart_plan(
+    stop_on_upgrade: bool,
+    signals: &SupervisionSignals,
+    executable: &Path,
+    data_root_hint: Option<&Path>,
+    api_addr: Option<SocketAddr>,
+) -> Result<RestartPlan, RestartOwnershipError> {
+    let mode = plan_restart_mode(stop_on_upgrade, signals)?;
+
+    // The swap writes `<executable>.backup` beside the target and the helper
+    // respawns from that directory. An install dir we cannot see is an
+    // unresolved contract, not something to discover mid-swap.
+    let install_dir = executable
+        .parent()
+        .filter(|dir| dir.is_dir())
+        .ok_or_else(|| RestartOwnershipError::Unresolved {
+            what: "install directory",
+            detail: format!(
+                "{} has no existing parent directory to hold the backup",
+                executable.display()
+            ),
+        })?;
+
+    let argv: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if argv.is_empty() {
+        return Err(RestartOwnershipError::Unresolved {
+            what: "process argv",
+            detail: "the running process reports no arguments, so the replacement's \
+                     configuration and roots cannot be reproduced"
+                .to_string(),
+        });
+    }
+
+    let cwd = std::env::current_dir().map_err(|e| RestartOwnershipError::Unresolved {
+        what: "working directory",
+        detail: e.to_string(),
+    })?;
+
+    let data_root = data_root_hint.unwrap_or(install_dir).to_path_buf();
+    if !data_root.is_dir() {
+        return Err(RestartOwnershipError::Unresolved {
+            what: "data root",
+            detail: format!("{} is not an existing directory", data_root.display()),
+        });
+    }
+
+    Ok(RestartPlan {
+        mode,
+        supervised_exit_code: match mode {
+            RestartMode::SupervisedExit => Some(supervised_exit_code()),
+            RestartMode::TransactionalHandoff => None,
+        },
+        supervision_signal: supervision_signal_name(signals).map(str::to_string),
+        executable: executable.to_path_buf(),
+        argv,
+        cwd,
+        data_root,
+        api_addr: api_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -211,20 +397,12 @@ pub struct UpgradeHandoff {
 }
 
 impl UpgradeHandoff {
-    /// Capture the old process's restart intent. Must run before any exit.
-    pub fn capture(
-        target_path: &Path,
-        backup_path: &Path,
-        to_version: &str,
-        api_addr: SocketAddr,
-        mode: RestartMode,
-    ) -> Self {
-        let argv: Vec<String> = std::env::args_os()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    /// Build the handoff record from an already-resolved [`RestartPlan`].
+    ///
+    /// ADR-0061 §1: the plan was resolved and validated before any bytes
+    /// changed, so argv/cwd/roots are *carried* here rather than re-sampled
+    /// from a process whose binary has since been replaced.
+    pub fn from_plan(plan: &RestartPlan, to_version: &str) -> Self {
         let env = ENV_WHITELIST
             .iter()
             .filter_map(|key| {
@@ -236,18 +414,18 @@ impl UpgradeHandoff {
         Self {
             from_version: crate::VERSION.to_string(),
             to_version: to_version.to_string(),
-            target_path: target_path.to_path_buf(),
-            backup_path: backup_path.to_path_buf(),
-            argv,
-            cwd,
+            target_path: plan.executable.clone(),
+            backup_path: Self::backup_path_for(&plan.executable),
+            argv: plan.argv.clone(),
+            cwd: plan.cwd.to_string_lossy().into_owned(),
             env,
             old_pid: std::process::id(),
-            api_addr,
+            api_addr: plan.api_addr,
             started_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            mode,
+            mode: plan.mode,
         }
     }
 
@@ -930,7 +1108,7 @@ mod tests {
         // supervised exit(0).
         assert_eq!(
             plan_restart_mode(true, &shell_parent_signals()),
-            RestartMode::TransactionalHandoff
+            Ok(RestartMode::TransactionalHandoff)
         );
     }
 
@@ -944,7 +1122,7 @@ mod tests {
         };
         assert_eq!(
             plan_restart_mode(true, &signals),
-            RestartMode::TransactionalHandoff
+            Ok(RestartMode::TransactionalHandoff)
         );
     }
 
@@ -970,7 +1148,7 @@ mod tests {
         assert!(!is_supervised(&signals));
         assert_eq!(
             plan_restart_mode(true, &signals),
-            RestartMode::TransactionalHandoff
+            Ok(RestartMode::TransactionalHandoff)
         );
     }
 
@@ -982,7 +1160,7 @@ mod tests {
         };
         assert_eq!(
             plan_restart_mode(true, &signals),
-            RestartMode::SupervisedExit
+            Ok(RestartMode::SupervisedExit)
         );
     }
 
@@ -994,7 +1172,7 @@ mod tests {
         };
         assert_eq!(
             plan_restart_mode(true, &signals),
-            RestartMode::SupervisedExit
+            Ok(RestartMode::SupervisedExit)
         );
     }
 
@@ -1008,7 +1186,7 @@ mod tests {
         };
         assert_eq!(
             plan_restart_mode(true, &signals),
-            RestartMode::SupervisedExit
+            Ok(RestartMode::SupervisedExit)
         );
     }
 
@@ -1023,27 +1201,217 @@ mod tests {
         };
         assert_eq!(
             plan_restart_mode(true, &signals),
-            RestartMode::SupervisedExit
+            Ok(RestartMode::SupervisedExit)
         );
     }
 
     #[test]
-    fn stop_on_upgrade_false_always_uses_handoff() {
-        // stop_on_upgrade=false replaces the old exec(): the new image can
-        // never be a fire-and-forget success path, supervised or not.
-        let supervised = SupervisionSignals {
-            invocation_id: true,
-            parent_comm: Some("systemd".to_string()),
-            ..shell_parent_signals()
-        };
-        assert_eq!(
-            plan_restart_mode(false, &supervised),
-            RestartMode::TransactionalHandoff
-        );
+    fn unsupervised_stop_on_upgrade_false_still_uses_handoff() {
+        // Unchanged half of the old `stop_on_upgrade_false_always_uses_handoff`
+        // contract: with nobody to respawn us, stop_on_upgrade=false must not
+        // become a fire-and-forget exit. The helper still owns the restart.
         assert_eq!(
             plan_restart_mode(false, &shell_parent_signals()),
-            RestartMode::TransactionalHandoff
+            Ok(RestartMode::TransactionalHandoff)
         );
+    }
+
+    #[test]
+    fn supervised_stop_on_upgrade_false_is_refused_not_classified() {
+        // INVERTED from `stop_on_upgrade_false_always_uses_handoff`
+        // (ADR-0061 §2, accepted 2026-09-09). The old contract classified this
+        // as TransactionalHandoff, which is exactly the #493 defect: launchd
+        // (or systemd) respawns the daemon while the handoff helper starts a
+        // second one, giving one data root two restart owners. Because we
+        // cannot know the supervisor's policy, the safe answer is neither
+        // mode — refuse, and keep the current binary serving until the
+        // operator corrects the deployment.
+        for signals in [
+            SupervisionSignals {
+                invocation_id: true,
+                ..shell_parent_signals()
+            },
+            SupervisionSignals {
+                x0x_supervised: true,
+                ..shell_parent_signals()
+            },
+            SupervisionSignals {
+                parent_comm: Some("systemd".to_string()),
+                ..shell_parent_signals()
+            },
+        ] {
+            let err = plan_restart_mode(false, &signals)
+                .expect_err("supervised + stop_on_upgrade=false must refuse, not classify");
+            assert!(
+                matches!(err, RestartOwnershipError::SupervisedRestartConflict { .. }),
+                "expected the ownership conflict, got {err:?}"
+            );
+            // The refusal is only actionable if it names the signal that made
+            // the instance managed and the setting to correct.
+            let message = err.to_string();
+            assert!(message.contains("stop_on_upgrade"), "message: {message}");
+            assert!(
+                message
+                    .contains(supervision_signal_name(&signals).expect("signals are supervised")),
+                "message: {message}"
+            );
+            assert!(
+                message.contains("No binaries were replaced"),
+                "the refusal must state that nothing was mutated: {message}"
+            );
+        }
+    }
+
+    /// A binary path inside `dir` whose parent exists — the minimum an
+    /// install directory must satisfy for the backup to be writable.
+    fn installed_binary(dir: &std::path::Path) -> PathBuf {
+        dir.join("x0xd")
+    }
+
+    #[test]
+    fn resolved_plan_carries_the_contract_the_restart_will_execute() {
+        // ADR-0061 §1: the fields the restart depends on (owner, exit
+        // behaviour, executable, argv, roots) must all be pinned by the
+        // resolver, because after replacement the running image no longer
+        // matches the bytes on disk and re-deriving them is unsound.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_root = dir.path().join("data");
+        std::fs::create_dir_all(&data_root).expect("data root");
+        let binary = installed_binary(dir.path());
+        let addr: SocketAddr = "127.0.0.1:12700".parse().expect("addr");
+
+        let plan = resolve_restart_plan(
+            true,
+            &shell_parent_signals(),
+            &binary,
+            Some(&data_root),
+            Some(addr),
+        )
+        .expect("an unsupervised terminal run resolves");
+
+        assert_eq!(plan.mode, RestartMode::TransactionalHandoff);
+        assert_eq!(plan.supervised_exit_code, None);
+        assert_eq!(plan.supervision_signal, None);
+        assert_eq!(plan.executable, binary);
+        assert_eq!(plan.data_root, data_root);
+        assert_eq!(plan.api_addr, addr);
+        assert!(!plan.argv.is_empty(), "argv must be captured pre-swap");
+        assert_eq!(plan.handoff_path(), data_root.join(HANDOFF_FILE_NAME));
+    }
+
+    #[test]
+    fn supervised_plan_requests_restart_from_the_owner_and_spawns_no_helper() {
+        // ADR-0061 §5: restart ownership stays singular. If the supervised
+        // plan ever spawned the helper, launchd/systemd and the helper would
+        // each start a daemon on `data_root` — the #493 defect.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = installed_binary(dir.path());
+        let signals = SupervisionSignals {
+            x0x_supervised: true,
+            ..shell_parent_signals()
+        };
+
+        let plan = resolve_restart_plan(true, &signals, &binary, Some(dir.path()), None)
+            .expect("supervised + stop_on_upgrade=true is a supported contract");
+
+        assert_eq!(plan.mode, RestartMode::SupervisedExit);
+        assert!(
+            !plan.spawns_helper(),
+            "the managed path must launch no detached replacement helper"
+        );
+        assert_eq!(plan.supervised_exit_code, Some(supervised_exit_code()));
+        assert_eq!(plan.supervision_signal.as_deref(), Some("X0X_SUPERVISED=1"));
+    }
+
+    #[test]
+    fn conflicting_managed_config_is_refused_by_the_resolver_too() {
+        // The refusal must sit on the path every apply caller uses, not only
+        // in the classifier: an apply that got as far as resolving must still
+        // abort before it can replace anything.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signals = SupervisionSignals {
+            invocation_id: true,
+            ..shell_parent_signals()
+        };
+        let err = resolve_restart_plan(
+            false,
+            &signals,
+            &installed_binary(dir.path()),
+            Some(dir.path()),
+            None,
+        )
+        .expect_err("supervised + stop_on_upgrade=false must not resolve");
+        assert!(matches!(
+            err,
+            RestartOwnershipError::SupervisedRestartConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn unresolvable_roots_fail_for_their_own_reason() {
+        // ADR-0061 validation: "malformed/unresolved contract input must fail
+        // for its own reason" — an unusable install dir or data root must not
+        // be reported as an ownership conflict, and must not be discovered
+        // after the swap.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_install = dir.path().join("no-such-dir").join("x0xd");
+        let err = resolve_restart_plan(
+            true,
+            &shell_parent_signals(),
+            &missing_install,
+            Some(dir.path()),
+            None,
+        )
+        .expect_err("a missing install directory is an unresolved contract");
+        assert!(
+            matches!(err, RestartOwnershipError::Unresolved { what, .. } if what == "install directory"),
+            "got {err:?}"
+        );
+
+        let err = resolve_restart_plan(
+            true,
+            &shell_parent_signals(),
+            &installed_binary(dir.path()),
+            Some(&dir.path().join("no-such-data-root")),
+            None,
+        )
+        .expect_err("a missing data root is an unresolved contract");
+        assert!(
+            matches!(err, RestartOwnershipError::Unresolved { what, .. } if what == "data root"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn handoff_record_is_built_from_the_plan_not_resampled() {
+        // ADR-0061 §1: "carry that plan through replacement and restart".
+        // The helper must respawn the argv/roots captured before the swap.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = installed_binary(dir.path());
+        let mut plan = resolve_restart_plan(
+            true,
+            &shell_parent_signals(),
+            &binary,
+            Some(dir.path()),
+            None,
+        )
+        .expect("resolves");
+        plan.argv = vec![
+            "x0xd".to_string(),
+            "--name".to_string(),
+            "alice".to_string(),
+        ];
+
+        let handoff = UpgradeHandoff::from_plan(&plan, "9.9.9");
+        assert_eq!(handoff.argv, plan.argv);
+        assert_eq!(handoff.target_path, plan.executable);
+        assert_eq!(
+            handoff.backup_path,
+            UpgradeHandoff::backup_path_for(&plan.executable)
+        );
+        assert_eq!(handoff.cwd, plan.cwd.to_string_lossy());
+        assert_eq!(handoff.mode, plan.mode);
+        assert_eq!(handoff.to_version, "9.9.9");
     }
 
     #[test]

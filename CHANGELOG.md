@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (managed installs): self-update refuses a conflicting restart
+  contract instead of spawning a helper — ADR-0061, issues #493/#415.**
+  ADR-0061 is Accepted (2026-09-09, option 4). Two changes follow.
+
+  1. *Resolve before mutation.* `apply_upgrade_from_manifest` now resolves and
+     validates the whole restart contract — restart owner, intended exit
+     behaviour, executable/argv, cwd and effective data root — **before** it
+     downloads or replaces the daemon or its `x0x` companion, and carries that
+     `RestartPlan` through replacement and restart rather than re-deriving it
+     from a process whose binary has since changed. An unresolvable contract
+     returns the new `UpgradeError::RestartOwnership` with the current process
+     still serving and the installed binaries untouched.
+  2. *Refuse a known conflict.* A daemon under recognized supervision
+     (`INVOCATION_ID`, parent `systemd`, or `X0X_SUPERVISED=1`) whose config
+     sets `[update] stop_on_upgrade = false` now **refuses** self-update. That
+     combination gave one data root two restart owners: launchd/systemd
+     respawned its child while the transactional handoff helper started
+     another (#493). This replaces the previously documented and unit-tested
+     "`false` always means transactional handoff" behaviour **for managed runs
+     only** — genuinely unsupervised terminal/nohup runs are unchanged.
+     Affected installs will see updates stop applying, with an error naming
+     the supervision signal and the setting to correct, until the deployment
+     is fixed.
+
+  **Upgrading x0x does not repair an existing hand-written launchd job.** A
+  job with no `X0X_SUPERVISED=1` marker keeps taking the handoff path and
+  keeps producing the #493 duplicate daemon; a missing marker cannot prove a
+  custom job is unsupervised, so the fix is migration, not detection. Run
+  `x0x autostart --repair` and reload the job with the `launchctl` pair it
+  prints. ADR-0061 §3 is recorded **not met** and §5 **partially met** — see
+  the implementation-status table in the ADR.
+
+  `upgrade::restart::plan_restart_mode` and
+  `AutoApplyUpgrader::restart_mode{,_with}` now return
+  `Result<RestartMode, RestartOwnershipError>`; `UpgradeHandoff::capture` is
+  replaced by `UpgradeHandoff::from_plan`, which cannot re-sample argv/roots
+  after a swap. Supervised exit logs now state explicitly that it is a restart
+  *request* — not health acceptance, and not an automatic rollback (ADR-0061
+  §6). Windows (#415) is unchanged and still has no supported managed policy.
+
 ### Added
 
 - **Daemon `mdns_enabled` TOML knob, and hermetic-by-default tests (#417).**
@@ -20,6 +62,18 @@ All notable changes to this project will be documented in this file.
   *namespaces* mDNS — it never stopped a same-plane fixture from finding a
   prod daemon, which is why the plane isolation added earlier was not by
   itself sufficient. (#337 was closed as a duplicate of #417.)
+
+- **`x0x autostart --repair`** migrates an existing hand-written macOS launchd
+  job to the supervised-upgrade contract (ADR-0061, #493). It inspects the
+  jobs in `~/Library/LaunchAgents` without changing service state and adds
+  only `EnvironmentVariables.X0X_SUPERVISED = "1"`, after backing up the plist
+  and verifying the readback; the job's label, executable, arguments, roots
+  and other environment are preserved. It refuses jobs that are not x0xd and
+  jobs without `KeepAlive: true` (a one-shot or conditional job is not a
+  guaranteed respawn), and never installs a default job beside a running
+  custom one. The change takes effect on the job's next load — the command
+  prints the `launchctl unload`/`load` pair rather than stopping a live
+  daemon itself.
 
 - **Encrypted group-scoped KvStore — issue #341 Phase B.** The #88 design
   (`docs/design/encrypted-kvstore.md`) is now implemented for the GSS
@@ -59,6 +113,44 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **API watchdog no longer aborts live daemons — issue #600.** Shipped
+  0.41.3 tripped its `/health` watchdog 5–12×/hour on mainnet, giving
+  clients connection-refused windows. `/health` was not a cheap endpoint:
+  it walked every connected peer, and that walk can take ant-quic's
+  `connection_lifecycle` **parking_lot write** lock once per peer, on a
+  tokio worker — the same lock a gossip storm keeps hot. The one endpoint
+  the watchdog probes was therefore the one most coupled to the storm; it
+  blew its 3 s budget and the watchdog read "runtime wedged" and aborted.
+  `GET /health` now serves its peer counts from a cached snapshot
+  refreshed every 5 s by a background task, so the handler is O(1) and
+  lock-free. **The response shape is unchanged** — `peers`,
+  `send_ready_peers` and the #262 `degraded` classification all behave as
+  before, only sourced from the snapshot. `GET /status` still reads live.
+- **Daemon stdout logging is now non-blocking (#600).** `x0xd` wrote every
+  log line straight to `std::io::stdout`, making each `warn!` a synchronous
+  `write(2)` under the process-wide stdout lock from tokio workers; the
+  #600 node emitted ~152k WARN lines, so the diagnostic was amplifying the
+  stall it reported. The stdout sink now goes through
+  `tracing_appender::non_blocking`, and the two dispatcher
+  "Timed out handling gossip message" lines are rate-limited to one per
+  30 s per worker, each reporting how many it stood in for. The watchdog
+  pauses 500 ms before `abort()` so its own post-mortem still flushes.
+- **`decode_to_delivery_drops` can no longer go negative (#600 / H3).**
+  The `tx.closed()` arm of the subscriber forwarding task credited
+  `subscriber_channel_closed` — a per-message counter that
+  `decode_to_delivery_drops` subtracts from `incoming_decoded` — even
+  though no message is involved when a receiver is simply dropped. Each
+  ended subscription drove the metric to −1 (mainnet reported `-18`,
+  meaning 18 dropped subscriptions, not 18 lost messages). Subscription
+  teardown now credits a new `subscriber_task_ended` counter, also exposed
+  at `GET /diagnostics/gossip`.
+- **Watchdog trips now say whether the executor was starved (#600).** A 1 s
+  `tokio::time::interval` task stamps a monotonic counter, and the trip log
+  reports that stamp's age. A stale heartbeat next to a live process is
+  proof the tokio executor stopped polling; a fresh one says the block was
+  inside the request path. `thread_dump_summary()` is Linux-only, so this
+  is the only such signal on macOS — and it needs no new dependency or
+  thread enumeration on either platform.
 - **`authorize_write` no longer permissive on the reserved Encrypted
   policy.** Phase A (#358) left the un-keyed `authorize_write` arm
   returning `Ok(())` for a context-less Encrypted store, so the handle

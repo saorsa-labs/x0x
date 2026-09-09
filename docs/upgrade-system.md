@@ -20,23 +20,73 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 
 `sweep_stale_upgrade_artifacts(dir, min_age)` runs once at `x0xd` startup. It removes leftover `.x0x-upgrade-*` temp dirs older than `min_age` (1h — never disturbs an in-flight apply) and `*.x0xold-*` sidelined binaries that clear the same age gate (issue #261: a handoff still in flight must not lose its rollback bytes). This reclaims debris from previously-interrupted attempts.
 
-## Restart after swap (#261 — transactional handoff)
+## Restart ownership is resolved before mutation (ADR-0061, #493)
 
-After the swap commits, the daemon classifies supervision **before** anything
-destructive runs (`upgrade::restart::plan_restart_mode`):
+The daemon resolves and validates the whole restart contract **before it
+downloads or replaces anything** (`upgrade::restart::resolve_restart_plan`,
+called from `apply_upgrade_from_manifest` before the swap). The resulting
+`RestartPlan` pins the restart owner, the intended exit behaviour, the
+executable/argv, the cwd and the effective data root, and is then *carried*
+through replacement and restart — never re-derived once the bytes on disk no
+longer match the running image.
+
+If the contract cannot be resolved, the apply returns
+`UpgradeError::RestartOwnership` with the current process still serving and
+the installed binaries untouched.
+
+`upgrade::restart::plan_restart_mode` decides the owner:
 
 - `SupervisedExit` — only when `[update] stop_on_upgrade = true` (the default)
   **and** one of three real signals is present: `INVOCATION_ID` is set
   (systemd unit), the parent's `comm` is `systemd`, or `X0X_SUPERVISED=1`
   (explicit opt-in: launchd plist, Windows service). The daemon writes the
   intent file, then exits 0 (100 on Windows) for the supervisor to re-exec the
-  new bytes. A *missing TTY* is **not** supervision — nohup/background/detached
-  stdin never qualifies, and neither does "some ancestor is launchd" (every
-  macOS process has that).
-- `TransactionalHandoff` — everything else, including unsupervised runs with
-  the default `stop_on_upgrade = true` (the macOS terminal incident) and every
-  `stop_on_upgrade = false` run. The old `exec()` path is gone: it could not
-  roll back.
+  new bytes, and launches **no** helper. A *missing TTY* is **not**
+  supervision — nohup/background/detached stdin never qualifies, and neither
+  does "some ancestor is launchd" (every macOS process has that).
+- **Refused** — recognized supervision **and** `stop_on_upgrade = false`. That
+  combination names two restart owners for one data root: the supervisor
+  respawns its child while the handoff helper starts another (#493). Since
+  x0xd cannot know the supervisor's policy, it refuses before replacement and
+  tells the operator which signal made the instance managed and which setting
+  to correct. **This replaced the pre-ADR-0061 behaviour, where
+  `stop_on_upgrade = false` always meant a transactional handoff.** Affected
+  installs stop applying updates until the config is corrected.
+- `TransactionalHandoff` — genuinely unsupervised runs, including the default
+  `stop_on_upgrade = true` terminal launch (the macOS terminal incident) and
+  unsupervised `stop_on_upgrade = false`. The old `exec()` path is gone: it
+  could not roll back.
+
+### What a successful apply does and does not prove
+
+Installed bytes, a pending restart, observed readiness and recovery are four
+distinct facts, and the apply logs report them separately. A supervised exit
+is a **restart request** to the service manager — not health acceptance, and
+not an automatic rollback. Recovery on the supervised path is the operator's
+documented manual procedure; only the transactional handoff observes
+`/health` and restores the backup itself.
+
+### Migrating an existing launchd job
+
+> **An existing hand-written launchd job is not fixed by upgrading x0x.**
+> A job with no `X0X_SUPERVISED=1` marker keeps taking the transactional
+> handoff path, so launchd still respawns its own child while the helper
+> starts another — the #493 duplicate daemon. Detection cannot prove an
+> arbitrary custom job is supervised (ADR-0061 §4); migration is the fix.
+> Run `x0x autostart --repair`, then reload the job with the `launchctl`
+> pair it prints.
+
+`x0x autostart --repair` inspects the LaunchAgents in `~/Library/LaunchAgents`
+without changing service state, and adds only
+`EnvironmentVariables.X0X_SUPERVISED = "1"` to an existing x0xd job, after
+backing the plist up and verifying the readback. It preserves the job's label,
+executable, arguments, roots and other environment; it never installs a
+default job beside a running custom one. It **refuses** a job that is not
+x0xd, and a job without `KeepAlive: true` (a one-shot or conditional job is
+not a guaranteed respawn, so declaring it supervised would leave the daemon
+down after the upgrade exit). The change takes effect on the job's next load —
+`--repair` prints the `launchctl unload`/`load` commands rather than stopping
+a running daemon itself.
 
 The handoff transaction (`upgrade::restart`):
 

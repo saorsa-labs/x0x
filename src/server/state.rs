@@ -959,6 +959,12 @@ pub(super) struct AppState {
     /// `UPGRADE_FAILED` artifact live (#261).
     pub(super) data_dir: PathBuf,
     pub(super) start_time: Instant,
+    /// Cached transport peer counts served by the auth-exempt `/health`
+    /// (issue #600). Refreshed by a background task; the handler only reads
+    /// atomics, so the watchdog's liveness probe never touches ant-quic's
+    /// `connection_lifecycle` lock. See
+    /// [`super::routes::status::HealthSnapshot`].
+    pub(super) health_snapshot: Arc<super::routes::status::HealthSnapshot>,
     pub(super) broadcast_tx: broadcast::Sender<SseEvent>,
     /// Active file transfers.
     pub(super) file_transfers: RwLock<HashMap<String, x0x::files::TransferState>>,
