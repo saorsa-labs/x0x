@@ -362,6 +362,248 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// What `x0x autostart --repair` decided about one existing launchd job.
+///
+/// ADR-0061's migration boundary: inspect the real job, prepare a *narrow*
+/// change that preserves its label/executable/arguments/roots, and refuse
+/// anything it cannot prove safe. It never installs a default job beside a
+/// running custom one, and never rewrites arbitrary service policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepairVerdict {
+    /// The job already declares the supervision marker — no change needed.
+    AlreadySupervised,
+    /// The job unconditionally respawns and lacks only the marker.
+    /// `has_env_dict` says whether `EnvironmentVariables` must be created.
+    Repairable { has_env_dict: bool },
+    /// The job is an x0xd job but does not unconditionally respawn, so
+    /// declaring it supervised would be unsound.
+    Refused(String),
+    /// Not an x0xd job at all. The repair says nothing about it and never
+    /// touches it — the LaunchAgents directory holds other people's services.
+    NotAnX0xdJob,
+}
+
+/// Basename of a launchd `ProgramArguments[0]`, ignoring any path.
+fn program_basename(program: &str) -> &str {
+    program.rsplit('/').next().unwrap_or(program)
+}
+
+/// Classify one launchd job (a plist converted to JSON) for `--repair`.
+///
+/// Kept free of `launchctl`/`plutil` so the decision table is testable on any
+/// platform; the macOS driver below only supplies the parsed job and applies
+/// the verdict.
+pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
+    let program = plist
+        .get("ProgramArguments")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|p| p.as_str())
+        .or_else(|| plist.get("Program").and_then(|p| p.as_str()));
+
+    let Some(program) = program else {
+        return RepairVerdict::NotAnX0xdJob;
+    };
+    if program_basename(program) != "x0xd" {
+        return RepairVerdict::NotAnX0xdJob;
+    }
+
+    // A supervised exit is only safe if something is guaranteed to bring the
+    // daemon back. `KeepAlive: true` is that guarantee; a KeepAlive dict is
+    // conditional and RunAtLoad-only jobs are one-shot. ADR-0061 §4: those
+    // must not be mistaken for a guaranteed supervised respawn.
+    match plist.get("KeepAlive") {
+        Some(serde_json::Value::Bool(true)) => {}
+        Some(serde_json::Value::Object(_)) => {
+            return RepairVerdict::Refused(
+                "KeepAlive is a conditional dictionary, so an unconditional respawn after \
+                 the upgrade exit is not guaranteed; review the job by hand"
+                    .to_string(),
+            );
+        }
+        _ => {
+            return RepairVerdict::Refused(
+                "job has no `KeepAlive: true`, so nothing is guaranteed to restart x0xd after \
+                 it exits for an upgrade; it keeps the transactional handoff path"
+                    .to_string(),
+            );
+        }
+    }
+
+    let env = plist.get("EnvironmentVariables");
+    let already = env
+        .and_then(|e| e.get(crate::upgrade::restart::SUPERVISED_ENV_VAR))
+        .and_then(|v| v.as_str())
+        == Some("1");
+    if already {
+        RepairVerdict::AlreadySupervised
+    } else {
+        RepairVerdict::Repairable {
+            has_env_dict: env.is_some_and(|e| e.is_object()),
+        }
+    }
+}
+
+/// `x0x autostart --repair` — migrate an existing hand-written launchd job to
+/// the supervised-upgrade contract (ADR-0061, #493).
+///
+/// Inspects the job without changing service state, then adds only
+/// `EnvironmentVariables.X0X_SUPERVISED = "1"`, preserving the job's label,
+/// executable, arguments, roots and every other key. The change takes effect
+/// on the job's next load; reloading is left to the operator because
+/// unload/load stops a running daemon.
+pub async fn autostart_repair() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_dir = dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join("Library/LaunchAgents");
+        if !plist_dir.is_dir() {
+            println!("No LaunchAgents directory at {}", plist_dir.display());
+            println!("Nothing to repair. `x0x autostart` installs a compliant job.");
+            return Ok(());
+        }
+
+        let mut inspected = 0usize;
+        let mut repaired = 0usize;
+        let mut refused = 0usize;
+        let mut compliant = 0usize;
+
+        for entry in std::fs::read_dir(&plist_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("plist") {
+                continue;
+            }
+            let Some(job) = read_plist_as_json(&path)? else {
+                continue;
+            };
+            // Only x0xd jobs are ours to look at; skip everything else
+            // silently rather than reporting on the user's other agents.
+            let verdict = classify_launchd_job(&job);
+            if verdict == RepairVerdict::NotAnX0xdJob {
+                continue;
+            }
+            inspected += 1;
+            let label = job
+                .get("Label")
+                .and_then(|l| l.as_str())
+                .unwrap_or("<unlabelled>");
+            println!("Job {label} ({})", path.display());
+
+            match verdict {
+                RepairVerdict::AlreadySupervised => {
+                    compliant += 1;
+                    println!(
+                        "  Already declares {}=1 — no change.",
+                        crate::upgrade::restart::SUPERVISED_ENV_VAR
+                    );
+                }
+                RepairVerdict::Refused(reason) => {
+                    refused += 1;
+                    println!("  REFUSED: {reason}");
+                    println!("  Left unchanged.");
+                }
+                RepairVerdict::NotAnX0xdJob => unreachable!("skipped above"),
+                RepairVerdict::Repairable { has_env_dict } => {
+                    let backup = path.with_extension("plist.x0x-backup");
+                    std::fs::copy(&path, &backup)
+                        .with_context(|| format!("failed to back up {}", path.display()))?;
+                    apply_supervised_marker(&path, has_env_dict)?;
+
+                    // Verify the readback rather than trusting the write.
+                    let after = read_plist_as_json(&path)?
+                        .context("repaired plist could not be read back")?;
+                    if classify_launchd_job(&after) != RepairVerdict::AlreadySupervised {
+                        std::fs::copy(&backup, &path).with_context(|| {
+                            format!("failed to restore backup over {}", path.display())
+                        })?;
+                        anyhow::bail!(
+                            "repair of {} did not verify; the backup was restored",
+                            path.display()
+                        );
+                    }
+                    repaired += 1;
+                    println!("  Backup:   {}", backup.display());
+                    println!(
+                        "  Added:    {}=1 (all other keys preserved)",
+                        crate::upgrade::restart::SUPERVISED_ENV_VAR
+                    );
+                    println!("  Takes effect on the job's next load. To apply now:");
+                    println!("    launchctl unload {}", path.display());
+                    println!("    launchctl load {}", path.display());
+                }
+            }
+        }
+
+        if inspected == 0 {
+            println!("No x0xd launchd job found in {}", plist_dir.display());
+            println!("Nothing to repair — `x0x autostart` installs a compliant job.");
+            return Ok(());
+        }
+        println!(
+            "\nInspected {inspected} x0xd job(s): {repaired} repaired, {compliant} already \
+             compliant, {refused} refused."
+        );
+        if repaired > 0 {
+            println!(
+                "Also confirm `[update] stop_on_upgrade` is true (the default) in the daemon \
+                 config: a supervised job with it set to false now refuses self-update."
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("`x0x autostart --repair` currently migrates macOS launchd jobs only.");
+        println!("systemd units generated by `x0x autostart` already set Restart=always,");
+        println!("and INVOCATION_ID makes them supervised without a marker.");
+    }
+
+    Ok(())
+}
+
+/// Convert a plist to JSON via `plutil`. `Ok(None)` when the file is not a
+/// parseable plist (deliberately not an error — the directory holds other
+/// people's agents).
+#[cfg(target_os = "macos")]
+fn read_plist_as_json(path: &Path) -> Result<Option<serde_json::Value>> {
+    let out = std::process::Command::new("plutil")
+        .args(["-convert", "json", "-o", "-", "--"])
+        .arg(path)
+        .output()
+        .context("failed to run plutil")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice(&out.stdout).ok())
+}
+
+/// Add `EnvironmentVariables.X0X_SUPERVISED = "1"` in place, creating the
+/// dictionary only if the job has none. Every other key is untouched.
+#[cfg(target_os = "macos")]
+fn apply_supervised_marker(path: &Path, has_env_dict: bool) -> Result<()> {
+    let marker = crate::upgrade::restart::SUPERVISED_ENV_VAR;
+    let mut cmd = std::process::Command::new("plutil");
+    if has_env_dict {
+        cmd.args(["-replace", &format!("EnvironmentVariables.{marker}")])
+            .args(["-string", "1", "--"]);
+    } else {
+        cmd.args(["-replace", "EnvironmentVariables"]).args([
+            "-json",
+            &format!("{{\"{marker}\":\"1\"}}"),
+            "--",
+        ]);
+    }
+    let status = cmd
+        .arg(path)
+        .status()
+        .context("failed to run plutil -replace")?;
+    if !status.success() {
+        anyhow::bail!("plutil could not update {} ({status})", path.display());
+    }
+    Ok(())
+}
+
 /// `x0x autostart --remove` — remove autostart configuration.
 pub async fn autostart_remove() -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -524,6 +766,97 @@ mod tests {
         // In a test environment without port files, instances should return empty
         let result = instances().await;
         assert!(result.is_ok(), "instances should not fail: {:?}", result);
+    }
+
+    fn job(extra: serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "Label": "com.example.x0xd",
+            "ProgramArguments": ["/opt/x0x/bin/x0xd", "--name", "alice"],
+            "RunAtLoad": true,
+            "KeepAlive": true,
+        });
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        base
+    }
+
+    #[test]
+    fn repair_targets_a_keepalive_x0xd_job_missing_only_the_marker() {
+        // This is the #493 population: a hand-written KeepAlive agent that
+        // launchd will respawn, but which x0xd cannot recognise as supervised,
+        // so self-update takes the handoff path and launchd starts a second
+        // daemon on the same data root.
+        assert_eq!(
+            classify_launchd_job(&job(serde_json::json!({}))),
+            RepairVerdict::Repairable {
+                has_env_dict: false
+            }
+        );
+        // An existing environment dict must be added to, not replaced — the
+        // migration boundary says preserve the job's other environment.
+        assert_eq!(
+            classify_launchd_job(&job(
+                serde_json::json!({"EnvironmentVariables": {"RUST_LOG": "info"}})
+            )),
+            RepairVerdict::Repairable { has_env_dict: true }
+        );
+    }
+
+    #[test]
+    fn repair_is_a_no_op_on_an_already_compliant_job() {
+        assert_eq!(
+            classify_launchd_job(&job(serde_json::json!({
+                "EnvironmentVariables": {"X0X_SUPERVISED": "1"}
+            }))),
+            RepairVerdict::AlreadySupervised
+        );
+    }
+
+    #[test]
+    fn repair_refuses_jobs_that_do_not_guarantee_a_respawn() {
+        // ADR-0061 §4: a one-shot or conditional job must not be mistaken for
+        // a guaranteed supervised respawn. Marking one supervised would make
+        // self-update exit 0 with nobody bringing the daemon back — a worse
+        // outcome than the duplicate-daemon bug being fixed.
+        let mut one_shot = job(serde_json::json!({}));
+        one_shot
+            .as_object_mut()
+            .expect("object")
+            .remove("KeepAlive");
+        assert!(matches!(
+            classify_launchd_job(&one_shot),
+            RepairVerdict::Refused(_)
+        ));
+        assert!(matches!(
+            classify_launchd_job(&job(
+                serde_json::json!({"KeepAlive": {"SuccessfulExit": false}})
+            )),
+            RepairVerdict::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn repair_does_not_touch_jobs_that_are_not_x0xd() {
+        // The repair must never rewrite an unrelated LaunchAgent, and must
+        // never install a default x0xd job beside somebody else's service.
+        let foreign = serde_json::json!({
+            "Label": "com.example.other",
+            "ProgramArguments": ["/usr/local/bin/otherd"],
+            "KeepAlive": true,
+        });
+        assert_eq!(classify_launchd_job(&foreign), RepairVerdict::NotAnX0xdJob);
+
+        // Real LaunchAgents directories contain jobs that declare neither key
+        // (observed live: com.google.keystone.*). Those are somebody else's
+        // service, so they must be skipped silently — not reported as x0xd
+        // jobs the repair refused.
+        assert_eq!(
+            classify_launchd_job(&serde_json::json!({"Label": "com.google.keystone.agent"})),
+            RepairVerdict::NotAnX0xdJob
+        );
     }
 
     #[tokio::test]
