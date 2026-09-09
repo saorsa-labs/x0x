@@ -17,6 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 use x0x::server::{serve_with_options, DaemonConfig, ServeOptions, ServerHandle};
 
+use base64::Engine;
 use serde_json::Value;
 
 struct Daemon {
@@ -243,6 +244,21 @@ async fn history_message_point_lookup_serves_group_row_by_canonical_id() {
 
     assert_eq!(local_send_record["msg_id"], msg_id);
     assert_eq!(local_send_record["provenance"], "LocalSend");
+    assert_eq!(
+        local_send_record["scope"],
+        format!("group:{group_id}"),
+        "the sender row must retain the requested stable group scope"
+    );
+    let encoded_payload = local_send_record["payload"]
+        .as_str()
+        .expect("sender payload must be base64");
+    let decoded_payload = base64::engine::general_purpose::STANDARD
+        .decode(encoded_payload)
+        .expect("sender payload base64");
+    assert_eq!(
+        decoded_payload, b"point-lookup wiring payload",
+        "the canonical sender row must retain the exact sent body"
+    );
     let (status, body) = daemon
         .get_status(&format!("/history/message/{msg_id}?scope=group:{group_id}"))
         .await;

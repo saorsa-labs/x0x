@@ -22,6 +22,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -103,6 +104,90 @@ fn default_miss_threshold() -> u32 {
 
 fn default_startup_grace_secs() -> u64 {
     90
+}
+
+/// How often the executor-liveness heartbeat task stamps itself.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Executor-liveness heartbeat (issue #600).
+///
+/// A trip tells us `/health` went unanswered; it does not tell us *why*. The
+/// two candidates have opposite fixes: the tokio executor stopped polling
+/// tasks at all (starvation), or the HTTP task was polled but blocked inside a
+/// lock or syscall. This distinguishes them for free: a plain
+/// `tokio::time::interval(1s)` task stamps a monotonic counter, and the
+/// watchdog — which runs on its own OS thread and therefore keeps working
+/// through either failure — logs that stamp's AGE when it trips.
+///
+/// A multi-second heartbeat age next to a live process is proof the executor
+/// stopped polling. An age near 1 s means the runtime was fine and the block
+/// was inside the request path. `thread_dump_summary()` is Linux-only, so on
+/// macOS this is the only signal of its kind — and it needs no new dependency
+/// or thread enumeration on either platform.
+#[derive(Debug)]
+pub(crate) struct RuntimeHeartbeat {
+    /// Monotonic origin; stamps are millis elapsed from here.
+    base: Instant,
+    /// Millis since `base` at the last stamp, or `NEVER_STAMPED`.
+    last_stamp_ms: AtomicU64,
+}
+
+/// Sentinel for "the heartbeat task has not run yet".
+const NEVER_STAMPED: u64 = u64::MAX;
+
+impl RuntimeHeartbeat {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last_stamp_ms: AtomicU64::new(NEVER_STAMPED),
+        }
+    }
+
+    /// Record that the runtime polled us just now.
+    fn stamp(&self) {
+        let elapsed = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        self.last_stamp_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    /// Time since the last stamp, or `None` if the task has never run.
+    ///
+    /// Safe to call from the watchdog thread: an atomic load and an `Instant`
+    /// read, no locks and no runtime involvement.
+    fn age(&self) -> Option<Duration> {
+        let stamped = self.last_stamp_ms.load(Ordering::Relaxed);
+        if stamped == NEVER_STAMPED {
+            return None;
+        }
+        let now_ms = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        Some(Duration::from_millis(now_ms.saturating_sub(stamped)))
+    }
+
+    /// Render the age for a log field.
+    fn describe(&self) -> String {
+        describe_heartbeat_age(self.age())
+    }
+}
+
+/// Age at or past which a heartbeat is read as executor starvation rather
+/// than an in-request block. Three missed ticks: one is scheduler jitter.
+const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(3);
+
+/// Turn a heartbeat age into the operator-facing verdict, naming the two
+/// readings explicitly so nobody has to remember which way round they go.
+///
+/// Kept free of the clock so the verdict boundary is testable without sleeping.
+fn describe_heartbeat_age(age: Option<Duration>) -> String {
+    match age {
+        None => "never stamped (heartbeat task never ran)".to_string(),
+        Some(age) if age >= HEARTBEAT_STALE_AFTER => format!(
+            "{age:?} stale (>= {HEARTBEAT_STALE_AFTER:?}) — executor starvation: \
+             tokio stopped polling tasks"
+        ),
+        Some(age) => format!(
+            "{age:?} fresh — the executor kept polling, so the block is inside \
+             the request path (a lock or a syscall)"
+        ),
+    }
 }
 
 /// One watchdog observation outcome.
@@ -253,12 +338,34 @@ fn probe_health(api_addr: SocketAddr, timeout: Duration) -> ProbeOutcome {
 /// Launch the watchdog thread. Called once from `serve_with_options` after
 /// the API listener is bound; owns its probe loop for the process lifetime
 /// (or until shutdown).
+///
+/// Must be called from inside a tokio runtime: it also spawns the
+/// [`RuntimeHeartbeat`] task whose staleness at trip time separates executor
+/// starvation from an in-request block (issue #600).
 pub(crate) fn spawn_api_watchdog(
     config: &ApiWatchdogConfig,
     api_addr: SocketAddr,
     agent: Arc<Agent>,
     shutdown: watch::Receiver<bool>,
 ) -> std::thread::JoinHandle<()> {
+    // Deliberately an ordinary tokio task on the normal executor: its whole
+    // value is that it stops being polled exactly when everything else does.
+    let heartbeat = Arc::new(RuntimeHeartbeat::new());
+    {
+        let heartbeat = Arc::clone(&heartbeat);
+        let mut shutdown_rx = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => heartbeat.stamp(),
+                    _ = shutdown_rx.changed() => return,
+                }
+            }
+        });
+    }
+
     let interval = Duration::from_secs(config.probe_interval_secs.max(1));
     let timeout = Duration::from_secs(config.probe_timeout_secs.max(1));
     let threshold = config.miss_threshold;
@@ -317,6 +424,7 @@ pub(crate) fn spawn_api_watchdog(
                         timeout,
                         &outcome,
                         abort_on_stall,
+                        &heartbeat,
                     );
                     return;
                 }
@@ -341,6 +449,7 @@ pub(crate) fn spawn_api_watchdog(
 /// Everything here is synchronous **by design**: the wedged state is
 /// "tokio tasks not being polled", so any `.await` (or `block_on`) would
 /// hang the diagnostics with the same wedge it is trying to report.
+#[allow(clippy::too_many_arguments)]
 fn trip(
     agent: &Agent,
     api_addr: SocketAddr,
@@ -349,6 +458,7 @@ fn trip(
     timeout: Duration,
     outcome: &ProbeOutcome,
     abort_on_stall: bool,
+    heartbeat: &RuntimeHeartbeat,
 ) {
     tracing::error!(
         target: "x0x::api_watchdog",
@@ -360,6 +470,7 @@ fn trip(
         agent_id = %agent.agent_id(),
         machine_id = %agent.machine_id(),
         pubsub_stats = ?agent.gossip_stats(),
+        runtime_heartbeat = %heartbeat.describe(),
         thread_dump = thread_dump_summary(),
         "API-unserved watchdog tripped (issue #384): /health unserved past the \
          grace window — async runtime presumed wedged (TCP accepted, HTTP \
@@ -371,9 +482,18 @@ fn trip(
             "abort_on_stall=true (supervised run or explicit override): calling \
              std::process::abort() for supervisor restart + core dump"
         );
+        // The stdout log sink is non-blocking (#600), so the two lines above
+        // are queued on a writer thread that `abort()` will not wait for and
+        // whose `WorkerGuard` destructor `abort()` will not run. Without this
+        // pause the daemon would abort with its own post-mortem unwritten.
+        std::thread::sleep(LOG_DRAIN_BEFORE_ABORT);
         std::process::abort();
     }
 }
+
+/// Grace given to the non-blocking log writer thread to flush the trip
+/// post-mortem before `std::process::abort()` discards it (issue #600).
+const LOG_DRAIN_BEFORE_ABORT: Duration = Duration::from_millis(500);
 
 /// Best-effort platform thread list. Linux: `/proc/self/task/*/comm`.
 /// Other platforms have no stable userspace enumeration — say so instead of
@@ -406,6 +526,61 @@ fn thread_dump_summary() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WHY (issue #600): a trip proves `/health` went unanswered but not why,
+    /// and the two causes have opposite fixes. `thread_dump_summary()` is
+    /// Linux-only, so on macOS this heartbeat is the ONLY thing that separates
+    /// "tokio stopped polling" from "the request path blocked". A heartbeat
+    /// that never ran must say so rather than read as age zero — reporting a
+    /// fresh heartbeat for a task that never started would point every future
+    /// investigation at the wrong hypothesis.
+    #[test]
+    fn heartbeat_distinguishes_never_stamped_from_stamped() {
+        let hb = RuntimeHeartbeat::new();
+        assert!(hb.age().is_none(), "an unstamped heartbeat has no age");
+        assert!(
+            hb.describe().contains("never stamped"),
+            "the trip log must say the heartbeat task never ran: {}",
+            hb.describe()
+        );
+
+        hb.stamp();
+        let age = hb.age().expect("a stamped heartbeat has an age");
+        assert!(
+            age < HEARTBEAT_INTERVAL,
+            "a just-stamped heartbeat must be fresh, got {age:?}"
+        );
+        assert!(
+            hb.describe().contains("fresh") && !hb.describe().contains("starvation"),
+            "a fresh heartbeat must be reported as an in-request block, not \
+             starvation: {}",
+            hb.describe()
+        );
+    }
+
+    /// The staleness boundary IS the diagnostic: a stamp older than a few
+    /// missed ticks next to a live process is proof the executor stopped
+    /// polling. Encode the boundary so nobody widens it into meaninglessness.
+    #[test]
+    fn the_staleness_boundary_separates_the_two_hypotheses() {
+        assert!(
+            describe_heartbeat_age(Some(HEARTBEAT_STALE_AFTER)).contains("starvation"),
+            "at the boundary the verdict must be starvation"
+        );
+        assert!(
+            describe_heartbeat_age(Some(HEARTBEAT_STALE_AFTER * 10)).contains("starvation"),
+            "well past the boundary the verdict must still be starvation"
+        );
+        let just_under = describe_heartbeat_age(Some(HEARTBEAT_STALE_AFTER - HEARTBEAT_INTERVAL));
+        assert!(
+            just_under.contains("fresh") && !just_under.contains("starvation"),
+            "one missed tick is scheduler jitter, not starvation: {just_under}"
+        );
+        assert!(
+            HEARTBEAT_STALE_AFTER > HEARTBEAT_INTERVAL,
+            "the stale threshold must allow at least one missed tick"
+        );
+    }
 
     fn machine(threshold: u32, grace: Duration) -> ApiWatchdogMachine {
         ApiWatchdogMachine::new(threshold, grace, Instant::now())
