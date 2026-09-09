@@ -84,14 +84,48 @@ Agent-to-agent gossip network for AI systems. Built on `ant-quic` (QUIC transpor
 
 ## Build & Test Commands
 
-Standard `just` recipes are available (see `just --list`). Raw cargo commands:
+Standard `just` recipes are available (see `just --list`). Test execution requires
+an unprivileged Linux environment with passwordless sudo and the existing
+namespace tools. macOS/Windows and missing prerequisites fail closed; there is
+no ambient-host runtime fallback. Compile/lint/doc commands remain available.
+
+```bash
+just test                           # Full suite inside the existing isolation boundary
+just test-full                      # Same suite, no fail-fast
+python3 scripts/dev/test-isolated.py nextest --all-features -- -E 'test(identity)'
+python3 scripts/dev/test-isolated.py nextest --all-features --test identity_integration --
+```
+
+The launcher contract is `nextest <build flags> -- <runtime flags>`; an extra
+`--` after the separator forwards nextest's emulated test-binary arguments.
+A name filter such as `identity` does not prove a test is inert. Direct
+`cargo test`/`cargo nextest run` is a low-level bypass and requires a separately
+reviewed inert selector or an already admitted runtime boundary. These developer
+results do not replace Tester final acceptance.
+
+The existing Linux wrapper checks a fresh loopback-only namespace and dropped
+privileges. Launcher preflight checks tools/passwordless sudo; actual namespace
+admission still belongs to that wrapper. Evidence remains under the printed
+`target/dev-isolation/run-*` directory, outside `/tmp`. Normal test runs preserve
+the configured Cargo target. Coverage uses a fresh owned target in each run;
+`just coverage-clean /absolute/path/to/run-*` removes only that completed run's
+coverage target (including reports inside it) after ownership checks, retaining
+custody evidence. The LCOV/check recipes generate a private report inside that
+owned target; the check recipe's threshold helper reads that same private file.
+After success, they atomically replace workspace `lcov.info` as a shared editor
+mirror (last writer wins). It is not evidence for an individual run, and cleanup
+leaves it alone. Use the printed run-owned report path for that run's evidence.
+Reports explicitly select every workspace package with
+`--package '*'`; build selection retains `--workspace`. Only successful completion
+unlocks cleanup; failed, active or interrupted runs are refused rather than
+guessed safe to delete. No general
+Cargo cache cleanup is performed by this entrypoint.
+
+Safe preparation commands:
 
 ```bash
 cargo fmt --all -- --check          # Format check
 cargo clippy --all-targets --all-features -- -D warnings  # Lint (zero warnings)
-cargo nextest run --all-features --workspace              # Run all tests
-cargo nextest run --all-features -E 'test(identity)'      # Run tests matching "identity"
-cargo nextest run --all-features --test identity_integration  # Run a specific integration test file
 cargo doc --all-features --no-deps  # Build docs (CI uses RUSTDOCFLAGS="-D warnings")
 cargo build --all-features          # Build library + x0xd + x0x binaries
 ```

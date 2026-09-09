@@ -892,6 +892,8 @@ impl Drop for RelayForwardReservation<'_> {
 /// never contend on the same lock.
 #[derive(Debug)]
 pub struct PeerRelay {
+    #[cfg(test)]
+    convergence_observer: Mutex<Option<ConvergenceSnapshot>>,
     policy: RelayPolicy,
     stats: RelayStats,
     per_peer: Mutex<HashMap<[u8; 32], PeerRelayState>>,
@@ -925,6 +927,8 @@ impl PeerRelay {
             per_peer: Mutex::new(HashMap::new()),
             limiter: Mutex::new(RelayLimiter::default()),
             v2_observed_senders: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            convergence_observer: Mutex::new(None),
         }
     }
 
@@ -937,6 +941,8 @@ impl PeerRelay {
             per_peer: Mutex::new(HashMap::new()),
             limiter: Mutex::new(RelayLimiter::default()),
             v2_observed_senders: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            convergence_observer: Mutex::new(None),
         }
     }
 
@@ -1015,6 +1021,57 @@ impl PeerRelay {
                 None => false,
             },
             Err(_) => false,
+        }
+    }
+
+    /// Read the retained baseline without invoking its lazy-pruning lookup.
+    pub(crate) fn digest_diagnostic_snapshot(
+        &self,
+        now: Instant,
+        filter: Option<[u8; 32]>,
+    ) -> crate::dm_digest_diagnostics::StoreSnapshot<
+        crate::dm_digest_diagnostics::BaselineObservation,
+        crate::dm_digest_diagnostics::BaselineTotals,
+    > {
+        use crate::dm_digest_diagnostics::{
+            millis, select_key, BaselineObservation, BaselineTotals, StoreSnapshot,
+        };
+        let Ok(seen) = self.v2_observed_senders.lock() else {
+            return StoreSnapshot::unavailable();
+        };
+        let mut keys = std::collections::BTreeSet::new();
+        let mut totals = BaselineTotals::default();
+        for (key, at) in seen.iter() {
+            totals.distinct_agents += 1;
+            if now.saturating_duration_since(*at) < V2_BASELINE_TTL {
+                totals.fresh += 1;
+            } else {
+                totals.expired_retained += 1;
+            }
+            select_key(&mut keys, *key, filter);
+        }
+        let rows = keys
+            .into_iter()
+            .filter_map(|key| {
+                seen.get(&key).map(|at| {
+                    let age = now.saturating_duration_since(*at);
+                    (
+                        key,
+                        BaselineObservation {
+                            state: if age < V2_BASELINE_TTL {
+                                "fresh"
+                            } else {
+                                "expired_retained"
+                            },
+                            age_ms: millis(age),
+                        },
+                    )
+                })
+            })
+            .collect();
+        StoreSnapshot {
+            totals: Some(totals),
+            rows,
         }
     }
 
@@ -1397,7 +1454,7 @@ mod tests {
 
     /// Minimal opaque inner envelope for the relay-wrapping tests. The
     /// relay never inspects `inner`, so a placeholder is sufficient.
-    fn dummy_inner() -> DmEnvelope {
+    pub(super) fn dummy_inner() -> DmEnvelope {
         DmEnvelope {
             protocol_version: 1,
             request_id: [7u8; 16],
@@ -3192,5 +3249,255 @@ mod tests {
         let generous =
             RelayPolicy::enabled().with_forward_limits(10, 100, 1_024, Duration::from_secs(60));
         assert_eq!(generous.limit_window, Duration::from_secs(60));
+    }
+}
+
+#[cfg(test)]
+mod digest_diagnostic_tests {
+    use super::*;
+    use crate::dm_capability::CapabilityStore;
+    use crate::dm_digest_diagnostics::join_snapshots;
+
+    #[test]
+    fn baseline_boundary_and_nonmutating_snapshot() {
+        let relay = PeerRelay::default();
+        let now = Instant::now();
+        relay
+            .v2_observed_senders
+            .lock()
+            .unwrap()
+            .insert([1; 32], now);
+        let at = now + V2_BASELINE_TTL;
+        let fresh = relay.digest_diagnostic_snapshot(at - Duration::from_millis(1), None);
+        assert_eq!(fresh.totals.unwrap().fresh, 1);
+        let expired = relay.digest_diagnostic_snapshot(at, None);
+        assert_eq!(expired.totals.as_ref().unwrap().expired_retained, 1);
+        let view = join_snapshots(
+            CapabilityStore::new().digest_diagnostic_snapshot(at, None),
+            expired,
+            None,
+        );
+        assert_eq!(
+            view["rows"][0]["v2_observed"]["age_ms"],
+            crate::dm_digest_diagnostics::millis(V2_BASELINE_TTL)
+        );
+        assert_eq!(view["rows"][0]["fresh_forward_downgrade_baseline"], false);
+        assert_eq!(
+            view["rows"][0]["capability_record_state"],
+            "absent_unknown_history"
+        );
+        assert_eq!(
+            *relay
+                .v2_observed_senders
+                .lock()
+                .unwrap()
+                .get(&[1; 32])
+                .unwrap(),
+            now
+        );
+        assert_eq!(
+            relay
+                .digest_diagnostic_snapshot(now, None)
+                .totals
+                .unwrap()
+                .fresh,
+            1
+        );
+    }
+
+    #[test]
+    fn poisoned_baseline_is_unavailable_with_other_store_rows() {
+        let relay = PeerRelay::default();
+        let now = Instant::now();
+        let _ = std::panic::catch_unwind(|| {
+            let mut guard = relay.v2_observed_senders.lock().unwrap();
+            guard.insert([1; 32], now);
+            panic!("deliberate inert poison");
+        });
+        let cap = CapabilityStore::new();
+        assert!(cap.insert(
+            AgentId([2; 32]),
+            crate::identity::MachineId([3; 32]),
+            crate::dm::DmCapabilities::pending(),
+            crate::dm_capability::now_unix_ms()
+        ));
+        let view = join_snapshots(
+            cap.digest_diagnostic_snapshot(now, None),
+            relay.digest_diagnostic_snapshot(now, None),
+            None,
+        );
+        assert!(view["totals"]["relay"].is_null());
+        assert_eq!(view["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(view["rows"][0]["capability_record_state"], "retained");
+        assert_eq!(view["rows"][0]["relay_record_state"], "unavailable");
+        assert!(view["rows"][0]["fresh_forward_downgrade_baseline"].is_null());
+        assert_eq!(relay.digest_diagnostic_snapshot(now, None).rows.len(), 0);
+    }
+}
+
+// Disabled per-instance test observations: no second network consumer and no
+// influence on send/classification results. No payload or secret is retained.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConvergenceEvent {
+    pub request_id: [u8; 16],
+    pub sender: [u8; 32],
+    pub destination: [u8; 32],
+    pub digest_present: bool,
+    pub hop: [u8; 32],
+    pub prefix: [u8; 32],
+    pub sent_wire: Option<(usize, [u8; 32])>,
+    pub disposition: Option<RelayDisposition>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConvergenceSnapshot {
+    pub events: Vec<ConvergenceEvent>,
+    pub overflow: bool,
+    pub decode_failed: bool,
+}
+
+#[cfg(test)]
+impl PeerRelay {
+    pub(crate) fn enable_convergence_observer(&self) -> Result<(), &'static str> {
+        let mut guard = self
+            .convergence_observer
+            .lock()
+            .map_err(|_| "observer poisoned")?;
+        if guard.is_some() {
+            return Err("observer already installed");
+        }
+        *guard = Some(ConvergenceSnapshot::default());
+        Ok(())
+    }
+
+    pub(crate) fn convergence_snapshot(&self) -> Result<ConvergenceSnapshot, &'static str> {
+        let guard = self
+            .convergence_observer
+            .lock()
+            .map_err(|_| "observer poisoned")?;
+        guard.clone().ok_or("observer disabled")
+    }
+
+    pub(crate) fn observe_convergence_sent(&self, wire: &[u8], relay: [u8; 32]) {
+        use sha2::{Digest, Sha256};
+        let Ok(mut guard) = self.convergence_observer.lock() else {
+            return;
+        };
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        if state.events.len() == 16 {
+            state.overflow = true;
+            return;
+        }
+        let Ok(frame) = RelayedDm::from_postcard(wire) else {
+            state.decode_failed = true;
+            return;
+        };
+        state.events.push(ConvergenceEvent {
+            request_id: frame.inner.request_id,
+            sender: frame.header.sender_agent_id,
+            destination: frame.header.dst_agent_id,
+            digest_present: frame.header.inner_digest.is_some(),
+            hop: relay,
+            prefix: frame.header.sender_agent_id,
+            sent_wire: Some((wire.len(), Sha256::digest(wire).into())),
+            disposition: None,
+        });
+    }
+
+    pub(crate) fn observe_convergence_received(
+        &self,
+        frame: &RelayedDm,
+        peer: [u8; 32],
+        prefix: [u8; 32],
+        disposition: RelayDisposition,
+    ) {
+        let Ok(mut guard) = self.convergence_observer.lock() else {
+            return;
+        };
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        if state.events.len() == 16 {
+            state.overflow = true;
+            return;
+        }
+        state.events.push(ConvergenceEvent {
+            request_id: frame.inner.request_id,
+            sender: frame.header.sender_agent_id,
+            destination: frame.header.dst_agent_id,
+            digest_present: frame.header.inner_digest.is_some(),
+            hop: peer,
+            prefix,
+            sent_wire: None,
+            disposition: Some(disposition),
+        });
+    }
+}
+
+#[cfg(test)]
+mod convergence_observer_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_and_decode_failure_are_explicit() {
+        let relay = PeerRelay::new();
+        relay.observe_convergence_sent(b"invalid", [0; 32]);
+        assert_eq!(
+            relay.convergence_snapshot().unwrap_err(),
+            "observer disabled"
+        );
+        relay.enable_convergence_observer().unwrap();
+        assert!(relay.enable_convergence_observer().is_err());
+        relay.observe_convergence_sent(b"invalid", [0; 32]);
+        let view = relay.convergence_snapshot().unwrap();
+        assert!(view.decode_failed);
+        assert!(view.events.is_empty());
+    }
+
+    #[test]
+    fn bounded_projection_and_poison_are_explicit() {
+        let relay = PeerRelay::new();
+        relay.enable_convergence_observer().unwrap();
+        let mut frame = super::tests::dummy_inner();
+        frame.request_id = [7; 16];
+        let frame = RelayedDm {
+            header: RelayHeader {
+                version: RelayHeader::VERSION,
+                dst_agent_id: [2; 32],
+                sender_agent_id: [1; 32],
+                sender_public_key: vec![],
+                originated_at_unix_ms: 1,
+                inner_digest: None,
+                signature: vec![],
+            },
+            inner: frame,
+        };
+        for _ in 0..17 {
+            relay.observe_convergence_received(
+                &frame,
+                [3; 32],
+                [1; 32],
+                RelayDisposition::DeliverLocally,
+            );
+        }
+        let view = relay.convergence_snapshot().unwrap();
+        assert_eq!(view.events.len(), 16);
+        assert!(view.overflow);
+        assert_eq!(view.events[0].request_id, [7; 16]);
+        assert_eq!(view.events[0].hop, [3; 32]);
+        assert_eq!(view.events[0].sent_wire, None);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = relay.convergence_observer.lock().unwrap();
+            panic!("inert observer poison");
+        });
+        relay.observe_convergence_sent(b"invalid", [0; 32]);
+        assert_eq!(
+            relay.convergence_snapshot().unwrap_err(),
+            "observer poisoned"
+        );
     }
 }

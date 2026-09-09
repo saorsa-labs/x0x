@@ -24,7 +24,13 @@ async fn build_agent(dir: &TempDir) -> Agent {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_peer_cache_dir(&peer_cache_dir)
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        })
         .build()
         .await
         .unwrap();
@@ -218,7 +224,13 @@ async fn announcement_with_user_identity_round_trip() {
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_user_key(user_kp)
         .with_peer_cache_dir(test_peer_cache_dir(&dir))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        })
         .build()
         .await
         .unwrap();
