@@ -103,3 +103,8 @@ max-threads = 2
 [[profile.default.overrides]]
 filter = "test(hs_f2_membership_cluster) | test(issue506_public_broadcast_control)"
 test-group = "membership-cluster"
+
+# #501: real multi-peer controls share the existing localhost serialization.
+[[profile.default.overrides]]
+filter = "test(legacy_bus_interop_tests::)"
+test-group = "quic-localhost"

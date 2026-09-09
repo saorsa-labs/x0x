@@ -3199,6 +3199,25 @@ impl NetworkNode {
             .map(|s| s.set_at)
     }
 
+    /// Install reverse Admin suppression for the single controlling task of
+    /// the current-thread diamond fixture. This synchronous sequence is not
+    /// an atomic absent-entry API for concurrent cross-thread callers.
+    #[cfg(test)]
+    pub(crate) fn suppress_admin_reconnect_for_testing(
+        &self,
+        peer_id: [u8; 32],
+    ) -> Option<Instant> {
+        {
+            // Reject even expired occupancy, and never recover a poisoned lock.
+            let map = self.reconnect_suppressions.lock().ok()?;
+            if map.contains_key(&peer_id) {
+                return None;
+            }
+        } // Release the inspection guard before the existing mechanism relocks.
+        self.suppress_reconnect(peer_id, DisconnectReason::Admin);
+        self.reconnect_suppression_set_at(peer_id)
+    }
+
     /// Outbound dial choke point, pre-socket half (issue #292, invariant C).
     ///
     /// Every id-known outbound seam — [`Self::connect_peer`],
@@ -3402,13 +3421,26 @@ impl NetworkNode {
     /// transport-connected peer with a live suppression tombstone is
     /// excluded even inside the transient accept-to-close window.
     pub(crate) async fn gossip_plane_peers(&self) -> Vec<AntPeerId> {
-        let mut admitted = Vec::new();
-        for peer in self.send_ready_peers().await {
-            if self.peer_admission(&peer).await == PeerAdmission::Admitted {
-                admitted.push(peer);
-            }
-        }
-        admitted
+        select_gossip_peers(
+            self.send_ready_peers(),
+            |peer| async move { self.peer_admission(&peer).await },
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn gossip_plane_peers_recorded(
+        &self,
+        recorder: &gossip_selection_diagnostics::Recorder,
+    ) -> Vec<AntPeerId> {
+        select_gossip_peers(
+            self.send_ready_peers(),
+            |peer| async move { self.peer_admission(&peer).await },
+            Some(recorder),
+        )
+        .await
     }
 
     /// Handle an inbound plane hello (issue #206).
@@ -4640,6 +4672,457 @@ fn plane_recently_cleared(
     };
     map.get(peer)
         .is_some_and(|at| at.elapsed() < PLANE_REVERIFY_TTL)
+}
+
+// One selection body for the existing method and its test-only observation path.
+// Recorder work is absent from non-test compilation; neither path adds a probe.
+pub(crate) async fn select_gossip_peers<Q, F, A>(
+    query: Q,
+    mut admission: F,
+    #[cfg(test)] recorder: Option<&gossip_selection_diagnostics::Recorder>,
+) -> Vec<AntPeerId>
+where
+    Q: std::future::Future<Output = Vec<AntPeerId>>,
+    F: FnMut(AntPeerId) -> A,
+    A: std::future::Future<Output = PeerAdmission>,
+{
+    let mut admitted = Vec::new();
+    #[cfg(test)]
+    if let Some(recorder) = recorder {
+        recorder.query_started();
+    }
+    let candidates = query.await;
+    #[cfg(test)]
+    if let Some(recorder) = recorder {
+        recorder.query_returned(&candidates);
+    }
+    for peer in candidates {
+        #[cfg(test)]
+        if let Some(recorder) = recorder {
+            recorder.admission_started();
+        }
+        let verdict = admission(peer).await;
+        #[cfg(test)]
+        if let Some(recorder) = recorder {
+            recorder.admission_returned(verdict);
+        }
+        if verdict == PeerAdmission::Admitted {
+            admitted.push(peer);
+        }
+    }
+    #[cfg(test)]
+    if let Some(recorder) = recorder {
+        recorder.completed();
+    }
+    admitted
+}
+
+/// Per-acquisition test evidence, never a source of admission decisions.
+#[cfg(test)]
+pub(crate) mod gossip_selection_diagnostics {
+    use super::{AntPeerId, PeerAdmission};
+    use serde::Serialize;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::time::Instant;
+
+    const MAX_ROWS: usize = 16;
+    const LABELS: [&str; 4] = ["G5", "D5", "O5", "W5"];
+
+    #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        NotStarted,
+        CandidateQueryInFlight,
+        AdmissionsInProgress,
+        Complete,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    struct Candidate {
+        ordinal: usize,
+        peer_id_hex: String,
+        alias: Option<&'static str>,
+        admission_begin_ns: Option<u64>,
+        admission_end_ns: Option<u64>,
+        verdict: Option<&'static str>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub(crate) struct Snapshot {
+        stage: Stage,
+        query_begin_ns: Option<u64>,
+        query_end_ns: Option<u64>,
+        completed_ns: Option<u64>,
+        total_candidates: Option<u64>,
+        duplicate_candidates: Option<u64>,
+        unknown_candidates: Option<u64>,
+        candidate_overflow: bool,
+        counter_overflow: bool,
+        clock_incomplete: bool,
+        poisoned: bool,
+        identity_map_valid: bool,
+        candidates: Vec<Candidate>,
+        #[serde(skip)]
+        next_admission: usize,
+    }
+
+    impl Snapshot {
+        pub(crate) fn complete(&self) -> bool {
+            self.stage == Stage::Complete && self.decision_fields_complete()
+        }
+
+        fn decision_fields_complete(&self) -> bool {
+            self.identity_map_valid
+                && !self.poisoned
+                && !self.candidate_overflow
+                && !self.counter_overflow
+                && !self.clock_incomplete
+                && self.duplicate_candidates == Some(0)
+                && self.unknown_candidates == Some(0)
+        }
+
+        pub(crate) fn edge(&self, expected: [u8; 32]) -> &'static str {
+            if !self.decision_fields_complete() || self.query_end_ns.is_none() {
+                return "Unknown";
+            }
+            let full = hex::encode(expected);
+            match self.candidates.iter().find(|row| row.peer_id_hex == full) {
+                None if self.stage == Stage::Complete => "AbsentFromReturnedCandidates",
+                None => "Unknown",
+                Some(row) => match row.verdict {
+                    Some("Suppressed") => "CandidateAdmissionSuppressed",
+                    Some("NotConnected") => "CandidateAdmissionNotConnected",
+                    Some("PlanePending") => "CandidateAdmissionPlanePending",
+                    Some("Admitted") => "CandidateAdmissionAdmitted",
+                    _ => "CandidateAdmissionUnfinished",
+                },
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct Recorder {
+        start: Instant,
+        identities: Option<[[u8; 32]; 4]>,
+        state: Arc<Mutex<Snapshot>>,
+        poisoned: Arc<AtomicBool>,
+    }
+
+    impl Recorder {
+        pub(crate) fn new(start: Instant, identities: Option<[[u8; 32]; 4]>) -> Self {
+            let identities = identities
+                .filter(|ids| ids.iter().enumerate().all(|(i, id)| !ids[..i].contains(id)));
+            Self {
+                start,
+                identities,
+                state: Arc::new(Mutex::new(Snapshot {
+                    stage: Stage::NotStarted,
+                    query_begin_ns: None,
+                    query_end_ns: None,
+                    completed_ns: None,
+                    total_candidates: None,
+                    duplicate_candidates: None,
+                    unknown_candidates: None,
+                    candidate_overflow: false,
+                    counter_overflow: false,
+                    clock_incomplete: false,
+                    poisoned: false,
+                    identity_map_valid: identities.is_some(),
+                    candidates: Vec::new(),
+                    next_admission: 0,
+                })),
+                poisoned: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn write(&self, update: impl FnOnce(&mut Snapshot, Option<u64>)) {
+            let at = Instant::now()
+                .checked_duration_since(self.start)
+                .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+            match self.state.lock() {
+                Ok(mut state) => {
+                    state.clock_incomplete |= at.is_none();
+                    update(&mut state, at);
+                }
+                Err(_) => self.poisoned.store(true, Ordering::Relaxed),
+            }
+        }
+
+        pub(super) fn query_started(&self) {
+            self.write(|s, at| {
+                s.stage = Stage::CandidateQueryInFlight;
+                s.query_begin_ns = at;
+            });
+        }
+
+        pub(super) fn query_returned(&self, peers: &[AntPeerId]) {
+            self.write(|s, at| {
+                s.stage = Stage::AdmissionsInProgress;
+                s.query_end_ns = at;
+                s.total_candidates = u64::try_from(peers.len()).ok();
+                s.counter_overflow |= s.total_candidates.is_none();
+                s.candidate_overflow = peers.len() > MAX_ROWS;
+                // Full duplicate accounting is bounded by the retained-row cap.
+                // Beyond it, null and overflow forbid any absence inference.
+                s.duplicate_candidates = (!s.candidate_overflow).then(|| {
+                    peers
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, peer)| peers[..*i].contains(peer))
+                        .count() as u64
+                });
+                s.unknown_candidates = self
+                    .identities
+                    .map(|ids| peers.iter().filter(|peer| !ids.contains(&peer.0)).count())
+                    .and_then(|n| u64::try_from(n).ok());
+                s.candidates = peers
+                    .iter()
+                    .take(MAX_ROWS)
+                    .enumerate()
+                    .map(|(ordinal, peer)| Candidate {
+                        ordinal,
+                        peer_id_hex: hex::encode(peer.0),
+                        alias: self
+                            .identities
+                            .and_then(|ids| ids.iter().position(|id| *id == peer.0))
+                            .map(|i| LABELS[i]),
+                        admission_begin_ns: None,
+                        admission_end_ns: None,
+                        verdict: None,
+                    })
+                    .collect();
+            });
+        }
+
+        pub(super) fn admission_started(&self) {
+            self.write(|s, at| {
+                if let Some(row) = s.candidates.get_mut(s.next_admission) {
+                    row.admission_begin_ns = at;
+                }
+            });
+        }
+
+        pub(super) fn admission_returned(&self, verdict: PeerAdmission) {
+            self.write(|s, at| {
+                if let Some(row) = s.candidates.get_mut(s.next_admission) {
+                    row.admission_end_ns = at;
+                    row.verdict = Some(match verdict {
+                        PeerAdmission::Suppressed => "Suppressed",
+                        PeerAdmission::NotConnected => "NotConnected",
+                        PeerAdmission::PlanePending => "PlanePending",
+                        PeerAdmission::Admitted => "Admitted",
+                    });
+                }
+                match s.next_admission.checked_add(1) {
+                    Some(next) => s.next_admission = next,
+                    None => s.counter_overflow = true,
+                }
+            });
+        }
+
+        pub(super) fn completed(&self) {
+            self.write(|s, at| {
+                s.stage = Stage::Complete;
+                s.completed_ns = at;
+            });
+        }
+
+        pub(crate) fn snapshot(&self) -> Snapshot {
+            let mut snapshot = match self.state.lock() {
+                Ok(state) => state.clone(),
+                Err(poisoned) => {
+                    self.poisoned.store(true, Ordering::Relaxed);
+                    poisoned.into_inner().clone()
+                }
+            };
+            snapshot.poisoned = self.poisoned.load(Ordering::Relaxed);
+            snapshot
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_diagnostic_preserves_actual_core_calls_and_output() {
+        let ids = [[1; 32], [2; 32], [3; 32], [4; 32]];
+        let peers = ids.map(ant_quic::PeerId).to_vec();
+        let expected = vec![ant_quic::PeerId(ids[3])];
+        for recorded in [false, true] {
+            let recorder = Recorder::new(Instant::now(), Some(ids));
+            let calls = std::cell::RefCell::new(Vec::new());
+            let query = std::cell::Cell::new(0);
+            let output = super::select_gossip_peers(
+                async {
+                    query.set(query.get() + 1);
+                    peers.clone()
+                },
+                |peer| {
+                    calls.borrow_mut().push(peer);
+                    std::future::ready(match peer.0[0] {
+                        1 => PeerAdmission::Suppressed,
+                        2 => PeerAdmission::NotConnected,
+                        3 => PeerAdmission::PlanePending,
+                        _ => PeerAdmission::Admitted,
+                    })
+                },
+                recorded.then_some(&recorder),
+            )
+            .await;
+            assert_eq!(query.get(), 1);
+            assert_eq!(*calls.borrow(), peers);
+            assert_eq!(output, expected);
+            if recorded {
+                let snapshot = recorder.snapshot();
+                assert!(snapshot.complete());
+                assert_eq!(
+                    ids.map(|id| snapshot.edge(id)),
+                    [
+                        "CandidateAdmissionSuppressed",
+                        "CandidateAdmissionNotConnected",
+                        "CandidateAdmissionPlanePending",
+                        "CandidateAdmissionAdmitted",
+                    ]
+                );
+            }
+        }
+        let recorder = Recorder::new(Instant::now(), Some(ids));
+        let output = super::select_gossip_peers(
+            std::future::ready(Vec::new()),
+            |_| async { panic!("empty returned candidates must not call admission") },
+            Some(&recorder),
+        )
+        .await;
+        assert!(output.is_empty());
+        assert_eq!(
+            recorder.snapshot().edge(ids[0]),
+            "AbsentFromReturnedCandidates"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_diagnostic_keeps_partial_query_and_admission_on_drop() {
+        let ids = [[1; 32], [2; 32], [3; 32], [4; 32]];
+        let recorder = Recorder::new(Instant::now(), Some(ids));
+        let future = super::select_gossip_peers(
+            std::future::pending(),
+            |_| std::future::ready(PeerAdmission::Admitted),
+            Some(&recorder),
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), future)
+                .await
+                .is_err()
+        );
+        let query = recorder.snapshot();
+        assert_eq!(query.stage, Stage::CandidateQueryInFlight);
+        assert_eq!(query.total_candidates, None);
+        assert_eq!(query.edge(ids[0]), "Unknown");
+        let recorder = Recorder::new(Instant::now(), Some(ids));
+        let calls = std::cell::Cell::new(0);
+        let future = super::select_gossip_peers(
+            std::future::ready(vec![ant_quic::PeerId(ids[0]), ant_quic::PeerId(ids[1])]),
+            |peer| {
+                calls.set(calls.get() + 1);
+                async move {
+                    if peer.0 == ids[1] {
+                        std::future::pending::<()>().await;
+                    }
+                    PeerAdmission::Admitted
+                }
+            },
+            Some(&recorder),
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), future)
+                .await
+                .is_err()
+        );
+        let partial = recorder.snapshot();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(partial.stage, Stage::AdmissionsInProgress);
+        assert_eq!(partial.edge(ids[0]), "CandidateAdmissionAdmitted");
+        assert_eq!(partial.edge(ids[1]), "CandidateAdmissionUnfinished");
+        assert!(partial.candidates[1].admission_begin_ns.is_some());
+        assert!(partial.candidates[1].admission_end_ns.is_none());
+        let frozen = serde_json::to_value(&partial).unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(serde_json::to_value(recorder.snapshot()).unwrap(), frozen);
+        assert_eq!(calls.get(), 2, "drop leaves no producer task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_diagnostic_bounds_unknown_duplicate_and_bad_map() {
+        let ids = [[1; 32], [2; 32], [3; 32], [4; 32]];
+        for (peers, map) in [
+            (vec![ant_quic::PeerId(ids[0]); MAX_ROWS + 1], Some(ids)),
+            (vec![ant_quic::PeerId(ids[0]); 2], Some(ids)),
+            (vec![ant_quic::PeerId([9; 32])], Some(ids)),
+            (vec![ant_quic::PeerId(ids[0])], Some([[1; 32]; 4])),
+        ] {
+            let recorder = Recorder::new(Instant::now(), map);
+            let calls = std::cell::Cell::new(0);
+            let output = super::select_gossip_peers(
+                std::future::ready(peers.clone()),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(PeerAdmission::Admitted)
+                },
+                Some(&recorder),
+            )
+            .await;
+            assert_eq!(
+                output, peers,
+                "diagnostic refusal cannot truncate actual selection"
+            );
+            assert_eq!(calls.get(), peers.len());
+            let snapshot = recorder.snapshot();
+            assert!(snapshot.candidates.len() <= MAX_ROWS);
+            assert!(!snapshot.complete());
+            assert_eq!(snapshot.edge(ids[3]), "Unknown");
+            if peers.len() > MAX_ROWS {
+                assert!(snapshot.candidate_overflow);
+                assert_eq!(snapshot.duplicate_candidates, None);
+                assert_eq!(snapshot.total_candidates, Some(peers.len() as u64));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_diagnostic_poison_clock_and_counter_do_not_change_selection() {
+        let ids = [[1; 32], [2; 32], [3; 32], [4; 32]];
+        for mutation in 0..3 {
+            let start = Instant::now()
+                + if mutation == 1 {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    std::time::Duration::ZERO
+                };
+            let recorder = Recorder::new(start, Some(ids));
+            if mutation == 0 {
+                let state = Arc::clone(&recorder.state);
+                assert!(std::panic::catch_unwind(|| {
+                    let _guard = state.lock().unwrap();
+                    panic!("inert poison control");
+                })
+                .is_err());
+            } else if mutation == 2 {
+                recorder.state.lock().unwrap().next_admission = usize::MAX;
+            }
+            let output = super::select_gossip_peers(
+                std::future::ready(vec![ant_quic::PeerId(ids[0])]),
+                |_| std::future::ready(PeerAdmission::Admitted),
+                Some(&recorder),
+            )
+            .await;
+            assert_eq!(output, vec![ant_quic::PeerId(ids[0])]);
+            let snapshot = recorder.snapshot();
+            assert!(!snapshot.complete());
+            assert_eq!(snapshot.edge(ids[0]), "Unknown");
+            match mutation {
+                0 => assert!(snapshot.poisoned),
+                1 => assert!(snapshot.clock_incomplete),
+                _ => assert!(snapshot.counter_overflow),
+            }
+        }
+    }
 }
 
 /// Project ant-quic's transport-filtered connection snapshot to peer IDs.

@@ -10168,6 +10168,30 @@ impl Agent {
             })
     }
 
+    // Same publish path and error mapping; test-only send-stage observation.
+    #[cfg(test)]
+    pub(crate) async fn publish_with_observed_fanout(
+        &self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> error::Result<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        runtime
+            .pubsub()
+            .publish_with_observed_fanout(topic.to_string(), bytes::Bytes::from(payload))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "publish failed: {}",
+                    e
+                )))
+            })
+    }
+
     /// Publish to a topic and return the signed V2 envelope bytes when
     /// signing is enabled.
     ///
@@ -25029,3 +25053,6 @@ mod peer_connected_handler_integration_tests {
 
 #[cfg(test)]
 mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod legacy_bus_interop_tests;

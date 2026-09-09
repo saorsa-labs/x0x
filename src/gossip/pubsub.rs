@@ -470,6 +470,56 @@ struct PublishFanoutOutcome {
     fan_out: u32,
     /// Signed envelope bytes when signing is enabled.
     envelope: Option<Bytes>,
+    /// Exact awaited send-stage counts, not remote receipt or forwarding proof.
+    #[cfg(test)]
+    observed_counts: Option<saorsa_gossip_pubsub::FanoutCounts>,
+}
+
+#[cfg(test)]
+impl PublishFanoutOutcome {
+    fn observed_fanout(self) -> (u32, Option<saorsa_gossip_pubsub::FanoutCounts>) {
+        (self.fan_out, self.observed_counts)
+    }
+}
+
+#[cfg(test)]
+mod observed_fanout_controls {
+    use super::PublishFanoutOutcome;
+    use saorsa_gossip_pubsub::FanoutCounts;
+
+    #[test]
+    fn retains_actual_counts_separately_from_report_override() {
+        for succeeded in [0, 1, 2] {
+            let counts = FanoutCounts {
+                attempted: 2,
+                succeeded,
+            };
+            let outcome = PublishFanoutOutcome {
+                fan_out: 7,
+                envelope: None,
+                observed_counts: Some(counts),
+            };
+            assert_eq!(outcome.observed_fanout(), (7, Some(counts)));
+        }
+    }
+
+    #[test]
+    fn unavailable_is_not_an_observed_zero() {
+        let outcome = |counts| {
+            PublishFanoutOutcome {
+                fan_out: 0,
+                envelope: None,
+                observed_counts: counts,
+            }
+            .observed_fanout()
+        };
+        assert_eq!(outcome(None), (0, None));
+        assert_eq!(
+            outcome(Some(FanoutCounts::default())),
+            (0, Some(FanoutCounts::default()))
+        );
+        assert_ne!(outcome(None), outcome(Some(FanoutCounts::default())));
+    }
 }
 
 /// Topic-name prefix marking a topic as local-only (issue #89).
@@ -1064,6 +1114,20 @@ impl PubSubManager {
             .fan_out)
     }
 
+    /// Retain the same awaited send-stage result for the controlled test load.
+    #[cfg(test)]
+    pub(crate) async fn publish_with_observed_fanout(
+        &self,
+        topic: String,
+        payload: Bytes,
+    ) -> NetworkResult<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let outcome = self
+            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .await?;
+        Ok(outcome.observed_fanout())
+    }
+
     /// Publish to a topic and return the signed V2 envelope bytes when
     /// signing is enabled.
     ///
@@ -1152,6 +1216,8 @@ impl PubSubManager {
             return Ok(PublishFanoutOutcome {
                 fan_out: 0,
                 envelope: None,
+                #[cfg(test)]
+                observed_counts: None,
             });
         }
 
@@ -1197,6 +1263,8 @@ impl PubSubManager {
                 Ok(PublishFanoutOutcome {
                     fan_out,
                     envelope: envelope_bytes,
+                    #[cfg(test)]
+                    observed_counts: counts,
                 })
             }
             Err(e) => {
