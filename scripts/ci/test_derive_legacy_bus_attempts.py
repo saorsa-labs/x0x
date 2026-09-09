@@ -221,6 +221,55 @@ class DerivationControls(unittest.TestCase):
         with self.assertRaisesRegex(module.Inconclusive, "TOPOLOGY_IDENTITY_DRIFT"):
             module.parse(b"\n".join(lines))
 
+    def test_generator_ancillary_preserves_exact_derivation(self):
+        plain = fixture()
+        expected = module.derive(module.parse(output(plain)), LOCK)
+        for diagnostic in (None, {}, {"schema": 1, "role": "G5", "cuts": {},
+                "load_returns": [{"ordinal": i, "reported_fanout": 3,
+                    "attempted": 2, "succeeded": i % 3} for i in range(200)],
+                "load_interpretation": None}):
+            with self.subTest(diagnostic_type=type(diagnostic).__name__):
+                enriched = copy.deepcopy(plain)
+                enriched["generator_diagnostics"] = diagnostic
+                self.assertEqual(module.derive(module.parse(output(enriched)), LOCK), expected)
+                self.assertNotEqual(hashlib.sha256(output(enriched)).digest(), hashlib.sha256(output(plain)).digest())
+
+    def test_generator_ancillary_cannot_relax_existing_oracles(self):
+        for mutation in ("missing", "default_zero", "optout_nonzero"):
+            record = fixture()
+            if mutation == "missing":
+                for cut in ("t0", "t1"):
+                    record["samples"]["D5"][cut]["egress"]["outbound_by_topic_named"] = []
+            elif mutation == "default_zero":
+                record["samples"]["D5"]["t1"]["egress"]["outbound_by_topic_named"][0]["outbound"]["eager"]["bytes"] = 0
+            else:
+                record["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"] = copy.deepcopy(record["samples"]["D5"]["t1"]["egress"]["outbound_by_topic_named"])
+            enriched = copy.deepcopy(record)
+            enriched["generator_diagnostics"] = {"schema": 1, "role": "G5", "cuts": {},
+                "load_returns": [{"ordinal": i, "reported_fanout": 2, "attempted": 2, "succeeded": 2} for i in range(200)],
+                "load_interpretation": {"attempted": 400, "send_stage_succeeded": 400,
+                    "zero_attempt_calls": 0, "attempted_without_send_stage_success_calls": 0}}
+            with self.subTest(mutation=mutation):
+                if mutation == "missing":
+                    for candidate in (record, enriched):
+                        with self.assertRaisesRegex(module.Inconclusive, "POSITIVE_BUS_ROW_ABSENT"):
+                            module.derive(module.parse(output(candidate)), LOCK)
+                else:
+                    expected = module.derive(module.parse(output(record)), LOCK)
+                    self.assertEqual(expected["derivation"], "FAIL")
+                    self.assertEqual(module.derive(module.parse(output(enriched)), LOCK), expected)
+
+    def test_generator_ancillary_shutdown_recapture_refused(self):
+        record = fixture()
+        record["generator_diagnostics"] = {"schema": 1, "role": "G5", "cuts": {},
+            "load_returns": [], "load_interpretation": None}
+        lines = output(record).splitlines()
+        final = json.loads(lines[-1][len(module.PREFIX):])
+        final["generator_diagnostics"]["load_returns"].append({"ordinal": 0, "reported_fanout": 2, "attempted": 2, "succeeded": 2})
+        lines[-1] = module.PREFIX + json.dumps(final).encode()
+        with self.assertRaisesRegex(module.Inconclusive, "POST_SHUTDOWN_RECAPTURE"):
+            module.parse(b"\n".join(lines))
+
 
 if __name__ == "__main__":
     unittest.main()

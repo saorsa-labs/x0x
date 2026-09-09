@@ -1253,6 +1253,135 @@ fn validate_topology_capture(
     Ok(())
 }
 
+// These cuts include background/local/relayed activity. Only load_returns
+// attributes counts to controlled calls. publish_total deltas do not validate
+// vector length or controlled origin; no cut is an acceptance predicate.
+fn generator_topic_projection(
+    rows: &std::collections::BTreeMap<String, saorsa_gossip_pubsub::OutboundTopicMeterSnapshot>,
+    zero_fanout: &std::collections::BTreeMap<String, u64>,
+    bus: saorsa_gossip_types::TopicId,
+) -> serde_json::Value {
+    use serde_json::json;
+    let key = bus.to_string(); // Same pinned TopicId projection as the existing meter.
+    let row = rows.get(&key).map(|row| {
+        let kind = |v: &saorsa_gossip_pubsub::OutboundKindMeterSnapshot| {
+            json!({"msgs":v.msgs,"bytes":v.bytes})
+        };
+        json!({"eager":kind(&row.eager),"ihave":kind(&row.ihave),
+            "iwant":kind(&row.iwant),"anti_entropy":kind(&row.anti_entropy)})
+    });
+    json!({"tracked_rows":rows.len(),"bus_row_present":row.is_some(),
+        "bus_outbound":row,"bus_zero_fanout":zero_fanout.get(&key)})
+}
+
+fn generator_cut(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
+    use serde_json::json;
+    let begin = diamond_now(clock);
+    let publish = agent
+        .gossip_stats()
+        .map(|s| json!({"publish_total":s.publish_total,"publish_failed":s.publish_failed}));
+    let stages = agent.gossip_pubsub_stage_stats().map(|s| {
+        let a = s.admission;
+        let origin = s.outbound_publish_origin;
+        json!({"topics":generator_topic_projection(&s.outbound_by_topic,
+                &s.zero_fanout_publishes_by_topic,
+                saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes())),
+            "origin":{"local_msgs":origin.local_msgs,"local_bytes":origin.local_bytes,
+                "relay_msgs":origin.relay_msgs,"relay_bytes":origin.relay_bytes},
+            "zero_fanout_publishes":s.zero_fanout_publishes,
+            "zero_succeeded_publishes":s.zero_succeeded_publishes,
+            "republish_per_peer_timeout":s.republish_per_peer_timeout,
+            "peers_evicted_not_connected":s.peers_evicted_not_connected,
+            "outbound_budget_exhausted":s.outbound_budget_exhausted,
+            "admission":{"admitted_critical":a.admitted_critical,"admitted_normal":a.admitted_normal,
+                "admitted_bulk":a.admitted_bulk,"dropped_bulk_peer_dead":a.dropped_bulk_peer_dead,
+                "dropped_bulk_peer_suspect":a.dropped_bulk_peer_suspect,
+                "dropped_bulk_peer_cooled":a.dropped_bulk_peer_cooled,
+                "dropped_bulk_backpressure":a.dropped_bulk_backpressure,
+                "dropped_normal_peer_dead":a.dropped_normal_peer_dead,
+                "dropped_normal_peer_suspect":a.dropped_normal_peer_suspect,
+                "dropped_critical_hard_error":a.dropped_critical_hard_error,
+                "dropped_critical_cooling":a.dropped_critical_cooling,
+                "dropped_critical_no_target":a.dropped_critical_no_target}})
+    });
+    generator_cut_projection(begin, diamond_now(clock), publish, stages)
+}
+
+fn generator_cut_projection(
+    begin: u64,
+    end: u64,
+    publish: Option<serde_json::Value>,
+    stages: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({"begin_ns":begin,"end_ns":end,"publish":publish,"stages":stages})
+}
+
+fn generator_load_returns(
+    calls: &[(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)],
+) -> serde_json::Value {
+    // Never silently truncate or turn missing counts into zero. Real caller is
+    // the unchanged fixed 200 loop; an oversized diagnostic is unavailable.
+    if calls.len() > 200 {
+        return serde_json::Value::Null;
+    }
+    serde_json::Value::Array(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (reported, counts))| {
+                serde_json::json!({"ordinal":ordinal,"reported_fanout":reported,
+            "attempted":counts.map(|c|c.attempted),"succeeded":counts.map(|c|c.succeeded)})
+            })
+            .collect(),
+    )
+}
+
+fn interpret_generator_load(rows: &serde_json::Value) -> Option<serde_json::Value> {
+    let rows = rows.as_array()?;
+    if rows.len() != 200 {
+        return None;
+    }
+    let (mut attempted, mut succeeded, mut zero_attempt_calls, mut no_success_calls) =
+        (0u64, 0u64, 0u64, 0u64);
+    for (ordinal, row) in rows.iter().enumerate() {
+        diamond_keys(
+            row,
+            &["ordinal", "reported_fanout", "attempted", "succeeded"],
+        )
+        .ok()?;
+        if row["ordinal"].as_u64()? != ordinal as u64
+            || row["reported_fanout"].as_u64()? > u64::from(u32::MAX)
+        {
+            return None;
+        }
+        let a = row["attempted"].as_u64()?;
+        let s = row["succeeded"].as_u64()?;
+        if s > a {
+            return None;
+        }
+        attempted = attempted.checked_add(a)?;
+        succeeded = succeeded.checked_add(s)?;
+        zero_attempt_calls += u64::from(a == 0);
+        no_success_calls += u64::from(a > 0 && s == 0);
+    }
+    // Send-stage Ok only: not remote receipt, decode, forwarding or durable ACK.
+    // No soft/hard error taxonomy is available in FanoutCounts.
+    Some(
+        serde_json::json!({"attempted":attempted,"send_stage_succeeded":succeeded,
+        "zero_attempt_calls":zero_attempt_calls,"attempted_without_send_stage_success_calls":no_success_calls}),
+    )
+}
+
+fn attach_generator_load(
+    raw: &mut serde_json::Value,
+    calls: &[(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)],
+) {
+    let rows = generator_load_returns(calls);
+    raw["generator_diagnostics"]["load_interpretation"] =
+        serde_json::json!(interpret_generator_load(&rows));
+    raw["generator_diagnostics"]["load_returns"] = rows;
+}
+
 fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
     let begin = diamond_now(clock);
     let egress = agent
@@ -1422,6 +1551,7 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
         "phase":"setup","outcome":"UNRUN","pid":std::process::id(),
         "claim":"controlled bus eager send attempts; not forwarding, wire occupancy or field reduction",
         "universe":topic_universe(agents),"samples":{},"load":{},
+        "generator_diagnostics":{"schema":1,"role":"G5","cuts":{},"load_returns":[],"load_interpretation":null},
         "identities":agents.iter().map(|a|json!({"agent":hex::encode(a.agent_id().0),"machine":hex::encode(a.machine_id().0)})).collect::<Vec<_>>(),
         "generator_peer_hex8":saorsa_gossip_types::PeerId::new(agents[0].machine_id().0).to_string(),
         "binary_sha256":preparation.binary_sha256,
@@ -1459,6 +1589,7 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     };
     let captured_pre = raw["topology"].clone();
     emit_measurement(&raw);
+    raw["generator_diagnostics"]["cuts"]["t0"] = generator_cut(&agents[0], clock);
     raw["samples"] =
         json!({"D5":{"t0":raw_sample(&agents[1],clock)},"O5":{"t0":raw_sample(&agents[2],clock)}});
     raw["phase"] = json!("t0");
@@ -1475,13 +1606,16 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     let mut sent = 0u64;
     let mut observed = std::collections::BTreeSet::new();
     let mut fanouts = Vec::new();
+    let mut load_returns = Vec::with_capacity(200);
     bounded("fixed 200-publication controlled load", Duration::from_secs(30), async {
         while sent < 200 {
             tokio::select! {
                 _ = timer.tick() => {
                     let mut payload = vec![0x50;4096];
                     payload[..8].copy_from_slice(&sent.to_be_bytes());
-                    let fanout=agents[0].publish_with_fanout(DM_BUS_TOPIC,payload).await.expect("generator publish");
+                    let returned=agents[0].publish_with_observed_fanout(DM_BUS_TOPIC,payload).await.expect("generator publish");
+                    let fanout=returned.0;
+                    load_returns.push(returned);
                     fanouts.push(fanout);sent+=1;
                 }
                 message=witness.recv() => {
@@ -1497,6 +1631,8 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     raw["samples"]["D5"]["t1"] = raw_sample(&agents[1], clock);
     raw["samples"]["O5"]["t1"] = raw_sample(&agents[2], clock);
     raw["load"] = json!({"sent":sent,"payload_bytes":4096,"period_ms":50,"elapsed_ns":started.elapsed().as_nanos() as u64,"fanouts":fanouts,"witness_observed_during_load":observed.len(),"witness_attribution":"none"});
+    raw["generator_diagnostics"]["cuts"]["t1"] = generator_cut(&agents[0], clock);
+    attach_generator_load(&mut raw, &load_returns);
     raw["topology"]["observations"]["t1"] = bounded(
         "final diamond observation",
         SETUP,
@@ -2040,4 +2176,179 @@ fn readiness_diagnostic_checks_identity_clock_overflow_and_closed_fallback() {
     assert_eq!(retained["samples"], samples);
     assert_eq!(retained["load"], load);
     assert_eq!(retained["readiness_diagnostics"], value);
+}
+
+// Constructor-free ancillary diagnostics controls; no call into generator_cut.
+#[test]
+fn generator_returns_preserve_order_override_and_unavailable() {
+    use saorsa_gossip_pubsub::FanoutCounts;
+    let rows = generator_load_returns(&[
+        (
+            9,
+            Some(FanoutCounts {
+                attempted: 2,
+                succeeded: 1,
+            }),
+        ),
+        (0, None),
+        (0, Some(FanoutCounts::default())),
+    ]);
+    assert_eq!(
+        rows[0],
+        serde_json::json!({"ordinal":0,"reported_fanout":9,"attempted":2,"succeeded":1})
+    );
+    assert_eq!(rows[1]["ordinal"], 1);
+    assert!(rows[1]["attempted"].is_null() && rows[1]["succeeded"].is_null());
+    assert_eq!(rows[2]["attempted"], 0);
+    assert_eq!(rows[2]["succeeded"], 0);
+    assert!(interpret_generator_load(&rows).is_none());
+    assert!(generator_load_returns(&vec![(0, None); 201]).is_null());
+}
+
+#[test]
+fn generator_load_interpretation_rejects_incoherent_or_partial_records() {
+    use saorsa_gossip_pubsub::FanoutCounts;
+    use serde_json::json;
+    let good = generator_load_returns(&vec![
+        (
+            7,
+            Some(FanoutCounts {
+                attempted: 2,
+                succeeded: 1
+            })
+        );
+        200
+    ]);
+    assert_eq!(
+        interpret_generator_load(&good),
+        Some(json!({"attempted":400,"send_stage_succeeded":200,
+        "zero_attempt_calls":0,"attempted_without_send_stage_success_calls":0}))
+    );
+    for (key, value) in [
+        ("succeeded", json!(3)),
+        ("attempted", json!(true)),
+        ("attempted", json!(-1)),
+        ("succeeded", json!(null)),
+        ("ordinal", json!(0)),
+        ("reported_fanout", json!(u64::MAX)),
+    ] {
+        let mut bad = good.clone();
+        bad[1][key] = value;
+        assert!(interpret_generator_load(&bad).is_none(), "{key}");
+    }
+    let mut missing = good.clone();
+    missing.as_array_mut().unwrap().pop();
+    assert!(interpret_generator_load(&missing).is_none());
+    let mut overflow = good.clone();
+    for row in overflow.as_array_mut().unwrap() {
+        row["attempted"] = json!(u64::MAX);
+    }
+    assert!(interpret_generator_load(&overflow).is_none());
+    let mut extra = good;
+    extra[0]["unexpected"] = json!(1);
+    assert!(interpret_generator_load(&extra).is_none());
+}
+
+#[test]
+fn generator_topic_projection_preserves_absence_and_exact_bus_selection() {
+    use saorsa_gossip_pubsub::{OutboundKindMeterSnapshot, OutboundTopicMeterSnapshot};
+    use saorsa_gossip_types::TopicId;
+    use std::collections::BTreeMap;
+    let bus = TopicId::from_entity(DM_BUS_TOPIC.as_bytes());
+    let other = TopicId::from_entity(b"different-topic");
+    let zero = || OutboundKindMeterSnapshot {
+        label: "not-retained",
+        msgs: 0,
+        bytes: 0,
+    };
+    let row = || OutboundTopicMeterSnapshot {
+        eager: zero(),
+        ihave: zero(),
+        iwant: zero(),
+        anti_entropy: zero(),
+    };
+    let mut rows = BTreeMap::new();
+    rows.insert(other.to_string(), row());
+    let mut zeros = BTreeMap::new();
+    zeros.insert(other.to_string(), 17);
+    let absent = generator_topic_projection(&rows, &zeros, bus);
+    assert_eq!(absent["bus_row_present"], false);
+    assert!(absent["bus_outbound"].is_null() && absent["bus_zero_fanout"].is_null());
+    rows.insert(bus.to_string(), row());
+    zeros.insert(bus.to_string(), 0);
+    let present = generator_topic_projection(&rows, &zeros, bus);
+    assert_eq!(present["bus_row_present"], true);
+    assert_eq!(present["tracked_rows"], 2);
+    assert_eq!(present["bus_outbound"]["eager"]["bytes"], 0);
+    assert_eq!(present["bus_zero_fanout"], 0);
+    diamond_keys(
+        &present,
+        &[
+            "tracked_rows",
+            "bus_row_present",
+            "bus_outbound",
+            "bus_zero_fanout",
+        ],
+    )
+    .unwrap();
+    for kind in ["eager", "ihave", "iwant", "anti_entropy"] {
+        diamond_keys(&present["bus_outbound"][kind], &["msgs", "bytes"]).unwrap();
+    }
+    let text = present.to_string();
+    assert!(
+        !text.contains(&bus.to_string())
+            && !text.contains(&other.to_string())
+            && !text.contains("not-retained")
+    );
+    let unavailable = generator_cut_projection(1, 2, None, None);
+    assert!(unavailable["publish"].is_null() && unavailable["stages"].is_null());
+}
+
+#[test]
+fn generator_ancillary_attachment_is_bounded_and_ignores_cut_totals() {
+    use saorsa_gossip_pubsub::FanoutCounts;
+    use serde_json::json;
+    let calls = vec![
+        (
+            u32::MAX,
+            Some(FanoutCounts {
+                attempted: usize::MAX,
+                succeeded: usize::MAX
+            })
+        );
+        200
+    ];
+    let mut raw = json!({"phase":"t1","outcome":"INCONCLUSIVE","reason":"existing oracle",
+        "generator_diagnostics":{"schema":1,"role":"G5","cuts":{"t0":{"publish":{"publish_total":0}},
+        "t1":{"publish":{"publish_total":u64::MAX}}}}});
+    attach_generator_load(&mut raw, &calls);
+    assert!(
+        serde_json::to_vec(&raw["generator_diagnostics"])
+            .unwrap()
+            .len()
+            < 65536
+    );
+    let calls = vec![
+        (
+            2,
+            Some(FanoutCounts {
+                attempted: 2,
+                succeeded: 0
+            })
+        );
+        200
+    ];
+    attach_generator_load(&mut raw, &calls);
+    assert_eq!(
+        raw["generator_diagnostics"]["load_interpretation"]
+            ["attempted_without_send_stage_success_calls"],
+        200
+    );
+    assert_eq!(raw["phase"], "t1");
+    assert_eq!(raw["outcome"], "INCONCLUSIVE");
+    assert_eq!(raw["reason"], "existing oracle");
+    raw["generator_diagnostics"]["cuts"] = json!(null);
+    let prior = raw["generator_diagnostics"]["load_interpretation"].clone();
+    attach_generator_load(&mut raw, &calls);
+    assert_eq!(raw["generator_diagnostics"]["load_interpretation"], prior);
 }
