@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """One #287 matched comparator; private evidence only, no host runtime fallback."""
 import argparse
+from contextlib import contextmanager
+import math
 import errno
 import hashlib
 import json
@@ -15,9 +17,9 @@ import subprocess
 import tarfile
 import time
 
-PARENT = 'd18172e82b28eff753a8d88dc0a12df47141ed96'
-ORIGINAL_PARENT = '08a92abc9871e5de3a4bd0542bfeb1127a15ebf8'
-PARENT_TREE = 'd25fa4c40d2462ffef9df6398cd2f1779f6579dd'
+PARENT = '1c23fdaef443b17e0a9f55d7f34f45d1393d227e'
+ORIGINAL_PARENT = 'd18172e82b28eff753a8d88dc0a12df47141ed96'
+PARENT_TREE = '58bd36d3b81ad07051fe6e08b3f81ff95a3a1183'
 OBSERVABILITY_PATHS = frozenset({'.github/workflows/issue287-matched-reader.yml',
     'scripts/ci/issue287-matched-reader-evidence.py',
     'scripts/ci/test_issue287_matched_reader_evidence.py'})
@@ -557,7 +559,7 @@ def validate_build(workspace, scratch, source, observer=None):
     return value
 
 
-def validate_build_inputs(workspace, scratch, source, observer):
+def build_description(workspace, scratch, observer=None):
     observe(observer, 'role', 'binary_metadata')
     data = operation(observer, 'metadata_read', lambda: read_owned(scratch / 'binaries.json', scratch, JSON_LIMIT, observer))
     meta = operation(observer, 'metadata_json', lambda: object_json(data))
@@ -586,6 +588,11 @@ def validate_build_inputs(workspace, scratch, source, observer):
     observe(observer, 'stage', 'binary_identity')
     require(binary_id == PRODUCER_BINARY_ID and binary['binary-id'] == PRODUCER_BINARY_ID and binary['binary-name'] == 'ws_integration'
             and binary['kind'] == 'test' and binary['package-id'] == packages[0]['id'], 'BINARY_IDENTITY')
+    return meta, cargo, packages, binary_id, binary, target
+
+
+def validate_build_inputs(workspace, scratch, source, observer):
+    meta, _cargo, packages, binary_id, binary, target = build_description(workspace, scratch, observer)
     observe(observer, 'role', 'test_binary')
     test = operation(observer, 'test_path', lambda: regular(Path(binary['binary-path']), target, MAX_TOTAL, observer))
     observe(observer, 'role', 'binary_metadata')
@@ -657,6 +664,381 @@ def validate_build_inputs(workspace, scratch, source, observer):
     return {'scratch': scratch.name, 'binary_id': binary_id,
             'binary_sha256': operation(observer, 'test_digest', lambda: digest(test)),
             'daemon_path': str(daemon), 'daemon_sha256': daemon_sha, 'input_hashes': custody['files']}
+
+
+# These are detachment limits only. Archive/capture MAX_TOTAL stays unchanged.
+DETACH_NAMES = ('gui-coverage', 'x0x', 'x0x-keygen', 'x0x-user-keygen', 'x0xd', 'x0xd-forge-injector')
+DETACH_FILE_LIMIT = 2 * 1024 * 1024 * 1024
+DETACH_TOTAL_LIMIT = 6 * DETACH_FILE_LIMIT
+DETACH_RECEIPT_LIMIT = 32 * 1024
+DETACH_CHUNK = 1024 * 1024
+DETACH_CODES = frozenset({'DETACH_DEADLINE', 'DETACH_FILE', 'DETACH_MODE', 'DETACH_DIRECTORY',
+    'DETACH_PATH', 'DETACH_DIRECTORY_CHANGED', 'DETACH_SHORT_READ', 'DETACH_GROWTH',
+    'DETACH_INPUT_CHANGED', 'DETACH_SET', 'DETACH_CAPACITY', 'DETACH_METADATA_CHANGED',
+    'DETACH_CUSTODY', 'DETACH_PACKAGE', 'DETACH_KIND', 'DETACH_ACTION', 'DETACH_SHORT_WRITE',
+    'DETACH_COPY_CHANGED', 'DETACH_DESTINATION', 'DETACH_TEMP_CHANGED', 'DETACH_INSTALL_CHANGED',
+    'DETACH_RECEIPT_BOUND', 'DETACH_PROGRESS_CHANGED', 'DETACH_PROGRESS_EXISTS', 'DETACH_RESPONSE', 'DETACH_REQUEST'})
+
+
+def detach_budget(deadline):
+    require(type(deadline) in (float, int) and math.isfinite(deadline), 'DETACH_DEADLINE')
+    require(not CANCELLED and time.monotonic() < deadline, 'DETACH_DEADLINE')
+
+
+def detach_state(info):
+    return [info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def detach_file(info, single=False, executable=True):
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            0 <= info.st_size <= DETACH_FILE_LIMIT and info.st_nlink >= 1 and
+            (not single or info.st_nlink == 1), 'DETACH_FILE')
+    mode = stat.S_IMODE(info.st_mode)
+    require(not mode & 0o7000 and (not executable or bool(mode & 0o111)), 'DETACH_MODE')
+
+
+def detach_directory(fd):
+    info = os.fstat(fd)
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+            not stat.S_IMODE(info.st_mode) & 0o022, 'DETACH_DIRECTORY')
+
+
+@contextmanager
+def detach_parent(target, relative):
+    """Open every component without following links; hold owned target/parent FDs."""
+    require(target.is_absolute() and '..' not in target.parts and
+            not relative.is_absolute() and relative.parts and
+            all(x not in ('.', '..', '') for x in relative.parts), 'DETACH_PATH')
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    anchor = os.open('/', flags)
+    parent = None
+    try:
+        for part in target.parts[1:]:
+            child = os.open(part, flags, dir_fd=anchor)
+            os.close(anchor); anchor = child
+        detach_directory(anchor)
+        parent = os.dup(anchor)
+        for part in relative.parts[:-1]:
+            child = os.open(part, flags, dir_fd=parent)
+            os.close(parent); parent = child
+            detach_directory(parent)
+        yield anchor, parent, relative.name
+    finally:
+        if parent is not None:
+            os.close(parent)
+        os.close(anchor)
+
+
+def detach_attached(target, relative, anchor, parent):
+    # Reopen the actual named directories. This is observed drift detection under
+    # exclusive ownership, not a CAS against an arbitrary concurrent same-UID writer.
+    with detach_parent(target, relative) as (current_anchor, current_parent, _name):
+        require(all((os.fstat(a).st_dev, os.fstat(a).st_ino) ==
+                    (os.fstat(b).st_dev, os.fstat(b).st_ino)
+                    for a, b in ((anchor, current_anchor), (parent, current_parent))), 'DETACH_DIRECTORY_CHANGED')
+
+
+def detach_hash_fd(fd, size, deadline):
+    detach_budget(deadline)
+    os.lseek(fd, 0, os.SEEK_SET)
+    hashed = hashlib.sha256()
+    remaining_bytes = size
+    while remaining_bytes:
+        detach_budget(deadline)
+        chunk = os.read(fd, min(DETACH_CHUNK, remaining_bytes))
+        require(bool(chunk), 'DETACH_SHORT_READ')
+        hashed.update(chunk)
+        remaining_bytes -= len(chunk)
+    require(os.read(fd, 1) == b'', 'DETACH_GROWTH')
+    detach_budget(deadline)
+    return hashed.hexdigest()
+
+
+def inspect_detach_input(target, relative, expected, deadline, single=False, executable=True, record=None):
+    detach_budget(deadline)
+    with detach_parent(target, relative) as (anchor, parent, name):
+        if record is not None:
+            record['stage'] = 'stat'
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if record is not None:
+            record.update(source_state=detach_state(before), size=before.st_size, nlink=before.st_nlink,
+                          mode=stat.S_IMODE(before.st_mode), stage='kind_owner_mode')
+        detach_file(before, single, executable)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            opened = os.fstat(fd)
+            require(detach_state(opened) == detach_state(before), 'DETACH_INPUT_CHANGED')
+            if record is not None:
+                record['stage'] = 'input_hash'
+            observed_sha = detach_hash_fd(fd, opened.st_size, deadline)
+            if record is not None:
+                record['source_sha256'] = observed_sha
+            require(observed_sha == expected, 'BUILD_INPUT_HASH')
+            require(detach_state(os.fstat(fd)) == detach_state(opened) and
+                    detach_state(os.stat(name, dir_fd=parent, follow_symlinks=False)) == detach_state(opened),
+                    'DETACH_INPUT_CHANGED')
+            detach_attached(target, relative, anchor, parent)
+            return detach_state(opened)
+        finally:
+            os.close(fd)
+
+
+def detach_capacity(rows):
+    require(len(rows) == 6 and {r['name'] for r in rows} == set(DETACH_NAMES) and
+            len({r['path'] for r in rows}) == 6, 'DETACH_SET')
+    total = 0
+    for row in rows:
+        require(type(row['size']) is int and 0 <= row['size'] <= DETACH_FILE_LIMIT and
+                type(row['nlink']) is int and row['nlink'] >= 1, 'DETACH_CAPACITY')
+        if row['nlink'] > 1:
+            total += row['size']
+    require(total <= DETACH_TOTAL_LIMIT, 'DETACH_CAPACITY')
+    return total
+
+
+def plan_detachment(workspace, scratch, source, deadline, on_plan=None):
+    """Structural build binding shared with final validation; never runtime admission."""
+    detach_budget(deadline)
+    meta, cargo, packages, _binary_id, binary, target = build_description(workspace, scratch)
+    metadata = {name: read_owned(scratch / name, scratch, JSON_LIMIT)
+                for name in ('binaries.json', 'cargo.json', 'custody.json')}
+    # The structural reader and retained request must refer to the same metadata.
+    require(object_json(metadata['binaries.json']) == meta and object_json(metadata['cargo.json']) == cargo,
+            'DETACH_METADATA_CHANGED')
+    custody = object_json(metadata['custody.json'])
+    require(set(custody) == {'source', 'files'} and custody['source'] == [source['head'], source['tree']], 'BUILD_SOURCE')
+    require(isinstance(custody['files'], dict) and all(type(p) is str and type(h) is str and
+            re.fullmatch('[0-9a-f]{64}', h) for p, h in custody['files'].items()), 'DETACH_CUSTODY')
+    test = regular(Path(binary['binary-path']), target, DETACH_FILE_LIMIT)
+    require(test == test.resolve() and '..' not in test.parts, 'DETACH_PATH')
+    values = meta['rust-build-meta']['non-test-binaries']
+    require(set(values) == {packages[0]['id']} and type(values[packages[0]['id']]) is list, 'DETACH_PACKAGE')
+    entries = values[packages[0]['id']]
+    require(len(entries) == 6 and {r['name'] for r in entries} == set(DETACH_NAMES), 'DETACH_SET')
+    paths = []
+    for row in entries:
+        require(row['kind'] == 'bin-exe' and type(row['path']) is str, 'DETACH_KIND')
+        relative = Path(row['path'])
+        require(not relative.is_absolute() and relative.parts and
+                row['path'] == relative.as_posix() and '..' not in relative.parts, 'DETACH_PATH')
+        path = target / relative
+        require(path != test, 'DETACH_PATH')
+        if row['name'] == 'x0xd':
+            require(relative.as_posix() == 'debug/x0xd', 'DAEMON_PATH')
+        paths.append(str(path))
+    require(len(set(paths)) == 6, 'DETACH_SET')
+    inputs = {str(test), str(workspace / 'Cargo.lock'), str(scratch / 'cargo.json'),
+              str(scratch / 'binaries.json'), *paths}
+    require(set(custody['files']) == inputs, 'BUILD_INPUT_SET')
+    for name in ('binaries.json', 'cargo.json'):
+        require(hashlib.sha256(metadata[name]).hexdigest() == custody['files'][str(scratch / name)], 'BUILD_INPUT_HASH')
+    lock = read_owned(workspace / 'Cargo.lock', workspace, JSON_LIMIT)
+    require(hashlib.sha256(lock).hexdigest() == LOCK == custody['files'][str(workspace / 'Cargo.lock')], 'LOCK_DRIFT')
+    inspect_detach_input(target, test.relative_to(target), custody['files'][str(test)], deadline,
+                         single=True, executable=False)
+    rows = []
+    for ordinal, (entry, path) in enumerate(zip(entries, paths)):
+        rows.append({'ordinal': ordinal, 'name': entry['name'], 'path': path,
+                     'expected_sha256': custody['files'][path], 'size': None, 'nlink': None,
+                     'mode': None, 'source_state': None, 'source_sha256': None,
+                     'action': None, 'stage': 'unobserved', 'copy_sha256': None,
+                     'destination_sha256': None, 'installed_sha256': None, 'alias_identity': 'unknown'})
+    if on_plan is not None:
+        on_plan(rows)
+    for row in rows:
+        inspect_detach_input(target, Path(row['path']).relative_to(target), row['expected_sha256'], deadline,
+                             record=row)
+        row.update(action='detach' if row['nlink'] > 1 else 'untouched', stage='planned')
+        if on_plan is not None:
+            on_plan(rows)
+    total = detach_capacity(rows)
+    # Preserve byte identity of all preflight inputs; final validation is still owed.
+    pins = {name: hashlib.sha256(raw).hexdigest() for name, raw in metadata.items()}
+    for name, expected in pins.items():
+        require(hashlib.sha256(read_owned(scratch / name, scratch, JSON_LIMIT)).hexdigest() == expected,
+                'DETACH_METADATA_CHANGED')
+    return rows, total, pins
+
+
+def detach_one(target, row, deadline):
+    relative = Path(row['path']).relative_to(target)
+    with detach_parent(target, relative) as (anchor, parent, name):
+        original = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        detach_file(original)
+        require(detach_state(original) == row['source_state'], 'DETACH_INPUT_CHANGED')
+        source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        temporary = '.issue287-detach-' + str(row['ordinal']) + '.pending'
+        destination_fd = None
+        try:
+            require(detach_state(os.fstat(source_fd)) == row['source_state'], 'DETACH_INPUT_CHANGED')
+            detach_budget(deadline)
+            if row['action'] == 'untouched':
+                row['installed_sha256'] = detach_hash_fd(source_fd, row['size'], deadline)
+                require(row['installed_sha256'] == row['expected_sha256'] and
+                        detach_state(os.fstat(source_fd)) == row['source_state'] and
+                        detach_state(os.stat(name, dir_fd=parent, follow_symlinks=False)) == row['source_state'],
+                        'DETACH_INPUT_CHANGED')
+                detach_attached(target, relative, anchor, parent)
+                row['stage'] = 'verified_untouched'
+                return
+            require(row['action'] == 'detach' and original.st_nlink > 1, 'DETACH_ACTION')
+            destination_fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                     0o600, dir_fd=parent)
+            row['stage'] = 'copying'
+            hashed = hashlib.sha256()
+            left = row['size']
+            while left:
+                detach_budget(deadline)
+                chunk = os.read(source_fd, min(DETACH_CHUNK, left))
+                require(bool(chunk), 'DETACH_SHORT_READ')
+                hashed.update(chunk); left -= len(chunk)
+                view = memoryview(chunk)
+                while view:
+                    detach_budget(deadline)
+                    count = os.write(destination_fd, view)
+                    require(count > 0, 'DETACH_SHORT_WRITE')
+                    view = view[count:]
+            require(os.read(source_fd, 1) == b'', 'DETACH_GROWTH')
+            row['copy_sha256'] = hashed.hexdigest()
+            require(row['copy_sha256'] == row['expected_sha256'] and
+                    detach_state(os.fstat(source_fd)) == row['source_state'], 'DETACH_COPY_CHANGED')
+            dest = os.fstat(destination_fd)
+            detach_file(dest, single=True, executable=False)
+            require(dest.st_size == row['size'], 'DETACH_DESTINATION')
+            row['destination_sha256'] = detach_hash_fd(destination_fd, row['size'], deadline)
+            require(row['destination_sha256'] == row['expected_sha256'] and
+                    detach_state(os.fstat(destination_fd)) == detach_state(dest), 'DETACH_DESTINATION')
+            os.fchmod(destination_fd, row['mode'])
+            dest = os.fstat(destination_fd)
+            detach_file(dest, single=True)
+            require(detach_state(os.stat(temporary, dir_fd=parent, follow_symlinks=False)) == detach_state(dest),
+                    'DETACH_TEMP_CHANGED')
+            detach_attached(target, relative, anchor, parent)
+            require(detach_state(os.stat(name, dir_fd=parent, follow_symlinks=False)) == row['source_state'] and
+                    detach_state(os.fstat(source_fd)) == row['source_state'], 'DETACH_INPUT_CHANGED')
+            detach_budget(deadline)
+            row['stage'] = 'installing'
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            installed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            detach_file(installed, single=True)
+            require((installed.st_dev, installed.st_ino, stat.S_IMODE(installed.st_mode), installed.st_size) ==
+                    (dest.st_dev, dest.st_ino, row['mode'], row['size']), 'DETACH_INSTALL_CHANGED')
+            row['installed_sha256'] = detach_hash_fd(destination_fd, row['size'], deadline)
+            require(row['installed_sha256'] == row['expected_sha256'] and
+                    detach_state(os.fstat(destination_fd)) == detach_state(installed) and
+                    detach_state(os.stat(name, dir_fd=parent, follow_symlinks=False)) == detach_state(installed),
+                    'DETACH_INSTALL_CHANGED')
+            detach_attached(target, relative, anchor, parent)
+            row['stage'] = 'verified_detached'
+        finally:
+            try:
+                if destination_fd is not None:
+                    # Clean only this positively identified one-link temporary.
+                    # A renamed, extra-linked or substituted entry is left untouched.
+                    try:
+                        info = os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        held = os.fstat(destination_fd)
+                        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1 and \
+                                (info.st_dev, info.st_ino) == (held.st_dev, held.st_ino):
+                            os.unlink(temporary, dir_fd=parent)
+            finally:
+                if destination_fd is not None:
+                    os.close(destination_fd)
+                os.close(source_fd)
+
+
+def detach_progress(private, value):
+    path, temporary = private / 'detach-progress.json', private / 'detach-progress.pending.json'
+    raw = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
+    require(len(raw) <= DETACH_RECEIPT_LIMIT and len(value['records']) <= 6, 'DETACH_RECEIPT_BOUND')
+    if path.exists() or path.is_symlink():
+        old = object_json(read_owned(path, private, DETACH_RECEIPT_LIMIT))
+        require(old['schema'] == value['schema'] and old['request_sha256'] == value['request_sha256'], 'DETACH_PROGRESS_CHANGED')
+    with temporary.open('xb') as stream:
+        stream.write(raw)
+    require(read_owned(temporary, private, DETACH_RECEIPT_LIMIT) == raw, 'DETACH_PROGRESS_CHANGED')
+    os.replace(temporary, path)
+    require(read_owned(path, private, DETACH_RECEIPT_LIMIT) == raw, 'DETACH_PROGRESS_CHANGED')
+
+
+def execute_detachment(workspace, scratch, source, private, deadline, request_sha):
+    report = {'schema': 'x0x.issue287-detachment/1', 'request_sha256': request_sha,
+              'source': [source['head'], source['tree']], 'state': 'planning', 'planned_bytes': None,
+              'metadata_sha256': None, 'records': [], 'error': None}
+    require(not (private / 'detach-progress.json').exists() and
+            not (private / 'detach-progress.json').is_symlink(), 'DETACH_PROGRESS_EXISTS')
+    detach_progress(private, report)
+    try:
+        def planning(rows):
+            report['records'] = rows
+            detach_progress(private, report)
+        rows, total, pins = plan_detachment(workspace, scratch, source, deadline, planning)
+        report.update(records=rows, planned_bytes=total, metadata_sha256=pins, state='prepared')
+        detach_progress(private, report)
+        for row in rows:
+            detach_budget(deadline)
+            detach_one(workspace / 'target', row, deadline)
+            detach_progress(private, report)
+        for name, expected in pins.items():
+            require(hashlib.sha256(read_owned(scratch / name, scratch, JSON_LIMIT)).hexdigest() == expected,
+                    'DETACH_METADATA_CHANGED')
+        report['state'] = 'completed'
+        detach_progress(private, report)
+    except (Rejected, OSError, ValueError, KeyError, TypeError) as error:
+        report['state'] = 'failed'
+        report['error'] = build_error(error)
+        if isinstance(error, Rejected) and error.args and error.args[0] in DETACH_CODES:
+            report['error'] = {'category': 'rejected', 'code': error.args[0]}
+        # Preserve the actual stage and partial facts; never manufacture admission.
+        detach_progress(private, report)
+        raise
+    return {'report_sha256': digest(private / 'detach-progress.json')}
+
+
+def prepare_verified_build(workspace, scratch, source, private, env, deadline, observer=None):
+    completed = run_worker('detach', {'workspace': str(workspace), 'scratch': str(scratch),
+                           'source': source, 'deadline': deadline - 20}, private, env, deadline, 1200)
+    require(set(completed) == {'schema', 'request_sha256', 'report_sha256'}, 'DETACH_RESPONSE')
+    raw = read_owned(private / 'detach-progress.json', private, DETACH_RECEIPT_LIMIT)
+    require(hashlib.sha256(raw).hexdigest() == completed['report_sha256'], 'DETACH_RESPONSE')
+    report = object_json(raw)
+    require(set(report) == {'schema', 'request_sha256', 'source', 'state', 'planned_bytes',
+            'metadata_sha256', 'records', 'error'} and report['schema'] == 'x0x.issue287-detachment/1' and
+            report['request_sha256'] == completed['request_sha256'] and report['source'] == [source['head'], source['tree']]
+            and report['state'] == 'completed' and report['error'] is None, 'DETACH_RESPONSE')
+    require(type(report['planned_bytes']) is int and report['planned_bytes'] == detach_capacity(report['records']), 'DETACH_RESPONSE')
+    require(set(report['metadata_sha256']) == {'binaries.json', 'cargo.json', 'custody.json'}, 'DETACH_RESPONSE')
+    for name, expected in report['metadata_sha256'].items():
+        require(hashlib.sha256(read_owned(scratch / name, scratch, JSON_LIMIT)).hexdigest() == expected, 'DETACH_METADATA_CHANGED')
+    # No exception to runtime admission: unchanged strict one-link/source/input/
+    # daemon checks must all succeed, and namespace reuse still verifies again.
+    detach_budget(deadline)
+    reuse = validate_build(workspace, scratch, source, observer)
+    meta = object_json(read_owned(scratch / 'binaries.json', scratch, JSON_LIMIT))
+    entries = [entry for rows in meta['rust-build-meta']['non-test-binaries'].values() for entry in rows]
+    require(len(entries) == 6, 'DETACH_RESPONSE')
+    for ordinal, row in enumerate(report['records']):
+        require(set(row) == {'ordinal', 'name', 'path', 'expected_sha256', 'size', 'nlink', 'mode', 'source_state',
+                'action', 'stage', 'source_sha256', 'copy_sha256', 'destination_sha256', 'installed_sha256', 'alias_identity'}, 'DETACH_RESPONSE')
+        require(type(row['ordinal']) is int and row['ordinal'] == ordinal and row['alias_identity'] == 'unknown' and
+                row['name'] == entries[ordinal]['name'] and row['path'] == str(workspace / 'target' / entries[ordinal]['path']) and
+                row['expected_sha256'] == reuse['input_hashes'][row['path']] == row['installed_sha256'] == row['source_sha256'], 'DETACH_RESPONSE')
+        state = row['source_state']
+        require(type(state) is list and len(state) == 8 and all(type(x) is int for x in state) and
+                state[2] == os.getuid() and state[4:6] == [row['nlink'], row['size']] and
+                stat.S_ISREG(state[3]) and row['mode'] == stat.S_IMODE(state[3]) and
+                not row['mode'] & 0o7000 and bool(row['mode'] & 0o111), 'DETACH_RESPONSE')
+        if row['nlink'] > 1:
+            require(row['action'] == 'detach' and row['stage'] == 'verified_detached' and
+                    row['copy_sha256'] == row['destination_sha256'] == row['expected_sha256'], 'DETACH_RESPONSE')
+        else:
+            require(row['action'] == 'untouched' and row['stage'] == 'verified_untouched' and
+                    row['copy_sha256'] is None and row['destination_sha256'] is None, 'DETACH_RESPONSE')
+    return reuse
 
 
 KINDS = {'inputs', 'checkpoint', 'workload', 'counters', 'wave', 'children', 'wire_close', 'draining_final_counters'}
@@ -1100,7 +1482,7 @@ def seal_packet(private, output, recipient, env, source, result, age, step_deadl
 
 def execute_worker(mode, request, response):
     # File-only worker modes. No Cargo, daemon, age, namespace or subprocess call.
-    require(mode in ('collect', 'archive', 'seal-metadata'), 'WORKER_MODE')
+    require(mode in ('collect', 'archive', 'seal-metadata', 'detach'), 'WORKER_MODE')
     private = request.parent
     require(private.is_absolute() and private == private.resolve() and private.stat().st_uid == os.getuid(), 'WORKER_OWNER')
     require(request == private / (mode + '-request.json') and response == private / (mode + '-response.json'), 'WORKER_PATH')
@@ -1109,7 +1491,14 @@ def execute_worker(mode, request, response):
             and data['mode'] == mode and data['private'] == str(private), 'WORKER_INPUT')
     payload = data['payload']
     value = {'schema': 'x0x.issue287-worker/1', 'request_sha256': digest(request)}
-    if mode == 'collect':
+    if mode == 'detach':
+        require(set(payload) == {'workspace', 'scratch', 'source', 'deadline'}, 'DETACH_REQUEST')
+        workspace, scratch = Path(payload['workspace']), Path(payload['scratch'])
+        require(workspace.is_absolute() and workspace == workspace.resolve() and
+                scratch == private / 'runner-temp/x0x-metadata-issue287', 'DETACH_REQUEST')
+        value.update(execute_detachment(workspace, scratch, payload['source'], private,
+                     payload['deadline'], value['request_sha256']))
+    elif mode == 'collect':
         require(set(payload) == {'workspace', 'source', 'reuse', 'runtime_exit', 'runtime_reason'}, 'COLLECT_INPUT')
         workspace = Path(payload['workspace'])
         require(workspace.is_absolute() and workspace == workspace.resolve(), 'COLLECT_WORKSPACE')
@@ -1291,7 +1680,7 @@ def main():
         shutil.copyfile(binaries, scratch / 'binaries.json')
         (scratch / 'lock.sha256').write_text(LOCK + '  Cargo.lock\n')
         build('record', ['python3', 'scripts/ci/nextest-reuse.py', 'record', str(scratch)])
-        reuse = validate_build(workspace, scratch, source, build_verification.before)
+        reuse = prepare_verified_build(workspace, scratch, source, private, env, build_deadline, build_verification.before)
         verification_action(build_verification.write,
                             lambda: write_json(private / 'verified-build-before.json', reuse))
         result.update(test_binary_sha256=reuse['binary_sha256'], daemon_binary_sha256=reuse['daemon_sha256'])
@@ -1364,7 +1753,7 @@ if __name__ == '__main__':
     try:
         if len(__import__('sys').argv) > 1 and __import__('sys').argv[1] == '--worker':
             worker = argparse.ArgumentParser()
-            worker.add_argument('--worker', choices=('collect', 'archive', 'seal-metadata'), required=True)
+            worker.add_argument('--worker', choices=('collect', 'archive', 'seal-metadata', 'detach'), required=True)
             worker.add_argument('--request', type=Path, required=True)
             worker.add_argument('--response', type=Path, required=True)
             args = worker.parse_args()

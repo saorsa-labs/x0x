@@ -1147,5 +1147,350 @@ class Controls(unittest.TestCase):
                 kill.assert_not_called()
 
 
+
+class DetachmentControls(unittest.TestCase):
+    """Actual shared file-only helpers; no test binary or subprocess is executed."""
+    build_inputs = Controls.build_inputs
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='issue287-detach-inert-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.workspace, old_scratch, self.source = self.build_inputs()
+        self.private = self.root / 'private'; self.private.mkdir(mode=0o700)
+        self.scratch = self.private / 'runner-temp/x0x-metadata-issue287'
+        self.scratch.parent.mkdir(mode=0o700)
+        old_scratch.rename(self.scratch)
+        self.target = self.workspace / 'target'
+        self.meta = json.loads((self.scratch / 'binaries.json').read_text())
+        self.package = next(iter(self.meta['rust-build-meta']['non-test-binaries']))
+        self.meta['rust-build-meta']['non-test-binaries'][self.package] = [
+            {'name': n, 'kind': 'bin-exe', 'path': 'debug/' + n} for n in M.DETACH_NAMES]
+        for name in M.DETACH_NAMES:
+            p = self.target / 'debug' / name
+            p.write_bytes(('inert bytes for ' + name).encode()); p.chmod(0o700)
+        self.record_fixture()
+        self.deadline = M.time.monotonic() + 120
+        self.calls = []
+
+    def record_fixture(self):
+        # Only initial test-fixture construction, never a production record call.
+        write(self.scratch / 'binaries.json', self.meta)
+        paths = [Path(b['binary-path']) for b in self.meta['rust-binaries'].values()]
+        paths += [self.target / r['path'] for rows in self.meta['rust-build-meta']['non-test-binaries'].values() for r in rows]
+        paths += [self.workspace / 'Cargo.lock', self.scratch / 'cargo.json', self.scratch / 'binaries.json']
+        write(self.scratch / 'custody.json', {'source': [self.source['head'], self.source['tree']],
+                                            'files': {str(p): M.digest(p) for p in paths}})
+
+    def link(self, name='gui-coverage'):
+        path = self.target / 'debug' / name
+        alias = self.root / ('alias-' + name)
+        os.link(path, alias)
+        return path, alias
+
+    def plan(self):
+        return M.plan_detachment(self.workspace, self.scratch, self.source, self.deadline)
+
+    def execute(self):
+        return M.execute_detachment(self.workspace, self.scratch, self.source, self.private, self.deadline, 'f' * 64)
+
+    def report(self):
+        return json.loads((self.private / 'detach-progress.json').read_text())
+
+    def fake_worker(self, argv, cwd, env, directory, name, timeout, deadline=None):
+        self.calls.append((name, timeout, deadline))
+        self.assertEqual(name, 'detach-worker')
+        self.assertEqual(argv[argv.index('--worker') + 1], 'detach')
+        try:
+            code = M.execute_worker('detach', Path(argv[argv.index('--request') + 1]), Path(argv[argv.index('--response') + 1]))
+        except (M.Rejected, OSError, ValueError, KeyError, TypeError):
+            code = 2
+        return {'exit': code, 'outer_reaped': True, 'reason': None}
+
+    def prepared(self):
+        with patch.object(M, 'run_private', side_effect=self.fake_worker), \
+             patch.object(M.subprocess, 'Popen', side_effect=AssertionError('no real subprocess')):
+            return M.prepare_verified_build(self.workspace, self.scratch, self.source, self.private, {}, self.deadline)
+
+    def test_real_two_link_baseline_rejects_then_shared_preparation_accepts(self):
+        path, alias = self.link(); old = path.stat(); original = path.read_bytes()
+        custody = (self.scratch / 'custody.json').read_bytes()
+        with self.assertRaisesRegex(M.Rejected, 'PATH_KIND_OR_LINK'):
+            M.validate_build(self.workspace, self.scratch, self.source)
+        result = self.prepared()
+        self.assertEqual(path.stat().st_nlink, 1)
+        self.assertNotEqual(path.stat().st_ino, old.st_ino)
+        self.assertEqual(alias.stat().st_ino, old.st_ino)
+        self.assertEqual(alias.read_bytes(), original)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.scratch / 'custody.json').read_bytes(), custody)
+        self.assertEqual(len(self.report()['records']), 6)
+        self.assertEqual(result['input_hashes'][str(path)], M.digest(alias))
+        self.assertEqual([x[0] for x in self.calls], ['detach-worker'])
+        self.assertEqual(self.calls[0][2], self.deadline)
+        self.assertLessEqual(self.calls[0][1], self.deadline - M.time.monotonic())
+
+    def test_one_link_inputs_untouched_with_full_set_verified(self):
+        old = {name: (self.target / 'debug' / name).stat().st_ino for name in M.DETACH_NAMES}
+        self.prepared()
+        self.assertEqual(self.report()['planned_bytes'], 0)
+        for row in self.report()['records']:
+            self.assertEqual(row['action'], 'untouched')
+            self.assertEqual((Path(row['path']).stat().st_ino, row['stage']), (old[row['name']], 'verified_untouched'))
+            self.assertIsNone(row['copy_sha256'])
+
+    def test_capacity_exact_six_times_two_gib_without_allocating(self):
+        rows = [{'name': n, 'path': '/fake/' + n, 'size': 2147483648, 'nlink': 2} for n in M.DETACH_NAMES]
+        self.assertEqual(M.detach_capacity(rows), 12884901888)
+        rows[0]['size'] += 1
+        with self.assertRaisesRegex(M.Rejected, 'DETACH_CAPACITY'): M.detach_capacity(rows)
+        rows[0]['size'] = 2147483648; rows[0]['nlink'] = 1
+        self.assertEqual(M.detach_capacity(rows), 5 * 2147483648)
+        with patch.object(M, 'DETACH_TOTAL_LIMIT', 1):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_CAPACITY'): M.detach_capacity(rows)
+
+    def test_capacity_closed_names_duplicate_paths_and_boolean_sizes(self):
+        base = [{'name': n, 'path': '/fake/' + n, 'size': 1, 'nlink': 2} for n in M.DETACH_NAMES]
+        variants = [base[:-1], base + [dict(base[0])]]
+        for field, value in [('name', 'foreign'), ('path', base[1]['path']), ('size', True), ('nlink', 0)]:
+            rows = copy.deepcopy(base); rows[0][field] = value; variants.append(rows)
+        for rows in variants:
+            with self.subTest(rows=rows):
+                with self.assertRaises(M.Rejected): M.detach_capacity(rows)
+
+    def test_full_planning_precedes_any_copy(self):
+        self.link(); (self.target / 'debug/x0xd-forge-injector').write_bytes(b'changed after record')
+        with patch.object(M, 'detach_one', side_effect=AssertionError('must not copy')):
+            with self.assertRaisesRegex(M.Rejected, 'BUILD_INPUT_HASH'): self.execute()
+        self.assertEqual(self.report()['state'], 'failed')
+        rows = self.report()['records']
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(rows[-1]['stage'], 'input_hash')
+        self.assertNotEqual(rows[-1]['source_sha256'], rows[-1]['expected_sha256'])
+        self.assertTrue(all(row['copy_sha256'] is None for row in rows))
+
+    def test_metadata_missing_extra_or_duplicate_name_never_filters_inputs(self):
+        rows = self.meta['rust-build-meta']['non-test-binaries'][self.package]
+        original = copy.deepcopy(rows)
+        for changed in (original[:-1], original + [dict(original[0])], [dict(original[0]), *original[1:5], dict(original[0])]):
+            self.meta['rust-build-meta']['non-test-binaries'][self.package] = changed
+            self.record_fixture()
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_SET'): self.plan()
+
+    def test_metadata_foreign_kind_package_or_escape_rejected(self):
+        original = copy.deepcopy(self.meta)
+        for mutation in ('kind', 'package', 'escape'):
+            self.meta = copy.deepcopy(original)
+            if mutation == 'kind': self.meta['rust-build-meta']['non-test-binaries'][self.package][0]['kind'] = 'other'
+            elif mutation == 'package': self.meta['rust-build-meta']['non-test-binaries']['foreign'] = []
+            else: self.meta['rust-build-meta']['non-test-binaries'][self.package][0]['path'] = '../outside'
+            write(self.scratch / 'binaries.json', self.meta)
+            # Earlier custody hash may also reject: no mutation/copy is allowed.
+            with self.assertRaises(M.Rejected): self.plan()
+
+    def test_custody_source_lock_and_metadata_hash_cannot_be_reblessed(self):
+        path = self.scratch / 'custody.json'; original = path.read_bytes()
+        for change in ('source', 'extra', 'hash'):
+            value = json.loads(original)
+            if change == 'source': value['source'][0] = 'e' * 40
+            elif change == 'extra': value['files']['/unknown'] = '0' * 64
+            else: value['files'][str(self.scratch / 'binaries.json')] = '0' * 64
+            write(path, value)
+            with self.assertRaises(M.Rejected): self.plan()
+        path.write_bytes(original)
+        (self.workspace / 'Cargo.lock').write_bytes(b'foreign lock')
+        with self.assertRaisesRegex(M.Rejected, 'LOCK_DRIFT'): self.plan()
+
+    def test_selected_test_hardlink_never_eligible(self):
+        path = Path(next(iter(self.meta['rust-binaries'].values()))['binary-path'])
+        os.link(path, self.root / 'test-alias')
+        with self.assertRaisesRegex(M.Rejected, 'PATH_KIND_OR_LINK'): self.plan()
+
+    def test_linked_source_owner_mode_symlink_and_directory_rejected(self):
+        path, _alias = self.link(); original = path.read_bytes()
+        path.chmod(0o4700)
+        with self.assertRaisesRegex(M.Rejected, 'DETACH_MODE'): self.plan()
+        path.chmod(0o700)
+        # Change only the linked candidate's reached stat result. Metadata and
+        # directory ownership retain the actual UID, so their older checks pass.
+        from types import SimpleNamespace
+        actual_stat = M.os.stat
+        injected = []
+        def candidate_owner(name, *args, **kwargs):
+            info = actual_stat(name, *args, **kwargs)
+            if name == path.name and kwargs.get('dir_fd') is not None:
+                values = {key: getattr(info, key) for key in ('st_dev', 'st_ino', 'st_uid', 'st_mode',
+                          'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')}
+                values['st_uid'] += 1
+                info = SimpleNamespace(**values)
+                injected.append(info)
+            return info
+        with patch.object(M.os, 'stat', side_effect=candidate_owner), \
+             patch.object(M, 'detach_file', wraps=M.detach_file) as admission:
+            with self.assertRaisesRegex(M.Rejected, '^DETACH_FILE$'): self.plan()
+        self.assertEqual(len(injected), 1)
+        self.assertEqual(injected[0].st_nlink, 2)
+        self.assertEqual(injected[0].st_uid, os.getuid() + 1)
+        self.assertTrue(any(call.args[0] is injected[0] for call in admission.call_args_list),
+                        'the linked candidate must reach the actual detach_file owner predicate')
+        path.unlink(); path.symlink_to(self.root / 'alias-gui-coverage')
+        with self.assertRaises(M.Rejected): self.plan()
+        path.unlink(); path.mkdir()
+        with self.assertRaises(M.Rejected): self.plan()
+        self.assertEqual((self.root / 'alias-gui-coverage').read_bytes(), original)
+
+    def test_symlink_ancestor_rejected_without_following(self):
+        self.link(); real = self.target / 'real-debug'
+        (self.target / 'debug').rename(real); (self.target / 'debug').symlink_to(real)
+        with self.assertRaises((M.Rejected, OSError)): self.plan()
+
+    def test_stale_temporary_is_never_overwritten_or_cleaned(self):
+        path, alias = self.link()
+        temporary = path.parent / '.issue287-detach-0.pending'; temporary.write_bytes(b'untouched stale entry')
+        with self.assertRaises(FileExistsError): self.execute()
+        self.assertEqual(temporary.read_bytes(), b'untouched stale entry')
+        self.assertEqual(path.stat().st_ino, alias.stat().st_ino)
+
+    def test_same_length_mutation_during_copy_is_rejected(self):
+        path, alias = self.link(); original_read = M.os.read; changed = []
+        rows, _total, _pins = self.plan()
+        def read(fd, count):
+            chunk = original_read(fd, count)
+            if not changed and chunk:
+                changed.append(True)
+                with alias.open('r+b') as stream: stream.write(b'X' * len(path.read_bytes()))
+            return chunk
+        with patch.object(M.os, 'read', side_effect=read):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_COPY_CHANGED'): M.detach_one(self.target, rows[0], self.deadline)
+        self.assertEqual(path.stat().st_ino, alias.stat().st_ino)
+        self.assertFalse((path.parent / '.issue287-detach-0.pending').exists())
+
+    def test_destination_corruption_rejected_before_installation(self):
+        path, alias = self.link(); original_write = M.os.write; injected = []
+        def corrupt(fd, data):
+            if not injected:
+                injected.append(True); data = b'X' * len(data)
+            return original_write(fd, data)
+        with patch.object(M.os, 'write', side_effect=corrupt):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_DESTINATION'): self.execute()
+        self.assertEqual(path.stat().st_ino, alias.stat().st_ino)
+
+    def test_short_writes_are_completed_and_zero_writes_reject(self):
+        path, alias = self.link(); original_write = M.os.write
+        with patch.object(M.os, 'write', side_effect=lambda fd, data: original_write(fd, data[:1])):
+            self.execute()
+        self.assertEqual(path.read_bytes(), alias.read_bytes())
+        # Actual zero-write branch on a second linked input, separate owned plan.
+        rows, _total, _pins = self.plan()
+        p2, _a2 = self.link('x0x'); rows, _total, _pins = self.plan()
+        with patch.object(M.os, 'write', return_value=0):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_SHORT_WRITE'): M.detach_one(self.target, rows[1], self.deadline)
+        self.assertFalse((p2.parent / '.issue287-detach-1.pending').exists())
+
+    def test_enospc_preserves_alias_and_removes_only_owned_temp(self):
+        path, alias = self.link(); original = alias.read_bytes()
+        with patch.object(M.os, 'write', side_effect=OSError(M.errno.ENOSPC, 'inert disk full')):
+            with self.assertRaises(OSError): self.execute()
+        self.assertEqual(path.stat().st_ino, alias.stat().st_ino)
+        self.assertEqual(alias.read_bytes(), original)
+        self.assertFalse((path.parent / '.issue287-detach-0.pending').exists())
+        self.assertEqual(self.report()['error'], {'category': 'filesystem', 'errno': 'ENOSPC'})
+
+    def test_temporary_extra_link_is_rejected_and_not_deleted(self):
+        path, alias = self.link(); original_chmod = M.os.fchmod
+        extra = self.root / 'extra-temp-link'
+        def linked(fd, mode):
+            original_chmod(fd, mode)
+            os.link(path.parent / '.issue287-detach-0.pending', extra)
+        with patch.object(M.os, 'fchmod', side_effect=linked):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_FILE'): self.execute()
+        self.assertEqual(path.stat().st_ino, alias.stat().st_ino)
+        self.assertEqual(extra.stat().st_nlink, 2)
+        self.assertTrue((path.parent / '.issue287-detach-0.pending').exists())
+
+    def test_changed_named_input_before_replace_is_not_overwritten(self):
+        path, alias = self.link(); original_attached = M.detach_attached; changed = []
+        rows, _total, _pins = self.plan()
+        def swapped(*args):
+            original_attached(*args)
+            if not changed:
+                changed.append(True); path.unlink(); path.write_bytes(b'foreign replacement')
+        with patch.object(M, 'detach_attached', side_effect=swapped):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_INPUT_CHANGED'): M.detach_one(self.target, rows[0], self.deadline)
+        self.assertEqual(path.read_bytes(), b'foreign replacement')
+        self.assertNotEqual(path.stat().st_ino, alias.stat().st_ino)
+
+    def test_cancellation_and_expired_budget_cannot_start_or_complete_copy(self):
+        path, alias = self.link()
+        with patch.object(M, 'CANCELLED', True):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_DEADLINE'): self.plan()
+        with patch.object(M.time, 'monotonic', return_value=self.deadline):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_DEADLINE'): self.plan()
+        original_write = M.os.write
+        def cancel(fd, data):
+            n = original_write(fd, data); M.CANCELLED = True; return n
+        with patch.object(M, 'CANCELLED', False), patch.object(M.os, 'write', side_effect=cancel):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_DEADLINE'): self.execute()
+        self.assertEqual(path.stat().st_ino, alias.stat().st_ino)
+
+    def test_detach_worker_is_execution_not_cancellation_cleanup(self):
+        self.assertNotIn('detach-worker', M.EVIDENCE_TASKS)
+        with patch.object(M, 'CANCELLED', True), patch.object(M.subprocess, 'Popen') as spawned:
+            with self.assertRaisesRegex(M.Rejected, 'EXECUTION_CANCELLED'):
+                M.run_bounded(['not-executed'], self.workspace, {}, self.private, 'detach-worker', 1200, self.deadline)
+        spawned.assert_not_called()
+
+    def test_worker_timeout_or_crash_blocks_strict_verification(self):
+        for reason, code in [('deadline', -9), (None, 2)]:
+            with self.subTest(reason=reason):
+                # run_worker exclusive request is intentionally not reused.
+                root = self.private / ('timeout' if reason else 'crash'); root.mkdir()
+                with patch.object(M, 'run_private', return_value={'exit': code, 'reason': reason, 'outer_reaped': True}), \
+                     patch.object(M, 'validate_build', side_effect=AssertionError('must not admit')):
+                    with self.assertRaisesRegex(M.Rejected, 'WORKER_NONPASS'):
+                        M.prepare_verified_build(self.workspace, self.scratch, self.source, root, {}, self.deadline)
+
+    def test_progress_and_response_cannot_overwrite_stale_or_forge_success(self):
+        write(self.private / 'detach-progress.json', {'stale': True})
+        with self.assertRaisesRegex(M.Rejected, 'DETACH_PROGRESS_EXISTS'): self.execute()
+        self.assertEqual(json.loads((self.private / 'detach-progress.json').read_text()), {'stale': True})
+
+    def test_complete_receipt_bound_and_original_verifier_still_required(self):
+        self.link()
+        original = M.validate_build
+        with patch.object(M, 'validate_build', wraps=original) as validator:
+            self.prepared()
+        validator.assert_called_once()
+        raw = (self.private / 'detach-progress.json').read_bytes()
+        self.assertLessEqual(len(raw), 32768)
+        self.assertEqual(len(self.report()['records']), 6)
+        self.assertTrue(all(x['alias_identity'] == 'unknown' for x in self.report()['records']))
+        self.assertLessEqual(self.report()['planned_bytes'], 12884901888)
+
+    def test_parent_rejects_missing_record_even_with_worker_receipt_hash(self):
+        original_worker = self.fake_worker
+        def omitted(*args, **kwargs):
+            result = original_worker(*args, **kwargs)
+            report = self.report(); report['records'].pop()
+            write(self.private / 'detach-progress.json', report)
+            response = self.private / 'detach-response.json'; value = json.loads(response.read_text())
+            value['report_sha256'] = M.digest(self.private / 'detach-progress.json'); write(response, value)
+            return result
+        with patch.object(M, 'run_private', side_effect=omitted):
+            with self.assertRaisesRegex(M.Rejected, 'DETACH_SET'):
+                M.prepare_verified_build(self.workspace, self.scratch, self.source, self.private, {}, self.deadline)
+
+    def test_parent_rejects_wrong_request_binding(self):
+        original_worker = self.fake_worker
+        def wrong(*args, **kwargs):
+            result = original_worker(*args, **kwargs)
+            response = self.private / 'detach-response.json'; value = json.loads(response.read_text())
+            value['request_sha256'] = '0' * 64; write(response, value)
+            return result
+        with patch.object(M, 'run_private', side_effect=wrong):
+            with self.assertRaisesRegex(M.Rejected, 'WORKER_BINDING'):
+                M.prepare_verified_build(self.workspace, self.scratch, self.source, self.private, {}, self.deadline)
+
 if __name__ == '__main__':
     unittest.main()
