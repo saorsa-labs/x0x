@@ -1,0 +1,83 @@
+name: Issue 501 isolated component evidence
+
+on:
+  push:
+    branches: [codex/501-isolated-evidence]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue501-component-evidence
+  cancel-in-progress: false
+
+jobs:
+  component:
+    if: github.repository == 'saorsa-labs/x0x' && github.event_name == 'push' && github.ref == 'refs/heads/codex/501-isolated-evidence'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Guard exact parent and seat admitted lock
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = aab3215ab4b00acac7539493624c8d58340b0c8f
+          test -z "$(git status --porcelain)"
+          echo '83fc5316716b6240ffa470daa77d3e6a7ea9ed09baf6631320d472514e38b32f  scripts/ci/issue501-component.lock' | sha256sum --check --status
+          test ! -e target
+          test ! -e Cargo.lock
+          cp scripts/ci/issue501-component.lock Cargo.lock
+          echo '2265bb7ac6df437ea1c6c69f7f856f8603989f4d4b64415c1a3a17c333d570c8  scripts/ci/issue501-recipient.txt' | sha256sum --check --status
+
+      - name: Prepare pinned tools and locked dependencies
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          umask 077
+          prep="$RUNNER_TEMP/issue501-preparation"
+          mkdir "$prep"
+          mkdir "$prep/bin"
+          sudo -n apt-get update > "$prep/apt-update.log" 2>&1
+          sudo -n apt-get install -y libasound2-dev libdbus-1-dev pkg-config iproute2 util-linux > "$prep/apt-install.log" 2>&1
+          rustup toolchain install 1.95.0 --profile minimal > "$prep/rustup.log" 2>&1
+          curl --fail --silent --show-error --location https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-x86_64-unknown-linux-gnu.tar.gz -o "$prep/nextest.tar.gz"
+          echo "66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e  $prep/nextest.tar.gz" | sha256sum --check --status
+          tar -xzf "$prep/nextest.tar.gz" -C "$prep/bin" cargo-nextest
+          curl --fail --silent --show-error --location https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz -o "$prep/age.tar.gz"
+          echo "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10  $prep/age.tar.gz" | sha256sum --check --status
+          tar -xzf "$prep/age.tar.gz" -C "$prep" age/age
+          cp "$prep/age/age" "$prep/bin/age"
+          echo "$prep/bin" >> "$GITHUB_PATH"
+          cargo fetch --locked > "$prep/cargo-fetch.log" 2>&1
+          cmp Cargo.lock scripts/ci/issue501-component.lock
+
+      - name: Inert evidence driver controls
+        run: python3 -B scripts/ci/test_issue501_component_evidence.py -v
+
+      - name: Five bounded isolated selectors and sealed evidence
+        id: evidence
+        timeout-minutes: 49
+        run: python3 scripts/ci/issue501-component-evidence.py --output-root "$RUNNER_TEMP/issue501-evidence"
+
+      - name: Upload ciphertext and closed receipt only
+        if: always() && steps.evidence.outputs.sealed == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue501-component-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/issue501-evidence/public/evidence.tar.age
+            ${{ runner.temp }}/issue501-evidence/public/receipt.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 30
