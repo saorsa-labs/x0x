@@ -525,10 +525,26 @@ fn diamond_now(clock: std::time::Instant) -> u64 {
 }
 
 async fn diamond_observations(agents: &[Agent], clock: std::time::Instant) -> serde_json::Value {
+    diamond_observations_with_recorder(agents, clock, None).await
+}
+
+async fn diamond_observations_with_recorder(
+    agents: &[Agent],
+    clock: std::time::Instant,
+    attempt: Option<&ReadinessAttempt>,
+) -> serde_json::Value {
     let mut observations = serde_json::Map::new();
-    for (label, agent) in DIAMOND_LABELS.iter().zip(agents) {
+    for (i, (label, agent)) in DIAMOND_LABELS.iter().zip(agents).enumerate() {
         let begin = diamond_now(clock);
-        let peers = agent.network().expect("network").gossip_plane_peers().await;
+        let network = agent.network().expect("network");
+        let peers = match attempt {
+            Some(attempt) => {
+                network
+                    .gossip_plane_peers_recorded(&attempt.owners[i])
+                    .await
+            }
+            None => network.gossip_plane_peers().await,
+        };
         let end = diamond_now(clock);
         // Full, unfiltered returned IDs: an unknown peer is not silently lost.
         let admitted = peers.iter().map(|p| hex::encode(p.0)).collect::<Vec<_>>();
@@ -565,53 +581,291 @@ async fn diamond_suppression_check(
     )
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+enum ReadinessTerminal {
+    BeforeAcquireDeadline,
+    AcquireTimedOut,
+    AcquireError,
+    ValidatedAfterDeadline,
+    RetrySleepTimedOut,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct ReadinessCounts {
+    attempts_started: u64,
+    acquisitions_completed: u64,
+    acquisition_errors: u64,
+    validations_rejected: u64,
+    validations_accepted: u64,
+    counter_overflow: bool,
+}
+
+fn readiness_increment(value: &mut u64, overflow: &mut bool) {
+    match value.checked_add(1) {
+        Some(next) => *value = next,
+        None => *overflow = true,
+    }
+}
+
+fn readiness_offset(start: tokio::time::Instant, at: tokio::time::Instant) -> Option<u64> {
+    at.checked_duration_since(start)
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+}
+
+fn readiness_identities(topology: &serde_json::Value) -> Option<[[u8; 32]; 4]> {
+    let object = topology["peer_ids"].as_object()?;
+    if object.len() != DIAMOND_LABELS.len() {
+        return None;
+    }
+    let mut ids = [[0; 32]; 4];
+    for (i, label) in DIAMOND_LABELS.iter().enumerate() {
+        let full = object.get(*label)?.as_str()?;
+        if full.len() != 64 {
+            return None;
+        }
+        hex::decode_to_slice(full, &mut ids[i]).ok()?;
+        if ids[..i].contains(&ids[i]) {
+            return None;
+        }
+    }
+    Some(ids)
+}
+
+#[derive(Debug, Clone)]
+struct ReadinessAttempt {
+    number: u64,
+    begin_ns: Option<u64>,
+    end_ns: Option<u64>,
+    validation_end_ns: Option<u64>,
+    acquisition_completed: bool,
+    identities: Option<[[u8; 32]; 4]>,
+    owners: [network::gossip_selection_diagnostics::Recorder; 4],
+}
+
+impl ReadinessAttempt {
+    fn new(number: u64, start: tokio::time::Instant, identities: Option<[[u8; 32]; 4]>) -> Self {
+        Self {
+            number,
+            begin_ns: readiness_offset(start, tokio::time::Instant::now()),
+            end_ns: None,
+            validation_end_ns: None,
+            acquisition_completed: false,
+            identities,
+            owners: std::array::from_fn(|_| {
+                network::gossip_selection_diagnostics::Recorder::new(start, identities)
+            }),
+        }
+    }
+
+    fn freeze(&self) -> serde_json::Value {
+        let mut owners = serde_json::Map::new();
+        for (i, (label, recorder)) in DIAMOND_LABELS.iter().zip(&self.owners).enumerate() {
+            let snapshot = recorder.snapshot();
+            // The literal four expected directed neighbor pairs, not a record-selected graph.
+            let expected = [[1, 2], [0, 3], [0, 3], [1, 2]][i];
+            let edges = expected
+                .into_iter()
+                .map(|other| {
+                    let decision = self
+                        .identities
+                        .map(|ids| snapshot.edge(ids[other]))
+                        .unwrap_or("Unknown");
+                    (DIAMOND_LABELS[other], decision)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            owners.insert((*label).into(), serde_json::json!({
+                "diagnostic_complete":snapshot.complete(), "selection":snapshot,"expected_edges":edges,
+            }));
+        }
+        serde_json::json!({"attempt":self.number,"begin_ns":self.begin_ns,"end_ns":self.end_ns,
+            "validation_end_ns":self.validation_end_ns,"acquisition_completed":self.acquisition_completed,
+            "owners":owners})
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReadinessDiagnostics {
+    schema: u8,
+    clock_domain: &'static str,
+    graph_clock_domain: &'static str,
+    candidate_omission_cause: &'static str,
+    late_valid_raw_observation_retained: bool,
+    terminal_stage: Option<ReadinessTerminal>,
+    start_ns: u64,
+    deadline_ns: Option<u64>,
+    terminal_ns: Option<u64>,
+    clock_incomplete: bool,
+    output_overflow: bool,
+    counts: ReadinessCounts,
+    last_completed_rejected_attempt: Option<serde_json::Value>,
+    terminal_attempt: Option<serde_json::Value>,
+}
+
+impl ReadinessDiagnostics {
+    fn new(start: tokio::time::Instant, deadline: tokio::time::Instant) -> Self {
+        let deadline_ns = readiness_offset(start, deadline);
+        Self {
+            schema: 1,
+            clock_domain: "tokio_since_final_readiness_start",
+            graph_clock_domain: "std_since_fixture_start",
+            candidate_omission_cause: "Unknown",
+            late_valid_raw_observation_retained: false,
+            terminal_stage: None,
+            start_ns: 0,
+            deadline_ns,
+            terminal_ns: None,
+            clock_incomplete: deadline_ns.is_none(),
+            output_overflow: false,
+            counts: ReadinessCounts::default(),
+            last_completed_rejected_attempt: None,
+            terminal_attempt: None,
+        }
+    }
+
+    fn finish(
+        &mut self,
+        stage: ReadinessTerminal,
+        start: tokio::time::Instant,
+        attempt: Option<&ReadinessAttempt>,
+    ) {
+        self.terminal_stage = Some(stage);
+        self.terminal_ns = readiness_offset(start, tokio::time::Instant::now());
+        self.clock_incomplete |= self.terminal_ns.is_none();
+        self.terminal_attempt = attempt.map(ReadinessAttempt::freeze);
+    }
+
+    fn bounded_value(&self) -> serde_json::Value {
+        const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+        if let Ok(encoded) = serde_json::to_vec(self) {
+            if encoded.len() <= MAX_DIAGNOSTIC_BYTES {
+                if let Ok(value) = serde_json::from_slice(&encoded) {
+                    return value;
+                }
+            }
+        }
+        // Fixed scalar fallback: never truncate JSON, replace the old graph, or change an oracle.
+        serde_json::json!({"schema":1,"clock_domain":self.clock_domain,
+            "graph_clock_domain":self.graph_clock_domain,"candidate_omission_cause":"Unknown",
+            "late_valid_raw_observation_retained":false,"terminal_stage":self.terminal_stage,
+            "start_ns":self.start_ns,"deadline_ns":self.deadline_ns,"terminal_ns":self.terminal_ns,
+            "clock_incomplete":self.clock_incomplete,"output_overflow":true,"counts":self.counts,
+            "last_completed_rejected_attempt":null,"terminal_attempt":null})
+    }
+}
+
 #[derive(Debug)]
 struct RejectedReadiness {
     reason: String,
     last_observation: Option<serde_json::Value>,
     last_rejection_reason: Option<String>,
+    diagnostics: ReadinessDiagnostics,
 }
 
 // One absolute deadline owns acquisition and polling. Only the full object
 // validated here can become pre_cut; timed-out partial acquisitions are dropped.
 async fn capture_ready_diamond<F, Fut>(
     topology: &serde_json::Value,
+    start: tokio::time::Instant,
     deadline: tokio::time::Instant,
     mut observe: F,
 ) -> Result<serde_json::Value, RejectedReadiness>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(ReadinessAttempt) -> Fut,
     Fut: Future<Output = Result<serde_json::Value, String>>,
 {
     let mut rejected = RejectedReadiness {
         reason: "final diamond readiness deadline elapsed".into(),
         last_observation: None,
         last_rejection_reason: None,
+        diagnostics: ReadinessDiagnostics::new(start, deadline),
     };
+    let identities = readiness_identities(topology);
     loop {
         if tokio::time::Instant::now() >= deadline {
+            rejected
+                .diagnostics
+                .finish(ReadinessTerminal::BeforeAcquireDeadline, start, None);
             return Err(rejected);
         }
-        let observed = match tokio::time::timeout_at(deadline, observe()).await {
-            Ok(Ok(observed)) => observed,
+        let counts = &mut rejected.diagnostics.counts;
+        readiness_increment(&mut counts.attempts_started, &mut counts.counter_overflow);
+        let mut attempt = ReadinessAttempt::new(counts.attempts_started, start, identities);
+        rejected.diagnostics.clock_incomplete |= attempt.begin_ns.is_none();
+        let acquired = tokio::time::timeout_at(deadline, observe(attempt.clone())).await;
+        let observed = match acquired {
+            Ok(Ok(observed)) => {
+                readiness_increment(
+                    &mut counts.acquisitions_completed,
+                    &mut counts.counter_overflow,
+                );
+                attempt.acquisition_completed = true;
+                attempt.end_ns = readiness_offset(start, tokio::time::Instant::now());
+                rejected.diagnostics.clock_incomplete |= attempt.end_ns.is_none();
+                observed
+            }
             Ok(Err(reason)) => {
+                readiness_increment(
+                    &mut counts.acquisitions_completed,
+                    &mut counts.counter_overflow,
+                );
+                readiness_increment(&mut counts.acquisition_errors, &mut counts.counter_overflow);
+                attempt.acquisition_completed = true;
+                attempt.end_ns = readiness_offset(start, tokio::time::Instant::now());
+                rejected.diagnostics.clock_incomplete |= attempt.end_ns.is_none();
                 rejected.reason = format!("final diamond observation failed: {reason}");
+                rejected
+                    .diagnostics
+                    .finish(ReadinessTerminal::AcquireError, start, Some(&attempt));
                 return Err(rejected);
             }
-            Err(_) => return Err(rejected),
+            Err(_) => {
+                rejected.diagnostics.finish(
+                    ReadinessTerminal::AcquireTimedOut,
+                    start,
+                    Some(&attempt),
+                );
+                return Err(rejected);
+            }
         };
-        match diamond_peer_sets(topology, &observed) {
-            Ok(()) if tokio::time::Instant::now() < deadline => return Ok(observed),
-            Ok(()) => return Err(rejected),
+        let validation = diamond_peer_sets(topology, &observed);
+        attempt.validation_end_ns = readiness_offset(start, tokio::time::Instant::now());
+        rejected.diagnostics.clock_incomplete |= attempt.validation_end_ns.is_none();
+        match validation {
+            Ok(()) => {
+                readiness_increment(
+                    &mut counts.validations_accepted,
+                    &mut counts.counter_overflow,
+                );
+                if tokio::time::Instant::now() < deadline {
+                    return Ok(observed);
+                }
+                rejected.diagnostics.finish(
+                    ReadinessTerminal::ValidatedAfterDeadline,
+                    start,
+                    Some(&attempt),
+                );
+                return Err(rejected);
+            }
             Err(reason) => {
+                readiness_increment(
+                    &mut counts.validations_rejected,
+                    &mut counts.counter_overflow,
+                );
                 rejected.last_observation = Some(observed);
                 rejected.last_rejection_reason = Some(reason);
+                rejected.diagnostics.last_completed_rejected_attempt = None;
+                rejected.diagnostics.last_completed_rejected_attempt = Some(attempt.freeze());
             }
         }
         if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(10)))
             .await
             .is_err()
         {
+            rejected.diagnostics.finish(
+                ReadinessTerminal::RetrySleepTimedOut,
+                start,
+                Some(&attempt),
+            );
             return Err(rejected);
         }
     }
@@ -625,6 +879,7 @@ fn retain_rejected_readiness(raw: &mut serde_json::Value, rejected: &RejectedRea
         "last_rejection_reason": rejected.last_rejection_reason,
         "completed_rejected_observation_available": rejected.last_observation.is_some(),
     });
+    raw["readiness_diagnostics"] = rejected.diagnostics.bounded_value();
 }
 
 async fn shape_diamond(
@@ -682,10 +937,14 @@ async fn shape_diamond(
     }
     // Keep the existing settle outside the unchanged final 20-second budget.
     tokio::time::sleep(Duration::from_secs(2)).await;
+    let start = tokio::time::Instant::now();
     let pre_cut = capture_ready_diamond(
         &raw["topology"],
-        tokio::time::Instant::now() + SETUP,
-        || async { Ok(diamond_observations(agents, clock).await) },
+        start,
+        start + SETUP,
+        |attempt| async move {
+            Ok(diamond_observations_with_recorder(agents, clock, Some(&attempt)).await)
+        },
     )
     .await?;
     raw["topology"]["observations"]["pre_cut"] = pre_cut;
@@ -1441,11 +1700,10 @@ async fn diamond_readiness_returns_exact_validated_post_refresh_observation() {
     valid["W5"]["begin_ns"] = serde_json::json!(12345);
     valid["W5"]["end_ns"] = serde_json::json!(12346);
     let mut observations = std::collections::VecDeque::from([missing, valid.clone()]);
-    let observed = capture_ready_diamond(
-        topology,
-        tokio::time::Instant::now() + Duration::from_secs(1),
-        || std::future::ready(Ok(observations.pop_front().expect("two acquisitions"))),
-    )
+    let start = tokio::time::Instant::now();
+    let observed = capture_ready_diamond(topology, start, start + Duration::from_secs(1), |_| {
+        std::future::ready(Ok(observations.pop_front().expect("two acquisitions")))
+    })
     .await
     .expect("second full observation is exact");
     assert_eq!(
@@ -1473,10 +1731,12 @@ async fn diamond_readiness_retains_rejection_on_absolute_deadline() {
         }
         let mut acquisitions = 0;
         let mut reached_t0_or_load = false;
+        let start = tokio::time::Instant::now();
         let result = capture_ready_diamond(
             &raw["topology"],
-            tokio::time::Instant::now() + Duration::from_millis(30),
-            || {
+            start,
+            start + Duration::from_millis(30),
+            |_| {
                 acquisitions += 1;
                 if acquisitions == 1 {
                     std::future::ready(Ok(invalid.clone())).boxed_local()
@@ -1515,10 +1775,12 @@ async fn diamond_readiness_retains_rejection_on_absolute_deadline() {
 #[tokio::test(start_paused = true)]
 async fn diamond_readiness_reports_no_completed_observation() {
     let raw = synthetic_diamond_evidence();
+    let start = tokio::time::Instant::now();
     let rejected = capture_ready_diamond(
         &raw["topology"],
-        tokio::time::Instant::now() + Duration::from_millis(10),
-        std::future::pending::<Result<serde_json::Value, String>>,
+        start,
+        start + Duration::from_millis(10),
+        |_| std::future::pending::<Result<serde_json::Value, String>>(),
     )
     .await
     .expect_err("a partial acquisition never becomes successful");
@@ -1542,10 +1804,12 @@ async fn diamond_readiness_retains_last_rejection_on_acquisition_error() {
         Ok(invalid.clone()),
         Err("inert acquisition failure".to_owned()),
     ]);
+    let start = tokio::time::Instant::now();
     let rejected = capture_ready_diamond(
         &raw["topology"],
-        tokio::time::Instant::now() + Duration::from_secs(1),
-        || std::future::ready(observations.pop_front().expect("two acquisitions")),
+        start,
+        start + Duration::from_secs(1),
+        |_| std::future::ready(observations.pop_front().expect("two acquisitions")),
     )
     .await
     .expect_err("acquisition error remains nonpass");
@@ -1554,4 +1818,211 @@ async fn diamond_readiness_retains_last_rejection_on_acquisition_error() {
         rejected.reason,
         "final diamond observation failed: inert acquisition failure"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_diagnostic_distinguishes_terminal_branches_and_counts() {
+    let raw = synthetic_diamond_evidence();
+    for stage in [
+        ReadinessTerminal::BeforeAcquireDeadline,
+        ReadinessTerminal::AcquireTimedOut,
+        ReadinessTerminal::AcquireError,
+        ReadinessTerminal::RetrySleepTimedOut,
+    ] {
+        let start = tokio::time::Instant::now();
+        let deadline = start
+            + if stage == ReadinessTerminal::BeforeAcquireDeadline {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(5)
+            };
+        let result = capture_ready_diamond(&raw["topology"], start, deadline, |_| async move {
+            match stage {
+                ReadinessTerminal::BeforeAcquireDeadline => {
+                    panic!("must not acquire after deadline")
+                }
+                ReadinessTerminal::AcquireTimedOut => std::future::pending().await,
+                ReadinessTerminal::AcquireError => Err("inert acquisition".to_owned()),
+                _ => Ok(serde_json::json!({})),
+            }
+        })
+        .await
+        .expect_err("every terminal branch remains nonpass");
+        let diag = result.diagnostics;
+        assert_eq!(diag.terminal_stage, Some(stage));
+        assert_eq!(diag.start_ns, 0);
+        assert_eq!(
+            diag.deadline_ns,
+            Some(if stage == ReadinessTerminal::BeforeAcquireDeadline {
+                0
+            } else {
+                5_000_000
+            })
+        );
+        assert!(!diag.clock_incomplete);
+        let counts = diag.counts;
+        let expected = match stage {
+            ReadinessTerminal::BeforeAcquireDeadline => (0, 0, 0, 0),
+            ReadinessTerminal::AcquireTimedOut => (1, 0, 0, 0),
+            ReadinessTerminal::AcquireError => (1, 1, 1, 0),
+            _ => (1, 1, 0, 1),
+        };
+        assert_eq!(
+            (
+                counts.attempts_started,
+                counts.acquisitions_completed,
+                counts.acquisition_errors,
+                counts.validations_rejected
+            ),
+            expected
+        );
+        assert_eq!(counts.validations_accepted, 0);
+        assert!(!counts.counter_overflow);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_diagnostic_labels_late_valid_without_retaining_graph() {
+    let raw = synthetic_diamond_evidence();
+    let valid = raw["topology"]["observations"]["pre_cut"].clone();
+    let start = tokio::time::Instant::now();
+    // Timeout polls the inner future before its timer; a ready full result can
+    // arrive at the deadline and must still fail the separate validation-time check.
+    let rejected = capture_ready_diamond(
+        &raw["topology"],
+        start,
+        start + Duration::from_millis(1),
+        |_| {
+            let valid = valid.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok(valid)
+            }
+        },
+    )
+    .await
+    .expect_err("late full graph does not extend readiness");
+    assert_eq!(
+        rejected.diagnostics.terminal_stage,
+        Some(ReadinessTerminal::ValidatedAfterDeadline)
+    );
+    assert_eq!(rejected.diagnostics.counts.validations_accepted, 1);
+    assert_eq!(rejected.diagnostics.counts.validations_rejected, 0);
+    assert!(rejected.last_observation.is_none());
+    assert!(!rejected.diagnostics.late_valid_raw_observation_retained);
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_diagnostic_keeps_distinct_rejected_and_partial_actual_core_attempts() {
+    let raw = synthetic_diamond_evidence();
+    let ids = readiness_identities(&raw["topology"]).expect("four full inert IDs");
+    let mut invalid = raw["topology"]["observations"]["pre_cut"].clone();
+    invalid["W5"]["admitted"] = serde_json::json!([]);
+    let mut calls = 0;
+    let start = tokio::time::Instant::now();
+    let rejected = capture_ready_diamond(
+        &raw["topology"],
+        start,
+        start + Duration::from_millis(30),
+        |attempt| {
+            calls += 1;
+            let invalid = invalid.clone();
+            async move {
+                if attempt.number == 1 {
+                    return Ok(invalid);
+                }
+                let peers = vec![ant_quic::PeerId(ids[1]), ant_quic::PeerId(ids[2])];
+                network::select_gossip_peers(
+                    std::future::ready(peers),
+                    |_| std::future::ready(network::PeerAdmission::Admitted),
+                    Some(&attempt.owners[0]),
+                )
+                .await;
+                network::select_gossip_peers(
+                    std::future::pending(),
+                    |_| std::future::ready(network::PeerAdmission::Admitted),
+                    Some(&attempt.owners[1]),
+                )
+                .await;
+                panic!("pending acquisition cannot reach a later owner")
+            }
+        },
+    )
+    .await
+    .expect_err("partial second attempt remains nonpass");
+    assert_eq!(calls, 2);
+    assert_eq!(rejected.last_observation.as_ref(), Some(&invalid));
+    let diag = rejected.diagnostics.bounded_value();
+    assert_eq!(diag["terminal_stage"], "AcquireTimedOut");
+    assert_eq!(diag["last_completed_rejected_attempt"]["attempt"], 1);
+    assert_eq!(diag["terminal_attempt"]["attempt"], 2);
+    assert_eq!(diag["terminal_attempt"]["acquisition_completed"], false);
+    let owners = &diag["terminal_attempt"]["owners"];
+    assert_eq!(owners["G5"]["selection"]["stage"], "Complete");
+    assert_eq!(
+        owners["G5"]["expected_edges"]["D5"],
+        "CandidateAdmissionAdmitted"
+    );
+    assert_eq!(owners["D5"]["selection"]["stage"], "CandidateQueryInFlight");
+    assert!(owners["D5"]["selection"]["total_candidates"].is_null());
+    assert_eq!(owners["D5"]["expected_edges"]["W5"], "Unknown");
+    assert_eq!(owners["O5"]["selection"]["stage"], "NotStarted");
+    assert_eq!(diag["counts"]["attempts_started"], 2);
+    assert_eq!(diag["counts"]["acquisitions_completed"], 1);
+    assert_eq!(diag["counts"]["validations_rejected"], 1);
+}
+
+#[test]
+fn readiness_diagnostic_checks_identity_clock_overflow_and_closed_fallback() {
+    let raw = synthetic_diamond_evidence();
+    assert!(readiness_identities(&raw["topology"]).is_some());
+    for mutation in 0..4 {
+        let mut topology = raw["topology"].clone();
+        match mutation {
+            0 => topology["peer_ids"]["G5"] = topology["peer_ids"]["D5"].clone(),
+            1 => topology["peer_ids"]["G5"] = serde_json::json!("01".repeat(8)),
+            2 => topology["peer_ids"]["G5"] = serde_json::json!("gg".repeat(32)),
+            _ => topology["peer_ids"]["extra"] = serde_json::json!("01".repeat(32)),
+        }
+        assert!(readiness_identities(&topology).is_none());
+    }
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        readiness_offset(start + Duration::from_nanos(1), start),
+        None
+    );
+    let mut diag = ReadinessDiagnostics::new(start, start + SETUP);
+    diag.counts.attempts_started = u64::MAX;
+    readiness_increment(
+        &mut diag.counts.attempts_started,
+        &mut diag.counts.counter_overflow,
+    );
+    assert_eq!(diag.counts.attempts_started, u64::MAX);
+    assert!(diag.counts.counter_overflow);
+    diag.finish(ReadinessTerminal::AcquireTimedOut, start, None);
+    diag.terminal_attempt = Some(serde_json::json!("x".repeat(64 * 1024)));
+    let value = diag.bounded_value();
+    assert!(serde_json::to_vec(&value).unwrap().len() <= 64 * 1024);
+    assert_eq!(value["output_overflow"], true);
+    assert_eq!(value["terminal_stage"], "AcquireTimedOut");
+    assert_eq!(value["counts"]["attempts_started"], u64::MAX);
+    assert!(value["terminal_attempt"].is_null());
+    let rejected = RejectedReadiness {
+        reason: "inert rejection".into(),
+        last_observation: None,
+        last_rejection_reason: None,
+        diagnostics: diag,
+    };
+    let mut retained = raw.clone();
+    retained["phase"] = serde_json::json!("setup");
+    let topology = retained["topology"].clone();
+    let samples = retained["samples"].clone();
+    let load = retained["load"].clone();
+    retain_rejected_readiness(&mut retained, &rejected);
+    assert_eq!(retained["phase"], "setup");
+    assert_eq!(retained["outcome"], "INCONCLUSIVE");
+    assert_eq!(retained["topology"], topology);
+    assert_eq!(retained["samples"], samples);
+    assert_eq!(retained["load"], load);
+    assert_eq!(retained["readiness_diagnostics"], value);
 }
