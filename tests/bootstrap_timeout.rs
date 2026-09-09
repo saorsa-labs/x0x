@@ -18,6 +18,18 @@ use std::time::{Duration, Instant};
 use x0x::bootstrap::{BootstrapConfig, BootstrapConnector};
 use x0x::network::{NetworkConfig, NetworkNode};
 
+/// Explicit test-only network config (#417/#337): loopback bind, no
+/// seeds, discovery/port-mapping off. Still a real socket constructor.
+fn test_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
+}
+
 #[tokio::test]
 async fn bootstrap_dial_timeout_is_bounded_and_advances() {
     // Loopback blackhole: a socket that swallows QUIC Initials but never
@@ -25,7 +37,7 @@ async fn bootstrap_dial_timeout_is_bounded_and_advances() {
     let blackhole = UdpSocket::bind("127.0.0.1:0").expect("bind blackhole socket");
     let addr = blackhole.local_addr().expect("read blackhole local addr");
 
-    let network = NetworkNode::new(NetworkConfig::default(), None, None)
+    let network = NetworkNode::new(test_network_config(), None, None)
         .await
         .expect("create network node");
 
