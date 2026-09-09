@@ -355,21 +355,23 @@ runs `x0x diagnostics gossip --json`, `x0x diagnostics transport --json`,
 and `x0x health --json` at both endpoints, preserves their responses and
 ranks **t1−t0** topic EAGER bytes. It also supplies the name map (§5.3).
 
-Save this as `capture-egress.py` in a new evidence directory. Requires
-Python 3 and `x0x` on PATH. Install the BLAKE3 helper and run:
+This recipe ships in-repo as `scripts/capture-egress.py` (`--window-secs` /
+`--out-dir` flags; extra topic names remain positional). Run it from a new
+evidence directory. Requires Python 3 and `x0x` on PATH. Install the BLAKE3
+helper and run:
 
 ```bash
 # macOS / Linux
 python3 -m venv .venv
 .venv/bin/python -m pip install blake3
-.venv/bin/python capture-egress.py
+.venv/bin/python /path/to/x0x/scripts/capture-egress.py
 ```
 
 ```powershell
 # Windows PowerShell (no activation or execution-policy change required)
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install blake3
-.\.venv\Scripts\python.exe capture-egress.py
+.\.venv\Scripts\python.exe C:\path\to\x0x\scripts\capture-egress.py
 ```
 
 ```python
