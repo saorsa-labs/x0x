@@ -11,17 +11,49 @@ use futures::FutureExt;
 use serde_json::json;
 use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
-const PHASE: Duration = Duration::from_secs(3);
+/// Positive deadline for every "wait for real convergence" step below. It is
+/// never a negative window — absence is asserted only over [`WINDOW`], which
+/// this calibration does not touch.
+///
+/// Calibration basis (Coverage Gate barrier-timeout flake). These barriers
+/// poll local state that changes when
+/// a signed capability advert completes a real gossip round trip between
+/// separate Agents on loopback, so their cost tracks gossip convergence
+/// latency under whatever CPU pressure the host is under. Measured per-barrier
+/// elapsed for this fixture, instrumented and run with the budget temporarily
+/// lifted so every barrier could finish:
+///
+/// - isolated: 11 barrier executions, worst 253 ms;
+/// - 2x CPU oversubscription: worst 477 ms and 578 ms over two runs;
+/// - 5x CPU oversubscription: worst 1052 / 3568 / 4007 ms over three runs.
+///
+/// Every run completed every barrier, so contention makes convergence late
+/// rather than absent. The former 3 s budget carried ~12x headroom isolated
+/// but sat inside the 5x distribution, which is where the CI flake lives.
+///
+/// Note the slowest barrier is environment-dependent — locally it is "relay
+/// observes sender extension", while the CI failure was "sender observes
+/// released relay extension", which never exceeded 598 ms here. That is why
+/// this stays a single shared budget: per-barrier budgets would over-fit to
+/// whichever step happened to be slow on the measuring host. 15 s is ~3.7x the
+/// slowest measured barrier and far inside nextest's 600 s terminate-after.
+const PHASE: Duration = Duration::from_secs(15);
 const WINDOW: Duration = Duration::from_millis(300);
 
 async fn until(label: &'static str, mut ready: impl FnMut() -> bool) {
-    tokio::time::timeout(PHASE, async {
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(PHASE, async {
         while !ready() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("three-second phase barrier: {label}"));
+    .await;
+    outcome.unwrap_or_else(|_| {
+        panic!(
+            "phase barrier ({PHASE:?}, waited {}ms): {label}",
+            started.elapsed().as_millis()
+        )
+    });
 }
 
 async fn build(dir: &std::path::Path, name: &str, candidates: Vec<String>) -> Agent {
