@@ -277,6 +277,17 @@ pub struct DaemonConfig {
     #[serde(default = "default_port_mapping_enabled")]
     pub(super) port_mapping_enabled: bool,
 
+    /// #417: operator toggle for ant-quic's first-party mDNS LAN discovery
+    /// and auto-connect (TOML `mdns_enabled`). Default `true`, matching
+    /// ant-quic and every shipped daemon to date — this key changes nothing
+    /// unless it is set. Set `false` for a hermetic daemon that neither
+    /// advertises nor browses on the LAN: the test harness does exactly that
+    /// so a fixture cannot discover and auto-connect to a live production
+    /// daemon on the same machine (the #417 defect). Note that
+    /// `network_id` only *namespaces* mDNS; this key turns it off outright.
+    #[serde(default = "default_mdns_enabled")]
+    pub(super) mdns_enabled: bool,
+
     /// X0X-0070b: peer-relay fallback configuration (TOML `[peer_relay]`).
     /// Defaults to disabled — opt in by setting `peer_relay.enabled = true`
     /// and listing relay-candidate hex agent IDs under
@@ -467,6 +478,13 @@ fn default_port_mapping_enabled() -> bool {
     true
 }
 
+/// #417: mDNS stays on by default so shipped daemons keep the LAN discovery
+/// behaviour they have always had. Only an explicit `mdns_enabled = false`
+/// (the test harness, or an operator on a hostile-discovery LAN) turns it off.
+fn default_mdns_enabled() -> bool {
+    true
+}
+
 pub fn default_bind_address() -> SocketAddr {
     // Bind to IPv6 unspecified ([::]) which accepts both IPv4 and IPv6
     // via dual-stack sockets. This avoids port conflicts on macOS where
@@ -650,6 +668,7 @@ impl Default for DaemonConfig {
             log_format: default_log_format(),
             bootstrap_peers: None,
             port_mapping_enabled: default_port_mapping_enabled(),
+            mdns_enabled: default_mdns_enabled(),
             peer_relay: x0x::network::PeerRelayConfig::default(),
             observed_prefix_enabled: false,
             skip_legacy_dm_bus: false,
@@ -1325,6 +1344,24 @@ mod tests {
         let config: DaemonConfig =
             toml::from_str("observed_prefix_enabled = true").expect("opt-in parses");
         assert!(config.observed_prefix_enabled);
+    }
+
+    #[test]
+    fn mdns_defaults_on_and_parses_explicit_opt_out() {
+        // Issue #417: mDNS is how a daemon finds LAN peers with no bootstrap,
+        // so adding the knob must NOT change what already-deployed daemons do
+        // — every construction path that does not name the key stays ON.
+        // Regressing this default would silently strip LAN discovery from the
+        // production fleet on upgrade.
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert!(config.mdns_enabled);
+        assert!(DaemonConfig::default().mdns_enabled);
+
+        // The opt-out is what makes a daemon hermetic: without it a test
+        // fixture advertises on the LAN and auto-connects to any live
+        // production daemon on the same machine (the #417 defect).
+        let config: DaemonConfig = toml::from_str("mdns_enabled = false").expect("opt-out parses");
+        assert!(!config.mdns_enabled);
     }
 
     #[test]

@@ -537,6 +537,7 @@ async fn self_announcement_populates_discovery_cache() {
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],
+            mdns_enabled: false,
             ..Default::default()
         })
         .build()
@@ -644,6 +645,7 @@ async fn self_announcement_populates_machine_cache() {
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],
+            mdns_enabled: false,
             ..Default::default()
         })
         .build()
@@ -673,6 +675,7 @@ async fn user_and_agent_link_to_discovered_machine() {
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],
+            mdns_enabled: false,
             ..Default::default()
         })
         .build()

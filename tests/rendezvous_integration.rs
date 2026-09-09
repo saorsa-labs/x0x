@@ -141,6 +141,7 @@ async fn test_agent_registers_to_shard() -> TestResult {
         .with_network_config(NetworkConfig {
             bind_addr: Some("0.0.0.0:0".parse()?),
             bootstrap_nodes: bootstrap_addrs,
+            mdns_enabled: false,
             ..Default::default()
         })
         .build()
@@ -175,6 +176,7 @@ async fn test_agent_lookup_via_shard() -> TestResult {
         .with_network_config(NetworkConfig {
             bind_addr: Some("0.0.0.0:0".parse()?),
             bootstrap_nodes: bootstrap_addrs.clone(),
+            mdns_enabled: false,
             ..Default::default()
         })
         .build()
@@ -187,6 +189,7 @@ async fn test_agent_lookup_via_shard() -> TestResult {
         .with_network_config(NetworkConfig {
             bind_addr: Some("0.0.0.0:0".parse()?),
             bootstrap_nodes: bootstrap_addrs,
+            mdns_enabled: false,
             ..Default::default()
         })
         .build()
@@ -309,6 +312,7 @@ async fn test_concurrent_shard_queries() -> TestResult {
         .with_network_config(NetworkConfig {
             bind_addr: Some("0.0.0.0:0".parse()?),
             bootstrap_nodes: bootstrap_addrs,
+            mdns_enabled: false,
             ..Default::default()
         })
         .build()

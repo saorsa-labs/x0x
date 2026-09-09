@@ -476,9 +476,11 @@ pub async fn serve_with_options(
         // CLI flag wins over config TOML so operators can override on a
         // single invocation without editing the config file.
         port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
-        // Daemon has no mdns TOML knob yet; keep ant-quic's current
-        // (enabled) behavior until operator plumbing is requested.
-        mdns_enabled: true,
+        // #417: operator-controlled via TOML `mdns_enabled`, defaulting to
+        // `true` so shipped daemons keep ant-quic's LAN discovery. The test
+        // harness sets it `false` so a fixture cannot discover and
+        // auto-connect to a live production daemon on the same machine.
+        mdns_enabled: config.mdns_enabled,
         peer_relay: config.peer_relay.clone(),
         network_id,
         observed_prefix_enabled: config.observed_prefix_enabled,

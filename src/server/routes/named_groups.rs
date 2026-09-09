@@ -41370,6 +41370,7 @@ pub(in crate::server) mod tests {
             bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
             bootstrap_nodes: Vec::new(),
             network_id: Some(plane.to_string()),
+            mdns_enabled: false,
             ..x0x::network::NetworkConfig::default()
         }
     }

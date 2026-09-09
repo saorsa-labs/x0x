@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Daemon `mdns_enabled` TOML knob, and hermetic-by-default tests (#417).**
+  `x0xd` hard-coded ant-quic's mDNS discovery to on with no way to disable it,
+  so every locally-started test and CI daemon advertised on the LAN and
+  auto-connected to whatever it found — including live production daemons on
+  the same machine. That both inflated real prod announce volume and made
+  co-located test runs fail non-deterministically. The root-level TOML key
+  `mdns_enabled` now controls it; it defaults to `true`, so shipped daemons
+  behave exactly as before. The test harness (`DaemonFixture` and the
+  cluster/pair orchestration) writes `mdns_enabled = false` unless the test
+  sets the key itself, and the in-process integration/unit agents build their
+  `NetworkConfig` with `mdns_enabled: false`. Note that `network_id` only
+  *namespaces* mDNS — it never stopped a same-plane fixture from finding a
+  prod daemon, which is why the plane isolation added earlier was not by
+  itself sufficient. (#337 was closed as a duplicate of #417.)
+
 - **Encrypted group-scoped KvStore — issue #341 Phase B.** The #88 design
   (`docs/design/encrypted-kvstore.md`) is now implemented for the GSS
   secure plane (ADR-0010). A store created under
