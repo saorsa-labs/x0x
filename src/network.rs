@@ -5258,6 +5258,18 @@ mod tests {
     use super::*;
     use saorsa_gossip_transport::GossipTransport;
 
+    /// Explicit test-only network config (#417/#337): loopback bind, no
+    /// seeds, discovery/port-mapping off. Still a real socket constructor.
+    fn test_network_config() -> NetworkConfig {
+        NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        }
+    }
+
     fn test_ant_peer(byte: u8) -> AntPeerId {
         ant_quic::PeerId([byte; 32])
     }
@@ -5355,7 +5367,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gossip_transport_trait() {
-        let config = NetworkConfig::default();
+        let config = test_network_config();
         let node = NetworkNode::new(config, None, None).await.unwrap();
 
         // Test local_peer_id() method
@@ -5677,9 +5689,22 @@ mod tests {
     }
 }
 
+/// Explicit test-only network config (#417/#337): loopback bind, no
+/// seeds, discovery/port-mapping off. Still a real socket constructor.
+#[cfg(test)]
+fn test_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
+}
+
 #[tokio::test]
 async fn test_network_node_subscribe_events() {
-    let config = NetworkConfig::default();
+    let config = test_network_config();
     let node = NetworkNode::new(config, None, None).await.unwrap();
 
     // Subscribe to events
@@ -5707,7 +5732,7 @@ async fn test_network_node_subscribe_events() {
 
 #[tokio::test]
 async fn test_network_node_multiple_subscribers() {
-    let config = NetworkConfig::default();
+    let config = test_network_config();
     let node = NetworkNode::new(config, None, None).await.unwrap();
 
     // Multiple subscribers

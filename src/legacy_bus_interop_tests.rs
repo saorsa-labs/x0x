@@ -565,11 +565,73 @@ async fn diamond_suppression_check(
     )
 }
 
+#[derive(Debug)]
+struct RejectedReadiness {
+    reason: String,
+    last_observation: Option<serde_json::Value>,
+    last_rejection_reason: Option<String>,
+}
+
+// One absolute deadline owns acquisition and polling. Only the full object
+// validated here can become pre_cut; timed-out partial acquisitions are dropped.
+async fn capture_ready_diamond<F, Fut>(
+    topology: &serde_json::Value,
+    deadline: tokio::time::Instant,
+    mut observe: F,
+) -> Result<serde_json::Value, RejectedReadiness>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, String>>,
+{
+    let mut rejected = RejectedReadiness {
+        reason: "final diamond readiness deadline elapsed".into(),
+        last_observation: None,
+        last_rejection_reason: None,
+    };
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(rejected);
+        }
+        let observed = match tokio::time::timeout_at(deadline, observe()).await {
+            Ok(Ok(observed)) => observed,
+            Ok(Err(reason)) => {
+                rejected.reason = format!("final diamond observation failed: {reason}");
+                return Err(rejected);
+            }
+            Err(_) => return Err(rejected),
+        };
+        match diamond_peer_sets(topology, &observed) {
+            Ok(()) if tokio::time::Instant::now() < deadline => return Ok(observed),
+            Ok(()) => return Err(rejected),
+            Err(reason) => {
+                rejected.last_observation = Some(observed);
+                rejected.last_rejection_reason = Some(reason);
+            }
+        }
+        if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(10)))
+            .await
+            .is_err()
+        {
+            return Err(rejected);
+        }
+    }
+}
+
+fn retain_rejected_readiness(raw: &mut serde_json::Value, rejected: &RejectedReadiness) {
+    raw["outcome"] = serde_json::json!("INCONCLUSIVE");
+    raw["reason"] = serde_json::json!(rejected.reason);
+    raw["rejected_readiness"] = serde_json::json!({
+        "last_completed_rejected_observation": rejected.last_observation,
+        "last_rejection_reason": rejected.last_rejection_reason,
+        "completed_rejected_observation_available": rejected.last_observation.is_some(),
+    });
+}
+
 async fn shape_diamond(
     agents: &[Agent],
     raw: &mut serde_json::Value,
     clock: std::time::Instant,
-) -> Vec<std::time::Instant> {
+) -> Result<Vec<std::time::Instant>, RejectedReadiness> {
     let expected = diamond_expected();
     let peer_ids: serde_json::Map<String, serde_json::Value> = DIAMOND_LABELS
         .iter()
@@ -615,29 +677,18 @@ async fn shape_diamond(
         }
     })
     .await;
-    bounded(
-        "fifth-only exact admitted diamond readiness",
-        SETUP,
-        async {
-            loop {
-                let observed = diamond_observations(agents, clock).await;
-                if diamond_peer_sets(&raw["topology"], &observed).is_ok() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        },
-    )
-    .await;
     for agent in agents {
         pubsub(agent).refresh_topic_peers().await;
     }
-    raw["topology"]["observations"]["pre_cut"] = bounded(
-        "pre-cut diamond observation",
-        SETUP,
-        diamond_observations(agents, clock),
+    // Keep the existing settle outside the unchanged final 20-second budget.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let pre_cut = capture_ready_diamond(
+        &raw["topology"],
+        tokio::time::Instant::now() + SETUP,
+        || async { Ok(diamond_observations(agents, clock).await) },
     )
-    .await;
+    .await?;
+    raw["topology"]["observations"]["pre_cut"] = pre_cut;
     for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(&originals) {
         let (check, _) = bounded(
             "pre-cut directed suppression check",
@@ -650,7 +701,7 @@ async fn shape_diamond(
             "initial_set_at_ns":diamond_offset(clock,*original),"pre_check":check,
             "ttl_ns":DIAMOND_TTL_NS,"margin_ns":DIAMOND_MARGIN_NS});
     }
-    originals
+    Ok(originals)
 }
 
 fn diamond_keys(value: &serde_json::Value, expected: &[&str]) -> Result<(), String> {
@@ -1124,11 +1175,16 @@ async fn measure(agents: &[Agent]) -> serde_json::Value {
     let mut witness = pubsub(&agents[3]).subscribe(DM_BUS_TOPIC.to_owned()).await;
     // Front-load binary hashing, lock/universe/identity work and witness setup.
     // Only this fifth case now shapes the already prepared full mesh.
-    let originals = shape_diamond(agents, &mut raw, clock).await;
+    let originals = match shape_diamond(agents, &mut raw, clock).await {
+        Ok(originals) => originals,
+        Err(rejected) => {
+            retain_rejected_readiness(&mut raw, &rejected);
+            emit_measurement(&raw);
+            panic!("INCONCLUSIVE: {}", rejected.reason);
+        }
+    };
     let captured_pre = raw["topology"].clone();
     emit_measurement(&raw);
-    // This fixed settle follows the separate labelled diamond readiness barrier.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     raw["samples"] =
         json!({"D5":{"t0":raw_sample(&agents[1],clock)},"O5":{"t0":raw_sample(&agents[2],clock)}});
     raw["phase"] = json!("t0");
@@ -1369,4 +1425,133 @@ fn diamond_validator_closed_shaping_operations() {
             "operation mutation {mutation}"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn diamond_readiness_returns_exact_validated_post_refresh_observation() {
+    let raw = synthetic_diamond_evidence();
+    let topology = &raw["topology"];
+    let before_refresh = topology["observations"]["pre_cut"].clone();
+    let mut missing = before_refresh.clone();
+    missing["W5"]["admitted"] = serde_json::json!([]);
+    // Old validation/discard/recapture could select the invalid second object.
+    assert!(diamond_peer_sets(topology, &before_refresh).is_ok());
+    assert!(diamond_peer_sets(topology, &missing).is_err());
+    let mut valid = before_refresh.clone();
+    valid["W5"]["begin_ns"] = serde_json::json!(12345);
+    valid["W5"]["end_ns"] = serde_json::json!(12346);
+    let mut observations = std::collections::VecDeque::from([missing, valid.clone()]);
+    let observed = capture_ready_diamond(
+        topology,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        || std::future::ready(Ok(observations.pop_front().expect("two acquisitions"))),
+    )
+    .await
+    .expect("second full observation is exact");
+    assert_eq!(
+        observed, valid,
+        "retain every field and interval of the admitted object"
+    );
+    assert!(observations.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn diamond_readiness_retains_rejection_on_absolute_deadline() {
+    for mutation in 0..3 {
+        let mut raw = synthetic_diamond_evidence();
+        let mut invalid = raw["topology"]["observations"]["pre_cut"].clone();
+        match mutation {
+            0 => invalid["W5"]["admitted"] = serde_json::json!([]),
+            1 => invalid["W5"]["admitted"][0] = serde_json::json!("ff".repeat(32)),
+            _ => {
+                let duplicate = invalid["W5"]["admitted"][0].clone();
+                invalid["W5"]["admitted"]
+                    .as_array_mut()
+                    .expect("array")
+                    .push(duplicate);
+            }
+        }
+        let mut acquisitions = 0;
+        let mut reached_t0_or_load = false;
+        let result = capture_ready_diamond(
+            &raw["topology"],
+            tokio::time::Instant::now() + Duration::from_millis(30),
+            || {
+                acquisitions += 1;
+                if acquisitions == 1 {
+                    std::future::ready(Ok(invalid.clone())).boxed_local()
+                } else {
+                    std::future::pending::<Result<serde_json::Value, String>>().boxed_local()
+                }
+            },
+        )
+        .await;
+        match result {
+            Ok(_) => reached_t0_or_load = true,
+            Err(rejected) => {
+                assert_eq!(rejected.last_observation.as_ref(), Some(&invalid));
+                assert_eq!(
+                    rejected.last_rejection_reason.as_deref(),
+                    Some("admitted set differs from literal diamond")
+                );
+                assert_eq!(rejected.reason, "final diamond readiness deadline elapsed");
+                let original_topology = raw["topology"].clone();
+                retain_rejected_readiness(&mut raw, &rejected);
+                assert_eq!(
+                    raw["topology"], original_topology,
+                    "no tombstone reinstall or closed-schema mutation"
+                );
+                assert_eq!(raw["outcome"], "INCONCLUSIVE");
+                assert_eq!(
+                    raw["rejected_readiness"]["last_completed_rejected_observation"],
+                    invalid
+                );
+            }
+        }
+        assert!(!reached_t0_or_load);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn diamond_readiness_reports_no_completed_observation() {
+    let raw = synthetic_diamond_evidence();
+    let rejected = capture_ready_diamond(
+        &raw["topology"],
+        tokio::time::Instant::now() + Duration::from_millis(10),
+        std::future::pending::<Result<serde_json::Value, String>>,
+    )
+    .await
+    .expect_err("a partial acquisition never becomes successful");
+    assert!(rejected.last_observation.is_none());
+    assert!(rejected.last_rejection_reason.is_none());
+    let mut retained = raw;
+    retain_rejected_readiness(&mut retained, &rejected);
+    assert_eq!(
+        retained["rejected_readiness"]["completed_rejected_observation_available"],
+        false
+    );
+    assert!(retained["rejected_readiness"]["last_completed_rejected_observation"].is_null());
+}
+
+#[tokio::test(start_paused = true)]
+async fn diamond_readiness_retains_last_rejection_on_acquisition_error() {
+    let raw = synthetic_diamond_evidence();
+    let mut invalid = raw["topology"]["observations"]["pre_cut"].clone();
+    invalid["W5"]["admitted"] = serde_json::json!([]);
+    let mut observations = std::collections::VecDeque::from([
+        Ok(invalid.clone()),
+        Err("inert acquisition failure".to_owned()),
+    ]);
+    let rejected = capture_ready_diamond(
+        &raw["topology"],
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        || std::future::ready(observations.pop_front().expect("two acquisitions")),
+    )
+    .await
+    .expect_err("acquisition error remains nonpass");
+    assert_eq!(rejected.last_observation, Some(invalid));
+    assert_eq!(
+        rejected.reason,
+        "final diamond observation failed: inert acquisition failure"
+    );
 }
