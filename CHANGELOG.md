@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- **Dead `[gossip]` HyParView knobs — `active_view_size`,
+  `passive_view_size`, `arwl`, `prwl`.** These were parsed and range-validated
+  but never reached `saorsa_gossip_membership::MembershipConfig`, so setting
+  them never changed overlay behaviour
+  (`docs/design/504-leaf-egress-budget.md` section 2). They are now ignored:
+  existing TOML still parses and x0xd still starts, emitting one deprecation
+  warning per key that points operators at `leaf_max_eager_degree`, which is
+  the knob that does bound Leaf gossip egress. This also removes a
+  restart-loop hazard — `active_view_size = 0` previously failed validation
+  and crash-looped the daemon over a knob with no runtime effect. Does not
+  close #504.
+
 ### Added
 
 - **Encrypted group-scoped KvStore — issue #341 Phase B.** The #88 design

@@ -278,6 +278,10 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Warning: {warning}");
     }
 
+    for warning in config.gossip.deprecation_warnings() {
+        eprintln!("Warning: {warning}");
+    }
+
     config
         .gossip
         .validate()
