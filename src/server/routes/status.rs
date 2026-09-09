@@ -10,10 +10,55 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const CONNECTIVITY_GRACE_SECS: u64 = 120;
 const STATUS_CONNECTING_GRACE_SECS: u64 = 45;
+
+/// How often the background refresher re-reads the transport peer counts that
+/// `/health` serves. Half the watchdog's default 10 s probe interval, so every
+/// probe sees a snapshot at most one refresh old.
+pub(in crate::server) const HEALTH_SNAPSHOT_REFRESH_SECS: u64 = 5;
+
+/// Cached transport peer counts for the auth-exempt `GET /health` (issue #600).
+///
+/// `/health` is the one endpoint the API watchdog probes (every 10 s, 3 s
+/// timeout, abort after 3 misses). Reading the counts live walks ant-quic's
+/// connected-peer table, which can take its `connection_lifecycle` parking_lot
+/// **write** lock once per peer — on a tokio worker, and parking_lot parks the
+/// OS thread. That is the same lock the gossip event path keeps hot, so under a
+/// storm the liveness probe was measuring lock contention, exceeded its 3 s
+/// budget, and aborted a perfectly live process 5–12×/hour on mainnet.
+///
+/// The handler now reads these two atomics and nothing else: O(1), lock-free,
+/// and independent of the peer table. The traversal moved to a background
+/// refresher task in `serve_with_options` (`src/server/mod.rs`), where blocking
+/// is survivable. Response shape is unchanged —
+/// `/health` is consumed by the VPS fleet monitor, `docs/api-reference.md`,
+/// and the #262 zero-peer degraded signal, all of which read these fields.
+#[derive(Debug, Default)]
+pub(in crate::server) struct HealthSnapshot {
+    peers: AtomicUsize,
+    send_ready_peers: AtomicUsize,
+}
+
+impl HealthSnapshot {
+    /// Publish a freshly measured pair of counts.
+    pub(in crate::server) fn store(&self, peers: usize, send_ready_peers: usize) {
+        self.peers.store(peers, Ordering::Relaxed);
+        self.send_ready_peers
+            .store(send_ready_peers, Ordering::Relaxed);
+    }
+
+    /// Read the last published counts as `(peers, send_ready_peers)`.
+    pub(in crate::server) fn load(&self) -> (usize, usize) {
+        (
+            self.peers.load(Ordering::Relaxed),
+            self.send_ready_peers.load(Ordering::Relaxed),
+        )
+    }
+}
 
 /// Generic JSON response wrapper.
 #[derive(Debug, Serialize)]
@@ -115,14 +160,14 @@ pub(in crate::server) struct StatusData {
 // ---------------------------------------------------------------------------
 
 /// GET /health
+///
+/// Deliberately O(1) and lock-free (issue #600): the peer counts come from
+/// [`HealthSnapshot`], never from a live peer-table walk. See that type for
+/// why the live read made the watchdog abort live daemons.
 pub(in crate::server) async fn health(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<HealthData>> {
-    let peers = state.agent.peers().await.map(|p| p.len()).unwrap_or(0);
-    let send_ready_peers = match state.agent.network() {
-        Some(network) => network.send_ready_peers().await.len(),
-        None => 0,
-    };
+    let (peers, send_ready_peers) = state.health_snapshot.load();
     let uptime_secs = state.start_time.elapsed().as_secs();
     let (status, degraded_reason) = classify_health(peers, send_ready_peers, uptime_secs);
 
@@ -280,7 +325,67 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_health, classify_runtime_status};
+    use super::{classify_health, classify_runtime_status, HealthSnapshot};
+
+    /// The `health` handler's own source, for the structural guard below.
+    /// Matches the `include_str!`-of-route-source convention in
+    /// `tests/api_coverage.rs`.
+    const STATUS_SOURCE: &str = include_str!("status.rs");
+
+    /// WHY (issue #600): `/health` is what the API watchdog probes every 10 s
+    /// with a 3 s budget, aborting the process after 3 misses. Reading peer
+    /// counts live walks ant-quic's connected-peer table and can take its
+    /// `connection_lifecycle` parking_lot **write** lock once per peer — the
+    /// same lock a gossip storm keeps hot — so the probe measured lock
+    /// contention instead of liveness and killed live mainnet daemons
+    /// 5–12×/hour. `/health` must stay O(1) and touch NO transport state.
+    ///
+    /// This is a source guard rather than a behavioural test because the
+    /// property is "the handler does not call X", which is only observable
+    /// under a real storm. It fails the moment someone reintroduces a live
+    /// peer read into the handler, which is exactly the regression to catch.
+    #[test]
+    fn health_handler_never_traverses_the_peer_table() {
+        let start = STATUS_SOURCE
+            .find("pub(in crate::server) async fn health(")
+            .expect("health handler must exist");
+        let rest = &STATUS_SOURCE[start..];
+        let end = rest
+            .find("/// GET /status")
+            .expect("health handler must be followed by the /status handler");
+        let body = &rest[..end];
+
+        for forbidden in [
+            "agent.peers()",
+            "send_ready_peers()",
+            "network.node_status()",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "GET /health must not call `{forbidden}` — it is the watchdog's \
+                 liveness probe and must not touch ant-quic's peer table \
+                 (issue #600). Read from `state.health_snapshot` instead."
+            );
+        }
+        assert!(
+            body.contains("state.health_snapshot.load()"),
+            "GET /health must serve its peer counts from the cached snapshot"
+        );
+    }
+
+    /// WHY (issue #600): the cache must be a faithful pass-through, so the
+    /// #262 degraded classification keeps working on cached counts. If the
+    /// snapshot ever mangled the pair, `/health` would report a transport
+    /// state the daemon is not in — to the fleet monitor, silently.
+    #[test]
+    fn health_snapshot_round_trips_both_counts() {
+        let snapshot = HealthSnapshot::default();
+        assert_eq!(snapshot.load(), (0, 0), "unprimed snapshot reads as zero");
+        snapshot.store(17, 3);
+        assert_eq!(snapshot.load(), (17, 3));
+        snapshot.store(0, 0);
+        assert_eq!(snapshot.load(), (0, 0), "a drop to zero must be visible");
+    }
 
     /// WHY (issue #262): a wedged-transport daemon — up for hours, zero
     /// peers, silent socket — must not read `healthy` to fleet monitoring.
