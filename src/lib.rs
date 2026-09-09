@@ -21645,7 +21645,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_machine_signature_verifies() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21661,7 +21667,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_requires_human_consent() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21676,7 +21688,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_with_user_requires_user_identity() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21692,7 +21710,13 @@ mod tests {
     async fn announce_identity_populates_discovery_cache() {
         let user_key = identity::UserKeypair::generate().unwrap();
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_user_key(user_key)
             .build()
             .await
@@ -21715,7 +21739,13 @@ mod tests {
     #[tokio::test]
     async fn relay_census_classifies_bootstrap_and_skips_stale() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21792,7 +21822,13 @@ mod tests {
         // evicts a valid member as NoCertificate. A later announce carrying
         // the resolved certificate must promote it into the existing entry.
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21884,7 +21920,13 @@ mod tests {
     #[tokio::test]
     async fn verified_certificate_events_fire_on_landing_not_on_replay() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21973,7 +22015,13 @@ mod tests {
         // live identity cache without bound — every OwnerCertified evidence
         // pass walks it. At the cap the stalest entry is evicted.
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22133,7 +22181,13 @@ mod tests {
     #[tokio::test]
     async fn retired_announce_publishes_v3_only() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22184,7 +22238,13 @@ mod tests {
     #[tokio::test]
     async fn named_agent_announces_self_name_on_v3_beat() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22254,7 +22314,13 @@ mod tests {
     #[tokio::test]
     async fn legacy_escape_hatch_publishes_v2_and_v3() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_legacy_announce(true)
             .build()
             .await
@@ -22309,7 +22375,13 @@ mod tests {
     async fn revoked_agent_fails_machine_verification_even_when_cached() {
         let user_key = identity::UserKeypair::generate().unwrap();
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_user_key(user_key)
             .build()
             .await
@@ -24081,7 +24153,13 @@ async fn dm_capability_advert_tracks_durable_history_presence() {
             .with_machine_key(dir.path().join("machine.key"))
             .with_agent_key_path(dir.path().join("agent.key"))
             .with_peer_cache_dir(dir.path().join("peers"))
-            .with_network_config(network::NetworkConfig::default());
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            });
         if with_history {
             builder = builder.with_history(history::HistoryConfig {
                 db_path: Some(dir.path().join("history.db")),
@@ -24134,7 +24212,13 @@ async fn dm_inbox_capability_upgrade_visible_to_late_subscriber() {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_peer_cache_dir(dir.path().join("peers"))
-        .with_network_config(network::NetworkConfig::default())
+        .with_network_config(network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..network::NetworkConfig::default()
+        })
         .build()
         .await
         .expect("agent");
