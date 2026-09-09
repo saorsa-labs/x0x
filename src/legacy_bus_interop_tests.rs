@@ -1607,7 +1607,22 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     let mut observed = std::collections::BTreeSet::new();
     let mut fanouts = Vec::new();
     let mut load_returns = Vec::with_capacity(200);
-    bounded("fixed 200-publication controlled load", Duration::from_secs(30), async {
+    // Calibration basis (#501 Coverage-Gate flake). This phase is rate-limited,
+    // not latency-limited: 200 ticks at 50 ms is a 10 s floor, but
+    // MissedTickBehavior::Skip rounds every publication up to the next 50 ms
+    // boundary, so the phase costs 200 * 50 ms * ceil(publish / 50 ms).
+    // Measured load-phase elapsed for this fixture: 10.5-10.9 s unloaded
+    // (53 ms mean period), 18.8 s at 2x CPU oversubscription (94 ms), and
+    // 41.4 / 42.4 / 45.4 / 50.1 / 61.9 / 78.5 s at 5x (207-393 ms). Every one
+    // of those runs still sent all 200 publications with publish_failed 0 and
+    // a non-zero fanout, so contention costs this phase time, not its
+    // observation. The former 30 s budget was derived from the 10 s nominal
+    // schedule and sat inside that measured range, so it aborted the load
+    // phase on loaded CI runners before the required observation could
+    // complete (ADR 0025, decision 3). 180 s is ~2.3x the slowest measured
+    // phase and still far inside nextest's 600 s terminate-after, so a genuine
+    // hang is still caught and still attributed to this label.
+    bounded("fixed 200-publication controlled load", Duration::from_secs(180), async {
         while sent < 200 {
             tokio::select! {
                 _ = timer.tick() => {
