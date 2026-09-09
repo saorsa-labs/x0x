@@ -5555,8 +5555,9 @@ impl Agent {
                 let mut guard = self.capability_advert_service.lock().await;
                 guard.take()
             };
-            if let Some(service) = service {
+            if let Some(mut service) = service {
                 service.abort();
+                service.stop_blob_responder().await;
             }
         }
 
@@ -9839,26 +9840,51 @@ impl Agent {
             service.abort();
             return Ok(());
         }
-        if let Some(prev) = guard.take() {
+        if let Some(mut prev) = guard.take() {
             prev.abort();
+            // Retain the old owner and the start mutex until its responder is
+            // joined. Cancelling this future still drops an aborting owner.
+            // Shutdown can contend on this mutex until cancellation completes;
+            // abort-and-join is not a hard wall-clock bound for non-yielding work.
+            prev.stop_blob_responder().await;
         }
-        *guard = Some(service);
+        // Replacement now awaits cancellation. Shutdown may have started
+        // during that join; do not install the still-local new service then.
+        if self.shutdown_token.is_cancelled() {
+            service.abort();
+            return Ok(());
+        }
+        let service = guard.insert(service);
         tracing::info!("Capability advert service started");
 
-        // L3: serve cert-blob fetches for peers that see our V3 announce
-        // digest but lack the cached pair. Same lifecycle as the caps
-        // service; the handle is detached (task ends with the pubsub).
+        // L3: the capability service owns the responder, including replacement,
+        // ordinary shutdown and Drop. Subscription cleanup is asynchronous.
         if self.shutdown_token.is_cancelled() {
             return Ok(());
         }
-        if let Err(e) = announce_blob::spawn_blob_responder(
+        match announce_blob::spawn_blob_responder(
             std::sync::Arc::clone(runtime.pubsub()),
             std::sync::Arc::clone(&self.announce_blob_cache),
             std::sync::Arc::clone(&self.own_cert_pair),
         )
         .await
         {
-            tracing::warn!("announce blob responder spawn failed: {e}");
+            Ok(handle) => {
+                // Cancellation-safety invariant: the factory must not await
+                // between spawning and returning this handle, and attachment
+                // here must be synchronous. A future reordering requires
+                // abort-on-drop custody at spawn before any intervening await.
+                let rejected = service.attach_blob_responder(handle).err();
+                let cancelled = service.abort_blob_responder_if_cancelled(&self.shutdown_token);
+                if let Some(mut rejected) = rejected {
+                    tracing::warn!("announce blob responder slot already occupied");
+                    rejected.stop().await;
+                }
+                if cancelled {
+                    service.stop_blob_responder().await;
+                }
+            }
+            Err(e) => tracing::warn!("announce blob responder spawn failed: {e}"),
         }
         Ok(())
     }
