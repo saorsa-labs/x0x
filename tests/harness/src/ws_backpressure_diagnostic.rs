@@ -11,6 +11,17 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
+fn validate_diagnostic_config(text: &str) -> std::io::Result<()> {
+    toml::from_str::<x0x::server::DaemonConfig>(text)
+        .map(|_| ())
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "diagnostic config invalid",
+            )
+        })
+}
+
 fn diagnostic_hash(path: &Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -743,8 +754,13 @@ impl Harness for Live {
             private_directory(&dir).map_err(|_| incomplete("CAPTURE_DIRECTORY"))?;
             let plane = format!("ws287-{}-{}", self.capture.nonce, arm.index());
             self.daemons[arm.index()] = Some(
-                DaemonFixture::spawn_diagnostic(&dir, &plane, diagnostic_hash)
-                    .map_err(|_| premise("DAEMON_SPAWN"))?,
+                DaemonFixture::spawn_diagnostic(
+                    &dir,
+                    &plane,
+                    diagnostic_hash,
+                    validate_diagnostic_config,
+                )
+                .map_err(|_| premise("DAEMON_SPAWN"))?,
             );
         }
         let end = self.at(end_ms);
@@ -1173,6 +1189,228 @@ pub async fn run() {
 #[cfg(test)]
 mod controls {
     use super::*;
+
+    fn identity_cleanup_receipt() -> DiagnosticCleanup {
+        DiagnosticCleanup {
+            pid: 1,
+            reaped: true,
+            deliberate_termination: Some(true),
+            exit: Some("inert observed exit".into()),
+            capture_complete: true,
+            identity_removed: false,
+            errors: Vec::new(),
+        }
+    }
+
+    fn prepare_owned_identity(data: &std::path::Path) -> (PathBuf, String) {
+        crate::daemon::prepare_diagnostic_identity(
+            data,
+            "ws287-123",
+            "inert-plane",
+            validate_diagnostic_config,
+        )
+        .expect("owned identity preparation")
+    }
+
+    #[test]
+    fn owned_identity_config_round_trips_exact_path_and_preserves_fields() {
+        let root = tempfile::Builder::new()
+            .prefix("ws287 identity ")
+            .tempdir()
+            .unwrap();
+        let (identity, text) = prepare_owned_identity(root.path());
+        let config: x0x::server::DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.identity_dir.as_ref(), Some(&identity));
+        assert_eq!(
+            identity,
+            root.path().canonicalize().unwrap().join("identity")
+        );
+        assert!(identity.is_absolute() && identity.is_dir());
+        assert_eq!(config.data_dir, root.path());
+        let mut actual: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(
+            actual.remove("identity_dir").unwrap().as_str(),
+            identity.to_str()
+        );
+        let prior = format!(
+            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = {:?}\nlog_level = \"warn\"\nbootstrap_peers = []\nnetwork_id = \"inert-plane\"\ninstance_name = \"ws287-123\"\n",
+            root.path().to_string_lossy(),
+        );
+        assert_eq!(actual, toml::from_str::<toml::Table>(&prior).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_identity_config_round_trips_quotes_and_backslashes() {
+        let root = tempfile::Builder::new()
+            .prefix("ws287 quoted-\"-backslash-\\-")
+            .tempdir()
+            .unwrap();
+        let (identity, text) = prepare_owned_identity(root.path());
+        let config: x0x::server::DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.identity_dir.as_ref(), Some(&identity));
+        assert_eq!(config.data_dir, root.path());
+    }
+
+    #[test]
+    fn owned_identity_cleanup_preserves_both_ambient_alternatives() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let named_sibling = root.path().join(".x0x-ws287-123");
+        let wrong_descendant = home.join(".x0x-ws287-123");
+        for path in [&named_sibling, &wrong_descendant] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("sentinel"), b"retain").unwrap();
+        }
+        let data = tempfile::tempdir_in(root.path()).unwrap();
+        let (identity, text) = prepare_owned_identity(data.path());
+        let configured: x0x::server::DaemonConfig = toml::from_str(&text).unwrap();
+        std::fs::write(identity.join("sentinel"), b"owned").unwrap();
+        let mut receipt = identity_cleanup_receipt();
+        receipt.remove_identity_directory(configured.identity_dir.as_ref().unwrap());
+        assert!(receipt.identity_removed && receipt.errors.is_empty());
+        assert!(!identity.exists());
+        assert!(data.path().is_dir());
+        for path in [named_sibling, wrong_descendant] {
+            assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"retain");
+        }
+    }
+
+    #[test]
+    fn owned_identity_cleanup_isolates_two_data_owners() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (a, _) = prepare_owned_identity(first.path());
+        let (b, _) = prepare_owned_identity(second.path());
+        std::fs::write(b.join("sentinel"), b"second").unwrap();
+        let mut receipt = identity_cleanup_receipt();
+        receipt.remove_identity_directory(&a);
+        assert!(receipt.identity_removed && !a.exists());
+        assert!(first.path().is_dir());
+        assert_eq!(std::fs::read(b.join("sentinel")).unwrap(), b"second");
+    }
+
+    #[test]
+    fn owned_identity_missing_and_file_errors_retain_fail_precedence() {
+        for regular_file in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (identity, _) = prepare_owned_identity(root.path());
+            std::fs::remove_dir(&identity).unwrap();
+            if regular_file {
+                std::fs::write(&identity, b"not a directory").unwrap();
+            }
+            let mut receipt = identity_cleanup_receipt();
+            receipt.remove_identity_directory(&identity);
+            assert!(!receipt.identity_removed);
+            assert_eq!(receipt.errors, ["CHILD_IDENTITY_CLEANUP_IO"]);
+            let mut trace = Transcript {
+                cleanup_complete: false,
+                problems: child_cleanup_problems(&receipt),
+                ..Default::default()
+            };
+            assert!(trace
+                .problems
+                .contains(&incomplete("CHILD_IDENTITY_CLEANUP_INCOMPLETE")));
+            assert!(trace
+                .problems
+                .contains(&incomplete("CHILD_IDENTITY_CLEANUP_IO")));
+            assert_eq!(trace.status(), "INCOMPLETE");
+            receipt.deliberate_termination = Some(false);
+            trace.problems = child_cleanup_problems(&receipt);
+            assert!(trace.problems.contains(&fail("OWN_DAEMON_EXIT")));
+            assert_eq!(trace.status(), "FAIL");
+            if regular_file {
+                assert_eq!(std::fs::read(&identity).unwrap(), b"not a directory");
+            }
+        }
+    }
+
+    #[test]
+    fn owned_identity_cleanup_requires_observed_reaping() {
+        let root = tempfile::tempdir().unwrap();
+        let (identity, _) = prepare_owned_identity(root.path());
+        let mut receipt = identity_cleanup_receipt();
+        receipt.reaped = false;
+        receipt.remove_identity_directory(&identity);
+        assert!(identity.is_dir());
+        assert!(!receipt.identity_removed && receipt.errors.is_empty());
+    }
+
+    #[test]
+    fn owned_identity_preparation_rejects_missing_anchor_and_collision() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("absent");
+        assert!(crate::daemon::prepare_diagnostic_identity(
+            &absent,
+            "ws287-123",
+            "inert-plane",
+            validate_diagnostic_config
+        )
+        .is_err());
+        assert!(!absent.exists());
+        let (identity, _) = prepare_owned_identity(root.path());
+        std::fs::write(identity.join("sentinel"), b"existing").unwrap();
+        let error = crate::daemon::prepare_diagnostic_identity(
+            root.path(),
+            "ws287-123",
+            "inert-plane",
+            validate_diagnostic_config,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(identity.join("sentinel")).unwrap(),
+            b"existing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_identity_encoding_rejects_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"invalid-\xff/identity".to_vec(),
+        ));
+        let error = crate::daemon::encode_diagnostic_identity_path(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn owned_identity_del_config_rejected_before_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let anchor = root.path().join("del-\u{7f}");
+        std::fs::create_dir(&anchor).unwrap();
+        let error = crate::daemon::prepare_diagnostic_identity(
+            &anchor,
+            "ws287-123",
+            "inert-plane",
+            validate_diagnostic_config,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!anchor.join("identity").exists());
+        assert!(std::fs::read_dir(&anchor).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_identity_debug_control_config_rejected_before_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let anchor = root.path().join("escape-\u{1b}");
+        std::fs::create_dir(&anchor).unwrap();
+        let error = crate::daemon::prepare_diagnostic_identity(
+            &anchor,
+            "ws287-123",
+            "inert-plane",
+            validate_diagnostic_config,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!anchor.join("identity").exists());
+        assert!(std::fs::read_dir(&anchor).unwrap().next().is_none());
+    }
+
     #[test]
     fn actual_reader_timestamp_rejects_late_count_after_metrics_wait() {
         let mut reader = Reader::default();

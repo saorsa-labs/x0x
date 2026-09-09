@@ -45,6 +45,61 @@ pub struct DiagnosticCleanup {
     pub errors: Vec<&'static str>,
 }
 
+impl DiagnosticCleanup {
+    /// Remove only the retained identity child, after this exact child was reaped.
+    pub(crate) fn remove_identity_directory(&mut self, identity_dir: &Path) {
+        if self.reaped {
+            match std::fs::remove_dir_all(identity_dir) {
+                Ok(()) => self.identity_removed = true,
+                Err(_) => self.errors.push("CHILD_IDENTITY_CLEANUP_IO"),
+            }
+        }
+    }
+}
+
+/// Encode the final identity path without filesystem access or lossy substitution.
+pub(crate) fn encode_diagnostic_identity_path(identity_dir: &Path) -> std::io::Result<String> {
+    let identity_text = identity_dir.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "diagnostic identity path is not UTF-8",
+        )
+    })?;
+    serde_json::to_string(identity_text).map_err(std::io::Error::other)
+}
+
+/// Prepare owned identity storage and its exact config without starting a process.
+/// The existing data root remains unchanged; only the identity anchor is resolved.
+pub(crate) fn prepare_diagnostic_identity(
+    data_dir: &Path,
+    name: &str,
+    plane: &str,
+    validate_config: fn(&str) -> std::io::Result<()>,
+) -> std::io::Result<(PathBuf, String)> {
+    let identity_dir = data_dir.canonicalize()?.join("identity");
+    let identity_value = encode_diagnostic_identity_path(&identity_dir)?;
+    let config = format!(
+        r#"bind_address = "0.0.0.0:0"
+api_address = "127.0.0.1:0"
+data_dir = {:?}
+identity_dir = {identity_value}
+log_level = "warn"
+bootstrap_peers = []
+network_id = {:?}
+instance_name = {:?}
+"#,
+        data_dir.to_string_lossy(),
+        plane,
+        name,
+    );
+    // Validate the entire exact text, including inherited data_dir formatting,
+    // before creating anything. The real caller supplies the DaemonConfig parser.
+    validate_config(&config)?;
+    // This fixed child belongs to the existing fresh TempDir. Reject any collision.
+    std::fs::create_dir(&identity_dir)?;
+    Ok((identity_dir, config))
+}
+
 #[allow(dead_code)]
 impl DaemonFixture {
     /// Start a daemon with a unique instance name derived from `prefix`.
@@ -343,6 +398,7 @@ impl DaemonFixture {
         directory: &Path,
         plane: &str,
         hash_binary: fn(&Path) -> std::io::Result<String>,
+        validate_config: fn(&str) -> std::io::Result<()>,
     ) -> std::io::Result<Self> {
         use std::io::Write;
         let name = format!("ws287-{}", rand::random::<u64>());
@@ -350,22 +406,8 @@ impl DaemonFixture {
             .prefix("data-")
             .tempdir_in(directory)?;
         let config_path = tempdir.path().join("config.toml");
-        let identity_dir = dirs::home_dir()
-            .ok_or_else(|| std::io::Error::other("diagnostic home unavailable"))?
-            .join(format!(".x0x-{name}"));
-        let config = format!(
-            r#"bind_address = "0.0.0.0:0"
-api_address = "127.0.0.1:0"
-data_dir = {:?}
-log_level = "warn"
-bootstrap_peers = []
-network_id = {:?}
-instance_name = {:?}
-"#,
-            tempdir.path().to_string_lossy(),
-            plane,
-            name,
-        );
+        let (identity_dir, config) =
+            prepare_diagnostic_identity(tempdir.path(), &name, plane, validate_config)?;
         diagnostic_file(&config_path)?.write_all(config.as_bytes())?;
         let binary = find_x0xd_binary().canonicalize()?;
         let binary_hash = hash_binary(&binary)?;
@@ -493,12 +535,7 @@ instance_name = {:?}
         } else {
             receipt.errors.push("CHILD_CLEANUP_CAPTURE_MISSING");
         }
-        if receipt.reaped {
-            match std::fs::remove_dir_all(&self.identity_dir) {
-                Ok(()) => receipt.identity_removed = true,
-                Err(_) => receipt.errors.push("CHILD_IDENTITY_CLEANUP_IO"),
-            }
-        }
+        receipt.remove_identity_directory(&self.identity_dir);
         receipt
     }
 

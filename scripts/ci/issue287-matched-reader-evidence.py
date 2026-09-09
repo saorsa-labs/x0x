@@ -17,12 +17,13 @@ import subprocess
 import tarfile
 import time
 
-PARENT = '1c23fdaef443b17e0a9f55d7f34f45d1393d227e'
-ORIGINAL_PARENT = 'd18172e82b28eff753a8d88dc0a12df47141ed96'
-PARENT_TREE = '58bd36d3b81ad07051fe6e08b3f81ff95a3a1183'
+PARENT = 'b62f32d4f9512107881ba91e2f7af2676443267c'
+ORIGINAL_PARENT = '1c23fdaef443b17e0a9f55d7f34f45d1393d227e'
+PARENT_TREE = 'd2a43c8f8e44ce7a798e6941f70abb3de200ecfe'
 OBSERVABILITY_PATHS = frozenset({'.github/workflows/issue287-matched-reader.yml',
     'scripts/ci/issue287-matched-reader-evidence.py',
-    'scripts/ci/test_issue287_matched_reader_evidence.py'})
+    'tests/harness/src/daemon.rs',
+    'tests/harness/src/ws_backpressure_diagnostic.rs'})
 BRANCH = 'refs/heads/codex/287-isolated-evidence'
 LOCK = '83fc5316716b6240ffa470daa77d3e6a7ea9ed09baf6631320d472514e38b32f'
 RECIPIENT_SHA = '2265bb7ac6df437ea1c6c69f7f856f8603989f4d4b64415c1a3a17c333d570c8'

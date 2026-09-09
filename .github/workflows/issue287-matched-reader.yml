@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git show -s --format=%P HEAD)" = 1c23fdaef443b17e0a9f55d7f34f45d1393d227e
+          test "$(git show -s --format=%P HEAD)" = b62f32d4f9512107881ba91e2f7af2676443267c
           test -z "$(git status --porcelain)"
           echo '83fc5316716b6240ffa470daa77d3e6a7ea9ed09baf6631320d472514e38b32f  scripts/ci/issue287-matched-reader.lock' | sha256sum --check --status
           test ! -e target
