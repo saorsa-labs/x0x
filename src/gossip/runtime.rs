@@ -92,6 +92,55 @@ const MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// watchdog timeout and leave the control-plane queue near capacity.
 const MEMBERSHIP_DISPATCH_WORKERS: usize = 4;
 
+/// Minimum gap between "Timed out handling gossip message" warn lines from one
+/// dispatcher worker (issue #600).
+const DISPATCH_TIMEOUT_WARN_WINDOW: Duration = Duration::from_secs(30);
+
+/// Rate limiter for a dispatcher's per-message timeout warn line (issue #600).
+///
+/// Under a gossip storm every worker times out on nearly every message, so this
+/// line alone produced ~152k WARN records on the mainnet node in #600. Each of
+/// those was a synchronous `write(2)` on a tokio worker, so the diagnostic was
+/// feeding the stall it was reporting. One line per window per worker keeps the
+/// signal (and reports how many it stood in for) without the amplification.
+///
+/// Deliberately worker-local and lock-free: shared state here would reintroduce
+/// exactly the kind of contention this fix removes.
+struct TimeoutWarnLimiter {
+    window: Duration,
+    last_emit: Option<Instant>,
+    suppressed: u64,
+}
+
+impl TimeoutWarnLimiter {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            last_emit: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Record a timeout. Returns `Some(suppressed_since_last_emit)` when the
+    /// caller should log, `None` when this occurrence is being suppressed.
+    ///
+    /// The FIRST timeout in a window always logs, so a single isolated timeout
+    /// is never hidden — only the tail of a burst is.
+    fn observe(&mut self, now: Instant) -> Option<u64> {
+        let due = match self.last_emit {
+            None => true,
+            Some(last) => now.duration_since(last) >= self.window,
+        };
+        if due {
+            self.last_emit = Some(now);
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed += 1;
+            None
+        }
+    }
+}
+
 /// Per-stream dispatcher counters.
 #[derive(Debug, Default)]
 pub struct DispatchStreamStats {
@@ -316,6 +365,7 @@ async fn run_pubsub_dispatcher(
     pubsub: Arc<PubSubManager>,
     dispatch_stats: Arc<GossipDispatchStats>,
 ) {
+    let mut timeout_warns = TimeoutWarnLimiter::new(DISPATCH_TIMEOUT_WARN_WINDOW);
     loop {
         // X0X-0009: every worker slot is spawned once and tracked for
         // shutdown. Slots above the current target park here, then wake when
@@ -375,16 +425,23 @@ async fn run_pubsub_dispatcher(
                     Err(_) => {
                         let elapsed = started.elapsed();
                         dispatch_stats.pubsub.record_timed_out(elapsed);
-                        tracing::warn!(
-                            from = %crate::logging::LogPeerId::from(peer),
-                            bytes,
-                            elapsed_ms = duration_ms(elapsed),
-                            timeout_secs = PUBSUB_MESSAGE_HANDLE_TIMEOUT.as_secs(),
-                            stream_type = "PubSub",
-                            worker_id,
-                            worker_count,
-                            "Timed out handling gossip message"
-                        );
+                        // Rate-limited (#600): the unbounded form of this line
+                        // is a synchronous stdout write per timed-out message
+                        // on a tokio worker, and under a storm that is every
+                        // message. The counter above is the lossless record.
+                        if let Some(suppressed) = timeout_warns.observe(Instant::now()) {
+                            tracing::warn!(
+                                from = %crate::logging::LogPeerId::from(peer),
+                                bytes,
+                                elapsed_ms = duration_ms(elapsed),
+                                timeout_secs = PUBSUB_MESSAGE_HANDLE_TIMEOUT.as_secs(),
+                                stream_type = "PubSub",
+                                worker_id,
+                                worker_count,
+                                suppressed_since_last_warn = suppressed,
+                                "Timed out handling gossip message"
+                            );
+                        }
                     }
                 }
             }
@@ -652,6 +709,7 @@ async fn run_membership_dispatcher(
     membership: Arc<HyParViewMembership<NetworkNode>>,
     dispatch_stats: Arc<GossipDispatchStats>,
 ) {
+    let mut timeout_warns = TimeoutWarnLimiter::new(DISPATCH_TIMEOUT_WARN_WINDOW);
     loop {
         match network.receive_membership_message().await {
             Ok((peer, data)) => {
@@ -707,15 +765,20 @@ async fn run_membership_dispatcher(
                     Err(_) => {
                         let elapsed = started.elapsed();
                         dispatch_stats.membership.record_timed_out(elapsed);
-                        tracing::warn!(
-                            from = %crate::logging::LogPeerId::from(peer),
-                            bytes,
-                            elapsed_ms = duration_ms(elapsed),
-                            timeout_secs = MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT.as_secs(),
-                            stream_type = "Membership",
-                            worker_id,
-                            "Timed out handling gossip message"
-                        );
+                        // Rate-limited for the same reason as the PubSub arm
+                        // above (#600); the counter is the lossless record.
+                        if let Some(suppressed) = timeout_warns.observe(Instant::now()) {
+                            tracing::warn!(
+                                from = %crate::logging::LogPeerId::from(peer),
+                                bytes,
+                                elapsed_ms = duration_ms(elapsed),
+                                timeout_secs = MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT.as_secs(),
+                                stream_type = "Membership",
+                                worker_id,
+                                suppressed_since_last_warn = suppressed,
+                                "Timed out handling gossip message"
+                            );
+                        }
                     }
                 }
             }
@@ -1116,6 +1179,42 @@ impl GossipRuntime {
 mod tests {
     use super::*;
     use crate::network::NetworkConfig;
+
+    /// WHY (issue #600): under a gossip storm every dispatched message times
+    /// out, so the unbounded warn emitted ~152k synchronous stdout writes from
+    /// tokio workers — the diagnostic feeding the stall it reported. But an
+    /// isolated timeout is a real signal and must never be swallowed, so the
+    /// FIRST occurrence always logs; only the tail of a burst is folded up.
+    #[test]
+    fn first_timeout_always_warns_and_the_burst_is_folded() {
+        let window = Duration::from_secs(30);
+        let mut limiter = TimeoutWarnLimiter::new(window);
+        let t0 = Instant::now();
+
+        assert_eq!(
+            limiter.observe(t0),
+            Some(0),
+            "an isolated timeout must warn immediately, with nothing suppressed"
+        );
+        for _ in 0..999 {
+            assert_eq!(
+                limiter.observe(t0),
+                None,
+                "the rest of the burst inside the window is suppressed"
+            );
+        }
+        assert_eq!(
+            limiter.observe(t0 + window),
+            Some(999),
+            "the next warn must report how many lines it stood in for, so the \
+             storm stays visible without the write amplification"
+        );
+        assert_eq!(
+            limiter.observe(t0 + window * 2),
+            Some(0),
+            "the suppressed tally resets after it is reported"
+        );
+    }
 
     /// Explicit test-only network config (#417/#337): loopback bind, no
     /// seeds, discovery/port-mapping off. Still a real socket constructor.
