@@ -26,8 +26,16 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
 
 const PREFIX: &[u8] = b"x0x-501-interop\0";
-const SETUP: Duration = Duration::from_secs(20);
-const DELIVERY: Duration = Duration::from_secs(10);
+// #607 contention recalibration: these wrap real network convergence steps
+// (QUIC pair dials, gossip-plane admission, decrypt delivery), which degrade
+// ~16x under CI CPU oversubscription (measured 253 ms isolated -> 4007 ms at
+// 5x; worst local 5x observations: pair dial 5.9 s, typed decrypt delivery
+// 5.4 s, with the PR #598 Coverage failure exceeding the old 10 s DELIVERY).
+// 60 s keeps >= 10x headroom over the local 5x worst case. Both are POSITIVE
+// deadlines: they await an event that must happen. Absence assertions use the
+// separate NEGATIVE_WINDOW below and are NOT raised.
+const SETUP: Duration = Duration::from_secs(60);
+const DELIVERY: Duration = Duration::from_secs(60);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(300);
 
 type Inbox = mpsc::Receiver<DmTypedPayload>;
@@ -274,7 +282,7 @@ async fn gossip_send(
     let subscriber = tracing_subscriber::registry().with(witness.clone());
     let signing = SigningContext::from_keypair(sender.identity.agent_keypair());
     let mut stages = DurableSendStages::default();
-    let config = DmSendConfig {
+    let mut config = DmSendConfig {
         max_retries: 0,
         require_gossip: true,
         require_gossip_ack: true,
@@ -285,6 +293,15 @@ async fn gossip_send(
     // send_via_gossip builds inner V1 when durable ACK is false. This calls the
     // production gossip helper directly, NOT Agent::send_direct route selection.
     assert!(!config.require_durable_app_ack);
+    // #607: the default per-attempt budget (RTT fallback 250 ms x 16 = 4 s,
+    // dm.rs dm_attempt_timeout) fires under CI CPU contention before the
+    // outer DELIVERY bound (observed 1/10 failures at local 5x with
+    // `Timeout { retries: 0, elapsed: 4.31 s }`). This is a POSITIVE
+    // deadline: it awaits the v1 gossip ACK. Raise the fixture's own
+    // per-attempt budget to the dm.rs ceiling for the same recalibration
+    // reason as SETUP/DELIVERY; retries stay 0 and the fallback witness
+    // count assertion is unchanged.
+    config.timeout_per_attempt = Duration::from_secs(30);
     let receipt = bounded(
         "production gossip helper and v1 ACK",
         DELIVERY,
