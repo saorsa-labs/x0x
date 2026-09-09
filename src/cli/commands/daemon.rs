@@ -368,6 +368,9 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
 /// change that preserves its label/executable/arguments/roots, and refuse
 /// anything it cannot prove safe. It never installs a default job beside a
 /// running custom one, and never rewrites arbitrary service policy.
+// Only the macOS `--repair` driver calls these; on other platforms they exist
+// for the unit tests, which is where the decision table is pinned.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RepairVerdict {
     /// The job already declares the supervision marker — no change needed.
@@ -384,6 +387,9 @@ pub(crate) enum RepairVerdict {
 }
 
 /// Basename of a launchd `ProgramArguments[0]`, ignoring any path.
+// Only the macOS `--repair` driver calls these; on other platforms they exist
+// for the unit tests, which is where the decision table is pinned.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn program_basename(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
@@ -393,6 +399,9 @@ fn program_basename(program: &str) -> &str {
 /// Kept free of `launchctl`/`plutil` so the decision table is testable on any
 /// platform; the macOS driver below only supplies the parsed job and applies
 /// the verdict.
+// Only the macOS `--repair` driver calls these; on other platforms they exist
+// for the unit tests, which is where the decision table is pinned.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
     let program = plist
         .get("ProgramArguments")
