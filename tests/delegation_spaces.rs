@@ -246,6 +246,41 @@ async fn join_group(owner: &AgentInstance, member: &AgentInstance, group_id: &st
     })
     .await;
     assert!(converged, "owner roster never showed the member Active");
+
+    // And wait for the JOINER's own install to become durable. `POST
+    // /groups/join` returns 200 on the in-memory stub; `named_groups.json`
+    // is only written once the joiner observes its own `MemberAdded` in the
+    // chain, which is exactly when its own roster seats it Active. Without
+    // this wait a test that stops the member here restarts it with "Loaded 0
+    // named groups", and every later group message is dropped as belonging
+    // to an unknown group — a harness race, not the behaviour under test.
+    let member_group = group_id.to_string();
+    let installed = wait_until(Duration::from_secs(15), || async {
+        let members: Value = authed_client(member)
+            .get(member.url(&format!("/groups/{member_group}/members")))
+            .send()
+            .await
+            .expect("member roster request")
+            .json()
+            .await
+            .expect("member roster json");
+        members["members"].as_array().is_some_and(|ms| {
+            ms.iter().any(|m| {
+                m["agent_id"]
+                    .as_str()
+                    .map(|a| a.eq_ignore_ascii_case(&member_id))
+                    == Some(true)
+                    && m["state"]
+                        .as_str()
+                        .is_some_and(|st| st.eq_ignore_ascii_case("active"))
+            })
+        })
+    })
+    .await;
+    assert!(
+        installed,
+        "joiner never seated itself Active (install not durable)"
+    );
 }
 
 async fn delegate(

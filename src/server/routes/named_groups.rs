@@ -12711,20 +12711,133 @@ pub(in crate::server) async fn publish_delegation_carrier(
         );
     }
     cache_public_message(&state, msg.clone()).await;
-    let direct_recipients = {
-        let groups = state.named_groups.read().await;
-        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-        groups
-            .get(&msg.group_id)
-            .map(|info| {
-                info.active_members()
-                    .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_hex))
-                    .map(|member| member.agent_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    };
+    let direct_recipients = active_member_recipients(&state, &msg.group_id).await;
+    spawn_delegation_carrier_redelivery(&state, &topic, &bytes, &msg);
     spawn_group_public_message_fanout_race(state, topic, bytes, direct_recipients, msg);
+}
+
+/// Active members of `group_id` other than this daemon, as lowercase hex.
+async fn active_member_recipients(state: &AppState, group_id: &str) -> Vec<String> {
+    let groups = state.named_groups.read().await;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    groups
+        .get(group_id)
+        .map(|info| {
+            info.active_members()
+                .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_hex))
+                .map(|member| member.agent_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Re-send a delegation carrier on a bounded schedule (#321 cold wake).
+///
+/// The initial volley in [`publish_delegation_carrier`] is single-shot on
+/// every leg: Plumtree cannot backfill a message published while a delegate
+/// was down, and the handoff DM to an unreachable delegate is dropped after
+/// its own short retry budget. A delegate that was merely restarting when the
+/// grant was issued would then never learn of authority it durably holds —
+/// the owner's history says the delegation is effective while the delegate
+/// can never exercise it.
+///
+/// Offsets run out to +60s for the same reason as
+/// [`GROUP_CONTROL_REDELIVERY_SCHEDULE`] — Plumtree's anti-entropy first tick
+/// lands at 30-60s, so the last attempt is the belt to that brace. The gap
+/// between attempts stays at or under 15s because the window a restarting
+/// delegate is actually back on the bus is short and unaligned with the grant:
+/// a sparser schedule can miss it entirely and leave the delegate permanently
+/// unaware. Recipients are re-read at each attempt, so a member removed in the
+/// meantime stops receiving the carrier.
+///
+/// Deliberately NOT persisted, for the same reason as the group-control
+/// repair: an owner crash mid-schedule loses the remaining attempts, and the
+/// grant stays effective in the owner's durable history regardless.
+const DELEGATION_CARRIER_REDELIVERY_SCHEDULE: [Duration; 6] = [
+    Duration::from_secs(3),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(25),
+    Duration::from_secs(40),
+    Duration::from_secs(60),
+];
+
+/// Test-only replacement for [`DELEGATION_CARRIER_REDELIVERY_SCHEDULE`], with
+/// the same semantics as [`GROUP_CONTROL_REDELIVERY_SCHEDULE_OVERRIDE`]:
+/// `X0X_TEST_DELEGATION_CARRIER_REDELIVERY_MS="200,600"` substitutes those
+/// millisecond offsets, and a value with no parseable offsets (`""`, `"off"`)
+/// switches the repair off entirely for a negative control.
+static DELEGATION_CARRIER_REDELIVERY_OVERRIDE: std::sync::LazyLock<Vec<Duration>> =
+    std::sync::LazyLock::new(|| {
+        let Ok(raw) = std::env::var("X0X_TEST_DELEGATION_CARRIER_REDELIVERY_MS") else {
+            return DELEGATION_CARRIER_REDELIVERY_SCHEDULE.to_vec();
+        };
+        raw.split(',')
+            .filter_map(|part| part.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .collect()
+    });
+
+fn spawn_delegation_carrier_redelivery(
+    state: &Arc<AppState>,
+    topic: &str,
+    bytes: &[u8],
+    msg: &x0x::groups::GroupPublicMessage,
+) {
+    let schedule = DELEGATION_CARRIER_REDELIVERY_OVERRIDE.clone();
+    if schedule.is_empty() {
+        return;
+    }
+    let state = Arc::clone(state);
+    let topic = topic.to_string();
+    let bytes = bytes.to_vec();
+    let msg = msg.clone();
+    tokio::spawn(async move {
+        let start = tokio::time::Instant::now();
+        for (index, offset) in schedule.iter().enumerate() {
+            tokio::time::sleep_until(start + *offset).await;
+            if let Err(e) = state.agent.publish_with_fanout(&topic, bytes.clone()).await {
+                tracing::debug!(
+                    topic = %LogHexId::topic(&topic),
+                    "delegation carrier resend publish failed: {e}"
+                );
+            }
+            // The global fallback is not optional on a resend: a delegate
+            // that restarted subscribes to it during startup, but spawns the
+            // PER-GROUP public listener only lazily, so a resend confined to
+            // the group topic reaches nobody who was rebuilt since the grant
+            // — exactly the delegate this repair exists for.
+            if let Err(e) = state
+                .agent
+                .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes.clone())
+                .await
+            {
+                tracing::debug!(
+                    topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+                    "delegation carrier resend global fallback failed: {e}"
+                );
+            }
+            let recipients = active_member_recipients(&state, &msg.group_id).await;
+            let outstanding = Arc::new(AtomicUsize::new(recipients.len()));
+            for recipient in &recipients {
+                spawn_group_public_message_delivery(
+                    &state,
+                    recipient,
+                    &msg,
+                    Arc::clone(&outstanding),
+                );
+            }
+            tracing::debug!(
+                target: "x0x::groups",
+                group_id = %LogHexId::group(&msg.group_id),
+                attempt = index + 1,
+                attempts = schedule.len(),
+                offset_ms = offset.as_millis() as u64,
+                recipients = recipients.len(),
+                "delegation carrier redelivery attempt"
+            );
+        }
+    });
 }
 
 /// Signed rider attribution for an MLS-plane send (review r4): the
