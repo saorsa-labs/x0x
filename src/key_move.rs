@@ -3046,6 +3046,18 @@ mod r5_registry_tests {
 
     use super::*;
 
+    /// Explicit test-only network config (#417/#337): loopback bind, no
+    /// seeds, discovery/port-mapping off. Still a real socket constructor.
+    fn test_network_config() -> crate::network::NetworkConfig {
+        crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        }
+    }
+
     /// WHY (review r5 H5): a recipient resolved through the DM-connection
     /// REGISTRY (no discovery-cache entry, so the funnel-head check never
     /// fired) must still be refused when its pairing is dead — and the
@@ -3056,7 +3068,7 @@ mod r5_registry_tests {
     #[tokio::test]
     async fn registry_resolved_recipient_refused_by_post_resolution_check() {
         let dir = tempfile::tempdir().unwrap();
-        let config = crate::network::NetworkConfig::default();
+        let config = test_network_config();
         let sender = crate::Agent::builder()
             .with_machine_key(dir.path().join("machine.key"))
             .with_agent_key_path(dir.path().join("agent.key"))

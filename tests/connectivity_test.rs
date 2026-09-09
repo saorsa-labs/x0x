@@ -9,6 +9,18 @@ use tempfile::TempDir;
 use x0x::connectivity::{ConnectOutcome, ReachabilityInfo};
 use x0x::{network::NetworkConfig, Agent, DiscoveredAgent};
 
+/// Explicit test-only network config (#417/#337): loopback bind, no
+/// seeds, discovery/port-mapping off. Still a real socket constructor.
+fn test_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -17,7 +29,7 @@ async fn build_agent(dir: &TempDir) -> Agent {
     Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap()

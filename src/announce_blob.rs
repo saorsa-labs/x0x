@@ -1109,9 +1109,21 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
+        /// Explicit test-only network config (#417/#337): loopback bind, no
+        /// seeds, discovery/port-mapping off. Still a real socket constructor.
+        fn test_network_config() -> NetworkConfig {
+            NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            }
+        }
+
         async fn make_pubsub() -> Arc<PubSubManager> {
             let node = Arc::new(
-                NetworkNode::new(NetworkConfig::default(), None, None)
+                NetworkNode::new(test_network_config(), None, None)
                     .await
                     .expect("network node"),
             );

@@ -8,6 +8,18 @@
 use tempfile::TempDir;
 use x0x::{network, Agent};
 
+/// Explicit test-only network config (#417/#337): loopback bind, no
+/// seeds, discovery/port-mapping off. Still a real socket constructor.
+fn test_network_config() -> network::NetworkConfig {
+    network::NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
+        ..network::NetworkConfig::default()
+    }
+}
+
 /// Test agent creation with default network configuration.
 #[tokio::test]
 async fn test_agent_creation() {
@@ -61,7 +73,7 @@ async fn test_agent_subscribe() {
 async fn test_agent_publish() {
     // Agent needs network to use pub/sub
     let agent = Agent::builder()
-        .with_network_config(x0x::network::NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .expect("Failed to create agent");
