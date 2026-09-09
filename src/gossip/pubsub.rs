@@ -60,10 +60,23 @@ pub struct PubSubStats {
     /// Subscriber channel was full and got dropped to isolate the dispatcher
     /// from a slow local consumer (for example a stuck SSE client path).
     pub slow_subscriber_dropped: AtomicU64,
-    /// Subscriber channel closed or was dropped after slow-consumer isolation —
-    /// message not delivered, but accounted for so decode→delivery deltas stay
-    /// meaningful.
+    /// A **decoded message** could not be handed to its subscriber: the channel
+    /// was closed, or the message was discarded by slow-consumer isolation.
+    ///
+    /// Every increment here is paired with an `incoming_decoded` increment,
+    /// which is what makes it valid to subtract from `incoming_decoded` in
+    /// `decode_to_delivery_drops`. Ending a subscription is NOT counted here —
+    /// that is `subscriber_task_ended` (issue #600 / H3: it used to be counted
+    /// here, which drove the drop metric to −1 per discarded subscription and
+    /// made the one signal that should read "messages were lost" instead read
+    /// "subscribers went away").
     pub subscriber_channel_closed: AtomicU64,
+    /// Subscription forwarding tasks that ended because the receiver was
+    /// dropped while no message was in flight (the `tx.closed()` arm).
+    ///
+    /// A pure lifecycle event with no matching decode, so it must never be
+    /// subtracted from `incoming_decoded`.
+    pub subscriber_task_ended: AtomicU64,
     /// Local publishes that fanned out to zero eager peers (`fan_out == 0`).
     /// Exposed as `gossip_publish_zero_fanout` at `GET /diagnostics/gossip`.
     pub publish_zero_fanout: AtomicU64,
@@ -80,6 +93,9 @@ pub struct PubSubStatsSnapshot {
     pub delivered_to_subscriber: u64,
     pub slow_subscriber_dropped: u64,
     pub subscriber_channel_closed: u64,
+    /// Subscription forwarding tasks that ended on a dropped receiver. A
+    /// lifecycle count, never a message loss count (issue #600 / H3).
+    pub subscriber_task_ended: u64,
     /// Local publishes whose eager-peer fan-out was zero.
     pub publish_zero_fanout: u64,
     /// `incoming_total - incoming_decoded - incoming_decode_failed` — messages
@@ -88,6 +104,10 @@ pub struct PubSubStatsSnapshot {
     pub in_flight_decode: i64,
     /// `incoming_decoded - delivered_to_subscriber - subscriber_channel_closed`
     /// — messages decoded but never handed off (drop signal).
+    ///
+    /// Every term is per-message, so this cannot go negative: subscription
+    /// lifecycle events land in `subscriber_task_ended` and are excluded here
+    /// (issue #600 / H3).
     pub decode_to_delivery_drops: i64,
 }
 
@@ -102,6 +122,7 @@ impl PubSubStats {
         let delivered_to_subscriber = self.delivered_to_subscriber.load(Ordering::Relaxed);
         let slow_subscriber_dropped = self.slow_subscriber_dropped.load(Ordering::Relaxed);
         let subscriber_channel_closed = self.subscriber_channel_closed.load(Ordering::Relaxed);
+        let subscriber_task_ended = self.subscriber_task_ended.load(Ordering::Relaxed);
         let publish_zero_fanout = self.publish_zero_fanout.load(Ordering::Relaxed);
         let in_flight_decode =
             incoming_total as i64 - incoming_decoded as i64 - incoming_decode_failed as i64;
@@ -117,6 +138,7 @@ impl PubSubStats {
             delivered_to_subscriber,
             slow_subscriber_dropped,
             subscriber_channel_closed,
+            subscriber_task_ended,
             publish_zero_fanout,
             in_flight_decode,
             decode_to_delivery_drops,
@@ -470,6 +492,56 @@ struct PublishFanoutOutcome {
     fan_out: u32,
     /// Signed envelope bytes when signing is enabled.
     envelope: Option<Bytes>,
+    /// Exact awaited send-stage counts, not remote receipt or forwarding proof.
+    #[cfg(test)]
+    observed_counts: Option<saorsa_gossip_pubsub::FanoutCounts>,
+}
+
+#[cfg(test)]
+impl PublishFanoutOutcome {
+    fn observed_fanout(self) -> (u32, Option<saorsa_gossip_pubsub::FanoutCounts>) {
+        (self.fan_out, self.observed_counts)
+    }
+}
+
+#[cfg(test)]
+mod observed_fanout_controls {
+    use super::PublishFanoutOutcome;
+    use saorsa_gossip_pubsub::FanoutCounts;
+
+    #[test]
+    fn retains_actual_counts_separately_from_report_override() {
+        for succeeded in [0, 1, 2] {
+            let counts = FanoutCounts {
+                attempted: 2,
+                succeeded,
+            };
+            let outcome = PublishFanoutOutcome {
+                fan_out: 7,
+                envelope: None,
+                observed_counts: Some(counts),
+            };
+            assert_eq!(outcome.observed_fanout(), (7, Some(counts)));
+        }
+    }
+
+    #[test]
+    fn unavailable_is_not_an_observed_zero() {
+        let outcome = |counts| {
+            PublishFanoutOutcome {
+                fan_out: 0,
+                envelope: None,
+                observed_counts: counts,
+            }
+            .observed_fanout()
+        };
+        assert_eq!(outcome(None), (0, None));
+        assert_eq!(
+            outcome(Some(FanoutCounts::default())),
+            (0, Some(FanoutCounts::default()))
+        );
+        assert_ne!(outcome(None), outcome(Some(FanoutCounts::default())));
+    }
 }
 
 /// Topic-name prefix marking a topic as local-only (issue #89).
@@ -959,8 +1031,12 @@ impl PubSubManager {
                     // topics leaked these unboundedly). Both arms are
                     // cancel-safe.
                     () = tx.closed() => {
+                        // Lifecycle, not loss: no message was decoded for this
+                        // event, so counting it as a decode→delivery drop drove
+                        // that metric negative once per discarded subscription
+                        // (issue #600 / H3).
                         stats
-                            .subscriber_channel_closed
+                            .subscriber_task_ended
                             .fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(
                             topic = %sub_topic,
@@ -1064,6 +1140,20 @@ impl PubSubManager {
             .fan_out)
     }
 
+    /// Retain the same awaited send-stage result for the controlled test load.
+    #[cfg(test)]
+    pub(crate) async fn publish_with_observed_fanout(
+        &self,
+        topic: String,
+        payload: Bytes,
+    ) -> NetworkResult<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let outcome = self
+            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .await?;
+        Ok(outcome.observed_fanout())
+    }
+
     /// Publish to a topic and return the signed V2 envelope bytes when
     /// signing is enabled.
     ///
@@ -1152,6 +1242,8 @@ impl PubSubManager {
             return Ok(PublishFanoutOutcome {
                 fan_out: 0,
                 envelope: None,
+                #[cfg(test)]
+                observed_counts: None,
             });
         }
 
@@ -1197,6 +1289,8 @@ impl PubSubManager {
                 Ok(PublishFanoutOutcome {
                     fan_out,
                     envelope: envelope_bytes,
+                    #[cfg(test)]
+                    observed_counts: counts,
                 })
             }
             Err(e) => {
@@ -2207,6 +2301,47 @@ mod tests {
             topic,
             payload,
         )
+    }
+
+    /// WHY (issue #600 / H3): `decode_to_delivery_drops` is the single signal
+    /// an operator reads as "messages were decoded and then lost". Counting a
+    /// subscription *ending* as a drop made it go negative — the mainnet node
+    /// reported `-18`, which reads as nonsense and hid whatever real drop
+    /// count was underneath it. A subscription ending is a lifecycle event
+    /// with no message attached; it must never enter the message ledger.
+    #[test]
+    fn ended_subscriptions_cannot_drive_the_drop_metric_negative() {
+        let stats = PubSubStats::default();
+        // 18 subscribers walked away; nothing was ever decoded.
+        for _ in 0..18 {
+            stats.subscriber_task_ended.fetch_add(1, Ordering::Relaxed);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.decode_to_delivery_drops, 0,
+            "ending subscriptions is not message loss"
+        );
+        assert_eq!(snapshot.subscriber_task_ended, 18);
+        assert_eq!(
+            snapshot.subscriber_channel_closed, 0,
+            "the lifecycle path must not touch the per-message counter"
+        );
+    }
+
+    /// The other half of the invariant: a message that WAS decoded and then
+    /// failed to reach its subscriber must still count as a drop. Fixing the
+    /// negative reading by muting the counter would be the wrong fix.
+    #[test]
+    fn decoded_but_undelivered_messages_still_count_as_drops() {
+        let stats = PubSubStats::default();
+        stats.incoming_decoded.fetch_add(10, Ordering::Relaxed);
+        stats
+            .delivered_to_subscriber
+            .fetch_add(7, Ordering::Relaxed);
+        stats
+            .subscriber_channel_closed
+            .fetch_add(2, Ordering::Relaxed);
+        assert_eq!(stats.snapshot().decode_to_delivery_drops, 1);
     }
 
     #[test]
@@ -3912,14 +4047,19 @@ mod tests {
     /// Before the fix the task parked on `plumtree_rx.recv()` indefinitely,
     /// so every discarded subscription (e.g. a daemon registration
     /// rollback on a unique topic) pinned a ghost task and its PlumTree
-    /// registration until process exit. The `subscriber_channel_closed`
-    /// counter is the task's exit breadcrumb — it must tick WITHOUT any
-    /// publish.
+    /// registration until process exit. The `subscriber_task_ended` counter
+    /// is the task's exit breadcrumb — it must tick WITHOUT any publish.
+    ///
+    /// ALSO (issue #600 / H3): that breadcrumb must NOT land in the
+    /// per-message ledger. It used to bump `subscriber_channel_closed`, which
+    /// `decode_to_delivery_drops` subtracts from `incoming_decoded` — so every
+    /// discarded subscription drove the one "messages were lost" signal an
+    /// operator reads to −1. The mainnet node in #600 reported −18.
     #[tokio::test]
     async fn dropping_subscription_ends_forwarding_task_on_quiet_topic() {
         let node = test_node().await;
         let manager = PubSubManager::new(node, None).expect("manager");
-        let before = manager.stats().subscriber_channel_closed;
+        let before = manager.stats().subscriber_task_ended;
 
         let sub = manager
             .subscribe("quiet-topic-238-teardown".to_string())
@@ -3930,7 +4070,7 @@ mod tests {
         // still notice the dropped receiver via tx.closed() and exit.
         let mut ended = false;
         for _ in 0..200 {
-            if manager.stats().subscriber_channel_closed > before {
+            if manager.stats().subscriber_task_ended > before {
                 ended = true;
                 break;
             }
@@ -3940,6 +4080,17 @@ mod tests {
             ended,
             "forwarding task must exit promptly when its subscriber is \
              dropped on a quiet topic (ghost-task leak)"
+        );
+
+        let stats = manager.stats();
+        assert_eq!(
+            stats.decode_to_delivery_drops, 0,
+            "ending a subscription is a lifecycle event, not message loss — it \
+             must never drive the drop signal negative (issue #600)"
+        );
+        assert_eq!(
+            stats.subscriber_channel_closed, 0,
+            "no message was decoded here, so the per-message counter must not move"
         );
     }
 

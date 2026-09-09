@@ -5555,8 +5555,9 @@ impl Agent {
                 let mut guard = self.capability_advert_service.lock().await;
                 guard.take()
             };
-            if let Some(service) = service {
+            if let Some(mut service) = service {
                 service.abort();
+                service.stop_blob_responder().await;
             }
         }
 
@@ -9839,26 +9840,51 @@ impl Agent {
             service.abort();
             return Ok(());
         }
-        if let Some(prev) = guard.take() {
+        if let Some(mut prev) = guard.take() {
             prev.abort();
+            // Retain the old owner and the start mutex until its responder is
+            // joined. Cancelling this future still drops an aborting owner.
+            // Shutdown can contend on this mutex until cancellation completes;
+            // abort-and-join is not a hard wall-clock bound for non-yielding work.
+            prev.stop_blob_responder().await;
         }
-        *guard = Some(service);
+        // Replacement now awaits cancellation. Shutdown may have started
+        // during that join; do not install the still-local new service then.
+        if self.shutdown_token.is_cancelled() {
+            service.abort();
+            return Ok(());
+        }
+        let service = guard.insert(service);
         tracing::info!("Capability advert service started");
 
-        // L3: serve cert-blob fetches for peers that see our V3 announce
-        // digest but lack the cached pair. Same lifecycle as the caps
-        // service; the handle is detached (task ends with the pubsub).
+        // L3: the capability service owns the responder, including replacement,
+        // ordinary shutdown and Drop. Subscription cleanup is asynchronous.
         if self.shutdown_token.is_cancelled() {
             return Ok(());
         }
-        if let Err(e) = announce_blob::spawn_blob_responder(
+        match announce_blob::spawn_blob_responder(
             std::sync::Arc::clone(runtime.pubsub()),
             std::sync::Arc::clone(&self.announce_blob_cache),
             std::sync::Arc::clone(&self.own_cert_pair),
         )
         .await
         {
-            tracing::warn!("announce blob responder spawn failed: {e}");
+            Ok(handle) => {
+                // Cancellation-safety invariant: the factory must not await
+                // between spawning and returning this handle, and attachment
+                // here must be synchronous. A future reordering requires
+                // abort-on-drop custody at spawn before any intervening await.
+                let rejected = service.attach_blob_responder(handle).err();
+                let cancelled = service.abort_blob_responder_if_cancelled(&self.shutdown_token);
+                if let Some(mut rejected) = rejected {
+                    tracing::warn!("announce blob responder slot already occupied");
+                    rejected.stop().await;
+                }
+                if cancelled {
+                    service.stop_blob_responder().await;
+                }
+            }
+            Err(e) => tracing::warn!("announce blob responder spawn failed: {e}"),
         }
         Ok(())
     }
@@ -10159,6 +10185,30 @@ impl Agent {
         runtime
             .pubsub()
             .publish_with_fanout(topic.to_string(), bytes::Bytes::from(payload))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "publish failed: {}",
+                    e
+                )))
+            })
+    }
+
+    // Same publish path and error mapping; test-only send-stage observation.
+    #[cfg(test)]
+    pub(crate) async fn publish_with_observed_fanout(
+        &self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> error::Result<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        runtime
+            .pubsub()
+            .publish_with_observed_fanout(topic.to_string(), bytes::Bytes::from(payload))
             .await
             .map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
@@ -15978,50 +16028,15 @@ impl Agent {
             ));
         }
         let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
-        let group_id_bytes = stable_group_id.as_bytes().to_vec();
         let persist_path = kv_snapshot_path(state_dir, &store_id);
-        let store = match kv::sync::load_snapshot(&persist_path) {
-            Ok(Some(snap)) => {
-                if snap.id() != &store_id {
-                    return Err(kv_storage_err(format!(
-                        "kv snapshot store-id mismatch for topic {topic}"
-                    )));
-                }
-                if snap.owner() != Some(&creator) {
-                    return Err(kv_storage_err(format!(
-                        "kv snapshot for topic {topic} is anchored on a different owner than the group creator"
-                    )));
-                }
-                match snap.policy() {
-                    kv::AccessPolicy::Encrypted { group_id } if *group_id == group_id_bytes => snap,
-                    other => {
-                        return Err(kv_storage_err(format!(
-                            "kv snapshot for topic {topic} carries policy {other}; refusing to open as an encrypted group store"
-                        )));
-                    }
-                }
-            }
-            Ok(None) => kv::KvStore::new_encrypted(
-                store_id,
-                name.to_string(),
-                creator,
-                group_id_bytes,
-                std::sync::Arc::clone(&secure),
-            )
-            .map_err(|e| kv_storage_err(format!("kv store creation failed: {e}")))?,
-            Err(e) => {
-                return Err(kv_storage_err(format!(
-                    "kv snapshot for topic {topic} is unreadable ({e}); refusing to start with amnesia — repair or remove the snapshot file explicitly"
-                )));
-            }
-        };
-        let mut store = store;
-        // Snapshots deserialize WITHOUT a context (serde(skip)); re-attach
-        // so the replica leaves the fail-closed state only now that the
-        // sync is provably sealed-path.
-        store
-            .set_secure_context(std::sync::Arc::clone(&secure))
-            .map_err(|e| kv_storage_err(format!("kv secure context re-attach failed: {e}")))?;
+        let store = load_group_kv_store(
+            &persist_path,
+            name,
+            stable_group_id,
+            creator,
+            &self.agent_id(),
+            std::sync::Arc::clone(&secure),
+        )?;
 
         let (sync, peer_id) = self
             .spawn_kv_sync_inner(
@@ -16214,6 +16229,220 @@ impl Agent {
     }
 }
 
+/// Validate the immutable binding shared by cached and restored group stores.
+/// A snapshot deliberately has no context; a cached handle must have a live one.
+pub(crate) fn validate_group_kv_store_binding(
+    store: &kv::KvStore,
+    name: &str,
+    stable_group_id: &str,
+    creator: identity::AgentId,
+    cached_member: Option<&identity::AgentId>,
+) -> error::Result<()> {
+    let (store_id, _) = kv::encrypted::group_store_identity(stable_group_id, name);
+    if store.id() != &store_id
+        || store.owner() != Some(&creator)
+        || !matches!(
+            store.ownership_source(),
+            kv::OwnershipSource::Anchored { .. }
+        )
+    {
+        return Err(kv_storage_err(
+            "group kv store ID or creator binding mismatch".into(),
+        ));
+    }
+    if !matches!(store.policy(), kv::AccessPolicy::Encrypted { group_id }
+        if group_id.as_slice() == stable_group_id.as_bytes())
+    {
+        return Err(kv_storage_err(
+            "group kv store policy or group binding mismatch".into(),
+        ));
+    }
+    if let Some(member) = cached_member {
+        let Some(ctx) = store.secure_context() else {
+            return Err(kv_storage_err(
+                "cached group kv store has no secure context".into(),
+            ));
+        };
+        if ctx.group_id() != stable_group_id.as_bytes() || !ctx.is_active_member(member) {
+            return Err(kv_storage_err(
+                "cached group kv store context is foreign or retired".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The actual persistent group opener's socket-free restore/reattach seam.
+fn load_group_kv_store(
+    path: &std::path::Path,
+    name: &str,
+    stable_group_id: &str,
+    creator: identity::AgentId,
+    local_agent: &identity::AgentId,
+    secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
+) -> error::Result<kv::KvStore> {
+    if name.is_empty()
+        || secure.group_id() != stable_group_id.as_bytes()
+        || !secure.is_active_member(local_agent)
+    {
+        return Err(kv_storage_err(
+            "group kv store requires a matching active-member context".into(),
+        ));
+    }
+    let (store_id, _) = kv::encrypted::group_store_identity(stable_group_id, name);
+    let mut store = match kv::sync::load_snapshot(path) {
+        Ok(Some(store)) => {
+            validate_group_kv_store_binding(&store, name, stable_group_id, creator, None)?;
+            store
+        }
+        Ok(None) => kv::KvStore::new_encrypted(
+            store_id,
+            name.to_string(),
+            creator,
+            stable_group_id.as_bytes().to_vec(),
+            std::sync::Arc::clone(&secure),
+        )
+        .map_err(|e| kv_storage_err(format!("kv store creation failed: {e}")))?,
+        Err(e) => {
+            return Err(kv_storage_err(format!(
+                "group kv snapshot is unreadable ({e}); refusing to start with amnesia"
+            )))
+        }
+    };
+    // Snapshots carry no context. Attach before any sync task can start.
+    store
+        .set_secure_context(secure)
+        .map_err(|e| kv_storage_err(format!("kv secure context re-attach failed: {e}")))?;
+    Ok(store)
+}
+
+#[cfg(test)]
+mod issue565_group_binding_tests {
+    use super::*;
+    use kv::encrypted::KvSecureContext;
+    use std::sync::Arc;
+
+    fn context(group: &str, owner: identity::AgentId) -> Arc<groups::GssKvSecureContext> {
+        let mut info = groups::GroupInfo::with_policy(
+            "g".into(),
+            String::new(),
+            owner,
+            group.into(),
+            groups::GroupPolicy::default(),
+        );
+        info.shared_secret = Some(vec![7; 32]);
+        Arc::new(groups::GssKvSecureContext::from_group(&info).unwrap())
+    }
+
+    fn write_snapshot(path: &std::path::Path, store: &kv::KvStore) {
+        // Existing V1 persistence format, decoded by the real load_snapshot.
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            store: &'a kv::KvStore,
+            seq_counter: u64,
+        }
+        let mut bytes = b"X0XKVS1\0".to_vec();
+        bytes.extend(
+            bincode::serialize(&Body {
+                store,
+                seq_counter: store.seq_counter_value(),
+            })
+            .unwrap(),
+        );
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn issue565_actual_restore_reattaches_only_matching_live_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.bin");
+        let owner = identity::AgentId([1; 32]);
+        let group = "ab".repeat(16);
+        let ctx = context(&group, owner);
+        let store = load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx.clone()).unwrap();
+        write_snapshot(&path, &store);
+        let inert = kv::sync::load_snapshot(&path).unwrap().unwrap();
+        assert!(inert.secure_context().is_none());
+        assert!(
+            validate_group_kv_store_binding(&inert, "Wiki", &group, owner, Some(&owner)).is_err()
+        );
+        let restored =
+            load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx.clone()).unwrap();
+        assert!(
+            validate_group_kv_store_binding(&restored, "Wiki", &group, owner, Some(&owner)).is_ok()
+        );
+        assert!(load_group_kv_store(
+            &path,
+            "Wiki",
+            &group,
+            owner,
+            &identity::AgentId([2; 32]),
+            ctx.clone()
+        )
+        .is_err());
+        let foreign = context(&"cd".repeat(16), owner);
+        assert!(load_group_kv_store(&path, "Wiki", &group, owner, &owner, foreign).is_err());
+        ctx.invalidate();
+        assert!(
+            validate_group_kv_store_binding(&restored, "Wiki", &group, owner, Some(&owner))
+                .is_err(),
+            "retirement fences the cached store's shared context"
+        );
+        assert!(load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx).is_err());
+    }
+
+    #[test]
+    fn issue565_actual_snapshot_and_cached_store_binding_reject_foreign_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.bin");
+        let owner = identity::AgentId([1; 32]);
+        let group = "ab".repeat(16);
+        let ctx = context(&group, owner);
+        let id = kv::encrypted::group_store_identity(&group, "Wiki").0;
+        for case in 0..4 {
+            let store = match case {
+                0 => kv::KvStore::new_encrypted(
+                    kv::encrypted::group_store_identity(&group, "Web").0,
+                    "Wiki".into(),
+                    owner,
+                    group.as_bytes().to_vec(),
+                    ctx.clone(),
+                )
+                .unwrap(),
+                1 => kv::KvStore::new_encrypted(
+                    id,
+                    "Wiki".into(),
+                    identity::AgentId([9; 32]),
+                    group.as_bytes().to_vec(),
+                    ctx.clone(),
+                )
+                .unwrap(),
+                2 => kv::KvStore::new(id, "Wiki".into(), owner, kv::AccessPolicy::Signed).unwrap(),
+                _ => kv::KvStore::new_encrypted(
+                    id,
+                    "Wiki".into(),
+                    owner,
+                    b"foreign".to_vec(),
+                    context("foreign", owner),
+                )
+                .unwrap(),
+            };
+            assert!(
+                validate_group_kv_store_binding(&store, "Wiki", &group, owner, Some(&owner))
+                    .is_err(),
+                "cached case {case}"
+            );
+            write_snapshot(&path, &store);
+            assert!(
+                load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx.clone()).is_err(),
+                "restore case {case}"
+            );
+        }
+        std::fs::write(&path, b"corrupt snapshot").unwrap();
+        assert!(load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx).is_err());
+    }
+}
+
 /// Snapshot file path for a store: `<dir>/<store-id-hex>.bin`.
 fn kv_snapshot_path(dir: &std::path::Path, id: &kv::KvStoreId) -> std::path::PathBuf {
     dir.join(format!("{}.bin", hex::encode(id.as_bytes())))
@@ -16259,6 +16488,29 @@ impl std::fmt::Debug for KvStoreHandle {
 }
 
 impl KvStoreHandle {
+    /// Check a cached encrypted handle against its current authoritative group.
+    pub(crate) async fn validate_group_binding(
+        &self,
+        name: &str,
+        stable_group_id: &str,
+        creator: identity::AgentId,
+    ) -> error::Result<()> {
+        let (_, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
+        if self.sync.topic() != topic {
+            return Err(kv_storage_err(
+                "cached group kv store topic mismatch".into(),
+            ));
+        }
+        let store = self.sync.read().await;
+        validate_group_kv_store_binding(
+            &store,
+            name,
+            stable_group_id,
+            creator,
+            Some(&self.agent_id),
+        )
+    }
+
     /// Return this handle's gossip peer id.
     #[must_use]
     pub fn peer_id(&self) -> saorsa_gossip_types::PeerId {
@@ -25029,3 +25281,6 @@ mod peer_connected_handler_integration_tests {
 
 #[cfg(test)]
 mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod legacy_bus_interop_tests;

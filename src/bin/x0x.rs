@@ -81,8 +81,12 @@ enum Commands {
     /// Configure daemon to start on boot (systemd/launchd).
     Autostart {
         /// Remove autostart configuration.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "repair")]
         remove: bool,
+        /// Migrate an existing hand-written launchd job to the supervised
+        /// upgrade contract (ADR-0061) instead of installing a new job.
+        #[arg(long)]
+        repair: bool,
     },
     /// Health check.
     Health,
@@ -1858,9 +1862,11 @@ async fn run(
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
         }
-        Commands::Autostart { remove } => {
+        Commands::Autostart { remove, repair } => {
             return if *remove {
                 commands::daemon::autostart_remove().await
+            } else if *repair {
+                commands::daemon::autostart_repair().await
             } else {
                 commands::daemon::autostart(name).await
             };
