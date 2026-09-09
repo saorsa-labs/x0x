@@ -24,7 +24,7 @@ mod owner;
 mod presence;
 mod profile;
 pub(crate) mod public_group_bootstrap_outbox;
-mod status;
+pub(super) mod status;
 mod stores;
 mod sync;
 mod tasks;

@@ -44,6 +44,44 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **API watchdog no longer aborts live daemons — issue #600.** Shipped
+  0.41.3 tripped its `/health` watchdog 5–12×/hour on mainnet, giving
+  clients connection-refused windows. `/health` was not a cheap endpoint:
+  it walked every connected peer, and that walk can take ant-quic's
+  `connection_lifecycle` **parking_lot write** lock once per peer, on a
+  tokio worker — the same lock a gossip storm keeps hot. The one endpoint
+  the watchdog probes was therefore the one most coupled to the storm; it
+  blew its 3 s budget and the watchdog read "runtime wedged" and aborted.
+  `GET /health` now serves its peer counts from a cached snapshot
+  refreshed every 5 s by a background task, so the handler is O(1) and
+  lock-free. **The response shape is unchanged** — `peers`,
+  `send_ready_peers` and the #262 `degraded` classification all behave as
+  before, only sourced from the snapshot. `GET /status` still reads live.
+- **Daemon stdout logging is now non-blocking (#600).** `x0xd` wrote every
+  log line straight to `std::io::stdout`, making each `warn!` a synchronous
+  `write(2)` under the process-wide stdout lock from tokio workers; the
+  #600 node emitted ~152k WARN lines, so the diagnostic was amplifying the
+  stall it reported. The stdout sink now goes through
+  `tracing_appender::non_blocking`, and the two dispatcher
+  "Timed out handling gossip message" lines are rate-limited to one per
+  30 s per worker, each reporting how many it stood in for. The watchdog
+  pauses 500 ms before `abort()` so its own post-mortem still flushes.
+- **`decode_to_delivery_drops` can no longer go negative (#600 / H3).**
+  The `tx.closed()` arm of the subscriber forwarding task credited
+  `subscriber_channel_closed` — a per-message counter that
+  `decode_to_delivery_drops` subtracts from `incoming_decoded` — even
+  though no message is involved when a receiver is simply dropped. Each
+  ended subscription drove the metric to −1 (mainnet reported `-18`,
+  meaning 18 dropped subscriptions, not 18 lost messages). Subscription
+  teardown now credits a new `subscriber_task_ended` counter, also exposed
+  at `GET /diagnostics/gossip`.
+- **Watchdog trips now say whether the executor was starved (#600).** A 1 s
+  `tokio::time::interval` task stamps a monotonic counter, and the trip log
+  reports that stamp's age. A stale heartbeat next to a live process is
+  proof the tokio executor stopped polling; a fresh one says the block was
+  inside the request path. `thread_dump_summary()` is Linux-only, so this
+  is the only such signal on macOS — and it needs no new dependency or
+  thread enumeration on either platform.
 - **`authorize_write` no longer permissive on the reserved Encrypted
   policy.** Phase A (#358) left the un-keyed `authorize_write` arm
   returning `Ok(())` for a context-less Encrypted store, so the handle

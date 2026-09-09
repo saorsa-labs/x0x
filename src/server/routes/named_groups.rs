@@ -30733,6 +30733,7 @@ pub(in crate::server) mod tests {
             api_address: "127.0.0.1:0".parse().expect("valid test API address"),
             data_dir: data_dir.to_path_buf(),
             start_time: Instant::now(),
+            health_snapshot: Arc::new(crate::server::routes::status::HealthSnapshot::default()),
             broadcast_tx,
             file_transfers: RwLock::new(HashMap::new()),
             receive_hashers: RwLock::new(HashMap::new()),
