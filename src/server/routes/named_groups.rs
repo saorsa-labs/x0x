@@ -4096,33 +4096,7 @@ pub(in crate::server) async fn persist_named_group_info(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(group_id.to_string());
         }
-        match pre_sidecar_bytes {
-            Some(bytes) => {
-                if let Err(e) =
-                    write_home_suite_sidecar(state, &String::from_utf8_lossy(bytes)).await
-                {
-                    tracing::error!(
-                        group_id = %LogHexId::group(group_id),
-                        error = %e,
-                        "#457 r5b: sidecar RESTORE failed — on-disk sidecar may hold a rejected mutation"
-                    );
-                }
-            }
-            None => {
-                if tokio::fs::try_exists(&state.home_suite_groups_path)
-                    .await
-                    .unwrap_or(false)
-                {
-                    if let Err(e) = tokio::fs::remove_file(&state.home_suite_groups_path).await {
-                        tracing::error!(
-                            group_id = %LogHexId::group(group_id),
-                            error = %e,
-                            "#457 r5b: sidecar REMOVE failed — on-disk sidecar may hold a rejected mutation"
-                        );
-                    }
-                }
-            }
-        }
+        restore_home_suite_sidecar(state, pre_sidecar_bytes.as_deref(), Some(group_id)).await;
     }
     let snapshot = {
         let mut groups = state.named_groups.write().await;
@@ -12711,20 +12685,133 @@ pub(in crate::server) async fn publish_delegation_carrier(
         );
     }
     cache_public_message(&state, msg.clone()).await;
-    let direct_recipients = {
-        let groups = state.named_groups.read().await;
-        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-        groups
-            .get(&msg.group_id)
-            .map(|info| {
-                info.active_members()
-                    .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_hex))
-                    .map(|member| member.agent_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    };
+    let direct_recipients = active_member_recipients(&state, &msg.group_id).await;
+    spawn_delegation_carrier_redelivery(&state, &topic, &bytes, &msg);
     spawn_group_public_message_fanout_race(state, topic, bytes, direct_recipients, msg);
+}
+
+/// Active members of `group_id` other than this daemon, as lowercase hex.
+async fn active_member_recipients(state: &AppState, group_id: &str) -> Vec<String> {
+    let groups = state.named_groups.read().await;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    groups
+        .get(group_id)
+        .map(|info| {
+            info.active_members()
+                .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_hex))
+                .map(|member| member.agent_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Re-send a delegation carrier on a bounded schedule (#321 cold wake).
+///
+/// The initial volley in [`publish_delegation_carrier`] is single-shot on
+/// every leg: Plumtree cannot backfill a message published while a delegate
+/// was down, and the handoff DM to an unreachable delegate is dropped after
+/// its own short retry budget. A delegate that was merely restarting when the
+/// grant was issued would then never learn of authority it durably holds —
+/// the owner's history says the delegation is effective while the delegate
+/// can never exercise it.
+///
+/// Offsets run out to +60s for the same reason as
+/// [`GROUP_CONTROL_REDELIVERY_SCHEDULE`] — Plumtree's anti-entropy first tick
+/// lands at 30-60s, so the last attempt is the belt to that brace. The gap
+/// between attempts stays at or under 15s because the window a restarting
+/// delegate is actually back on the bus is short and unaligned with the grant:
+/// a sparser schedule can miss it entirely and leave the delegate permanently
+/// unaware. Recipients are re-read at each attempt, so a member removed in the
+/// meantime stops receiving the carrier.
+///
+/// Deliberately NOT persisted, for the same reason as the group-control
+/// repair: an owner crash mid-schedule loses the remaining attempts, and the
+/// grant stays effective in the owner's durable history regardless.
+const DELEGATION_CARRIER_REDELIVERY_SCHEDULE: [Duration; 6] = [
+    Duration::from_secs(3),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(25),
+    Duration::from_secs(40),
+    Duration::from_secs(60),
+];
+
+/// Test-only replacement for [`DELEGATION_CARRIER_REDELIVERY_SCHEDULE`], with
+/// the same semantics as [`GROUP_CONTROL_REDELIVERY_SCHEDULE_OVERRIDE`]:
+/// `X0X_TEST_DELEGATION_CARRIER_REDELIVERY_MS="200,600"` substitutes those
+/// millisecond offsets, and a value with no parseable offsets (`""`, `"off"`)
+/// switches the repair off entirely for a negative control.
+static DELEGATION_CARRIER_REDELIVERY_OVERRIDE: std::sync::LazyLock<Vec<Duration>> =
+    std::sync::LazyLock::new(|| {
+        let Ok(raw) = std::env::var("X0X_TEST_DELEGATION_CARRIER_REDELIVERY_MS") else {
+            return DELEGATION_CARRIER_REDELIVERY_SCHEDULE.to_vec();
+        };
+        raw.split(',')
+            .filter_map(|part| part.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .collect()
+    });
+
+fn spawn_delegation_carrier_redelivery(
+    state: &Arc<AppState>,
+    topic: &str,
+    bytes: &[u8],
+    msg: &x0x::groups::GroupPublicMessage,
+) {
+    let schedule = DELEGATION_CARRIER_REDELIVERY_OVERRIDE.clone();
+    if schedule.is_empty() {
+        return;
+    }
+    let state = Arc::clone(state);
+    let topic = topic.to_string();
+    let bytes = bytes.to_vec();
+    let msg = msg.clone();
+    tokio::spawn(async move {
+        let start = tokio::time::Instant::now();
+        for (index, offset) in schedule.iter().enumerate() {
+            tokio::time::sleep_until(start + *offset).await;
+            if let Err(e) = state.agent.publish_with_fanout(&topic, bytes.clone()).await {
+                tracing::debug!(
+                    topic = %LogHexId::topic(&topic),
+                    "delegation carrier resend publish failed: {e}"
+                );
+            }
+            // The global fallback is not optional on a resend: a delegate
+            // that restarted subscribes to it during startup, but spawns the
+            // PER-GROUP public listener only lazily, so a resend confined to
+            // the group topic reaches nobody who was rebuilt since the grant
+            // — exactly the delegate this repair exists for.
+            if let Err(e) = state
+                .agent
+                .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes.clone())
+                .await
+            {
+                tracing::debug!(
+                    topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+                    "delegation carrier resend global fallback failed: {e}"
+                );
+            }
+            let recipients = active_member_recipients(&state, &msg.group_id).await;
+            let outstanding = Arc::new(AtomicUsize::new(recipients.len()));
+            for recipient in &recipients {
+                spawn_group_public_message_delivery(
+                    &state,
+                    recipient,
+                    &msg,
+                    Arc::clone(&outstanding),
+                );
+            }
+            tracing::debug!(
+                target: "x0x::groups",
+                group_id = %LogHexId::group(&msg.group_id),
+                attempt = index + 1,
+                attempts = schedule.len(),
+                offset_ms = offset.as_millis() as u64,
+                recipients = recipients.len(),
+                "delegation carrier redelivery attempt"
+            );
+        }
+    });
 }
 
 /// Signed rider attribution for an MLS-plane send (review r4): the
@@ -27000,6 +27087,45 @@ async fn write_home_suite_sidecar(
     })
 }
 
+/// Put the Home-Suite sidecar back to its pre-transaction bytes (or remove
+/// it when it did not exist before). Used by every pre-durable rollback:
+/// #457 r5b (journaled rebind) and #471 (ordinary save whose
+/// `named_groups.json` write failed after the sidecar was already
+/// replaced). Failures are logged, not returned — the caller is already
+/// unwinding a failed transaction.
+async fn restore_home_suite_sidecar(
+    state: &AppState,
+    pre_sidecar_bytes: Option<&[u8]>,
+    group_id: Option<&str>,
+) {
+    let group = group_id.map(LogHexId::group);
+    match pre_sidecar_bytes {
+        Some(bytes) => {
+            if let Err(e) = write_home_suite_sidecar(state, &String::from_utf8_lossy(bytes)).await {
+                tracing::error!(
+                    group_id = ?group,
+                    error = %e,
+                    "sidecar RESTORE failed — on-disk sidecar may hold a rejected mutation"
+                );
+            }
+        }
+        None => {
+            if tokio::fs::try_exists(&state.home_suite_groups_path)
+                .await
+                .unwrap_or(false)
+            {
+                if let Err(e) = tokio::fs::remove_file(&state.home_suite_groups_path).await {
+                    tracing::error!(
+                        group_id = ?group,
+                        error = %e,
+                        "sidecar REMOVE failed — on-disk sidecar may hold a rejected mutation"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// ADR 0028: checked version of save_named_groups that returns an error on
 /// write failure so the causal replay path can refuse to drop a queue entry
 /// when group-state persistence failed (audit 5).
@@ -27051,11 +27177,10 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     // authoritative Home-Suite record) is written FIRST; the legacy-safe
     // named_groups.json replacement follows only on sidecar success, so a
     // crash between the writes can never leave a named-groups view whose
-    // Home-Suite entry has no authoritative backing. NOTE(#471): this
-    // ordinary-save two-file split is NOT transactional on FAILURE (sidecar
-    // new / named old survives a failed second write); tracked in #471,
-    // deliberately out of scope for the #470 CAS rollback — the CAS path
-    // makes no cross-file atomicity claim.
+    // Home-Suite entry has no authoritative backing. #471: the FAILURE
+    // direction is covered below — if the named write does not land, the
+    // sidecar is restored to its pre-write bytes, so the ordinary save
+    // never leaves (sidecar new / named old) on the non-journaled path.
     let (legacy_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
         encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
@@ -27085,35 +27210,57 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     let sidecar_exists = tokio::fs::try_exists(&state.home_suite_groups_path)
         .await
         .unwrap_or(false);
+    // #471: `Some(pre_bytes)` once the sidecar has actually been replaced
+    // — the value to restore if the named write below does not land.
+    // `None` means no sidecar write happened, so there is nothing to undo.
+    // (`write_home_suite_sidecar` only errors BEFORE its rename, so an
+    // `?` here leaves the sidecar untouched and needs no rollback.)
+    let mut sidecar_rollback: Option<Option<Vec<u8>>> = None;
     if !home_suite_json.is_empty() && (sidecar_exists || home_suite_json != "{}") {
+        let pre_sidecar_bytes = tokio::fs::read(&state.home_suite_groups_path).await.ok();
         let sidecar_outcome = write_home_suite_sidecar(state, &home_suite_json).await?;
         if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
+        sidecar_rollback = Some(pre_sidecar_bytes);
     }
     // #470/#471 fault shape: the sidecar above has already been written;
     // failing HERE reproduces the documented #471 split outcome
-    // (sidecar new / named old) through the production path.
-    if save_fault_legacy_write_fails() {
-        return Err(std::io::Error::other(
+    // (sidecar new / named old) through the production path — which the
+    // rollback after the write must now undo.
+    let outcome = if save_fault_legacy_write_fails() {
+        Err(std::io::Error::other(
             "injected legacy roster write failure (#470/#471 test)",
-        ));
+        ))
+    } else {
+        write_named_groups_json_atomic(&state.named_groups_path, &legacy_json)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to save named groups: {e}");
+                e
+            })
+            // #477 (r8 item 1) test fault: the rename happened; report the
+            // parent-dir fsync as failed (constant-false outside test builds).
+            .map(|written| {
+                if written == AtomicWriteOutcome::Durable && save_fault_after_write_not_durable() {
+                    AtomicWriteOutcome::ReplacedNotDurable
+                } else {
+                    written
+                }
+            })
+    };
+    // #471: the named write did NOT land (pre-rename failure or no
+    // replacement) while the sidecar above already did — the split this
+    // ordinary save path has no journal to repair. Undo the sidecar half
+    // so the on-disk pair stays consistent as a unit. `ReplacedNotDurable`
+    // is NOT rolled back: both files then hold the new content and only
+    // the parent-dir fsync is in doubt, which the durability-confirmation
+    // re-save above handles.
+    if matches!(&outcome, Err(_) | Ok(AtomicWriteOutcome::NotReplaced)) {
+        if let Some(pre_sidecar_bytes) = sidecar_rollback.as_ref() {
+            restore_home_suite_sidecar(state, pre_sidecar_bytes.as_deref(), None).await;
+        }
     }
-    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &legacy_json)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to save named groups: {e}");
-            e
-        })
-        // #477 (r8 item 1) test fault: the rename happened; report the
-        // parent-dir fsync as failed (constant-false outside test builds).
-        .map(|written| {
-            if written == AtomicWriteOutcome::Durable && save_fault_after_write_not_durable() {
-                AtomicWriteOutcome::ReplacedNotDurable
-            } else {
-                written
-            }
-        });
     match &outcome {
         Ok(AtomicWriteOutcome::Durable) => {
             state
@@ -30733,6 +30880,7 @@ pub(in crate::server) mod tests {
             api_address: "127.0.0.1:0".parse().expect("valid test API address"),
             data_dir: data_dir.to_path_buf(),
             start_time: Instant::now(),
+            health_snapshot: Arc::new(crate::server::routes::status::HealthSnapshot::default()),
             broadcast_tx,
             file_transfers: RwLock::new(HashMap::new()),
             receive_hashers: RwLock::new(HashMap::new()),
@@ -41244,6 +41392,198 @@ pub(in crate::server) mod tests {
         }
     }
 
+    async fn wait_for_public_history_row(
+        state: &AppState,
+        stable_group_id: &str,
+        canonical_id: &str,
+        provenance: x0x::history::Provenance,
+    ) -> x0x::history::StoredRecord {
+        for _ in 0..40 {
+            if let Some(history) = state.agent.history() {
+                let rows = history
+                    .store()
+                    .query(&x0x::history::HistoryQuery {
+                        scope: Some(x0x::history::Scope::Group(stable_group_id.to_string())),
+                        ..Default::default()
+                    })
+                    .expect("query public history");
+                if let Some(row) = rows.into_iter().find(|row| {
+                    row.record.provenance == provenance
+                        && row
+                            .record
+                            .signed_artifact
+                            .as_deref()
+                            .and_then(|artifact| {
+                                serde_json::from_slice::<x0x::groups::GroupPublicMessage>(artifact)
+                                    .ok()
+                            })
+                            .is_some_and(|message| message.msg_id() == canonical_id)
+                }) {
+                    return row;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!(
+            "public history row did not commit: group={stable_group_id} canonical={canonical_id} provenance={provenance:?}"
+        );
+    }
+
+    fn is_public_history_row(row: &x0x::history::StoredRecord, canonical_id: &str) -> bool {
+        row.record
+            .signed_artifact
+            .as_deref()
+            .and_then(|artifact| {
+                serde_json::from_slice::<x0x::groups::GroupPublicMessage>(artifact).ok()
+            })
+            .is_some_and(|message| message.msg_id() == canonical_id)
+    }
+
+    fn public_history_rows(
+        state: &AppState,
+        stable_group_id: &str,
+        canonical_id: &str,
+    ) -> Vec<x0x::history::StoredRecord> {
+        let Some(history) = state.agent.history() else {
+            return Vec::new();
+        };
+        history
+            .store()
+            .query(&x0x::history::HistoryQuery {
+                scope: Some(x0x::history::Scope::Group(stable_group_id.to_string())),
+                ..Default::default()
+            })
+            .expect("query public history")
+            .into_iter()
+            .filter(|row| is_public_history_row(row, canonical_id))
+            .collect()
+    }
+
+    async fn exercise_public_recorder_order(
+        sender: &AppState,
+        remote: &AppState,
+        sender_group_key: &str,
+        remote_group_key: &str,
+        stable_group_id: &str,
+        message: x0x::groups::GroupPublicMessage,
+        cache_first: bool,
+    ) {
+        let canonical_id = message.msg_id();
+        if cache_first {
+            cache_public_message(sender, message.clone()).await;
+        } else {
+            ingest_public_message(sender, message.clone(), sender_group_key).await;
+        }
+        // The first real recorder must commit a LocalSend row on its own;
+        // otherwise the second entry point could mask a no-op implementation.
+        let first_row = wait_for_public_history_row(
+            sender,
+            stable_group_id,
+            &canonical_id,
+            x0x::history::Provenance::LocalSend,
+        )
+        .await;
+        assert_eq!(first_row.record.payload, message.body.as_bytes());
+
+        if cache_first {
+            ingest_public_message(sender, message.clone(), sender_group_key).await;
+        } else {
+            cache_public_message(sender, message.clone()).await;
+        }
+        // Keep the receiver separate so this same signed artifact takes the
+        // verified-envelope provenance path.
+        ingest_public_message(remote, message.clone(), remote_group_key).await;
+        let sender_rows = public_history_rows(sender, stable_group_id, &canonical_id);
+        assert_eq!(
+            sender_rows.len(),
+            1,
+            "both sender recorders must deduplicate to one canonical row"
+        );
+        let sender_row = sender_rows.into_iter().next().expect("one sender row");
+        let remote_row = wait_for_public_history_row(
+            remote,
+            stable_group_id,
+            &canonical_id,
+            x0x::history::Provenance::VerifiedEnvelope,
+        )
+        .await;
+        assert_eq!(
+            sender_row.record.scope.canonical(),
+            format!("group:{stable_group_id}")
+        );
+        assert_eq!(
+            remote_row.record.scope.canonical(),
+            format!("group:{stable_group_id}")
+        );
+        assert_eq!(sender_row.record.payload, message.body.as_bytes());
+        assert_eq!(remote_row.record.payload, message.body.as_bytes());
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical_id)
+            .expect("canonical id hex")
+            .try_into()
+            .expect("canonical id length");
+        let indexed = sender
+            .agent
+            .history()
+            .expect("sender history")
+            .store()
+            .get_by_canonical_group_msg_id(canonical_bytes, stable_group_id)
+            .expect("canonical lookup")
+            .expect("canonical row after competing recorders");
+        assert_eq!(indexed.record.msg_id, sender_row.record.msg_id);
+        assert_eq!(indexed.record.payload, message.body.as_bytes());
+        assert_eq!(sender_group_key, remote_group_key);
+    }
+
+    /// Issue #321: exercise the actual sender cache and receiver ingest entry
+    /// points in both arrival orders without constructing a daemon or opening
+    /// a socket. The sender invokes both entry points against the same store;
+    /// a separate offline receiver records the same artifact as a verified
+    /// envelope, while provenance follows daemon role.
+    #[tokio::test]
+    async fn public_history_recorders_converge_in_both_arrival_orders() -> Result<()> {
+        let (local, _local_dir) = secure_endpoint_test_state().await?;
+        let (remote, _remote_dir) = secure_endpoint_test_state().await?;
+        let creator = local.agent.agent_id();
+        let local_group_key = insert_public_group(local.as_ref(), creator, "issue321-order").await;
+        let remote_group_key =
+            insert_public_group(remote.as_ref(), creator, "issue321-order").await;
+        let stable_group_id = local
+            .named_groups
+            .read()
+            .await
+            .get(&local_group_key)
+            .expect("local group")
+            .stable_group_id()
+            .to_string();
+        let signing_key = local.agent.identity().agent_keypair();
+        for (body, cache_first) in [("cache-first", true), ("ingest-first", false)] {
+            let message = x0x::groups::GroupPublicMessage::sign(
+                stable_group_id.clone(),
+                "issue321-state".to_string(),
+                1,
+                signing_key,
+                None,
+                x0x::groups::GroupPublicMessageKind::Chat,
+                body.to_string(),
+                if cache_first { 1 } else { 2 },
+                None,
+                None,
+                None,
+            )?;
+            exercise_public_recorder_order(
+                local.as_ref(),
+                remote.as_ref(),
+                &local_group_key,
+                &remote_group_key,
+                &stable_group_id,
+                message,
+                cache_first,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     /// Why (#296): callers detect the gossip black-hole from `fan_out`.
     /// A send body without the field must never be produced.
     #[test]
@@ -48939,6 +49279,9 @@ mod cas_rollback_470 {
     #[derive(Clone, Copy)]
     enum XOp {
         Insert,
+        /// #471: insert X as a HOME-SUITE group, so the save must create
+        /// the sidecar (the `None` half of the sidecar rollback).
+        InsertHome,
         Update,
         Delete,
     }
@@ -48946,6 +49289,9 @@ mod cas_rollback_470 {
     impl XOp {
         fn apply(&self, groups: &mut HashMap<String, x0x::groups::GroupInfo>) {
             match self {
+                XOp::InsertHome => {
+                    groups.insert(X_ID.to_string(), home_suite_group(0x33, X_ID));
+                }
                 XOp::Insert => {
                     groups.insert(X_ID.to_string(), plain_group(0x58, X_ID, "x-inserted"));
                 }
@@ -49379,13 +49725,18 @@ mod cas_rollback_470 {
         );
     }
 
-    /// The #471 residual, pinned as a test: the ordinary save writes the
-    /// authoritative sidecar BEFORE the legacy file, so an `Err` at the
-    /// legacy write leaves (sidecar new / named old / memory rolled back).
-    /// #470's CAS makes no cross-file atomicity claim — this split is
-    /// filed as #471 and deliberately not fixed here.
+    /// INVERTED (#471). This test previously PINNED the defect: it asserted
+    /// that an `Err` at the legacy write legitimately left (sidecar new /
+    /// named old), on the reasoning that #470's CAS made no cross-file
+    /// atomicity claim. That expectation was wrong as a durability
+    /// contract: the sidecar is the AUTHORITATIVE record for Home-Suite
+    /// groups, so a sidecar that is ahead of `named_groups.json` silently
+    /// commits a mutation the caller was told had failed — and this
+    /// ordinary save path has no journal, so nothing on disk explains or
+    /// repairs the split at startup. The sidecar write must now be undone
+    /// when the named write does not land.
     #[tokio::test]
-    async fn err_after_sidecar_leaves_471_split_with_memory_rolled_back() {
+    async fn err_after_sidecar_restores_sidecar_leaving_no_471_split() {
         let (state, dir) = secure_endpoint_test_state().await.expect("test state");
         {
             let mut groups = state.named_groups.write().await;
@@ -49394,24 +49745,32 @@ mod cas_rollback_470 {
         }
         assert!(save_named_groups(&state).await, "seed save");
         let x_before = current(&state, X_ID).await.expect("X seeded");
+        let sidecar_path = dir.path().join(super::HOME_SUITE_GROUPS_FILE);
+        let sidecar_before = tokio::fs::read(&sidecar_path)
+            .await
+            .expect("seeded sidecar");
 
         let outcome = run_failed_persist(&state, SaveFault::Error, XOp::Update, None, None).await;
         assert!(outcome.is_err());
 
         // Memory: rolled back per-key (the #470 rule).
         assert_eq!(current(&state, X_ID).await, Some(x_before.clone()));
-        // Disk: the #471 split — sidecar holds the NEW record...
-        let sidecar = tokio::fs::read_to_string(dir.path().join(super::HOME_SUITE_GROUPS_FILE))
+        // Disk: the sidecar is back to its pre-write bytes — no split.
+        let sidecar_after = tokio::fs::read(&sidecar_path)
             .await
             .expect("sidecar exists");
-        let sidecar_map: HashMap<String, x0x::groups::GroupInfo> =
-            serde_json::from_str(&sidecar).expect("sidecar json");
         assert_eq!(
-            sidecar_map.get(X_ID).expect("X in sidecar").name,
-            "x-renamed-by-mutation",
-            "#471: sidecar retains the new record after the legacy write fails"
+            sidecar_after, sidecar_before,
+            "#471: a failed named write must undo the sidecar half, not \
+             leave the authoritative record ahead of named_groups.json"
         );
-        // ...while the legacy file still serves the OLD (legacy-safe) view.
+        let sidecar_map: HashMap<String, x0x::groups::GroupInfo> =
+            serde_json::from_slice(&sidecar_after).expect("sidecar json");
+        assert_ne!(
+            sidecar_map.get(X_ID).expect("X in sidecar").name,
+            "x-renamed-by-mutation"
+        );
+        // ...and the legacy file still serves the OLD (legacy-safe) view.
         let legacy = tokio::fs::read_to_string(dir.path().join("named_groups.json"))
             .await
             .expect("legacy file");
@@ -49419,5 +49778,71 @@ mod cas_rollback_470 {
             serde_json::from_str(&legacy).expect("legacy json");
         let legacy_x = legacy_map.get(X_ID).expect("X in legacy view");
         assert_ne!(legacy_x.name, "x-renamed-by-mutation");
+    }
+
+    /// WHY #471 matters (Rule 9): a save the caller was told FAILED must not
+    /// be observable after a restart. The daemon reloads Home-Suite groups
+    /// through `load_named_groups_merged`, where the sidecar record wins
+    /// over the legacy placeholder — so a sidecar left ahead of
+    /// `named_groups.json` resurrects the rejected mutation as committed
+    /// state on the next start, with the in-memory rollback erased. This
+    /// asserts the reload, not the file bytes, and fails against the
+    /// pre-fix behaviour.
+    #[tokio::test]
+    async fn failed_save_is_not_resurrected_by_restart_reload() {
+        let (state, _dir) = secure_endpoint_test_state().await.expect("test state");
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.insert(X_ID.to_string(), home_suite_group(0x33, X_ID));
+        }
+        assert!(save_named_groups(&state).await, "seed save");
+        let x_before = current(&state, X_ID).await.expect("X seeded");
+
+        let outcome = run_failed_persist(&state, SaveFault::Error, XOp::Update, None, None).await;
+        assert!(outcome.is_err(), "the caller is told the save failed");
+
+        let reloaded = super::load_named_groups_merged(
+            &state.named_groups_path,
+            &state.home_suite_groups_path,
+        )
+        .await
+        .expect("reload the durable pair");
+        assert_eq!(
+            reloaded.get(X_ID).map(|g| g.name.as_str()),
+            Some(x_before.name.as_str()),
+            "a rejected mutation must not survive a restart via the \
+             authoritative sidecar"
+        );
+    }
+
+    /// The `None` half of the rollback: when no sidecar existed before the
+    /// save, a failed named write must REMOVE the sidecar it created — an
+    /// orphaned sidecar would otherwise introduce a Home-Suite group that
+    /// `named_groups.json` never learned about.
+    #[tokio::test]
+    async fn err_after_first_sidecar_write_removes_the_orphan() {
+        let (state, dir) = secure_endpoint_test_state().await.expect("test state");
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.insert(Y_ID.to_string(), plain_group(0x22, Y_ID, "y-original"));
+        }
+        assert!(save_named_groups(&state).await, "seed save (no Home group)");
+        let sidecar_path = dir.path().join(super::HOME_SUITE_GROUPS_FILE);
+        assert!(
+            !tokio::fs::try_exists(&sidecar_path).await.unwrap_or(false),
+            "no sidecar before the first Home-Suite group"
+        );
+
+        // The mutation inserts X as a Home-Suite group, so the save must
+        // CREATE the sidecar; then the named write fails.
+        let outcome =
+            run_failed_persist(&state, SaveFault::Error, XOp::InsertHome, None, None).await;
+        assert!(outcome.is_err());
+        assert_eq!(current(&state, X_ID).await, None, "insert rolled back");
+        assert!(
+            !tokio::fs::try_exists(&sidecar_path).await.unwrap_or(false),
+            "#471: a sidecar created by a failed save must be removed, not \
+             left as an orphan record"
+        );
     }
 }

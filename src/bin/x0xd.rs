@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tracing_appender::non_blocking::WorkerGuard;
 
 #[cfg(feature = "profile-heap")]
 #[global_allocator]
@@ -278,12 +279,19 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Warning: {warning}");
     }
 
+    for warning in config.gossip.deprecation_warnings() {
+        eprintln!("Warning: {warning}");
+    }
+
     config
         .gossip
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid gossip config: {e}"))?;
 
-    init_logging(&config.log_level, &config.log_format)?;
+    // Held for the rest of `main` (issue #600): dropping the guard stops the
+    // non-blocking stdout writer thread and silently discards every later log
+    // line. Named (not `_`) so it is not dropped at the end of this statement.
+    let _log_guard = init_logging(&config.log_level, &config.log_format)?;
 
     let exec_policy = x0x::exec::load_exec_policy(exec_acl_override.as_deref(), exec_acl_load_mode)
         .await
@@ -575,7 +583,12 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
 ///
 /// The effective filter string is logged at startup so operators can verify
 /// what ended up active.
-fn init_logging(level: &str, format: &str) -> Result<()> {
+///
+/// Returns the [`tracing_appender::non_blocking::WorkerGuard`] for the stdout
+/// sink. **The caller must keep it alive for the process lifetime** — dropping
+/// it shuts the writer thread down and every subsequent log line is silently
+/// discarded (issue #600).
+fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
     use tracing_subscriber::EnvFilter;
 
     let fallback = level.to_lowercase();
@@ -646,15 +659,23 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
+    // Issue #600: the stdout sink is NON-BLOCKING. Writing straight to
+    // `std::io::stdout` makes every `warn!` a synchronous `write(2)` under the
+    // process-wide stdout lock — from tokio workers, and under a gossip storm
+    // that is tens of thousands of serialised syscalls competing with the very
+    // tasks that must stay responsive for the API watchdog's `/health` probe.
+    // `non_blocking` hands formatted lines to a dedicated writer thread instead.
+    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+
     let stdout_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static> =
         if format == "json" {
             Box::new(
                 tracing_subscriber::fmt::layer()
                     .json()
-                    .with_writer(std::io::stdout),
+                    .with_writer(stdout_writer),
             )
         } else {
-            Box::new(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+            Box::new(tracing_subscriber::fmt::layer().with_writer(stdout_writer))
         };
 
     let file_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
@@ -698,7 +719,7 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
         );
     }
 
-    Ok(())
+    Ok(stdout_guard)
 }
 
 #[cfg(test)]
