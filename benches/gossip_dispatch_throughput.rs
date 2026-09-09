@@ -61,9 +61,19 @@ fn build_eager_wire(
 
 fn make_manager(rt: &Runtime) -> Arc<PubSubManager> {
     rt.block_on(async {
-        let network = NetworkNode::new(NetworkConfig::default(), None, None)
-            .await
-            .expect("bench network starts");
+        let network = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("bench network starts");
         Arc::new(PubSubManager::new(Arc::new(network), None).expect("bench pubsub manager starts"))
     })
 }
