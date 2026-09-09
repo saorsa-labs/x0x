@@ -22,6 +22,7 @@ x0x_export_legacy_token_vars
 # join network, interact with other agents.
 #
 # Prerequisites:
+#   - Python 3.11+ (standard-library TOML parser for local configuration)
 #   - x0xd binary built (cargo build --release)
 #   - SSH access to VPS nodes (for token retrieval and verification)
 #   - VPS bootstrap nodes running the current package version (run e2e_deploy.sh first)
@@ -36,6 +37,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 X0XD="${X0XD:-$PROJECT_DIR/target/release/x0xd}"
 VERSION="$(grep '^version = ' "$PROJECT_DIR/Cargo.toml" | head -1 | cut -d '"' -f2)"
+
+# Resolve selected-network config before SSH, API calls or daemon startup.
+# Invalid/missing testnet authority must not fall back to production seeds.
+LOCAL_CONFIG="$(python3 "$SCRIPT_DIR/e2e_live_config.py" \
+    --network "$X0X_NETWORK" --repository "$PROJECT_DIR" \
+    --data-dir /tmp/x0x-e2e-live)"
 
 PASS=0; FAIL=0; SKIP=0; TOTAL=0
 RED='[0;31m'; GREEN='[0;32m'; YELLOW='[0;33m'; CYAN='[0;36m'; NC='[0m'
@@ -186,20 +193,13 @@ for node in "${VPS_NAMES[@]}"; do
 done
 echo "  NYC agent: ${VPS_AIDS[nyc]:0:16}..."
 
-# ── Start local node with default bootstrap (real network) ──────────────
+# ── Start local node with selected-network bootstrap ───────────────────
 echo -e "
-${CYAN}[Setup] Starting local x0xd (joining real bootstrap network)...${NC}"
+${CYAN}[Setup] Starting local x0xd (selected network: $X0X_NETWORK)...${NC}"
 rm -rf /tmp/x0x-e2e-live
 mkdir -p /tmp/x0x-e2e-live
 
-cat>/tmp/x0x-e2e-live/config.toml<<TOML
-instance_name = "e2e-live"
-data_dir = "/tmp/x0x-e2e-live"
-bind_address = "0.0.0.0:15483"
-api_address = "127.0.0.1:19200"
-log_level = "warn"
-# No bootstrap_peers override — uses DEFAULT_BOOTSTRAP_PEERS (6 global nodes on port 5483)
-TOML
+printf '%s\n' "$LOCAL_CONFIG" > /tmp/x0x-e2e-live/config.toml
 
 $X0XD --config /tmp/x0x-e2e-live/config.toml &>/tmp/x0x-e2e-live/log &
 LP=$!

@@ -917,6 +917,7 @@ pub async fn serve_with_options(
         api_address: actual_api_addr,
         data_dir: config.data_dir.clone(),
         start_time: Instant::now(),
+        health_snapshot: Arc::new(routes::status::HealthSnapshot::default()),
         broadcast_tx,
         file_transfers: RwLock::new(HashMap::new()),
         receive_hashers: RwLock::new(HashMap::new()),
@@ -959,6 +960,46 @@ pub async fn serve_with_options(
     // are owned by the Agent/ExecService and stopped by their own `shutdown()`
     // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Issue #600: keep the peer-table traversal that `/health` used to do
+    // inline OFF the request path. The watchdog probes `/health` with a 3 s
+    // budget and aborts the process after 3 misses; walking ant-quic's peer
+    // table takes its `connection_lifecycle` parking_lot write lock per peer,
+    // which is exactly the lock a gossip storm keeps hot. Do the walk here,
+    // once every HEALTH_SNAPSHOT_REFRESH_SECS, and let the handler read
+    // atomics. If this task is itself starved, `/health` still answers with a
+    // slightly stale count instead of hanging — which is the correct failure
+    // mode for a liveness probe.
+    {
+        let snapshot_state = Arc::clone(&state);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                let peers = snapshot_state
+                    .agent
+                    .peers()
+                    .await
+                    .map(|p| p.len())
+                    .unwrap_or(0);
+                let send_ready = match snapshot_state.agent.network() {
+                    Some(network) => network.send_ready_peers().await.len(),
+                    None => 0,
+                };
+                snapshot_state.health_snapshot.store(peers, send_ready);
+            }
+        }));
+    }
 
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
