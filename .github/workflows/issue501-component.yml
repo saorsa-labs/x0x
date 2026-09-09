@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git show -s --format=%P HEAD)" = aab3215ab4b00acac7539493624c8d58340b0c8f
+          test "$(git show -s --format=%P HEAD)" = 920296961c028d5c2bc61368e2d0ea2e132f601b
           test -z "$(git status --porcelain)"
           echo '83fc5316716b6240ffa470daa77d3e6a7ea9ed09baf6631320d472514e38b32f  scripts/ci/issue501-component.lock' | sha256sum --check --status
           test ! -e target
@@ -64,6 +64,9 @@ jobs:
 
       - name: Inert evidence driver controls
         run: python3 -B scripts/ci/test_issue501_component_evidence.py -v
+
+      - name: Inert shared wrapper argument controls
+        run: python3 -B scripts/ci/test_nextest_isolated.py -v
 
       - name: Five bounded isolated selectors and sealed evidence
         id: evidence

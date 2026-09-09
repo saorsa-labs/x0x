@@ -14,7 +14,7 @@ import subprocess
 import tarfile
 import time
 
-PARENT = 'aab3215ab4b00acac7539493624c8d58340b0c8f'
+PARENT = '920296961c028d5c2bc61368e2d0ea2e132f601b'
 BRANCH = 'refs/heads/codex/501-isolated-evidence'
 LOCK = '83fc5316716b6240ffa470daa77d3e6a7ea9ed09baf6631320d472514e38b32f'
 RECIPIENT_SHA = '2265bb7ac6df437ea1c6c69f7f856f8603989f4d4b64415c1a3a17c333d570c8'
@@ -164,8 +164,8 @@ def source_map(workspace, expected_sha):
     require(git('rev-parse', 'HEAD').decode().strip() == expected_sha, 'SOURCE_HEAD')
     require(git('show', '-s', '--format=%P', 'HEAD').decode().split() == [PARENT], 'SOURCE_PARENT')
     require(not git('status', '--porcelain').strip(), 'SOURCE_DIRTY')
-    require(git('rev-parse', PARENT + '^{tree}').decode().strip() == 'db1af05cdaccbb12ebcf6f68196b93577e788dba', 'PARENT_TREE')
-    require(set(git('diff', '--name-only', PARENT, 'HEAD').decode().splitlines()) == {'.github/workflows/issue501-component.yml', 'scripts/ci/issue501-component-evidence.py', 'scripts/ci/test_issue501_component_evidence.py', 'scripts/ci/issue501-component.lock', 'scripts/ci/issue501-recipient.txt'}, 'CONTRIBUTION_SCOPE')
+    require(git('rev-parse', PARENT + '^{tree}').decode().strip() == '71f9e06f5f73cf414ac88eb75ed9d7563d20c943', 'PARENT_TREE')
+    require(set(git('diff', '--name-only', PARENT, 'HEAD').decode().splitlines()) == {'.github/workflows/issue501-component.yml', 'scripts/ci/issue501-component-evidence.py', 'scripts/ci/nextest-isolated.sh', 'scripts/ci/test_nextest_isolated.py'}, 'CONTRIBUTION_SCOPE')
     entries = {}
     for row in git('ls-tree', '-rz', '--full-tree', 'HEAD').split(b'\0'):
         if not row:
