@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Constructor-free controls. Imports only; fake binaries are data, never executed."""
 import copy
+from contextlib import ExitStack
 import importlib.util
 import json
 import os
@@ -770,6 +771,380 @@ class Controls(unittest.TestCase):
             receipt = M.seal_packet(private, out, recipient, {}, source, result, age, M.time.monotonic() + 120)
         self.assertEqual((receipt['status'], receipt['local_status'], result['status']), ('FAIL', 'FAIL', 'FAIL'))
 
+
+
+    def observation(self):
+        return M.BuildObservation(M.time.monotonic())
+
+    def observation_error(self, observer, action, error=M.Rejected):
+        with self.assertRaises(error) as caught:
+            action()
+        self.assertEqual(observer.state, 'rejected')
+        return caught.exception
+
+    def fs_trace(self, action):
+        calls = []
+        def wrapper(label, original):
+            def invoke(*args, **kwargs):
+                calls.append((label, args, kwargs))
+                return original(*args, **kwargs)
+            return invoke
+        with ExitStack() as stack:
+            for owner, names in ((Path, ('resolve', 'is_absolute', 'is_symlink', 'stat', 'exists', 'open')),
+                                 (M.os, ('open', 'fstat', 'getuid')), (M, ('digest',))):
+                for name in names:
+                    stack.enter_context(patch.object(owner, name, wrapper(name, getattr(owner, name))))
+            result = action()
+        return result, calls
+
+    def test_build_observer_preserves_real_file_call_order_and_return(self):
+        w, scratch, source = self.build_inputs()
+        original, before = self.fs_trace(lambda: M.validate_build(w, scratch, source))
+        o = self.observation()
+        result, after = self.fs_trace(lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(result, original)
+        self.assertEqual(after, before, 'recording must not add, repeat or reorder filesystem operations')
+        self.assertEqual(o.state, 'verified')
+        self.assertEqual(o.roles[('test_binary', 0)]['facts']['nlink'], 1)
+        self.assertEqual(o.roles[('binary_metadata', 0)]['facts']['before_open_equal'], True)
+        self.assertEqual(o.roles[('cargo_metadata', 0)]['facts']['after_read_equal'], True)
+        self.assertLessEqual(len(json.dumps(M.BuildVerification(source, M.time.monotonic()).value()).encode()), 32768)
+
+    def test_build_observer_two_links_reject_actual_guard_without_later_probe(self):
+        w, scratch, source = self.build_inputs()
+        binary = w / 'target/debug/deps/ws_integration-deadbeef'
+        os.link(binary, self.root / 'second-link')
+        def rejected(observer):
+            with self.assertRaisesRegex(M.Rejected, 'PATH_KIND_OR_LINK'):
+                M.validate_build(w, scratch, source, observer)
+        _, before = self.fs_trace(lambda: rejected(None))
+        o = self.observation(); _, after = self.fs_trace(lambda: rejected(o))
+        self.assertEqual(after, before)
+        self.assertEqual(o.current_stage, 'regular_kind_link')
+        self.assertEqual(o.current['facts']['nlink'], 2)
+        self.assertEqual(o.current['facts']['owner_matches'], 'unobserved')
+        self.assertEqual(o.error, {'category': 'rejected', 'code': 'PATH_KIND_OR_LINK'})
+        self.assertNotIn(('daemon', 0), o.roles)
+
+    def test_build_observer_missing_stat_is_unobserved_not_zero(self):
+        w, scratch, source = self.build_inputs()
+        (w / 'target/debug/deps/ws_integration-deadbeef').unlink()
+        o = self.observation()
+        self.observation_error(o, lambda: M.validate_build(w, scratch, source, o), FileNotFoundError)
+        self.assertEqual(o.current_stage, 'regular_containment')
+        self.assertTrue(o.current['facts']['absolute'])
+        self.assertEqual(o.current['facts']['contained'], 'unobserved')
+        self.assertEqual(o.current['facts']['nlink'], 'unobserved')
+        self.assertEqual(o.error, {'category': 'filesystem', 'errno': 'ENOENT'})
+
+    def test_build_observer_symlink_escape_and_size_keep_first_predicate(self):
+        w, scratch, source = self.build_inputs()
+        binary = w / 'target/debug/deps/ws_integration-deadbeef'
+        original = binary.read_bytes(); binary.unlink()
+        outside = self.root / 'outside'; outside.write_bytes(original); binary.symlink_to(outside)
+        o = self.observation()
+        self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(o.error['code'], 'PATH_ESCAPE')
+        self.assertEqual(o.current['facts']['ancestor_symlink'], 'unobserved')
+        binary.unlink(); inside = binary.with_name('inside'); inside.write_bytes(original); binary.symlink_to(inside)
+        o = self.observation()
+        self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(o.error['code'], 'PATH_SYMLINK'); self.assertTrue(o.current['facts']['ancestor_symlink'])
+        binary.unlink(); binary.write_bytes(original)
+        with patch.object(M, 'MAX_TOTAL', 1):
+            o = self.observation()
+            self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(o.error['code'], 'FILE_OWNER_OR_SIZE')
+        self.assertEqual(o.current['facts']['size'], len(original))
+        self.assertEqual(o.current['facts']['limit'], 1)
+        self.assertTrue(o.current['facts']['owner_matches'])
+
+    def test_build_observer_owner_mismatch_records_only_boolean(self):
+        w, scratch, source = self.build_inputs(); uid = os.getuid()
+        o = self.observation()
+        with patch.object(M.os, 'getuid', return_value=uid + 1):
+            self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertFalse(o.current['facts']['owner_matches'])
+        self.assertEqual(o.current_stage, 'regular_owner_size')
+        self.assertNotIn('uid', json.dumps(o.value()))
+
+    def test_build_observer_fixed_fallbacks_and_short_circuit(self):
+        w, scratch, source = self.build_inputs(); o = self.observation()
+        M.validate_build(w, scratch, source, o)
+        for i in (0, 1, 3):
+            self.assertFalse(o.roles[('fallback', i)]['facts']['exists'])
+            self.assertEqual(o.roles[('fallback', i)]['facts']['resolved_equal'], 'unobserved')
+        self.assertTrue(o.roles[('fallback', 2)]['facts']['resolved_equal'])
+        self.assertTrue(o.roles[('fallback', 2)]['facts']['digest_equal'])
+        for index, path in ((0, w / 'target/release/x0xd'), (1, w / '../../target/release/x0xd'),
+                            (3, w / '../../target/debug/x0xd')):
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'foreign bytes not executed')
+            o = self.observation()
+            with patch.object(M, 'digest', wraps=M.digest) as hashed:
+                self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+            self.assertEqual(o.error['code'], 'DAEMON_ALTERNATE')
+            self.assertEqual(o.current['role'], 'fallback'); self.assertEqual(o.current['ordinal'], index)
+            self.assertFalse(o.current['facts']['resolved_equal'])
+            self.assertEqual(o.current['facts']['digest_equal'], 'unobserved')
+            self.assertNotIn(path, [call.args[0] for call in hashed.call_args_list])
+            self.assertNotIn(('fallback', index + 1), o.roles)
+            path.unlink()
+
+    def test_build_observer_fallback_symlink_and_digest_mismatch(self):
+        w, scratch, source = self.build_inputs(); daemon = w / 'target/debug/x0xd'
+        path = w / 'target/release/x0xd'; path.parent.mkdir(); path.symlink_to(daemon)
+        o = self.observation(); self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(o.error['code'], 'DAEMON_SYMLINK')
+        self.assertTrue(o.current['facts']['symlink']); self.assertEqual(o.current['facts']['exists'], 'unobserved')
+        path.unlink(); original = M.digest; calls = 0
+        def changed(p):
+            nonlocal calls
+            if p == daemon:
+                calls += 1
+                if calls == 2: return '0' * 64
+            return original(p)
+        o = self.observation()
+        with patch.object(M, 'digest', side_effect=changed):
+            self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(o.current_stage, 'fallback_digest')
+        self.assertTrue(o.current['facts']['resolved_equal']); self.assertFalse(o.current['facts']['digest_equal'])
+        self.assertEqual(calls, 2)
+
+    def test_build_observer_schema_hash_and_decode_failures_keep_distinct_stages(self):
+        w, scratch, source = self.build_inputs()
+        metadata = scratch / 'binaries.json'; saved = metadata.read_bytes()
+        metadata.write_text('{secret-like-malformed')
+        o = self.observation(); self.observation_error(o, lambda: M.validate_build(w, scratch, source, o), ValueError)
+        self.assertEqual((o.current_stage, o.error), ('metadata_json', {'category': 'json_or_value'}))
+        metadata.write_text('{}')
+        o = self.observation(); self.observation_error(o, lambda: M.validate_build(w, scratch, source, o), KeyError)
+        self.assertEqual((o.current_stage, o.error), ('target', {'category': 'missing_key'}))
+        metadata.write_bytes(saved)
+        custody = scratch / 'custody.json'; c = json.loads(custody.read_text()); original = copy.deepcopy(c)
+        c['files']['foreign-secret-path'] = '0' * 64; write(custody, c)
+        o = self.observation(); self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual((o.current_stage, o.error['code']), ('input_set', 'BUILD_INPUT_SET'))
+        first = next(iter(original['files'])); original['files'][first] = '0' * 64; write(custody, original)
+        o = self.observation(); self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual((o.current_stage, o.error['code']), ('input_hash', 'BUILD_INPUT_HASH'))
+        self.assertFalse(o.current['facts']['digest_equal'])
+        self.assertNotIn('secret', json.dumps(o.value()))
+
+    def test_build_observer_open_and_read_race_use_existing_stats_only(self):
+        w, scratch, source = self.build_inputs(); original = M.os.fstat; calls = 0
+        def changed(fd):
+            nonlocal calls
+            calls += 1; value = original(fd)
+            from types import SimpleNamespace
+            if calls == 1:
+                return SimpleNamespace(st_dev=value.st_dev, st_ino=value.st_ino + 1, st_size=value.st_size)
+            return value
+        o = self.observation()
+        with patch.object(M.os, 'fstat', side_effect=changed):
+            self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(calls, 1); self.assertFalse(o.current['facts']['before_open_equal'])
+        self.assertEqual(o.current['facts']['after_read_equal'], 'unobserved')
+        self.assertEqual(o.error['code'], 'FILE_RACE')
+        calls = 0
+        def changed_after(fd):
+            nonlocal calls
+            calls += 1; value = original(fd)
+            from types import SimpleNamespace
+            if calls == 2:
+                return SimpleNamespace(st_size=value.st_size, st_mtime_ns=value.st_mtime_ns + 1)
+            return value
+        o = self.observation()
+        with patch.object(M.os, 'fstat', side_effect=changed_after):
+            self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(calls, 2); self.assertTrue(o.current['facts']['before_open_equal'])
+        self.assertFalse(o.current['facts']['after_read_equal']); self.assertEqual(o.error['code'], 'FILE_CHANGED')
+
+    def test_build_observer_preserves_first_failure_and_unavailable_recording(self):
+        w, scratch, source = self.build_inputs(); o = self.observation()
+        error = KeyError('SECRET_KEY_DO_NOT_RECORD')
+        with patch.object(M, 'object_json', side_effect=error), patch.object(o, 'fact', side_effect=RuntimeError('SECRET_TELEMETRY')):
+            caught = self.observation_error(o, lambda: M.validate_build(w, scratch, source, o), KeyError)
+        self.assertIs(caught, error); self.assertTrue(o.unavailable)
+        prior = copy.deepcopy(o.value())
+        M.observe(o, 'finish', ValueError('later')); M.observe(o, 'stage', 'target'); M.observe(o, 'role', 'daemon')
+        self.assertEqual(o.value(), prior)
+        self.assertNotIn('SECRET', json.dumps(o.value()))
+        o = self.observation()
+        with patch.object(o, 'fact', side_effect=RuntimeError('observer unavailable')):
+            self.assertEqual(M.validate_build(w, scratch, source, o)['binary_id'], M.PRODUCER_BINARY_ID)
+        self.assertTrue(o.unavailable); self.assertEqual(o.state, 'verified')
+
+    def test_build_observer_never_swallows_cancellation(self):
+        w, scratch, source = self.build_inputs(); o = self.observation()
+        with patch.object(M, 'object_json', side_effect=M.PublicationCancelled):
+            with self.assertRaises(M.PublicationCancelled): M.validate_build(w, scratch, source, o)
+        self.assertEqual(o.state, 'in_progress')
+        with patch.object(o, 'fact', side_effect=M.PublicationCancelled):
+            with self.assertRaises(M.PublicationCancelled): M.observe(o, 'fact', 'absolute', True)
+
+    def test_build_observer_receipt_write_and_post_equality_are_separate(self):
+        w, scratch, source = self.build_inputs(); v = M.BuildVerification(source, M.time.monotonic())
+        reuse = M.validate_build(w, scratch, source, v.before)
+        err = OSError(M.errno.ENOSPC, 'SECRET_PATH')
+        def fail(): raise err
+        with self.assertRaises(OSError) as caught: M.verification_action(v.write, fail)
+        self.assertIs(caught.exception, err); self.assertEqual(v.before.state, 'verified')
+        self.assertEqual(v.after.state, 'not_started'); self.assertEqual(v.write['error']['errno'], 'ENOSPC')
+        checked = M.validate_build(w, scratch, source, v.after)
+        self.assertEqual(checked, reuse)
+        with self.assertRaisesRegex(M.Rejected, 'BUILD_DRIFT'):
+            M.verification_action(v.equality, lambda: M.require(checked == {}, 'BUILD_DRIFT'))
+        self.assertEqual(v.after.state, 'verified'); self.assertEqual(v.equality['error']['code'], 'BUILD_DRIFT')
+        self.assertNotIn('SECRET', json.dumps(v.value()))
+
+    def test_build_observer_role_cap_does_not_truncate_actual_input_verification(self):
+        w, scratch, source = self.build_inputs(); meta_path = scratch / 'binaries.json'
+        meta = json.loads(meta_path.read_text()); rows = next(iter(meta['rust-build-meta']['non-test-binaries'].values()))
+        extra = []
+        for i in range(20):
+            path = w / f'target/debug/inert-{i}'; path.write_bytes(b'data never executed'); extra.append(path)
+            rows.append({'name': f'inert-{i}', 'kind': 'bin-exe', 'path': f'debug/inert-{i}'})
+        write(meta_path, meta)
+        c = json.loads((scratch / 'custody.json').read_text())
+        c['files'][str(meta_path)] = M.digest(meta_path)
+        c['files'].update({str(p): M.digest(p) for p in extra}); write(scratch / 'custody.json', c)
+        o = self.observation(); M.validate_build(w, scratch, source, o)
+        self.assertEqual(o.state, 'verified'); self.assertTrue(o.facts_truncated)
+        self.assertLessEqual(sum(k[0] in ('input', 'non_test_binary') for k in o.roles), 16)
+        c['files'][str(extra[-1])] = '0' * 64; write(scratch / 'custody.json', c)
+        o = self.observation(); self.observation_error(o, lambda: M.validate_build(w, scratch, source, o))
+        self.assertEqual(o.error['code'], 'BUILD_INPUT_HASH'); self.assertEqual(o.current['role'], 'input')
+        self.assertFalse(o.current['facts']['digest_equal'])
+
+    def test_build_observer_closed_error_numeric_and_serialized_bounds(self):
+        v = M.BuildVerification({'head': 'a' * 40, 'tree': 'b' * 40}, M.time.monotonic())
+        for o in (v.before, v.after):
+            o.start()
+            for role in ('non_test_binary', 'input'):
+                for i in range(100):
+                    o.role(role, i)
+                    for fact in ('size', 'nlink', 'limit'): o.fact(fact, 10 ** 100)
+            o.stage('SECRET_STAGE'); o.fact('SECRET_FIELD', 'SECRET_VALUE')
+            o.finish(M.Rejected('SECRET_REJECTION'))
+        raw = json.dumps(v.value()).encode()
+        self.assertLessEqual(len(raw), 32768); self.assertNotIn(b'SECRET', raw)
+        self.assertIn(b'UNRECOGNIZED_REJECTION', raw); self.assertIn(b'overflow', raw)
+        for error in (KeyError('SECRET'), ValueError('SECRET'), TypeError('SECRET'), RuntimeError('SECRET'), OSError(999999, 'SECRET')):
+            self.assertNotIn('SECRET', json.dumps(M.build_error(error)))
+        with patch.object(v.before, 'value', side_effect=ValueError('SECRET_PROJECTION')):
+            fallback = v.value()
+        self.assertTrue(fallback['before_runtime']['unavailable'])
+        self.assertEqual(fallback['before_runtime']['error'], v.before.error)
+        self.assertLess(len(json.dumps(fallback).encode()), 32768)
+        self.assertNotIn('SECRET', json.dumps(fallback))
+
+    def test_build_observer_private_adjudication_archived_public_schema_unchanged(self):
+        private, out, recipient, source, result, age = self.seal_inputs()
+        v = M.BuildVerification(source, M.time.monotonic()); v.before.start(); v.before.finish(M.Rejected('PATH_KIND_OR_LINK'))
+        write(private / 'adjudication.json', {'result': result, 'gaps': [], 'build_verification': v.value()})
+        with patch.object(M, 'run_private', side_effect=self.fake_seal), patch.dict(os.environ, {'GITHUB_RUN_ID': '1', 'GITHUB_RUN_ATTEMPT': '1'}):
+            receipt = M.seal_packet(private, out, recipient, {}, source, result, age, M.time.monotonic() + 120)
+        self.assertNotIn('build_verification', json.dumps(receipt))
+        manifest = json.loads((private / 'plaintext-manifest.json').read_text())
+        self.assertEqual(manifest['adjudication.json'], M.digest(private / 'adjudication.json'))
+        with M.tarfile.open(out.parent / 'private-evidence.tar') as archive:
+            row = json.loads(archive.extractfile('adjudication.json').read())
+        self.assertEqual(row['build_verification']['before_runtime']['error']['code'], 'PATH_KIND_OR_LINK')
+
+    def parent_object(self, parents=None):
+        parents = [M.ORIGINAL_PARENT] if parents is None else parents
+        return ('tree ' + 'b' * 40 + '\n' + ''.join('parent ' + p + '\n' for p in parents) +
+                'author Inert <inert@example.invalid> 0 +0000\n\nmessage\n').encode()
+
+    def test_parent_header_uses_raw_shallow_boundary_not_traversal(self):
+        M.verify_parent_header(self.parent_object())
+        for raw in (self.parent_object([]), self.parent_object(['f' * 40]),
+                    self.parent_object([M.ORIGINAL_PARENT, M.ORIGINAL_PARENT]), self.parent_object(['malformed']),
+                    self.parent_object([]) + b'parent ' + M.ORIGINAL_PARENT.encode() + b'\n',
+                    self.parent_object().replace(b'parent ', b'parent  ', 1),
+                    self.parent_object().replace(b'\n\n', b'\nparent\tmalformed\n\n', 1)):
+            with self.assertRaises(M.Rejected): M.verify_parent_header(raw)
+        with self.assertRaisesRegex(M.Rejected, 'PARENT_OBJECT_BOUND'): M.verify_parent_header(b'x' * (M.COMMIT_LIMIT + 1))
+        with self.assertRaisesRegex(M.Rejected, 'PARENT_HEADER_BOUND'):
+            M.verify_parent_header(b'x' * (M.COMMIT_HEADER_LIMIT + 1) + b'\n\n')
+
+    def test_parent_read_bounded_pipe_and_owned_cleanup_only_fake_process(self):
+        from types import SimpleNamespace
+        class Fake:
+            pid = 999999
+            returncode = None
+            stdout = SimpleNamespace(fileno=lambda: 98, close=lambda: None)
+            def poll(self): return self.returncode
+            def wait(self, timeout=None): self.returncode = 0; return 0
+        raw = self.parent_object(); child = Fake(); chunks = [raw, b'']
+        with patch.object(M.subprocess, 'Popen', return_value=child) as spawn, patch.object(M.os, 'set_blocking'), \
+             patch.object(M.select, 'select', return_value=([child.stdout], [], [])), \
+             patch.object(M.os, 'read', side_effect=lambda _fd, count: chunks.pop(0)) as read, \
+             patch.object(M.os, 'killpg') as kill:
+            self.assertEqual(M.read_parent_commit(self.root, M.time.monotonic() + 30), raw)
+        self.assertEqual(spawn.call_args.args[0], ['git', 'cat-file', 'commit', M.PARENT])
+        self.assertTrue(all(c.args[1] <= 4096 for c in read.call_args_list)); kill.assert_not_called()
+        for mode in ('overflow', 'timeout', 'cancel'):
+            child = Fake(); child.returncode = None
+            def fake_read(_fd, count):
+                if mode == 'cancel': raise M.PublicationCancelled()
+                return b'x' * count
+            with patch.object(M.subprocess, 'Popen', return_value=child), patch.object(M.os, 'set_blocking'), \
+                 patch.object(M.select, 'select', return_value=([] if mode == 'timeout' else [child.stdout], [], [])), \
+                 patch.object(M.os, 'read', side_effect=fake_read), patch.object(M.os, 'killpg') as kill:
+                with self.assertRaises(M.PublicationCancelled if mode == 'cancel' else M.Rejected):
+                    M.read_parent_commit(self.root, M.time.monotonic() + 30)
+            kill.assert_called_once_with(child.pid, M.signal.SIGTERM)
+            self.assertEqual(child.returncode, 0)
+
+    def test_successor_guard_exact_three_paths_tree_and_parent(self):
+        sha = 'e' * 40
+        responses = {('rev-parse', 'HEAD'): sha.encode(), ('show', '-s', '--format=%P', 'HEAD'): M.PARENT.encode(),
+                     ('status', '--porcelain'): b'', ('rev-parse', M.PARENT + '^{tree}'): M.PARENT_TREE.encode(),
+                     ('diff', '--name-only', M.PARENT, 'HEAD'): '\n'.join(sorted(M.OBSERVABILITY_PATHS)).encode(),
+                     ('ls-tree', '-rz', '--full-tree', 'HEAD'): b'', ('rev-parse', 'HEAD^{tree}'): b'a' * 40}
+        def run(raw=None):
+            with patch.object(M.subprocess, 'check_output', side_effect=lambda args, **kw: responses[tuple(args[1:])]), \
+                 patch.object(M, 'read_parent_commit', return_value=self.parent_object() if raw is None else raw), patch.object(M, 'digest', return_value=M.LOCK):
+                return M.source_map(self.root, sha)
+        self.assertEqual(run()['parents'], [M.PARENT])
+        with self.assertRaisesRegex(M.Rejected, 'PARENT_ANCESTRY'): run(self.parent_object(['f' * 40]))
+        for key, value, code in ((('show', '-s', '--format=%P', 'HEAD'), M.ORIGINAL_PARENT.encode(), 'SOURCE_PARENT'),
+                                 (('rev-parse', M.PARENT + '^{tree}'), b'0' * 40, 'PARENT_TREE'),
+                                 (('diff', '--name-only', M.PARENT, 'HEAD'), b'extra\n' + responses[('diff', '--name-only', M.PARENT, 'HEAD')], 'CONTRIBUTION_SCOPE')):
+            saved = responses[key]; responses[key] = value
+            with self.assertRaisesRegex(M.Rejected, code): run()
+            responses[key] = saved
+
+    def test_parent_read_eof_nonzero_and_wait_timeout_do_not_lose_reap(self):
+        from types import SimpleNamespace
+        class Fake:
+            pid = 999999
+            returncode = None
+            stdout = SimpleNamespace(fileno=lambda: 98, close=lambda: None)
+            def __init__(self, stalled): self.stalled, self.waits = stalled, []
+            def poll(self): return self.returncode
+            def wait(self, timeout=None):
+                self.waits.append(timeout)
+                if self.stalled and len(self.waits) == 1:
+                    raise M.subprocess.TimeoutExpired('inert-only', timeout)
+                self.returncode = 1
+                return 1
+        for stalled in (False, True):
+            child = Fake(stalled)
+            with patch.object(M.subprocess, 'Popen', return_value=child), patch.object(M.os, 'set_blocking'), \
+                 patch.object(M.select, 'select', return_value=([child.stdout], [], [])), \
+                 patch.object(M.os, 'read', return_value=b''), patch.object(M.os, 'killpg') as kill, \
+                 patch.object(M.time, 'monotonic', return_value=100):
+                with self.assertRaises(M.subprocess.TimeoutExpired if stalled else M.Rejected):
+                    M.read_parent_commit(self.root, 130)
+            self.assertEqual(child.returncode, 1)
+            self.assertEqual(child.waits[0], 10)
+            if stalled:
+                kill.assert_called_once_with(child.pid, M.signal.SIGTERM)
+                self.assertEqual(child.waits[1], 20)
+            else:
+                kill.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """One #287 matched comparator; private evidence only, no host runtime fallback."""
 import argparse
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
 import stat
@@ -13,7 +15,12 @@ import subprocess
 import tarfile
 import time
 
-PARENT = '08a92abc9871e5de3a4bd0542bfeb1127a15ebf8'
+PARENT = 'd18172e82b28eff753a8d88dc0a12df47141ed96'
+ORIGINAL_PARENT = '08a92abc9871e5de3a4bd0542bfeb1127a15ebf8'
+PARENT_TREE = 'd25fa4c40d2462ffef9df6398cd2f1779f6579dd'
+OBSERVABILITY_PATHS = frozenset({'.github/workflows/issue287-matched-reader.yml',
+    'scripts/ci/issue287-matched-reader-evidence.py',
+    'scripts/ci/test_issue287_matched_reader_evidence.py'})
 BRANCH = 'refs/heads/codex/287-isolated-evidence'
 LOCK = '83fc5316716b6240ffa470daa77d3e6a7ea9ed09baf6631320d472514e38b32f'
 RECIPIENT_SHA = '2265bb7ac6df437ea1c6c69f7f856f8603989f4d4b64415c1a3a17c333d570c8'
@@ -151,6 +158,61 @@ def run_private(argv, cwd, env, directory, name, timeout, deadline=None):
     return result
 
 
+COMMIT_LIMIT = 64 * 1024
+COMMIT_HEADER_LIMIT = 8 * 1024
+
+
+def verify_parent_header(raw):
+    """Read the real commit header, including at a depth-two shallow boundary."""
+    require(type(raw) is bytes and len(raw) <= COMMIT_LIMIT, 'PARENT_OBJECT_BOUND')
+    header, separator, _message = raw.partition(b'\n\n')
+    require(bool(separator) and len(header) <= COMMIT_HEADER_LIMIT, 'PARENT_HEADER_BOUND')
+    parents = []
+    for line in header.split(b'\n'):
+        if line.startswith(b'parent'):
+            require(re.fullmatch(rb'parent [0-9a-f]{40}', line) is not None, 'PARENT_HEADER')
+            parents.append(line[7:])
+    require(parents == [ORIGINAL_PARENT.encode('ascii')], 'PARENT_ANCESTRY')
+
+
+def read_parent_commit(workspace, deadline=None):
+    """Fixed Git object only; bounded pipe reads and owned cleanup, no fetch."""
+    end = time.monotonic() + 30
+    if deadline is not None:
+        end = min(end, deadline)
+    # Keep the existing twenty-second TERM allowance inside both bounds.
+    work_end = end - 20
+    require(time.monotonic() < work_end, 'PHASE_DEADLINE')
+    child = subprocess.Popen(['git', 'cat-file', 'commit', PARENT], cwd=workspace,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+    data = bytearray()
+    try:
+        os.set_blocking(child.stdout.fileno(), False)
+        while True:
+            left = work_end - time.monotonic()
+            require(left > 0, 'PARENT_READ_DEADLINE')
+            ready, _, _ = select.select([child.stdout], [], [], left)
+            require(bool(ready), 'PARENT_READ_DEADLINE')
+            try:
+                chunk = os.read(child.stdout.fileno(), min(4096, COMMIT_LIMIT + 1 - len(data)))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            data.extend(chunk)
+            require(len(data) <= COMMIT_LIMIT, 'PARENT_OBJECT_BOUND')
+        code = child.wait(timeout=max(0, work_end - time.monotonic()))
+        require(code == 0, 'PARENT_READ_FAILED')
+        return bytes(data)
+    finally:
+        try:
+            child.stdout.close()
+        finally:
+            # Final OS reap may outlast a deadline; no false hard-bound claim.
+            terminate_owned(child, end)
+
+
 def source_map(workspace, expected_sha, deadline=None):
     def git(*args):
         return subprocess.check_output(['git', *args], cwd=workspace, stderr=subprocess.DEVNULL,
@@ -158,8 +220,9 @@ def source_map(workspace, expected_sha, deadline=None):
     require(git('rev-parse', 'HEAD').decode().strip() == expected_sha, 'SOURCE_HEAD')
     require(git('show', '-s', '--format=%P', 'HEAD').decode().split() == [PARENT], 'SOURCE_PARENT')
     require(not git('status', '--porcelain').strip(), 'SOURCE_DIRTY')
-    require(git('rev-parse', PARENT + '^{tree}').decode().strip() == 'eddd539f1ed0ad1d968be33751d085ea9783ae3f', 'PARENT_TREE')
-    require(set(git('diff', '--name-only', PARENT, 'HEAD').decode().splitlines()) == {'.github/workflows/issue287-matched-reader.yml', 'scripts/ci/issue287-matched-reader-evidence.py', 'scripts/ci/test_issue287_matched_reader_evidence.py', 'scripts/ci/issue287-matched-reader.lock', 'scripts/ci/issue287-recipient.txt'}, 'CONTRIBUTION_SCOPE')
+    require(git('rev-parse', PARENT + '^{tree}').decode().strip() == PARENT_TREE, 'PARENT_TREE')
+    require(set(git('diff', '--name-only', PARENT, 'HEAD').decode().splitlines()) == OBSERVABILITY_PATHS, 'CONTRIBUTION_SCOPE')
+    verify_parent_header(read_parent_commit(workspace, deadline))
     entries = {}
     for row in git('ls-tree', '-rz', '--full-tree', 'HEAD').split(b'\0'):
         if not row:
@@ -221,31 +284,239 @@ def interrupted(_number, _frame):
         raise PublicationCancelled()
 
 
-def regular(path, root, limit=MAX_FILE):
-    path, root = Path(path), Path(root).resolve(strict=True)
-    require(path.is_absolute() and path.resolve(strict=True).is_relative_to(root), 'PATH_ESCAPE')
+BUILD_OBSERVATION_LIMIT = 32 * 1024
+BUILD_NUMBER_LIMIT = (1 << 53) - 1
+BUILD_CODES = frozenset({'PATH_ESCAPE', 'PATH_SYMLINK', 'PATH_KIND_OR_LINK',
+    'FILE_OWNER_OR_SIZE', 'FILE_RACE', 'FILE_CHANGED', 'JSON_DUPLICATE', 'JSON_NUMBER',
+    'TARGET_ROOT', 'BUILD_ROOT', 'PACKAGE_ROOT', 'BINARY_COUNT', 'BINARY_IDENTITY',
+    'DAEMON_PACKAGE', 'DAEMON_METADATA', 'DAEMON_PATH', 'DAEMON_SYMLINK',
+    'DAEMON_ALTERNATE', 'BUILD_SOURCE', 'BUILD_INPUT_SET', 'BUILD_INPUT_HASH', 'BUILD_DRIFT'})
+BUILD_STAGES = frozenset({'not_started', 'metadata_read', 'metadata_json', 'cargo_read',
+    'cargo_json', 'target', 'workspace', 'packages', 'binary_map', 'binary_count',
+    'binary_entry', 'binary_identity', 'test_path', 'non_test_map', 'inputs',
+    'non_test_iteration', 'non_test_path', 'input_insert', 'daemon_name', 'daemon_package',
+    'daemon_append', 'daemon_count', 'daemon_select', 'daemon_path', 'fallback_paths',
+    'daemon_digest', 'fallback_symlink', 'fallback_exists', 'fallback_resolve',
+    'fallback_digest', 'custody_read', 'custody_json', 'custody_source', 'input_set',
+    'input_hash', 'test_digest', 'return_value', 'regular_resolve_root',
+    'regular_containment', 'regular_symlink', 'regular_stat', 'regular_kind_link',
+    'regular_owner_size', 'read_before_stat', 'read_open', 'read_fdopen', 'read_open_stat',
+    'read_identity', 'read_bytes', 'read_after_stat', 'read_close', 'read_stability'})
+BUILD_FACTS = ('absolute', 'contained', 'ancestor_symlink', 'stat_kind', 'nlink',
+    'size', 'limit', 'owner_matches', 'before_open_equal', 'after_read_equal',
+    'read_within_limit', 'symlink', 'exists', 'resolved_equal', 'digest_equal')
+BUILD_ROLES = frozenset({'unknown', 'test_binary', 'non_test_binary', 'daemon',
+    'cargo_metadata', 'binary_metadata', 'custody', 'lock', 'fallback', 'input'})
+
+
+def build_error(error):
+    if isinstance(error, Rejected):
+        code = error.args[0] if error.args and type(error.args[0]) is str else None
+        return {'category': 'rejected', 'code': code if code in BUILD_CODES else 'UNRECOGNIZED_REJECTION'}
+    if isinstance(error, OSError):
+        names = {errno.ENOENT: 'ENOENT', errno.EACCES: 'EACCES', errno.EPERM: 'EPERM',
+                 errno.ELOOP: 'ELOOP', errno.ENOTDIR: 'ENOTDIR', errno.EIO: 'EIO',
+                 errno.ENOSPC: 'ENOSPC'}
+        return {'category': 'filesystem', 'errno': names.get(error.errno, 'OTHER')}
+    for kind, name in ((ValueError, 'json_or_value'), (KeyError, 'missing_key'),
+                       (TypeError, 'wrong_type'), (subprocess.SubprocessError, 'subprocess')):
+        if isinstance(error, kind):
+            return {'category': name}
+    return {'category': 'other'}
+
+
+def observe(observer, method, *args):
+    """Telemetry errors cannot change a checked operation or swallow cancellation."""
+    if observer is not None:
+        try:
+            getattr(observer, method)(*args)
+        except PublicationCancelled:
+            raise
+        except Exception:
+            observer.unavailable = True
+
+
+def operation(observer, stage, action):
+    observe(observer, 'stage', stage)
+    return action()
+
+
+def fact(observer, name, value):
+    observe(observer, 'fact', name, value)
+    return value
+
+
+class BuildObservation:
+    """Two local invocation records; no filesystem access or global registration."""
+    def __init__(self, origin):
+        self.origin = origin
+        self.unavailable = False
+        self.state = 'not_started'
+        self.current_stage = 'not_started'
+        self.started_ms = self.finished_ms = None
+        self.error = None
+        self.facts_truncated = False
+        self.current = self.new_role('unknown', 0)
+        self.roles = {}
+
+    @staticmethod
+    def number(value):
+        return value if type(value) is int and 0 <= value <= BUILD_NUMBER_LIMIT else 'overflow'
+
+    @staticmethod
+    def new_role(role, ordinal):
+        return {'role': role, 'ordinal': ordinal, 'facts': dict.fromkeys(BUILD_FACTS, 'unobserved')}
+
+    def stamp(self):
+        elapsed = time.monotonic() - self.origin
+        if not 0 <= elapsed <= BUILD_NUMBER_LIMIT / 1000:
+            self.unavailable = True
+            return 'unobserved'
+        return int(elapsed * 1000)
+
+    def start(self):
+        if self.state == 'not_started':
+            self.state, self.started_ms = 'in_progress', self.stamp()
+
+    def stage(self, stage):
+        if self.state == 'in_progress':
+            self.current_stage = stage if stage in BUILD_STAGES else 'not_started'
+
+    def role(self, role, ordinal=0):
+        if self.state != 'in_progress':
+            return
+        role = role if role in BUILD_ROLES else 'unknown'
+        ordinal = self.number(ordinal)
+        key = (role, ordinal)
+        # Fixed roles plus16 metadata slots. Overflow keeps the currently checked
+        # operand, but does not retain an unbounded history or stop verification.
+        metadata_role = role in ('non_test_binary', 'input')
+        bounded = not metadata_role or (type(ordinal) is int and ordinal < 16)
+        if metadata_role and key not in self.roles:
+            bounded = bounded and sum(k[0] in ('non_test_binary', 'input') for k in self.roles) < 16
+        if role == 'fallback':
+            bounded = type(ordinal) is int and ordinal < 4
+        if not bounded:
+            self.facts_truncated = True
+            self.current = self.new_role(role, ordinal)
+        else:
+            self.current = self.roles.setdefault(key, self.new_role(role, ordinal))
+
+    def fact(self, name, value):
+        if self.state != 'in_progress' or name not in BUILD_FACTS:
+            return
+        if name in ('nlink', 'size', 'limit'):
+            value = self.number(value)
+        elif name == 'stat_kind':
+            value = value if value in ('regular', 'directory', 'symlink', 'other') else 'unobserved'
+        elif type(value) is not bool:
+            value = 'unobserved'
+        self.current['facts'][name] = value
+
+    def stat(self, info, limit):
+        kind = {stat.S_IFREG: 'regular', stat.S_IFDIR: 'directory', stat.S_IFLNK: 'symlink'}.get(stat.S_IFMT(info.st_mode), 'other')
+        for key, value in (('stat_kind', kind), ('nlink', info.st_nlink), ('size', info.st_size), ('limit', limit)):
+            self.fact(key, value)
+
+    def finish(self, error=None):
+        if self.state == 'in_progress':
+            self.error = build_error(error) if error is not None else None
+            self.state = 'rejected' if error is not None else 'verified'
+            self.finished_ms = self.stamp()
+
+    def value(self, compact=False):
+        return {'state': self.state, 'stage': self.current_stage, 'started_ms': self.started_ms,
+                'finished_ms': self.finished_ms, 'current': self.current, 'error': self.error,
+                'unavailable': self.unavailable, 'facts_truncated': self.facts_truncated or compact,
+                'observations': [] if compact else list(self.roles.values())}
+
+
+class BuildVerification:
+    def __init__(self, source, origin):
+        self.source = {key: source[key] for key in ('head', 'tree')}
+        self.before = BuildObservation(origin)
+        self.after = BuildObservation(origin)
+        self.write = {'state': 'not_started', 'error': None}
+        self.equality = {'state': 'not_started', 'error': None}
+
+    def value(self):
+        def shape(compact):
+            return {'schema': 'x0x.issue287-build-verification/1', 'source': self.source,
+                    'clock': 'milliseconds_since_driver_entry', 'before_runtime': self.before.value(compact),
+                    'after_runtime': self.after.value(compact), 'verified_receipt_write': self.write,
+                    'after_runtime_equality': self.equality}
+        try:
+            value = shape(False)
+            if len(json.dumps(value, sort_keys=True).encode()) > BUILD_OBSERVATION_LIMIT:
+                value = shape(True)
+            if len(json.dumps(value, sort_keys=True).encode()) > BUILD_OBSERVATION_LIMIT:
+                raise ValueError('bounded observer projection unavailable')
+            return value
+        except PublicationCancelled:
+            raise
+        except Exception:
+            # Internal values below are fixed enums/bounded numbers, not exception
+            # text. Preserve the first classified failure even if projection fails.
+            def unavailable(o):
+                return {'state': o.state, 'stage': o.current_stage, 'error': o.error,
+                        'current': {'role': o.current['role'], 'ordinal': o.current['ordinal']},
+                        'unavailable': True, 'facts_truncated': True}
+            return {'schema': 'x0x.issue287-build-verification/1', 'source': self.source,
+                    'clock': 'milliseconds_since_driver_entry', 'before_runtime': unavailable(self.before),
+                    'after_runtime': unavailable(self.after), 'verified_receipt_write': self.write,
+                    'after_runtime_equality': self.equality}
+
+
+def verification_action(slot, action):
+    """Write/equality errors remain separate from a successful verifier."""
+    slot['state'] = 'started'
+    try:
+        value = action()
+    except PublicationCancelled:
+        raise
+    except Exception as error:
+        slot.update(state='rejected', error=build_error(error))
+        raise
+    slot['state'] = 'completed'
+    return value
+
+
+def regular(path, root, limit=MAX_FILE, observer=None):
+    path, root = operation(observer, 'regular_resolve_root', lambda: (Path(path), Path(root).resolve(strict=True)))
+    observe(observer, 'stage', 'regular_containment')
+    require(fact(observer, 'absolute', path.is_absolute()) and
+            fact(observer, 'contained', path.resolve(strict=True).is_relative_to(root)), 'PATH_ESCAPE')
     for part in (path, *path.parents):
-        require(not part.is_symlink(), 'PATH_SYMLINK')
+        observe(observer, 'stage', 'regular_symlink')
+        require(not fact(observer, 'ancestor_symlink', part.is_symlink()), 'PATH_SYMLINK')
         if part == root:
             break
-    info = path.stat()
+    info = operation(observer, 'regular_stat', path.stat)
+    observe(observer, 'stat', info, limit)
+    observe(observer, 'stage', 'regular_kind_link')
     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'PATH_KIND_OR_LINK')
-    require(info.st_uid == os.getuid() and info.st_size <= limit, 'FILE_OWNER_OR_SIZE')
+    observe(observer, 'stage', 'regular_owner_size')
+    require(fact(observer, 'owner_matches', info.st_uid == os.getuid()) and info.st_size <= limit, 'FILE_OWNER_OR_SIZE')
     return path
 
 
-def read_owned(path, root, limit=MAX_FILE):
-    path = regular(path, root, limit)
-    before = path.stat()
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+def read_owned(path, root, limit=MAX_FILE, observer=None):
+    path = regular(path, root, limit, observer)
+    before = operation(observer, 'read_before_stat', path.stat)
+    fd = operation(observer, 'read_open', lambda: os.open(path, os.O_RDONLY | os.O_NOFOLLOW))
+    observe(observer, 'stage', 'read_fdopen')
     with os.fdopen(fd, 'rb') as f:
-        opened = os.fstat(f.fileno())
-        require((before.st_dev, before.st_ino, before.st_size) ==
-                (opened.st_dev, opened.st_ino, opened.st_size), 'FILE_RACE')
-        data = f.read(limit + 1)
-        after = os.fstat(f.fileno())
-    require(len(data) <= limit and (opened.st_size, opened.st_mtime_ns) ==
-            (after.st_size, after.st_mtime_ns), 'FILE_CHANGED')
+        opened = operation(observer, 'read_open_stat', lambda: os.fstat(f.fileno()))
+        observe(observer, 'stage', 'read_identity')
+        require(fact(observer, 'before_open_equal', (before.st_dev, before.st_ino, before.st_size) ==
+                (opened.st_dev, opened.st_ino, opened.st_size)), 'FILE_RACE')
+        data = operation(observer, 'read_bytes', lambda: f.read(limit + 1))
+        after = operation(observer, 'read_after_stat', lambda: os.fstat(f.fileno()))
+        observe(observer, 'stage', 'read_close')
+    observe(observer, 'stage', 'read_stability')
+    require(fact(observer, 'read_within_limit', len(data) <= limit) and
+            fact(observer, 'after_read_equal', (opened.st_size, opened.st_mtime_ns) ==
+            (after.st_size, after.st_mtime_ns)), 'FILE_CHANGED')
     return data
 
 
@@ -271,47 +542,120 @@ def producer_admission():
     require(PRODUCER_BINARY_ID == 'x0x::ws_integration', 'PRODUCER_CONTRACT_UNVERIFIED')
 
 
-def validate_build(workspace, scratch, source):
-    meta = object_json(read_owned(scratch / 'binaries.json', scratch, JSON_LIMIT))
-    cargo = object_json(read_owned(scratch / 'cargo.json', scratch, JSON_LIMIT))
+def validate_build(workspace, scratch, source, observer=None):
+    observe(observer, 'start')
+    try:
+        value = validate_build_inputs(workspace, scratch, source, observer)
+    except PublicationCancelled:
+        raise
+    except Exception as error:
+        # Observe then re-raise the same exception; existing caller catch sets
+        # still determine propagation and the actual nonpass verdict.
+        observe(observer, 'finish', error)
+        raise
+    observe(observer, 'finish')
+    return value
+
+
+def validate_build_inputs(workspace, scratch, source, observer):
+    observe(observer, 'role', 'binary_metadata')
+    data = operation(observer, 'metadata_read', lambda: read_owned(scratch / 'binaries.json', scratch, JSON_LIMIT, observer))
+    meta = operation(observer, 'metadata_json', lambda: object_json(data))
+    del data
+    observe(observer, 'role', 'cargo_metadata')
+    data = operation(observer, 'cargo_read', lambda: read_owned(scratch / 'cargo.json', scratch, JSON_LIMIT, observer))
+    cargo = operation(observer, 'cargo_json', lambda: object_json(data))
+    del data
+    observe(observer, 'role', 'binary_metadata')
+    observe(observer, 'stage', 'target')
     target = workspace / 'target'
     require(Path(meta['rust-build-meta']['target-directory']) == target, 'TARGET_ROOT')
+    observe(observer, 'role', 'cargo_metadata')
+    observe(observer, 'stage', 'workspace')
     require(Path(cargo['workspace_root']) == workspace and Path(cargo['target_directory']) == target, 'BUILD_ROOT')
+    observe(observer, 'stage', 'packages')
     packages = [p for p in cargo['packages'] if p['name'] == 'x0x' and Path(p['manifest_path']) == workspace / 'Cargo.toml']
     require(len(packages) == 1, 'PACKAGE_ROOT')
+    observe(observer, 'role', 'binary_metadata')
+    observe(observer, 'stage', 'binary_map')
     binaries = meta['rust-binaries']
+    observe(observer, 'stage', 'binary_count')
     require(len(binaries) == 1, 'BINARY_COUNT')
+    observe(observer, 'stage', 'binary_entry')
     binary_id, binary = next(iter(binaries.items()))
+    observe(observer, 'stage', 'binary_identity')
     require(binary_id == PRODUCER_BINARY_ID and binary['binary-id'] == PRODUCER_BINARY_ID and binary['binary-name'] == 'ws_integration'
             and binary['kind'] == 'test' and binary['package-id'] == packages[0]['id'], 'BINARY_IDENTITY')
-    test = regular(Path(binary['binary-path']), target, MAX_TOTAL)
+    observe(observer, 'role', 'test_binary')
+    test = operation(observer, 'test_path', lambda: regular(Path(binary['binary-path']), target, MAX_TOTAL, observer))
+    observe(observer, 'role', 'binary_metadata')
+    observe(observer, 'stage', 'non_test_map')
     non_test = meta['rust-build-meta']['non-test-binaries']
+    observe(observer, 'stage', 'inputs')
     inputs = {str(test), str(workspace / 'Cargo.lock'), str(scratch / 'cargo.json'), str(scratch / 'binaries.json')}
     daemons = []
+    # Bounded private role association only; actual input set/iteration unchanged.
+    roles = {str(test): ('test_binary', 0), str(workspace / 'Cargo.lock'): ('lock', 0),
+             str(scratch / 'cargo.json'): ('cargo_metadata', 0), str(scratch / 'binaries.json'): ('binary_metadata', 0)} if observer is not None else {}
+    ordinal = 0
+    observe(observer, 'stage', 'non_test_iteration')
     for package, values in non_test.items():
         for row in values:
-            path = regular(target / row['path'], target, MAX_TOTAL)
+            observe(observer, 'role', 'non_test_binary', ordinal)
+            path = operation(observer, 'non_test_path', lambda: regular(target / row['path'], target, MAX_TOTAL, observer))
+            observe(observer, 'stage', 'input_insert')
             inputs.add(str(path))
+            if observer is not None and ordinal < 16:
+                roles.setdefault(str(path), ('non_test_binary', ordinal))
+            observe(observer, 'stage', 'daemon_name')
             if row.get('name') == 'x0xd':
+                observe(observer, 'stage', 'daemon_package')
                 require(package == packages[0]['id'] and row['kind'] == 'bin-exe', 'DAEMON_PACKAGE')
+                observe(observer, 'stage', 'daemon_append')
                 daemons.append(path)
+            ordinal = min(ordinal + 1, BUILD_NUMBER_LIMIT)
+            observe(observer, 'role', 'binary_metadata')
+            observe(observer, 'stage', 'non_test_iteration')
+    observe(observer, 'role', 'binary_metadata')
+    observe(observer, 'stage', 'daemon_count')
     require(len(daemons) == 1, 'DAEMON_METADATA')
+    observe(observer, 'stage', 'daemon_select')
     daemon = daemons[0]
+    observe(observer, 'role', 'daemon')
     # Cargo's integration-test CARGO_BIN_EXE_x0xd must denote this executable.
     # Fresh target + complete metadata disallows an inherited release fallback.
+    observe(observer, 'stage', 'daemon_path')
     require(daemon == target / 'debug/x0xd', 'DAEMON_PATH')
+    observe(observer, 'stage', 'fallback_paths')
     candidates = [workspace / 'target/release/x0xd', workspace / '../../target/release/x0xd',
                   workspace / 'target/debug/x0xd', workspace / '../../target/debug/x0xd']
-    daemon_sha = digest(daemon)
-    for candidate in candidates:
-        require(not candidate.is_symlink(), 'DAEMON_SYMLINK')
-        if candidate.exists():
-            require(candidate.resolve() == daemon and digest(candidate) == daemon_sha, 'DAEMON_ALTERNATE')
-    custody = object_json(read_owned(scratch / 'custody.json', scratch, JSON_LIMIT))
+    daemon_sha = operation(observer, 'daemon_digest', lambda: digest(daemon))
+    for ordinal, candidate in enumerate(candidates):
+        observe(observer, 'role', 'fallback', ordinal)
+        observe(observer, 'stage', 'fallback_symlink')
+        require(not fact(observer, 'symlink', candidate.is_symlink()), 'DAEMON_SYMLINK')
+        observe(observer, 'stage', 'fallback_exists')
+        if fact(observer, 'exists', candidate.exists()):
+            observe(observer, 'stage', 'fallback_resolve')
+            require(fact(observer, 'resolved_equal', candidate.resolve() == daemon) and
+                    fact(observer, 'digest_equal', operation(observer, 'fallback_digest', lambda: digest(candidate)) == daemon_sha), 'DAEMON_ALTERNATE')
+    observe(observer, 'role', 'custody')
+    data = operation(observer, 'custody_read', lambda: read_owned(scratch / 'custody.json', scratch, JSON_LIMIT, observer))
+    custody = operation(observer, 'custody_json', lambda: object_json(data))
+    del data
+    observe(observer, 'stage', 'custody_source')
     require(custody['source'] == [source['head'], source['tree']], 'BUILD_SOURCE')
+    observe(observer, 'stage', 'input_set')
     require(set(custody['files']) == inputs, 'BUILD_INPUT_SET')
-    require(all(digest(Path(p)) == sha for p, sha in custody['files'].items()), 'BUILD_INPUT_HASH')
-    return {'scratch': scratch.name, 'binary_id': binary_id, 'binary_sha256': digest(test),
+    def checked_hash(p, sha, ordinal):
+        observe(observer, 'role', *roles.get(p, ('input', min(ordinal, BUILD_NUMBER_LIMIT))))
+        return fact(observer, 'digest_equal', operation(observer, 'input_hash', lambda: digest(Path(p))) == sha)
+    observe(observer, 'stage', 'input_hash')
+    require(all(checked_hash(p, sha, i) for i, (p, sha) in enumerate(custody['files'].items())), 'BUILD_INPUT_HASH')
+    observe(observer, 'role', 'test_binary')
+    observe(observer, 'stage', 'return_value')
+    return {'scratch': scratch.name, 'binary_id': binary_id,
+            'binary_sha256': operation(observer, 'test_digest', lambda: digest(test)),
             'daemon_path': str(daemon), 'daemon_sha256': daemon_sha, 'input_hashes': custody['files']}
 
 
@@ -926,6 +1270,7 @@ def main():
               'ran': 0, 'passed': 0, 'failed': 0, 'namespace_admitted': False, 'outer_reaped': False,
               'test_binary_sha256': None, 'daemon_binary_sha256': None, 'framework_status': 'UNVERIFIED'}
     runtime, reuse = None, None
+    build_verification = BuildVerification(source, step_deadline - 49 * 60)
     request_pins = {}
     complete, terminal_ok, gaps = False, False, []
     framework_failed = False
@@ -946,8 +1291,9 @@ def main():
         shutil.copyfile(binaries, scratch / 'binaries.json')
         (scratch / 'lock.sha256').write_text(LOCK + '  Cargo.lock\n')
         build('record', ['python3', 'scripts/ci/nextest-reuse.py', 'record', str(scratch)])
-        reuse = validate_build(workspace, scratch, source)
-        write_json(private / 'verified-build-before.json', reuse)
+        reuse = validate_build(workspace, scratch, source, build_verification.before)
+        verification_action(build_verification.write,
+                            lambda: write_json(private / 'verified-build-before.json', reuse))
         result.update(test_binary_sha256=reuse['binary_sha256'], daemon_binary_sha256=reuse['daemon_sha256'])
         require(not (workspace / 'target/issue287-captures').exists(), 'CAPTURE_NOT_FRESH')
         require(not CANCELLED and time.monotonic() + 1230 <= deadline, 'RUNTIME_ADMISSION_DEADLINE')
@@ -991,7 +1337,8 @@ def main():
             # cannot manufacture a local oracle status from framework failure.
             gaps.append('CAPTURE_WORKER_INCOMPLETE')
         try:
-            require(validate_build(workspace, scratch, source) == reuse, 'BUILD_DRIFT')
+            checked = validate_build(workspace, scratch, source, build_verification.after)
+            verification_action(build_verification.equality, lambda: require(checked == reuse, 'BUILD_DRIFT'))
         except (Rejected, OSError, ValueError, KeyError, TypeError):
             gaps.append('BUILD_DRIFT')
     try:
@@ -1003,7 +1350,8 @@ def main():
     if CANCELLED:
         gaps.append('EXECUTION_CANCELLED')
     finish_result(result, terminal_ok, complete, gaps, framework_failed)
-    write_json(private / 'adjudication.json', {'result': result, 'gaps': gaps})
+    write_json(private / 'adjudication.json', {'result': result, 'gaps': gaps,
+               'build_verification': build_verification.value()})
     seal_packet(private, output, recipient, env, source, result, age, step_deadline, request_pins.get('collect'))
     with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
         f.write('sealed=true\n')
