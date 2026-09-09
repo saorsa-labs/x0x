@@ -914,6 +914,9 @@ impl GossipRuntime {
         if let Some(warning) = config.normalize_egress_budget() {
             tracing::warn!("{warning}");
         }
+        for warning in config.deprecation_warnings() {
+            tracing::warn!("{warning}");
+        }
         config.validate().map_err(|e| {
             crate::error::NetworkError::NodeCreation(format!("invalid gossip config: {e}"))
         })?;
@@ -1236,8 +1239,8 @@ mod tests {
             .expect("Failed to create runtime");
 
         assert_eq!(
-            runtime.config().active_view_size,
-            GossipConfig::default().active_view_size
+            runtime.config().leaf_max_eager_degree,
+            GossipConfig::default().leaf_max_eager_degree
         );
     }
 
@@ -1266,7 +1269,10 @@ mod tests {
             .await
             .expect("Failed to create runtime");
 
-        assert_eq!(runtime.config().active_view_size, config.active_view_size);
+        assert_eq!(
+            runtime.config().leaf_max_eager_degree,
+            config.leaf_max_eager_degree
+        );
         assert!(Arc::ptr_eq(runtime.network(), &network_arc));
     }
 
@@ -1289,7 +1295,7 @@ mod tests {
     #[tokio::test]
     async fn test_runtime_invalid_config() {
         let config = GossipConfig {
-            active_view_size: 0,
+            dispatch_workers: 0,
             ..Default::default()
         };
         let network = NetworkNode::new(test_network_config(), None, None)
