@@ -762,12 +762,24 @@ mod tests {
     use crate::identity::AgentKeypair;
     use crate::network::{NetworkConfig, NetworkNode};
 
+    /// Explicit test-only network config (#417/#337): loopback bind, no
+    /// seeds, discovery/port-mapping off. Still a real socket constructor.
+    fn test_network_config() -> NetworkConfig {
+        NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        }
+    }
+
     /// Isolated network node (mirrors the helper in `src/gossip/pubsub.rs`
     /// tests). `PubSubManager` is fully constructable in tests, so the advert
     /// service is testable end-to-end without a live mesh.
     async fn make_node() -> Arc<NetworkNode> {
         Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
+            NetworkNode::new(test_network_config(), None, None)
                 .await
                 .expect("network node"),
         )

@@ -19,9 +19,10 @@ use x0x::{identity::AgentId, network::NetworkConfig, presence::PresenceEvent, Ag
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a local agent with an isolated key store, peer cache, and the default (loopback)
-/// network config.  Does NOT call `join_network()` — the caller must do so
-/// if network connectivity is needed.
+/// Build a local agent with an isolated key store, peer cache, and the
+/// explicit local test network config (loopback, no seeds, discovery and
+/// port mapping off).  Does NOT call `join_network()` — the caller must do
+/// so if network connectivity is needed.
 ///
 /// Machine key, agent key, and peer cache are stored in an isolated `TempDir` so that
 /// concurrent calls do not share key files or network cache state.
@@ -32,7 +33,7 @@ async fn build_local_agent() -> (Agent, TempDir) {
         .with_machine_key(tmp.path().join("machine.key"))
         .with_agent_key_path(tmp.path().join("agent.key"))
         .with_peer_cache_dir(tmp.path().join("peers"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -49,6 +50,19 @@ async fn build_offline_agent() -> (Agent, TempDir) {
         .await
         .unwrap();
     (agent, tmp)
+}
+
+/// Explicit test-only network config (#417/#337): loopback bind, no
+/// seeds, discovery/port-mapping off. Still a real socket constructor.
+/// `loopback_network_config` below preserves caller-supplied local seeds.
+fn test_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
 }
 
 fn loopback_network_config(bootstrap_nodes: Vec<SocketAddr>) -> NetworkConfig {
