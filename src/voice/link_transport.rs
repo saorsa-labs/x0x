@@ -127,12 +127,112 @@ const ADVERT_SEND_BOUND: std::time::Duration = std::time::Duration::from_secs(5)
 /// reopened once.
 const RELIABLE_WRITE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Replay window ceiling per lane: the most recent frames written to the
+/// live stream are retained so an eviction can re-send them (#277).
+///
+/// The window is a fixed-size ring, and that IS the memory guarantee —
+/// replay can never cost more than [`LANE_REPLAY_MAX_BYTES`] per lane.
+/// 256 frames is ~5 s of 50 fps audio, far more than any plausible
+/// in-flight set (roughly one RTT of frames), so in practice a frame
+/// leaves the window long after the peer received it.
+///
+/// **When the bound is hit the OLDEST frame ages out of the window.** It
+/// is not an error and it applies no backpressure. Ageing out is normal
+/// steady-state behaviour on any call longer than the window and is NOT
+/// loss: those frames went to a healthy stream and were delivered by
+/// QUIC. The consequence is narrower — if the stream later dies, only
+/// frames still inside the window can be replayed.
+///
+/// Retirement is deliberately NOT proof-based. `finish()` + `stopped()`
+/// would prove delivery, but only by rolling the lane onto a fresh
+/// stream: two concurrent inbound readers then interleave at the
+/// receiver's queue, and the resulting reorder pushed
+/// `voice_e2e::voice_pipeline_delivers_decodable_audio` below its ≥99 %
+/// post-jitter gate (measured: 2/5 suite runs green with rolling, 6/6
+/// without). A bounded window costs duplicates on a rare eviction; a
+/// rolling checkpoint cost delivery on every healthy call.
+const LANE_REPLAY_MAX_FRAMES: usize = 256;
+
+/// Byte-side companion to [`LANE_REPLAY_MAX_FRAMES`] (256 KiB per lane)
+/// — a Data lane carrying few but large frames must be bounded by
+/// volume, not frame count.
+const LANE_REPLAY_MAX_BYTES: usize = 256 * 1024;
+
+/// A framed payload (`u32-BE length ‖ payload`) retained for replay.
+/// Shared rather than copied — a replay re-writes the identical bytes.
+type ReplayFrame = Arc<[u8]>;
+
+/// Put frames salvaged from a dead stream back at the FRONT of the send
+/// queue, preserving their relative order. Returns how many were
+/// requeued.
+///
+/// Order matters twice over: salvaged frames were written before
+/// anything already queued, and among themselves they must keep the
+/// order the caller sent them in. Losing or reordering here would
+/// reintroduce exactly the defect #277 fixes.
+fn requeue_salvaged(
+    frames: std::collections::VecDeque<ReplayFrame>,
+    queue: &mut std::collections::VecDeque<ReplayFrame>,
+) -> u64 {
+    let resent = frames.len() as u64;
+    for salvaged in frames.into_iter().rev() {
+        queue.push_front(salvaged);
+    }
+    resent
+}
+
 /// Outbound lane: the send half of an opened `WebRtcV1` stream, keyed by
 /// [`StreamType`]. The recv half is parked alongside so the peer's stream
 /// state stays open for the lane's lifetime.
 struct OutboundLane {
     send: ant_quic::HighLevelSendStream,
     _recv: ant_quic::HighLevelRecvStream,
+    /// The most recent frames written to THIS stream, bounded by
+    /// [`LANE_REPLAY_MAX_FRAMES`] / [`LANE_REPLAY_MAX_BYTES`].
+    ///
+    /// On eviction these are replayed onto the replacement stream rather
+    /// than destroyed by `HighLevelSendStream`'s `Drop` reset (#277).
+    /// Oldest first, so ageing out is a `pop_front`.
+    window: std::collections::VecDeque<ReplayFrame>,
+    /// Total bytes in `window`, so the bound check stays O(1).
+    window_bytes: usize,
+}
+
+impl OutboundLane {
+    /// Record a frame that has been written to this stream, ageing the
+    /// oldest out of the window once the bound is reached.
+    fn retain(&mut self, frame: ReplayFrame) {
+        push_bounded(&mut self.window, &mut self.window_bytes, frame);
+    }
+}
+
+/// Push a frame into a replay window, ageing the OLDEST frames out until
+/// the window is back inside [`LANE_REPLAY_MAX_FRAMES`] /
+/// [`LANE_REPLAY_MAX_BYTES`].
+///
+/// Oldest-first is deliberate: the newest frames are the ones still worth
+/// re-sending, and for audio a stale frame would be discarded by the
+/// receiver's jitter buffer as late anyway. The bound is what makes the
+/// replay window a fixed memory cost rather than a leak on a long call.
+fn push_bounded(
+    window: &mut std::collections::VecDeque<ReplayFrame>,
+    window_bytes: &mut usize,
+    frame: ReplayFrame,
+) {
+    *window_bytes += frame.len();
+    window.push_back(frame);
+    while window.len() > LANE_REPLAY_MAX_FRAMES || *window_bytes > LANE_REPLAY_MAX_BYTES {
+        // Never age out the only frame: a lone frame larger than the byte
+        // bound cannot be shrunk below it, and dropping it would discard
+        // the very frame we were asked to retain.
+        if window.len() <= 1 {
+            break;
+        }
+        match window.pop_front() {
+            Some(aged) => *window_bytes = window_bytes.saturating_sub(aged.len()),
+            None => break,
+        }
+    }
 }
 
 /// Live unreliable datagram lane (ADR-0042 c). Present only when the
@@ -202,6 +302,10 @@ pub struct X0xLinkTransport {
     /// Datagrams dropped by the per-connection byte ceiling (flood
     /// defense; see [`DATAGRAM_BYTE_RATE`]).
     datagram_rate_limited: Arc<AtomicU64>,
+    /// Frames re-sent on a replacement stream after their carrying
+    /// stream died (issue #277). Non-zero means the replay buffer
+    /// prevented data loss that would previously have been silent.
+    replay_frames_resent: Arc<AtomicU64>,
 }
 
 impl X0xLinkTransport {
@@ -228,7 +332,19 @@ impl X0xLinkTransport {
             datagram_frames_sent: Arc::new(AtomicU64::new(0)),
             datagram_frames_received: Arc::new(AtomicU64::new(0)),
             datagram_rate_limited: Arc::new(AtomicU64::new(0)),
+            replay_frames_resent: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Frames re-sent on a replacement stream after the stream carrying
+    /// them died before the peer acknowledged them (issue #277).
+    ///
+    /// Each one is a frame that older builds reported `Ok` for and then
+    /// silently destroyed, so a non-zero count is the replay buffer
+    /// working — not a fault.
+    #[must_use]
+    pub fn replay_frames_resent(&self) -> u64 {
+        self.replay_frames_resent.load(Ordering::Relaxed)
     }
 
     /// Pin which lane carries encoded audio (ADR-0042 c).
@@ -728,11 +844,33 @@ impl X0xLinkTransport {
     /// Reliable path: one ordered `WebRtcV1` stream per
     /// `(direction, StreamType)` lane, `u32-BE length ‖ payload` frames.
     ///
-    /// Connection churn (Codex r2 finding 2): a cached stream from a
-    /// replaced connection errors on write ("sending stopped by peer").
-    /// On any write failure the cached lane is EVICTED and reopened on
-    /// the current connection (one retry); a stream from a dead
-    /// connection must never wedge the reliable path.
+    /// # Delivery contract: AT-LEAST-ONCE (issue #277)
+    ///
+    /// A frame this method reports `Ok` for is retained in a bounded
+    /// per-lane window and REPLAYED on a fresh stream if the stream that
+    /// carried it dies first. Two consequences callers must handle:
+    ///
+    /// - **Duplicates are possible.** Retirement is by window, not by
+    ///   acknowledgement, so a replay re-sends frames the peer had
+    ///   already received. Audio is safe:
+    ///   `saorsa_webrtc_core::jitter::JitterBuffer::push` drops a repeat
+    ///   of a buffered sequence (`duplicates_dropped`) and a repeat of an
+    ///   already-played one (`late_dropped`), both keyed on
+    ///   `AudioDatagram.seq`. **Data-lane payloads are opaque to x0x, so
+    ///   Data callers own their own idempotency.**
+    /// - **Order is not guaranteed across a stream boundary.** Replayed
+    ///   frames ride a different QUIC stream from the frames queued after
+    ///   them, and the two streams have no ordering relation. Order
+    ///   within a single stream is unchanged (QUIC-ordered).
+    ///
+    /// This replaces silent loss: eviction used to `remove()` the lane,
+    /// and dropping an unfinished `HighLevelSendStream` RESETS it,
+    /// discarding bytes belonging to frames earlier calls had already
+    /// been told were sent.
+    ///
+    /// Retention is bounded by [`LANE_REPLAY_MAX_FRAMES`] /
+    /// [`LANE_REPLAY_MAX_BYTES`] per lane; past that the oldest frames
+    /// age out of the window (see [`LANE_REPLAY_MAX_FRAMES`]).
     async fn send_reliable(
         &self,
         stream_type: StreamType,
@@ -744,98 +882,145 @@ impl X0xLinkTransport {
             .ok_or_else(|| {
                 LinkTransportError::SendError(format!("frame length {} out of range", data.len()))
             })?;
+        // One buffer per frame: the exact bytes a replay re-writes.
+        let mut framed = Vec::with_capacity(4 + data.len());
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(data);
+        let frame: ReplayFrame = Arc::from(framed.into_boxed_slice());
 
+        let key = stream_type.as_u8();
         let mut lanes = self.lanes.lock().await;
+
+        // Everything that must reach the wire on this call, oldest first.
+        let mut queue: std::collections::VecDeque<ReplayFrame> = std::collections::VecDeque::new();
+        queue.push_back(frame);
+
         // First attempt on the cached lane (opening it if absent); on a
-        // write failure evict and re-open once on the current
-        // connection.
+        // write failure the lane's retained frames are salvaged and
+        // replayed on a replacement stream.
         for attempt in 0..2 {
-            if let std::collections::hash_map::Entry::Vacant(slot) =
-                lanes.entry(stream_type.as_u8())
-            {
-                let mut stream = self
-                    .agent
-                    .open_peer_stream(&self.remote, StreamProtocol::WebRtcV1)
-                    .await
-                    .map_err(|e| {
-                        LinkTransportError::SendError(format!("open WebRtcV1 lane: {e}"))
-                    })?;
-                match tokio::time::timeout(
-                    RELIABLE_WRITE_BOUND,
-                    stream.send_mut().write_all(&[stream_type.as_u8()]),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    // A stream whose open/prefix write already failed is
-                    // useless — do not cache it.
-                    Ok(Err(e)) if attempt == 0 => {
-                        tracing::warn!(
-                            target: "voice",
-                            error = %e,
-                            "lane prefix write failed; reopening on the current connection"
-                        );
-                        continue; // evicted by not inserting; retry open
+            if let std::collections::hash_map::Entry::Vacant(slot) = lanes.entry(key) {
+                match self.open_lane_stream(stream_type).await? {
+                    Some(lane) => {
+                        slot.insert(lane);
                     }
-                    Ok(Err(e)) => return Err(lt_err("write StreamType byte", e)),
-                    Err(_) if attempt == 0 => {
-                        tracing::warn!(
-                            target: "voice",
-                            "lane prefix write exceeded bound; reopening on the current connection"
-                        );
-                        continue;
-                    }
-                    Err(_) => {
+                    // Prefix write failed: the stream is useless and was
+                    // never cached. Retry the open once.
+                    None if attempt == 0 => continue,
+                    None => {
                         return Err(LinkTransportError::SendError(
-                            "lane prefix write timed out — connection likely replaced".to_owned(),
+                            "lane prefix write failed — connection likely replaced".to_owned(),
                         ));
                     }
                 }
-                let (send, recv) = stream.into_split();
-                slot.insert(OutboundLane { send, _recv: recv });
             }
-            let Some(lane) = lanes.get_mut(&stream_type.as_u8()) else {
+            let Some(lane) = lanes.get_mut(&key) else {
                 return Err(LinkTransportError::SendError(
                     "lane vanished during send".to_owned(),
                 ));
             };
-            // Bounded write: a stream whose connection died mid-churn
-            // does not error — flow control stops progressing and
-            // write_all awaits forever. The bound converts that stall
-            // into an eviction + reopen.
-            let written = tokio::time::timeout(RELIABLE_WRITE_BOUND, async {
-                lane.send.write_all(&len.to_be_bytes()).await?;
-                lane.send.write_all(data).await
-            })
-            .await;
-            match written {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(e)) if attempt == 0 => {
+
+            match Self::write_queued(lane, &mut queue).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt == 0 => {
                     tracing::warn!(
                         target: "voice",
+                        lane = key,
                         error = %e,
-                        "cached reliable lane failed; evicting and reopening on the current connection"
+                        queued = queue.len(),
+                        "reliable lane failed; salvaging retained frames for replay"
                     );
-                    lanes.remove(&stream_type.as_u8());
+                    // Salvage the dead stream's retained frames — they are
+                    // older than anything still queued, so they go first.
+                    // Dropping the stream here resets it, which is only
+                    // safe because we kept its frames.
+                    if let Some(dead) = lanes.remove(&key) {
+                        let resent = requeue_salvaged(dead.window, &mut queue);
+                        self.replay_frames_resent
+                            .fetch_add(resent, Ordering::Relaxed);
+                    }
                 }
-                Ok(Err(e)) => return Err(lt_err("write frame", e)),
-                Err(_) if attempt == 0 => {
-                    tracing::warn!(
-                        target: "voice",
-                        "reliable lane write exceeded bound; evicting and reopening on the current connection"
-                    );
-                    lanes.remove(&stream_type.as_u8());
-                }
-                Err(_) => {
-                    return Err(LinkTransportError::SendError(
-                        "reliable lane write timed out — connection likely replaced".to_owned(),
-                    ));
+                Err(e) => {
+                    lanes.remove(&key);
+                    return Err(lt_err("write frame after replay attempt", e));
                 }
             }
         }
         Err(LinkTransportError::SendError(
             "reliable lane reopen failed after eviction".to_owned(),
         ))
+    }
+
+    /// Open one `WebRtcV1` stream and write its [`StreamType`] prefix.
+    ///
+    /// `Ok(None)` means the stream opened but its prefix write failed or
+    /// stalled — it is useless and must not be cached, and the caller
+    /// decides whether to retry the open.
+    async fn open_lane_stream(
+        &self,
+        stream_type: StreamType,
+    ) -> Result<Option<OutboundLane>, LinkTransportError> {
+        let mut stream = self
+            .agent
+            .open_peer_stream(&self.remote, StreamProtocol::WebRtcV1)
+            .await
+            .map_err(|e| LinkTransportError::SendError(format!("open WebRtcV1 lane: {e}")))?;
+        match tokio::time::timeout(
+            RELIABLE_WRITE_BOUND,
+            stream.send_mut().write_all(&[stream_type.as_u8()]),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "voice",
+                    error = %e,
+                    "lane prefix write failed; reopening on the current connection"
+                );
+                return Ok(None);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "voice",
+                    "lane prefix write exceeded bound; reopening on the current connection"
+                );
+                return Ok(None);
+            }
+        }
+        let (send, recv) = stream.into_split();
+        Ok(Some(OutboundLane {
+            send,
+            _recv: recv,
+            window: std::collections::VecDeque::new(),
+            window_bytes: 0,
+        }))
+    }
+
+    /// Write queued frames in order, retaining each in the lane's replay
+    /// window as it lands so an eviction mid-queue replays exactly the
+    /// frames not known to have been delivered.
+    ///
+    /// A stream whose connection died mid-churn does not error — flow
+    /// control simply stops progressing and `write_all` awaits forever —
+    /// so each frame is bounded and a stall is reported as a failure.
+    async fn write_queued(
+        lane: &mut OutboundLane,
+        queue: &mut std::collections::VecDeque<ReplayFrame>,
+    ) -> Result<(), String> {
+        while let Some(frame) = queue.front().cloned() {
+            match tokio::time::timeout(RELIABLE_WRITE_BOUND, lane.send.write_all(&frame)).await {
+                Ok(Ok(())) => {
+                    queue.pop_front();
+                    lane.retain(frame);
+                }
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(_) => {
+                    return Err("write exceeded bound — connection likely replaced".to_owned())
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Datagram path (ADR-0042 c): one unreliable QUIC datagram per
@@ -977,7 +1162,14 @@ impl LinkTransport for X0xLinkTransport {
             lane.advert_listener.abort();
         }
         self.peer_datagram_capable.store(false, Ordering::SeqCst);
-        self.lanes.lock().await.clear();
+        // Finish each lane before dropping it. Dropping an unfinished
+        // `HighLevelSendStream` RESETS it, which would discard the tail
+        // of frames already reported `Ok` — the same silent loss #277
+        // fixes on the eviction path. A finished stream keeps delivering
+        // its buffered bytes.
+        for (_, mut lane) in self.lanes.lock().await.drain() {
+            let _ = lane.send.finish();
+        }
         Ok(())
     }
 
@@ -1167,5 +1359,183 @@ mod tests {
         // pinned so the datagram routing can never capture another lane.
         assert_eq!(StreamType::Audio.as_u8(), 0x20);
         assert_eq!(StreamType::try_from_u8(0x20), Some(StreamType::Audio));
+    }
+
+    // === Replay buffer (issue #277) ===
+
+    // === Replay window (issue #277) ===
+
+    fn rframe(tag: u8) -> ReplayFrame {
+        Arc::from(vec![tag; 8].into_boxed_slice())
+    }
+
+    fn tags(queue: &std::collections::VecDeque<ReplayFrame>) -> Vec<u8> {
+        queue.iter().map(|f| f[0]).collect()
+    }
+
+    fn window_of(n: usize) -> (std::collections::VecDeque<ReplayFrame>, usize) {
+        let mut w = std::collections::VecDeque::new();
+        let mut b = 0usize;
+        for i in 0..n {
+            push_bounded(&mut w, &mut b, rframe((i % 251) as u8));
+        }
+        (w, b)
+    }
+
+    #[test]
+    fn salvaged_frames_are_replayed_ahead_of_the_queue_in_order() {
+        // WHY: this is the #277 fix in one assertion. Frames a previous
+        // call already reported `Ok` for are still buffered in the stream
+        // being evicted; dropping that stream RESETS it and destroys
+        // them. They must come back — ahead of whatever is queued (they
+        // were written first) and in their original order.
+        let salvaged: std::collections::VecDeque<ReplayFrame> =
+            [rframe(1), rframe(2), rframe(3)].into_iter().collect();
+        let mut queue: std::collections::VecDeque<ReplayFrame> =
+            [rframe(10), rframe(11)].into_iter().collect();
+
+        let resent = requeue_salvaged(salvaged, &mut queue);
+
+        assert_eq!(resent, 3, "every salvaged frame must be counted");
+        assert_eq!(
+            tags(&queue),
+            vec![1, 2, 3, 10, 11],
+            "salvaged frames must precede queued ones and keep their order"
+        );
+    }
+
+    #[test]
+    fn salvage_of_an_empty_lane_is_a_no_op() {
+        // WHY: a lane evicted before it ever wrote a frame has nothing at
+        // risk; it must not perturb the queue or inflate the counter.
+        let mut queue: std::collections::VecDeque<ReplayFrame> = [rframe(10)].into_iter().collect();
+
+        let resent = requeue_salvaged(std::collections::VecDeque::new(), &mut queue);
+
+        assert_eq!(resent, 0);
+        assert_eq!(tags(&queue), vec![10]);
+    }
+
+    #[test]
+    fn replay_window_is_bounded_on_a_long_call() {
+        // WHY: retaining every frame written would grow for the life of a
+        // call — a memory leak on a lane that runs for hours. The window
+        // is a fixed-size ring, and THAT is the memory guarantee.
+        let (window, bytes) = window_of(LANE_REPLAY_MAX_FRAMES * 4);
+
+        assert_eq!(
+            window.len(),
+            LANE_REPLAY_MAX_FRAMES,
+            "the window must stop growing at its frame bound"
+        );
+        assert!(
+            bytes <= LANE_REPLAY_MAX_BYTES,
+            "retained bytes {bytes} exceeded the bound {LANE_REPLAY_MAX_BYTES}"
+        );
+        assert_eq!(
+            bytes,
+            window.iter().map(|f| f.len()).sum::<usize>(),
+            "the byte tally must track the ring, or the bound drifts"
+        );
+    }
+
+    #[test]
+    fn replay_window_ages_out_the_oldest_frames_first() {
+        // WHY: on a lane that has outrun its window the newest frames are
+        // the ones still worth re-sending; an old audio frame would be
+        // dropped by the receiver's jitter buffer as late anyway.
+        let mut window = std::collections::VecDeque::new();
+        let mut bytes = 0usize;
+        for i in 0..=LANE_REPLAY_MAX_FRAMES {
+            push_bounded(
+                &mut window,
+                &mut bytes,
+                rframe(u8::try_from(i % 251).unwrap()),
+            );
+        }
+
+        assert_eq!(window.len(), LANE_REPLAY_MAX_FRAMES);
+        assert_eq!(
+            window.front().map(|f| f[0]),
+            Some(1),
+            "frame 0 must be the one aged out, not a newer frame"
+        );
+    }
+
+    #[test]
+    fn replay_window_bounded_by_bytes_for_large_frames() {
+        // WHY: the Data lane carries few but large frames, so a frame
+        // count alone would not bound memory.
+        let big: ReplayFrame = Arc::from(vec![0u8; LANE_REPLAY_MAX_BYTES / 4].into_boxed_slice());
+        let mut window = std::collections::VecDeque::new();
+        let mut bytes = 0usize;
+        for _ in 0..32 {
+            push_bounded(&mut window, &mut bytes, Arc::clone(&big));
+        }
+
+        assert!(
+            window.len() < LANE_REPLAY_MAX_FRAMES,
+            "the byte bound must bind before the frame bound for large frames"
+        );
+        assert!(
+            bytes <= LANE_REPLAY_MAX_BYTES,
+            "retained bytes {bytes} exceeded the bound {LANE_REPLAY_MAX_BYTES}"
+        );
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_byte_bound_is_still_retained() {
+        // WHY: ageing out the only frame in the window would discard the
+        // very frame we were asked to retain, and an unguarded trim loop
+        // on an over-sized frame would spin forever.
+        let huge: ReplayFrame = Arc::from(vec![0u8; LANE_REPLAY_MAX_BYTES * 2].into_boxed_slice());
+        let mut window = std::collections::VecDeque::new();
+        let mut bytes = 0usize;
+
+        push_bounded(&mut window, &mut bytes, huge);
+
+        assert_eq!(window.len(), 1, "the lone frame must survive the trim");
+    }
+
+    #[test]
+    fn audio_duplicates_from_replay_are_deduped_by_the_jitter_buffer() {
+        // WHY: the reliable lane is at-least-once, so replay CAN deliver
+        // an Audio frame twice. That is only safe because the receiver's
+        // jitter buffer drops a repeated `AudioDatagram.seq`. If a
+        // dependency bump ever removed that dedup, at-least-once would
+        // become a correctness bug for audio — this test fails first.
+        use saorsa_webrtc_core::jitter::{JitterBuffer, JitterConfig, JitterEvent};
+
+        let frame = |seq: u32| AudioDatagram {
+            seq,
+            timestamp_ms: u64::from(seq) * 20,
+            flags: 0,
+            payload: Bytes::from(vec![7u8; 40]),
+        };
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+
+        jb.push(frame(0));
+        jb.push(frame(1));
+        jb.push(frame(1)); // the replayed duplicate
+        jb.push(frame(2));
+
+        let mut delivered: Vec<u32> = Vec::new();
+        for _ in 0..16 {
+            for ev in jb.poll_ready() {
+                if let JitterEvent::Frame(f) = ev {
+                    delivered.push(f.seq);
+                }
+            }
+        }
+
+        let ones = delivered.iter().filter(|s| **s == 1).count();
+        assert_eq!(
+            ones, 1,
+            "a replayed audio frame must be delivered once, got {ones} copies of seq 1"
+        );
+        assert!(
+            jb.counters().duplicates_dropped >= 1,
+            "the duplicate must be dropped by the jitter buffer's seq dedup"
+        );
     }
 }

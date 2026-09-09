@@ -107,7 +107,13 @@ async fn test_agent_with_network_creates_cache_dir() {
         .with_machine_key(temp.path().join("machine.key"))
         .with_agent_key_path(temp.path().join("agent.key"))
         .with_peer_cache_dir(&cache_dir)
-        .with_network_config(x0x::network::NetworkConfig::default())
+        .with_network_config(x0x::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        })
         .build()
         .await
         .expect("failed to build agent");
@@ -125,7 +131,13 @@ async fn test_shutdown_saves_cache() {
         .with_machine_key(temp.path().join("machine.key"))
         .with_agent_key_path(temp.path().join("agent.key"))
         .with_peer_cache_dir(&cache_dir)
-        .with_network_config(x0x::network::NetworkConfig::default())
+        .with_network_config(x0x::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        })
         .build()
         .await
         .expect("failed to build agent");
@@ -235,7 +247,13 @@ async fn test_default_cache_dir_when_not_specified() {
     let build_result = Agent::builder()
         .with_machine_key(temp.path().join("machine.key"))
         .with_agent_key_path(temp.path().join("agent.key"))
-        .with_network_config(x0x::network::NetworkConfig::default())
+        .with_network_config(x0x::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        })
         .build()
         .await;
 

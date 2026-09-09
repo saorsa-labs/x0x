@@ -12,6 +12,19 @@ use x0x::identity::{AgentId, MachineId};
 use x0x::network::NetworkConfig;
 use x0x::{Agent, DirectMessage, DiscoveredAgent};
 
+/// Explicit test-only network config (#417/#337): loopback bind, no
+/// seeds, discovery/port-mapping off. Still a real socket constructor.
+/// `loopback_network_config` below is preserved for its existing callers.
+fn test_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
+}
+
 fn loopback_network_config() -> NetworkConfig {
     NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
@@ -76,7 +89,7 @@ async fn create_test_agent(temp_dir: &TempDir, name: &str) -> Agent {
         .with_agent_key_path(agent_key_path)
         .with_contact_store_path(contacts_path)
         .with_peer_cache_dir(cache_dir)
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .expect("Failed to create test agent")

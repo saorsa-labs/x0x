@@ -9,6 +9,20 @@
 use tempfile::TempDir;
 use x0x::{network::NetworkConfig, Agent};
 
+/// Explicit test-only network config (#417/#337): loopback bind, no
+/// seeds, discovery/port-mapping off. Still a real socket constructor.
+/// Distinct from `isolated_network_config` below, which is preserved for
+/// the transport-identity test.
+fn test_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
+}
+
 fn isolated_network_config() -> NetworkConfig {
     NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback bind address")),
@@ -37,7 +51,7 @@ async fn test_machine_id_non_zero() {
     let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -62,7 +76,7 @@ async fn test_machine_id_stable_across_restarts() {
     let agent1 = Agent::builder()
         .with_machine_key(key_path.clone())
         .with_agent_key_path(dir.path().join("agent1.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -71,7 +85,7 @@ async fn test_machine_id_stable_across_restarts() {
     let agent2 = Agent::builder()
         .with_machine_key(key_path.clone())
         .with_agent_key_path(dir.path().join("agent2.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -95,7 +109,7 @@ async fn test_different_key_files_different_machine_ids() {
     let agent1 = Agent::builder()
         .with_machine_key(dir.path().join("machine1.key"))
         .with_agent_key_path(dir.path().join("agent1.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -103,7 +117,7 @@ async fn test_different_key_files_different_machine_ids() {
     let agent2 = Agent::builder()
         .with_machine_key(dir.path().join("machine2.key"))
         .with_agent_key_path(dir.path().join("agent2.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -130,7 +144,7 @@ async fn test_agent_id_portable_across_machines() {
     let agent1 = Agent::builder()
         .with_machine_key(dir.path().join("machineA.key"))
         .with_agent_key_path(agent_key.clone())
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -139,7 +153,7 @@ async fn test_agent_id_portable_across_machines() {
     let agent2 = Agent::builder()
         .with_machine_key(dir.path().join("machineB.key"))
         .with_agent_key_path(agent_key.clone())
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -167,7 +181,7 @@ async fn test_announcement_machine_id_matches_agent() {
     let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -196,7 +210,7 @@ async fn test_announcement_verifies() {
     let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
@@ -218,7 +232,7 @@ async fn test_machine_public_key_derives_machine_id() {
     let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_network_config(test_network_config())
         .build()
         .await
         .unwrap();
