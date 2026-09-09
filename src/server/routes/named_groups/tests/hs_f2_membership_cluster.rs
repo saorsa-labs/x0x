@@ -1693,6 +1693,34 @@ async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()>
     let mut owner_sub = owner.subscribe(topic).await?;
     let mut joiner_sub = joiner.subscribe(topic).await?;
     restart_readiness_diag("subscriptions_ready", started);
+    // #510: sample the fanout surface both publishes read, at barrier entry
+    // and then on the same 1 s cadence as the barrier's own rounds, so a
+    // surface that EMPTIES mid-barrier is distinguishable from one that was
+    // already empty at entry. Observational only — it never gates, never
+    // extends the 20 s deadline, and is aborted the moment the barrier ends.
+    let surface_sampler = match (owner.network(), joiner.network()) {
+        (Some(owner_net), Some(joiner_net)) => {
+            let owner_net = Arc::clone(owner_net);
+            let joiner_net = Arc::clone(joiner_net);
+            let joiner_peer = ant_quic::PeerId(joiner.machine_id().0);
+            let owner_peer = ant_quic::PeerId(owner.machine_id().0);
+            Some(tokio::spawn(async move {
+                let mut round = 0u32;
+                loop {
+                    let owner_surface = restart_peer_surface(&owner_net, &joiner_peer).await;
+                    let joiner_surface = restart_peer_surface(&joiner_net, &owner_peer).await;
+                    eprintln!(
+                        "DIAG hs_f2_restart phase=barrier_surface elapsed_ms={} round={round} \
+                         owner[{owner_surface}] joiner[{joiner_surface}]",
+                        started.elapsed().as_millis()
+                    );
+                    round = round.saturating_add(1);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }))
+        }
+        _ => None,
+    };
     // #510: publish WITH fanout observation via the existing PUBLIC Agent API.
     // Fanout = attempted eager-peer opportunity, never confirmed delivery.
     let (result, diag) = await_restart_gossip_ready_with(
@@ -1722,6 +1750,9 @@ async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()>
         },
     )
     .await;
+    if let Some(sampler) = surface_sampler {
+        sampler.abort();
+    }
     if result.is_err() {
         // #510: connectivity scalars are OBSERVATIONAL and must never extend
         // the helper past its single absolute 20 s deadline. Use a zero-budget
@@ -1777,6 +1808,90 @@ fn restart_readiness_diag(phase: &str, started: std::time::Instant) {
         "DIAG hs_f2_restart phase={phase} elapsed_ms={}",
         started.elapsed().as_millis()
     );
+}
+
+/// #510: the two peer surfaces that disagree after an owner restart.
+///
+/// `is_connected` (`network.rs` `NetworkNode::is_connected`) is raw ant-quic
+/// transport truth. The publish path the certified announce depends on reads
+/// a STRICTER surface — `connected_peers()` filtered by the #206 plane gate,
+/// i.e. `gossip_plane_peers()` — which is what `publish_with_fanout` counts.
+/// A barrier gating on the former can clear while the fanout surface is
+/// empty; that mismatch is why #510 presents as a mystery 20 s timeout
+/// instead of an assertion.
+struct RestartPeerSurface {
+    transport_connected: bool,
+    connected_len: usize,
+    plane_len: usize,
+    counterpart_in_connected: bool,
+    counterpart_in_plane: bool,
+    admission: crate::network::PeerAdmission,
+}
+
+impl std::fmt::Display for RestartPeerSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "is_connected={} connected_peers={} plane_peers={} \
+             counterpart_connected={} counterpart_plane={} admission={:?}",
+            u8::from(self.transport_connected),
+            self.connected_len,
+            self.plane_len,
+            u8::from(self.counterpart_in_connected),
+            u8::from(self.counterpart_in_plane),
+            self.admission,
+        )
+    }
+}
+
+async fn restart_peer_surface(
+    net: &crate::network::NetworkNode,
+    counterpart: &ant_quic::PeerId,
+) -> RestartPeerSurface {
+    let connected = net.connected_peers().await;
+    let plane = net.gossip_plane_peers().await;
+    RestartPeerSurface {
+        transport_connected: net.is_connected(counterpart).await,
+        connected_len: connected.len(),
+        plane_len: plane.len(),
+        counterpart_in_connected: connected.contains(counterpart),
+        counterpart_in_plane: plane.contains(counterpart),
+        admission: net.peer_admission(counterpart).await,
+    }
+}
+
+/// #510: record every ant-quic peer-lifecycle transition the RESTARTED owner
+/// observes (`Established` / `Replaced` / `Closed` with its reason). This is
+/// the line that decides between "the reconnect was never durable" and "it
+/// was torn down mid-barrier" — both product defects, but different ones
+/// (the #278 half-open/zombie-connection lineage).
+fn spawn_restart_lifecycle_diag(
+    mut events: tokio::sync::broadcast::Receiver<(ant_quic::PeerId, ant_quic::PeerLifecycleEvent)>,
+    watched: ant_quic::PeerId,
+    started: std::time::Instant,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok((peer, event)) => {
+                    let scope = if peer == watched { "joiner" } else { "other" };
+                    eprintln!(
+                        "DIAG hs_f2_restart phase=owner_lifecycle elapsed_ms={} \
+                         peer={scope} event={event:?}",
+                        started.elapsed().as_millis()
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!(
+                        "DIAG hs_f2_restart phase=owner_lifecycle_lagged elapsed_ms={} \
+                         skipped={skipped}",
+                        started.elapsed().as_millis()
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 fn restart_readiness_failure_diag(
@@ -2466,19 +2581,55 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         .expect("restarted owner network")
         .clone();
     let reconnect_started = std::time::Instant::now();
+    let owner_peer = ant_quic::PeerId(owner_agent.machine_id().0);
+    // #510: watch ant-quic's lifecycle stream on the RESTARTED owner from
+    // BEFORE the dial, so a `Replaced`/`Closed` for the joiner — during the
+    // reconnect or later inside the gossip barrier — is recorded with its
+    // reason instead of vanishing.
+    let _lifecycle_diag = owner_net
+        .subscribe_all_peer_events()
+        .await
+        .map(|events| spawn_restart_lifecycle_diag(events, joiner_peer, reconnect_started));
     owner_net.connect_addr(joiner_addr).await?;
+    // #510: the old gate was `owner_net.is_connected(&joiner_peer)` — raw
+    // ant-quic transport truth. The certified announce that follows publishes
+    // through `gossip_plane_peers()` (`connected_peers()` + the #206 plane
+    // gate), a STRICTER surface, so the old gate could clear while the fanout
+    // surface was empty and the real failure only surfaced 20 s later as a
+    // silent gossip timeout. Gate on the surface publish actually reads, on
+    // BOTH sides. Same 20 s deadline, no retries (ADR-0025).
     let reconnect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while std::time::Instant::now() < reconnect_deadline {
-        if owner_net.is_connected(&joiner_peer).await {
-            break;
+    let mut poll = 0u32;
+    let (owner_surface, joiner_surface) = loop {
+        let owner_surface = restart_peer_surface(&owner_net, &joiner_peer).await;
+        let joiner_surface = restart_peer_surface(&joiner_net, &owner_peer).await;
+        let ready = owner_surface.plane_len > 0 && joiner_surface.plane_len > 0;
+        // Every poll is 100 ms; log the first, then once a second, plus the
+        // decisive one, so a 20 s wait stays readable.
+        if poll.is_multiple_of(10) || ready {
+            eprintln!(
+                "DIAG hs_f2_restart phase=reconnect_poll elapsed_ms={} poll={poll} \
+                 owner[{owner_surface}] joiner[{joiner_surface}]",
+                reconnect_started.elapsed().as_millis()
+            );
         }
+        if ready || std::time::Instant::now() >= reconnect_deadline {
+            break (owner_surface, joiner_surface);
+        }
+        poll = poll.saturating_add(1);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    let reconnected = owner_net.is_connected(&joiner_peer).await;
+    };
+    let reconnected = owner_surface.plane_len > 0 && joiner_surface.plane_len > 0;
     if !reconnected {
         restart_readiness_diag("reconnect_timeout", reconnect_started);
     }
-    assert!(reconnected, "restarted owner must reconnect to the joiner");
+    assert!(
+        reconnected,
+        "restarted owner and joiner must BOTH expose a non-empty gossip fanout \
+         surface (gossip_plane_peers) before the certified announce — an empty \
+         side makes publish fanout structurally zero (#510/#278): \
+         owner[{owner_surface}] joiner[{joiner_surface}]"
+    );
     restart_readiness_diag("reconnect_established", reconnect_started);
     // Readiness barrier replacing the old fixed 2 s settle: the QUIC
     // reconnect above proves TRANSPORT only — prove gossip pubsub routes

@@ -1,9 +1,9 @@
 # ADR 0061: Self-Update Must Resolve Restart Ownership Before Replacing Binaries
 
-- **Status:** Proposed
-- **Date:** 2026-09-06
-- **Decision owners:** David Irvine (proposed; human decision pending)
-- **Reviewers:** pending human engineering and platform-operator review
+- **Status:** Accepted
+- **Date:** 2026-09-06 (proposed); 2026-09-09 (accepted)
+- **Decision owners:** David Irvine
+- **Reviewers:** David Irvine (human engineering review, 2026-09-09)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** [issue #493](https://github.com/saorsa-labs/x0x/issues/493), [issue #415](https://github.com/saorsa-labs/x0x/issues/415), Accepted [ADR 0023](./0023-durable-local-history.md), [ADR 0025](./0025-required-gates-prove-observation-completeness.md), [ADR 0026](./0026-managed-x0xd-deployment.md), Proposed [ADR 0045](./0045-decentralized-self-update.md), [upgrade mechanics](../upgrade-system.md)
@@ -39,8 +39,8 @@ wrapper restarts on the chosen status. PPID 1, launchd/services ancestry,
 missing TTY, and service-looking names also do not establish restart policy.
 The helper cannot safely compete with a manager that independently respawns.
 
-This proposal changes future behavior. It neither records a completed fix
-nor accepts the related Proposed ADR 0045.
+This ADR changes future behavior. It neither records a completed fix nor
+accepts the related Proposed ADR 0045.
 
 ## Decision Drivers
 
@@ -74,7 +74,24 @@ nor accepts the related Proposed ADR 0045.
 
 ## Decision
 
-If accepted, the following contract governs self-update:
+**Accepted 2026-09-09 by David Irvine: option 4**, "validate ownership before
+replacement; reject conflicting managed settings". Option 3 (a recognized
+supervisor silently overriding the false setting) was considered and
+explicitly rejected: it changes the operator's requested restart behavior
+without telling them. The accepted consequence is that a managed instance
+configured with `stop_on_upgrade = false` stops applying updates until its
+configuration is corrected, replacing today's documented and unit-tested
+"false always means transactional handoff" behavior for managed runs.
+
+Existing hand-written launchd jobs are migrated with `x0x autostart --repair`,
+inside the migration boundary below.
+
+Acceptance of this contract is **not** a claim that all six clauses are
+implemented. §3 is **not met** and §5 is **partially met** as of the accepting
+change; see *Implementation status at acceptance* under Validation. Read that
+section before assuming any clause below is live.
+
+The following contract governs self-update:
 
 1. **Resolve before mutation.** Before replacing either daemon or companion
    binary, resolve and validate the instance's restart owner, intended exit
@@ -136,10 +153,17 @@ loaded custom plist changed. A Windows wrapper example must name its tested
 version and policy; it does not establish support for all WinSW, NSSM or SCM
 arrangements. Migration and product rollout must retain separate receipts.
 
-Human engineering review must resolve the reject-versus-supervisor-override
-choice, the initially supported platform policies, and whether manual
-recovery is an acceptable first-stage boundary. Until then this remains
-Proposed; no runtime policy or deployment change is authorized by this file.
+Human engineering review resolved the reject-versus-supervisor-override
+choice on 2026-09-09: **refuse** (§2), with manual, platform-tested recovery
+accepted as the first-stage boundary (§6). The initially supported platform
+policy is macOS launchd `KeepAlive: true` jobs carrying the supervision
+marker, plus systemd units, both on exit status 0. Windows (#415) has **no**
+supported managed policy yet: `x0x autostart` does not generate a Windows
+service, and the transactional helper is spawned without
+`CREATE_BREAKAWAY_FROM_JOB`, so a job-object wrapper (WinSW, NSSM) terminates
+the helper and any daemon it spawns. Windows therefore needs its own
+classification and wrapper contract, tracked separately under #415; it is not
+closed by this ADR.
 
 ## Consequences
 
@@ -200,6 +224,26 @@ is not a pass.
   expected replacement's ownership/version and durable sentinel data, and
   report the actual manual or automated recovery outcome.
 
+### Implementation status at acceptance
+
+Recorded on the face of this ADR so a reader does not assume the whole
+contract is live. The accepting change is PR #612 (issue #493).
+
+| Clause | Status | What is and is not true |
+| --- | --- | --- |
+| §1 resolve before mutation | **Met** | The restart owner, intended exit behaviour, executable, argv, cwd and data root are resolved and validated before either binary is replaced, and carried through replacement and restart. "Roots" plural is satisfied by validating the data root directly plus pinning argv/cwd pre-swap — the identity root is determined by those, and is deliberately not plumbed as a separate derived field. |
+| §2 reject a known conflict | **Met** | Recognized supervision plus `stop_on_upgrade = false` refuses before replacement, naming the signal and the setting to correct. |
+| §3 bind supported deployments explicitly | **NOT MET** | Supervision is recognized by marker/signal alone — precisely the "marker in isolation" §3 rules out. There is no versioned template and no loaded-policy readback in the upgrade path. Residual failure: a job carrying the marker whose `KeepAlive` is later removed or made conditional still classifies `SupervisedExit`, exits 0, and nothing restarts it, so the daemon goes down and stays down. `x0x autostart --repair` checks `KeepAlive` at repair time only, not at upgrade time. |
+| §4 preserve the unsupervised path | **Met, with the stated gap** | No-signal still classifies as `TransactionalHandoff`. This does not fix any existing unmarked job: the #493 population is repaired by migration, not detection. |
+| §5 keep restart ownership singular | **PARTIALLY MET** | The negative half holds and is testable (`RestartPlan::spawns_helper()`): the managed path launches no detached replacement helper. There is **no** positive enforcement that no overlapping daemon uses the same effective root. This ADR rejects a PID file, an API-port check and a separate history-DB path as proof without stating what would suffice, so no criterion was invented. Tracked by issue #601. |
+| §6 state recovery honestly | **Partially met** | Recovery is labelled manual, no automatic supervised rollback is advertised, and apply reporting distinguishes installed bytes, pending restart, observed readiness and recovery. The *documented, platform-tested* operator recovery procedure §6 permits has not been written or run. |
+
+No platform acceptance observation below has been executed. §3's "supported
+launchd jobs must actually restart after 0" remains unobserved: the migration
+evidence is a live macOS run against fixture plists, which proves the plist
+edit is correct and narrow, not that a migrated job restarts after an upgrade
+exit.
+
 Current `tests/upgrade_handoff_integration.rs:14` is Unix-only and exercises
 synthetic helper transactions, not launchd or Windows service acceptance.
 Those tests and the classification table remain useful controls but do not
@@ -208,7 +252,8 @@ been executed for this Proposed ADR.
 
 ## Notes for AI-assisted work
 
-AI tools may help draft this ADR but must not mark it Accepted without human
-engineering review and debate. Accepted ADRs are immutable: create a new
-superseding ADR rather than editing one. A draft PR, green document checks,
-or a bot review is not human acceptance or permission to deploy this policy.
+AI tools drafted this ADR; David Irvine accepted it on 2026-09-09 after human
+engineering review, which is what moved it out of Proposed. Now that it is
+Accepted it is immutable: create a new superseding ADR rather than editing
+this one. A draft PR, green document checks, or a bot review is not human
+acceptance or permission to deploy this policy.
