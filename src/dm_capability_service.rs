@@ -213,12 +213,75 @@ pub(crate) fn ingest_verified_digest_extension(
     )
 }
 
+/// Owns the optional blob responder even while an asynchronous stop is cancelled.
+/// Ordinary stop joins this task; Drop can only request its cancellation.
+#[derive(Default)]
+pub(crate) struct BlobResponderTask {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl BlobResponderTask {
+    fn install(&mut self, handle: JoinHandle<()>) -> Result<(), Self> {
+        let incoming = Self {
+            handle: Some(handle),
+        };
+        if self.handle.is_some() {
+            // Refuse replacement without losing custody of either task. The
+            // caller can join the rejected task; dropping it still aborts it.
+            incoming.abort();
+            return Err(incoming);
+        }
+        *self = incoming;
+        Ok(())
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    fn abort_if_cancelled(&self, token: &tokio_util::sync::CancellationToken) -> bool {
+        if token.is_cancelled() {
+            self.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) async fn stop(&mut self) {
+        self.abort();
+        if let Some(handle) = self.handle.as_mut() {
+            // Keep the handle in its Drop-aborting owner across this await.
+            // Taking it first would detach it if the stop future were dropped.
+            match handle.await {
+                Ok(()) => tracing::debug!("Announce blob responder stopped"),
+                Err(error) if error.is_cancelled() => {
+                    tracing::debug!("Announce blob responder aborted");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Announce blob responder failed during stop");
+                }
+            }
+            self.handle = None;
+        }
+    }
+}
+
+impl Drop for BlobResponderTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 pub struct CapabilityAdvertService {
     publisher: JoinHandle<()>,
     subscriber: JoinHandle<()>,
     digest_subscriber: JoinHandle<()>,
     targeted_response_subscriber: JoinHandle<()>,
     targeted_request_responder: JoinHandle<()>,
+    blob_responder: BlobResponderTask,
 }
 
 impl CapabilityAdvertService {
@@ -582,6 +645,7 @@ impl CapabilityAdvertService {
             subscriber,
             targeted_response_subscriber,
             targeted_request_responder,
+            blob_responder: BlobResponderTask::default(),
         })
     }
 
@@ -606,7 +670,28 @@ impl CapabilityAdvertService {
         .await
     }
 
+    /// Attach without an await after the responder factory returns its handle.
+    pub(crate) fn attach_blob_responder(
+        &mut self,
+        handle: JoinHandle<()>,
+    ) -> Result<(), BlobResponderTask> {
+        self.blob_responder.install(handle)
+    }
+
+    pub(crate) fn abort_blob_responder_if_cancelled(
+        &self,
+        token: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        self.blob_responder.abort_if_cancelled(token)
+    }
+
+    /// Join only the blob responder. The other five tasks remain abort-only.
+    pub(crate) async fn stop_blob_responder(&mut self) {
+        self.blob_responder.stop().await;
+    }
+
     pub fn abort(&self) {
+        self.blob_responder.abort();
         self.publisher.abort();
         self.subscriber.abort();
         self.digest_subscriber.abort();
@@ -754,6 +839,187 @@ pub fn verify_advert_signature(advert: &CapabilityAdvert, public_key_bytes: &[u8
         &signature,
     )
     .is_ok()
+}
+
+#[cfg(test)]
+mod blob_responder_lifecycle_tests {
+    use super::{BlobResponderTask, CapabilityAdvertService};
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+    use tokio_util::sync::CancellationToken;
+
+    struct Dropped(Option<oneshot::Sender<()>>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    // No service factory or transport: the real owner's methods receive only
+    // inert Tokio tasks. Construct the sentinel before spawn so even an unpolled
+    // task must release its captured state when cancellation completes.
+    fn pending_task() -> (JoinHandle<()>, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let sentinel = Dropped(Some(dropped_tx));
+        let task = tokio::spawn(async move {
+            let _sentinel = sentinel;
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        (task, entered_rx, dropped_rx)
+    }
+
+    fn inert_service() -> CapabilityAdvertService {
+        CapabilityAdvertService {
+            publisher: tokio::spawn(async {}),
+            subscriber: tokio::spawn(async {}),
+            digest_subscriber: tokio::spawn(async {}),
+            targeted_response_subscriber: tokio::spawn(async {}),
+            targeted_request_responder: tokio::spawn(async {}),
+            blob_responder: BlobResponderTask::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_abort_and_stop_join_pending_responder() {
+        let mut service = inert_service();
+        let (handle, entered, dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        entered.await.unwrap();
+        service.abort();
+        service.stop_blob_responder().await;
+        dropped.await.unwrap();
+        assert!(service.blob_responder.handle.is_none());
+        service.stop_blob_responder().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_slot_can_be_reused_without_retaining_prior_tasks() {
+        let mut service = inert_service();
+        for _ in 0..3 {
+            let (handle, entered, dropped) = pending_task();
+            assert!(service.attach_blob_responder(handle).is_ok());
+            entered.await.unwrap();
+            service.stop_blob_responder().await;
+            dropped.await.unwrap();
+            assert!(service.blob_responder.handle.is_none());
+        }
+        service.stop_blob_responder().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_attachment_retains_old_and_returns_aborted_new_owner() {
+        let mut service = inert_service();
+        let (old, old_entered, mut old_dropped) = pending_task();
+        assert!(service.attach_blob_responder(old).is_ok());
+        old_entered.await.unwrap();
+        let (new, new_entered, new_dropped) = pending_task();
+        new_entered.await.unwrap();
+        let mut refused = match service.attach_blob_responder(new) {
+            Err(owner) => owner,
+            Ok(()) => panic!("occupied responder slot accepted a replacement"),
+        };
+        // The refused task is already cancelled, not merely left for the caller.
+        new_dropped.await.unwrap();
+        assert!(matches!(
+            old_dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        refused.stop().await;
+        assert!(refused.handle.is_none());
+        service.stop_blob_responder().await;
+        old_dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_drop_aborts_responder_without_explicit_shutdown() {
+        let mut service = inert_service();
+        let (handle, entered, dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        entered.await.unwrap();
+        drop(service);
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_attach_cancel_check_aborts_when_already_cancelled() {
+        let mut service = inert_service();
+        let token = CancellationToken::new();
+        token.cancel();
+        let (handle, _entered, dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        assert!(service.abort_blob_responder_if_cancelled(&token));
+        service.stop_blob_responder().await;
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_attach_cancel_check_preserves_live_task_until_cancelled() {
+        let mut service = inert_service();
+        let token = CancellationToken::new();
+        let (handle, entered, mut dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        entered.await.unwrap();
+        assert!(!service.abort_blob_responder_if_cancelled(&token));
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        token.cancel();
+        assert!(service.abort_blob_responder_if_cancelled(&token));
+        service.stop_blob_responder().await;
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_stop_keeps_handle_owned_until_drop() {
+        let mut service = inert_service();
+        let (handle, entered, dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        entered.await.unwrap();
+        let mut stop = Box::pin(service.stop_blob_responder());
+        let mut context = Context::from_waker(Waker::noop());
+        // No scheduler turn between abort and this first join poll. Dropping
+        // the pending stop simulates cancellation without signalling a process.
+        assert!(matches!(stop.as_mut().poll(&mut context), Poll::Pending));
+        drop(stop);
+        assert!(service.blob_responder.handle.is_some());
+        drop(service);
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_task_is_joined_and_slot_cleared() {
+        let mut service = inert_service();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = finished_tx.send(());
+        });
+        finished_rx.await.unwrap();
+        assert!(handle.is_finished());
+        assert!(service.attach_blob_responder(handle).is_ok());
+        service.stop_blob_responder().await;
+        assert!(service.blob_responder.handle.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn already_aborted_task_is_joined_and_slot_cleared() {
+        let mut service = inert_service();
+        let (handle, entered, dropped) = pending_task();
+        entered.await.unwrap();
+        handle.abort();
+        dropped.await.unwrap();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        service.stop_blob_responder().await;
+        assert!(service.blob_responder.handle.is_none());
+    }
 }
 
 #[cfg(test)]
