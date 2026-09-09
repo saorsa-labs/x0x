@@ -24,7 +24,7 @@ mod owner;
 mod presence;
 mod profile;
 pub(crate) mod public_group_bootstrap_outbox;
-mod status;
+pub(super) mod status;
 mod stores;
 mod sync;
 mod tasks;
@@ -55,8 +55,8 @@ pub(super) use groups::{
     mls_decrypt, mls_encrypt, remove_mls_member,
 };
 pub(super) use history::{
-    history_diagnostics, history_list, history_message, history_purge, history_search,
-    history_stats,
+    history_diagnostics, history_list, history_message, history_purge, history_scopes,
+    history_search, history_stats,
 };
 pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,
@@ -126,8 +126,8 @@ pub(super) use status::{
 };
 pub(super) use stores::{
     apply_direct_kv_store_delta, create_group_kv_store, create_kv_store, delete_kv_value,
-    get_kv_value, gss_kv_refresh, join_kv_store, list_kv_keys, list_kv_stores, put_kv_value,
-    retire_group_kv_stores, KvStoreDirectDelta, KV_STORE_DELTA_DM_PREFIX,
+    get_kv_value, join_kv_store, list_kv_keys, list_kv_stores, put_kv_value,
+    restore_bound_gss_store, retire_group_kv_stores, KvStoreDirectDelta, KV_STORE_DELTA_DM_PREFIX,
 };
 pub(super) use sync::{enroll_device, get_sync_devices, unenroll_device, DaemonView};
 pub(super) use tasks::{

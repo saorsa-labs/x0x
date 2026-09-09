@@ -1077,10 +1077,10 @@ mod tests {
             parent_comm: Some("zsh".to_string()),
             stdin_is_tty: true,
         };
-        let upgrader = deferred_restart_upgrader(true, ctx);
+        let upgrader = deferred_restart_upgrader(true, ctx.clone());
         assert_eq!(
             upgrader.restart_mode_with(&terminal_launched),
-            restart::RestartMode::TransactionalHandoff
+            Ok(restart::RestartMode::TransactionalHandoff)
         );
         // And the fleet contract: systemd + stop_on_upgrade=true still exits.
         let systemd = restart::SupervisionSignals {
@@ -1091,7 +1091,18 @@ mod tests {
         };
         assert_eq!(
             upgrader.restart_mode_with(&systemd),
-            restart::RestartMode::SupervisedExit
+            Ok(restart::RestartMode::SupervisedExit)
         );
+
+        // INVERTED from the pre-ADR-0061 expectation that this same HTTP path
+        // returned TransactionalHandoff. A daemon under a service manager
+        // whose config says stop_on_upgrade=false has two restart owners, so
+        // /upgrade/apply must refuse rather than hand the operator a second
+        // daemon on the same data root (#493).
+        let conflicted = deferred_restart_upgrader(false, ctx);
+        assert!(matches!(
+            conflicted.restart_mode_with(&systemd),
+            Err(restart::RestartOwnershipError::SupervisedRestartConflict { .. })
+        ));
     }
 }

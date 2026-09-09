@@ -118,6 +118,8 @@ jobs:
         run: bash scripts/ci/nextest-isolated.sh --all-features --test daemon_api_integration -- -- --ignored
       - name: Run named group D4 signed commit integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_d4_apply -- -- --ignored
+      - name: Run bound-port forwarding regression
+        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
 
   # Groups: the heavy named-group daemon suite (28 daemon-backed tests),
   # isolated on its own runner so it cannot stack on core's cold build.
@@ -143,8 +145,257 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - name: 'Check issue #321 custody routing (inert)'
+        run: python3 scripts/ci/test_issue321_custody_routing.py
       - name: Run named group integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_integration -- --run-ignored ignored-only
+      # The existing isolated nextest invocation resolves Cargo.lock and warms
+      # the locked dependency graph before this offline daemon build.
+      - name: 'Build and pin x0xd for issue #321'
+        run: |
+          cargo build --offline --locked --all-features --bin x0xd
+          test -x target/debug/x0xd
+          sha256sum target/debug/x0xd
+      # Each issue #321 selector gets its own RUNNER_TEMP subtree and typed
+      # acceptance receipt. Use a task env name: Actions reserves RUNNER_TEMP,
+      # so bind it at command invocation for the collector as the producer does.
+      # The shared collector binds one test binary to one
+      # build-custody scratch; combining binaries would make custody ambiguous.
+      - name: 'Run issue #321 verified history restart acceptance'
+        run: |
+          set -euo pipefail
+          test -x target/debug/x0xd
+          root="$RUNNER_TEMP/issue321-history-restart"
+          mkdir -p "$root"
+          sha256sum target/debug/x0xd > "$root/x0xd.sha256"
+          set +e
+          X0X_ISOLATION_ROLE=acceptance RUNNER_TEMP="$root" \
+            bash scripts/ci/nextest-isolated.sh --all-features \
+              --test named_group_e_live -- \
+              --run-ignored ignored-only \
+              -E 'test(=e_verified_envelope_history_lookup_survives_restart)' \
+              > "$root/command.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/command.log"
+          printf '%s\n' "$status" > "$root/command.exit"
+          exit "$status"
+      - name: 'Collect issue #321 verified history custody'
+        id: collect_issue321_history
+        if: always()
+        env:
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue321-history-restart
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: named_group_e_live
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/safe"
+      - name: 'Upload issue #321 verified history custody'
+        if: always() && steps.collect_issue321_history.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue321-history-custody
+          path: ${{ runner.temp }}/issue321-history-restart/safe/custody-receipt.json
+          if-no-files-found: error
+
+      - name: 'Run issue #321 direct canonical point lookup'
+        if: always()
+        run: |
+          set -euo pipefail
+          test -x target/debug/x0xd
+          root="$RUNNER_TEMP/issue321-history-point"
+          mkdir -p "$root"
+          sha256sum target/debug/x0xd > "$root/x0xd.sha256"
+          set +e
+          X0X_ISOLATION_ROLE=acceptance RUNNER_TEMP="$root" \
+            bash scripts/ci/nextest-isolated.sh --all-features \
+              --test history_point_lookup_wiring -- \
+              -E 'test(=history_message_point_lookup_serves_group_row_by_canonical_id)' \
+              > "$root/command.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/command.log"
+          printf '%s\n' "$status" > "$root/command.exit"
+          exit "$status"
+      - name: 'Collect issue #321 direct lookup custody'
+        id: collect_issue321_point
+        if: always()
+        env:
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue321-history-point
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: history_point_lookup_wiring
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/safe"
+      - name: 'Upload issue #321 direct lookup custody'
+        if: always() && steps.collect_issue321_point.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue321-history-point-custody
+          path: ${{ runner.temp }}/issue321-history-point/safe/custody-receipt.json
+          if-no-files-found: error
+
+      - name: 'Run issue #321 delegation and cold-wake acceptance'
+        if: always()
+        run: |
+          set -euo pipefail
+          test -x target/debug/x0xd
+          root="$RUNNER_TEMP/issue321-delegation"
+          mkdir -p "$root"
+          sha256sum target/debug/x0xd > "$root/x0xd.sha256"
+          set +e
+          X0X_ISOLATION_ROLE=acceptance RUNNER_TEMP="$root" \
+            bash scripts/ci/nextest-isolated.sh --all-features \
+              --test delegation_spaces -- \
+              --run-ignored ignored-only \
+              -E 'test(=delegation_survives_restart_via_history) | test(=delegation_carrier_verified_history_survives_receiver_restart) | test(=delegated_child_cold_wake_rehydrates_carrier_and_sends_as)' \
+              > "$root/command.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/command.log"
+          printf '%s\n' "$status" > "$root/command.exit"
+          exit "$status"
+      - name: 'Collect issue #321 delegation custody'
+        id: collect_issue321_delegation
+        if: always()
+        env:
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue321-delegation
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: delegation_spaces
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/safe"
+      - name: 'Upload issue #321 delegation custody'
+        if: always() && steps.collect_issue321_delegation.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue321-delegation-custody
+          path: ${{ runner.temp }}/issue321-delegation/safe/custody-receipt.json
+          if-no-files-found: error
+
+      - name: 'Run issue #321 moderated transport control'
+        if: always()
+        run: |
+          set -euo pipefail
+          test -x target/debug/x0xd
+          root="$RUNNER_TEMP/issue321-moderated"
+          mkdir -p "$root"
+          sha256sum target/debug/x0xd > "$root/x0xd.sha256"
+          set +e
+          X0X_ISOLATION_ROLE=acceptance RUNNER_TEMP="$root" \
+            bash scripts/ci/nextest-isolated.sh --all-features \
+              --test named_group_e_live -- \
+              --run-ignored ignored-only \
+              -E 'test(=e_moderated_public_positive_cross_daemon_receive)' \
+              > "$root/command.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/command.log"
+          printf '%s\n' "$status" > "$root/command.exit"
+          exit "$status"
+      - name: 'Collect issue #321 moderated custody'
+        id: collect_issue321_moderated
+        if: always()
+        env:
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue321-moderated
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: named_group_e_live
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/safe"
+      - name: 'Upload issue #321 moderated custody'
+        if: always() && steps.collect_issue321_moderated.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue321-moderated-custody
+          path: ${{ runner.temp }}/issue321-moderated/safe/custody-receipt.json
+          if-no-files-found: error
+
+  # Issue #277 datagram-lane acceptance (ADR-0042 (c)). Loopback only:
+  # every agent binds 127.0.0.1:0 and the lossy proxy binds 127.0.0.1:0,
+  # so nothing in this job leaves the runner. Kept in its own job because
+  # the phase oracles below assert EXACT jitter counter deltas and need a
+  # lossless clean lane; sharing a runner with a heavy suite would turn a
+  # scheduling stall into a false counter mismatch.
+  integration-voice-datagram:
+    name: 'Integration (voice datagram, #277)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # Pin the bytes before any runtime: build the suite without
+      # executing it, so discovery below reuses binaries that already
+      # exist rather than compiling inside the namespace.
+      - name: Build the acceptance suite (no execution)
+        run: cargo test --all-features --test voice_datagram_e2e --no-run
+      # Selection proof, structured. This suite is entirely `#[ignore]`d,
+      # so a plain `cargo test` reports it green without executing a
+      # single test, and a missing `required-features` entry compiles the
+      # file away to an empty, passing binary. Both are invisible in
+      # human-readable output, so this asserts nextest's JSON list: real
+      # test names, and the `ignored` flag that decides whether
+      # `--run-ignored ignored-only` selects them at all. Runs inside the
+      # issue #417 namespace so discovery executes the test binaries on
+      # `lo` only, never on the host network.
+      - name: 'Assert acceptance selection (structured nextest JSON)'
+        env:
+          X0X_ISOLATION_ROLE: selection
+        run: python3 scripts/ci/isolated-runtime.py python3 scripts/ci/voice-datagram-selection.py
+      # Acceptance itself goes through the reviewed wrapper: cargo
+      # metadata resolved once, binaries-only build with no discovery
+      # execution outside isolation, `nextest-reuse.py record` pinning
+      # every binary hash plus Cargo.lock and the HEAD/tree SHAs, then
+      # `run` re-verifying that custody inside the issue #417 namespace
+      # before a single test executes.
+      - name: 'Run issue #277 datagram-lane acceptance'
+        env:
+          X0X_ISOLATION_ROLE: acceptance
+        run: |
+          bash scripts/ci/nextest-isolated.sh --all-features \
+            --test voice_datagram_e2e -- \
+            --run-ignored ignored-only \
+            --test-threads 1
+      # Retention. The wrapper chain writes its admission, teardown and
+      # build-custody receipts into $RUNNER_TEMP, which dies with the runner,
+      # so without this the only reviewable evidence is the free-text job log.
+      # The collector reads a fixed allowlist of those generated files and
+      # emits a fixed allowlist of fields: no argv, no environment, no
+      # absolute paths, no product output. It runs on failure too, so the
+      # namespace teardown receipt survives a failed acceptance step, and it
+      # exits non-zero when the job otherwise succeeded but a receipt is
+      # missing or inconsistent — a green test run cannot be reported without
+      # its custody. Min 2 runs: the selection proof and the acceptance run
+      # are each separately admitted.
+      - name: 'Collect issue #417 isolation custody'
+        id: collect_custody
+        if: always()
+        env:
+          X0X_CUSTODY_EXPECT: ${{ job.status }}
+          X0X_CUSTODY_MIN_RUNS: '2'
+          X0X_CUSTODY_ROLES: selection,acceptance
+          X0X_CUSTODY_TARGET: voice_datagram_e2e
+        run: python3 scripts/ci/isolation-custody-collect.py "$RUNNER_TEMP/x0x-custody-receipt"
+      - name: 'Upload issue #417 isolation custody receipt'
+        if: always() && steps.collect_custody.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: voice-datagram-isolation-custody
+          path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
+          if-no-files-found: error
 
   # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
   integration-net:

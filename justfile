@@ -20,10 +20,10 @@ lint:
     cargo clippy --all-targets --all-features -- -D warnings
 
 test:
-    cargo nextest run --all-features --workspace
+    python3 scripts/dev/test-isolated.py nextest --all-features --workspace --
 
 test-verbose:
-    cargo nextest run --all-features --workspace --no-capture
+    python3 scripts/dev/test-isolated.py nextest --all-features --workspace -- --no-capture
 
 # Full-coverage suite run. nextest is fail-fast by default: the first failure
 # cancels everything still queued, so a single flake can hide up to ~800
@@ -31,7 +31,7 @@ test-verbose:
 # v0.41.1 post-release verification). Use this whenever a run must prove the
 # whole suite rather than everything-up-to-first-failure.
 test-full:
-    cargo nextest run --all-features --workspace --no-fail-fast
+    python3 scripts/dev/test-isolated.py nextest --all-features --workspace -- --no-fail-fast
 
 # Run the F1 GSS-rotation ADR gate tests (gate 3 ordering + gate 7a
 # producer). The filter `test(/(^|::)f1_/)` selects the five f1_
@@ -40,7 +40,7 @@ test-full:
 # `--no-fail-fast --test-threads=1` is required so the §7a mutation
 # receipt's PASS/PASS/FAIL split by test name is unambiguous.
 adr-gates-f1:
-    cargo nextest run -p x0x --all-features --no-fail-fast --test-threads=1 -E 'test(/(^|::)f1_/)'
+    python3 scripts/dev/test-isolated.py nextest -p x0x --all-features -- --no-fail-fast --test-threads=1 -E 'test(/(^|::)f1_/)'
 
 # Live counterpart to `adr-gates-f1`: spawns three real x0xd daemons and proves
 # the ADMIN REMOVE path rotates the GSS secret cross-daemon. Separate from
@@ -48,7 +48,7 @@ adr-gates-f1:
 # is not selected by that recipe's default run. Validated against a pre-F1
 # build (e301371), where R1 and R3 fail — see the file header.
 adr-gates-f1-live:
-    cargo nextest run -p x0x --all-features --no-fail-fast --test-threads=1 --run-ignored all -E 'test(/(^|::)f1_.*_live/)'
+    python3 scripts/dev/test-isolated.py nextest -p x0x --all-features -- --no-fail-fast --test-threads=1 --run-ignored all -E 'test(/(^|::)f1_.*_live/)'
 
 build:
     cargo build --all-features
@@ -84,43 +84,57 @@ check: fmt-check deploy-check lint build test doc audit deny
 # KV append-only REST/e2e suite (#[ignore] — boots real x0xd daemons, so it
 # needs a built binary and cannot run hermetically under plain `just test`).
 test-kv-e2e:
+    python3 scripts/dev/test-isolated.py check
     cargo build --release --bin x0xd
-    cargo nextest run --all-features --test kv_append_only_rest -- --ignored
+    python3 scripts/dev/test-isolated.py nextest --all-features --test kv_append_only_rest -- -- --ignored
 
 # CRDT-subscription restart-recovery suite (#[ignore] — boots real x0xd
 # daemons; covers the issue #238 rehydration-wedge and zombie-subscription
 # regressions plus the original restart-amnesia tests).
 test-recovery-e2e:
+    python3 scripts/dev/test-isolated.py check
     cargo build --bin x0xd
-    cargo nextest run --all-features --test crdt_subscription_persistence --run-ignored all
+    python3 scripts/dev/test-isolated.py nextest --all-features --test crdt_subscription_persistence -- --run-ignored all
+
+# Issue #277 datagram-lane acceptance (ADR-0042 (c)) — #[ignore]d because it
+# binds real UDP sockets on loopback. Two independent halves in one suite:
+# the deterministic jitter-counter phase oracles (exact reordered /
+# late_dropped / duplicates_dropped deltas on a clean lane) and the
+# loss/resilience/SNR/latency/path-custody posture behind a lossy proxy.
+# Single-threaded: the phase oracles assert exact counters and must not
+# contend for the runner.
+#
+# This developer entrypoint uses the same Linux isolation/custody wrappers as
+# CI. Unsupported hosts fail closed; it does not grant final acceptance credit.
+test-voice-datagram-e2e:
+    python3 scripts/dev/test-isolated.py voice
 
 # ── Test coverage (line/region) ───────────────────────────────────────────
 #
 # Uses cargo-llvm-cov + nextest. Install once with:
 #   cargo install cargo-llvm-cov --locked
-# Coverage data lives under target/llvm-cov-target/ — `just coverage-clean`
-# wipes it if results look stale.
+# Each invocation retains a fresh coverage target under its printed
+# target/dev-isolation/run-*/ directory. Clean only an explicit completed run.
 
 # Run the full nextest suite under llvm-cov and open an HTML report.
 coverage:
-    cargo llvm-cov --all-features --workspace --html nextest
+    python3 scripts/dev/test-isolated.py coverage --all-features --workspace -- --package '*' --html
 
 # Print a one-shot text summary (fast — useful before pushing).
 coverage-summary:
-    cargo llvm-cov --all-features --workspace --summary-only nextest
+    python3 scripts/dev/test-isolated.py coverage --all-features --workspace -- --package '*' --summary-only
 
-# Emit lcov.info for editors (e.g. Coverage Gutters) and future CI uploads.
+# Retain a private LCOV report and atomically mirror lcov.info for editors.
 coverage-lcov:
-    cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest
+    python3 scripts/dev/test-isolated.py coverage-lcov
 
 # Run the CI-style floor gate and advisory per-module threshold report.
 coverage-check:
-    cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info --fail-under-lines 48 nextest
-    python3 scripts/check-coverage-thresholds.py --lcov lcov.info --thresholds coverage-thresholds.toml --enforce-global
+    python3 scripts/dev/test-isolated.py coverage-check
 
-# Wipe cached profraw/profdata when results look stale.
-coverage-clean:
-    cargo llvm-cov clean --workspace
+# Remove only a completed developer run's coverage target; preserve custody.
+coverage-clean RUN:
+    python3 scripts/dev/test-isolated.py coverage-clean {{quote(RUN)}}
 
 # ── GUI coverage (API-surface, not line coverage) ─────────────────────────
 

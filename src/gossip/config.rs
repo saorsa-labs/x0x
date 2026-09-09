@@ -5,8 +5,15 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for the gossip overlay network.
 ///
-/// These parameters control the HyParView membership protocol behavior and
-/// x0x's receive-side dispatch pipeline.
+/// These parameters control x0x's Leaf egress budget, participation mode and
+/// receive-side dispatch pipeline.
+///
+/// The former HyParView view-size knobs (`active_view_size`,
+/// `passive_view_size`, `arwl`, `prwl`) are **deprecated and ignored**: they
+/// were validated but never reached
+/// `saorsa_gossip_membership::MembershipConfig`, so setting them changed
+/// nothing. See `docs/design/504-leaf-egress-budget.md` §2. To bound Leaf
+/// gossip egress use [`Self::leaf_max_eager_degree`] instead.
 ///
 /// All fields are individually `#[serde(default)]` so an operator can write a
 /// partial `[gossip]` section in TOML (for example only `dispatch_workers = 4`)
@@ -14,25 +21,22 @@ use serde::{Deserialize, Serialize};
 /// back to the value from `GossipConfig::default()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
-    /// Size of active view (peers we actively gossip with).
-    /// Default: 6
-    #[serde(default = "default_active_view_size")]
-    pub active_view_size: usize,
+    /// Deprecated: `[gossip] active_view_size`. Parsed only so existing
+    /// operator TOML keeps loading; the value is ignored.
+    #[serde(default, skip_serializing, rename = "active_view_size")]
+    pub deprecated_active_view_size: Option<usize>,
 
-    /// Size of passive view (backup peers for failure recovery).
-    /// Default: 30
-    #[serde(default = "default_passive_view_size")]
-    pub passive_view_size: usize,
+    /// Deprecated: `[gossip] passive_view_size`. Ignored, see above.
+    #[serde(default, skip_serializing, rename = "passive_view_size")]
+    pub deprecated_passive_view_size: Option<usize>,
 
-    /// Active Random Walk Length - hops for FORWARD_JOIN in active view.
-    /// Default: 6
-    #[serde(default = "default_arwl")]
-    pub arwl: usize,
+    /// Deprecated: `[gossip] arwl`. Ignored, see above.
+    #[serde(default, skip_serializing, rename = "arwl")]
+    pub deprecated_arwl: Option<usize>,
 
-    /// Passive Random Walk Length - hops for FORWARD_JOIN in passive view.
-    /// Default: 3
-    #[serde(default = "default_prwl")]
-    pub prwl: usize,
+    /// Deprecated: `[gossip] prwl`. Ignored, see above.
+    #[serde(default, skip_serializing, rename = "prwl")]
+    pub deprecated_prwl: Option<usize>,
 
     /// Number of concurrent PubSub decode/verify/fanout workers draining the
     /// inbound PubSub queue. Default stays 1 for one release cycle so rollback
@@ -77,22 +81,6 @@ pub struct GossipConfig {
 
 const MAX_DISPATCH_WORKERS: usize = 32;
 
-const fn default_active_view_size() -> usize {
-    6
-}
-
-const fn default_passive_view_size() -> usize {
-    30
-}
-
-const fn default_arwl() -> usize {
-    6
-}
-
-const fn default_prwl() -> usize {
-    3
-}
-
 const fn default_dispatch_workers() -> usize {
     1
 }
@@ -118,10 +106,10 @@ const fn default_leaf_egress_hard() -> u64 {
 impl Default for GossipConfig {
     fn default() -> Self {
         Self {
-            active_view_size: 6,
-            passive_view_size: 30,
-            arwl: 6,
-            prwl: 3,
+            deprecated_active_view_size: None,
+            deprecated_passive_view_size: None,
+            deprecated_arwl: None,
+            deprecated_prwl: None,
             dispatch_workers: default_dispatch_workers(),
             leaf_max_eager_degree: default_leaf_max_eager_degree(),
             leaf_egress_soft_bytes_per_sec: default_leaf_egress_soft(),
@@ -183,21 +171,35 @@ impl GossipConfig {
         Some(format!("{error}; using default Leaf egress budget"))
     }
 
+    /// Operator warnings for deprecated `[gossip]` keys that are still set.
+    ///
+    /// Why this warns instead of failing: live nodes already carry these keys
+    /// in their TOML and must keep starting. They were previously `> 0`
+    /// validated, so a stale `active_view_size = 0` could restart-loop a
+    /// daemon over a knob that had no effect at all.
+    #[must_use]
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        [
+            ("active_view_size", self.deprecated_active_view_size),
+            ("passive_view_size", self.deprecated_passive_view_size),
+            ("arwl", self.deprecated_arwl),
+            ("prwl", self.deprecated_prwl),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|_| key))
+        .map(|key| {
+            format!(
+                "[gossip] {key} is deprecated and ignored - it never reached HyParView \
+                 membership, so it has never changed overlay behaviour. Remove it from your \
+                 config. To bound Leaf gossip egress use leaf_max_eager_degree."
+            )
+        })
+        .collect()
+    }
+
     /// Validate configuration parameters.
     pub fn validate(&self) -> Result<(), String> {
         self.validate_egress_budget()?;
-        if self.active_view_size == 0 {
-            return Err("active_view_size must be > 0".to_string());
-        }
-        if self.passive_view_size == 0 {
-            return Err("passive_view_size must be > 0".to_string());
-        }
-        if self.arwl == 0 {
-            return Err("arwl must be > 0".to_string());
-        }
-        if self.prwl == 0 {
-            return Err("prwl must be > 0".to_string());
-        }
         if self.dispatch_workers == 0 {
             return Err("dispatch_workers must be > 0".to_string());
         }
@@ -245,23 +247,14 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = GossipConfig::default();
-        assert_eq!(config.active_view_size, 6);
-        assert_eq!(config.passive_view_size, 30);
-        assert_eq!(config.arwl, 6);
-        assert_eq!(config.prwl, 3);
         assert_eq!(config.dispatch_workers, 1);
+        assert_eq!(config.leaf_max_eager_degree, 2);
     }
 
     #[test]
     fn test_config_validation() {
         let valid = GossipConfig::default();
         assert!(valid.validate().is_ok());
-
-        let invalid = GossipConfig {
-            active_view_size: 0,
-            ..Default::default()
-        };
-        assert!(invalid.validate().is_err());
 
         let invalid = GossipConfig {
             dispatch_workers: 0,
@@ -280,29 +273,74 @@ mod tests {
     fn partial_toml_section_falls_back_to_defaults() {
         // Operators must be able to override a single field without repeating
         // the rest of the struct. This guards against the regression that
-        // shipped briefly during the X0X-0005 soak rollout where missing
-        // `active_view_size` in a partial `[gossip]` section caused x0xd to
-        // restart-loop on every node.
+        // shipped briefly during the X0X-0005 soak rollout where a missing
+        // field in a partial `[gossip]` section caused x0xd to restart-loop on
+        // every node.
         let cfg: GossipConfig = toml::from_str("dispatch_workers = 4").expect("partial TOML");
         let defaults = GossipConfig::default();
         assert_eq!(cfg.dispatch_workers, 4);
-        assert_eq!(cfg.active_view_size, defaults.active_view_size);
-        assert_eq!(cfg.passive_view_size, defaults.passive_view_size);
-        assert_eq!(cfg.arwl, defaults.arwl);
-        assert_eq!(cfg.prwl, defaults.prwl);
+        assert_eq!(cfg.leaf_max_eager_degree, defaults.leaf_max_eager_degree);
+        assert!(cfg.deprecation_warnings().is_empty());
         assert!(!cfg.relay);
         assert_eq!(cfg.resolved_participation(), ParticipationMode::Leaf);
+    }
+
+    #[test]
+    fn deprecated_view_knobs_still_parse_and_warn_instead_of_failing() {
+        // Why this matters: live nodes have `active_view_size` etc. in their
+        // deployed TOML. Removing the knobs must not stop a single daemon from
+        // starting, but an operator who believes they are tuning fan-out has
+        // to be told the key does nothing (docs/design/504-leaf-egress-budget.md
+        // section 2 — the values never reached HyParView membership).
+        let cfg: GossipConfig =
+            toml::from_str("active_view_size = 4\npassive_view_size = 12\narwl = 2\nprwl = 1\n")
+                .expect("deprecated keys must keep parsing");
+
+        assert!(
+            cfg.validate().is_ok(),
+            "deprecated keys must never fail validation"
+        );
+
+        let warnings = cfg.deprecation_warnings();
+        assert_eq!(warnings.len(), 4, "every set deprecated key must warn");
+        for key in ["active_view_size", "passive_view_size", "arwl", "prwl"] {
+            assert!(
+                warnings.iter().any(|w| w.contains(key)),
+                "missing deprecation warning for {key}"
+            );
+        }
+        assert!(
+            warnings.iter().all(|w| w.contains("leaf_max_eager_degree")),
+            "warning must point operators at the knob that does bound egress"
+        );
+    }
+
+    #[test]
+    fn deprecated_zero_view_size_no_longer_restart_loops_the_daemon() {
+        // Regression guard: `active_view_size = 0` used to fail validate() and
+        // therefore crash-loop x0xd, for a knob with zero runtime effect.
+        let cfg: GossipConfig =
+            toml::from_str("active_view_size = 0").expect("zero must still parse");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.deprecation_warnings().len(), 1);
+    }
+
+    #[test]
+    fn deprecated_keys_are_not_written_back_on_serialize() {
+        // They are ignored, so echoing them into a rendered config would keep
+        // telling operators the knob exists.
+        let cfg: GossipConfig = toml::from_str("active_view_size = 4").expect("parses");
+        let rendered = toml::to_string(&cfg).expect("serializes");
+        assert!(!rendered.contains("active_view_size"));
     }
 
     #[test]
     fn empty_toml_section_yields_full_defaults() {
         let cfg: GossipConfig = toml::from_str("").expect("empty TOML");
         let defaults = GossipConfig::default();
-        assert_eq!(cfg.active_view_size, defaults.active_view_size);
-        assert_eq!(cfg.passive_view_size, defaults.passive_view_size);
-        assert_eq!(cfg.arwl, defaults.arwl);
-        assert_eq!(cfg.prwl, defaults.prwl);
         assert_eq!(cfg.dispatch_workers, defaults.dispatch_workers);
+        assert_eq!(cfg.leaf_max_eager_degree, defaults.leaf_max_eager_degree);
+        assert!(cfg.deprecation_warnings().is_empty());
         assert!(!cfg.relay);
         assert_eq!(cfg.resolved_participation(), ParticipationMode::Leaf);
     }

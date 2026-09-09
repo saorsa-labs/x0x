@@ -81,8 +81,12 @@ enum Commands {
     /// Configure daemon to start on boot (systemd/launchd).
     Autostart {
         /// Remove autostart configuration.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "repair")]
         remove: bool,
+        /// Migrate an existing hand-written launchd job to the supervised
+        /// upgrade contract (ADR-0061) instead of installing a new job.
+        #[arg(long)]
+        repair: bool,
     },
     /// Health check.
     Health,
@@ -746,7 +750,11 @@ enum DiagnosticsSub {
     /// Print ADR-0035 relay metering: advert census, selection skew, inbound dialers.
     Relay,
     /// Print direct-message counters, fan-out health, and per-peer state.
-    Dm,
+    Dm {
+        /// Inspect one exact agent's retained digest state (64 hexadecimal characters).
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Print per-group ingest counters and drop-reason buckets.
     Groups,
     /// Print remote exec counters, warnings, and ACL summary.
@@ -788,12 +796,23 @@ enum HistorySub {
         #[arg(long)]
         scope: Option<String>,
     },
-    /// Full-text search over text history within a scope.
+    /// Full-text search over text history, in one scope or across all.
+    ///
+    /// Two forms (issue #275):
+    ///   `x0x history search <SCOPE> <QUERY>` — the legacy scoped form.
+    ///   `x0x history search <QUERY>`         — search every retained scope.
+    ///
+    /// The forms are told apart by argument COUNT, not by content: with two
+    /// positionals the first is the scope, with one it is the query. The
+    /// scope is never guessed from the text.
     Search {
-        /// Scope: `dm:<agent_hex>`, `group:<stable_id>`, or `topic:<name>`.
-        scope: String,
-        /// Search terms (treated as literal terms, not FTS operators).
-        query: String,
+        /// With a QUERY after it: the scope (`dm:<agent_hex>`,
+        /// `group:<stable_id>`, `topic:<name>`). Alone: the search terms,
+        /// applied across every scope.
+        scope_or_query: String,
+        /// Search terms when a scope was given first (literal terms, not
+        /// FTS operators).
+        query: Option<String>,
         /// Inclusive lower bound on local receipt time (unix ms).
         #[arg(long)]
         since_ms: Option<u64>,
@@ -806,6 +825,16 @@ enum HistorySub {
         /// Keyset cursor: rows strictly older than this row id.
         #[arg(long)]
         before_id: Option<i64>,
+    },
+    /// List the scopes that still hold retained history rows.
+    Scopes {
+        /// Keyset cursor: canonical scope from the previous page's
+        /// `next_after_scope`.
+        #[arg(long)]
+        after_scope: Option<String>,
+        /// Max scopes (server clamps to 500; default 100).
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Print row counts, database size, and retention bounds.
     Stats,
@@ -1833,9 +1862,11 @@ async fn run(
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
         }
-        Commands::Autostart { remove } => {
+        Commands::Autostart { remove, repair } => {
             return if *remove {
                 commands::daemon::autostart_remove().await
+            } else if *repair {
+                commands::daemon::autostart_repair().await
             } else {
                 commands::daemon::autostart(name).await
             };
@@ -2166,7 +2197,9 @@ async fn run(
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
             DiagnosticsSub::Transport => commands::network::diagnostics_transport(&client).await,
             DiagnosticsSub::Relay => commands::network::diagnostics_relay(&client).await,
-            DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
+            DiagnosticsSub::Dm { agent } => {
+                commands::network::diagnostics_dm_for_agent(&client, agent.as_deref()).await
+            }
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
             DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,
@@ -2184,17 +2217,28 @@ async fn run(
                 commands::history::list(&client, &scope, since_ms, until_ms, limit, before_id).await
             }
             HistorySub::Search {
-                scope,
+                scope_or_query,
                 query,
                 since_ms,
                 until_ms,
                 limit,
                 before_id,
             } => {
+                // Two positionals ⇒ legacy scoped form; one ⇒ cross-scope.
+                let (scope, needle) = commands::history::split_search_args(scope_or_query, query);
                 commands::history::search(
-                    &client, &scope, &query, since_ms, until_ms, limit, before_id,
+                    &client,
+                    scope.as_deref(),
+                    &needle,
+                    since_ms,
+                    until_ms,
+                    limit,
+                    before_id,
                 )
                 .await
+            }
+            HistorySub::Scopes { after_scope, limit } => {
+                commands::history::scopes(&client, after_scope.as_deref(), limit).await
             }
             HistorySub::Message { msg_id, scope } => {
                 commands::history::message(&client, &msg_id, scope.as_deref()).await

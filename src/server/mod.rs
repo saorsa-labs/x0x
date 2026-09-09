@@ -54,8 +54,8 @@ use routes::{
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_file_message,
     handle_join_result_message, handle_treekem_catchup_request, handle_treekem_catchup_response,
     handle_welcome_blob_message, health, history_diagnostics, history_list, history_message,
-    history_purge, history_search, history_stats, identity_revocations, identity_revoke,
-    import_agent_card, import_group_card, ingest_public_message, introduction,
+    history_purge, history_scopes, history_search, history_stats, identity_revocations,
+    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
     join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
     list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
     list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
@@ -526,6 +526,7 @@ pub async fn serve_with_options(
     let mut builder = Agent::builder()
         .with_network_config(network_config)
         .with_gossip_config(gossip_config)
+        .with_skip_legacy_dm_bus(config.skip_legacy_dm_bus)
         .with_peer_cache_dir(cache_dir)
         .with_contact_store_path(&contacts_path)
         .with_history(history_config)
@@ -916,6 +917,7 @@ pub async fn serve_with_options(
         api_address: actual_api_addr,
         data_dir: config.data_dir.clone(),
         start_time: Instant::now(),
+        health_snapshot: Arc::new(routes::status::HealthSnapshot::default()),
         broadcast_tx,
         file_transfers: RwLock::new(HashMap::new()),
         receive_hashers: RwLock::new(HashMap::new()),
@@ -958,6 +960,46 @@ pub async fn serve_with_options(
     // are owned by the Agent/ExecService and stopped by their own `shutdown()`
     // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Issue #600: keep the peer-table traversal that `/health` used to do
+    // inline OFF the request path. The watchdog probes `/health` with a 3 s
+    // budget and aborts the process after 3 misses; walking ant-quic's peer
+    // table takes its `connection_lifecycle` parking_lot write lock per peer,
+    // which is exactly the lock a gossip storm keeps hot. Do the walk here,
+    // once every HEALTH_SNAPSHOT_REFRESH_SECS, and let the handler read
+    // atomics. If this task is itself starved, `/health` still answers with a
+    // slightly stale count instead of hanging — which is the correct failure
+    // mode for a liveness probe.
+    {
+        let snapshot_state = Arc::clone(&state);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                let peers = snapshot_state
+                    .agent
+                    .peers()
+                    .await
+                    .map(|p| p.len())
+                    .unwrap_or(0);
+                let send_ready = match snapshot_state.agent.network() {
+                    Some(network) => network.send_ready_peers().await.len(),
+                    None => 0,
+                };
+                snapshot_state.health_snapshot.store(peers, send_ready);
+            }
+        }));
+    }
 
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
@@ -1951,6 +1993,7 @@ pub async fn serve_with_options(
         // ADR-0023 durable-history read surface
         .route("/history", get(history_list).delete(history_purge))
         .route("/history/message/:msg_id", get(history_message))
+        .route("/history/scopes", get(history_scopes))
         .route("/history/search", get(history_search))
         .route("/history/stats", get(history_stats))
         .route("/diagnostics/ack", get(ack_diagnostics))

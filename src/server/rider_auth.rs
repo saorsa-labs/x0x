@@ -531,6 +531,10 @@ mod tests {
             ("/groups/abc/members", Method::POST),
             ("/groups/abc/secure/decrypt", Method::POST),
             ("/history/search", Method::GET),
+            // Issue #275 added cross-scope search and scope discovery. Both
+            // stay OUTSIDE the ADR-0039 allowlist: either would hand a rider
+            // rows or row counts for scopes it was never granted.
+            ("/history/scopes", Method::GET),
             ("/history/stats", Method::GET),
             ("/history", Method::DELETE),
             ("/files/send", Method::POST),

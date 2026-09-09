@@ -648,7 +648,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics dm",
         description: "Direct-message send/receive counters and per-peer health",
         category: "network",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::query("agent", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -685,11 +685,19 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/history/scopes",
+        cli_name: "history scopes",
+        description: "Enumerate history scopes holding retained rows, with row count and newest seen_at_ms",
+        category: "history",
+        request: RequestSpec::Fields(&[RequestField::query("after_scope", false), RequestField::query("limit", false)]),
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/history/search",
         cli_name: "history search",
-        description: "Full-text search over text history payloads within a scope",
+        description: "Full-text search over text history payloads (scope optional: omit to search all scopes)",
         category: "history",
-        request: RequestSpec::Fields(&[RequestField::query_as("scope", true, "SCOPE"), RequestField::query_as("q", true, "QUERY"), RequestField::query("since_ms", false), RequestField::query("until_ms", false), RequestField::query("limit", false), RequestField::query("before_id", false)]),
+        request: RequestSpec::Fields(&[RequestField::query_as("scope", false, "SCOPE_OR_QUERY"), RequestField::query_as("q", true, "QUERY"), RequestField::query("since_ms", false), RequestField::query("until_ms", false), RequestField::query("limit", false), RequestField::query("before_id", false)]),
     },
     EndpointDef {
         method: Method::Get,

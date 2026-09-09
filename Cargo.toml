@@ -72,6 +72,8 @@ tar = "0.4"
 zip = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+# Issue #600: stdout log writes must not run synchronously on tokio workers.
+tracing-appender = "0.2"
 zeroize = "1.8.2"
 four-word-networking = "2.7.0"
 futures = { version = "0.3", features = ["alloc"] }
@@ -175,6 +177,10 @@ required-features = ["voice"]
 
 [[test]]
 name = "voice_e2e"
+required-features = ["voice"]
+
+[[test]]
+name = "voice_datagram_e2e"
 required-features = ["voice"]
 
 [workspace]

@@ -355,21 +355,23 @@ runs `x0x diagnostics gossip --json`, `x0x diagnostics transport --json`,
 and `x0x health --json` at both endpoints, preserves their responses and
 ranks **t1−t0** topic EAGER bytes. It also supplies the name map (§5.3).
 
-Save this as `capture-egress.py` in a new evidence directory. Requires
-Python 3 and `x0x` on PATH. Install the BLAKE3 helper and run:
+This recipe ships in-repo as `scripts/capture-egress.py` (`--window-secs` /
+`--out-dir` flags; extra topic names remain positional). Run it from a new
+evidence directory. Requires Python 3 and `x0x` on PATH. Install the BLAKE3
+helper and run:
 
 ```bash
 # macOS / Linux
 python3 -m venv .venv
 .venv/bin/python -m pip install blake3
-.venv/bin/python capture-egress.py
+.venv/bin/python /path/to/x0x/scripts/capture-egress.py
 ```
 
 ```powershell
 # Windows PowerShell (no activation or execution-policy change required)
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install blake3
-.\.venv\Scripts\python.exe capture-egress.py
+.\.venv\Scripts\python.exe C:\path\to\x0x\scripts\capture-egress.py
 ```
 
 ```python
@@ -663,7 +665,7 @@ with comparable peers/workload and recovery evidence, distinct from C0.
 | 2 | Fail-soft byte shedding, including explicit Critical/Normal forwarding policy if needed | named capture + per-topic/origin/priority meters + delivery/recovery gates |
 | 3 | Consume-only / no-forward for global announce on Leaf | sg API or a carefully metered x0x fork; evidence that announce (not the bus) is the top row |
 | 4 | #501 `skip_legacy_dm_bus` default-on-Leaf decision | #501 PR + the same capture |
-| 5 | Honest HyParView mapping **or** delete dead knobs | independent cleanup; does not close #504 |
+| 5 | ~~Honest HyParView mapping **or** delete dead knobs~~ **DONE**: `active_view_size` / `passive_view_size` / `arwl` / `prwl` deleted; parsed-and-warned only, so deployed TOML keeps loading | independent cleanup; does not close #504 |
 | — | #505 ant-quic MTU | other repo; only blocks some measurement hosts |
 
 ## 7. Success criteria for *this* document

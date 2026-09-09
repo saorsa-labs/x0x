@@ -156,6 +156,9 @@ pub mod dm;
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
 
+/// Bounded per-peer DM digest diagnostic observations.
+pub mod dm_digest_diagnostics;
+
 /// Background service that publishes this agent's capability advert and
 /// consumes peers' adverts into a shared [`dm_capability::CapabilityStore`].
 pub mod dm_capability_service;
@@ -255,6 +258,11 @@ pub struct Agent {
     network: Option<std::sync::Arc<network::NetworkNode>>,
     /// The gossip runtime for pub/sub messaging.
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
+    /// Disable the inbox's legacy-bus subscription, reverse-ACK bus pre-warm,
+    /// and legacy ACK hedge. Installed during build before network listeners.
+    /// Default false; sender bus fallback is unchanged. Bus-only senders
+    /// cannot reach this inbox when enabled.
+    skip_legacy_dm_bus: bool,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
@@ -355,6 +363,9 @@ pub struct Agent {
     /// KEM pubkey). `start_dm_inbox` upgrades via this sender to trigger
     /// immediate republish.
     dm_capabilities_tx: std::sync::Arc<tokio::sync::watch::Sender<dm::DmCapabilities>>,
+    #[cfg(test)]
+    capability_convergence_observer:
+        std::sync::Mutex<Option<std::sync::Arc<dm_capability_service::ConvergenceServiceObserver>>>,
     /// In-flight DM ACK waiters shared between `send_direct` and the inbox.
     dm_inflight_acks: std::sync::Arc<dm::InFlightAcks>,
     /// Receiver-side dedupe cache.
@@ -2832,6 +2843,10 @@ pub struct AgentBuilder {
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
     gossip_config: Option<gossip::GossipConfig>,
+    /// Opt out of the inbox's legacy-bus subscription, reverse-ACK bus
+    /// pre-warm, and legacy ACK hedge. Default false; sender bus fallback
+    /// stays enabled, but bus-only senders cannot reach the opted-out inbox.
+    skip_legacy_dm_bus: bool,
     peer_cache_dir: Option<std::path::PathBuf>,
     /// When true, skip opening the bootstrap peer cache entirely.
     /// Useful for fully isolated embedders and test harnesses.
@@ -3829,6 +3844,7 @@ impl Agent {
             user_key_path: None,
             network_config: None,
             gossip_config: None,
+            skip_legacy_dm_bus: false,
             peer_cache_dir: None,
             disable_peer_cache: false,
             heartbeat_interval_secs: None,
@@ -5539,8 +5555,9 @@ impl Agent {
                 let mut guard = self.capability_advert_service.lock().await;
                 guard.take()
             };
-            if let Some(service) = service {
+            if let Some(mut service) = service {
                 service.abort();
+                service.stop_blob_responder().await;
             }
         }
 
@@ -5861,6 +5878,23 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_config_with_provenance(to, payload, config)
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// #461: provenance variant for the direct-send HTTP route — identical
+    /// behavior to the public method INCLUDING the ADR-0023 §4 outbound
+    /// history wiring (this is the single common path; the public method
+    /// only maps away the ingress), plus the observed ingress of the
+    /// winning authenticated durable ACK (`None` when unstamped). The public
+    /// struct and every public signature are unchanged.
+    pub(crate) async fn send_direct_with_config_with_provenance(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
         // history wiring point. Classify before the send so the payload is
@@ -5875,9 +5909,9 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner(to, payload, config)
+            .send_direct_with_config_inner_with_provenance(to, payload, config)
             .await;
-        if let (Ok(receipt), Some(recorded_payload)) = (&result, history_payload) {
+        if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
         }
         result
@@ -5923,12 +5957,12 @@ impl Agent {
         });
     }
 
-    async fn send_direct_with_config_inner(
+    async fn send_direct_with_config_inner_with_provenance(
         &self,
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
-    ) -> Result<dm::DmReceipt, dm::DmError> {
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
         // the raw agent key, so the gate must refuse HERE, before any
@@ -5989,7 +6023,7 @@ impl Agent {
                 path = "loopback",
                 delivered_subscribers = delivered,
             );
-            return Ok(receipt);
+            return Ok((receipt, None));
         }
 
         let send_started = std::time::Instant::now();
@@ -6222,7 +6256,7 @@ impl Agent {
         };
 
         let result = if let Some(receipt) = preferred_raw_receipt {
-            Ok(receipt)
+            Ok((receipt, None))
         } else if preferred_raw_err.as_ref().is_some_and(|err| {
             config.stop_fallback_on_raw_error
                 || Self::raw_quic_error_should_stop_fallback(err, gossip_ok)
@@ -6247,7 +6281,7 @@ impl Agent {
                     // `Replaced` for that machine_id rather than serving out
                     // the full backoff window.
                     let lifecycle_hint = self.dm_lifecycle_hint(to).await;
-                    dm_send::send_via_gossip(
+                    dm_send::send_via_gossip_with_provenance(
                         dm_send::DmSendContext {
                             pubsub: std::sync::Arc::clone(runtime.pubsub()),
                             signing: &signing,
@@ -6287,7 +6321,8 @@ impl Agent {
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
-                    .map_err(Self::map_raw_quic_dm_error),
+                    .map_err(Self::map_raw_quic_dm_error)
+                    .map(|receipt| (receipt, None)),
             }
         };
 
@@ -6307,7 +6342,7 @@ impl Agent {
         match result {
             Ok(receipt) => {
                 self.direct_messaging
-                    .record_outgoing_succeeded(*to, receipt.path);
+                    .record_outgoing_succeeded(*to, receipt.0.path);
                 // X0X-0070b: every direct-DM success clears the relay engine's
                 // per-peer failure history. A peer that had crossed
                 // `needs_relay` and now recovers a direct path increments
@@ -6336,7 +6371,7 @@ impl Agent {
                             Ok(relay_receipt) => {
                                 self.direct_messaging
                                     .record_outgoing_succeeded(*to, relay_receipt.path);
-                                return Ok(relay_receipt);
+                                return Ok((relay_receipt, None));
                             }
                             Err(relay_err) => {
                                 tracing::debug!(
@@ -6460,6 +6495,9 @@ impl Agent {
             .as_ref()
             .ok_or_else(|| dm::DmError::NoConnectivity("no network for relay send".to_string()))?;
         let relay_peer_id = ant_quic::PeerId(relay_machine_id.0);
+        #[cfg(test)]
+        self.peer_relay
+            .observe_convergence_sent(&wire, relay_agent.0);
         network
             .send_direct_typed(
                 &relay_peer_id,
@@ -6475,6 +6513,7 @@ impl Agent {
             accepted_at: std::time::Instant::now(),
             retries_used: 0,
             path: dm::DmPath::Relayed { via: relay_agent },
+            // #461: relay-lane send — no durable-ACK waiter was involved.
         })
     }
 
@@ -9766,7 +9805,15 @@ impl Agent {
         // L3 retirement: the periodic caps advert only runs on the legacy
         // escape hatch. On-demand mode still answers targeted/warm requests
         // and publishes on capability upgrades.
-        let service = dm_capability_service::CapabilityAdvertService::spawn(
+        #[cfg(test)]
+        let convergence_observer = self
+            .capability_convergence_observer
+            .lock()
+            .map_err(|_| {
+                error::IdentityError::Storage(std::io::Error::other("service observer poisoned"))
+            })?
+            .clone();
+        let service = dm_capability_service::CapabilityAdvertService::spawn_observed(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
@@ -9775,6 +9822,8 @@ impl Agent {
             std::sync::Arc::clone(&self.capability_store),
             std::time::Duration::from_secs(dm_capability::ADVERT_PUBLISH_INTERVAL_SECS),
             self.legacy_announce,
+            #[cfg(test)]
+            convergence_observer,
         )
         .await
         .map_err(|e| {
@@ -9791,26 +9840,51 @@ impl Agent {
             service.abort();
             return Ok(());
         }
-        if let Some(prev) = guard.take() {
+        if let Some(mut prev) = guard.take() {
             prev.abort();
+            // Retain the old owner and the start mutex until its responder is
+            // joined. Cancelling this future still drops an aborting owner.
+            // Shutdown can contend on this mutex until cancellation completes;
+            // abort-and-join is not a hard wall-clock bound for non-yielding work.
+            prev.stop_blob_responder().await;
         }
-        *guard = Some(service);
+        // Replacement now awaits cancellation. Shutdown may have started
+        // during that join; do not install the still-local new service then.
+        if self.shutdown_token.is_cancelled() {
+            service.abort();
+            return Ok(());
+        }
+        let service = guard.insert(service);
         tracing::info!("Capability advert service started");
 
-        // L3: serve cert-blob fetches for peers that see our V3 announce
-        // digest but lack the cached pair. Same lifecycle as the caps
-        // service; the handle is detached (task ends with the pubsub).
+        // L3: the capability service owns the responder, including replacement,
+        // ordinary shutdown and Drop. Subscription cleanup is asynchronous.
         if self.shutdown_token.is_cancelled() {
             return Ok(());
         }
-        if let Err(e) = announce_blob::spawn_blob_responder(
+        match announce_blob::spawn_blob_responder(
             std::sync::Arc::clone(runtime.pubsub()),
             std::sync::Arc::clone(&self.announce_blob_cache),
             std::sync::Arc::clone(&self.own_cert_pair),
         )
         .await
         {
-            tracing::warn!("announce blob responder spawn failed: {e}");
+            Ok(handle) => {
+                // Cancellation-safety invariant: the factory must not await
+                // between spawning and returning this handle, and attachment
+                // here must be synchronous. A future reordering requires
+                // abort-on-drop custody at spawn before any intervening await.
+                let rejected = service.attach_blob_responder(handle).err();
+                let cancelled = service.abort_blob_responder_if_cancelled(&self.shutdown_token);
+                if let Some(mut rejected) = rejected {
+                    tracing::warn!("announce blob responder slot already occupied");
+                    rejected.stop().await;
+                }
+                if cancelled {
+                    service.stop_blob_responder().await;
+                }
+            }
+            Err(e) => tracing::warn!("announce blob responder spawn failed: {e}"),
         }
         Ok(())
     }
@@ -9867,7 +9941,7 @@ impl Agent {
                 sender_agent_id: self.identity.agent_id(),
             }) as std::sync::Arc<dyn dm_inbox::DirectAckHedge>
         });
-        let service = dm_inbox::DmInboxService::spawn_with_hedge(
+        let service = dm_inbox::DmInboxService::spawn_with_hedge_options(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
@@ -9884,6 +9958,7 @@ impl Agent {
             std::sync::Arc::clone(&self.authenticated_machine_bindings),
             self.history_handle.clone(),
             direct_hedge,
+            self.skip_legacy_dm_bus,
         )
         .await
         .map_err(|e| {
@@ -10110,6 +10185,30 @@ impl Agent {
         runtime
             .pubsub()
             .publish_with_fanout(topic.to_string(), bytes::Bytes::from(payload))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "publish failed: {}",
+                    e
+                )))
+            })
+    }
+
+    // Same publish path and error mapping; test-only send-stage observation.
+    #[cfg(test)]
+    pub(crate) async fn publish_with_observed_fanout(
+        &self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> error::Result<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        runtime
+            .pubsub()
+            .publish_with_observed_fanout(topic.to_string(), bytes::Bytes::from(payload))
             .await
             .map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
@@ -14252,6 +14351,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Opt out of the inbox's compatibility-bus subscription, reverse-ACK
+    /// bus pre-warming, and legacy ACK hedge. Installed before network event
+    /// listeners start. Defaults to false for rolling compatibility.
+    ///
+    /// Sender-side fallback to the bus is deliberately unchanged. With this
+    /// enabled, bus-only senders no longer reach this inbox; targeted inbox
+    /// delivery and targeted/Direct ACK routes remain available.
+    #[must_use]
+    pub fn with_skip_legacy_dm_bus(mut self, skip: bool) -> Self {
+        self.skip_legacy_dm_bus = skip;
+        self
+    }
+
     /// Set the directory for the bootstrap peer cache.
     ///
     /// The cache persists peer quality metrics across restarts, enabling
@@ -14919,7 +15031,15 @@ impl AgentBuilder {
                     e
                 )))
             })?;
-            Some(std::sync::Arc::new(runtime))
+            let runtime = std::sync::Arc::new(runtime);
+            // This must happen during build, before `join_network` starts
+            // the network-event listener. A later inbox-only setter would
+            // leave a race where the first trusted PeerConnected event warms
+            // the bus permanently.
+            runtime
+                .pubsub()
+                .set_skip_legacy_dm_bus(self.skip_legacy_dm_bus);
+            Some(runtime)
         } else {
             None
         };
@@ -15014,6 +15134,7 @@ impl AgentBuilder {
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,
+            skip_legacy_dm_bus: self.skip_legacy_dm_bus,
             bootstrap_cache,
             gossip_cache_adapter,
             machine_kem,
@@ -15045,6 +15166,8 @@ impl AgentBuilder {
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
+            #[cfg(test)]
+            capability_convergence_observer: std::sync::Mutex::new(None),
             dm_capabilities_tx: std::sync::Arc::new({
                 let (tx, _rx) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
                 tx
@@ -15905,50 +16028,15 @@ impl Agent {
             ));
         }
         let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
-        let group_id_bytes = stable_group_id.as_bytes().to_vec();
         let persist_path = kv_snapshot_path(state_dir, &store_id);
-        let store = match kv::sync::load_snapshot(&persist_path) {
-            Ok(Some(snap)) => {
-                if snap.id() != &store_id {
-                    return Err(kv_storage_err(format!(
-                        "kv snapshot store-id mismatch for topic {topic}"
-                    )));
-                }
-                if snap.owner() != Some(&creator) {
-                    return Err(kv_storage_err(format!(
-                        "kv snapshot for topic {topic} is anchored on a different owner than the group creator"
-                    )));
-                }
-                match snap.policy() {
-                    kv::AccessPolicy::Encrypted { group_id } if *group_id == group_id_bytes => snap,
-                    other => {
-                        return Err(kv_storage_err(format!(
-                            "kv snapshot for topic {topic} carries policy {other}; refusing to open as an encrypted group store"
-                        )));
-                    }
-                }
-            }
-            Ok(None) => kv::KvStore::new_encrypted(
-                store_id,
-                name.to_string(),
-                creator,
-                group_id_bytes,
-                std::sync::Arc::clone(&secure),
-            )
-            .map_err(|e| kv_storage_err(format!("kv store creation failed: {e}")))?,
-            Err(e) => {
-                return Err(kv_storage_err(format!(
-                    "kv snapshot for topic {topic} is unreadable ({e}); refusing to start with amnesia — repair or remove the snapshot file explicitly"
-                )));
-            }
-        };
-        let mut store = store;
-        // Snapshots deserialize WITHOUT a context (serde(skip)); re-attach
-        // so the replica leaves the fail-closed state only now that the
-        // sync is provably sealed-path.
-        store
-            .set_secure_context(std::sync::Arc::clone(&secure))
-            .map_err(|e| kv_storage_err(format!("kv secure context re-attach failed: {e}")))?;
+        let store = load_group_kv_store(
+            &persist_path,
+            name,
+            stable_group_id,
+            creator,
+            &self.agent_id(),
+            std::sync::Arc::clone(&secure),
+        )?;
 
         let (sync, peer_id) = self
             .spawn_kv_sync_inner(
@@ -16141,6 +16229,220 @@ impl Agent {
     }
 }
 
+/// Validate the immutable binding shared by cached and restored group stores.
+/// A snapshot deliberately has no context; a cached handle must have a live one.
+pub(crate) fn validate_group_kv_store_binding(
+    store: &kv::KvStore,
+    name: &str,
+    stable_group_id: &str,
+    creator: identity::AgentId,
+    cached_member: Option<&identity::AgentId>,
+) -> error::Result<()> {
+    let (store_id, _) = kv::encrypted::group_store_identity(stable_group_id, name);
+    if store.id() != &store_id
+        || store.owner() != Some(&creator)
+        || !matches!(
+            store.ownership_source(),
+            kv::OwnershipSource::Anchored { .. }
+        )
+    {
+        return Err(kv_storage_err(
+            "group kv store ID or creator binding mismatch".into(),
+        ));
+    }
+    if !matches!(store.policy(), kv::AccessPolicy::Encrypted { group_id }
+        if group_id.as_slice() == stable_group_id.as_bytes())
+    {
+        return Err(kv_storage_err(
+            "group kv store policy or group binding mismatch".into(),
+        ));
+    }
+    if let Some(member) = cached_member {
+        let Some(ctx) = store.secure_context() else {
+            return Err(kv_storage_err(
+                "cached group kv store has no secure context".into(),
+            ));
+        };
+        if ctx.group_id() != stable_group_id.as_bytes() || !ctx.is_active_member(member) {
+            return Err(kv_storage_err(
+                "cached group kv store context is foreign or retired".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The actual persistent group opener's socket-free restore/reattach seam.
+fn load_group_kv_store(
+    path: &std::path::Path,
+    name: &str,
+    stable_group_id: &str,
+    creator: identity::AgentId,
+    local_agent: &identity::AgentId,
+    secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
+) -> error::Result<kv::KvStore> {
+    if name.is_empty()
+        || secure.group_id() != stable_group_id.as_bytes()
+        || !secure.is_active_member(local_agent)
+    {
+        return Err(kv_storage_err(
+            "group kv store requires a matching active-member context".into(),
+        ));
+    }
+    let (store_id, _) = kv::encrypted::group_store_identity(stable_group_id, name);
+    let mut store = match kv::sync::load_snapshot(path) {
+        Ok(Some(store)) => {
+            validate_group_kv_store_binding(&store, name, stable_group_id, creator, None)?;
+            store
+        }
+        Ok(None) => kv::KvStore::new_encrypted(
+            store_id,
+            name.to_string(),
+            creator,
+            stable_group_id.as_bytes().to_vec(),
+            std::sync::Arc::clone(&secure),
+        )
+        .map_err(|e| kv_storage_err(format!("kv store creation failed: {e}")))?,
+        Err(e) => {
+            return Err(kv_storage_err(format!(
+                "group kv snapshot is unreadable ({e}); refusing to start with amnesia"
+            )))
+        }
+    };
+    // Snapshots carry no context. Attach before any sync task can start.
+    store
+        .set_secure_context(secure)
+        .map_err(|e| kv_storage_err(format!("kv secure context re-attach failed: {e}")))?;
+    Ok(store)
+}
+
+#[cfg(test)]
+mod issue565_group_binding_tests {
+    use super::*;
+    use kv::encrypted::KvSecureContext;
+    use std::sync::Arc;
+
+    fn context(group: &str, owner: identity::AgentId) -> Arc<groups::GssKvSecureContext> {
+        let mut info = groups::GroupInfo::with_policy(
+            "g".into(),
+            String::new(),
+            owner,
+            group.into(),
+            groups::GroupPolicy::default(),
+        );
+        info.shared_secret = Some(vec![7; 32]);
+        Arc::new(groups::GssKvSecureContext::from_group(&info).unwrap())
+    }
+
+    fn write_snapshot(path: &std::path::Path, store: &kv::KvStore) {
+        // Existing V1 persistence format, decoded by the real load_snapshot.
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            store: &'a kv::KvStore,
+            seq_counter: u64,
+        }
+        let mut bytes = b"X0XKVS1\0".to_vec();
+        bytes.extend(
+            bincode::serialize(&Body {
+                store,
+                seq_counter: store.seq_counter_value(),
+            })
+            .unwrap(),
+        );
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn issue565_actual_restore_reattaches_only_matching_live_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.bin");
+        let owner = identity::AgentId([1; 32]);
+        let group = "ab".repeat(16);
+        let ctx = context(&group, owner);
+        let store = load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx.clone()).unwrap();
+        write_snapshot(&path, &store);
+        let inert = kv::sync::load_snapshot(&path).unwrap().unwrap();
+        assert!(inert.secure_context().is_none());
+        assert!(
+            validate_group_kv_store_binding(&inert, "Wiki", &group, owner, Some(&owner)).is_err()
+        );
+        let restored =
+            load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx.clone()).unwrap();
+        assert!(
+            validate_group_kv_store_binding(&restored, "Wiki", &group, owner, Some(&owner)).is_ok()
+        );
+        assert!(load_group_kv_store(
+            &path,
+            "Wiki",
+            &group,
+            owner,
+            &identity::AgentId([2; 32]),
+            ctx.clone()
+        )
+        .is_err());
+        let foreign = context(&"cd".repeat(16), owner);
+        assert!(load_group_kv_store(&path, "Wiki", &group, owner, &owner, foreign).is_err());
+        ctx.invalidate();
+        assert!(
+            validate_group_kv_store_binding(&restored, "Wiki", &group, owner, Some(&owner))
+                .is_err(),
+            "retirement fences the cached store's shared context"
+        );
+        assert!(load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx).is_err());
+    }
+
+    #[test]
+    fn issue565_actual_snapshot_and_cached_store_binding_reject_foreign_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.bin");
+        let owner = identity::AgentId([1; 32]);
+        let group = "ab".repeat(16);
+        let ctx = context(&group, owner);
+        let id = kv::encrypted::group_store_identity(&group, "Wiki").0;
+        for case in 0..4 {
+            let store = match case {
+                0 => kv::KvStore::new_encrypted(
+                    kv::encrypted::group_store_identity(&group, "Web").0,
+                    "Wiki".into(),
+                    owner,
+                    group.as_bytes().to_vec(),
+                    ctx.clone(),
+                )
+                .unwrap(),
+                1 => kv::KvStore::new_encrypted(
+                    id,
+                    "Wiki".into(),
+                    identity::AgentId([9; 32]),
+                    group.as_bytes().to_vec(),
+                    ctx.clone(),
+                )
+                .unwrap(),
+                2 => kv::KvStore::new(id, "Wiki".into(), owner, kv::AccessPolicy::Signed).unwrap(),
+                _ => kv::KvStore::new_encrypted(
+                    id,
+                    "Wiki".into(),
+                    owner,
+                    b"foreign".to_vec(),
+                    context("foreign", owner),
+                )
+                .unwrap(),
+            };
+            assert!(
+                validate_group_kv_store_binding(&store, "Wiki", &group, owner, Some(&owner))
+                    .is_err(),
+                "cached case {case}"
+            );
+            write_snapshot(&path, &store);
+            assert!(
+                load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx.clone()).is_err(),
+                "restore case {case}"
+            );
+        }
+        std::fs::write(&path, b"corrupt snapshot").unwrap();
+        assert!(load_group_kv_store(&path, "Wiki", &group, owner, &owner, ctx).is_err());
+    }
+}
+
 /// Snapshot file path for a store: `<dir>/<store-id-hex>.bin`.
 fn kv_snapshot_path(dir: &std::path::Path, id: &kv::KvStoreId) -> std::path::PathBuf {
     dir.join(format!("{}.bin", hex::encode(id.as_bytes())))
@@ -16186,6 +16488,29 @@ impl std::fmt::Debug for KvStoreHandle {
 }
 
 impl KvStoreHandle {
+    /// Check a cached encrypted handle against its current authoritative group.
+    pub(crate) async fn validate_group_binding(
+        &self,
+        name: &str,
+        stable_group_id: &str,
+        creator: identity::AgentId,
+    ) -> error::Result<()> {
+        let (_, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
+        if self.sync.topic() != topic {
+            return Err(kv_storage_err(
+                "cached group kv store topic mismatch".into(),
+            ));
+        }
+        let store = self.sync.read().await;
+        validate_group_kv_store_binding(
+            &store,
+            name,
+            stable_group_id,
+            creator,
+            Some(&self.agent_id),
+        )
+    }
+
     /// Return this handle's gossip peer id.
     #[must_use]
     pub fn peer_id(&self) -> saorsa_gossip_types::PeerId {
@@ -16951,6 +17276,14 @@ fn spawn_relay_dm_listener(
                 now_ms,
                 is_sender_contact,
                 is_sender_blocked,
+            );
+
+            #[cfg(test)]
+            peer_relay.observe_convergence_received(
+                &relayed,
+                relay_peer_id.0,
+                _relay_sender_agent_id,
+                disposition,
             );
 
             // Revocation gate (PR #177 review, fix 1): the inner envelope's
@@ -18155,6 +18488,71 @@ mod tests {
             CapabilityRefreshRegistration::Unavailable
         ));
         assert_eq!(registry.len(), 0);
+    }
+
+    /// #461 regression (b8a9e2a HOLD): the provenance entry used by the
+    /// REST /direct/send route must carry the SAME ADR-0023 outbound
+    /// history wiring as the public method — an offline agent self-DM
+    /// through `send_direct_with_config_with_provenance` must leave an
+    /// Outbound row in its history store. No sockets, no daemon: the real
+    /// loopback send path with a real history DB.
+    #[tokio::test]
+    async fn provenance_entry_records_outbound_history_on_success() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db_path = dir.path().join("history.db");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_history(history::HistoryConfig {
+                enabled: true,
+                db_path: Some(db_path.clone()),
+                ..history::HistoryConfig::default()
+            })
+            .build()
+            .await
+            .expect("agent with history");
+        let self_id = agent.agent_id();
+        let payload = b"provenance-history-regression".to_vec();
+
+        let (receipt, ingress) = agent
+            .send_direct_with_config_with_provenance(
+                &self_id,
+                payload.clone(),
+                dm::DmSendConfig::default(),
+            )
+            .await
+            .expect("self-DM via the provenance entry");
+        assert_eq!(receipt.path, dm::DmPath::Loopback);
+        assert_eq!(ingress, None, "loopback self-DM observes no ACK ingress");
+
+        // The outbound writer is asynchronous — poll through the agent's OWN
+        // store handle (a second connection cannot take the live writer's
+        // SQLite locks; the daemon-kill pattern only opens post-mortem).
+        let query = history::HistoryQuery {
+            scope: Some(history::Scope::Dm(hex::encode(self_id.as_bytes()))),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows = agent
+                .history_handle
+                .as_ref()
+                .expect("history handle")
+                .store()
+                .query(&query)
+                .expect("query history");
+            if rows.iter().any(|r| {
+                r.record.payload == payload && r.record.direction == history::Direction::Outbound
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provenance entry must record the outbound history row (b8a9e2a regression)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     #[tokio::test]
@@ -21499,7 +21897,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_machine_signature_verifies() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21515,7 +21919,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_requires_human_consent() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21530,7 +21940,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_with_user_requires_user_identity() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21546,7 +21962,13 @@ mod tests {
     async fn announce_identity_populates_discovery_cache() {
         let user_key = identity::UserKeypair::generate().unwrap();
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_user_key(user_key)
             .build()
             .await
@@ -21569,7 +21991,13 @@ mod tests {
     #[tokio::test]
     async fn relay_census_classifies_bootstrap_and_skips_stale() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21646,7 +22074,13 @@ mod tests {
         // evicts a valid member as NoCertificate. A later announce carrying
         // the resolved certificate must promote it into the existing entry.
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21738,7 +22172,13 @@ mod tests {
     #[tokio::test]
     async fn verified_certificate_events_fire_on_landing_not_on_replay() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21827,7 +22267,13 @@ mod tests {
         // live identity cache without bound — every OwnerCertified evidence
         // pass walks it. At the cap the stalest entry is evicted.
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21987,7 +22433,13 @@ mod tests {
     #[tokio::test]
     async fn retired_announce_publishes_v3_only() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22038,7 +22490,13 @@ mod tests {
     #[tokio::test]
     async fn named_agent_announces_self_name_on_v3_beat() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22108,7 +22566,13 @@ mod tests {
     #[tokio::test]
     async fn legacy_escape_hatch_publishes_v2_and_v3() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_legacy_announce(true)
             .build()
             .await
@@ -22163,7 +22627,13 @@ mod tests {
     async fn revoked_agent_fails_machine_verification_even_when_cached() {
         let user_key = identity::UserKeypair::generate().unwrap();
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_user_key(user_key)
             .build()
             .await
@@ -23935,7 +24405,13 @@ async fn dm_capability_advert_tracks_durable_history_presence() {
             .with_machine_key(dir.path().join("machine.key"))
             .with_agent_key_path(dir.path().join("agent.key"))
             .with_peer_cache_dir(dir.path().join("peers"))
-            .with_network_config(network::NetworkConfig::default());
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            });
         if with_history {
             builder = builder.with_history(history::HistoryConfig {
                 db_path: Some(dir.path().join("history.db")),
@@ -23988,7 +24464,13 @@ async fn dm_inbox_capability_upgrade_visible_to_late_subscriber() {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_peer_cache_dir(dir.path().join("peers"))
-        .with_network_config(network::NetworkConfig::default())
+        .with_network_config(network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..network::NetworkConfig::default()
+        })
         .build()
         .await
         .expect("agent");
@@ -24796,3 +25278,9 @@ mod peer_connected_handler_integration_tests {
         assert_eq!(back.move_protocol, unsigned.move_protocol);
     }
 }
+
+#[cfg(test)]
+mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod legacy_bus_interop_tests;

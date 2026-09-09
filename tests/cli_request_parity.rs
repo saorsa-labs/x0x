@@ -17,7 +17,7 @@
 //! Any drift between two of the three fails with a diff naming the field.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
 use x0x::api::{CliExpose, EndpointDef, FieldLocation, RequestSpec, ENDPOINTS};
@@ -26,6 +26,25 @@ use x0x::api::{CliExpose, EndpointDef, FieldLocation, RequestSpec, ENDPOINTS};
 
 fn bin_path() -> &'static str {
     env!("CARGO_BIN_EXE_x0x")
+}
+
+/// Run the `x0x` binary to completion with every stdio stream stated
+/// explicitly, and wait for the child directly.
+///
+/// This spells out what `Command::output()` already does by default (stdin
+/// null, stdout/stderr captured) rather than relying on the default, and
+/// uses `spawn` + `wait_with_output` so the child is reaped at an explicit
+/// call site. It is a readability/ownership choice, not a fix: no LEAK
+/// cause is claimed here, and no guarantee is made about descendants the
+/// child may spawn.
+fn run_cli(args: &[String]) -> std::io::Result<std::process::Output> {
+    Command::new(bin_path())
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?
+        .wait_with_output()
 }
 /// Resolve an `EndpointDef::cli_name` into argv invocations (handles the
 /// `"tasks claim / tasks complete"` and `"constitution --json"`
@@ -63,9 +82,7 @@ fn cached_help(tokens: &[String]) -> String {
                 }
                 let mut args = tokens.clone();
                 args.push("--help".to_string());
-                let out = Command::new(bin_path())
-                    .args(&args)
-                    .output()
+                let out = run_cli(&args)
                     .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin_path()));
                 assert!(
                     out.status.success(),
@@ -298,6 +315,17 @@ const CLIENT_ENFORCED_REQUIRED: &[(&str, &str, &str, &str)] = &[
         "agent_id",
         "src/cli/commands/exec.rs::run (argv-empty bail)",
     ),
+    // `x0x history search` is a two-form command (issue #275):
+    // `<SCOPE> <QUERY>` (legacy, scoped) or `<QUERY>` alone (cross-scope).
+    // The needle is therefore carried by the FIRST positional in the
+    // one-argument form, which clap makes mandatory — so `q` can never be
+    // absent from the wire even though its `[QUERY]` token is bracketed.
+    (
+        "GET",
+        "/history/search",
+        "q",
+        "src/cli/commands/history.rs::split_search_args (clap's mandatory first positional becomes `q` when no second positional is given)",
+    ),
 ];
 
 /// WHY (review r3, item 1): registry `required` must match clap's own
@@ -382,11 +410,13 @@ fn registry_requiredness_matches_clap() {
 
 /// Dummy CLI value for a flag/positional: BOOL placeholders need a real
 /// boolean, PATH/JSON placeholders point at a valid-JSON temp file (some
-/// commands read AND parse the file client-side), everything else "1"
-/// (parses as every scalar type clap accepts).
+/// commands read AND parse the file client-side), AGENT needs a complete
+/// hexadecimal identity, and other placeholders retain the scalar exemplar "1".
 fn dummy_value(placeholder: &str) -> String {
     let up = placeholder.to_ascii_uppercase();
-    if up.contains("BOOL") {
+    if normalize_positional(placeholder) == "agent" {
+        "ab".repeat(32)
+    } else if up.contains("BOOL") {
         "true".to_string()
     } else if up.contains("FILE") {
         "/dev/null".to_string()
@@ -400,6 +430,33 @@ fn dummy_value(placeholder: &str) -> String {
     } else {
         "1".to_string()
     }
+}
+
+#[test]
+fn agent_dummy_value_passes_exact_diagnostics_validation() {
+    // A parity input must reach request construction without relaxing the
+    // production filter or exempting the endpoint from wire-field checks.
+    let surface = parse_help_surface(
+        "Usage: x0x diagnostics dm [OPTIONS]\n\nOptions:\n  --agent <AGENT>  Inspect one exact agent\n",
+    );
+    let flag_placeholder = surface
+        .flag_placeholders
+        .get("--agent")
+        .expect("actual flag placeholder from help parser");
+    assert_eq!(flag_placeholder, "<AGENT>");
+    assert_eq!(
+        x0x::dm_digest_diagnostics::parse_agent_filter(&dummy_value(flag_placeholder)),
+        Ok([0xab; 32])
+    );
+    for placeholder in ["AGENT", "agent", "<AGENT>", "[AGENT]"] {
+        assert_eq!(
+            x0x::dm_digest_diagnostics::parse_agent_filter(&dummy_value(placeholder)),
+            Ok([0xab; 32])
+        );
+    }
+    assert!(x0x::dm_digest_diagnostics::parse_agent_filter("1").is_err());
+    assert_eq!(dummy_value("LIMIT"), "1");
+    assert_eq!(dummy_value("BOOL"), "true");
 }
 
 /// Build argv exercising the command's path-parameter positionals plus
@@ -534,10 +591,7 @@ fn conflicting_flag(err: &str) -> Option<(String, String)> {
 }
 
 fn run_dump(argv: &[String]) -> Result<serde_json::Value, String> {
-    let out = Command::new(bin_path())
-        .args(argv)
-        .output()
-        .map_err(|e| format!("spawn failed: {e}"))?;
+    let out = run_cli(argv).map_err(|e| format!("spawn failed: {e}"))?;
     // Streaming commands (subscribe/events) dump their request and then
     // exit non-zero when no daemon answers — the dump line is the proof.
     let stdout = String::from_utf8_lossy(&out.stdout);

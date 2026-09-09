@@ -696,6 +696,106 @@ pub(in crate::server) struct CreateGroupStoreRequest {
     name: String,
 }
 
+type GroupStoreResponse = (StatusCode, Json<serde_json::Value>);
+
+/// Creation-fixed identity; app names retain the existing trim-only semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GssGroupStoreBinding {
+    group_key: String,
+    stable_group_id: String,
+    creator: AgentId,
+    name: String,
+    store_id: x0x::kv::KvStoreId,
+    topic: String,
+}
+
+fn validate_gss_store_group(
+    info: &x0x::groups::GroupInfo,
+    caller: &AgentId,
+) -> Result<(), GroupStoreResponse> {
+    if info.withdrawn {
+        return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
+    }
+    if !info.has_active_member(&hex::encode(caller.as_bytes())) {
+        return Err(forbidden("not a member"));
+    }
+    if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
+        return Err(bad_request(
+            "encrypted stores require an MlsEncrypted group",
+        ));
+    }
+    if info.secure_plane != x0x::mls::SecureGroupPlane::Gss {
+        return Err(bad_request(
+            "encrypted stores v1 are GSS-backed; other planes are not supported yet",
+        ));
+    }
+    if info.shared_secret.is_none() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "local daemon holds no shared secret for this group yet",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_gss_group_store(
+    groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    id: &str,
+    name: &str,
+    caller: &AgentId,
+) -> Result<GssGroupStoreBinding, GroupStoreResponse> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad_request("store name must not be empty"));
+    }
+    let (group_key, info) = if let Some(pair) = groups.get_key_value(id) {
+        pair
+    } else {
+        let mut matches = groups
+            .iter()
+            .filter(|(_, info)| info.stable_group_id() == id);
+        let pair = matches.next().ok_or_else(|| not_found("group not found"))?;
+        if matches.next().is_some() {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "ambiguous local group binding",
+            ));
+        }
+        pair
+    };
+    validate_gss_store_group(info, caller)?;
+    let stable_group_id = info.stable_group_id().to_string();
+    let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, name);
+    Ok(GssGroupStoreBinding {
+        group_key: group_key.clone(),
+        stable_group_id,
+        creator: info.creator,
+        name: name.to_string(),
+        store_id,
+        topic,
+    })
+}
+
+/// Used by the real per-record refresh hook; invalidation also fences clones.
+fn refresh_gss_store_binding(
+    ctx: &x0x::groups::GssKvSecureContext,
+    info: Option<&x0x::groups::GroupInfo>,
+    creator: AgentId,
+    caller: &AgentId,
+) -> bool {
+    if let Some(info) = info {
+        if info.creator == creator
+            && info.stable_group_id().as_bytes() == ctx.group_id()
+            && validate_gss_store_group(info, caller).is_ok()
+        {
+            ctx.update_from_group(info);
+            return true;
+        }
+    }
+    ctx.invalidate();
+    false
+}
+
 /// Deterministic refresh hook for a GSS encrypted-store context: re-reads
 /// the authoritative group from the daemon's named-groups map (under the
 /// read guard — no `GroupInfo` clone) and refreshes the context snapshot.
@@ -706,6 +806,7 @@ pub(in crate::server) fn gss_kv_refresh(
     ctx: Arc<x0x::groups::GssKvSecureContext>,
     group_key: String,
     topic: String,
+    creator: AgentId,
 ) -> x0x::kv::sync::SecureRefreshFn {
     let state = Arc::clone(state);
     Arc::new(move || {
@@ -714,26 +815,17 @@ pub(in crate::server) fn gss_kv_refresh(
         let group_key = group_key.clone();
         let topic = topic.clone();
         Box::pin(async move {
-            let lifecycle = {
+            let valid = {
                 let groups = state.named_groups.read().await;
-                match groups.get(&group_key) {
-                    // Group gone (leave/removal) or withdrawn: the local
-                    // agent must not keep operating the store on a stale
-                    // secret/roster snapshot.
-                    None => Some("group removed (left or deleted)"),
-                    Some(info) if info.withdrawn => Some("group state withdrawn"),
-                    Some(info) => {
-                        ctx.update_from_group(info);
-                        None
-                    }
-                }
+                refresh_gss_store_binding(
+                    &ctx,
+                    groups.get(&group_key),
+                    creator,
+                    &state.agent.agent_id(),
+                )
             };
-            if let Some(reason) = lifecycle {
-                tracing::warn!(
-                    target: "x0x::kv",
-                    "retiring encrypted store {topic}: {reason} — invalidating context and cancelling sync"
-                );
-                ctx.invalidate();
+            if !valid {
+                tracing::warn!(target: "x0x::kv", "retiring encrypted store {topic}: group binding is no longer eligible");
                 if let Some(h) = state.kv_stores.write().await.remove(&topic) {
                     h.retire();
                 }
@@ -772,24 +864,77 @@ pub(in crate::server) async fn retire_group_kv_stores(state: &AppState, stable_g
     }
 }
 
-/// Resolve the GSS secure context for a group store, re-reading the group
-/// under the named-groups read lock. Fails when the group is gone or the
-/// daemon holds no shared secret for it yet.
-async fn gss_context_for_group(
+/// Called only while the canonical store reservation and group membership
+/// guard are held. Re-resolve before touching a cached handle or starting sync.
+async fn open_bound_gss_store(
     state: &Arc<AppState>,
-    group_key: &str,
-) -> Result<Arc<x0x::groups::GssKvSecureContext>, (StatusCode, Json<serde_json::Value>)> {
-    let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(group_key) else {
-        return Err(not_found("group not found"));
+    expected: &GssGroupStoreBinding,
+) -> Result<
+    (
+        x0x::KvStoreHandle,
+        Arc<x0x::groups::GssKvSecureContext>,
+        bool,
+    ),
+    GroupStoreResponse,
+> {
+    let secure = {
+        let groups = state.named_groups.read().await;
+        let current = resolve_gss_group_store(
+            &groups,
+            &expected.group_key,
+            &expected.name,
+            &state.agent.agent_id(),
+        )?;
+        if &current != expected {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "group store binding changed during open",
+            ));
+        }
+        let info = groups
+            .get(&current.group_key)
+            .ok_or_else(|| not_found("group not found"))?;
+        Arc::new(
+            x0x::groups::GssKvSecureContext::from_group(info)
+                .ok_or_else(|| api_error(StatusCode::CONFLICT, "group secret unavailable"))?,
+        )
     };
-    match x0x::groups::GssKvSecureContext::from_group(info) {
-        Some(ctx) => Ok(Arc::new(ctx)),
-        None => Err(api_error(
-            StatusCode::CONFLICT,
-            "local daemon holds no shared secret for this group yet — join or refresh group state first",
-        )),
+    let cached = { state.kv_stores.read().await.get(&expected.topic).cloned() };
+    if let Some(handle) = cached {
+        if handle
+            .validate_group_binding(&expected.name, &expected.stable_group_id, expected.creator)
+            .await
+            .is_err()
+        {
+            handle.retire();
+            state.kv_stores.write().await.remove(&expected.topic);
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "cached group store binding mismatch or retired context",
+            ));
+        }
+        return Ok((handle, secure, false));
     }
+    let refresh = gss_kv_refresh(
+        state,
+        Arc::clone(&secure),
+        expected.group_key.clone(),
+        expected.topic.clone(),
+        expected.creator,
+    );
+    let handle = state
+        .agent
+        .open_group_kv_store_persistent(
+            &expected.name,
+            &expected.stable_group_id,
+            expected.creator,
+            Arc::clone(&secure) as Arc<dyn KvSecureContext>,
+            refresh,
+            &state.kv_store_state_dir,
+        )
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    Ok((handle, secure, true))
 }
 
 /// Shared metadata payload for create / idempotent re-open responses.
@@ -836,143 +981,143 @@ pub(in crate::server) async fn create_group_kv_store(
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Json(req): Json<CreateGroupStoreRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return bad_request("store name must not be empty");
-    }
-    // Group authorization + v1-backend gates (single read pass).
-    let creator = {
+    let binding = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
-        };
-        if info.withdrawn {
-            return api_error(StatusCode::CONFLICT, "group is withdrawn");
-        }
-        if !info.has_active_member(&caller_hex) {
-            return forbidden("not a member");
-        }
-        if !actor.rider_allows_group(info.stable_group_id()) {
-            return forbidden("rider token is not granted this group");
-        }
-        if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
-            return bad_request(
-                "group is not MlsEncrypted — encrypted stores require a confidential group",
-            );
-        }
-        if info.secure_plane != x0x::mls::SecureGroupPlane::Gss {
-            return bad_request(
-                "encrypted stores v1 are GSS-backed (ADR-0010); TreeKEM-plane groups are not supported yet",
-            );
-        }
-        info.creator
-    };
-    let stable_group_id = {
-        // The stable group id is creation-fixed; re-read to avoid holding
-        // the lock across the derive.
-        let groups = state.named_groups.read().await;
-        match groups.get(&id) {
-            Some(info) => info.stable_group_id().to_string(),
-            None => return not_found("group not found"),
+        match resolve_gss_group_store(&groups, &id, &req.name, &state.agent.agent_id()) {
+            Ok(binding) => binding,
+            Err(response) => return response,
         }
     };
-
-    let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, &name);
-    // Idempotent re-open: an already-open store returns its metadata.
-    if let Some(handle) = state.kv_stores.read().await.get(&topic) {
-        let secure = gss_context_for_group(&state, &id).await;
-        let epoch = secure.as_ref().map(|c| c.current_epoch()).unwrap_or(0);
-        return (
-            StatusCode::OK,
-            Json(group_store_json(handle, &topic, &store_id, &stable_group_id, epoch).await),
-        );
+    if !actor.rider_allows_group(&binding.stable_group_id) {
+        return forbidden("rider token is not granted this group");
     }
-
-    // Serialize concurrent create/rehydrate for this store.
-    let reservation =
-        crdt_subscriptions::handle_reservation(&state, crdt_subscriptions::KIND_KV_STORE, &topic)
-            .await;
-    let _guard = reservation.lock().await;
-    if let Some(handle) = state.kv_stores.read().await.get(&topic) {
-        let secure = gss_context_for_group(&state, &id).await;
-        let epoch = secure.as_ref().map(|c| c.current_epoch()).unwrap_or(0);
-        return (
-            StatusCode::OK,
-            Json(group_store_json(handle, &topic, &store_id, &stable_group_id, epoch).await),
-        );
-    }
-
-    let secure = match gss_context_for_group(&state, &id).await {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
+    let reservation = crdt_subscriptions::handle_reservation(
+        &state,
+        crdt_subscriptions::KIND_KV_STORE,
+        &binding.topic,
+    )
+    .await;
+    let _reservation_guard = reservation.lock().await;
+    // Use the same alias-canonicalizing mutex as all group membership writers.
+    let membership = super::named_groups::group_membership_lock(&state, &binding.group_key).await;
+    let _membership_guard = membership.lock().await;
+    let (handle, secure, created) = match open_bound_gss_store(&state, &binding).await {
+        Ok(opened) => opened,
+        Err(response) => return response,
     };
-    let refresh = gss_kv_refresh(&state, Arc::clone(&secure), id.clone(), topic.clone());
-
-    match state
-        .agent
-        .open_group_kv_store_persistent(
-            &name,
-            &stable_group_id,
-            creator,
-            Arc::clone(&secure) as Arc<dyn KvSecureContext>,
-            refresh,
-            &state.kv_store_state_dir,
+    if created {
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle.clone());
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "policy".into(),
+            serde_json::Value::String("encrypted".into()),
+        );
+        extra.insert(
+            "expected_owner".into(),
+            serde_json::Value::String(hex::encode(binding.creator.as_bytes())),
+        );
+        extra.insert(
+            "stable_group_id".into(),
+            serde_json::Value::String(binding.stable_group_id.clone()),
+        );
+        if let Err(e) = crdt_subscriptions::record(
+            &state,
+            crdt_subscriptions::CrdtSubscriptionEntry {
+                kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
+                id: binding.topic.clone(),
+                name: binding.name.clone(),
+                topic: binding.topic.clone(),
+                role: crdt_subscriptions::ROLE_CREATED.to_string(),
+                extra,
+            },
         )
         .await
-    {
-        Ok(handle) => {
-            state
-                .kv_stores
-                .write()
-                .await
-                .insert(topic.clone(), handle.clone());
-            // Persist the registration so a restart re-opens the store with
-            // the group binding (creator + stable group id) instead of
-            // skipping it (manifest_policy fail-closes unknown policies).
-            let mut extra = serde_json::Map::new();
-            extra.insert(
-                "policy".to_string(),
-                serde_json::Value::String("encrypted".to_string()),
+        {
+            handle.retire();
+            state.kv_stores.write().await.remove(&binding.topic);
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to persist subscription registration: {e}"),
             );
-            extra.insert(
-                "expected_owner".to_string(),
-                serde_json::Value::String(hex::encode(creator.as_bytes())),
-            );
-            extra.insert(
-                "stable_group_id".to_string(),
-                serde_json::Value::String(stable_group_id.clone()),
-            );
-            if let Err(e) = crdt_subscriptions::record(
-                &state,
-                crdt_subscriptions::CrdtSubscriptionEntry {
-                    kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
-                    id: topic.clone(),
-                    name: name.clone(),
-                    topic: topic.clone(),
-                    role: crdt_subscriptions::ROLE_CREATED.to_string(),
-                    extra,
-                },
-            )
-            .await
-            {
-                tracing::error!("failed to persist group kv store registration {topic}: {e}");
-                if let Some(h) = state.kv_stores.write().await.remove(&topic) {
-                    h.cancel_sync();
-                }
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to persist subscription registration: {e}"),
-                );
-            }
-            let epoch = secure.current_epoch();
-            (
-                StatusCode::CREATED,
-                Json(group_store_json(&handle, &topic, &store_id, &stable_group_id, epoch).await),
-            )
         }
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
+    (
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(
+            group_store_json(
+                &handle,
+                &binding.topic,
+                &binding.store_id,
+                &binding.stable_group_id,
+                secure.current_epoch(),
+            )
+            .await,
+        ),
+    )
+}
+
+/// Manifest binding must agree with current group authority, not supply it.
+fn validate_gss_store_manifest(
+    entry: &crdt_subscriptions::CrdtSubscriptionEntry,
+    binding: &GssGroupStoreBinding,
+) -> Result<(), GroupStoreResponse> {
+    if entry.id != binding.topic
+        || entry.topic != binding.topic
+        || entry.name != binding.name
+        || entry.extra.get("stable_group_id").and_then(|v| v.as_str())
+            != Some(binding.stable_group_id.as_str())
+        || entry
+            .extra
+            .get("expected_owner")
+            .and_then(|v| v.as_str())
+            .and_then(|owner| parse_agent_id_hex(owner).ok())
+            != Some(binding.creator)
+        || entry.extra.get("policy").and_then(|v| v.as_str()) != Some("encrypted")
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "encrypted store manifest binding mismatch",
+        ));
+    }
+    Ok(())
+}
+
+/// Encrypted restore's final decision. Caller holds the per-entry reservation;
+/// canonical ID validation precedes cached lookup and prevents alternate keys
+/// from evading that reservation. Membership stays serialized through install.
+pub(in crate::server) async fn restore_bound_gss_store(
+    state: &Arc<AppState>,
+    entry: &crdt_subscriptions::CrdtSubscriptionEntry,
+) -> Result<bool, GroupStoreResponse> {
+    let stable = entry
+        .extra
+        .get("stable_group_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| bad_request("encrypted store manifest has no stable group ID"))?;
+    let binding = {
+        let groups = state.named_groups.read().await;
+        resolve_gss_group_store(&groups, stable, &entry.name, &state.agent.agent_id())?
+    };
+    validate_gss_store_manifest(entry, &binding)?;
+    let membership = super::named_groups::group_membership_lock(state, &binding.group_key).await;
+    let _membership_guard = membership.lock().await;
+    let (handle, _, created) = open_bound_gss_store(state, &binding).await?;
+    if created {
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle);
+    }
+    Ok(created)
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1150,195 @@ mod tests {
     use crate::groups::{GroupConfidentiality, GroupInfo, GroupPolicy, GssKvSecureContext};
     use crate::mls::SecureGroupPlane;
 
+    fn binding_fixture(id: &str) -> GroupInfo {
+        let mut info = GroupInfo::with_policy(
+            "group".into(),
+            String::new(),
+            AgentId([1; 32]),
+            id.into(),
+            GroupPolicy::default(),
+        );
+        info.policy.confidentiality = GroupConfidentiality::MlsEncrypted;
+        info.secure_plane = SecureGroupPlane::Gss;
+        info.add_member(
+            hex::encode(AgentId([2; 32]).as_bytes()),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        info.shared_secret = Some(vec![7; 32]);
+        info
+    }
+
+    #[test]
+    fn issue565_full_group_and_trim_only_application_identity() {
+        let first = "abcdef0123456789aaaaaaaaaaaaaaaa";
+        let second = "abcdef0123456789bbbbbbbbbbbbbbbb";
+        let groups = std::collections::HashMap::from([
+            ("alias".into(), binding_fixture(first)),
+            (second.into(), binding_fixture(second)),
+        ]);
+        let owner =
+            resolve_gss_group_store(&groups, "alias", "  Wiki  ", &AgentId([1; 32])).unwrap();
+        let member = resolve_gss_group_store(&groups, first, "Wiki", &AgentId([2; 32])).unwrap();
+        assert_eq!(
+            owner, member,
+            "creator and member resolve the same full identity through alias/stable ID"
+        );
+        assert_ne!(
+            owner.store_id,
+            resolve_gss_group_store(&groups, second, "Wiki", &AgentId([2; 32]))
+                .unwrap()
+                .store_id
+        );
+        assert_ne!(
+            owner.store_id,
+            resolve_gss_group_store(&groups, first, "wiki", &AgentId([2; 32]))
+                .unwrap()
+                .store_id
+        );
+        assert!(resolve_gss_group_store(&groups, first, "  ", &AgentId([2; 32])).is_err());
+    }
+
+    #[test]
+    fn issue565_resolver_and_refresh_reject_ineligible_binding_and_fence_clones() {
+        let gid = "ab".repeat(16);
+        let base = binding_fixture(&gid);
+        for case in 0..10 {
+            let mut info = base.clone();
+            match case {
+                0 => info.withdrawn = true,
+                1 => {
+                    info.remove_member(&hex::encode(AgentId([2; 32]).as_bytes()), None);
+                }
+                2 => info.policy.confidentiality = GroupConfidentiality::SignedPublic,
+                3 => info.secure_plane = SecureGroupPlane::TreeKem,
+                4 => info.shared_secret = None,
+                5 => info.creator = AgentId([9; 32]),
+                6 => info = binding_fixture(&"cd".repeat(16)),
+                8 | 9 => {
+                    info.members_v2
+                        .get_mut(&hex::encode(AgentId([2; 32]).as_bytes()))
+                        .unwrap()
+                        .state = if case == 8 {
+                        x0x::groups::GroupMemberState::Pending
+                    } else {
+                        x0x::groups::GroupMemberState::Banned
+                    };
+                }
+                _ => {}
+            }
+            let ctx = GssKvSecureContext::from_group(&base).unwrap();
+            let cloned = ctx.clone();
+            let current = (case != 7).then_some(&info);
+            assert!(
+                !refresh_gss_store_binding(&ctx, current, base.creator, &AgentId([2; 32])),
+                "case {case}"
+            );
+            assert!(
+                !cloned.is_active_member(&AgentId([2; 32])),
+                "clone fenced case {case}"
+            );
+            let id = x0x::kv::encrypted::group_store_identity(&gid, "Wiki").0;
+            assert!(cloned.seal(&id, b"private").is_err());
+            if !(5..8).contains(&case) {
+                let groups = std::collections::HashMap::from([(gid.clone(), info)]);
+                assert!(resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([2; 32])).is_err());
+            }
+        }
+        let ctx = GssKvSecureContext::from_group(&base).unwrap();
+        let mut advanced = base.clone();
+        advanced.secret_epoch += 1;
+        assert!(refresh_gss_store_binding(
+            &ctx,
+            Some(&advanced),
+            base.creator,
+            &AgentId([2; 32])
+        ));
+        assert_eq!(ctx.current_epoch(), advanced.secret_epoch);
+        let groups = std::collections::HashMap::from([(gid.clone(), base)]);
+        assert!(resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([3; 32])).is_err());
+        assert!(resolve_gss_group_store(&groups, "missing", "Wiki", &AgentId([2; 32])).is_err());
+    }
+
+    #[test]
+    fn issue565_restore_manifest_cannot_supply_identity_or_authority() {
+        let gid = "ab".repeat(16);
+        let groups = std::collections::HashMap::from([(gid.clone(), binding_fixture(&gid))]);
+        let binding = resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([2; 32])).unwrap();
+        let good = crdt_subscriptions::CrdtSubscriptionEntry {
+            kind: crdt_subscriptions::KIND_KV_STORE.into(),
+            id: binding.topic.clone(),
+            topic: binding.topic.clone(),
+            name: binding.name.clone(),
+            role: crdt_subscriptions::ROLE_CREATED.into(),
+            extra: serde_json::Map::from_iter([
+                ("stable_group_id".into(), serde_json::Value::String(gid)),
+                (
+                    "expected_owner".into(),
+                    serde_json::Value::String(hex::encode(binding.creator.as_bytes())),
+                ),
+                (
+                    "policy".into(),
+                    serde_json::Value::String("encrypted".into()),
+                ),
+            ]),
+        };
+        assert!(validate_gss_store_manifest(&good, &binding).is_ok());
+        let mut hex_binding = binding.clone();
+        hex_binding.creator = AgentId([0xab; 32]);
+        let mut upper_owner = good.clone();
+        upper_owner.extra.insert(
+            "expected_owner".into(),
+            serde_json::Value::String("AB".repeat(32)),
+        );
+        assert!(
+            validate_gss_store_manifest(&upper_owner, &hex_binding).is_ok(),
+            "preserve parsed owner-ID spelling compatibility"
+        );
+        for case in 0..6 {
+            let mut entry = good.clone();
+            match case {
+                0 => entry.id = "different-registry-key".into(),
+                1 => entry.topic = "different-topic".into(),
+                2 => {
+                    entry.extra.insert(
+                        "expected_owner".into(),
+                        serde_json::Value::String(hex::encode(AgentId([9; 32]).as_bytes())),
+                    );
+                }
+                3 => {
+                    entry.extra.insert(
+                        "stable_group_id".into(),
+                        serde_json::Value::String("foreign".into()),
+                    );
+                }
+                4 => {
+                    entry
+                        .extra
+                        .insert("policy".into(), serde_json::Value::String("signed".into()));
+                }
+                _ => entry.name = " Wiki ".into(),
+            }
+            assert!(
+                validate_gss_store_manifest(&entry, &binding).is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    /// Explicit test-only network config (#417/#337): loopback bind, no
+    /// seeds, discovery/port-mapping off. Still a real socket constructor.
+    fn test_network_config() -> x0x::network::NetworkConfig {
+        x0x::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        }
+    }
+
     /// Agent + AppState over a temp dir, WITH an in-process gossip runtime
     /// (the encrypted-store happy path spawns real sync loops).
     async fn encrypted_store_test_state() -> (Arc<AppState>, tempfile::TempDir) {
@@ -1015,7 +1349,7 @@ mod tests {
                 .with_machine_key(data_dir.join("machine.key"))
                 .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
                 .with_contact_store_path(data_dir.join("contacts.json"))
-                .with_network_config(x0x::network::NetworkConfig::default())
+                .with_network_config(test_network_config())
                 .build()
                 .await
                 .unwrap(),
@@ -1147,7 +1481,13 @@ mod tests {
         let ctx =
             Arc::new(x0x::groups::GssKvSecureContext::from_group(&pre_leave_info).expect("ctx"));
         assert!(ctx.is_active_member(&state.agent.agent_id()));
-        let hook = gss_kv_refresh(&state, ctx, group_key.clone(), topic.clone());
+        let hook = gss_kv_refresh(
+            &state,
+            ctx,
+            group_key.clone(),
+            topic.clone(),
+            state.agent.agent_id(),
+        );
         hook().await;
 
         // The handle is retired out of the registry...
@@ -1223,7 +1563,13 @@ mod tests {
             .expect("ctx"),
         );
         assert!(ctx.is_active_member(&state.agent.agent_id()));
-        let hook = gss_kv_refresh(&state, Arc::clone(&ctx), group_key.clone(), topic);
+        let hook = gss_kv_refresh(
+            &state,
+            Arc::clone(&ctx),
+            group_key.clone(),
+            topic,
+            state.agent.agent_id(),
+        );
         hook().await;
         assert!(
             !ctx.is_active_member(&state.agent.agent_id()),

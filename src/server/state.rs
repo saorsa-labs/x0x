@@ -296,6 +296,12 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) observed_prefix_enabled: bool,
 
+    /// Opt out of the inbox's legacy-bus subscription, reverse-ACK bus
+    /// pre-warm, and legacy ACK hedge. Default false. Sender bus fallback
+    /// is unchanged; bus-only senders cannot reach this inbox when enabled.
+    #[serde(default)]
+    pub(super) skip_legacy_dm_bus: bool,
+
     /// Update configuration.
     #[serde(default)]
     pub(super) update: DaemonUpdateConfig,
@@ -646,6 +652,7 @@ impl Default for DaemonConfig {
             port_mapping_enabled: default_port_mapping_enabled(),
             peer_relay: x0x::network::PeerRelayConfig::default(),
             observed_prefix_enabled: false,
+            skip_legacy_dm_bus: false,
             update: DaemonUpdateConfig::default(),
             history: default_history_config(),
             gossip: x0x::gossip::GossipConfig::default(),
@@ -933,6 +940,12 @@ pub(super) struct AppState {
     /// `UPGRADE_FAILED` artifact live (#261).
     pub(super) data_dir: PathBuf,
     pub(super) start_time: Instant,
+    /// Cached transport peer counts served by the auth-exempt `/health`
+    /// (issue #600). Refreshed by a background task; the handler only reads
+    /// atomics, so the watchdog's liveness probe never touches ant-quic's
+    /// `connection_lifecycle` lock. See
+    /// [`super::routes::status::HealthSnapshot`].
+    pub(super) health_snapshot: Arc<super::routes::status::HealthSnapshot>,
     pub(super) broadcast_tx: broadcast::Sender<SseEvent>,
     /// Active file transfers.
     pub(super) file_transfers: RwLock<HashMap<String, x0x::files::TransferState>>,

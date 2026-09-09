@@ -463,6 +463,8 @@ struct AttestationVerifyCtx {
     contact_store: std::sync::Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
     own_machine_id: MachineId,
     now_ms: u64,
+    revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    move_state: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
 }
 
 /// Inbound gate decision for a `ForwardV2` attested stream (#204).
@@ -642,6 +644,41 @@ async fn decide_inbound_attested(
         peer_machine,
         &target,
     )?;
+
+    // The machine-level gate may have excluded a moved-away co-resident
+    // while accepting a live agent on the same machine. Authenticate the
+    // header's exact opener against CURRENT authority too: a valid signature
+    // and a stale discovery binding must not resurrect that dead pairing.
+    // Snapshot only this placement, then release its lock before reading
+    // revocation state; no shared locks are held across another lock await.
+    let placement = ctx
+        .move_state
+        .read()
+        .await
+        .placement(&header.opener_agent_id)
+        .cloned();
+    let placements = placement
+        .map(|record| std::collections::HashMap::from([(header.opener_agent_id, record)]))
+        .unwrap_or_default();
+    let revoked = ctx.revocation_set.read().await;
+    crate::streams::stream_gate(
+        &header.opener_agent_id,
+        Some(trust_decision),
+        revoked.is_agent_revoked(&header.opener_agent_id),
+        revoked.is_machine_revoked(peer_machine),
+        crate::identity::is_expired(agent.cert_not_after, ctx.now_ms / 1000),
+    )
+    .map_err(|_| ConnectDenialReason::AttestationFailed)?;
+    if crate::key_move::enforce_pairing(
+        &revoked,
+        &placements,
+        &header.opener_agent_id,
+        peer_machine,
+    )
+    .is_some()
+    {
+        return Err(ConnectDenialReason::AttestationFailed);
+    }
 
     Ok(target)
 }
@@ -845,6 +882,8 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                 contact_store: Arc::clone(&ctx.contact_store),
                 own_machine_id: ctx.own_machine_id,
                 now_ms,
+                revocation_set: Arc::clone(&ctx.revocation_set),
+                move_state: Arc::clone(&ctx.move_state),
             };
             match decide_inbound_attested(&header, &ctx.policy, &machine_id, &verify_ctx).await {
                 Ok(addr) => addr,
@@ -1415,9 +1454,14 @@ impl ForwardService {
             .local_addr()
             .map_err(|e| NetworkError::ConnectionFailed(format!("local_addr: {e}")))?;
         let cancel = CancellationToken::new();
+        // Register the kernel-assigned address.  Keeping the requested
+        // `:0` here makes list/remove unable to identify the listener that
+        // was actually opened (and makes two ephemeral forwards collide).
+        let mut registered_spec = spec.clone();
+        registered_spec.local_addr = bound;
         if let Ok(mut forwards) = self.forwards.lock() {
             forwards.push(ForwardEntry {
-                spec: spec.clone(),
+                spec: registered_spec,
                 cancel: cancel.clone(),
             });
         }
@@ -2264,6 +2308,12 @@ mod tests {
                     contact_store: contacts,
                     own_machine_id: recipient_machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 },
             )
             .await,
@@ -2300,6 +2350,12 @@ mod tests {
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 },
             )
             .await,
@@ -2327,6 +2383,12 @@ mod tests {
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 },
             )
             .await,
@@ -2355,6 +2417,12 @@ mod tests {
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 },
             )
             .await,
@@ -2381,6 +2449,12 @@ mod tests {
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 },
             )
             .await,
@@ -2409,6 +2483,12 @@ mod tests {
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 },
             )
             .await,
@@ -2438,6 +2518,12 @@ mod tests {
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 },
             )
             .await,
@@ -2452,6 +2538,158 @@ mod tests {
         assert!(
             text.contains("attestation invalid"),
             "bad signature must surface the inner ForwardError"
+        );
+    }
+
+    /// No Agent/Node construction: real identity primitives, shared inbound
+    /// gate and wire header codec, entirely in memory.
+    #[tokio::test]
+    async fn r132_attested_opener_obeys_current_pairing_after_shared_gate() {
+        use crate::key_move::{MoveState, Placement, PlacementAuthority, PlacementRecord};
+        let a = AgentKeypair::generate().unwrap();
+        let b = AgentKeypair::generate().unwrap();
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let machine = MachineId([21; 32]);
+        let recipient = MachineId([22; 32]);
+        let cache = cache_with_agent(&a, machine);
+        cache
+            .write()
+            .await
+            .extend(cache_with_agent(&b, machine).read().await.clone());
+        let contacts = trusted_store(a.agent_id());
+        contacts
+            .write()
+            .await
+            .set_identity_type(&b.agent_id(), IdentityType::Anonymous);
+        contacts
+            .write()
+            .await
+            .set_trust(&b.agent_id(), TrustLevel::Trusted);
+        let revoked = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let moves = Arc::new(tokio::sync::RwLock::new(MoveState::new()));
+        let target = "127.0.0.1:22".parse().unwrap();
+        let policy = policy_multi(vec![
+            allow_entry(a.agent_id(), machine, &[target]),
+            allow_entry(b.agent_id(), machine, &[target]),
+        ]);
+        let shared_policy = Arc::new(std::sync::RwLock::new(Arc::new(policy.clone())));
+        let record = PlacementRecord::sign(
+            a.agent_id(),
+            owner.public_key().as_bytes(),
+            Placement::Pinned(MachineId([23; 32])),
+            1,
+            1,
+            owner.secret_key(),
+        )
+        .unwrap();
+        moves
+            .write()
+            .await
+            .cache_placement(record, PlacementAuthority::local_owner(&owner))
+            .unwrap();
+        let surviving = crate::Agent::gate_peer_machine_inbound(
+            &cache,
+            &contacts,
+            &revoked,
+            &moves,
+            &shared_policy,
+            &machine,
+        )
+        .await
+        .unwrap();
+        assert_eq!(surviving, vec![b.agent_id()]);
+        let ctx = AttestationVerifyCtx {
+            discovery_cache: cache,
+            contact_store: contacts,
+            own_machine_id: recipient,
+            now_ms: now_ms(),
+            revocation_set: revoked,
+            move_state: moves,
+        };
+        let good = v2_wire_round_trip(&signed_v2_header("127.0.0.1", 22, &b, recipient)).await;
+        assert_eq!(
+            decide_inbound_attested(&good, &policy, &machine, &ctx).await,
+            Ok(target)
+        );
+        let excluded = v2_wire_round_trip(&signed_v2_header("127.0.0.1", 22, &a, recipient)).await;
+        assert_eq!(
+            decide_inbound_attested(&excluded, &policy, &machine, &ctx).await,
+            Err(ConnectDenialReason::AttestationFailed),
+            "a valid old opener signature cannot restore a dead placement"
+        );
+    }
+
+    #[tokio::test]
+    async fn r132_attested_opener_rechecks_expiry_and_revocation() {
+        let kp = AgentKeypair::generate().unwrap();
+        let machine = MachineId([24; 32]);
+        let recipient = MachineId([25; 32]);
+        let cache = cache_with_agent(&kp, machine);
+        let ctx = AttestationVerifyCtx {
+            discovery_cache: cache.clone(),
+            contact_store: trusted_store(kp.agent_id()),
+            own_machine_id: recipient,
+            now_ms: now_ms(),
+            revocation_set: Arc::new(tokio::sync::RwLock::new(
+                crate::revocation::RevocationSet::new(),
+            )),
+            move_state: Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new())),
+        };
+        let target = "127.0.0.1:22".parse().unwrap();
+        let policy = policy_with_allow(kp.agent_id(), machine, target);
+        let shared_policy = Arc::new(std::sync::RwLock::new(Arc::new(policy.clone())));
+        assert_eq!(
+            crate::Agent::gate_peer_machine_inbound(
+                &ctx.discovery_cache,
+                &ctx.contact_store,
+                &ctx.revocation_set,
+                &ctx.move_state,
+                &shared_policy,
+                &machine
+            )
+            .await
+            .unwrap(),
+            vec![kp.agent_id()]
+        );
+        let header = v2_wire_round_trip(&signed_v2_header("127.0.0.1", 22, &kp, recipient)).await;
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &ctx).await,
+            Ok(target)
+        );
+        cache
+            .write()
+            .await
+            .get_mut(&kp.agent_id())
+            .unwrap()
+            .cert_not_after = Some(1);
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &ctx).await,
+            Err(ConnectDenialReason::AttestationFailed)
+        );
+        cache
+            .write()
+            .await
+            .get_mut(&kp.agent_id())
+            .unwrap()
+            .cert_not_after = None;
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            1,
+            None,
+        )
+        .unwrap();
+        ctx.revocation_set
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .unwrap();
+        assert_eq!(
+            decide_inbound_attested(&header, &policy, &machine, &ctx).await,
+            Err(ConnectDenialReason::AttestationFailed)
         );
     }
 
@@ -2558,6 +2796,62 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "binds loopback TCP listeners; run only in the isolated integration tier"]
+    async fn port_zero_forwards_are_listed_and_removed_by_bound_address() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(agent.clone(), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+        let peer = AgentId([7; 32]);
+        let spec = |peer_agent| ForwardSpec {
+            local_addr: "127.0.0.1:0".parse().expect("loopback address"),
+            peer_agent,
+            target_host: "127.0.0.1".to_string(),
+            target_port: 9,
+        };
+
+        let first = service.add_forward(spec(peer)).await.expect("first bind");
+        let second = service.add_forward(spec(peer)).await.expect("second bind");
+        assert_ne!(first, second);
+        assert!(first.port() != 0 && second.port() != 0);
+        let listed = service.list_forwards();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|entry| entry.local_addr == first));
+        assert!(listed.iter().any(|entry| entry.local_addr == second));
+
+        assert!(service.remove_forward(first));
+        assert!(!service.remove_forward(first));
+        wait_until_bindable(first).await;
+        assert_eq!(service.list_forwards().len(), 1);
+        assert!(service.remove_forward(second));
+        wait_until_bindable(second).await;
+        assert!(service.list_forwards().is_empty());
+        service.shutdown();
+        agent.shutdown().await;
+    }
+
+    async fn wait_until_bindable(addr: SocketAddr) {
+        for _ in 0..100 {
+            if TcpListener::bind(addr).await.is_ok() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("listener {addr} did not close within bounded wait");
+    }
+
+    #[tokio::test]
     async fn decide_inbound_attested_matrix() {
         let kp = AgentKeypair::generate().unwrap();
         let agent = kp.agent_id();
@@ -2579,7 +2873,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts
+                    now_ms: ts,
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2597,7 +2897,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts
+                    now_ms: ts,
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2617,7 +2923,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts
+                    now_ms: ts,
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2636,7 +2948,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts
+                    now_ms: ts,
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2655,7 +2973,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts
+                    now_ms: ts,
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2674,7 +2998,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts
+                    now_ms: ts,
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2722,6 +3052,12 @@ mod tests {
                     contact_store: contacts,
                     own_machine_id: own_machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 },
             )
             .await
@@ -2756,7 +3092,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: own_machine,
-                    now_ms: now_ms()
+                    now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2785,7 +3127,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: other_machine,
-                    now_ms: now_ms()
+                    now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2817,7 +3165,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts
+                    now_ms: ts,
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2849,7 +3203,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts
+                    now_ms: ts,
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2878,7 +3238,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms()
+                    now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2942,7 +3308,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms()
+                    now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -2959,7 +3331,13 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms()
+                    now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await
@@ -3025,6 +3403,12 @@ mod tests {
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
                     now_ms: now_ms(),
+                    revocation_set: Arc::new(tokio::sync::RwLock::new(
+                        crate::revocation::RevocationSet::new()
+                    )),
+                    move_state: Arc::new(tokio::sync::RwLock::new(
+                        crate::key_move::MoveState::new()
+                    )),
                 }
             )
             .await

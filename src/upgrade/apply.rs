@@ -101,23 +101,47 @@ impl AutoApplyUpgrader {
     ///
     /// Unsupervised (the default for a terminal-launched daemon) this runs the
     /// transactional handoff and never returns. Supervised it exits for the
-    /// supervisor and never returns. Returns `Err` only when the handoff could
-    /// not even be started (helper spawn failure) — the old process keeps
-    /// running in that case.
+    /// supervisor and never returns. Returns `Err` when the restart contract
+    /// cannot be resolved (ADR-0061 §1/§2) or when the handoff could not even
+    /// be started (helper spawn failure) — the old process keeps running in
+    /// both cases.
     pub fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
         let target_path = current_binary_path()?;
-        self.trigger_restart(&target_path, target_version)
+        let plan = self.resolve_restart_plan(&target_path)?;
+        self.trigger_restart(&plan, target_version)
     }
 
     /// Classify the restart mode for the current environment (I0).
-    pub fn restart_mode(&self) -> restart::RestartMode {
+    pub fn restart_mode(&self) -> Result<restart::RestartMode, restart::RestartOwnershipError> {
         self.restart_mode_with(&restart::SupervisionSignals::sample())
     }
 
     /// Classification with injected signals — the single planner every apply
     /// caller routes through (startup check, gossip, fallback poll, HTTP).
-    pub fn restart_mode_with(&self, signals: &restart::SupervisionSignals) -> restart::RestartMode {
+    pub fn restart_mode_with(
+        &self,
+        signals: &restart::SupervisionSignals,
+    ) -> Result<restart::RestartMode, restart::RestartOwnershipError> {
         restart::plan_restart_mode(self.stop_on_upgrade, signals)
+    }
+
+    /// Resolve and validate this instance's restart contract (ADR-0061 §1).
+    ///
+    /// Every apply path calls this **before** replacing any binary, so a
+    /// conflicting or unresolvable contract fails while the current image is
+    /// still serving and the installed bytes are untouched.
+    pub fn resolve_restart_plan(
+        &self,
+        binary_path: &Path,
+    ) -> Result<restart::RestartPlan, UpgradeError> {
+        restart::resolve_restart_plan(
+            self.stop_on_upgrade,
+            &restart::SupervisionSignals::sample(),
+            binary_path,
+            self.restart_context.data_dir.as_deref(),
+            self.restart_context.api_addr,
+        )
+        .map_err(UpgradeError::from)
     }
 
     /// Apply an upgrade from a `ReleaseManifest`.
@@ -155,6 +179,24 @@ impl AutoApplyUpgrader {
             .ok_or(UpgradeError::NoPlatformAsset)?;
 
         let target_path = current_binary_path()?;
+
+        // ADR-0061 §1 — resolve before mutation. The restart owner, intended
+        // exit behaviour, executable/argv and effective roots are resolved and
+        // validated here, before a single byte of either the daemon or the
+        // companion binary changes. A conflicting or unresolvable contract
+        // (§2) returns Err with the current process still serving and the
+        // installed binaries untouched. The plan is then carried through
+        // replacement and restart — never re-derived post-swap.
+        let restart_plan = self.resolve_restart_plan(&target_path)?;
+        info!(
+            mode = ?restart_plan.mode,
+            supervision = restart_plan.supervision_signal.as_deref().unwrap_or("none"),
+            stop_on_upgrade = self.stop_on_upgrade,
+            data_root = %restart_plan.data_root.display(),
+            spawns_helper = restart_plan.spawns_helper(),
+            "Restart contract resolved before replacement"
+        );
+
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
@@ -249,15 +291,27 @@ impl AutoApplyUpgrader {
         }
 
         if matches!(result, UpgradeResult::Success { .. }) {
+            // ADR-0061 §6 — report honestly. Installed bytes, a pending
+            // restart, observed readiness and recovery are four distinct
+            // facts; only the first is established at this point.
             info!(
                 version = %target_version,
-                "Successfully upgraded to version {}",
+                installed_bytes = true,
+                restart = "pending",
+                restart_mode = ?restart_plan.mode,
+                readiness_observed = false,
+                recovery = "none",
+                "Upgrade bytes installed for version {}; restart is pending and \
+                 replacement readiness has not been observed yet",
                 target_version
             );
             if self.restart_on_success {
-                if let Err(e) = self.trigger_restart(&target_path, &target_version.to_string()) {
+                if let Err(e) = self.trigger_restart(&restart_plan, &target_version.to_string()) {
                     warn!(
                         error = %e,
+                        installed_bytes = true,
+                        restart = "not_started",
+                        readiness_observed = false,
                         "Restart after successful upgrade did not start: {e}; \
                          old process keeps serving"
                     );
@@ -268,48 +322,27 @@ impl AutoApplyUpgrader {
         Ok(result)
     }
 
-    /// Trigger a restart after successful upgrade (#261).
+    /// Execute an already-resolved restart plan (#261, ADR-0061 §1).
     ///
-    /// Classification first (I0): `SupervisedExit` only when `stop_on_upgrade`
-    /// is true AND a real supervision signal is present (`INVOCATION_ID`,
-    /// parent comm `systemd`, `X0X_SUPERVISED=1`). Everything else — including
-    /// unsupervised runs with the default `stop_on_upgrade = true` — goes
-    /// through the transactional handoff, which proves `/health` on the new
-    /// binary or restores the backup. The old `exec()` path is gone: it could
-    /// not roll back.
+    /// The plan is *not* re-classified here: it was resolved and validated
+    /// before replacement, so this only carries it out.
+    ///
+    /// - `SupervisedExit` (supervision present **and** `stop_on_upgrade`
+    ///   true) writes the intent record and exits for the external owner.
+    ///   ADR-0061 §5: no detached helper is spawned on this path, so nothing
+    ///   can start a second daemon on the same data root.
+    /// - `TransactionalHandoff` (genuinely unsupervised, including the default
+    ///   `stop_on_upgrade = true` terminal launch) runs the helper, which
+    ///   proves `/health` on the new binary or restores the backup.
     fn trigger_restart(
         &self,
-        binary_path: &Path,
+        plan: &restart::RestartPlan,
         target_version: &str,
     ) -> Result<(), UpgradeError> {
-        let mode = self.restart_mode();
-        info!(
-            mode = ?mode,
-            stop_on_upgrade = self.stop_on_upgrade,
-            "Restart planned after successful upgrade"
-        );
+        let handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
+        let handoff_path = plan.handoff_path();
 
-        let backup_path = restart::UpgradeHandoff::backup_path_for(binary_path);
-        let handoff = restart::UpgradeHandoff::capture(
-            binary_path,
-            &backup_path,
-            target_version,
-            self.restart_context
-                .api_addr
-                .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
-            mode,
-        );
-        let handoff_path = match self.restart_context.data_dir.as_deref() {
-            Some(data_dir) => data_dir.join(restart::HANDOFF_FILE_NAME),
-            // Non-daemon caller with no data dir: keep the intent record next
-            // to the binary rather than losing it entirely.
-            None => binary_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(restart::HANDOFF_FILE_NAME),
-        };
-
-        match mode {
+        match plan.mode {
             restart::RestartMode::SupervisedExit => {
                 // I3: write the intent file BEFORE exiting so a supervisor
                 // crash loop is diagnosable. Best-effort — the exit contract
@@ -321,10 +354,23 @@ impl AutoApplyUpgrader {
                         "Failed to write upgrade intent file before supervised exit"
                     );
                 }
-                let exit_code = if cfg!(windows) { 100 } else { 0 };
+                let exit_code = plan
+                    .supervised_exit_code
+                    .unwrap_or_else(restart::supervised_exit_code);
+                // ADR-0061 §6: this exit is a *restart request* to the owner
+                // named in `supervision`. It is not health acceptance, and it
+                // arms no automatic rollback — recovery on this path is the
+                // documented manual operator procedure.
                 info!(
                     exit_code = exit_code,
-                    "Exiting with code {} for service manager restart", exit_code
+                    supervision = plan.supervision_signal.as_deref().unwrap_or("none"),
+                    installed_bytes = true,
+                    restart = "requested_from_supervisor",
+                    readiness_observed = false,
+                    automatic_rollback = false,
+                    "Exiting with code {} to request a restart from the service manager; \
+                     replacement readiness is observed by the supervisor, not by x0xd",
+                    exit_code
                 );
                 std::process::exit(exit_code);
             }
@@ -695,7 +741,8 @@ mod tests {
     #[test]
     fn upgrader_restart_mode_routes_through_the_single_planner() {
         // Whatever flags/context an apply caller sets, the mode decision must
-        // come from plan_restart_mode — there is no second ad-hoc exit path.
+        // come from plan_restart_mode — there is no second ad-hoc exit path,
+        // and no caller-local way to route around the ADR-0061 refusal.
         for stop in [true, false] {
             let upgrader = AutoApplyUpgrader::new("x0xd").with_stop_on_upgrade(stop);
             for signals in [
@@ -716,6 +763,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn apply_path_refuses_conflicting_managed_config_before_any_replacement() {
+        // ADR-0061 §1+§2 on the apply path itself: `resolve_restart_plan` is
+        // what `apply_upgrade_from_manifest` calls before it downloads or
+        // replaces anything, so a supervised instance configured with
+        // stop_on_upgrade=false must fail here — with the current binary still
+        // on disk and still serving — rather than after the swap.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("x0xd");
+        std::fs::write(&binary, b"current image").expect("write binary");
+
+        let upgrader = AutoApplyUpgrader::new("x0xd")
+            .with_stop_on_upgrade(false)
+            .with_restart_context(RestartContext {
+                data_dir: Some(dir.path().to_path_buf()),
+                api_addr: None,
+                shutdown: None,
+            });
+
+        // Sampled signals are the real environment, so drive the refusal
+        // through the planner the resolver delegates to.
+        let supervised = restart::SupervisionSignals {
+            x0x_supervised: true,
+            ..Default::default()
+        };
+        let err = upgrader
+            .restart_mode_with(&supervised)
+            .expect_err("supervised + stop_on_upgrade=false must be refused");
+        assert!(matches!(
+            err,
+            restart::RestartOwnershipError::SupervisedRestartConflict { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&binary).expect("binary still present"),
+            b"current image",
+            "a refused apply must leave the installed binary untouched"
+        );
     }
 
     #[test]

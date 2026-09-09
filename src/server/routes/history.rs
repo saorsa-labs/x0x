@@ -15,14 +15,20 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use std::sync::Arc;
-use x0x::history::{HistoryQuery, Scope, Store, StoredRecord};
+use x0x::history::{HistoryQuery, Scope, ScopeSummary, Store, StoredRecord};
 
 /// Query parameters shared by `GET /history` and `GET /history/search`.
 #[derive(Debug, serde::Deserialize)]
 pub(in crate::server) struct HistoryListParams {
     /// Canonical scope string: `dm:<agent_hex>` | `group:<stable_id>` |
     /// `topic:<name>`.
-    scope: String,
+    ///
+    /// **Required by `GET /history`** (the handler 400s without it, and the
+    /// ADR-0039 rider grant is expressed per scope, so a scope-less list can
+    /// never be authorized). **Optional on `GET /history/search`** (issue
+    /// #275): omitting it searches the owner's whole retained local history
+    /// across scopes. A supplied-but-malformed scope is still a 400 on both.
+    scope: Option<String>,
     /// Inclusive lower bound on `seen_at_ms`.
     since_ms: Option<i64>,
     /// Inclusive upper bound on `seen_at_ms`.
@@ -39,9 +45,9 @@ fn parse_scope(s: &str) -> Result<Scope, String> {
     Scope::parse(s).map_err(|e| format!("invalid scope {s:?}: {e}"))
 }
 
-fn query_from(params: &HistoryListParams, scope: Scope) -> HistoryQuery {
+fn query_from(params: &HistoryListParams, scope: Option<Scope>) -> HistoryQuery {
     HistoryQuery {
-        scope: Some(scope),
+        scope,
         scope_kind: None,
         since_ms: params.since_ms,
         until_ms: params.until_ms,
@@ -117,7 +123,13 @@ pub(in crate::server) async fn history_list(
     let Some(history) = state.agent.history() else {
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "history store disabled");
     };
-    let scope = match parse_scope(&params.scope) {
+    // `scope` stays REQUIRED here (issue #275 relaxed it only for
+    // `/history/search`): the ADR-0039 rider grant is expressed per group
+    // scope, so a scope-less listing has nothing to authorize against.
+    let Some(requested_scope) = params.scope.as_deref() else {
+        return api_error(StatusCode::BAD_REQUEST, "missing required parameter scope");
+    };
+    let scope = match parse_scope(requested_scope) {
         Ok(s) => s,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
@@ -147,7 +159,7 @@ pub(in crate::server) async fn history_list(
         );
     }
     let store = Arc::clone(history.store());
-    let q = query_from(&params, scope);
+    let q = query_from(&params, Some(scope));
     match tokio::task::spawn_blocking(move || store.query(&q)).await {
         Ok(Ok(rows)) => {
             let next_before_id = rows.last().map(|r| r.id);
@@ -292,7 +304,21 @@ fn resolve_history_message(
     Ok(None)
 }
 
-/// GET /history/search — FTS5 search over text payloads within a scope.
+/// GET /history/search — FTS5 search over text payloads.
+///
+/// `scope` is OPTIONAL (issue #275): omitted, the search runs across every
+/// scope in the owner's retained local history; supplied, it narrows to that
+/// one scope exactly as before. A malformed `scope` is still a 400, and an
+/// absent or blank `q` is still a 400 — omitting `scope` widens the search,
+/// it never relaxes validation.
+///
+/// Owner-only: `/history/search` is not in the ADR-0039 rider allowlist, so
+/// the auth middleware 403s a rider token before this handler runs. That is
+/// what keeps the cross-scope form from leaking counts or rows outside a
+/// rider's granted groups.
+///
+/// Paginates on the same newest-rowid-first keyset as `GET /history`:
+/// `before_id` in, `next_before_id` out.
 pub(in crate::server) async fn history_search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HistoryListParams>,
@@ -303,7 +329,7 @@ pub(in crate::server) async fn history_search(
     let Some(needle) = params.q.clone().filter(|s| !s.trim().is_empty()) else {
         return api_error(StatusCode::BAD_REQUEST, "missing search parameter q");
     };
-    let scope = match parse_scope(&params.scope) {
+    let scope = match params.scope.as_deref().map(parse_scope).transpose() {
         Ok(s) => s,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
@@ -311,13 +337,91 @@ pub(in crate::server) async fn history_search(
     let q = query_from(&params, scope);
     match tokio::task::spawn_blocking(move || store.search(&needle, &q)).await {
         Ok(Ok(rows)) => {
+            let next_before_id = rows.last().map(|r| r.id);
             let items: Vec<_> = rows.iter().map(row_json).collect();
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "count": items.len(), "records": items })),
+                Json(serde_json::json!({
+                    "ok": true,
+                    "count": items.len(),
+                    "next_before_id": next_before_id,
+                    "records": items,
+                })),
             )
         }
         Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("search: {e}")),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
+    }
+}
+
+/// Query parameters for `GET /history/scopes`.
+#[derive(Debug, serde::Deserialize)]
+pub(in crate::server) struct HistoryScopesParams {
+    /// Keyset cursor: the canonical scope string of the last row of the
+    /// previous page. Enumeration resumes strictly after its
+    /// `(scope_kind, scope_id)` tuple. Malformed ⇒ 400.
+    after_scope: Option<String>,
+    /// Max scopes (server clamps to [`x0x::history::MAX_QUERY_LIMIT`];
+    /// omitted or 0 ⇒ the history default of 100).
+    limit: Option<usize>,
+}
+
+/// Serialize one scope-enumeration row.
+fn scope_json(summary: &ScopeSummary) -> serde_json::Value {
+    serde_json::json!({
+        "scope": summary.scope.canonical(),
+        "scope_kind": summary.scope.kind(),
+        "scope_id": summary.scope.id(),
+        "rows": summary.rows,
+        "newest_seen_at_ms": summary.newest_seen_at_ms,
+    })
+}
+
+/// GET /history/scopes — enumerate the scopes that still hold retained rows
+/// (issue #275 discovery), ascending by `(scope_kind, scope_id)`.
+///
+/// Answers "what can I query?" without the caller already knowing a scope
+/// string. Each row carries the canonical scope, its stored
+/// `scope_kind`/`scope_id` columns, its retained row count, and the newest
+/// `seen_at_ms` in it. Counts are of LOCALLY RETAINED rows only — retention
+/// and `DELETE /history` shrink them, and a scope whose last row is gone
+/// disappears entirely. This is not a claim about network completeness.
+///
+/// Paging uses the `(scope_kind, scope_id)` keyset (`after_scope`), never an
+/// offset and never a timestamp, so it is stable under concurrent writes;
+/// it is live, not a snapshot.
+///
+/// Owner-only: not in the ADR-0039 rider allowlist, so the middleware 403s
+/// rider tokens before this handler runs — a rider cannot learn that scopes
+/// outside its grants exist, nor their counts.
+pub(in crate::server) async fn history_scopes(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HistoryScopesParams>,
+) -> impl IntoResponse {
+    let Some(history) = state.agent.history() else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "history store disabled");
+    };
+    let after = match params.after_scope.as_deref().map(parse_scope).transpose() {
+        Ok(s) => s,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
+    };
+    let limit = params.limit.unwrap_or(0);
+    let store = Arc::clone(history.store());
+    match tokio::task::spawn_blocking(move || store.scopes(after.as_ref(), limit)).await {
+        Ok(Ok(summaries)) => {
+            let next_after_scope = summaries.last().map(|s| s.scope.canonical());
+            let items: Vec<_> = summaries.iter().map(scope_json).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "count": items.len(),
+                    "next_after_scope": next_after_scope,
+                    "scopes": items,
+                })),
+            )
+        }
+        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("scopes: {e}")),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
     }
 }
@@ -410,7 +514,7 @@ pub(in crate::server) async fn history_diagnostics(
 mod tests {
     use super::*;
     use x0x::groups::{GroupPublicMessage, GroupPublicMessageKind};
-    use x0x::history::{Direction, HistoryRecord, Provenance, Store};
+    use x0x::history::{Direction, HistoryRecord, InsertOutcome, Provenance, Store};
 
     #[test]
     fn group_history_json_uses_canonical_message_id_and_thread_ancestry() {
@@ -606,5 +710,582 @@ mod tests {
         .expect("local canonical target");
         assert_eq!(local_resolved.record.msg_id, local_target.msg_id);
         assert_eq!(local_resolved.record.provenance, Provenance::LocalSend);
+    }
+
+    #[test]
+    fn canonical_projection_rejects_scope_and_body_mismatches() {
+        let dir = tempfile::tempdir().expect("temporary history directory");
+        let store = Store::open(&dir.path().join("history.db")).expect("open history store");
+        let message = GroupPublicMessage {
+            group_id: "canonical-guard".to_string(),
+            state_hash_at_send: "state".to_string(),
+            revision_at_send: 1,
+            author_agent_id: "author".to_string(),
+            author_public_key: "key".to_string(),
+            author_user_id: None,
+            kind: GroupPublicMessageKind::Chat,
+            body: "canonical body".to_string(),
+            timestamp: 1,
+            thread_root: None,
+            thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
+            rider_provenance: None,
+            signature: "signature".to_string(),
+        };
+        let artifact = serde_json::to_vec(&message).expect("serialize artifact");
+        let canonical = message.msg_id();
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical)
+            .expect("canonical hex")
+            .try_into()
+            .expect("canonical length");
+
+        let record = |scope: Scope, payload: Vec<u8>, seen_at_ms: i64| HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope,
+            author_agent: Some("author".to_string()),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: seen_at_ms,
+            seen_at_ms,
+            direction: Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: Some(artifact.clone()),
+            signature: Some(vec![1]),
+            sig_context: Some("x0x.group.public-message.v2".to_string()),
+            provenance: Provenance::VerifiedEnvelope,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        let wrong_scope = record(
+            Scope::Group("other-group".to_string()),
+            message.body.as_bytes().to_vec(),
+            1,
+        );
+        let wrong_body = record(
+            Scope::Group(message.group_id.clone()),
+            b"tampered body".to_vec(),
+            2,
+        );
+        let wrong_scope_id = wrong_scope.msg_id;
+        let wrong_body_id = wrong_body.msg_id;
+        store.insert(&wrong_scope).expect("insert scope mismatch");
+        store.insert(&wrong_body).expect("insert body mismatch");
+
+        for (id, scope) in [
+            (wrong_scope_id, "other-group"),
+            (wrong_body_id, "canonical-guard"),
+        ] {
+            assert!(store.get_by_msg_id(id).expect("dedupe lookup").is_some());
+            assert!(
+                resolve_history_message(
+                    &store,
+                    canonical_bytes,
+                    &canonical,
+                    Some(Scope::Group(scope.to_string())),
+                )
+                .expect("canonical lookup")
+                .is_none(),
+                "mismatched artifact must never resolve as canonical group {scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_projection_dedupes_local_and_verified_recorders() {
+        let dir = tempfile::tempdir().expect("temporary history directory");
+        let store = Store::open(&dir.path().join("history.db")).expect("open history store");
+        let message = GroupPublicMessage {
+            group_id: "recorder-order".to_string(),
+            state_hash_at_send: "state".to_string(),
+            revision_at_send: 1,
+            author_agent_id: "author".to_string(),
+            author_public_key: "key".to_string(),
+            author_user_id: None,
+            kind: GroupPublicMessageKind::Chat,
+            body: "same signed body".to_string(),
+            timestamp: 1,
+            thread_root: None,
+            thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
+            rider_provenance: None,
+            signature: "signature".to_string(),
+        };
+        let artifact = serde_json::to_vec(&message).expect("serialize artifact");
+        let payload = message.body.as_bytes().to_vec();
+        let make_record = |provenance| HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope: Scope::Group(message.group_id.clone()),
+            author_agent: Some(message.author_agent_id.clone()),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1,
+            seen_at_ms: 1,
+            direction: Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload: payload.clone(),
+            signed_artifact: Some(artifact.clone()),
+            signature: Some(vec![1]),
+            sig_context: Some("x0x.group.public-message.v2".to_string()),
+            provenance,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        let local = make_record(Provenance::LocalSend);
+        let verified = make_record(Provenance::VerifiedEnvelope);
+        assert_eq!(
+            store.insert(&local).expect("insert LocalSend"),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            store.insert(&verified).expect("insert VerifiedEnvelope"),
+            InsertOutcome::Duplicate,
+            "same signed artifact/body must not create competing history rows"
+        );
+        let canonical = message.msg_id();
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical)
+            .expect("canonical hex")
+            .try_into()
+            .expect("canonical length");
+        let resolved = resolve_history_message(
+            &store,
+            canonical_bytes,
+            &canonical,
+            Some(Scope::Group(message.group_id)),
+        )
+        .expect("canonical lookup")
+        .expect("deduped canonical row");
+        assert_eq!(resolved.record.provenance, Provenance::LocalSend);
+    }
+
+    #[test]
+    fn canonical_projection_backfills_after_auxiliary_table_loss() {
+        let dir = tempfile::tempdir().expect("temporary history directory");
+        let db = dir.path().join("history.db");
+        let message = GroupPublicMessage {
+            group_id: "backfill-group".to_string(),
+            state_hash_at_send: "state".to_string(),
+            revision_at_send: 1,
+            author_agent_id: "author".to_string(),
+            author_public_key: "key".to_string(),
+            author_user_id: None,
+            kind: GroupPublicMessageKind::Chat,
+            body: "backfill body".to_string(),
+            timestamp: 1,
+            thread_root: None,
+            thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
+            rider_provenance: None,
+            signature: "signature".to_string(),
+        };
+        let artifact = serde_json::to_vec(&message).expect("serialize artifact");
+        let payload = message.body.as_bytes().to_vec();
+        let row = HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+            scope: Scope::Group(message.group_id.clone()),
+            author_agent: Some(message.author_agent_id.clone()),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1,
+            seen_at_ms: 1,
+            direction: Direction::Outbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: Some(artifact),
+            signature: Some(vec![1]),
+            sig_context: Some("x0x.group.public-message.v2".to_string()),
+            provenance: Provenance::LocalSend,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        let canonical = message.msg_id();
+        let canonical_bytes: [u8; 32] = hex::decode(&canonical)
+            .expect("canonical hex")
+            .try_into()
+            .expect("canonical length");
+        {
+            let store = Store::open(&db).expect("open history store");
+            store.insert(&row).expect("insert history row");
+        }
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open legacy-shaped database");
+            conn.execute_batch("DROP TABLE history_canonical_ids;")
+                .expect("drop derived table");
+        }
+        let reopened = Store::open(&db).expect("reopen and backfill history store");
+        let resolved = resolve_history_message(
+            &reopened,
+            canonical_bytes,
+            &canonical,
+            Some(Scope::Group(message.group_id)),
+        )
+        .expect("canonical lookup after backfill")
+        .expect("backfill must restore valid projection");
+        assert_eq!(resolved.record.msg_id, row.msg_id);
+        assert_eq!(resolved.record.provenance, Provenance::LocalSend);
+    }
+}
+
+#[cfg(test)]
+mod discovery_auth_tests {
+    //! Issue #275 read surface, driven through the REAL `auth_middleware`
+    //! and the REAL handlers on an in-process router — no sockets, no
+    //! daemon, no test-only auth shim.
+    //!
+    //! ADR-0039 is accepted and unchanged: `rider_route_allowed` admits
+    //! GET `/history` and nothing else under `/history`. The tests below
+    //! assert the consequence at the REQUEST layer rather than by
+    //! re-reading the predicate, because the predicate agreeing with itself
+    //! would not prove the middleware is in the path for these new routes.
+
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::get;
+    use tower::ServiceExt;
+    use x0x::history::{Direction, HistoryConfig, HistoryRecord, Provenance};
+
+    /// The fixture's durable API token (`secure_endpoint_test_state_at`
+    /// hard-codes `"test-token"`).
+    const DURABLE: &str = "test-token";
+    const GRANTED_GROUP: &str = "granted-group";
+
+    /// Owned state whose agent has a real, isolated history store.
+    async fn history_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
+        let identity_dir = dir.join("identity");
+        tokio::fs::create_dir_all(&identity_dir).await?;
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(&identity_dir)
+                .with_machine_key(identity_dir.join("machine.key"))
+                .with_agent_key_path(identity_dir.join("agent.key"))
+                .with_agent_cert_path(identity_dir.join("agent.cert"))
+                .with_user_key(x0x::identity::UserKeypair::generate()?)
+                .with_contact_store_path(dir.join("contacts.json"))
+                .with_history(HistoryConfig {
+                    db_path: Some(dir.join("history.db")),
+                    ..HistoryConfig::daemon_default()
+                })
+                .build()
+                .await?,
+        );
+        super::super::named_groups::tests::secure_endpoint_test_state_at(dir, agent).await
+    }
+
+    /// The history routes exactly as `server::mod` wires them, behind the
+    /// production auth middleware.
+    fn history_router(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route("/history", get(history_list))
+            .route("/history/scopes", get(history_scopes))
+            .route("/history/search", get(history_search))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn get_as(
+        app: &axum::Router,
+        path: &str,
+        bearer: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    /// A rider token granted exactly `GRANTED_GROUP`.
+    async fn rider_token(state: &AppState) -> String {
+        let mut store = state.rider_tokens.lock().await;
+        let (token, _record) = store
+            .issue(
+                "aa".repeat(32),
+                vec![GRANTED_GROUP.to_string()],
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await
+            .expect("rider token issues");
+        token
+    }
+
+    fn text_row(scope: Scope, body: &str, seen_at_ms: i64) -> HistoryRecord {
+        HistoryRecord {
+            msg_id: HistoryRecord::compute_msg_id(None, body.as_bytes()),
+            scope,
+            author_agent: Some("aa".repeat(32)),
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: seen_at_ms,
+            seen_at_ms,
+            direction: Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload: body.as_bytes().to_vec(),
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: Provenance::LocalAppDecrypt,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        }
+    }
+
+    /// Seed one searchable row per scope kind, including the rider's
+    /// granted group and a group it was NOT granted.
+    fn seed(state: &AppState) {
+        let store = state.agent.history().expect("history enabled").store();
+        for (scope, body, seen) in [
+            (Scope::Dm("peer-a".into()), "needle in the dm", 1_000),
+            (
+                Scope::Group(GRANTED_GROUP.into()),
+                "needle in the granted group",
+                2_000,
+            ),
+            (
+                Scope::Group("secret-group".into()),
+                "needle in the ungranted group",
+                3_000,
+            ),
+            (Scope::Topic("chat".into()), "needle in the topic", 4_000),
+        ] {
+            store.insert(&text_row(scope, body, seen)).expect("insert");
+        }
+    }
+
+    /// WHY (ADR-0039, unchanged): the cross-scope search added by issue #275
+    /// would hand a rider every scope in the store at once. The accepted
+    /// boundary admits GET `/history` and nothing else, so the middleware
+    /// must reject the rider BEFORE the handler runs — asserted here with a
+    /// real request, since a handler-level check alone could be bypassed by
+    /// any future route that forgets it.
+    #[tokio::test]
+    async fn rider_is_denied_search_and_scopes_but_keeps_granted_group_list() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed(&state);
+        let app = history_router(Arc::clone(&state));
+        let rider = rider_token(&state).await;
+
+        for path in [
+            "/history/search?q=needle",
+            "/history/search?scope=group:granted-group&q=needle",
+            "/history/scopes",
+            "/history/scopes?limit=1",
+        ] {
+            let (status, json) = get_as(&app, path, &rider).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "rider must be denied {path}: {json}"
+            );
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("deny-by-default"),
+                "denial must come from the ADR-0039 middleware, not a handler: {json}"
+            );
+        }
+
+        // The retained grant still works, unchanged.
+        let (status, json) = get_as(&app, "/history?scope=group:granted-group", &rider).await;
+        assert_eq!(status, StatusCode::OK, "granted group list: {json}");
+        assert_eq!(json["count"], 1);
+        assert_eq!(json["records"][0]["scope"], "group:granted-group");
+
+        // …and only for the granted scope.
+        for path in [
+            "/history?scope=group:secret-group",
+            "/history?scope=dm:peer-a",
+            "/history?scope=topic:chat",
+        ] {
+            let (status, json) = get_as(&app, path, &rider).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {json}");
+        }
+        Ok(())
+    }
+
+    /// WHY (issue #275): omitting `scope` must widen the search to every
+    /// retained scope while supplying one must still narrow it. Driven
+    /// through the router so the optional-`scope` deserialization, not just
+    /// the store call, is what is proven.
+    #[tokio::test]
+    async fn owner_search_spans_scopes_without_scope_and_narrows_with_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed(&state);
+        let app = history_router(Arc::clone(&state));
+
+        let (status, json) = get_as(&app, "/history/search?q=needle", DURABLE).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["count"], 4, "every scope is searched: {json}");
+        assert!(
+            json["next_before_id"].is_i64(),
+            "search must expose the rowid cursor for paging: {json}"
+        );
+
+        let (status, json) =
+            get_as(&app, "/history/search?scope=dm:peer-a&q=needle", DURABLE).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["count"], 1, "scoped search still filters: {json}");
+        assert_eq!(json["records"][0]["scope"], "dm:peer-a");
+        Ok(())
+    }
+
+    /// WHY (issue #275): the cursor a page hands back must be the cursor the
+    /// next page accepts. Two single-row pages over a four-row result set
+    /// prove the round trip and that the second page does not repeat the
+    /// first row.
+    #[tokio::test]
+    async fn owner_search_pages_through_its_own_next_before_id() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed(&state);
+        let app = history_router(Arc::clone(&state));
+
+        let (_, first) = get_as(&app, "/history/search?q=needle&limit=1", DURABLE).await;
+        let cursor = first["next_before_id"].as_i64().expect("cursor");
+        assert_eq!(first["records"][0]["id"], cursor);
+
+        let (status, second) = get_as(
+            &app,
+            &format!("/history/search?q=needle&limit=1&before_id={cursor}"),
+            DURABLE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["count"], 1);
+        assert!(
+            second["records"][0]["id"].as_i64().expect("id") < cursor,
+            "the next page is strictly older: {second}"
+        );
+        Ok(())
+    }
+
+    /// WHY (issue #275): discovery is the point — a caller with no scope
+    /// string must be able to learn which scopes exist, how many retained
+    /// rows each holds, and how recent they are, then walk them with the
+    /// canonical cursor.
+    #[tokio::test]
+    async fn owner_scopes_enumerates_and_pages_by_canonical_cursor() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed(&state);
+        let app = history_router(Arc::clone(&state));
+
+        let (status, json) = get_as(&app, "/history/scopes", DURABLE).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["count"], 4, "{json}");
+        let first = &json["scopes"][0];
+        assert_eq!(first["scope"], "dm:peer-a");
+        assert_eq!(first["scope_kind"], 0);
+        assert_eq!(first["scope_id"], "peer-a");
+        assert_eq!(first["rows"], 1);
+        assert_eq!(first["newest_seen_at_ms"], 1_000);
+        assert_eq!(json["next_after_scope"], "topic:chat");
+
+        let (status, page) = get_as(&app, "/history/scopes?limit=1", DURABLE).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["next_after_scope"], "dm:peer-a");
+        let (status, page2) = get_as(
+            &app,
+            "/history/scopes?limit=1&after_scope=dm:peer-a",
+            DURABLE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page2}");
+        assert_eq!(
+            page2["scopes"][0]["scope"], "group:granted-group",
+            "the cursor is exclusive and resumes in (kind, id) order: {page2}"
+        );
+        Ok(())
+    }
+
+    /// WHY (issue #275): relaxing `scope` on search must not relax anything
+    /// else. `GET /history` keeps requiring it (the rider grant is scoped),
+    /// a supplied-but-malformed scope is still rejected on both, a blank `q`
+    /// is still rejected, and a malformed enumeration cursor is a 400 rather
+    /// than a silent restart from the first scope.
+    #[tokio::test]
+    async fn validation_boundaries_survive_the_optional_scope() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed(&state);
+        let app = history_router(Arc::clone(&state));
+
+        for path in [
+            "/history",                            // scope still required
+            "/history?scope=nope",                 // malformed scope
+            "/history/search?scope=nope&q=needle", // malformed scope, search
+            "/history/search?scope=dm:&q=needle",  // empty scope id
+            "/history/search",                     // missing q
+            "/history/search?q=",                  // blank q
+            "/history/search?q=%20",               // whitespace-only q
+            "/history/scopes?after_scope=nope",    // malformed cursor
+            "/history/scopes?after_scope=group:",  // empty cursor id
+        ] {
+            let (status, json) = get_as(&app, path, DURABLE).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {json}");
+        }
+
+        // An oversized limit is clamped, not rejected (history convention).
+        let (status, json) = get_as(&app, "/history/scopes?limit=100000", DURABLE).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["count"], 4, "{json}");
+        Ok(())
+    }
+
+    /// WHY (issue #275): a fresh install has no rows. Discovery must answer
+    /// "nothing yet" as a normal empty page — a 404 or an error here would
+    /// make the first-run path look broken.
+    #[tokio::test]
+    async fn empty_store_returns_empty_pages_not_errors() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        let app = history_router(Arc::clone(&state));
+
+        let (status, json) = get_as(&app, "/history/scopes", DURABLE).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["count"], 0);
+        assert!(json["next_after_scope"].is_null(), "{json}");
+        assert_eq!(json["scopes"], serde_json::json!([]));
+
+        let (status, json) = get_as(&app, "/history/search?q=needle", DURABLE).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["count"], 0);
+        assert!(json["next_before_id"].is_null(), "{json}");
+        Ok(())
     }
 }
