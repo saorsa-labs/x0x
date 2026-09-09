@@ -43,6 +43,7 @@ fn loopback_network_config_with_relay(relay: PeerRelayConfig) -> NetworkConfig {
         bootstrap_nodes: Vec::new(),
         port_mapping_enabled: false,
         peer_relay: relay,
+        mdns_enabled: false,
         ..NetworkConfig::default()
     }
 }

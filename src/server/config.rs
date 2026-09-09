@@ -48,6 +48,7 @@ const ROOT_OWNED_KEYS: &[&str] = &[
     "instance_name",
     "log_format",
     "log_level",
+    "mdns_enabled",
     "network_id",
     "observed_prefix_enabled",
     "port_mapping_enabled",

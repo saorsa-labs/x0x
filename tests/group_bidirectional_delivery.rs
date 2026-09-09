@@ -32,6 +32,7 @@ fn loopback_network_config() -> x0x::network::NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
         bootstrap_nodes: Vec::new(),
         port_mapping_enabled: false,
+        mdns_enabled: false,
         ..x0x::network::NetworkConfig::default()
     }
 }

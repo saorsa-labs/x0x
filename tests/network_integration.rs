@@ -41,6 +41,7 @@ async fn test_agent_with_network_config() {
     let builder = builder.with_network_config(network::NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: vec!["127.0.0.1:5483".parse().unwrap()],
+        mdns_enabled: false,
         ..Default::default()
     });
 
