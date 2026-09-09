@@ -156,6 +156,9 @@ pub mod dm;
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
 
+/// Bounded per-peer DM digest diagnostic observations.
+pub mod dm_digest_diagnostics;
+
 /// Background service that publishes this agent's capability advert and
 /// consumes peers' adverts into a shared [`dm_capability::CapabilityStore`].
 pub mod dm_capability_service;
@@ -255,6 +258,11 @@ pub struct Agent {
     network: Option<std::sync::Arc<network::NetworkNode>>,
     /// The gossip runtime for pub/sub messaging.
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
+    /// Disable the inbox's legacy-bus subscription, reverse-ACK bus pre-warm,
+    /// and legacy ACK hedge. Installed during build before network listeners.
+    /// Default false; sender bus fallback is unchanged. Bus-only senders
+    /// cannot reach this inbox when enabled.
+    skip_legacy_dm_bus: bool,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
@@ -355,6 +363,9 @@ pub struct Agent {
     /// KEM pubkey). `start_dm_inbox` upgrades via this sender to trigger
     /// immediate republish.
     dm_capabilities_tx: std::sync::Arc<tokio::sync::watch::Sender<dm::DmCapabilities>>,
+    #[cfg(test)]
+    capability_convergence_observer:
+        std::sync::Mutex<Option<std::sync::Arc<dm_capability_service::ConvergenceServiceObserver>>>,
     /// In-flight DM ACK waiters shared between `send_direct` and the inbox.
     dm_inflight_acks: std::sync::Arc<dm::InFlightAcks>,
     /// Receiver-side dedupe cache.
@@ -2832,6 +2843,10 @@ pub struct AgentBuilder {
     #[allow(dead_code)]
     network_config: Option<network::NetworkConfig>,
     gossip_config: Option<gossip::GossipConfig>,
+    /// Opt out of the inbox's legacy-bus subscription, reverse-ACK bus
+    /// pre-warm, and legacy ACK hedge. Default false; sender bus fallback
+    /// stays enabled, but bus-only senders cannot reach the opted-out inbox.
+    skip_legacy_dm_bus: bool,
     peer_cache_dir: Option<std::path::PathBuf>,
     /// When true, skip opening the bootstrap peer cache entirely.
     /// Useful for fully isolated embedders and test harnesses.
@@ -3829,6 +3844,7 @@ impl Agent {
             user_key_path: None,
             network_config: None,
             gossip_config: None,
+            skip_legacy_dm_bus: false,
             peer_cache_dir: None,
             disable_peer_cache: false,
             heartbeat_interval_secs: None,
@@ -5539,8 +5555,9 @@ impl Agent {
                 let mut guard = self.capability_advert_service.lock().await;
                 guard.take()
             };
-            if let Some(service) = service {
+            if let Some(mut service) = service {
                 service.abort();
+                service.stop_blob_responder().await;
             }
         }
 
@@ -6478,6 +6495,9 @@ impl Agent {
             .as_ref()
             .ok_or_else(|| dm::DmError::NoConnectivity("no network for relay send".to_string()))?;
         let relay_peer_id = ant_quic::PeerId(relay_machine_id.0);
+        #[cfg(test)]
+        self.peer_relay
+            .observe_convergence_sent(&wire, relay_agent.0);
         network
             .send_direct_typed(
                 &relay_peer_id,
@@ -9785,7 +9805,15 @@ impl Agent {
         // L3 retirement: the periodic caps advert only runs on the legacy
         // escape hatch. On-demand mode still answers targeted/warm requests
         // and publishes on capability upgrades.
-        let service = dm_capability_service::CapabilityAdvertService::spawn(
+        #[cfg(test)]
+        let convergence_observer = self
+            .capability_convergence_observer
+            .lock()
+            .map_err(|_| {
+                error::IdentityError::Storage(std::io::Error::other("service observer poisoned"))
+            })?
+            .clone();
+        let service = dm_capability_service::CapabilityAdvertService::spawn_observed(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
@@ -9794,6 +9822,8 @@ impl Agent {
             std::sync::Arc::clone(&self.capability_store),
             std::time::Duration::from_secs(dm_capability::ADVERT_PUBLISH_INTERVAL_SECS),
             self.legacy_announce,
+            #[cfg(test)]
+            convergence_observer,
         )
         .await
         .map_err(|e| {
@@ -9810,26 +9840,51 @@ impl Agent {
             service.abort();
             return Ok(());
         }
-        if let Some(prev) = guard.take() {
+        if let Some(mut prev) = guard.take() {
             prev.abort();
+            // Retain the old owner and the start mutex until its responder is
+            // joined. Cancelling this future still drops an aborting owner.
+            // Shutdown can contend on this mutex until cancellation completes;
+            // abort-and-join is not a hard wall-clock bound for non-yielding work.
+            prev.stop_blob_responder().await;
         }
-        *guard = Some(service);
+        // Replacement now awaits cancellation. Shutdown may have started
+        // during that join; do not install the still-local new service then.
+        if self.shutdown_token.is_cancelled() {
+            service.abort();
+            return Ok(());
+        }
+        let service = guard.insert(service);
         tracing::info!("Capability advert service started");
 
-        // L3: serve cert-blob fetches for peers that see our V3 announce
-        // digest but lack the cached pair. Same lifecycle as the caps
-        // service; the handle is detached (task ends with the pubsub).
+        // L3: the capability service owns the responder, including replacement,
+        // ordinary shutdown and Drop. Subscription cleanup is asynchronous.
         if self.shutdown_token.is_cancelled() {
             return Ok(());
         }
-        if let Err(e) = announce_blob::spawn_blob_responder(
+        match announce_blob::spawn_blob_responder(
             std::sync::Arc::clone(runtime.pubsub()),
             std::sync::Arc::clone(&self.announce_blob_cache),
             std::sync::Arc::clone(&self.own_cert_pair),
         )
         .await
         {
-            tracing::warn!("announce blob responder spawn failed: {e}");
+            Ok(handle) => {
+                // Cancellation-safety invariant: the factory must not await
+                // between spawning and returning this handle, and attachment
+                // here must be synchronous. A future reordering requires
+                // abort-on-drop custody at spawn before any intervening await.
+                let rejected = service.attach_blob_responder(handle).err();
+                let cancelled = service.abort_blob_responder_if_cancelled(&self.shutdown_token);
+                if let Some(mut rejected) = rejected {
+                    tracing::warn!("announce blob responder slot already occupied");
+                    rejected.stop().await;
+                }
+                if cancelled {
+                    service.stop_blob_responder().await;
+                }
+            }
+            Err(e) => tracing::warn!("announce blob responder spawn failed: {e}"),
         }
         Ok(())
     }
@@ -9886,7 +9941,7 @@ impl Agent {
                 sender_agent_id: self.identity.agent_id(),
             }) as std::sync::Arc<dyn dm_inbox::DirectAckHedge>
         });
-        let service = dm_inbox::DmInboxService::spawn_with_hedge(
+        let service = dm_inbox::DmInboxService::spawn_with_hedge_options(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
@@ -9903,6 +9958,7 @@ impl Agent {
             std::sync::Arc::clone(&self.authenticated_machine_bindings),
             self.history_handle.clone(),
             direct_hedge,
+            self.skip_legacy_dm_bus,
         )
         .await
         .map_err(|e| {
@@ -10129,6 +10185,30 @@ impl Agent {
         runtime
             .pubsub()
             .publish_with_fanout(topic.to_string(), bytes::Bytes::from(payload))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "publish failed: {}",
+                    e
+                )))
+            })
+    }
+
+    // Same publish path and error mapping; test-only send-stage observation.
+    #[cfg(test)]
+    pub(crate) async fn publish_with_observed_fanout(
+        &self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> error::Result<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        runtime
+            .pubsub()
+            .publish_with_observed_fanout(topic.to_string(), bytes::Bytes::from(payload))
             .await
             .map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(
@@ -14271,6 +14351,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Opt out of the inbox's compatibility-bus subscription, reverse-ACK
+    /// bus pre-warming, and legacy ACK hedge. Installed before network event
+    /// listeners start. Defaults to false for rolling compatibility.
+    ///
+    /// Sender-side fallback to the bus is deliberately unchanged. With this
+    /// enabled, bus-only senders no longer reach this inbox; targeted inbox
+    /// delivery and targeted/Direct ACK routes remain available.
+    #[must_use]
+    pub fn with_skip_legacy_dm_bus(mut self, skip: bool) -> Self {
+        self.skip_legacy_dm_bus = skip;
+        self
+    }
+
     /// Set the directory for the bootstrap peer cache.
     ///
     /// The cache persists peer quality metrics across restarts, enabling
@@ -14938,7 +15031,15 @@ impl AgentBuilder {
                     e
                 )))
             })?;
-            Some(std::sync::Arc::new(runtime))
+            let runtime = std::sync::Arc::new(runtime);
+            // This must happen during build, before `join_network` starts
+            // the network-event listener. A later inbox-only setter would
+            // leave a race where the first trusted PeerConnected event warms
+            // the bus permanently.
+            runtime
+                .pubsub()
+                .set_skip_legacy_dm_bus(self.skip_legacy_dm_bus);
+            Some(runtime)
         } else {
             None
         };
@@ -15033,6 +15134,7 @@ impl AgentBuilder {
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,
+            skip_legacy_dm_bus: self.skip_legacy_dm_bus,
             bootstrap_cache,
             gossip_cache_adapter,
             machine_kem,
@@ -15064,6 +15166,8 @@ impl AgentBuilder {
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
+            #[cfg(test)]
+            capability_convergence_observer: std::sync::Mutex::new(None),
             dm_capabilities_tx: std::sync::Arc::new({
                 let (tx, _rx) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
                 tx
@@ -16970,6 +17074,14 @@ fn spawn_relay_dm_listener(
                 now_ms,
                 is_sender_contact,
                 is_sender_blocked,
+            );
+
+            #[cfg(test)]
+            peer_relay.observe_convergence_received(
+                &relayed,
+                relay_peer_id.0,
+                _relay_sender_agent_id,
+                disposition,
             );
 
             // Revocation gate (PR #177 review, fix 1): the inner envelope's
@@ -21583,7 +21695,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_machine_signature_verifies() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21599,7 +21717,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_requires_human_consent() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21614,7 +21738,13 @@ mod tests {
     #[tokio::test]
     async fn identity_announcement_with_user_requires_user_identity() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21630,7 +21760,13 @@ mod tests {
     async fn announce_identity_populates_discovery_cache() {
         let user_key = identity::UserKeypair::generate().unwrap();
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_user_key(user_key)
             .build()
             .await
@@ -21653,7 +21789,13 @@ mod tests {
     #[tokio::test]
     async fn relay_census_classifies_bootstrap_and_skips_stale() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21730,7 +21872,13 @@ mod tests {
         // evicts a valid member as NoCertificate. A later announce carrying
         // the resolved certificate must promote it into the existing entry.
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21822,7 +21970,13 @@ mod tests {
     #[tokio::test]
     async fn verified_certificate_events_fire_on_landing_not_on_replay() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -21911,7 +22065,13 @@ mod tests {
         // live identity cache without bound — every OwnerCertified evidence
         // pass walks it. At the cap the stalest entry is evicted.
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22071,7 +22231,13 @@ mod tests {
     #[tokio::test]
     async fn retired_announce_publishes_v3_only() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22122,7 +22288,13 @@ mod tests {
     #[tokio::test]
     async fn named_agent_announces_self_name_on_v3_beat() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .build()
             .await
             .unwrap();
@@ -22192,7 +22364,13 @@ mod tests {
     #[tokio::test]
     async fn legacy_escape_hatch_publishes_v2_and_v3() {
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_legacy_announce(true)
             .build()
             .await
@@ -22247,7 +22425,13 @@ mod tests {
     async fn revoked_agent_fails_machine_verification_even_when_cached() {
         let user_key = identity::UserKeypair::generate().unwrap();
         let agent = Agent::builder()
-            .with_network_config(network::NetworkConfig::default())
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
             .with_user_key(user_key)
             .build()
             .await
@@ -24019,7 +24203,13 @@ async fn dm_capability_advert_tracks_durable_history_presence() {
             .with_machine_key(dir.path().join("machine.key"))
             .with_agent_key_path(dir.path().join("agent.key"))
             .with_peer_cache_dir(dir.path().join("peers"))
-            .with_network_config(network::NetworkConfig::default());
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            });
         if with_history {
             builder = builder.with_history(history::HistoryConfig {
                 db_path: Some(dir.path().join("history.db")),
@@ -24072,7 +24262,13 @@ async fn dm_inbox_capability_upgrade_visible_to_late_subscriber() {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_peer_cache_dir(dir.path().join("peers"))
-        .with_network_config(network::NetworkConfig::default())
+        .with_network_config(network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..network::NetworkConfig::default()
+        })
         .build()
         .await
         .expect("agent");
@@ -24880,3 +25076,9 @@ mod peer_connected_handler_integration_tests {
         assert_eq!(back.move_protocol, unsigned.move_protocol);
     }
 }
+
+#[cfg(test)]
+mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod legacy_bus_interop_tests;

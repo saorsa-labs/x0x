@@ -213,12 +213,75 @@ pub(crate) fn ingest_verified_digest_extension(
     )
 }
 
+/// Owns the optional blob responder even while an asynchronous stop is cancelled.
+/// Ordinary stop joins this task; Drop can only request its cancellation.
+#[derive(Default)]
+pub(crate) struct BlobResponderTask {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl BlobResponderTask {
+    fn install(&mut self, handle: JoinHandle<()>) -> Result<(), Self> {
+        let incoming = Self {
+            handle: Some(handle),
+        };
+        if self.handle.is_some() {
+            // Refuse replacement without losing custody of either task. The
+            // caller can join the rejected task; dropping it still aborts it.
+            incoming.abort();
+            return Err(incoming);
+        }
+        *self = incoming;
+        Ok(())
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    fn abort_if_cancelled(&self, token: &tokio_util::sync::CancellationToken) -> bool {
+        if token.is_cancelled() {
+            self.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) async fn stop(&mut self) {
+        self.abort();
+        if let Some(handle) = self.handle.as_mut() {
+            // Keep the handle in its Drop-aborting owner across this await.
+            // Taking it first would detach it if the stop future were dropped.
+            match handle.await {
+                Ok(()) => tracing::debug!("Announce blob responder stopped"),
+                Err(error) if error.is_cancelled() => {
+                    tracing::debug!("Announce blob responder aborted");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Announce blob responder failed during stop");
+                }
+            }
+            self.handle = None;
+        }
+    }
+}
+
+impl Drop for BlobResponderTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 pub struct CapabilityAdvertService {
     publisher: JoinHandle<()>,
     subscriber: JoinHandle<()>,
     digest_subscriber: JoinHandle<()>,
     targeted_response_subscriber: JoinHandle<()>,
     targeted_request_responder: JoinHandle<()>,
+    blob_responder: BlobResponderTask,
 }
 
 impl CapabilityAdvertService {
@@ -232,6 +295,33 @@ impl CapabilityAdvertService {
         store: Arc<CapabilityStore>,
         publish_interval: Duration,
         periodic: bool,
+    ) -> NetworkResult<Self> {
+        Self::spawn_observed(
+            pubsub,
+            signing,
+            self_agent_id,
+            self_machine_id,
+            caps_rx,
+            store,
+            publish_interval,
+            periodic,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_observed(
+        pubsub: Arc<PubSubManager>,
+        signing: Arc<SigningContext>,
+        self_agent_id: AgentId,
+        self_machine_id: MachineId,
+        caps_rx: tokio::sync::watch::Receiver<DmCapabilities>,
+        store: Arc<CapabilityStore>,
+        publish_interval: Duration,
+        periodic: bool,
+        #[cfg(test)] observation: Option<Arc<ConvergenceServiceObserver>>,
     ) -> NetworkResult<Self> {
         let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
         // #448: new peers additionally consume the signed digest
@@ -253,6 +343,8 @@ impl CapabilityAdvertService {
         let (reannounce_tx, mut reannounce_rx) = tokio::sync::mpsc::channel::<()>(16);
         let warm_reannounce_tx = reannounce_tx.clone();
 
+        #[cfg(test)]
+        let warm_observation = observation.clone();
         let subscriber = tokio::spawn(async move {
             while let Some(message) = subscription.recv().await {
                 let sender = message.sender;
@@ -270,7 +362,11 @@ impl CapabilityAdvertService {
                         carrier = "warm",
                         requester = sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
                     );
-                    let _ = warm_reannounce_tx.try_send(());
+                    let _result = warm_reannounce_tx.try_send(());
+                    #[cfg(test)]
+                    if let Some(observer) = &warm_observation {
+                        observer.enqueue(&message, "warm", _result.is_ok());
+                    }
                     continue;
                 }
                 if ingest_verified_capability_advert(&store_sub, self_agent_for_sub, &message) {
@@ -320,6 +416,8 @@ impl CapabilityAdvertService {
             tracing::debug!("targeted capability advert response subscriber exited");
         });
 
+        #[cfg(test)]
+        let critical_observation = observation.clone();
         let targeted_request_responder = tokio::spawn(async move {
             while let Some(message) = targeted_request_subscription.recv().await {
                 if !message.verified
@@ -339,7 +437,11 @@ impl CapabilityAdvertService {
                     carrier = "critical",
                     requester = message.sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
                 );
-                let _ = reannounce_tx.try_send(());
+                let _result = reannounce_tx.try_send(());
+                #[cfg(test)]
+                if let Some(observer) = &critical_observation {
+                    observer.enqueue(&message, "critical", _result.is_ok());
+                }
             }
             tracing::debug!("targeted capability advert request responder exited");
         });
@@ -364,6 +466,10 @@ impl CapabilityAdvertService {
             let mut requests_open = true;
             loop {
                 while reannounce_rx.try_recv().is_ok() {
+                    #[cfg(test)]
+                    if let Some(observer) = &observation {
+                        observer.record(ServiceEvent::Consumed);
+                    }
                     targeted_response_pending = true;
                 }
                 let caps_snapshot = publisher_caps_rx.borrow().clone();
@@ -374,6 +480,10 @@ impl CapabilityAdvertService {
                 // `changed()` arm below restarts the burst as soon as the
                 // caps watch upgrades, so readiness still propagates fast.
                 if !advert_is_publishable(&caps_snapshot) {
+                    #[cfg(test)]
+                    if let Some(observer) = &observation {
+                        observer.record(ServiceEvent::PendingSkip);
+                    }
                     tracing::debug!("capability advert pending (no inbox/KEM yet); not publishing");
                     tokio::select! {
                         _ = tokio::time::sleep(publish_interval) => {}
@@ -388,7 +498,11 @@ impl CapabilityAdvertService {
                             // immediately, so there is nothing to answer with
                             // yet — just remember that someone asked.
                             match request {
-                                Some(()) => targeted_response_pending = true,
+                                Some(()) => {
+                                    #[cfg(test)]
+                                    if let Some(observer) = &observation { observer.record(ServiceEvent::Consumed); }
+                                    targeted_response_pending = true;
+                                },
                                 None => requests_open = false,
                             }
                         }
@@ -492,6 +606,8 @@ impl CapabilityAdvertService {
                             match request {
                                 None => requests_open = false,
                                 Some(()) => {
+                                    #[cfg(test)]
+                                    if let Some(observer) = &observation { observer.record(ServiceEvent::Consumed); }
                                     targeted_response_pending = true;
                                     let now = tokio::time::Instant::now();
                                     let earliest = last_targeted_response_at.map_or(now, |last| {
@@ -529,6 +645,7 @@ impl CapabilityAdvertService {
             subscriber,
             targeted_response_subscriber,
             targeted_request_responder,
+            blob_responder: BlobResponderTask::default(),
         })
     }
 
@@ -553,7 +670,28 @@ impl CapabilityAdvertService {
         .await
     }
 
+    /// Attach without an await after the responder factory returns its handle.
+    pub(crate) fn attach_blob_responder(
+        &mut self,
+        handle: JoinHandle<()>,
+    ) -> Result<(), BlobResponderTask> {
+        self.blob_responder.install(handle)
+    }
+
+    pub(crate) fn abort_blob_responder_if_cancelled(
+        &self,
+        token: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        self.blob_responder.abort_if_cancelled(token)
+    }
+
+    /// Join only the blob responder. The other five tasks remain abort-only.
+    pub(crate) async fn stop_blob_responder(&mut self) {
+        self.blob_responder.stop().await;
+    }
+
     pub fn abort(&self) {
+        self.blob_responder.abort();
         self.publisher.abort();
         self.subscriber.abort();
         self.digest_subscriber.abort();
@@ -704,17 +842,210 @@ pub fn verify_advert_signature(advert: &CapabilityAdvert, public_key_bytes: &[u8
 }
 
 #[cfg(test)]
+mod blob_responder_lifecycle_tests {
+    use super::{BlobResponderTask, CapabilityAdvertService};
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+    use tokio_util::sync::CancellationToken;
+
+    struct Dropped(Option<oneshot::Sender<()>>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    // No service factory or transport: the real owner's methods receive only
+    // inert Tokio tasks. Construct the sentinel before spawn so even an unpolled
+    // task must release its captured state when cancellation completes.
+    fn pending_task() -> (JoinHandle<()>, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let sentinel = Dropped(Some(dropped_tx));
+        let task = tokio::spawn(async move {
+            let _sentinel = sentinel;
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        (task, entered_rx, dropped_rx)
+    }
+
+    fn inert_service() -> CapabilityAdvertService {
+        CapabilityAdvertService {
+            publisher: tokio::spawn(async {}),
+            subscriber: tokio::spawn(async {}),
+            digest_subscriber: tokio::spawn(async {}),
+            targeted_response_subscriber: tokio::spawn(async {}),
+            targeted_request_responder: tokio::spawn(async {}),
+            blob_responder: BlobResponderTask::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_abort_and_stop_join_pending_responder() {
+        let mut service = inert_service();
+        let (handle, entered, dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        entered.await.unwrap();
+        service.abort();
+        service.stop_blob_responder().await;
+        dropped.await.unwrap();
+        assert!(service.blob_responder.handle.is_none());
+        service.stop_blob_responder().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_slot_can_be_reused_without_retaining_prior_tasks() {
+        let mut service = inert_service();
+        for _ in 0..3 {
+            let (handle, entered, dropped) = pending_task();
+            assert!(service.attach_blob_responder(handle).is_ok());
+            entered.await.unwrap();
+            service.stop_blob_responder().await;
+            dropped.await.unwrap();
+            assert!(service.blob_responder.handle.is_none());
+        }
+        service.stop_blob_responder().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_attachment_retains_old_and_returns_aborted_new_owner() {
+        let mut service = inert_service();
+        let (old, old_entered, mut old_dropped) = pending_task();
+        assert!(service.attach_blob_responder(old).is_ok());
+        old_entered.await.unwrap();
+        let (new, new_entered, new_dropped) = pending_task();
+        new_entered.await.unwrap();
+        let mut refused = match service.attach_blob_responder(new) {
+            Err(owner) => owner,
+            Ok(()) => panic!("occupied responder slot accepted a replacement"),
+        };
+        // The refused task is already cancelled, not merely left for the caller.
+        new_dropped.await.unwrap();
+        assert!(matches!(
+            old_dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        refused.stop().await;
+        assert!(refused.handle.is_none());
+        service.stop_blob_responder().await;
+        old_dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_drop_aborts_responder_without_explicit_shutdown() {
+        let mut service = inert_service();
+        let (handle, entered, dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        entered.await.unwrap();
+        drop(service);
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_attach_cancel_check_aborts_when_already_cancelled() {
+        let mut service = inert_service();
+        let token = CancellationToken::new();
+        token.cancel();
+        let (handle, _entered, dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        assert!(service.abort_blob_responder_if_cancelled(&token));
+        service.stop_blob_responder().await;
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_attach_cancel_check_preserves_live_task_until_cancelled() {
+        let mut service = inert_service();
+        let token = CancellationToken::new();
+        let (handle, entered, mut dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        entered.await.unwrap();
+        assert!(!service.abort_blob_responder_if_cancelled(&token));
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        token.cancel();
+        assert!(service.abort_blob_responder_if_cancelled(&token));
+        service.stop_blob_responder().await;
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_stop_keeps_handle_owned_until_drop() {
+        let mut service = inert_service();
+        let (handle, entered, dropped) = pending_task();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        entered.await.unwrap();
+        let mut stop = Box::pin(service.stop_blob_responder());
+        let mut context = Context::from_waker(Waker::noop());
+        // No scheduler turn between abort and this first join poll. Dropping
+        // the pending stop simulates cancellation without signalling a process.
+        assert!(matches!(stop.as_mut().poll(&mut context), Poll::Pending));
+        drop(stop);
+        assert!(service.blob_responder.handle.is_some());
+        drop(service);
+        dropped.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_task_is_joined_and_slot_cleared() {
+        let mut service = inert_service();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = finished_tx.send(());
+        });
+        finished_rx.await.unwrap();
+        assert!(handle.is_finished());
+        assert!(service.attach_blob_responder(handle).is_ok());
+        service.stop_blob_responder().await;
+        assert!(service.blob_responder.handle.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn already_aborted_task_is_joined_and_slot_cleared() {
+        let mut service = inert_service();
+        let (handle, entered, dropped) = pending_task();
+        entered.await.unwrap();
+        handle.abort();
+        dropped.await.unwrap();
+        assert!(service.attach_blob_responder(handle).is_ok());
+        service.stop_blob_responder().await;
+        assert!(service.blob_responder.handle.is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::AgentKeypair;
     use crate::network::{NetworkConfig, NetworkNode};
+
+    /// Explicit test-only network config (#417/#337): loopback bind, no
+    /// seeds, discovery/port-mapping off. Still a real socket constructor.
+    fn test_network_config() -> NetworkConfig {
+        NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        }
+    }
 
     /// Isolated network node (mirrors the helper in `src/gossip/pubsub.rs`
     /// tests). `PubSubManager` is fully constructable in tests, so the advert
     /// service is testable end-to-end without a live mesh.
     async fn make_node() -> Arc<NetworkNode> {
         Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
+            NetworkNode::new(test_network_config(), None, None)
                 .await
                 .expect("network node"),
         )
@@ -1356,5 +1687,306 @@ mod tests {
         assert!(caps.supports_durable_app_ack());
 
         service.abort();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceEvent {
+    Enqueue {
+        requester: [u8; 32],
+        carrier: &'static str,
+        payload_hash: [u8; 32],
+        accepted: bool,
+    },
+    Consumed,
+    PendingSkip,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ConvergenceServiceObserver(std::sync::Mutex<(Vec<ServiceEvent>, bool)>);
+
+#[cfg(test)]
+impl ConvergenceServiceObserver {
+    fn record(&self, event: ServiceEvent) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        if state.0.len() == 16 {
+            state.1 = true;
+        } else {
+            state.0.push(event);
+        }
+    }
+    fn enqueue(&self, message: &PubSubMessage, carrier: &'static str, accepted: bool) {
+        use sha2::{Digest, Sha256};
+        if let Some(requester) = message.sender {
+            self.record(ServiceEvent::Enqueue {
+                requester: requester.0,
+                carrier,
+                payload_hash: Sha256::digest(&message.payload).into(),
+                accepted,
+            });
+        }
+    }
+    pub(crate) fn snapshot(&self) -> Result<Vec<ServiceEvent>, &'static str> {
+        let state = self.0.lock().map_err(|_| "service observer poisoned")?;
+        if state.1 {
+            return Err("service observer overflow");
+        }
+        Ok(state.0.clone())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn convergence_request_bytes(agent: AgentId) -> Vec<u8> {
+    encode_targeted_capability_request(agent).expect("encode fixed-size fixture request")
+}
+
+#[cfg(test)]
+mod asymmetric_ingress_tests {
+    use super::*;
+    use crate::{
+        dm,
+        identity::{AgentKeypair, MachineKeypair},
+        peer_relay::{PeerRelay, RelayDisposition, RelayPolicy, RelayRefusal},
+    };
+
+    fn message(signing: &SigningContext, extension: bool) -> PubSubMessage {
+        let caps = DmCapabilities::v1_gossip_ready(vec![1; 1184]);
+        let payload = if extension {
+            build_signed_digest_extension(signing, signing.agent_id, MachineId([4; 32]), &caps)
+                .unwrap()
+                .unwrap()
+        } else {
+            build_signed_advert(signing, signing.agent_id, MachineId([4; 32]), caps).unwrap()
+        };
+        // Unit boundary only: these are controlled verified outer metadata,
+        // not evidence that a live PubSub transport authenticated the message.
+        PubSubMessage {
+            topic: if extension {
+                crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC
+            } else {
+                DM_CAPABILITY_TOPIC
+            }
+            .into(),
+            payload: payload.into(),
+            sender: Some(signing.agent_id),
+            sender_public_key: Some(signing.public_key_bytes.clone()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        }
+    }
+
+    fn frame(signing: &SigningContext, bound: bool) -> crate::peer_relay::RelayedDm {
+        let machine = MachineKeypair::generate().unwrap();
+        let kem = crate::groups::kem_envelope::AgentKemKeypair::generate().unwrap();
+        let now = dm::now_unix_ms();
+        let inner = dm::EnvelopeBuilder::build_payload_envelope(
+            [7; 16],
+            &signing.agent_id,
+            &machine.machine_id(),
+            &machine,
+            &AgentId([9; 32]),
+            &kem.public_bytes,
+            now,
+            now + 60_000,
+            b"unit payload".to_vec(),
+            |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+        )
+        .unwrap();
+        PeerRelay::new()
+            .build_relayed_dm(
+                &AgentId([9; 32]),
+                &signing.agent_id,
+                signing.public_key_bytes.clone(),
+                now,
+                inner,
+                bound,
+                |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn asymmetric_signed_ingress_preserves_legacy_until_observed_v2() {
+        let s = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let r = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let at_r = CapabilityStore::new();
+        let at_s = CapabilityStore::new();
+        assert!(ingest_verified_capability_advert(
+            &at_r,
+            r.agent_id,
+            &message(&s, false)
+        ));
+        assert!(ingest_verified_digest_extension(
+            &at_r,
+            r.agent_id,
+            &message(&s, true)
+        ));
+        assert!(ingest_verified_capability_advert(
+            &at_s,
+            s.agent_id,
+            &message(&r, false)
+        ));
+        assert!(at_r.lookup(&s.agent_id).unwrap().digest_support);
+        assert!(!crate::peer_relay::peer_advertises_inner_digest(
+            at_s.lookup(&r.agent_id).as_ref()
+        ));
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        assert_eq!(
+            relay.disposition_for(
+                &frame(&s, false),
+                &r.agent_id,
+                dm::now_unix_ms(),
+                true,
+                false
+            ),
+            RelayDisposition::Forward {
+                dst_agent_id: [9; 32]
+            }
+        );
+        assert!(relay
+            .digest_diagnostic_snapshot(std::time::Instant::now(), None)
+            .rows
+            .is_empty());
+        assert_eq!(
+            relay.disposition_for(
+                &frame(&s, true),
+                &r.agent_id,
+                dm::now_unix_ms(),
+                true,
+                false
+            ),
+            RelayDisposition::Forward {
+                dst_agent_id: [9; 32]
+            }
+        );
+        assert_eq!(
+            relay.disposition_for(
+                &frame(&s, false),
+                &r.agent_id,
+                dm::now_unix_ms(),
+                true,
+                false
+            ),
+            RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest)
+        );
+    }
+
+    #[test]
+    fn asymmetric_signed_ingress_extension_order_and_rejection() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let base = message(&signing, false);
+        let extension = message(&signing, true);
+        assert!(ingest_verified_digest_extension(&store, local, &extension));
+        assert!(store.lookup(&signing.agent_id).is_none());
+        assert!(ingest_verified_capability_advert(&store, local, &base));
+        assert!(store.lookup(&signing.agent_id).unwrap().digest_support);
+        let mut unverified = extension.clone();
+        unverified.verified = false;
+        assert!(!ingest_verified_digest_extension(
+            &CapabilityStore::new(),
+            local,
+            &unverified
+        ));
+        let mut forged =
+            crate::dm_capability::DigestSupportExtension::from_postcard(&extension.payload)
+                .unwrap();
+        forged.signature[0] ^= 1;
+        let mut forged_message = extension;
+        forged_message.payload = postcard::to_stdvec(&forged).unwrap().into();
+        assert!(!ingest_verified_digest_extension(
+            &CapabilityStore::new(),
+            local,
+            &forged_message
+        ));
+        let foreign = AgentKeypair::generate().unwrap();
+        let mut wrong_sender = base.clone();
+        wrong_sender.sender = Some(foreign.agent_id());
+        assert!(!ingest_verified_capability_advert(
+            &CapabilityStore::new(),
+            local,
+            &wrong_sender
+        ));
+    }
+
+    #[test]
+    fn asymmetric_signed_ingress_observation_does_not_refresh() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let store = CapabilityStore::new();
+        let local = AgentId([3; 32]);
+        assert!(ingest_verified_capability_advert(
+            &store,
+            local,
+            &message(&signing, false)
+        ));
+        assert!(ingest_verified_digest_extension(
+            &store,
+            local,
+            &message(&signing, true)
+        ));
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        let v2 = frame(&signing, true);
+        assert_eq!(
+            relay.disposition_for(&v2, &local, dm::now_unix_ms(), true, false),
+            RelayDisposition::Forward {
+                dst_agent_id: [9; 32]
+            }
+        );
+        let at = std::time::Instant::now();
+        let before = crate::dm_digest_diagnostics::join_snapshots(
+            store.digest_diagnostic_snapshot(at, None),
+            relay.digest_diagnostic_snapshot(at, None),
+            None,
+        );
+        let after = crate::dm_digest_diagnostics::join_snapshots(
+            store.digest_diagnostic_snapshot(at, None),
+            relay.digest_diagnostic_snapshot(at, None),
+            None,
+        );
+        assert_eq!(before, after);
+        assert_eq!(
+            relay.disposition_for(
+                &frame(&signing, false),
+                &local,
+                dm::now_unix_ms(),
+                true,
+                false
+            ),
+            RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest)
+        );
+    }
+
+    #[test]
+    fn service_observer_bounds_poison_and_pending_predicate() {
+        let observer = ConvergenceServiceObserver::default();
+        assert!(!advert_is_publishable(&DmCapabilities::pending()));
+        assert!(advert_is_publishable(&DmCapabilities::v1_gossip_ready(
+            vec![1; 1184]
+        )));
+        for _ in 0..16 {
+            observer.record(ServiceEvent::PendingSkip);
+        }
+        assert_eq!(observer.snapshot().unwrap().len(), 16);
+        observer.record(ServiceEvent::Consumed);
+        assert_eq!(
+            observer.snapshot().unwrap_err(),
+            "service observer overflow"
+        );
+        let observer = ConvergenceServiceObserver::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = observer.0.lock().unwrap();
+            panic!("inert service poison");
+        });
+        observer.record(ServiceEvent::Consumed);
+        assert_eq!(
+            observer.snapshot().unwrap_err(),
+            "service observer poisoned"
+        );
     }
 }

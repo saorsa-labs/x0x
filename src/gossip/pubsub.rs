@@ -26,7 +26,7 @@ use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
@@ -332,6 +332,23 @@ impl Subscription {
     pub async fn recv(&mut self) -> Option<PubSubMessage> {
         self.receiver.recv().await
     }
+
+    /// Receive from either subscription until both are closed and drained.
+    pub(crate) async fn recv_from_either(&mut self, other: &mut Self) -> Option<PubSubMessage> {
+        recv_from_either(&mut self.receiver, &mut other.receiver).await
+    }
+}
+
+/// A closed carrier must not terminate or repeatedly wake a live carrier's wait.
+async fn recv_from_either<T>(
+    first: &mut mpsc::Receiver<T>,
+    second: &mut mpsc::Receiver<T>,
+) -> Option<T> {
+    tokio::select! {
+        Some(message) = first.recv() => Some(message),
+        Some(message) = second.recv() => Some(message),
+        else => None,
+    }
 }
 
 impl Drop for Subscription {
@@ -425,6 +442,10 @@ pub struct PubSubManager {
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
     /// Live subscribed transport ids for the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// Whether the DM inbox opted out of the compatibility bus.  This is
+    /// installed by `AgentBuilder` before network listeners can run so a
+    /// trusted connect event cannot undo the opt-out with an ACK pre-warm.
+    skip_legacy_dm_bus: AtomicBool,
     /// Inbound unsubscribed pass-through frames this Leaf refused.
     unsubscribed_refused_frames: AtomicU64,
     unsubscribed_refused_bytes: AtomicU64,
@@ -449,6 +470,56 @@ struct PublishFanoutOutcome {
     fan_out: u32,
     /// Signed envelope bytes when signing is enabled.
     envelope: Option<Bytes>,
+    /// Exact awaited send-stage counts, not remote receipt or forwarding proof.
+    #[cfg(test)]
+    observed_counts: Option<saorsa_gossip_pubsub::FanoutCounts>,
+}
+
+#[cfg(test)]
+impl PublishFanoutOutcome {
+    fn observed_fanout(self) -> (u32, Option<saorsa_gossip_pubsub::FanoutCounts>) {
+        (self.fan_out, self.observed_counts)
+    }
+}
+
+#[cfg(test)]
+mod observed_fanout_controls {
+    use super::PublishFanoutOutcome;
+    use saorsa_gossip_pubsub::FanoutCounts;
+
+    #[test]
+    fn retains_actual_counts_separately_from_report_override() {
+        for succeeded in [0, 1, 2] {
+            let counts = FanoutCounts {
+                attempted: 2,
+                succeeded,
+            };
+            let outcome = PublishFanoutOutcome {
+                fan_out: 7,
+                envelope: None,
+                observed_counts: Some(counts),
+            };
+            assert_eq!(outcome.observed_fanout(), (7, Some(counts)));
+        }
+    }
+
+    #[test]
+    fn unavailable_is_not_an_observed_zero() {
+        let outcome = |counts| {
+            PublishFanoutOutcome {
+                fan_out: 0,
+                envelope: None,
+                observed_counts: counts,
+            }
+            .observed_fanout()
+        };
+        assert_eq!(outcome(None), (0, None));
+        assert_eq!(
+            outcome(Some(FanoutCounts::default())),
+            (0, Some(FanoutCounts::default()))
+        );
+        assert_ne!(outcome(None), outcome(Some(FanoutCounts::default())));
+    }
 }
 
 /// Topic-name prefix marking a topic as local-only (issue #89).
@@ -576,6 +647,7 @@ impl PubSubManager {
             passthrough_refresh_runs: AtomicU64::new(0),
             topic_id_by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
             subscribed_topic_ids: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            skip_legacy_dm_bus: AtomicBool::new(false),
             unsubscribed_refused_frames: AtomicU64::new(0),
             unsubscribed_refused_bytes: AtomicU64::new(0),
             unsubscribed_refused_graft_equiv: AtomicU64::new(0),
@@ -1042,6 +1114,20 @@ impl PubSubManager {
             .fan_out)
     }
 
+    /// Retain the same awaited send-stage result for the controlled test load.
+    #[cfg(test)]
+    pub(crate) async fn publish_with_observed_fanout(
+        &self,
+        topic: String,
+        payload: Bytes,
+    ) -> NetworkResult<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let outcome = self
+            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .await?;
+        Ok(outcome.observed_fanout())
+    }
+
     /// Publish to a topic and return the signed V2 envelope bytes when
     /// signing is enabled.
     ///
@@ -1130,6 +1216,8 @@ impl PubSubManager {
             return Ok(PublishFanoutOutcome {
                 fan_out: 0,
                 envelope: None,
+                #[cfg(test)]
+                observed_counts: None,
             });
         }
 
@@ -1175,6 +1263,8 @@ impl PubSubManager {
                 Ok(PublishFanoutOutcome {
                     fan_out,
                     envelope: envelope_bytes,
+                    #[cfg(test)]
+                    observed_counts: counts,
                 })
             }
             Err(e) => {
@@ -1504,6 +1594,18 @@ impl PubSubManager {
         holds.insert(topic.to_string(), hold);
         drop(holds);
         self.refresh_subscribed_topic_id(topic, topic_id).await;
+    }
+
+    /// Set the compatibility DM-bus policy before network listeners start.
+    /// The manager owns this immutable-at-runtime choice because reverse-ACK
+    /// pre-warming receives only a pub/sub handle.
+    pub(crate) fn set_skip_legacy_dm_bus(&self, skip: bool) {
+        self.skip_legacy_dm_bus.store(skip, Ordering::Release);
+    }
+
+    /// Whether this manager's DM inbox opted out of the compatibility bus.
+    pub(crate) fn skip_legacy_dm_bus(&self) -> bool {
+        self.skip_legacy_dm_bus.load(Ordering::Acquire)
     }
 
     /// Topic ids currently known to PlumTree. Test helper for proving a
@@ -4790,5 +4892,117 @@ mod tests {
                 "{reason} must refuse valid outer V1"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod closed_input_tests {
+    use super::recv_from_either;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Wake, Waker};
+    use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn assert_pending<F: Future>(future: Pin<&mut F>, wake: &Arc<WakeCount>) {
+        let waker = Waker::from(Arc::clone(wake));
+        assert!(future.poll(&mut Context::from_waker(&waker)).is_pending());
+    }
+
+    async fn closed_carrier_preserves_survivor(close_first: bool) {
+        let (first_tx, mut first) = mpsc::channel(2);
+        let (second_tx, mut second) = mpsc::channel(2);
+        let live_tx = if close_first {
+            drop(first_tx);
+            second_tx
+        } else {
+            drop(second_tx);
+            first_tx
+        };
+        let wake = Arc::new(WakeCount::default());
+        {
+            let mut next = std::pin::pin!(recv_from_either(&mut first, &mut second));
+            assert_pending(next.as_mut(), &wake);
+            live_tx
+                .try_send(17)
+                .expect("live carrier accepts a message");
+            assert_eq!(next.await, Some(17));
+        }
+        live_tx.try_send(23).expect("survivor remains usable");
+        assert_eq!(recv_from_either(&mut first, &mut second).await, Some(23));
+        drop(live_tx);
+        assert_eq!(recv_from_either(&mut first, &mut second).await, None);
+    }
+
+    #[tokio::test]
+    async fn first_closed_waits_for_live_second() {
+        closed_carrier_preserves_survivor(true).await;
+    }
+
+    #[tokio::test]
+    async fn second_closed_waits_for_live_first() {
+        closed_carrier_preserves_survivor(false).await;
+    }
+
+    #[tokio::test]
+    async fn both_closed_and_empty_terminate() {
+        let (first_tx, mut first) = mpsc::channel::<u8>(1);
+        let (second_tx, mut second) = mpsc::channel::<u8>(1);
+        drop((first_tx, second_tx));
+        assert_eq!(recv_from_either(&mut first, &mut second).await, None);
+        assert_eq!(recv_from_either(&mut first, &mut second).await, None);
+    }
+
+    #[tokio::test]
+    async fn closed_carriers_drain_buffered_values_before_terminating() {
+        let (first_tx, mut first) = mpsc::channel(2);
+        let (second_tx, mut second) = mpsc::channel(2);
+        for value in [1, 2] {
+            first_tx.try_send((0, value)).expect("first capacity");
+            second_tx.try_send((1, value)).expect("second capacity");
+        }
+        drop((first_tx, second_tx));
+        let mut received = [Vec::new(), Vec::new()];
+        while let Some((carrier, value)) = recv_from_either(&mut first, &mut second).await {
+            received[carrier].push(value);
+        }
+        assert_eq!(received, [vec![1, 2], vec![1, 2]]);
+    }
+
+    #[tokio::test]
+    async fn closing_pending_carriers_wakes_and_terminates() {
+        let (first_tx, mut first) = mpsc::channel::<u8>(1);
+        let (second_tx, mut second) = mpsc::channel::<u8>(1);
+        let wake = Arc::new(WakeCount::default());
+        let mut next = std::pin::pin!(recv_from_either(&mut first, &mut second));
+        assert_pending(next.as_mut(), &wake);
+        let before = wake.0.load(Ordering::Relaxed);
+        drop((first_tx, second_tx));
+        assert!(wake.0.load(Ordering::Relaxed) > before);
+        assert_eq!(next.await, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_preserves_both_live_carriers() {
+        let (first_tx, mut first) = mpsc::channel(1);
+        let (second_tx, mut second) = mpsc::channel(1);
+        {
+            let mut next = std::pin::pin!(recv_from_either(&mut first, &mut second));
+            assert_pending(next.as_mut(), &Arc::new(WakeCount::default()));
+        }
+        first_tx.try_send(31).expect("first still live");
+        assert_eq!(recv_from_either(&mut first, &mut second).await, Some(31));
+        second_tx.try_send(47).expect("second still live");
+        assert_eq!(recv_from_either(&mut first, &mut second).await, Some(47));
     }
 }

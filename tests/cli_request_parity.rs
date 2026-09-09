@@ -410,11 +410,13 @@ fn registry_requiredness_matches_clap() {
 
 /// Dummy CLI value for a flag/positional: BOOL placeholders need a real
 /// boolean, PATH/JSON placeholders point at a valid-JSON temp file (some
-/// commands read AND parse the file client-side), everything else "1"
-/// (parses as every scalar type clap accepts).
+/// commands read AND parse the file client-side), AGENT needs a complete
+/// hexadecimal identity, and other placeholders retain the scalar exemplar "1".
 fn dummy_value(placeholder: &str) -> String {
     let up = placeholder.to_ascii_uppercase();
-    if up.contains("BOOL") {
+    if normalize_positional(placeholder) == "agent" {
+        "ab".repeat(32)
+    } else if up.contains("BOOL") {
         "true".to_string()
     } else if up.contains("FILE") {
         "/dev/null".to_string()
@@ -428,6 +430,33 @@ fn dummy_value(placeholder: &str) -> String {
     } else {
         "1".to_string()
     }
+}
+
+#[test]
+fn agent_dummy_value_passes_exact_diagnostics_validation() {
+    // A parity input must reach request construction without relaxing the
+    // production filter or exempting the endpoint from wire-field checks.
+    let surface = parse_help_surface(
+        "Usage: x0x diagnostics dm [OPTIONS]\n\nOptions:\n  --agent <AGENT>  Inspect one exact agent\n",
+    );
+    let flag_placeholder = surface
+        .flag_placeholders
+        .get("--agent")
+        .expect("actual flag placeholder from help parser");
+    assert_eq!(flag_placeholder, "<AGENT>");
+    assert_eq!(
+        x0x::dm_digest_diagnostics::parse_agent_filter(&dummy_value(flag_placeholder)),
+        Ok([0xab; 32])
+    );
+    for placeholder in ["AGENT", "agent", "<AGENT>", "[AGENT]"] {
+        assert_eq!(
+            x0x::dm_digest_diagnostics::parse_agent_filter(&dummy_value(placeholder)),
+            Ok([0xab; 32])
+        );
+    }
+    assert!(x0x::dm_digest_diagnostics::parse_agent_filter("1").is_err());
+    assert_eq!(dummy_value("LIMIT"), "1");
+    assert_eq!(dummy_value("BOOL"), "true");
 }
 
 /// Build argv exercising the command's path-parameter positionals plus
