@@ -58,6 +58,34 @@ class ReleaseCardTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn('Agent card version', result.stdout)
 
+    def test_staged_card_mismatched_against_tag_is_blocking(self):
+        # WHY (#514): the published asset must be inspected against the
+        # release TAG, not merely against the source tree — a staged card
+        # that drifted from the tagged release has to block publishing even
+        # when the source files themselves are consistent with the tag.
+        staged = self.root / 'release-files/agent.json'
+        staged.parent.mkdir()
+        card = json.loads((ROOT / CARD).read_text())
+        card['version'] = '0.10.0'
+        staged.write_text(json.dumps(card))
+        result = self.validate(card=staged)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            f"Agent card version '0.10.0' does not match release tag v{self.version}",
+            result.stdout,
+            result.stdout + result.stderr,
+        )
+
+    def test_tag_argument_is_rejected_outside_release_tag_mode(self):
+        # WHY (#514 audit lesson): a silently ignored --tag makes a
+        # tag-mismatch gate look like a pass — misuse must fail loudly.
+        result = subprocess.run(
+            ['python3', str(self.root / VALIDATOR), '--mode', 'push_main',
+             '--tag', 'v' + self.version],
+            cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--tag is only valid in release_tag mode', result.stderr)
+
     def test_card_only_pr_change_runs_blocking_rule(self):
         rule = self.policy['rules']['version_sync']
         self.assertTrue(self.validator.should_run_rule(

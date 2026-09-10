@@ -497,8 +497,18 @@ jobs:
           cp SKILL.md.sig release-files/
           cp SAORSA_PUBLIC_KEY.asc release-files/
           cp .well-known/agent.json release-files/
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode push_main --agent-card release-files/agent.json
+          # The PUBLISHED asset must be inspected against the tag, not just
+          # against the source tree (#514): on a tag push, pass the tag so a
+          # staged card that drifted from the tagged release blocks the
+          # GitHub Release step. Manual dispatches have no tag ref.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            python3 .github/scripts/validate_release_metadata.py \
+              --mode release_tag --tag "${GITHUB_REF_NAME}" \
+              --agent-card release-files/agent.json
+          else
+            python3 .github/scripts/validate_release_metadata.py \
+              --mode push_main --agent-card release-files/agent.json
+          fi
           ls -la release-files/
 
       - name: Create GitHub Release

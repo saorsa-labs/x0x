@@ -373,6 +373,14 @@ def validate_version_sync(rule, state, tag_version=None, agent_card=None):
             skill_path,
         )
 
+    if tag_version and card_version != tag_version:
+        state.add(
+            rule["level"],
+            f"Agent card version {card_version!r} does not match release tag v{tag_version} "
+            f"— {fix_hint}",
+            card_path,
+        )
+
     if tag_version and skill_version != tag_version:
         state.add(
             rule["level"],
@@ -455,6 +463,13 @@ def main():
         changed_files = get_changed_files(args.base_sha)
         print(
             f"Changed files for pull_request mode: {', '.join(changed_files) if changed_files else '(none)'}"
+        )
+
+    if args.tag and args.mode != "release_tag":
+        # A silently ignored --tag would make a tag-mismatch gate look like
+        # a pass (the #514 audit lesson) — refuse it loudly instead.
+        raise SystemExit(
+            f"--tag is only valid in release_tag mode (got mode {args.mode!r})"
         )
 
     tag_version = None
