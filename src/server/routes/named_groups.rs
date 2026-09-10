@@ -2644,6 +2644,16 @@ fn spawn_named_group_event_delivery_to_active_members(
 /// Deliberately NOT persisted: a daemon crash mid-schedule still loses the
 /// notice. That is the accepted trade-off of the no-ADR ruling — the ADR 0030
 /// §5 durable outbox stays `SignedPublic`-only.
+/// #531 I3: every rejection inside the `MemberBanned` apply arm is otherwise a
+/// bare `REJECTED`, so a failed ban cannot be told apart from a lost one.
+fn banned_reject(reason: &'static str, group_id: &str) -> ApplyMetadataResult {
+    tracing::debug!(
+        target: "treekem.trace", stage = "member_banned_apply",
+        group_id = %group_id, outcome = "REJECTED", reason,
+    );
+    ApplyMetadataResult::REJECTED
+}
+
 const GROUP_CONTROL_REDELIVERY_SCHEDULE: [Duration; 4] = [
     Duration::from_secs(6),
     Duration::from_secs(15),
@@ -2686,12 +2696,28 @@ fn spawn_group_control_event_redelivery(
     extra_recipients: &[String],
 ) {
     let schedule = GROUP_CONTROL_REDELIVERY_SCHEDULE_OVERRIDE.clone();
+    // #531 I1: the early return below is silent, so "resends disabled" could
+    // only be shown by an ABSENCE of trace. Make the control self-evidencing.
+    tracing::debug!(
+        target: "treekem.trace", stage = "group_control_redelivery_schedule",
+        kind = named_group_metadata_event_kind(event),
+        attempts = schedule.len(), disabled = schedule.is_empty(),
+        raw_env = std::env::var("X0X_TEST_GROUP_REDELIVERY_SCHEDULE_MS")
+            .unwrap_or_default(),
+    );
     if schedule.is_empty() {
         return;
     }
     let recipients: Vec<String> = named_group_event_recipients(state, info, extra_recipients)
         .into_iter()
         .collect();
+    // #531 I2: the trace below logs recipients.len() only; the banned target's
+    // presence must be evidence, not inference from a count.
+    tracing::debug!(
+        target: "treekem.trace", stage = "group_control_redelivery_recipients",
+        kind = named_group_metadata_event_kind(event),
+        recipients = ?recipients, extra = ?extra_recipients,
+    );
     let state = Arc::clone(state);
     let metadata_topic = metadata_topic.to_string();
     let event = event.clone();
@@ -9426,20 +9452,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ..
         } => {
             let Some(commit) = commit else {
-                return ApplyMetadataResult::REJECTED;
+                return banned_reject("missing_commit", &resolved_group_key);
             };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return ApplyMetadataResult::REJECTED;
+                return banned_reject("actor_not_admin_or_not_sender", &resolved_group_key);
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                 let Some(commit_b64) = treekem_commit_b64 else {
-                    return ApplyMetadataResult::REJECTED;
+                    return banned_reject("treekem_commit_b64_absent", &resolved_group_key);
                 };
                 let Some(epoch) = treekem_epoch else {
-                    return ApplyMetadataResult::REJECTED;
+                    return banned_reject("treekem_epoch_absent", &resolved_group_key);
                 };
                 Some((commit_b64, epoch))
             } else {
@@ -9471,11 +9497,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             )
             .await
             else {
-                return ApplyMetadataResult::REJECTED;
+                return banned_reject("apply_stateful_event_with_evidence", &resolved_group_key);
             };
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
             if banned_self {
+                // #531 I4a: teardown has BEGUN. This is not an accept — the
+                // persist below can still reject, so nothing durable is claimed
+                // here. The durable outcome is logged after persistence only.
+                tracing::debug!(
+                    target: "treekem.trace", stage = "member_banned_apply",
+                    group_id = %resolved_group_key, outcome = "cleanup_started",
+                );
                 state
                     .treekem_groups
                     .write()
@@ -9491,14 +9524,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
                     Ok(bytes) => bytes,
-                    Err(_) => return ApplyMetadataResult::REJECTED,
+                    Err(_) => {
+                        return banned_reject("treekem_commit_b64_decode", &resolved_group_key)
+                    }
                 };
                 let group = {
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
                 };
                 let Some(group) = group else {
-                    return ApplyMetadataResult::REJECTED;
+                    return banned_reject("treekem_group_missing", &resolved_group_key);
                 };
                 if let Err(e) = process_treekem_commit_after_crypto_recheck(
                     state,
@@ -9512,15 +9547,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 .await
                 {
                     tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM ban commit: {e}");
-                    return ApplyMetadataResult::REJECTED;
+                    return banned_reject(
+                        "process_treekem_commit_after_crypto_recheck",
+                        &resolved_group_key,
+                    );
                 }
             }
             if !matches!(
                 persist_named_group_info(state, &resolved_group_key, next.clone()).await,
                 Ok(AtomicWriteOutcome::Durable)
             ) {
-                return ApplyMetadataResult::REJECTED;
+                return banned_reject("persist_not_durable", &resolved_group_key);
             }
+            // #531 I4b: the ONLY point at which the ban is durably applied.
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "member_banned_apply",
+                group_id = %resolved_group_key,
+                outcome = "ACCEPTED_DURABLE",
+                banned_self,
+            );
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             *replay_group_id = Some(resolved_group_key.clone());
             remember_treekem_membership_event(state, &event_for_log).await;

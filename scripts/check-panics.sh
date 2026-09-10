@@ -129,7 +129,7 @@ check_no_nul_bytes
 
 # Scan for problematic patterns
 scan_pattern "\.unwrap()" ".unwrap() calls"
-scan_pattern "\.expect\(" ".expect() calls"
+scan_pattern "\.expect[(]" ".expect() calls"
 scan_pattern "panic!" "panic! macro"
 scan_pattern "todo!" "todo! macro"
 scan_pattern "unimplemented!" "unimplemented! macro"
