@@ -26,16 +26,22 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
 
 const PREFIX: &[u8] = b"x0x-501-interop\0";
-// #607 contention recalibration: these wrap real network convergence steps
-// (QUIC pair dials, gossip-plane admission, decrypt delivery), which degrade
-// ~16x under CI CPU oversubscription (measured 253 ms isolated -> 4007 ms at
-// 5x; worst local 5x observations: pair dial 5.9 s, typed decrypt delivery
-// 5.4 s, with the PR #598 Coverage failure exceeding the old 10 s DELIVERY).
-// 60 s keeps >= 10x headroom over the local 5x worst case. Both are POSITIVE
-// deadlines: they await an event that must happen. Absence assertions use the
-// separate NEGATIVE_WINDOW below and are NOT raised.
+// #607 contention recalibration. SETUP wraps real network convergence steps
+// (QUIC pair dials, gossip-plane admission) that degrade ~16x under CI CPU
+// oversubscription (measured 253 ms isolated -> 4007 ms at 5x; worst local
+// 5x completing dial 5.9 s, leaving only 3.4x headroom at the old 20 s).
+// 60 s keeps >= 10x headroom over the measured worst case. POSITIVE deadline.
+//
+// DELIVERY stays at 10 s deliberately: this cycle's CI (PR #619 Coverage,
+// 2026-09-10) PROVED the one DELIVERY site that fires under CI — "receiver
+// typed decrypt delivery" after the targeted exact-ciphertext publish — is
+// non-arrival, not slowness: it still failed with a 60 s budget (62.78 s
+// test) while the first bus delivery in the same run completed
+// (default_bus_positive observed). The other DELIVERY sites' measured 5x
+// worst is 4.5 s, inside 10 s with >= 2.2x headroom. The non-arrival defect
+// is tracked in #613 and must NOT be papered over with a bigger budget.
 const SETUP: Duration = Duration::from_secs(60);
-const DELIVERY: Duration = Duration::from_secs(60);
+const DELIVERY: Duration = Duration::from_secs(10);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(300);
 
 type Inbox = mpsc::Receiver<DmTypedPayload>;
