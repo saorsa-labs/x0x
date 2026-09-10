@@ -211,3 +211,58 @@ not `null` — when disabled or unobserved):
 The token is **never gossiped, never announced, and never on `/peers`**: it
 is populated only in the raw-QUIC DM receive path and serialized only on the
 DM surfaces above.
+
+## Persistent fork quarantine (ADR-0064, Guard A — slice 1)
+
+Owner-axis groups (Home-suite / OwnerCertified admission — the groups whose
+commits go through `seal_commit_owner_certified` and the owner head
+attestation) carry a persistent, per-node fork-quarantine marker
+(`fork_quarantine` on the group record, exposed via `GET /groups/:id`). The
+marker is set only when a conflicting state-commit passes the authenticated
+fork-evidence gate (valid signature, committer an active admin in the
+retained predecessor roster — the same gate ADR-0059's deduplicated evidence
+uses), and it is written in the same atomic group-store mutation as the
+evidence record (through the standard `persist_named_groups_mutation`
+compare-and-restore path), so it survives restarts. For owner-axis groups the
+authoritative record is the `home-suite-groups.json` sidecar; the legacy
+`named_groups.json` view holds a placeholder that also carries the marker.
+While set, the
+membership-gated routes — public send, TreeKEM encrypt/decrypt, and the
+secure encrypt/open/reseal family — refuse with the typed HTTP **409
+`fork_quarantined`** (counted per group in `/diagnostics/groups` as
+`fork_quarantine_set` / `fork_quarantine_refusals`). The marker carries a
+forensic snapshot of both conflicting commit headers (no shared secrets, no
+TreeKEM material). The clear rule (round-2 maintainer decision, ADR-0064 §3
+"owner anchor = owner key") is deliberately narrow — the marker clears ONLY
+through an owner-anchored path, and BOTH local conditions must hold in
+addition to the strictly-greater-revision requirement:
+
+- **Explicit seal route**: the evidence-bearing seal endpoint
+  (`POST /groups/:id/state/seal` → `owner_certified_seal_with_eviction`),
+  AND the local install holds the **owner USER key** (the same
+  `owner_key_unavailable` fence as owner-axis invite minting: key loaded and
+  its derived user id equal to the policy owner — an agent-key seal carrying
+  only an ADR-0038 certificate verdict is NOT an owner anchor), AND the
+  sealed commit's revision is **strictly greater** than the evidenced
+  revision. The shared `seal_commit_owner_certified` wrapper used by ~22
+  routine mutation sites (rename, policy, add/ban/promote, …) never clears —
+  routine mutations on a quarantined group leave the marker in place.
+- **Tier-1 attestation-verified adoption**: across-gap adoption of a
+  `MemberAdded` anchored by the owner-signed head attestation, with the
+  terminal revision **strictly greater** than the evidenced revision.
+
+A contested branch's own commits never clear it (a same-revision sibling, a
+lower revision, or a seal without the owner user key all refuse); there is
+deliberately no
+automated eviction (ADR-0064 Decision 2). The marker is strictly local
+containment state: stripped from outbound signed-public bootstrap snapshots
+and rejected inbound, exactly like `invite_lineage` — a member that never
+received the authenticated evidence is not contained (per-node scope,
+ADR-0064 Decision 3). **Non-owner-axis groups are out of scope for this
+slice**: they never receive a marker and their behaviour is byte-for-byte
+unchanged; their quarantine/recovery semantics (indefinite
+`quarantine_no_anchor` quarantine and the manual operator runbook) are
+deferred to the ADR follow-up (#472). Mixed-fleet note: the marker is a
+serde-default JSON field, so v0.41.4 binaries ignore it (and silently drop
+it if they rewrite the record — a downgrade loses containment, it never
+bricks).

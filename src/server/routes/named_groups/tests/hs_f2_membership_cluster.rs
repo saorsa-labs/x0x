@@ -4880,3 +4880,383 @@ fn blob_diagnostic_formatter_does_not_infer_pending_or_normalize_observations() 
     .iter()
     .any(|name| field.contains(name))));
 }
+
+// ── ADR-0064 slice 1 (Guard A): owner-axis fork quarantine ─────────────
+
+/// Clone the base, mutate the description, and seal through the
+/// PRODUCTION owner-certified seal path (the same wrapper every
+/// authority commit site uses).
+async fn adr0064_owner_seal_variant(
+    state: &AppState,
+    base: &x0x::groups::GroupInfo,
+    description: &str,
+) -> Result<x0x::groups::GroupInfo> {
+    let mut v = base.clone();
+    v.description = description.to_string();
+    seal_commit_owner_certified(
+        state,
+        &mut v,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    Ok(v)
+}
+
+/// An owner-axis group with a sealed base commit and a lineage record —
+/// the joiner-side shape on which conflicts produce evidence (and, from
+/// ADR-0064 slice 1, the quarantine marker).
+async fn adr0064_sealed_owner_group_with_lineage(
+    state: &AppState,
+    group_id: &str,
+    policy: GroupPolicy,
+) -> Result<x0x::groups::GroupInfo> {
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "quarantine-e2e".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.to_string(),
+        policy,
+    );
+    seal_commit_owner_certified(
+        state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    info.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: info.state_revision,
+        base_hash: info.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    });
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.to_string(), info.clone());
+    Ok(info)
+}
+
+/// Drive one state-commit through the REAL central apply hook.
+async fn adr0064_apply_commit(
+    state: &Arc<AppState>,
+    group_id: &str,
+    commit: x0x::groups::state_commit::GroupStateCommit,
+    description: &str,
+) -> Result<Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError>> {
+    let current = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .expect("group record present");
+    let mutation = description.to_string();
+    Ok(apply_stateful_event_with_evidence(
+        state,
+        group_id,
+        &current,
+        &commit,
+        false,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.description = mutation;
+        },
+    )
+    .await)
+}
+
+/// Two EQUAL-REVISION twins sealed by the same local admin key on an
+/// OWNER-AXIS group (the conflicting twin classifies as StaleRevision
+/// evidence): ADR-0064 slice 1 adds the durable containment — the
+/// authenticated evidence sets the persistent quarantine marker (with
+/// its forensic snapshot), the membership-gated routes refuse with the
+/// typed 409 `fork_quarantined`, and the EXPLICIT owner-key seal route
+/// (revision strictly greater than the evidence) lifts it again. r2
+/// honesty note: this is NOT the full #468 stale-removal shape (removed
+/// admin, joiner seated at N, MemberAdded across a gap, attestation
+/// refusal) — that shape is only partially covered here via the
+/// adoption-clear test and the clear-rule negative controls in
+/// `fork_quarantine.rs`.
+#[tokio::test]
+async fn adr0064_owner_axis_twin_conflict_quarantines_gates_and_owner_seal_clears() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "7d".repeat(32);
+    let base = adr0064_sealed_owner_group_with_lineage(
+        &state,
+        &group_id,
+        owner_certified_policy(&owner_kp),
+    )
+    .await?;
+
+    // Two different validly-signed commits at revision 2 (same prev):
+    // whichever applies second is the stale fork.
+    let fork_a = adr0064_owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = adr0064_owner_seal_variant(&state, &base, "fork-b").await?;
+    let fork_a_commit = fork_a.commit_log.last().expect("sealed").commit.clone();
+    let fork_b_commit = fork_b.commit_log.last().expect("sealed").commit.clone();
+
+    let first = adr0064_apply_commit(&state, &group_id, fork_a_commit.clone(), "fork-a").await?;
+    assert!(first.is_ok(), "the first fork applies cleanly: {first:?}");
+    persist_named_groups_mutation(&state, |groups| {
+        let info = groups.get_mut(&group_id).expect("group");
+        *info = first.expect("applied");
+        true
+    })
+    .await?;
+
+    // The conflicting twin: refused AND contained.
+    let second = adr0064_apply_commit(&state, &group_id, fork_b_commit.clone(), "fork-b").await?;
+    assert!(second.is_err(), "the conflicting twin must be refused");
+    {
+        let groups = state.named_groups.read().await;
+        let record = groups.get(&group_id).expect("group");
+        let marker = record
+            .fork_quarantine
+            .as_ref()
+            .expect("owner-axis conflict sets the persistent marker");
+        assert_eq!(marker.revision, 2);
+        assert_eq!(marker.state_hash, fork_b_commit.state_hash);
+        assert_eq!(marker.committed_by, authority_hex);
+        assert!(!marker.no_anchor, "owner-axis groups have an anchor");
+        // Forensic snapshot: our terminal vs the conflicting commit.
+        assert_eq!(
+            marker.snapshot.terminal_commit.state_hash, fork_a_commit.state_hash,
+            "the snapshot's terminal is the observing node's head"
+        );
+        assert_eq!(
+            marker.snapshot.conflicting_commit.state_hash,
+            fork_b_commit.state_hash
+        );
+    }
+    let row = diagnostics_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.fork_quarantine_set, 1);
+
+    // The gate: secure encrypt refuses with the typed 409 while the
+    // marker is set (parity with the ADR-0038 restore gate).
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    let body: serde_json::Value = json.0;
+    assert_eq!(status, StatusCode::CONFLICT, "gated while quarantined");
+    assert_eq!(
+        body["error"].as_str(),
+        Some("fork_quarantined"),
+        "typed quarantine error: {body}"
+    );
+    let row = diagnostics_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.fork_quarantine_refusals, 1);
+
+    // The LOCAL owner-certified seal is an owner-anchored clear: the
+    // evidence-bearing seal re-verifies the roster and lifts the marker.
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "seal clears the quarantine: {body}");
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "marker cleared by the owner-certified seal"
+    );
+    Ok(())
+}
+
+/// Blueprint fault matrix "restart mid-quarantine": the marker is
+/// PERSISTED (unlike the ADR-0038 `#[serde(skip)]` transient) — a full
+/// store reload through `load_named_groups_merged` must carry it back
+/// verbatim and the gate must still refuse. A transient marker would
+/// silently un-contain the node on every restart.
+#[tokio::test]
+async fn adr0064_restart_preserves_marker_and_gate_still_refuses() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7e".repeat(32);
+    let base = adr0064_sealed_owner_group_with_lineage(
+        &state,
+        &group_id,
+        owner_certified_policy(&owner_kp),
+    )
+    .await?;
+
+    let fork_a = adr0064_owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = adr0064_owner_seal_variant(&state, &base, "fork-b").await?;
+    let fork_a_commit = fork_a.commit_log.last().expect("sealed").commit.clone();
+    let fork_b_commit = fork_b.commit_log.last().expect("sealed").commit.clone();
+
+    let first = adr0064_apply_commit(&state, &group_id, fork_a_commit, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_named_groups_mutation(&state, |groups| {
+        let info = groups.get_mut(&group_id).expect("group");
+        *info = first.expect("applied");
+        true
+    })
+    .await?;
+    let second = adr0064_apply_commit(&state, &group_id, fork_b_commit, "fork-b").await?;
+    assert!(second.is_err());
+    let live_marker = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .expect("group")
+        .fork_quarantine
+        .clone()
+        .expect("marker set before restart");
+
+    // Persist → restart-load through the real merged loader.
+    assert!(save_named_groups(&state).await);
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    let reloaded_marker = reloaded
+        .get(&group_id)
+        .expect("group survives the reload")
+        .fork_quarantine
+        .clone();
+    assert_eq!(
+        reloaded_marker,
+        Some(live_marker),
+        "the quarantine marker (snapshot included) reloads verbatim from disk"
+    );
+
+    // Install the reloaded store as the live map. The loader sets the
+    // ADR-0038 restore flag for owner-certified groups; clear ONLY that
+    // transient (it is a separate, seal-liftable gate) so this test
+    // isolates the FORK gate's post-restart posture.
+    *state.named_groups.write().await = reloaded;
+    {
+        let mut groups = state.named_groups.write().await;
+        let record = groups.get_mut(&group_id).expect("group");
+        record.owner_cert_reverify_required = false;
+    }
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the gate still refuses after the restart"
+    );
+    assert_eq!(
+        json.0["error"].as_str(),
+        Some("fork_quarantined"),
+        "typed fork-quarantine error after reload: {}",
+        json.0
+    );
+    Ok(())
+}
+
+/// ADR-0064 r2 item 3e: the SECOND owner-anchored clear — tier-1
+/// (owner-attestation-anchored) across-gap adoption on a joiner stub
+/// that already carries ≥1 applied commit. Positive arm: the terminal
+/// revision is strictly greater than the evidenced revision, so the
+/// attestation-verified adoption clears the marker. Negative arm
+/// (r2 item 2b): the same adoption with the marker AT the terminal
+/// revision still seats the joiner but must NOT clear — the contested
+/// branch can never buy a clear at or below the evidence it caused.
+/// A bare invite stub cannot hold evidence (empty commit_log), so the
+/// fixture seats the marker on the r3-stage stub, which retains its
+/// sealed base commit.
+#[tokio::test]
+async fn adr0064_adoption_clear_requires_strictly_greater_revision() -> Result<()> {
+    let terminal_revision = |stage: &R3Stage| -> u64 {
+        match &stage.member_added {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit: Some(commit),
+                ..
+            } => commit.revision,
+            _ => panic!("staged MemberAdded carries its terminal commit"),
+        }
+    };
+    async fn seat_marker(stage: &R3Stage, revision: u64) {
+        let terminal_header = {
+            let groups = stage.joiner_state.named_groups.read().await;
+            groups
+                .get(&stage.group_id)
+                .expect("stub")
+                .terminal_commit_header()
+        };
+        let mut groups = stage.joiner_state.named_groups.write().await;
+        groups
+            .get_mut(&stage.group_id)
+            .expect("stub")
+            .fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: stage.authority_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+            },
+            no_anchor: false,
+        });
+    }
+
+    // Positive: evidence revision strictly below the terminal.
+    let stage = r3_stage(0x9A).await?;
+    let terminal = terminal_revision(&stage);
+    assert!(terminal >= 1, "the staged terminal advances the chain");
+    seat_marker(&stage, terminal - 1).await;
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(result.accepted, "the attested adoption seats the joiner");
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(info.has_active_member(&stage.joiner_hex));
+        assert!(
+            !info.is_fork_quarantined(),
+            "tier-1 attestation-anchored adoption at revision {terminal} > evidence {} clears",
+            terminal - 1
+        );
+    }
+
+    // Negative: marker AT the terminal revision — adoption succeeds but
+    // never clears.
+    let stage = r3_stage(0x9B).await?;
+    let terminal = terminal_revision(&stage);
+    seat_marker(&stage, terminal).await;
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(
+        result.accepted,
+        "the quarantined stub still adopts (ingest must stay open)"
+    );
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            info.has_active_member(&stage.joiner_hex),
+            "joiner seated regardless of the marker"
+        );
+        assert!(
+            info.is_fork_quarantined(),
+            "adoption at revision == evidence revision does NOT clear"
+        );
+    }
+    Ok(())
+}

@@ -206,6 +206,57 @@ pub struct HomeMetadata {
     pub provisioned_at_ms: u64,
 }
 
+/// ADR-0064 (Guard A): forensic snapshot of the two competing terminal
+/// commits at the moment a fork was observed — both conflicting commit
+/// HEADERS (revision, parent, roster root, policy/meta hashes, signature)
+/// and nothing else. Redaction is by construction: [`state_commit::GroupStateCommit`]
+/// carries no TreeKEM state and no shared secrets, so nothing sensitive
+/// can enter the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkSnapshot {
+    /// The observing node's own terminal commit at evidence time.
+    pub terminal_commit: state_commit::GroupStateCommit,
+    /// The authenticated conflicting commit that triggered the evidence.
+    pub conflicting_commit: state_commit::GroupStateCommit,
+}
+
+/// ADR-0064 (Guard A): persistent per-node fork-quarantine marker for
+/// owner-axis (OwnerCertified / Home) groups. Set only from fork evidence
+/// that passed the authenticated-candidate gate
+/// (`evaluate_fork_evidence_candidate`); membership-gated routes refuse
+/// with `fork_quarantined` (409) while it is set. Clears ONLY through an
+/// owner-anchored path (verified head attestation on adoption, or a local
+/// owner-certified seal) — never by a contested branch's own commits.
+///
+/// Slice-1 scope (deliberate boundary): set and gated ONLY for groups
+/// whose policy has an owner axis; non-owner-axis groups never receive a
+/// marker and are byte-for-byte unchanged. `no_anchor` is reserved for
+/// the documented non-owner-axis indefinite-quarantine semantics
+/// (`quarantine_no_anchor`) and is always `false` in this slice.
+///
+/// Persistence: a serde-default `GroupInfo` field — old v0.41.4 binaries
+/// ignore the unknown field (JSON, not bincode; no wire enum grows a
+/// variant, see #451). Local-only: stripped from outbound signed-public
+/// bootstrap snapshots and rejected inbound, exactly like
+/// [`InviteLineage`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkQuarantine {
+    /// Revision the conflicting (evidenced) commit claims.
+    pub revision: u64,
+    /// The conflicting commit's state hash.
+    pub state_hash: String,
+    /// The admin that committed it (hex agent id).
+    pub committed_by: String,
+    /// Local observation time (unix ms).
+    pub observed_at_ms: u64,
+    /// Forensic snapshot of both competing commit headers.
+    pub snapshot: ForkSnapshot,
+    /// True when the marker can never auto-clear (non-owner-axis
+    /// runbook case; slice 1 never sets it).
+    #[serde(default)]
+    pub no_anchor: bool,
+}
+
 /// Metadata for a group.
 ///
 /// Persisted as JSON. The legacy v1 layout used a flat `members: BTreeSet`
@@ -216,7 +267,8 @@ pub struct HomeMetadata {
 /// fold any v1 data into v2.
 /// #470: FULL record equality — derived over EVERY field, including the
 /// `#[serde(skip)]`/local-only ones (`owner_cert_reverify_required`,
-/// `issued_invite_secrets`, `issued_invites`, Home metadata, commit log).
+/// `issued_invite_secrets`, `issued_invites`, Home metadata, commit log,
+/// and the ADR-0064 `fork_quarantine` marker).
 /// The compare-and-restore rollback in
 /// `persist_named_groups_mutation_unlocked` uses this to decide whether a
 /// concurrent writer touched a key; any subset equality would call a
@@ -343,6 +395,11 @@ pub struct GroupInfo {
     /// local (see [`InviteLineage`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite_lineage: Option<InviteLineage>,
+    /// ADR-0064 (Guard A): persistent fork-quarantine marker. Strictly
+    /// local (stripped/rejected on bootstrap snapshots); participates in
+    /// the #470 full-record equality. See [`ForkQuarantine`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_quarantine: Option<ForkQuarantine>,
 
     /// Retained, applied state-commit history (issue #111, follow-up to
     /// ADR-0016). Each entry pairs a signed
@@ -534,8 +591,51 @@ impl std::fmt::Display for SetMemberCertificateError {
         }
     }
 }
-
 impl GroupInfo {
+    /// ADR-0064 (Guard A): whether this node currently refuses
+    /// membership-gated routes for the group because authenticated fork
+    /// evidence is outstanding. Slice-1 scope: only ever true on
+    /// owner-axis groups.
+    #[must_use]
+    pub fn is_fork_quarantined(&self) -> bool {
+        self.fork_quarantine.is_some()
+    }
+
+    /// ADR-0064: header-only view of this record's terminal commit for
+    /// the forensic [`ForkSnapshot`] — the retained commit at the current
+    /// revision when history holds it, else a header synthesized from the
+    /// head fields (without signature material, which lives only in the
+    /// retained log). Containment must not depend on log retention, so a
+    /// truncated `commit_log` degrades the snapshot, never the marker.
+    #[must_use]
+    pub fn terminal_commit_header(&self) -> state_commit::GroupStateCommit {
+        if let Some(retained) = self
+            .commit_log
+            .iter()
+            .rev()
+            .find(|rc| rc.commit.revision == self.state_revision)
+        {
+            return retained.commit.clone();
+        }
+        state_commit::GroupStateCommit {
+            group_id: self.stable_group_id().to_string(),
+            revision: self.state_revision,
+            prev_state_hash: self.prev_state_hash.clone(),
+            roster_root: state_commit::roster_root_of_projection(&state_commit::roster_projection(
+                &self.members_v2,
+            )),
+            policy_hash: state_commit::compute_policy_hash(&self.policy),
+            public_meta_hash: state_commit::compute_public_meta_hash(&self.public_meta()),
+            security_binding: self.security_binding.clone(),
+            state_hash: self.state_hash.clone(),
+            withdrawn: self.withdrawn,
+            committed_by: String::new(),
+            committed_at: self.updated_at,
+            signer_public_key: String::new(),
+            signature: String::new(),
+        }
+    }
+
     /// Create a new `GroupInfo` with the given policy (defaults to `private_secure`).
     #[must_use]
     pub fn new(name: String, description: String, creator: AgentId, mls_group_id: String) -> Self {
@@ -651,6 +751,7 @@ impl GroupInfo {
             owner_cert_reverify_required: false,
             home: None,
             invite_lineage: None,
+            fork_quarantine: None,
             issued_invite_secrets: HashSet::new(),
             issued_invites: HashMap::new(),
         };
@@ -820,6 +921,12 @@ impl GroupInfo {
                 // ONLY on an all-clean verdict — a grace-admitted
                 // evidence-missing member must keep the group
                 // quarantined.
+                // ADR-0064 r2: this shared wrapper is what ~22 ROUTINE
+                // mutation sites (rename, policy, add/ban/promote, …)
+                // seal through, so it must NOT clear the fork-quarantine
+                // marker — the owner-anchored local clear is
+                // [`Self::clear_fork_quarantine_on_explicit_owner_seal`],
+                // called only from the explicit seal route.
                 if verdict.is_all_clean() {
                     self.owner_cert_reverify_required = false;
                 }
@@ -834,6 +941,43 @@ impl GroupInfo {
                 Err(err)
             }
         }
+    }
+
+    /// ADR-0064 r2 (maintainer decision on the clear rule): the ONLY
+    /// local owner anchor that may clear the fork-quarantine marker.
+    /// Called exclusively from the EXPLICIT evidence-bearing seal route
+    /// (`POST /groups/:id/state/seal` → `owner_certified_seal_with_eviction`)
+    /// after its seal succeeded — never from the shared
+    /// [`Self::seal_commit_with_owner_certs`] wrapper that ~22 routine
+    /// mutation sites (rename, policy, add/ban/promote, …) seal through.
+    /// All three conditions must hold:
+    /// - the group has an owner axis (non-owner-axis groups never carry
+    ///   a marker in this slice);
+    /// - the local install holds the OWNER USER KEY, fenced exactly like
+    ///   the #469 A1b invite fence (`owner_key_unavailable`): the key is
+    ///   loaded AND its derived user id EQUALS the policy owner — an
+    ///   agent-key seal with only an ADR-0038 certificate verdict is not
+    ///   an owner anchor;
+    /// - the sealed revision (`self.state_revision`, already bumped by
+    ///   the seal that accompanies this call) is STRICTLY greater than
+    ///   the evidenced revision — a same-revision sibling never clears.
+    pub fn clear_fork_quarantine_on_explicit_owner_seal(
+        &mut self,
+        owner_user_key: Option<&crate::identity::UserKeypair>,
+    ) {
+        let Some(marker) = self.fork_quarantine.as_ref() else {
+            return;
+        };
+        let Some(owner_id) = self.policy.admission.owner_certified_user_id() else {
+            return;
+        };
+        let owner_key_held = owner_user_key.is_some_and(|kp| {
+            crate::identity::UserId::from_public_key(kp.public_key()) == *owner_id
+        });
+        if !owner_key_held || self.state_revision <= marker.revision {
+            return;
+        }
+        self.fork_quarantine = None;
     }
 
     /// ADR-0038 (review B3): seal WITHOUT auto-pruning — for the sequential

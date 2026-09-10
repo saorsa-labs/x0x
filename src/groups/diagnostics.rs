@@ -139,6 +139,15 @@ pub struct GroupCounters {
     /// second device's self-leave — could previously sit queued forever
     /// with no other signal).
     pub membership_events_queued_revision_gap: u64,
+    /// ADR-0064 slice 1: owner-axis groups whose authenticated fork
+    /// evidence durably installed the persistent fork-quarantine marker
+    /// (owner-axis only — non-owner-axis groups are out of scope for
+    /// this slice and never increment it).
+    pub fork_quarantine_set: u64,
+    /// ADR-0064 slice 1: membership-gated route refusals (public send,
+    /// TreeKEM encrypt/decrypt, secure encrypt/open/reseal) while the
+    /// marker is set.
+    pub fork_quarantine_refusals: u64,
 }
 
 /// Per-group gauges for ADR 0028 causal predecessor delivery. Populated by the
@@ -211,6 +220,105 @@ pub struct GroupsDiagnostics {
     conflict_unauthenticated_last_ms: Mutex<HashMap<String, u64>>,
 }
 
+/// Sum two counter tables field-by-field (saturating). Module-scoped so
+/// the round-2 regression test can drive EVERY field directly — a
+/// dropped line fails the test instead of silently under-counting
+/// `/diagnostics/groups` fleet aggregates.
+fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
+    dst.messages_received = dst.messages_received.saturating_add(src.messages_received);
+    dst.messages_dropped_decode_failed = dst
+        .messages_dropped_decode_failed
+        .saturating_add(src.messages_dropped_decode_failed);
+    dst.join_attempts_timed_out = dst
+        .join_attempts_timed_out
+        .saturating_add(src.join_attempts_timed_out);
+    dst.join_refusal_stale_attempt = dst
+        .join_refusal_stale_attempt
+        .saturating_add(src.join_refusal_stale_attempt);
+    dst.join_refusal_signing_throttled = dst
+        .join_refusal_signing_throttled
+        .saturating_add(src.join_refusal_signing_throttled);
+    for (reason, count) in &src.invites_refused_reasons {
+        let entry = dst
+            .invites_refused_reasons
+            .entry(reason.clone())
+            .or_insert(0);
+        *entry = entry.saturating_add(*count);
+    }
+    dst.adoption_fork_evidence = dst
+        .adoption_fork_evidence
+        .saturating_add(src.adoption_fork_evidence);
+    dst.conflict_unauthenticated = dst
+        .conflict_unauthenticated
+        .saturating_add(src.conflict_unauthenticated);
+    dst.messages_dropped_author_banned = dst
+        .messages_dropped_author_banned
+        .saturating_add(src.messages_dropped_author_banned);
+    dst.messages_dropped_write_policy_violation = dst
+        .messages_dropped_write_policy_violation
+        .saturating_add(src.messages_dropped_write_policy_violation);
+    dst.sends_rejected_write_policy = dst
+        .sends_rejected_write_policy
+        .saturating_add(src.sends_rejected_write_policy);
+    dst.public_message_gossip_raced_unicast = dst
+        .public_message_gossip_raced_unicast
+        .saturating_add(src.public_message_gossip_raced_unicast);
+    dst.messages_dropped_signature_failed = dst
+        .messages_dropped_signature_failed
+        .saturating_add(src.messages_dropped_signature_failed);
+    dst.messages_dropped_other = dst
+        .messages_dropped_other
+        .saturating_add(src.messages_dropped_other);
+    dst.member_joined_events_applied = dst
+        .member_joined_events_applied
+        .saturating_add(src.member_joined_events_applied);
+    dst.member_joined_events_rejected_non_member_role = dst
+        .member_joined_events_rejected_non_member_role
+        .saturating_add(src.member_joined_events_rejected_non_member_role);
+    dst.member_joined_events_rejected_invite_secret_unknown = dst
+        .member_joined_events_rejected_invite_secret_unknown
+        .saturating_add(src.member_joined_events_rejected_invite_secret_unknown);
+    dst.member_joined_events_rejected_owner_cert_pending = dst
+        .member_joined_events_rejected_owner_cert_pending
+        .saturating_add(src.member_joined_events_rejected_owner_cert_pending);
+    dst.member_joined_events_rejected_treekem_unavailable = dst
+        .member_joined_events_rejected_treekem_unavailable
+        .saturating_add(src.member_joined_events_rejected_treekem_unavailable);
+    dst.member_added_events_adopted = dst
+        .member_added_events_adopted
+        .saturating_add(src.member_added_events_adopted);
+    dst.member_added_events_rejected_state_chain_gap = dst
+        .member_added_events_rejected_state_chain_gap
+        .saturating_add(src.member_added_events_rejected_state_chain_gap);
+    dst.causal_relayed = dst.causal_relayed.saturating_add(src.causal_relayed);
+    dst.causal_retried = dst.causal_retried.saturating_add(src.causal_retried);
+    dst.causal_queued = dst.causal_queued.saturating_add(src.causal_queued);
+    dst.causal_deduplicated = dst
+        .causal_deduplicated
+        .saturating_add(src.causal_deduplicated);
+    dst.causal_applied = dst.causal_applied.saturating_add(src.causal_applied);
+    dst.membership_events_queued_revision_gap = dst
+        .membership_events_queued_revision_gap
+        .saturating_add(src.membership_events_queued_revision_gap);
+    dst.fork_quarantine_set = dst
+        .fork_quarantine_set
+        .saturating_add(src.fork_quarantine_set);
+    dst.fork_quarantine_refusals = dst
+        .fork_quarantine_refusals
+        .saturating_add(src.fork_quarantine_refusals);
+    dst.causal_expired = dst.causal_expired.saturating_add(src.causal_expired);
+    dst.causal_invalid = dst.causal_invalid.saturating_add(src.causal_invalid);
+    dst.causal_conflicted = dst.causal_conflicted.saturating_add(src.causal_conflicted);
+    dst.causal_capacity_rejected = dst
+        .causal_capacity_rejected
+        .saturating_add(src.causal_capacity_rejected);
+    dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (None, Some(b)) => Some(b),
+        (a, None) => a,
+    };
+}
+
 impl GroupsDiagnostics {
     /// Construct an empty diagnostics table.
     #[must_use]
@@ -245,6 +353,24 @@ impl GroupsDiagnostics {
         self.with_counters(group_id, |c| {
             c.membership_events_queued_revision_gap =
                 c.membership_events_queued_revision_gap.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 1: the persistent fork-quarantine marker was
+    /// durably installed for this group (owner-axis groups only — see
+    /// `GroupCounters::fork_quarantine_set`).
+    pub fn record_fork_quarantine_set(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_quarantine_set = c.fork_quarantine_set.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 1: a membership-gated route refused the group
+    /// because the fork-quarantine marker is set (typed 409
+    /// `fork_quarantined`).
+    pub fn record_fork_quarantine_refusal(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_quarantine_refusals = c.fork_quarantine_refusals.saturating_add(1);
         });
     }
 
@@ -561,95 +687,6 @@ impl GroupsDiagnostics {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-
-        fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
-            dst.messages_received = dst.messages_received.saturating_add(src.messages_received);
-            dst.messages_dropped_decode_failed = dst
-                .messages_dropped_decode_failed
-                .saturating_add(src.messages_dropped_decode_failed);
-            dst.join_attempts_timed_out = dst
-                .join_attempts_timed_out
-                .saturating_add(src.join_attempts_timed_out);
-            dst.join_refusal_stale_attempt = dst
-                .join_refusal_stale_attempt
-                .saturating_add(src.join_refusal_stale_attempt);
-            dst.join_refusal_signing_throttled = dst
-                .join_refusal_signing_throttled
-                .saturating_add(src.join_refusal_signing_throttled);
-            for (reason, count) in &src.invites_refused_reasons {
-                let entry = dst
-                    .invites_refused_reasons
-                    .entry(reason.clone())
-                    .or_insert(0);
-                *entry = entry.saturating_add(*count);
-            }
-            dst.adoption_fork_evidence = dst
-                .adoption_fork_evidence
-                .saturating_add(src.adoption_fork_evidence);
-            dst.conflict_unauthenticated = dst
-                .conflict_unauthenticated
-                .saturating_add(src.conflict_unauthenticated);
-            dst.messages_dropped_author_banned = dst
-                .messages_dropped_author_banned
-                .saturating_add(src.messages_dropped_author_banned);
-            dst.messages_dropped_write_policy_violation = dst
-                .messages_dropped_write_policy_violation
-                .saturating_add(src.messages_dropped_write_policy_violation);
-            dst.sends_rejected_write_policy = dst
-                .sends_rejected_write_policy
-                .saturating_add(src.sends_rejected_write_policy);
-            dst.public_message_gossip_raced_unicast = dst
-                .public_message_gossip_raced_unicast
-                .saturating_add(src.public_message_gossip_raced_unicast);
-            dst.messages_dropped_signature_failed = dst
-                .messages_dropped_signature_failed
-                .saturating_add(src.messages_dropped_signature_failed);
-            dst.messages_dropped_other = dst
-                .messages_dropped_other
-                .saturating_add(src.messages_dropped_other);
-            dst.member_joined_events_applied = dst
-                .member_joined_events_applied
-                .saturating_add(src.member_joined_events_applied);
-            dst.member_joined_events_rejected_non_member_role = dst
-                .member_joined_events_rejected_non_member_role
-                .saturating_add(src.member_joined_events_rejected_non_member_role);
-            dst.member_joined_events_rejected_invite_secret_unknown = dst
-                .member_joined_events_rejected_invite_secret_unknown
-                .saturating_add(src.member_joined_events_rejected_invite_secret_unknown);
-            dst.member_joined_events_rejected_owner_cert_pending = dst
-                .member_joined_events_rejected_owner_cert_pending
-                .saturating_add(src.member_joined_events_rejected_owner_cert_pending);
-            dst.member_joined_events_rejected_treekem_unavailable = dst
-                .member_joined_events_rejected_treekem_unavailable
-                .saturating_add(src.member_joined_events_rejected_treekem_unavailable);
-            dst.member_added_events_adopted = dst
-                .member_added_events_adopted
-                .saturating_add(src.member_added_events_adopted);
-            dst.member_added_events_rejected_state_chain_gap = dst
-                .member_added_events_rejected_state_chain_gap
-                .saturating_add(src.member_added_events_rejected_state_chain_gap);
-            dst.causal_relayed = dst.causal_relayed.saturating_add(src.causal_relayed);
-            dst.causal_retried = dst.causal_retried.saturating_add(src.causal_retried);
-            dst.causal_queued = dst.causal_queued.saturating_add(src.causal_queued);
-            dst.causal_deduplicated = dst
-                .causal_deduplicated
-                .saturating_add(src.causal_deduplicated);
-            dst.causal_applied = dst.causal_applied.saturating_add(src.causal_applied);
-            dst.causal_expired = dst.causal_expired.saturating_add(src.causal_expired);
-            dst.causal_invalid = dst.causal_invalid.saturating_add(src.causal_invalid);
-            dst.causal_conflicted = dst.causal_conflicted.saturating_add(src.causal_conflicted);
-            dst.causal_capacity_rejected = dst
-                .causal_capacity_rejected
-                .saturating_add(src.causal_capacity_rejected);
-            dst.membership_events_queued_revision_gap = dst
-                .membership_events_queued_revision_gap
-                .saturating_add(src.membership_events_queued_revision_gap);
-            dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (None, Some(b)) => Some(b),
-                (a, None) => a,
-            };
-        }
 
         let stable_for_key = |key: &str| -> String {
             groups
@@ -976,5 +1013,208 @@ mod tests {
         let owner = crate::identity::UserKeypair::generate().expect("user keypair");
         let agent = crate::identity::AgentKeypair::generate().expect("agent keypair");
         crate::identity::AgentCertificate::issue(&owner, &agent).expect("stub cert issue")
+    }
+    /// ADR-0064 r2 / review item 1: the #635 merge hunk dropped the
+    /// `causal_applied` line, which no existing test caught. This test
+    /// drives EVERY merged field with distinct non-zero values on both
+    /// sides and asserts each sum, so any future dropped (or wrongly
+    /// doubled) merge line fails here instead of silently under-counting
+    /// `/diagnostics/groups` fleet aggregates.
+    #[test]
+    fn merge_counters_sums_every_field() {
+        let counters_with = |base: u64| GroupCounters {
+            messages_received: base + 1,
+            messages_dropped_decode_failed: base + 2,
+            messages_dropped_author_banned: base + 3,
+            messages_dropped_write_policy_violation: base + 4,
+            sends_rejected_write_policy: base + 5,
+            public_message_gossip_raced_unicast: base + 6,
+            messages_dropped_signature_failed: base + 7,
+            messages_dropped_other: base + 8,
+            last_message_at_ms: Some(base + 9),
+            member_joined_events_applied: base + 10,
+            member_joined_events_rejected_non_member_role: base + 11,
+            member_joined_events_rejected_invite_secret_unknown: base + 12,
+            invites_refused_reasons: std::collections::BTreeMap::from([(
+                "reason-a".to_string(),
+                base + 13,
+            )]),
+            join_attempts_timed_out: base + 14,
+            join_refusal_stale_attempt: base + 15,
+            join_refusal_signing_throttled: base + 16,
+            adoption_fork_evidence: base + 17,
+            conflict_unauthenticated: base + 18,
+            // Snapshot-time gauge, NOT a merged counter: set non-zero to
+            // pin that merge leaves it alone (snapshot recomputes it).
+            members_awaiting_certificate: base + 19,
+            member_joined_events_rejected_owner_cert_pending: base + 20,
+            member_joined_events_rejected_treekem_unavailable: base + 21,
+            member_added_events_adopted: base + 22,
+            member_added_events_rejected_state_chain_gap: base + 23,
+            causal_relayed: base + 24,
+            causal_retried: base + 25,
+            causal_queued: base + 26,
+            causal_deduplicated: base + 27,
+            causal_applied: base + 28,
+            causal_expired: base + 29,
+            causal_invalid: base + 30,
+            causal_conflicted: base + 31,
+            causal_capacity_rejected: base + 32,
+            membership_events_queued_revision_gap: base + 33,
+            fork_quarantine_set: base + 34,
+            fork_quarantine_refusals: base + 35,
+        };
+        let dst = counters_with(7);
+        let src = counters_with(1_000);
+        let gauge_before = dst.members_awaiting_certificate;
+        let mut merged = dst.clone();
+        merge_counters(&mut merged, &src);
+        // Every merged counter must equal the exact per-field sum — a
+        // dropped merge line leaves dst's value; a doubled line over-sums.
+        assert_eq!(
+            merged.messages_received,
+            dst.messages_received + src.messages_received
+        );
+        assert_eq!(
+            merged.messages_dropped_decode_failed,
+            dst.messages_dropped_decode_failed + src.messages_dropped_decode_failed
+        );
+        assert_eq!(
+            merged.messages_dropped_author_banned,
+            dst.messages_dropped_author_banned + src.messages_dropped_author_banned
+        );
+        assert_eq!(
+            merged.messages_dropped_write_policy_violation,
+            dst.messages_dropped_write_policy_violation
+                + src.messages_dropped_write_policy_violation
+        );
+        assert_eq!(
+            merged.sends_rejected_write_policy,
+            dst.sends_rejected_write_policy + src.sends_rejected_write_policy
+        );
+        assert_eq!(
+            merged.public_message_gossip_raced_unicast,
+            dst.public_message_gossip_raced_unicast + src.public_message_gossip_raced_unicast
+        );
+        assert_eq!(
+            merged.messages_dropped_signature_failed,
+            dst.messages_dropped_signature_failed + src.messages_dropped_signature_failed
+        );
+        assert_eq!(
+            merged.messages_dropped_other,
+            dst.messages_dropped_other + src.messages_dropped_other
+        );
+        assert_eq!(
+            merged.last_message_at_ms,
+            dst.last_message_at_ms.max(src.last_message_at_ms)
+        );
+        assert_eq!(
+            merged.member_joined_events_applied,
+            dst.member_joined_events_applied + src.member_joined_events_applied
+        );
+        assert_eq!(
+            merged.member_joined_events_rejected_non_member_role,
+            dst.member_joined_events_rejected_non_member_role
+                + src.member_joined_events_rejected_non_member_role
+        );
+        assert_eq!(
+            merged.member_joined_events_rejected_invite_secret_unknown,
+            dst.member_joined_events_rejected_invite_secret_unknown
+                + src.member_joined_events_rejected_invite_secret_unknown
+        );
+        assert_eq!(
+            merged.invites_refused_reasons.get("reason-a"),
+            Some(
+                &(dst.invites_refused_reasons.get("reason-a").unwrap()
+                    + src.invites_refused_reasons.get("reason-a").unwrap())
+            )
+        );
+        assert_eq!(merged.invites_refused_reasons.len(), 1);
+        assert_eq!(
+            merged.join_attempts_timed_out,
+            dst.join_attempts_timed_out + src.join_attempts_timed_out
+        );
+        assert_eq!(
+            merged.join_refusal_stale_attempt,
+            dst.join_refusal_stale_attempt + src.join_refusal_stale_attempt
+        );
+        assert_eq!(
+            merged.join_refusal_signing_throttled,
+            dst.join_refusal_signing_throttled + src.join_refusal_signing_throttled
+        );
+        assert_eq!(
+            merged.adoption_fork_evidence,
+            dst.adoption_fork_evidence + src.adoption_fork_evidence
+        );
+        assert_eq!(
+            merged.conflict_unauthenticated,
+            dst.conflict_unauthenticated + src.conflict_unauthenticated
+        );
+        assert_eq!(
+            merged.member_joined_events_rejected_owner_cert_pending,
+            dst.member_joined_events_rejected_owner_cert_pending
+                + src.member_joined_events_rejected_owner_cert_pending
+        );
+        assert_eq!(
+            merged.member_joined_events_rejected_treekem_unavailable,
+            dst.member_joined_events_rejected_treekem_unavailable
+                + src.member_joined_events_rejected_treekem_unavailable
+        );
+        assert_eq!(
+            merged.member_added_events_adopted,
+            dst.member_added_events_adopted + src.member_added_events_adopted
+        );
+        assert_eq!(
+            merged.member_added_events_rejected_state_chain_gap,
+            dst.member_added_events_rejected_state_chain_gap
+                + src.member_added_events_rejected_state_chain_gap
+        );
+        assert_eq!(
+            merged.causal_relayed,
+            dst.causal_relayed + src.causal_relayed
+        );
+        assert_eq!(
+            merged.causal_retried,
+            dst.causal_retried + src.causal_retried
+        );
+        assert_eq!(merged.causal_queued, dst.causal_queued + src.causal_queued);
+        assert_eq!(
+            merged.causal_deduplicated,
+            dst.causal_deduplicated + src.causal_deduplicated
+        );
+        assert_eq!(
+            merged.causal_applied,
+            dst.causal_applied + src.causal_applied
+        );
+        assert_eq!(
+            merged.causal_expired,
+            dst.causal_expired + src.causal_expired
+        );
+        assert_eq!(
+            merged.causal_invalid,
+            dst.causal_invalid + src.causal_invalid
+        );
+        assert_eq!(
+            merged.causal_conflicted,
+            dst.causal_conflicted + src.causal_conflicted
+        );
+        assert_eq!(
+            merged.causal_capacity_rejected,
+            dst.causal_capacity_rejected + src.causal_capacity_rejected
+        );
+        assert_eq!(
+            merged.membership_events_queued_revision_gap,
+            dst.membership_events_queued_revision_gap + src.membership_events_queued_revision_gap
+        );
+        assert_eq!(
+            merged.fork_quarantine_set,
+            dst.fork_quarantine_set + src.fork_quarantine_set
+        );
+        assert_eq!(
+            merged.fork_quarantine_refusals,
+            dst.fork_quarantine_refusals + src.fork_quarantine_refusals
+        );
+        // The gauge is recomputed at snapshot time, never merged.
+        assert_eq!(merged.members_awaiting_certificate, gauge_before);
     }
 }
