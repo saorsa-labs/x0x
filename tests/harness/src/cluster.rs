@@ -103,6 +103,13 @@ impl AgentInstance {
     /// preserved on test failure). When unset, I/O is discarded as before.
     /// The daemon inherits `RUST_LOG` from this process — set it in the test
     /// environment to raise verbosity for post-restart diagnostics.
+    ///
+    /// Hermeticity (PR #634 review round 2): like the initial spawn and
+    /// `restart_on_new_quic_port_no_bootstrap`, a restart must never dial
+    /// the EMBEDDED production bootstrap peers. `--no-hard-coded-bootstrap`
+    /// keeps the config file's own `bootstrap_peers` (the hermetic
+    /// sibling), so pair/trio mesh reconnection is unchanged — only the
+    /// prod addresses drop out.
     pub async fn start(&mut self) {
         let reservations = self.prepare_start();
         let (stdout, stderr) = match test_log_stdio(&self.name, "restart") {
@@ -115,6 +122,7 @@ impl AgentInstance {
             .arg(&self.config_path)
             .arg("--name")
             .arg(&self.name)
+            .arg("--no-hard-coded-bootstrap")
             .stdout(stdout)
             .stderr(stderr);
         drop(reservations);
