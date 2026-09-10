@@ -106,9 +106,20 @@ impl DaemonFixture {
         // #417: hermetic by default — a private plane namespaces mDNS but does
         // not stop the fixture advertising on the LAN, so turn mDNS off outright.
         let mdns_line = hermetic_mdns_line(extra_config);
+        // #609: identity must be FIXTURE-OWNED, not home-derived. Without an
+        // explicit `identity_dir` the daemon resolves identity from the
+        // instance name — `$HOME/.x0x-<name>` — so the fixture daemon READS
+        // AND WRITES key material under whichever home the test process
+        // inherited (the real one under plain `cargo test`; the nextest
+        // wrapper's scratch only by accident of env). An explicit dir inside
+        // the fixture tempdir makes isolation hold by construction, runner
+        // or no runner, and the assert below fails loudly if the daemon ever
+        // stops honouring it.
+        let identity_dir = tempdir.path().join("identity");
         let mut config = format!(
-            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nlog_level = \"warn\"\n{}{}{}instance_name = \"{}\"\n",
+            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nidentity_dir = \"{}\"\nlog_level = \"warn\"\n{}{}{}instance_name = \"{}\"\n",
             tempdir.path().display(),
+            identity_dir.display(),
             bootstrap_line,
             network_line,
             mdns_line,
@@ -121,10 +132,6 @@ impl DaemonFixture {
             }
         }
         std::fs::write(&config_path, config).expect("write config");
-
-        let identity_dir = dirs::home_dir()
-            .expect("home dir")
-            .join(format!(".x0x-{name}"));
 
         let mut process_cmd = Command::new(&binary);
         process_cmd
@@ -154,6 +161,23 @@ impl DaemonFixture {
         };
 
         fixture.wait_for_startup().await;
+
+        // #609 hermeticity gate: the daemon must keep its identity inside
+        // the fixture tempdir and must NOT have fallen back to the
+        // instance-name path under the process's home (the leak this
+        // guards against wrote real key files into the operator's home;
+        // thousands of stale ~/.x0x-<name> dirs were found in the wild).
+        assert!(
+            fixture.identity_dir.join("machine.key").exists(),
+            "#609: fixture daemon did not place its identity in the fixture-owned dir {}",
+            fixture.identity_dir.display()
+        );
+        let leaked = dirs::home_dir().map(|h| h.join(format!(".x0x-{name}")));
+        assert!(
+            leaked.as_ref().is_none_or(|p| !p.exists()),
+            "#609: fixture daemon leaked identity to the home-derived instance dir {}",
+            leaked.map_or_else(|| "<none>".to_string(), |p| p.display().to_string())
+        );
         fixture
     }
 
