@@ -34904,6 +34904,206 @@ pub(in crate::server) mod tests {
         Ok((status, body))
     }
 
+    // ====================================================================
+    // Issue #372 — the "live zero-member group" state is UNREACHABLE on
+    // the committed-state path: `enforce_last_admin_invariant` (invoked
+    // by every seal/apply, groups/mod.rs apply paths) refuses any
+    // non-withdrawn roster with zero active admins, and the last
+    // member of a sealable roster is necessarily an admin (the
+    // invariant holds inductively on every committed transition).
+    // These tests pin that refusal so a future change cannot start
+    // persisting empty live rosters, and characterize what the
+    // concurrent last-two-members race (#372's real residual — needs
+    // the ADR-0016 protocol decision per the issue triage) actually
+    // converges to: a stale single-survivor view, never a zero-member
+    // live group.
+    // ====================================================================
+
+    async fn foreign_roster_state(
+        n_admins: usize,
+        n_members: usize,
+    ) -> Result<(
+        Arc<AppState>,
+        tempfile::TempDir,
+        String,
+        x0x::groups::GroupInfo,
+        Vec<x0x::identity::AgentKeypair>,
+        Vec<x0x::identity::AgentKeypair>,
+    )> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let group_id = "5c".repeat(32);
+        let admins: Vec<_> = (0..n_admins.max(1))
+            .map(|_| x0x::identity::AgentKeypair::generate())
+            .collect::<Result<_, _>>()?;
+        let members: Vec<_> = (0..n_members)
+            .map(|_| x0x::identity::AgentKeypair::generate())
+            .collect::<Result<_, _>>()?;
+        let creator = admins[0].agent_id();
+        let creator_hex = hex::encode(creator.as_bytes());
+        let mut parent = x0x::groups::GroupInfo::with_policy(
+            "372 roster".to_string(),
+            String::new(),
+            creator,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        parent.roster_revision = 1;
+        parent.shared_secret = Some(vec![9; 32]);
+        for admin in &admins {
+            parent.add_member(
+                hex::encode(admin.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Admin,
+                Some(creator_hex.clone()),
+                None,
+            );
+        }
+        for member in &members {
+            parent.add_member(
+                hex::encode(member.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(creator_hex.clone()),
+                None,
+            );
+        }
+        parent.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), parent.clone());
+        Ok((state, dir, group_id, parent, admins, members))
+    }
+
+    /// The actor's committed self-removal transition sealed from `parent`.
+    async fn signed_self_leave_event(
+        state: &AppState,
+        parent: &x0x::groups::GroupInfo,
+        group_id: &str,
+        leaver: &x0x::identity::AgentKeypair,
+    ) -> Result<NamedGroupMetadataEvent> {
+        let leaver_hex = hex::encode(leaver.agent_id().as_bytes());
+        let mut committed = parent.clone();
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        let commit = seal_commit_owner_certified(state, &mut committed, leaver, 2_000).await?;
+        Ok(NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.to_string(),
+            revision,
+            actor: leaver_hex,
+            agent_id: hex::encode(leaver.agent_id().as_bytes()),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(commit),
+        })
+    }
+
+    #[tokio::test]
+    async fn metadata_removal_emptying_roster_is_rejected_not_persisted() -> Result<()> {
+        // WHY (#372): the issue's literal artifact — a persisted LIVE
+        // zero-member group — must stay impossible. The refusal happens
+        // at the EARLIEST layer: `seal_commit_owner_certified` itself
+        // refuses to produce a commit for a transition that would leave
+        // a live roster with zero active admins (the last member of any
+        // sealable roster is necessarily an admin — the invariant holds
+        // inductively on every committed transition). No emptying
+        // commit can therefore exist, so no apply path can persist one;
+        // the holder's store is untouched and no tombstone is minted
+        // from an invalid transition.
+        let (state, _dir, group_id, parent, admins, _members) = foreign_roster_state(1, 0).await?;
+        let sole_admin = admins.into_iter().next().context("sole admin")?;
+        let sole_admin_hex = hex::encode(sole_admin.agent_id().as_bytes());
+        let mut emptying = parent.clone();
+        emptying.roster_revision = emptying.roster_revision.saturating_add(1);
+        emptying.remove_member(&sole_admin_hex, Some(sole_admin_hex.clone()));
+        let seal = seal_commit_owner_certified(&state, &mut emptying, &sole_admin, 2_000).await;
+        assert!(
+            seal.is_err(),
+            "sealing a live zero-admin (hence zero-member) roster must be refused"
+        );
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("pre-event view retained");
+        assert!(!info.withdrawn, "no tombstone from an invalid transition");
+        assert_eq!(
+            info.active_member_count(),
+            parent.active_member_count(),
+            "roster untouched by the refused transition"
+        );
+        assert!(
+            info.shared_secret.is_some(),
+            "key material untouched by the refused transition"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn member_self_leave_with_admin_survivor_applies_and_stays_live() -> Result<()> {
+        // WHY: the invariant must refuse only EMPTYING removals — an
+        // ordinary member self-leave with an admin survivor is the
+        // legitimate Proceed shape and must keep applying.
+        let (state, _dir, group_id, parent, admins, members) = foreign_roster_state(1, 1).await?;
+        let admin_hex = hex::encode(admins[0].agent_id().as_bytes());
+        let member = members.into_iter().next().context("member")?;
+        let event = signed_self_leave_event(&state, &parent, &group_id, &member).await?;
+        let applied =
+            apply_named_group_metadata_event(&state, event, member.agent_id(), true, None).await;
+        assert!(applied.accepted, "a survivor self-leave must apply");
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group retained");
+        assert!(!info.withdrawn, "a survivor keeps the group live");
+        assert!(info.has_active_member(&admin_hex));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_last_two_admins_race_converges_to_survivor_view_not_zero() -> Result<()> {
+        // WHY (#372 characterization): two admins self-leave inside the
+        // same window, each sealing from the same two-admin parent
+        // (sibling commits). A third-party holder applies the first
+        // valid leave (roster: the other admin, LIVE); the sibling is
+        // refused on the commit-chain mismatch. The worst reachable
+        // state is therefore a stale single-survivor view with no
+        // tombstone — the documented residual awaiting the ADR-0016
+        // protocol decision — and NEVER a persisted live zero-member
+        // group.
+        let (state, _dir, group_id, parent, admins, _members) = foreign_roster_state(2, 0).await?;
+        let mut admins = admins.into_iter();
+        let admin_a = admins.next().context("admin a")?;
+        let admin_b = admins.next().context("admin b")?;
+        let b_hex = hex::encode(admin_b.agent_id().as_bytes());
+        let event_a = signed_self_leave_event(&state, &parent, &group_id, &admin_a).await?;
+        let event_b = signed_self_leave_event(&state, &parent, &group_id, &admin_b).await?;
+
+        let applied =
+            apply_named_group_metadata_event(&state, event_a, admin_a.agent_id(), true, None).await;
+        assert!(applied.accepted, "the first valid self-leave applies");
+
+        let applied =
+            apply_named_group_metadata_event(&state, event_b, admin_b.agent_id(), true, None).await;
+        assert!(
+            !applied.accepted,
+            "the sibling self-leave is refused on the commit-chain mismatch"
+        );
+
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group retained");
+        assert!(
+            !info.withdrawn,
+            "no tombstone exists for the race (residual)"
+        );
+        assert_eq!(
+            info.active_member_count(),
+            1,
+            "worst reachable state: a stale single-survivor view"
+        );
+        assert!(
+            info.has_active_member(&b_hex),
+            "the survivor is the peer the first leaver's commit left behind"
+        );
+        Ok(())
+    }
+
     #[test]
     fn signed_public_bootstrap_is_secret_free_and_commit_bound() -> Result<()> {
         let authority = x0x::identity::AgentKeypair::generate()?;
