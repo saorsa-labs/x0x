@@ -4,7 +4,7 @@
 //!
 //! Crafts an unattested first-seen TaskItem — a `Claimed { victim, ts: 1 }`
 //! element in the TaskItem's checkbox OR-Set with NO matching attestation — via
-//! `x0x::crdt::forge_unattested_delta_bytes`, which returns the bincode
+//! `x0x::crdt::forge_unattested_delta_bytes`, which on success returns bincode
 //! `(PeerId, TaskListDelta)` wire bytes (the exact format the live sync path
 //! decodes). It then publishes those bytes over REAL gossip through the target
 //! daemon's `POST /publish` wire API on the task list's topic.
@@ -149,7 +149,7 @@ fn main() -> Result<()> {
 
     // The in-crate forge seam: bincode (PeerId, TaskListDelta) bytes carrying
     // a Claimed{victim, ts:1} element with NO attestation.
-    let delta_bytes = forge_unattested_delta_bytes(victim, task_id, spoof_peer);
+    let delta_bytes = forge_unattested_delta_bytes(victim, task_id, spoof_peer)?;
     let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&delta_bytes);
 
     let (host, port, path) = host_port(&cli.daemon)?;

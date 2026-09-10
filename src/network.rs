@@ -6231,6 +6231,7 @@ async fn network_node_uses_plumbed_per_instance_cache() {
     let config = NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
         ..NetworkConfig::default()
     };
     let node = NetworkNode::new(config, Some(cache_config), None)
@@ -6269,6 +6270,7 @@ async fn network_node_in_memory_cache_writes_nothing() {
     let config = NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
         ..NetworkConfig::default()
     };
     let node = NetworkNode::new(config, Some(cache_config), None)
@@ -7280,11 +7282,13 @@ mod identity_before_bookkeeping_tests {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: Vec::new(),
             inbound_allowlist: a_fake_allowlist,
+            mdns_enabled: false,
             ..NetworkConfig::default()
         };
         let config_b = NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
             ..NetworkConfig::default()
         };
 

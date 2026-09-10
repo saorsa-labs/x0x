@@ -56,6 +56,7 @@ fn cfg_a_local(_port_offset: u16) -> NetworkConfig {
     NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: vec![],
+        mdns_enabled: false,
         ..Default::default()
     }
 }
@@ -69,6 +70,7 @@ fn cfg_a_vps(_port_offset: u16) -> NetworkConfig {
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect(),
+        mdns_enabled: false,
         ..Default::default()
     }
 }
@@ -89,6 +91,7 @@ fn cfg_b(a_addr: std::net::SocketAddr, vps: bool) -> NetworkConfig {
     NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: nodes,
+        mdns_enabled: false,
         ..Default::default()
     }
 }
@@ -102,6 +105,7 @@ fn cfg_b_vps_only() -> NetworkConfig {
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect(),
+        mdns_enabled: false,
         ..Default::default()
     }
 }

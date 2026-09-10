@@ -17901,6 +17901,7 @@ mod tests {
     fn local_discovery_scope_tracks_bootstrap_partition() {
         let mut config = network::NetworkConfig {
             bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
             ..network::NetworkConfig::default()
         };
         assert!(allow_local_discovery_addresses(&config));
@@ -19957,6 +19958,7 @@ mod tests {
         let global_cfg = network::NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
             bootstrap_nodes: vec!["142.93.199.50:5483".parse().expect("wan seed")],
+            mdns_enabled: false,
             ..network::NetworkConfig::default()
         };
         assert!(
@@ -25128,6 +25130,7 @@ mod peer_connected_handler_integration_tests {
             .with_network_config(network::NetworkConfig {
                 bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
                 bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
                 ..network::NetworkConfig::default()
             })
             .build()
@@ -25141,6 +25144,7 @@ mod peer_connected_handler_integration_tests {
             .with_network_config(network::NetworkConfig {
                 bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
                 bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
                 ..network::NetworkConfig::default()
             })
             .build()
