@@ -168,6 +168,88 @@ async fn announce_full_cert(state: &AppState, cert: x0x::identity::AgentCertific
         .insert(agent_id, entry);
 }
 
+#[derive(Clone, Copy)]
+enum BlobDiagnosticRole {
+    Owner,
+    Joiner,
+}
+
+// All values are independent per-agent lifetime totals. No target digest,
+// observation window, coherent snapshot, pending count or causal inference.
+fn format_blob_diagnostics(
+    role: BlobDiagnosticRole,
+    stats: &crate::announce_blob::AnnounceBlobCacheStats,
+) -> String {
+    let role = match role {
+        BlobDiagnosticRole::Owner => "owner",
+        BlobDiagnosticRole::Joiner => "joiner",
+    };
+    let fields = [
+        ("blob_cache_hits", stats.blob_cache_hits),
+        ("blob_cache_misses", stats.blob_cache_misses),
+        ("blob_fetches_ok", stats.blob_fetches_ok),
+        ("blob_fetches_failed", stats.blob_fetches_failed),
+        ("fetches_spawned", stats.diagnostics.fetches_spawned),
+        (
+            "terminal_both_carriers_failed",
+            stats.diagnostics.terminal_both_carriers_failed,
+        ),
+        (
+            "terminal_deadline_elapsed",
+            stats.diagnostics.terminal_deadline_elapsed,
+        ),
+        (
+            "terminal_subscription_closed",
+            stats.diagnostics.terminal_subscription_closed,
+        ),
+        (
+            "terminal_verifier_error",
+            stats.diagnostics.terminal_verifier_error,
+        ),
+        ("responses_seen", stats.diagnostics.responses_seen),
+        (
+            "responses_skipped_malformed",
+            stats.diagnostics.responses_skipped_malformed,
+        ),
+        (
+            "responses_skipped_mismatched_digest",
+            stats.diagnostics.responses_skipped_mismatched_digest,
+        ),
+        (
+            "verified_requests_decoded",
+            stats.diagnostics.verified_requests_decoded,
+        ),
+        ("unknown_digest", stats.diagnostics.unknown_digest),
+        ("pair_available", stats.diagnostics.pair_available),
+        ("coalesced_dropped", stats.diagnostics.coalesced_dropped),
+        (
+            "response_publish_ok_local",
+            stats.diagnostics.response_publish_ok_local,
+        ),
+        (
+            "publish_failed_local",
+            stats.diagnostics.publish_failed_local,
+        ),
+    ];
+    let mut line = String::from(
+        "counters_are_independent_relaxed_no_snapshot_pending_not_exact scope=per_agent_lifetime_no_digest_window_attempt_attribution",
+    );
+    for (name, value) in fields {
+        line.push_str(&format!(" {role}_{name}={value}"));
+    }
+    line
+}
+
+fn emit_joiner_blob_diagnostics(joiner: &Agent) {
+    eprintln!(
+        "DIAG cert-resolution-blob {}",
+        format_blob_diagnostics(
+            BlobDiagnosticRole::Joiner,
+            &joiner.announce_blob_cache.snapshot()
+        )
+    );
+}
+
 /// Emit a bounded, privacy-minimal snapshot when a certificate wait expires.
 ///
 /// The cache uses `try_read` so a diagnostic cannot extend or mask the wait.
@@ -212,7 +294,7 @@ fn emit_certificate_resolution_diagnostics(state: &AppState, joiner_id: x0x::ide
             "DIAG cert-resolution-state cache_busy={} entry_present={} ",
             "digest_present={} cert_present={} digest_matches_cert={} ",
             "cert_binds_joiner={} blob_cache_hits={} blob_cache_misses={} ",
-            "blob_fetches_ok={} blob_fetches_failed={}"
+            "blob_fetches_ok={} blob_fetches_failed={} {}"
         ),
         cache_busy,
         entry_present,
@@ -224,6 +306,7 @@ fn emit_certificate_resolution_diagnostics(state: &AppState, joiner_id: x0x::ide
         blob_stats.blob_cache_misses,
         blob_stats.blob_fetches_ok,
         blob_stats.blob_fetches_failed,
+        format_blob_diagnostics(BlobDiagnosticRole::Owner, &blob_stats),
     );
 }
 
@@ -2604,6 +2687,7 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     });
     if cert_event.is_none() {
         emit_certificate_resolution_diagnostics(owner_state.as_ref(), joiner_id);
+        emit_joiner_blob_diagnostics(&joiner_agent);
     }
     assert!(
         cert_event.is_some_and(|event| event.agent_id == joiner_id),
@@ -4701,4 +4785,98 @@ async fn issue458r4_adoption_hydrates_reconstructed_digest_only_seats() -> Resul
         "the hydrated certificate persisted with the adopted roster"
     );
     Ok(())
+}
+
+#[test]
+fn blob_diagnostic_formatter_preserves_closed_numeric_fields_and_roles() {
+    use crate::announce_blob::{AnnounceBlobCacheStats, AnnounceBlobDiagnostics};
+    let stats = AnnounceBlobCacheStats {
+        blob_cache_hits: 1,
+        blob_cache_misses: 2,
+        blob_fetches_ok: 3,
+        blob_fetches_failed: 4,
+        diagnostics: AnnounceBlobDiagnostics {
+            fetches_spawned: 5,
+            terminal_both_carriers_failed: 6,
+            terminal_deadline_elapsed: 7,
+            terminal_subscription_closed: 8,
+            terminal_verifier_error: 9,
+            responses_seen: 10,
+            responses_skipped_malformed: 11,
+            responses_skipped_mismatched_digest: 12,
+            verified_requests_decoded: 13,
+            unknown_digest: 14,
+            pair_available: 15,
+            coalesced_dropped: 16,
+            response_publish_ok_local: 17,
+            publish_failed_local: 18,
+        },
+    };
+    let expected_names = [
+        "blob_cache_hits",
+        "blob_cache_misses",
+        "blob_fetches_ok",
+        "blob_fetches_failed",
+        "fetches_spawned",
+        "terminal_both_carriers_failed",
+        "terminal_deadline_elapsed",
+        "terminal_subscription_closed",
+        "terminal_verifier_error",
+        "responses_seen",
+        "responses_skipped_malformed",
+        "responses_skipped_mismatched_digest",
+        "verified_requests_decoded",
+        "unknown_digest",
+        "pair_available",
+        "coalesced_dropped",
+        "response_publish_ok_local",
+        "publish_failed_local",
+    ];
+    for (role, prefix) in [
+        (BlobDiagnosticRole::Owner, "owner"),
+        (BlobDiagnosticRole::Joiner, "joiner"),
+    ] {
+        let text = format_blob_diagnostics(role, &stats);
+        let parts: Vec<_> = text.split_whitespace().collect();
+        assert_eq!(parts.len(), expected_names.len() + 2);
+        assert_eq!(
+            parts[0],
+            "counters_are_independent_relaxed_no_snapshot_pending_not_exact"
+        );
+        assert_eq!(
+            parts[1],
+            "scope=per_agent_lifetime_no_digest_window_attempt_attribution"
+        );
+        for (i, name) in expected_names.into_iter().enumerate() {
+            assert_eq!(parts[i + 2], format!("{prefix}_{name}={}", i + 1));
+        }
+    }
+}
+
+#[test]
+fn blob_diagnostic_formatter_does_not_infer_pending_or_normalize_observations() {
+    let mut stats = crate::announce_blob::AnnounceBlobCacheStats::default();
+    // Deliberately incoherent across a read interval; output must remain raw.
+    stats.diagnostics.terminal_deadline_elapsed = u64::MAX;
+    stats.diagnostics.responses_skipped_malformed = 7;
+    stats.diagnostics.responses_skipped_mismatched_digest = 11;
+    let text = format_blob_diagnostics(BlobDiagnosticRole::Owner, &stats);
+    assert!(text.contains("owner_fetches_spawned=0"));
+    assert!(text.contains(&format!("owner_terminal_deadline_elapsed={}", u64::MAX)));
+    assert!(text.contains("owner_responses_skipped_malformed=7"));
+    assert!(text.contains("owner_responses_skipped_mismatched_digest=11"));
+    let fields: Vec<_> = text.split_whitespace().skip(2).collect();
+    assert!(fields.iter().all(|field| field
+        .split_once('=')
+        .is_some_and(|(_, value)| value.parse::<u64>().is_ok())));
+    assert!(!fields.iter().any(|field| [
+        "in_flight",
+        "pending",
+        "identity",
+        "payload",
+        "agent_id",
+        "peer_id"
+    ]
+    .iter()
+    .any(|name| field.contains(name))));
 }
