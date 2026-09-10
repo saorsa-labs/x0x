@@ -294,3 +294,10 @@ machine will read to decide when a mandate-capable authority's mandate-less
 events must be refused. The existing post-mutation head attestation remains
 the terminal CAS confirmation and now additionally requires the terminal's
 TreeKEM epoch to match the mandate's declared epoch when both are present.
+
+Preimage errata (recorded for #472; the Accepted ADR body is immutable):
+ the implemented v2 preimage signs the §1a members PLUS a `version` byte,
+ the `authority_agent_id`, and `issued_at_ms` — strictly stronger bindings
+ the per-authority capability map (§1b) requires; every later
+ implementation must diff against this v2 shape, not the §1a formula
+ alone.

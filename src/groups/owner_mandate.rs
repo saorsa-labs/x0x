@@ -4,7 +4,7 @@
 //! The mandate is the ADMISSION OWNER's USER-key signature over a preimage
 //! whose every member is deterministically known BEFORE the seating
 //! authority mutates TreeKEM or persists: the authority clones its live
-//! [`GroupInfo`](crate::groups::GroupInfo), applies the seat-write it is
+//! [`GroupInfo`], applies the seat-write it is
 //! about to perform, and derives the roster root over that clone (the
 //! ACTUAL current roster — never the possibly-stale invite projection; the
 //! r2 `{owner, A, B, joiner}` sequence is exactly the case the invite
@@ -286,6 +286,9 @@ impl OwnerMandate {
             ));
         }
         if self.policy_hash != terminal.policy_hash {
+            return Err(OwnerMandateError::PolicyHashMismatch);
+        }
+        if self.public_meta_hash != terminal.public_meta_hash {
             return Err(OwnerMandateError::MetaHashMismatch);
         }
         if event_epoch.is_some_and(|epoch| epoch != self.declared_epoch) {

@@ -363,3 +363,98 @@ fn replay_reinsertion_keeps_valid_gap_and_discards_removed_author() {
     );
     assert!(queue.is_empty(), "removed author must not be requeued");
 }
+
+/// WHY (ADR-0064 slice 2, round-2 review item 1): a mandate-bearing
+/// TreeKEM `MemberAdded` is the NEW NORMAL for owner-key authorities on
+/// owner-axis groups — the queue-admission predicate matches on event
+/// SHAPE, and the mandate field must be shape-inert. If the pattern
+/// demanded `owner_mandate: None`, every such event arriving ahead of
+/// its predecessor would be DROPPED instead of queued (#482/#492
+/// catch-up breaks for exactly the events slice 2 introduces; blueprint
+/// §5: "a quarantined group must still queue (not drop)").
+#[test]
+fn member_added_with_owner_mandate_still_queues_on_revision_gap() {
+    let mut f = Fixture::new();
+    // The commit signer/actor must be an active admin (the fixture seats
+    // the plain member; the queue predicate requires Admin-or-higher).
+    let actor = hex::encode(f.member.agent_id().as_bytes());
+    f.info.set_member_role(&actor, GroupRole::Admin);
+    let joiner = hex::encode(AgentId([0xA5; 32]).as_bytes());
+    let commit = GroupStateCommit::sign(
+        f.info.stable_group_id().to_string(),
+        f.info.state_revision + 4,
+        Some("missing predecessor".into()),
+        "future roster".into(),
+        "policy".into(),
+        "metadata".into(),
+        None,
+        false,
+        1,
+        &f.member,
+    )
+    .expect("signed future commit");
+    // The shape the production authority now emits: cert-bearing, TreeKEM
+    // transport fields present, and (for owner-key authorities) a mandate.
+    let mandate = || {
+        Some(x0x::groups::OwnerMandate {
+            version: x0x::groups::OWNER_MANDATE_VERSION,
+            stable_group_id: f.info.stable_group_id().to_string(),
+            expected_terminal_revision: commit.revision,
+            parent_state_hash: "missing predecessor".to_string(),
+            roster_root_after_add: commit.roster_root.clone(),
+            policy_hash: commit.policy_hash.clone(),
+            public_meta_hash: commit.public_meta_hash.clone(),
+            declared_epoch: 1,
+            joiner_agent_id: joiner.clone(),
+            invite_secret_hash: String::new(),
+            admission_cert_digest: String::new(),
+            authority_agent_id: actor.clone(),
+            issued_at_ms: 1,
+            signature_b64: String::new(),
+        })
+    };
+    let build = |owner_mandate| NamedGroupMetadataEvent::MemberAdded {
+        group_id: f.info.stable_group_id().to_string(),
+        revision: f.info.roster_revision + 4,
+        actor: actor.clone(),
+        agent_id: joiner.clone(),
+        display_name: None,
+        treekem_commit_b64: Some("commit".to_string()),
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: Some(1),
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some("certificate".to_string()),
+        owner_mandate,
+        commit: Some(commit.clone()),
+    };
+    let sender = f.member.agent_id();
+    let mut queue_with = VecDeque::new();
+    let queued_with = admit_treekem_pending_event(
+        f.info.stable_group_id(),
+        &f.info,
+        &mut queue_with,
+        &build(mandate()),
+        sender,
+        &actor,
+    );
+    assert!(
+        queued_with.is_some(),
+        "mandate-bearing MemberAdded must queue on a revision gap"
+    );
+    let mut queue_without = VecDeque::new();
+    let queued_without = admit_treekem_pending_event(
+        f.info.stable_group_id(),
+        &f.info,
+        &mut queue_without,
+        &build(None),
+        sender,
+        &actor,
+    );
+    assert!(
+        queued_without.is_some(),
+        "mandate-free MemberAdded still queues (pre-slice-2 shape)"
+    );
+}

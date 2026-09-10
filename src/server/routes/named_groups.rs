@@ -5316,8 +5316,7 @@ fn authorized_treekem_membership_event_for_queue(
             actor,
             // ADR-0038 round-2: accept cert-bearing adds (see the frontier
             // pattern above).
-            certificate_b64: _,
-            owner_mandate: None,
+            owner_mandate: _,
             commit: Some(_),
             treekem_commit_b64: Some(_),
             treekem_epoch: Some(_),

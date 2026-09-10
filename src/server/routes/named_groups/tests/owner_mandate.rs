@@ -972,3 +972,143 @@ fn mixed_fleet_json_shapes_decode_both_ways() {
             .expect("record with map round-trips");
     assert_eq!(round.mandate_capability, with_map.mandate_capability);
 }
+
+/// WHY (round 2, review item 2): the policy/public-meta comparisons are
+/// INDEPENDENT of the signature — a mandate re-signed (validly, under
+/// the real owner key) over a DIFFERENT hash than the terminal commit's
+/// must fail the terminal comparison, proving the receiver checks what
+/// the commit actually sealed rather than trusting the signed claim.
+#[test]
+fn mandate_terminal_hash_comparisons_are_independent_of_signature() {
+    let f = mandate_fixture(owner_certified_policy(
+        &UserKeypair::from_seed(&[0x9Bu8; 32]).unwrap(),
+    ));
+    let resign_with = |policy_hash: String, meta_hash: String| {
+        x0x::groups::OwnerMandate::sign(
+            &f.mandate.stable_group_id,
+            f.mandate.expected_terminal_revision,
+            &f.mandate.parent_state_hash,
+            &f.mandate.roster_root_after_add,
+            &policy_hash,
+            &meta_hash,
+            f.mandate.declared_epoch,
+            &f.joiner_hex,
+            &f.mandate.invite_secret_hash,
+            &f.mandate.admission_cert_digest,
+            &f.authority_hex,
+            f.mandate.issued_at_ms,
+            &f.owner_kp,
+        )
+        .expect("re-sign under the real owner key")
+    };
+    // Policy-hash mismatch: signature verifies over the signed (wrong)
+    // value — only the terminal comparison can catch it.
+    let wrong_policy = resign_with(
+        f.mandate.policy_hash.clone() + "x",
+        f.mandate.public_meta_hash.clone(),
+    );
+    assert_eq!(
+        f.verify(&wrong_policy),
+        Err(x0x::groups::OwnerMandateError::PolicyHashMismatch),
+        "a validly-signed policy-hash mismatch must fail with the typed variant"
+    );
+    // Public-meta-hash mismatch: same proof for the meta hash.
+    let wrong_meta = resign_with(
+        f.mandate.policy_hash.clone(),
+        f.mandate.public_meta_hash.clone() + "x",
+    );
+    assert_eq!(
+        f.verify(&wrong_meta),
+        Err(x0x::groups::OwnerMandateError::MetaHashMismatch),
+        "a validly-signed meta-hash mismatch must fail with the typed variant"
+    );
+    // Control: re-signing with the terminal's own hashes still verifies.
+    let right = resign_with(
+        f.mandate.policy_hash.clone(),
+        f.mandate.public_meta_hash.clone(),
+    );
+    assert!(f.verify(&right).is_ok());
+}
+
+/// WHY (round 2, review item 4): `HeadAttestation::verify_against_terminal`
+/// must enforce the two-phase epoch closure (ADR-0064 §1a) — a mandate is
+/// pre-mutation intent, and the terminal's ACTUAL TreeKEM epoch must equal
+/// its declared epoch. A pre-slice-2 peer sends no mandate and must be
+/// unaffected; a GSS-plane event carries no epoch to bind (check skipped).
+/// (The across-gap adoption caller is non-TreeKEM-only today, so the
+/// direct unit on the method is the honest way to drive Some-epoch arms.)
+#[test]
+fn head_attestation_mandate_epoch_check() {
+    use x0x::server::routes::named_groups::HeadAttestation;
+
+    let owner_kp = UserKeypair::from_seed(&[0xC3u8; 32]).expect("owner key");
+    let authority_kp = AgentKeypair::generate().expect("authority key");
+    let joiner_hex = hex::encode(
+        AgentKeypair::generate()
+            .expect("joiner")
+            .agent_id()
+            .as_bytes(),
+    );
+    let group_id = "c3".repeat(32);
+    let head_state_hash = "ab".repeat(32);
+    let attestation = HeadAttestation::sign(&group_id, 3, &head_state_hash, &joiner_hex, &owner_kp)
+        .expect("attestation");
+    let terminal = x0x::groups::GroupStateCommit::sign(
+        group_id.clone(),
+        4,
+        Some(head_state_hash.clone()),
+        "roster".to_string(),
+        "policy".to_string(),
+        "meta".to_string(),
+        None,
+        false,
+        1,
+        &authority_kp,
+    )
+    .expect("terminal");
+    let owner_pk = owner_kp.public_key();
+    let owner = owner_kp.user_id();
+    let mandate = x0x::groups::OwnerMandate::sign(
+        &group_id,
+        4,
+        &head_state_hash,
+        "roster",
+        "policy",
+        "meta",
+        5,
+        &joiner_hex,
+        &"00".repeat(32),
+        &"11".repeat(32),
+        &hex::encode(authority_kp.agent_id().as_bytes()),
+        1,
+        &owner_kp,
+    )
+    .expect("mandate with declared epoch 5");
+
+    let verify = |mandate: Option<&x0x::groups::OwnerMandate>, epoch: Option<u64>| {
+        attestation.verify_against_terminal(
+            owner_pk,
+            &owner,
+            &terminal,
+            &joiner_hex,
+            mandate,
+            epoch,
+        )
+    };
+    assert!(
+        verify(Some(&mandate), Some(5)),
+        "matching declared epoch verifies"
+    );
+    assert!(
+        !verify(Some(&mandate), Some(6)),
+        "declared epoch != the terminal's actual epoch must refuse"
+    );
+    assert!(
+        verify(None, Some(5)),
+        "no mandate (pre-slice-2 peer) is unaffected"
+    );
+    assert!(
+        verify(Some(&mandate), None),
+        "GSS-plane events carry no epoch to bind"
+    );
+}
