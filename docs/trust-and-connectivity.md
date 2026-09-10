@@ -266,3 +266,31 @@ deferred to the ADR follow-up (#472). Mixed-fleet note: the marker is a
 serde-default JSON field, so v0.41.4 binaries ignore it (and silently drop
 it if they rewrite the record — a downgrade loses containment, it never
 bricks).
+
+## Owner mandate (ADR-0064, Decision §1 — slice 2, verify-if-present)
+
+When a seating authority that holds the owner USER key seats a member through
+an invite (`MemberJoined` → `MemberAdded`), it mints an **owner mandate**: an
+owner-user-key signature over a preimage deterministically derived at the
+pre-mutation point — the group's stable id, the authority agent, the roster
+root over the authority's CURRENT roster plus the seat-write (never the
+possibly-stale invite projection), the terminal revision/parent hash the
+commit will chain from, the declared TreeKEM epoch, the joiner, the invite
+secret's hash, and the admission certificate digest. The mandate rides the
+`MemberAdded` event as an optional serde-default field (`owner_mandate`), so
+older binaries simply ignore it (#451 mixed-fleet safety), and installs that
+hold no owner key (the keyless tier) omit it. In this slice the mandate is
+**verify-if-present** on every receiver: a present mandate that fails any
+binding (signature, roster-root triple-equality against the receiver's own
+re-derived candidate and the terminal commit, anchor revision/parent,
+authority/joiner identity, epoch) rejects the event with the local state
+byte-identical (`owner_mandate_invalid` in `/diagnostics/groups`), while an
+absent mandate applies exactly as before (warned and counted as
+`owner_mandate_absent`) — refusal for absence is deliberately NOT implemented
+yet. Each verified mandate (or owner-countersigned InviteV4 observed at join)
+records a per-authority-agent capability entry (`mandate_capability` on the
+group record, local-only like `invite_lineage`) that slice 3's grace state
+machine will read to decide when a mandate-capable authority's mandate-less
+events must be refused. The existing post-mutation head attestation remains
+the terminal CAS confirmation and now additionally requires the terminal's
+TreeKEM epoch to match the mandate's declared epoch when both are present.

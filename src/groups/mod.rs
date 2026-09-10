@@ -19,6 +19,7 @@ pub mod kem_envelope;
 pub mod kv_context;
 pub mod member;
 pub mod owner_cert;
+pub mod owner_mandate;
 pub mod policy;
 pub mod public_message;
 pub mod request;
@@ -44,6 +45,9 @@ pub use self::kv_context::GssKvSecureContext;
 pub use self::member::{GroupMember, GroupMemberState, GroupRole};
 pub use self::owner_cert::{
     failing_active_members, verify_owner_certified_member, OwnerCertEvidence, OwnerCertFailure,
+};
+pub use self::owner_mandate::{
+    MandateCapabilityState, OwnerMandate, OwnerMandateError, OWNER_MANDATE_VERSION,
 };
 pub use self::policy::{
     GroupAdmission, GroupConfidentiality, GroupDiscoverability, GroupPolicy, GroupPolicyPreset,
@@ -400,6 +404,17 @@ pub struct GroupInfo {
     /// the #470 full-record equality. See [`ForkQuarantine`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_quarantine: Option<ForkQuarantine>,
+    /// ADR-0064 (§1b): per-AUTHORITY-AGENT mandate-capability map for
+    /// owner-axis groups. An absent entry is the `Unknown` state (the
+    /// keyless tier — never observed capability from that agent); a
+    /// present entry records the first observation that proved the
+    /// agent's install holds the owner USER key (a verified mandate or an
+    /// owner-countersigned InviteV4). Strictly local like
+    /// [`InviteLineage`] (stripped outbound / rejected inbound on
+    /// bootstrap snapshots); participates in the #470 full-record
+    /// equality. Slice 2 records only — no grace/`Refusing` derivation.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub mandate_capability: BTreeMap<String, owner_mandate::MandateCapabilityState>,
 
     /// Retained, applied state-commit history (issue #111, follow-up to
     /// ADR-0016). Each entry pairs a signed
@@ -752,6 +767,7 @@ impl GroupInfo {
             home: None,
             invite_lineage: None,
             fork_quarantine: None,
+            mandate_capability: BTreeMap::new(),
             issued_invite_secrets: HashSet::new(),
             issued_invites: HashMap::new(),
         };
