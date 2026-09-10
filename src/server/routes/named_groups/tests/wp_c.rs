@@ -302,6 +302,96 @@ fn wp_c_491_u64_max_self_leave_is_not_queued_forever() {
     assert_eq!(adopt_roster_revision(info.roster_revision, u64::MAX), 3);
 }
 
+/// #491 poison through the PRODUCTION apply arm: the two tests above pin
+/// the classifier and the clamp helper separately — this one drives a
+/// fully signed, correctly chained MemberRemoved carrying roster revision
+/// `u64::MAX` through `apply_named_group_metadata_event_inner` (the same
+/// arm gossip delivery uses) and asserts the LIVE group's
+/// `roster_revision` is exactly prior+1 afterwards. `roster_revision` is
+/// not committed by the signed state hash, so a raw assignment (or an
+/// unclamped `max`) in the apply arm would saturate the local clock —
+/// this test fails on exactly that regression.
+#[tokio::test]
+async fn wp_c_491_poison_u64_max_member_removed_through_apply_arm_advances_clock_by_one() {
+    let (state, _dir) = tests::secure_endpoint_test_state().await.expect("state");
+    let group_id = "6a".repeat(32);
+    let leaver = crate::identity::AgentKeypair::generate().expect("leaver keypair");
+    let leaver_hex = hex::encode(leaver.agent_id().as_bytes());
+
+    let mut info = crate::groups::GroupInfo::with_policy(
+        "wp-c-poison".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.clone(),
+        crate::groups::GroupPolicy::default(),
+    );
+    // GSS plane (the default): the MemberRemoved arm adopts the event
+    // roster revision at NG's apply site without any TreeKEM payload.
+    info.roster_revision = 5;
+    info.add_member(
+        leaver_hex.clone(),
+        crate::groups::GroupRole::Member,
+        None,
+        None,
+    );
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info.clone());
+
+    // The leaver's own commit: exactly adjacent, hash-linked to our chain,
+    // signed over the post-removal roster — everything honest EXCEPT the
+    // roster counter, which is poisoned to u64::MAX.
+    let mut post = info.clone();
+    post.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+    let commit = crate::groups::GroupStateCommit::sign(
+        post.stable_group_id().to_string(),
+        post.state_revision + 1,
+        Some(post.state_hash.clone()),
+        crate::groups::compute_roster_root(&post.members_v2),
+        crate::groups::compute_policy_hash(&post.policy),
+        crate::groups::compute_public_meta_hash(&post.public_meta()),
+        post.security_binding.clone(),
+        false,
+        post.state_revision + 1,
+        &leaver,
+    )
+    .expect("sign removal commit");
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: group_id.clone(),
+        revision: u64::MAX,
+        actor: leaver_hex.clone(),
+        agent_id: leaver_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit),
+    };
+
+    let applied =
+        apply_named_group_metadata_event_inner(&state, event, leaver.agent_id(), true, false, None)
+            .await;
+    assert!(
+        applied.accepted,
+        "the signed adjacent self-leave must apply"
+    );
+
+    let groups = state.named_groups.read().await;
+    let live = groups.get(&group_id).expect("group survives the apply");
+    assert_eq!(
+        live.roster_revision, 6,
+        "poison u64::MAX roster revision must advance the live clock by exactly \
+         one (5 -> 6); got {} — a clamp bypass in the apply arm",
+        live.roster_revision
+    );
+    assert!(
+        !live.has_active_member(&leaver_hex),
+        "the leaving member must actually be removed"
+    );
+}
+
 /// Shared #491 fixture: the local daemon is the owner's certified primary
 /// (user key + builder-issued cert), holding an OwnerCertified group whose
 /// SECOND admin seat is certificate-pending (digest-only, inside its grace
