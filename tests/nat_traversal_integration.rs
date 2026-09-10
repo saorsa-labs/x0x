@@ -265,6 +265,7 @@ async fn create_agent_with_vps_bootstrap() -> TestResult<VpsTestAgent> {
         .with_network_config(NetworkConfig {
             bind_addr: Some("0.0.0.0:0".parse()?),
             bootstrap_nodes: bootstrap_addrs,
+            mdns_enabled: false,
             ..Default::default()
         })
         .build()
@@ -442,6 +443,7 @@ async fn test_concurrent_connections() -> TestResult<()> {
                 .with_network_config(NetworkConfig {
                     bind_addr: Some("0.0.0.0:0".parse()?),
                     bootstrap_nodes: bootstrap_addrs,
+                    mdns_enabled: false,
                     ..Default::default()
                 })
                 .build()

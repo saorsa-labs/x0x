@@ -15,6 +15,7 @@ fn isolated_config() -> NetworkConfig {
     NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
         bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
         ..NetworkConfig::default()
     }
 }

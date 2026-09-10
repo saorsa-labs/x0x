@@ -861,12 +861,14 @@ impl TaskItem {
 /// * `victim` - The agent ID being impersonated in the forged claim
 /// * `task_id` - The target task ID
 /// * `spoof_peer` - The PeerId to use as the delta sender and OR-Set tag
-#[must_use]
+///
+/// # Errors
+/// Returns [`CrdtError::Serialization`] if the delta cannot be encoded.
 pub fn forge_unattested_delta_bytes(
     victim: AgentId,
     task_id: TaskId,
     spoof_peer: PeerId,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let metadata =
         crate::crdt::TaskMetadata::new("forged".to_string(), String::new(), 0, victim, 1);
     let mut task = TaskItem::new(task_id, metadata, spoof_peer);
@@ -880,8 +882,7 @@ pub fn forge_unattested_delta_bytes(
     // Deliberately do NOT add an attestation — this is the attack.
 
     let delta = crate::crdt::TaskListDelta::for_state_change(task_id, task, 0);
-    crate::gossip::wire::encode_delta(spoof_peer, &delta)
-        .expect("encode_delta must not fail for a well-formed delta")
+    Ok(crate::gossip::wire::encode_delta(spoof_peer, &delta)?)
 }
 
 #[cfg(test)]

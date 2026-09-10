@@ -55,5 +55,8 @@ jobs:
       - name: Make script executable
         run: chmod +x scripts/check-panics.sh
 
+      - name: Test panic scanner on synthetic sources
+        run: python3 scripts/test_check_panics.py
+
       - name: Run panic scanner
         run: ./scripts/check-panics.sh

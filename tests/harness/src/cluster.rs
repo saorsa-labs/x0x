@@ -641,6 +641,32 @@ async fn create_cluster() -> AgentCluster {
 /// suppression check mirrors `daemon.rs`'s `bootstrap_peers` handling — a
 /// duplicate TOML key would be a parse error, and it lets a caller override the
 /// plane deliberately.
+/// The hermeticity line every harness-started daemon gets (#417).
+///
+/// An unset `mdns_enabled` resolves to `true` — the production default — which
+/// leaves the fixture advertising and browsing on the LAN and AUTO-CONNECTING
+/// to whatever it finds, including a live `x0xd` on the developer's own machine.
+/// That is the #417 defect: test daemons join the prod mesh, inflate real
+/// announce volume, and make co-located test runs fail non-deterministically.
+/// `with_private_plane` above is NOT sufficient on its own — `network_id` only
+/// *namespaces* mDNS, so a fixture that is handed the prod plane still finds
+/// prod daemons.
+///
+/// Returns `""` when the caller already set the key, so a test that deliberately
+/// exercises mDNS can opt back in; a duplicate TOML key is a parse error. This
+/// is duplicated in `daemon.rs` because integration tests `#[path]`-include
+/// each harness module on its own, with no shared crate root between them.
+fn hermetic_mdns_line(extra_config: &str) -> &'static str {
+    let caller_set_it = extra_config
+        .lines()
+        .any(|l| l.trim_start().starts_with("mdns_enabled"));
+    if caller_set_it {
+        ""
+    } else {
+        "mdns_enabled = false\n"
+    }
+}
+
 fn with_private_plane(plane_id: &str, extra_config: &str) -> String {
     let has_network_id = extra_config
         .lines()
@@ -896,12 +922,16 @@ async fn start_instance_with_env(
     // test binaries otherwise SELF-REPLACE via gossip-delivered auto-update
     // (x0x#226 standing rule). It goes LAST so table sections opened by
     // `extra_config` cannot swallow the flat keys above it.
+    // #417: hermetic by default. Sits with the other flat keys, ABOVE
+    // `extra_config`, for the same reason `[update]` sits below it.
+    let mdns_line = hermetic_mdns_line(extra_config);
     let config_content = format!(
         "api_address = \"127.0.0.1:{api_port}\"\n\
          bind_address = \"0.0.0.0:{bind_port}\"\n\
          data_dir = \"{}\"\n\
          identity_dir = \"{}/identity\"\n\
          log_level = \"warn\"\n\
+         {mdns_line}\
          {bootstrap}\n\
          {extra_config}\n\
          [update]\n\
@@ -983,5 +1013,28 @@ mod reservation_tests {
         assert_ne!(first.bind_port, second.bind_port);
         assert!(PortReservations::bind(first.api_port, first.bind_port).is_err());
         assert!(PortReservations::bind(second.api_port, second.bind_port).is_err());
+    }
+}
+
+#[cfg(test)]
+mod hermeticity_tests {
+    use super::hermetic_mdns_line;
+
+    #[test]
+    fn harness_daemons_disable_mdns_unless_the_test_opts_in() {
+        // #417: a harness daemon must not be discoverable by — or able to
+        // auto-connect to — a production daemon on the same machine. The key
+        // is only absent-means-ON at the daemon, so if this line ever stops
+        // being emitted, every test daemon silently rejoins the prod mesh.
+        assert_eq!(hermetic_mdns_line(""), "mdns_enabled = false\n");
+        assert_eq!(
+            hermetic_mdns_line("bootstrap_peers = []\n"),
+            "mdns_enabled = false\n"
+        );
+
+        // A test that is actually about mDNS must be able to turn it back on,
+        // and emitting our line as well would be a duplicate-key parse error.
+        assert_eq!(hermetic_mdns_line("mdns_enabled = true\n"), "");
+        assert_eq!(hermetic_mdns_line("  mdns_enabled = false\n"), "");
     }
 }

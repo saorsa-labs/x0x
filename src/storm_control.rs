@@ -520,6 +520,7 @@ mod wiring_tests {
                 .with_network_config(crate::network::NetworkConfig {
                     bind_addr: Some("127.0.0.1:0".parse().unwrap()),
                     bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
                     ..crate::network::NetworkConfig::default()
                 })
         };

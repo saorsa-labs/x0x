@@ -23,6 +23,7 @@ async fn build_agent(dir: &std::path::Path, name: &str, network_id: Option<&str>
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
         bootstrap_nodes: Vec::new(),
         network_id: network_id.map(str::to_string),
+        mdns_enabled: false,
         ..NetworkConfig::default()
     };
     Agent::builder()

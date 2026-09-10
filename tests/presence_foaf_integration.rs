@@ -70,6 +70,7 @@ fn loopback_network_config(bootstrap_nodes: Vec<SocketAddr>) -> NetworkConfig {
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         bootstrap_nodes,
         port_mapping_enabled: false,
+        mdns_enabled: false,
         ..NetworkConfig::default()
     }
 }

@@ -427,6 +427,7 @@ fn hermetic_network_config() -> NetworkConfig {
         bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         bootstrap_nodes: Vec::new(),
         port_mapping_enabled: false,
+        mdns_enabled: false,
         ..Default::default()
     }
 }
@@ -457,6 +458,7 @@ async fn two_local_agents() -> Result<(Agent, Agent, TempDir, TempDir), Box<dyn 
         bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         bootstrap_nodes: vec![a_addr],
         port_mapping_enabled: false,
+        mdns_enabled: false,
         ..Default::default()
     };
     let agent_b = Agent::builder()
