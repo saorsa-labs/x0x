@@ -656,6 +656,9 @@ S.set('detailOpen',false);S.set('detailType','');S.set('detailData',null);
 
 // Channel metadata cache: { spaceId: [{ name, description, creator, topic, ... }] }
 const channelCache={};
+// #565: per-space channel-index load failures, shown in the chat header so a
+// failed read is never mistaken for "this space has no channels".
+const channelErrors={};
 // Thread metadata cache: { msgId: { parent_msg_id, parent_text, reply_count, participants, topic } }
 const threadCache={};
 
@@ -978,6 +981,7 @@ function showCreateChannel(spaceId){
   const m=showModal(`<h2>Create Channel</h2>
     <input id="modal-chan-name" placeholder="channel-name (lowercase)" style="width:100%;margin-bottom:8px">
     <input id="modal-chan-desc" placeholder="Description (optional)" style="width:100%;margin-bottom:12px">
+    <div id="modal-chan-error" style="display:none;color:var(--rd);font-size:12px;margin-bottom:8px"></div>
     <div class="actions">
       <button onclick="this.closest('.modal-overlay').remove()">Cancel</button>
       <button class="pri" onclick="createChannel('${spaceId}')">Create</button>
@@ -985,45 +989,117 @@ function showCreateChannel(spaceId){
   setTimeout(()=>document.getElementById('modal-chan-name').focus(),100);
 }
 
+/// Show an error inside the still-open Create-Channel modal. The modal, the
+/// typed name and the description stay put so a failed save never costs the
+/// user their draft (issue #565: a failed save must surface as a failure).
+function channelModalError(msg){
+  const e=document.getElementById('modal-chan-error');
+  if(!e){toast(msg,'error');return}
+  e.textContent=msg;e.style.display='block';
+}
+
 async function createChannel(spaceId){
   const nameRaw=document.getElementById('modal-chan-name').value.trim();
   const desc=document.getElementById('modal-chan-desc').value.trim();
   const name=nameRaw.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/^-+|-+$/g,'');
   if(!name)return;
+  // #565: channel index writes go through the SAME policy-bound store
+  // resolver as Wiki/Web pages. A private space therefore lands in the
+  // group-bound encrypted store, never the unbound generic Signed store;
+  // and every response below is checked — a failed create/read/write is
+  // reported to the user, never announced as success.
+  const st=await openSpacePageStore(spaceId,'channels');
+  if(!st.ok){channelModalError(st.reason);return}
+  if(!spacePageStoreCurrent(spaceId,st)){channelModalError(SPACE_POLICY_MOVED_BEFORE);return}
   const channel={name,description:desc||'',creator:S.get('agentId'),created_at:Date.now(),topic:getChannelTopic(spaceId,name)};
-  // Store in KvStore
-  const storeId='x0x-channels-'+spaceId.slice(0,16);
-  const stores=await api('/stores');
-  if(!(stores&&stores.stores||[]).find(s=>s.id===storeId)){
-    await api('/stores',{method:'POST',body:JSON.stringify({name:'Channels',topic:storeId})});
+  // Read the current index to append. A MISSING index key is an empty list;
+  // any OTHER read failure aborts the create — building on a failed read
+  // would silently drop the channels that are already there.
+  const cur=await api('/stores/'+encSeg(st.id)+'/channels_index');
+  if(!spacePageStoreCurrent(spaceId,st)){channelModalError(SPACE_POLICY_MOVED_BEFORE);return}
+  if(!cur||!cur._http_ok){
+    if(!cur||cur._http_status!==404){
+      channelModalError('Could not read the channel list. '+apiError(cur));
+      return;
+    }
   }
-  // Read existing channels, add new one
-  const existing=await api('/stores/'+storeId+'/channels_index');
   let channels=[];
-  if(existing&&existing.value){try{channels=JSON.parse(u8decode(existing.value))}catch(e){}}
+  if(cur&&cur._http_ok&&cur.value){
+    try{channels=JSON.parse(u8decode(cur.value))}catch(e){
+      channelModalError('The channel list in this space is damaged, so no channel was created.');
+      return;
+    }
+  }
+  if(channels.some(c=>c&&c.name===name)){
+    channelModalError('A channel named #'+name+' already exists in this space.');
+    return;
+  }
   channels.push(channel);
-  await api('/stores/'+storeId+'/channels_index',{method:'PUT',body:JSON.stringify({value:u8encode(JSON.stringify(channels)),content_type:'application/json'})});
+  const r=await api('/stores/'+encSeg(st.id)+'/channels_index',{method:'PUT',body:JSON.stringify({value:u8encode(JSON.stringify(channels)),content_type:'application/json'})});
+  if(!r||!r._http_ok){channelModalError('Channel NOT created. '+apiError(r));return}
+  if(!spacePageStoreCurrent(spaceId,st)){channelModalError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   channelCache[spaceId]=channels;
+  delete channelErrors[spaceId];
   document.querySelector('.modal-overlay').remove();
   toast('Channel #'+name+' created','success');
   navigateChannel(spaceId,name);
 }
 
 async function loadSpaceChannels(spaceId){
-  const storeId='x0x-channels-'+spaceId.slice(0,16);
-  const r=await api('/stores/'+storeId+'/channels_index');
-  if(r&&r.value){
-    try{
-      const channels=JSON.parse(u8decode(r.value));
-      channelCache[spaceId]=channels;
-      return channels;
-    }catch(e){}
+  // #565: read the channel index through the policy-bound store resolver.
+  // Three outcomes, kept apart on purpose:
+  //   * store unavailable / read failed  -> functional default #general,
+  //     the failure recorded in channelErrors and shown in the chat header
+  //     (a failed read is NOT an empty channel list);
+  //   * index key missing (404)           -> genuinely empty -> defaults;
+  //   * index present                     -> the stored list.
+  const st=await openSpacePageStore(spaceId,'channels');
+  if(!st.ok){
+    channelErrors[spaceId]=st.reason;
+    channelCache[spaceId]=defaultChannels(spaceId);
+    return channelCache[spaceId];
   }
-  // Default channel
-  const defaults=[{name:'general',description:'General discussion',creator:'',topic:getChannelTopic(spaceId,'general')}];
-  channelCache[spaceId]=defaults;
-  return defaults;
+  if(!spacePageStoreCurrent(spaceId,st)){
+    channelErrors[spaceId]=SPACE_POLICY_MOVED_BEFORE;
+    channelCache[spaceId]=defaultChannels(spaceId);
+    return channelCache[spaceId];
+  }
+  const r=await api('/stores/'+encSeg(st.id)+'/channels_index');
+  if(!spacePageStoreCurrent(spaceId,st)){
+    channelErrors[spaceId]=SPACE_POLICY_MOVED_AFTER_READ;
+    channelCache[spaceId]=defaultChannels(spaceId);
+    return channelCache[spaceId];
+  }
+  if(!r||!r._http_ok){
+    if(r&&r._http_status===404){
+      // No index yet: the space genuinely has no extra channels.
+      delete channelErrors[spaceId];
+      channelCache[spaceId]=defaultChannels(spaceId);
+      return channelCache[spaceId];
+    }
+    channelErrors[spaceId]='Could not load the channel list. '+apiError(r);
+    channelCache[spaceId]=defaultChannels(spaceId);
+    return channelCache[spaceId];
+  }
+  const v=r.value===undefined||r.value===null?'':r.value;
+  let channels=[];
+  try{channels=JSON.parse(u8decode(v))}catch(e){
+    channelErrors[spaceId]='The channel list in this space is damaged; showing only #general.';
+    channelCache[spaceId]=defaultChannels(spaceId);
+    return channelCache[spaceId];
+  }
+  delete channelErrors[spaceId];
+  channelCache[spaceId]=Array.isArray(channels)&&channels.length?channels:defaultChannels(spaceId);
+  return channelCache[spaceId];
 }
+
+/// The always-functional channel set: #general exists as a chat topic even
+/// when no index has ever been written.
+function defaultChannels(spaceId){
+  return [{name:'general',description:'General discussion',creator:'',topic:getChannelTopic(spaceId,'general')}];
+}
+
+
 
 // Thread helpers
 function getThreadMeta(msgId){return threadCache[msgId]||null}
@@ -2112,7 +2188,7 @@ function renderSpaceChat(el,sid){
   renderSidebar();
   const cats=Object.keys(EMOJI_CATS);
   const pins=getPinned(chatKey);
-  el.innerHTML=`<div class="channel-header">
+  el.innerHTML=`${channelErrors[sid]?'<div class="card mb" style="font-size:12px;color:var(--rd)">'+esc(channelErrors[sid])+'</div>':''}<div class="channel-header">
     <span class="hash" style="font-size:18px;color:var(--tx3)">#</span>
     <div style="flex:1">
       <div class="name">${esc(chan)}</div>
@@ -3043,7 +3119,7 @@ async function openSpacePageStore(sid,app){
     }
     if(!((stores.stores||[]).find(s=>s.id===id))){
       if(stale())return staleAnswer;
-      const c=await api('/stores',{method:'POST',body:JSON.stringify({name:app==='wiki'?'Wiki':'Web',topic:id})});
+      const c=await api('/stores',{method:'POST',body:JSON.stringify({name:{wiki:'Wiki',web:'Web',channels:'Channels'}[app]||app,topic:id})});
       if(stale())return staleAnswer;
       if(!c||!c._http_ok){
         return {ok:false,reason:'Could not open this space’s page store. '+apiError(c),pub:true};
