@@ -297,3 +297,89 @@ async fn test_default_cache_dir_when_not_specified() {
         );
     }
 }
+
+/// #491 (from #484): prune-on-empty — when the startup self-entry prune
+/// leaves the persistent bootstrap cache with ZERO entries, the cache
+/// FILE must be unlinked too. WHY: ant-quic's `remove()` is memory-only
+/// and `save()` refuses to write below `min_peers_to_save` (=1), so a
+/// self-only cache would reappear from disk on the next restart and the
+/// node would select ITSELF as its relay again — the observed HS-E1 D2
+/// failure ("No route to host" for ~28 min until the file was deleted by
+/// hand). Phase 1 persists exactly one self-keyed advert; phase 2
+/// restarts the SAME identity (same machine.key → same peer id), so the
+/// prune empties the cache and must have removed the file — and the file
+/// must STAY gone across the second shutdown's save cycle.
+#[tokio::test]
+async fn wp_c_491_bootstrap_cache_file_pruned_when_self_entry_empties_it() {
+    let temp = TempDir::new().unwrap();
+    let cache_dir = temp.path().join("peers");
+    let cache_file = cache_dir.join("bootstrap_cache.json");
+    let addr: std::net::SocketAddr = "127.0.0.1:54831".parse().unwrap();
+
+    // Phase 1: seed the cache with exactly one entry — our OWN peer id
+    // (the shape a self-observed announcement leaves behind).
+    let own_peer_id = {
+        let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
+            .await
+            .expect("failed to build first agent")
+        else {
+            return;
+        };
+        let own = PeerId::new(agent.machine_id().0);
+        let advert = CoordinatorAdvert::new(
+            own,
+            CoordinatorRoles::default(),
+            vec![AddrHint::new(addr)],
+            NatClass::Unknown,
+            60_000,
+        );
+        let adapter = agent
+            .gossip_cache_adapter()
+            .expect("network agent should expose cache adapter");
+        assert!(
+            adapter.insert_advert(advert).await,
+            "seeding the self-keyed advert must succeed"
+        );
+        assert_eq!(adapter.peer_count().await, 1);
+        agent.shutdown().await;
+        own
+    };
+    assert!(
+        cache_file.exists(),
+        "shutdown must persist the single self-keyed entry (min_peers_to_save=1)"
+    );
+
+    // Phase 2: same identity, same cache dir. The #484 startup prune
+    // removes the self entry; with the cache then empty the persisted
+    // file must be unlinked, and the second shutdown must not resurrect it.
+    {
+        let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
+            .await
+            .expect("failed to build second agent")
+        else {
+            return;
+        };
+        assert_eq!(
+            PeerId::new(agent.machine_id().0),
+            own_peer_id,
+            "the rebuilt agent must reuse the same machine identity"
+        );
+        let adapter = agent
+            .gossip_cache_adapter()
+            .expect("network agent should expose cache adapter");
+        assert_eq!(
+            adapter.peer_count().await,
+            0,
+            "the self entry must be pruned from the loaded cache"
+        );
+        assert!(
+            !cache_file.exists(),
+            "an emptied bootstrap cache file must be pruned from disk (#484: never self-dial)"
+        );
+        agent.shutdown().await;
+        assert!(
+            !cache_file.exists(),
+            "the pruned file must stay gone across the shutdown save cycle"
+        );
+    }
+}

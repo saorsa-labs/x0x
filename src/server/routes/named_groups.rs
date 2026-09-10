@@ -5324,24 +5324,28 @@ fn treekem_state_frontier_gap_reason(
     {
         return None;
     }
-    // #482 (design r2 item 1): waive the ROSTER-clock gap ONLY for an
-    // authenticated SELF-leave (actor == target) on MemberRemoved — the
-    // exact wedge shape from HS-E1, where the leaver's roster clock ran
-    // ahead of ours because InviteV4 stubs seed both clocks from
-    // base_state_revision. A global waiver would let any member poison
-    // the roster clock (roster_revision is NOT committed by the state
-    // hash, so a u64::MAX event revision would saturate ours via max).
-    // The apply path clamps the adopted roster revision to local+1, so
-    // even a self-leave cannot inflate our clock arbitrarily.
-    let is_authenticated_self_leave = matches!(
-        event,
-        NamedGroupMetadataEvent::MemberRemoved { actor, agent_id, .. }
-            if actor.eq_ignore_ascii_case(agent_id)
-    );
-    if frontier.commit.revision > info.state_revision.saturating_add(1)
-        || (!is_authenticated_self_leave
-            && frontier.revision > info.roster_revision.saturating_add(1))
-    {
+    // #482 (design r2 item 1) / #492 (item 1): waive the ROSTER-clock gap
+    // for adjacent hash-linked commits regardless of event kind. Without
+    // the waiver, an event whose signed commit is the genuine next link
+    // in our chain still took an avoidable first-admission deferral plus
+    // a catch-up round trip whenever the sender's unauthenticated roster
+    // counter ran ahead (InviteV4 stubs seed both clocks from
+    // base_state_revision). The queue's recovery —
+    // replay_pending_treekem_events re-applies retained entries with
+    // allow_queue = false on every admitted catch-up response — made
+    // that deferral conditional, not harmless: it holds only while the
+    // pending entry survives its TTL/cap and a responder answers, which
+    // is exactly what never holds for the #482 self-leave/two-member
+    // shape (the leaver has dropped its record; no third peer exists).
+    // The signed state chain below (exact revision+1 AND prev-state-hash
+    // link) remains the only admission authority — `roster_revision` is
+    // not hash-committed, and every production apply path adopts an
+    // event roster revision solely through adopt_roster_revision's +1
+    // clamp (the sole raw seed is the inviter-signed InviteV4 stub,
+    // which produces the divergence rather than adopting it) — so a
+    // poison u64::MAX revision advances our clock by exactly one, never
+    // saturates it.
+    if frontier.commit.revision > info.state_revision.saturating_add(1) {
         return Some("revision_gap".to_string());
     }
     if frontier.commit.prev_state_hash.as_deref() != Some(info.state_hash.as_str()) {

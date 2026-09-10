@@ -2669,3 +2669,333 @@ async fn member_banned_lost_initial_volley_recovers_via_bounded_resend() {
 
     let _ = alice.delete(&format!("/groups/{group_id}")).await;
 }
+
+// ===========================================================================
+// WP-C #491: production-path leave behaviors (self-leave convergence,
+// already-gone refusal on both leave arms, restart hydration).
+// ===========================================================================
+
+/// Shared prefix for the #491 daemon tests: alice creates a group, invites
+/// bob, bob joins, and both sides converge on one state hash before the
+/// test-specific leave action. Returns (group_id, bob_group_id, bob_agent_id).
+async fn wp_c_491_seated_pair(
+    alice: &AgentInstance,
+    bob: &AgentInstance,
+    group_name: &str,
+) -> (String, String, String) {
+    let create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({ "name": group_name, "display_name": "Alice" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(create["ok"], true, "group create failed: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap().to_string();
+
+    let invite: Value = alice
+        .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let invite_link = invite["invite_link"].as_str().unwrap().to_string();
+    let bob_join: Value = bob
+        .post(
+            "/groups/join",
+            serde_json::json!({ "invite": invite_link, "display_name": "Bob Local" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bob_join["ok"], true, "bob join failed: {bob_join:?}");
+    let bob_group_id = bob_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
+    let bob_agent_id = bob.agent_id().await;
+
+    // Alice must observe the join before any leave is attempted.
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            let info: Value = alice
+                .get(&format!("/groups/{group_id}/members"))
+                .await
+                .json()
+                .await
+                .unwrap_or_default();
+            info["members"]
+                .as_array()
+                .map(|members| members.iter().any(|m| m["agent_id"] == bob_agent_id))
+                .unwrap_or(false)
+        })
+        .await,
+        "alice never observed bob's join"
+    );
+    // And bob must have applied alice's authoritative roster before leaving,
+    // so the self-leave chains onto the converged state hash.
+    let alice_hash = group_state_hash(alice, &group_id)
+        .await
+        .expect("alice state hash after join");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            group_state_hash(bob, &bob_group_id).await.as_deref() == Some(alice_hash.as_str())
+        })
+        .await,
+        "bob never converged on alice's state hash before leaving"
+    );
+    (group_id, bob_group_id, bob_agent_id)
+}
+
+/// Roster projection of `GET /groups/:id/members` no longer seats `agent_id`.
+async fn roster_dropped_bob(node: &AgentInstance, group_id: &str, agent_id: &str) -> bool {
+    let info: Value = node
+        .get(&format!("/groups/{group_id}/members"))
+        .await
+        .json()
+        .await
+        .unwrap_or_default();
+    info["members"]
+        .as_array()
+        .map(|members| !members.iter().any(|m| m["agent_id"] == agent_id))
+        .unwrap_or(false)
+}
+
+/// #491 (from #482): self-leave convergence through the production apply
+/// path, across two daemons. WHY: pre-fix, the leaver's roster clock ran
+/// ahead of the authority's (InviteV4 stubs seed both clocks from
+/// base_state_revision), so the authority classified the verified
+/// self-leave as `revision_gap` and queued it FOREVER — alice's roster
+/// kept a ghost member and her state revision never advanced, silently
+/// (one WARN line). Here bob self-leaves and alice MUST apply the
+/// member_removed: her roster drops bob and her state revision advances.
+#[tokio::test]
+#[ignore]
+async fn wp_c_491_self_leave_converges_across_daemons() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+    let (group_id, bob_group_id, bob_agent_id) =
+        wp_c_491_seated_pair(alice, bob, "wp-c-491-self-leave").await;
+
+    let pre_revision = group_state(alice, &group_id)
+        .await
+        .expect("alice group state before leave")["state_revision"]
+        .as_u64()
+        .expect("revision");
+
+    let leave: Value = bob
+        .delete(&format!("/groups/{bob_group_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(leave["ok"], true, "bob self-leave failed: {leave:?}");
+
+    // The convergence assertion: alice applies the self-leave — the roster
+    // drops bob AND the state chain advances past the removal commit.
+    let converged = wait_until(Duration::from_secs(30), || async {
+        let revision_advanced = group_state(alice, &group_id)
+            .await
+            .and_then(|s| s["state_revision"].as_u64())
+            .is_some_and(|r| r > pre_revision);
+        revision_advanced && roster_dropped_bob(alice, &group_id, &bob_agent_id).await
+    })
+    .await;
+    assert!(
+        converged,
+        "alice never applied bob's self-leave (roster/revision did not advance \
+         past revision {pre_revision}) — the #482 revision_gap wedge"
+    );
+
+    // The leaver's own view is gone (self-removal drops the local record).
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            bob.get(&format!("/groups/{bob_group_id}")).await.status() == StatusCode::NOT_FOUND
+        })
+        .await,
+        "bob's own group record survived his self-leave"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+/// #491: once the roster clock already records the member as gone, BOTH
+/// leave arms refuse instead of minting a duplicate removal — the admin
+/// remove arm 404s (member not found: the roster no longer seats them)
+/// and the removed member's self-leave 404s (their record was dropped at
+/// removal-apply). WHY: a second MemberRemoved would advance the state
+/// chain and epochs with no membership change, handing mixed-version
+/// peers a divergent clock for nothing; the refusal must be idempotent.
+/// (The 409 arm of this family — OwnerCertMemberPending on both planes
+/// of a live leave — is covered in-crate by the wp_c_491_leave_* tests.)
+#[tokio::test]
+#[ignore]
+async fn wp_c_491_leave_arms_refuse_when_member_already_gone() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+    let (group_id, bob_group_id, bob_agent_id) =
+        wp_c_491_seated_pair(alice, bob, "wp-c-491-already-gone").await;
+
+    let pre_remove_revision = group_state(alice, &group_id)
+        .await
+        .expect("alice state before remove")["state_revision"]
+        .as_u64()
+        .expect("revision");
+    let remove: Value = alice
+        .delete(&format!("/groups/{group_id}/members/{bob_agent_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(remove["ok"], true, "admin remove failed: {remove:?}");
+
+    // Wait until the roster clock has fully recorded the removal on both
+    // sides: alice's state advances and bob's record is dropped.
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            group_state(alice, &group_id)
+                .await
+                .and_then(|s| s["state_revision"].as_u64())
+                .is_some_and(|r| r > pre_remove_revision)
+                && bob.get(&format!("/groups/{bob_group_id}")).await.status()
+                    == StatusCode::NOT_FOUND
+        })
+        .await,
+        "removal never fully propagated before the already-gone probes"
+    );
+    let settled_revision = group_state(alice, &group_id)
+        .await
+        .expect("alice state after remove")["state_revision"]
+        .as_u64()
+        .expect("revision");
+
+    // Admin arm: re-remove the already-gone member.
+    let re_remove = alice
+        .delete(&format!("/groups/{group_id}/members/{bob_agent_id}"))
+        .await;
+    assert_eq!(
+        re_remove.status(),
+        StatusCode::NOT_FOUND,
+        "admin re-remove of an already-gone member must refuse, got {} body {:?}",
+        re_remove.status(),
+        re_remove.json::<Value>().await
+    );
+
+    // Self-leave arm: the removed member tries to leave the group that
+    // already dropped them.
+    let re_leave = bob.delete(&format!("/groups/{bob_group_id}")).await;
+    assert_eq!(
+        re_leave.status(),
+        StatusCode::NOT_FOUND,
+        "self-leave on an already-dropped record must refuse, got {} body {:?}",
+        re_leave.status(),
+        re_leave.json::<Value>().await
+    );
+
+    // Neither refusal may mint a new roster state.
+    let after_probes = group_state(alice, &group_id)
+        .await
+        .expect("alice state after probes")["state_revision"]
+        .as_u64()
+        .expect("revision");
+    assert_eq!(
+        after_probes, settled_revision,
+        "refused leave arms must not advance the roster clock"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+/// #491 (from #483): restart hydration — after a leave, the authority's
+/// roster/clock state must be rehydrated from disk on restart, not reset.
+/// WHY: pre-fix, restart rebuilt the identity-discovery map empty and the
+/// durable state was effectively orphaned (certificate resolution lost,
+/// roster clocks re-derived) — a restarted owner looked like a fresh
+/// joiner to its own group. Here alice restarts (same data dir, same
+/// identity, no embedded bootstrap peers) and MUST serve the SAME state
+/// hash, a state revision at least as high as pre-restart, the SAME
+/// roster_revision (the unauthenticated clock the #482/#492 work is
+/// about — exposed on GET /groups/:id), and a roster that still
+/// excludes the departed member.
+#[tokio::test]
+#[ignore]
+async fn wp_c_491_restart_rehydrates_roster_clock_after_leave() {
+    let mut pair = pair().await;
+    let alice = &mut pair.alice;
+    let bob = &pair.bob;
+    let (group_id, bob_group_id, bob_agent_id) =
+        wp_c_491_seated_pair(alice, bob, "wp-c-491-restart").await;
+
+    let leave: Value = bob
+        .delete(&format!("/groups/{bob_group_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(leave["ok"], true, "bob self-leave failed: {leave:?}");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            roster_dropped_bob(alice, &group_id, &bob_agent_id).await
+        })
+        .await,
+        "alice never applied bob's self-leave before the restart"
+    );
+    let pre_restart = group_state(alice, &group_id)
+        .await
+        .expect("alice state before restart");
+    let pre_revision = pre_restart["state_revision"].as_u64().expect("revision");
+    let pre_hash = pre_restart["state_hash"]
+        .as_str()
+        .expect("hash")
+        .to_string();
+    let pre_roster_revision = alice
+        .get(&format!("/groups/{group_id}"))
+        .await
+        .json::<Value>()
+        .await
+        .expect("alice group view before restart")["roster_revision"]
+        .as_u64()
+        .expect("roster_revision on GET /groups/:id");
+
+    alice.restart().await;
+
+    let post_restart = group_state(alice, &group_id)
+        .await
+        .expect("alice group state after restart");
+    assert_eq!(
+        post_restart["state_hash"].as_str(),
+        Some(pre_hash.as_str()),
+        "restart must rehydrate the exact durable state hash, not reset it"
+    );
+    assert!(
+        post_restart["state_revision"]
+            .as_u64()
+            .is_some_and(|r| r >= pre_revision),
+        "restart must not rewind the state clock: pre {pre_revision}, post {:?}",
+        post_restart["state_revision"].as_u64()
+    );
+    let post_roster_revision = alice
+        .get(&format!("/groups/{group_id}"))
+        .await
+        .json::<Value>()
+        .await
+        .expect("alice group view after restart")["roster_revision"]
+        .as_u64()
+        .expect("roster_revision on GET /groups/:id");
+    assert_eq!(
+        post_roster_revision, pre_roster_revision,
+        "restart must rehydrate the roster clock exactly (the #482/#492 clock), \
+         not reset or re-derive it"
+    );
+    assert!(
+        roster_dropped_bob(alice, &group_id, &bob_agent_id).await,
+        "the departed member must still be gone from the rehydrated roster"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
