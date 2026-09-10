@@ -782,7 +782,10 @@ struct RejectedReadiness {
     reason: String,
     last_observation: Option<serde_json::Value>,
     last_rejection_reason: Option<String>,
-    diagnostics: ReadinessDiagnostics,
+    // #604: boxed so `Result<_, RejectedReadiness>` stays under the
+    // `result_large_err` threshold (288 bytes unboxed). Field access and
+    // `&self` borrows are unchanged via `Box`'s `Deref`.
+    diagnostics: Box<ReadinessDiagnostics>,
 }
 
 // One absolute deadline owns acquisition and polling. Only the full object
@@ -801,7 +804,7 @@ where
         reason: "final diamond readiness deadline elapsed".into(),
         last_observation: None,
         last_rejection_reason: None,
-        diagnostics: ReadinessDiagnostics::new(start, deadline),
+        diagnostics: Box::new(ReadinessDiagnostics::new(start, deadline)),
     };
     let identities = readiness_identities(topology);
     loop {
@@ -2200,7 +2203,7 @@ fn readiness_diagnostic_checks_identity_clock_overflow_and_closed_fallback() {
         reason: "inert rejection".into(),
         last_observation: None,
         last_rejection_reason: None,
-        diagnostics: diag,
+        diagnostics: Box::new(diag),
     };
     let mut retained = raw.clone();
     retained["phase"] = serde_json::json!("setup");

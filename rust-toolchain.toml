@@ -1,0 +1,26 @@
+# Issue #604: pin the toolchain so `just check` and CI evaluate the same
+# thing. CI pins 1.95.0 in every workflow job (dtolnay/rust-toolchain with
+# `toolchain: 1.95.0`); without a repo pin, local development silently uses
+# whatever is installed and clippy findings disagree in both directions —
+# observed on main @ 8440014: result_large_err fired locally on 1.98 while
+# CI's 1.95 passed green.
+#
+# The channel lives HERE, in exactly one place, so a bump is a one-line
+# reviewable change. The two 1.98-only findings this unblocks are already
+# fixed on this branch (boxing RejectedReadiness), so the tree is clippy
+# -D warnings clean on both sides of the pin.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+targets = [
+  # The build matrix (.github/workflows/build.yml) cross-compiles to these.
+  # A repo-level pin must declare them or the pinned toolchain has no std for
+  # the cross target and `cargo build --target <T>` fails with
+  # "can't find crate for `core`".
+  "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
