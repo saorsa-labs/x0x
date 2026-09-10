@@ -113,6 +113,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+
+- **Explicit single-instance guard on the daemon data directory — issue #601.**
+  `x0xd` now takes an advisory exclusive `flock` on
+  `<data_dir>/instance.lock` at startup, before the update check, the API
+  listener, identity load/generation, or any other subsystem initialises,
+  and holds it for the lifetime of the server. Previously the only thing
+  preventing two daemons on one data directory was SQLite's
+  `PRAGMA locking_mode = EXCLUSIVE` on `history.db` — implicit (the second
+  process died with `history initialization failed / failed to create
+  agent`, which reads as a history subsystem fault — the #493 confusion),
+  and void with `[history] enabled = false` (verified live during the #601
+  investigation: two daemons coexisted fully on one data dir and one
+  identity dir, both signing as the same agent identity). A refused second
+  daemon now exits with `another x0xd instance owns data dir <dir>
+  (instance lock … held by pid <pid>)`, naming the holder and the fix. The
+  lock rides the open file description, so process exit — including crash
+  or `kill -9` — releases it; a stale `instance.lock` never blocks the next
+  start (the file's pid is diagnostics for the refusal message only).
 - **API watchdog no longer aborts live daemons — issue #600.** Shipped
   0.41.3 tripped its `/health` watchdog 5–12×/hour on mainnet, giving
   clients connection-refused windows. `/health` was not a cheap endpoint:
