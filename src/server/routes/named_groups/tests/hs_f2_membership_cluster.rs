@@ -1869,6 +1869,7 @@ fn spawn_restart_lifecycle_diag(
     mut events: tokio::sync::broadcast::Receiver<(ant_quic::PeerId, ant_quic::PeerLifecycleEvent)>,
     watched: ant_quic::PeerId,
     started: std::time::Instant,
+    side: &'static str,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1876,7 +1877,7 @@ fn spawn_restart_lifecycle_diag(
                 Ok((peer, event)) => {
                     let scope = if peer == watched { "joiner" } else { "other" };
                     eprintln!(
-                        "DIAG hs_f2_restart phase=owner_lifecycle elapsed_ms={} \
+                        "DIAG hs_f2_restart phase={side}_lifecycle elapsed_ms={} \
                          peer={scope} event={event:?}",
                         started.elapsed().as_millis()
                     );
@@ -2586,10 +2587,9 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     // BEFORE the dial, so a `Replaced`/`Closed` for the joiner — during the
     // reconnect or later inside the gossip barrier — is recorded with its
     // reason instead of vanishing.
-    let _lifecycle_diag = owner_net
-        .subscribe_all_peer_events()
-        .await
-        .map(|events| spawn_restart_lifecycle_diag(events, joiner_peer, reconnect_started));
+    let _lifecycle_diag = owner_net.subscribe_all_peer_events().await.map(|events| {
+        spawn_restart_lifecycle_diag(events, joiner_peer, reconnect_started, "owner")
+    });
     owner_net.connect_addr(joiner_addr).await?;
     // #510: the old gate was `owner_net.is_connected(&joiner_peer)` — raw
     // ant-quic transport truth. The certified announce that follows publishes
@@ -3328,13 +3328,71 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     drop(owner_agent);
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
+    // #510 RCA instrumentation (mirrors the TreeKEM variant): watch BOTH
+    // sides' ant-quic lifecycle streams from before the dial, and poll BOTH
+    // sides' surfaces during the reconnect gate. The 2026-09-10 CI failure
+    // showed the owner's transport connection dropping within ~1s of the
+    // barrier while the joiner kept `counterpart_connected=1` for the whole
+    // 20s window (a possible stale/joiner-side view — the #278 zombie
+    // lineage). The owner-side `Closed { reason }` plus the joiner's
+    // simultaneous belief that it is still connected is exactly the evidence
+    // that distinguishes a genuine transport drop from a stale joiner view.
+    let real_home_reconnect_started = std::time::Instant::now();
+    let _real_home_owner_lifecycle = owner_agent
+        .network()
+        .expect("restarted owner network")
+        .subscribe_all_peer_events()
+        .await
+        .map(|events| {
+            spawn_restart_lifecycle_diag(
+                events,
+                joiner_peer,
+                real_home_reconnect_started,
+                "real_home_owner",
+            )
+        });
+    let _real_home_joiner_lifecycle = joiner_agent
+        .network()
+        .expect("joiner network")
+        .subscribe_all_peer_events()
+        .await
+        .map(|events| {
+            spawn_restart_lifecycle_diag(
+                events,
+                ant_quic::PeerId(owner_agent.machine_id().0),
+                real_home_reconnect_started,
+                "real_home_joiner",
+            )
+        });
     owner_agent
         .network()
         .expect("restarted owner network")
         .connect_addr(joiner_addr)
         .await?;
+    eprintln!(
+        "DIAG hs_f2_restart phase=real_home_connect_returned elapsed_ms={}",
+        real_home_reconnect_started.elapsed().as_millis()
+    );
     deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut real_home_poll = 0u32;
     while std::time::Instant::now() < deadline {
+        if real_home_poll.is_multiple_of(10) {
+            let owner_surface = restart_peer_surface(
+                owner_agent.network().expect("restarted owner network"),
+                &joiner_peer,
+            )
+            .await;
+            let joiner_surface = restart_peer_surface(
+                joiner_agent.network().expect("joiner network"),
+                &ant_quic::PeerId(owner_agent.machine_id().0),
+            )
+            .await;
+            eprintln!(
+                "DIAG hs_f2_restart phase=real_home_reconnect_poll elapsed_ms={} \
+                 poll={real_home_poll} owner[{owner_surface}] joiner[{joiner_surface}]",
+                real_home_reconnect_started.elapsed().as_millis()
+            );
+        }
         if owner_agent
             .network()
             .expect("restarted owner network")
@@ -3343,6 +3401,7 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
         {
             break;
         }
+        real_home_poll = real_home_poll.saturating_add(1);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(
@@ -3352,6 +3411,10 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
             .is_connected(&joiner_peer)
             .await,
         "restarted owner must reconnect"
+    );
+    restart_readiness_diag(
+        "real_home_reconnect_established",
+        real_home_reconnect_started,
     );
     // Readiness barrier replacing the old fixed 2 s settle: prove gossip
     // pubsub routes BOTH directions before the one-shot certified announce.
