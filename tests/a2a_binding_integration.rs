@@ -26,6 +26,7 @@ fn loopback_network_config() -> NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
         bootstrap_nodes: Vec::new(),
         port_mapping_enabled: false,
+        mdns_enabled: false,
         ..NetworkConfig::default()
     }
 }
@@ -39,15 +40,6 @@ fn normalize_loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
     } else {
         addr
     }
-}
-
-fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("Operation not permitted")
-        && (message.contains("All socket binds failed")
-            || message.contains("Failed to bind UDP socket")
-            || message.contains("bind UDP socket")
-            || message.contains("network initialization failed"))
 }
 
 fn discovered_agent(agent: &Agent, addr: std::net::SocketAddr, now_secs: u64) -> DiscoveredAgent {
@@ -77,24 +69,22 @@ fn discovered_agent(agent: &Agent, addr: std::net::SocketAddr, now_secs: u64) ->
 async fn create_loopback_test_agent(
     temp_dir: &TempDir,
     name: &str,
-) -> Result<Option<Agent>, Box<dyn std::error::Error>> {
+) -> Result<Agent, Box<dyn std::error::Error>> {
     let machine_key_path = temp_dir.path().join(format!("{name}_machine.key"));
     let agent_key_path = temp_dir.path().join(format!("{name}_agent.key"));
     let contacts_path = temp_dir.path().join(format!("{name}_contacts.json"));
 
-    match Agent::builder()
+    // Setup errors, including denied UDP binds, must fail the selected test.
+    // Returning a success-shaped skip would bypass every round-trip assertion.
+    let agent = Agent::builder()
         .with_machine_key(machine_key_path)
         .with_agent_key_path(agent_key_path)
         .with_contact_store_path(contacts_path)
         .with_peer_cache_disabled()
         .with_network_config(loopback_network_config())
         .build()
-        .await
-    {
-        Ok(agent) => Ok(Some(agent)),
-        Err(error) if is_network_bind_permission_error(&error) => Ok(None),
-        Err(error) => Err(Box::new(error)),
-    }
+        .await?;
+    Ok(agent)
 }
 
 struct BindingPair {
@@ -104,18 +94,13 @@ struct BindingPair {
 }
 
 /// Bring up two loopback agents on the real DM path, each with a binding
-/// session. Returns `None` when the sandbox forbids UDP binds (same skip
-/// convention as the DM integration tests).
+/// session. Any setup failure, including a denied UDP bind, fails the caller.
 async fn setup_pair(
     temp_dir: &TempDir,
     alice_request_timeout: Duration,
-) -> Result<Option<BindingPair>, Box<dyn std::error::Error>> {
-    let Some(alice) = create_loopback_test_agent(temp_dir, "alice").await? else {
-        return Ok(None);
-    };
-    let Some(bob) = create_loopback_test_agent(temp_dir, "bob").await? else {
-        return Ok(None);
-    };
+) -> Result<BindingPair, Box<dyn std::error::Error>> {
+    let alice = create_loopback_test_agent(temp_dir, "alice").await?;
+    let bob = create_loopback_test_agent(temp_dir, "bob").await?;
 
     alice.join_network().await?;
     bob.join_network().await?;
@@ -174,11 +159,11 @@ async fn setup_pair(
         BindingConfig::default(),
     ));
 
-    Ok(Some(BindingPair {
+    Ok(BindingPair {
         bob_id: bob.agent_id(),
         alice_session,
         bob_session,
-    }))
+    })
 }
 
 /// Register the three A2A unary methods of this increment with canned,
@@ -246,9 +231,7 @@ fn message_send_params(text: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unary_round_trip_over_dm() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new().unwrap();
-    let Some(pair) = setup_pair(&temp_dir, Duration::from_secs(30)).await? else {
-        return Ok(());
-    };
+    let pair = setup_pair(&temp_dir, Duration::from_secs(30)).await?;
     register_a2a_handlers(&pair.bob_session);
 
     let message = pair
@@ -304,9 +287,7 @@ async fn unary_round_trip_over_dm() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_method_returns_jsonrpc_error() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new().unwrap();
-    let Some(pair) = setup_pair(&temp_dir, Duration::from_secs(30)).await? else {
-        return Ok(());
-    };
+    let pair = setup_pair(&temp_dir, Duration::from_secs(30)).await?;
     register_a2a_handlers(&pair.bob_session);
 
     let err = pair
@@ -332,9 +313,7 @@ async fn unknown_method_returns_jsonrpc_error() -> Result<(), Box<dyn std::error
 async fn request_timeout_fires_and_session_stays_healthy() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = TempDir::new().unwrap();
-    let Some(pair) = setup_pair(&temp_dir, Duration::from_millis(500)).await? else {
-        return Ok(());
-    };
+    let pair = setup_pair(&temp_dir, Duration::from_millis(500)).await?;
     register_a2a_handlers(&pair.bob_session);
     pair.bob_session.register_handler("work/stall", |_params| {
         std::future::pending::<Result<Value, JsonRpcError>>()
@@ -380,9 +359,7 @@ async fn request_timeout_fires_and_session_stays_healthy() -> Result<(), Box<dyn
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_call_future_cleans_in_flight_entry() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new().unwrap();
-    let Some(pair) = setup_pair(&temp_dir, Duration::from_secs(30)).await? else {
-        return Ok(());
-    };
+    let pair = setup_pair(&temp_dir, Duration::from_secs(30)).await?;
     pair.bob_session.register_handler("work/stall", |_params| {
         std::future::pending::<Result<Value, JsonRpcError>>()
     });
@@ -420,9 +397,7 @@ async fn dropped_call_future_cleans_in_flight_entry() -> Result<(), Box<dyn std:
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_calls_do_not_cross_correlation() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new().unwrap();
-    let Some(pair) = setup_pair(&temp_dir, Duration::from_secs(30)).await? else {
-        return Ok(());
-    };
+    let pair = setup_pair(&temp_dir, Duration::from_secs(30)).await?;
     register_a2a_handlers(&pair.bob_session);
     pair.bob_session
         .register_handler("work/echo", |params| async move {
