@@ -921,18 +921,14 @@ impl GroupInfo {
                 // ONLY on an all-clean verdict — a grace-admitted
                 // evidence-missing member must keep the group
                 // quarantined.
+                // ADR-0064 r2: this shared wrapper is what ~22 ROUTINE
+                // mutation sites (rename, policy, add/ban/promote, …)
+                // seal through, so it must NOT clear the fork-quarantine
+                // marker — the owner-anchored local clear is
+                // [`Self::clear_fork_quarantine_on_explicit_owner_seal`],
+                // called only from the explicit seal route.
                 if verdict.is_all_clean() {
                     self.owner_cert_reverify_required = false;
-                    // ADR-0064 slice 1: an owner-axis group's local
-                    // owner-certified seal is one of the TWO owner-anchored
-                    // clears of the fork-quarantine marker (the other is
-                    // the verified head attestation on across-gap
-                    // adoption). It only ever fires on groups that can
-                    // carry the marker (owner axis); for every other axis
-                    // this is a no-op on an always-`None` field.
-                    if self.policy.admission.owner_certified_user_id().is_some() {
-                        self.fork_quarantine = None;
-                    }
                 }
                 Ok((commit, evicted))
             }
@@ -945,6 +941,43 @@ impl GroupInfo {
                 Err(err)
             }
         }
+    }
+
+    /// ADR-0064 r2 (maintainer decision on the clear rule): the ONLY
+    /// local owner anchor that may clear the fork-quarantine marker.
+    /// Called exclusively from the EXPLICIT evidence-bearing seal route
+    /// (`POST /groups/:id/state/seal` → `owner_certified_seal_with_eviction`)
+    /// after its seal succeeded — never from the shared
+    /// [`Self::seal_commit_with_owner_certs`] wrapper that ~22 routine
+    /// mutation sites (rename, policy, add/ban/promote, …) seal through.
+    /// All three conditions must hold:
+    /// - the group has an owner axis (non-owner-axis groups never carry
+    ///   a marker in this slice);
+    /// - the local install holds the OWNER USER KEY, fenced exactly like
+    ///   the #469 A1b invite fence (`owner_key_unavailable`): the key is
+    ///   loaded AND its derived user id EQUALS the policy owner — an
+    ///   agent-key seal with only an ADR-0038 certificate verdict is not
+    ///   an owner anchor;
+    /// - the sealed revision (`self.state_revision`, already bumped by
+    ///   the seal that accompanies this call) is STRICTLY greater than
+    ///   the evidenced revision — a same-revision sibling never clears.
+    pub fn clear_fork_quarantine_on_explicit_owner_seal(
+        &mut self,
+        owner_user_key: Option<&crate::identity::UserKeypair>,
+    ) {
+        let Some(marker) = self.fork_quarantine.as_ref() else {
+            return;
+        };
+        let Some(owner_id) = self.policy.admission.owner_certified_user_id() else {
+            return;
+        };
+        let owner_key_held = owner_user_key.is_some_and(|kp| {
+            crate::identity::UserId::from_public_key(kp.public_key()) == *owner_id
+        });
+        if !owner_key_held || self.state_revision <= marker.revision {
+            return;
+        }
+        self.fork_quarantine = None;
     }
 
     /// ADR-0038 (review B3): seal WITHOUT auto-pruning — for the sequential

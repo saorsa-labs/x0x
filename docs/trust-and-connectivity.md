@@ -221,17 +221,39 @@ attestation) carry a persistent, per-node fork-quarantine marker
 marker is set only when a conflicting state-commit passes the authenticated
 fork-evidence gate (valid signature, committer an active admin in the
 retained predecessor roster — the same gate ADR-0059's deduplicated evidence
-uses), and it is written in the same atomic `named_groups.json` mutation as
-the evidence record, so it survives restarts. While set, the
+uses), and it is written in the same atomic group-store mutation as the
+evidence record (through the standard `persist_named_groups_mutation`
+compare-and-restore path), so it survives restarts. For owner-axis groups the
+authoritative record is the `home-suite-groups.json` sidecar; the legacy
+`named_groups.json` view holds a placeholder that also carries the marker.
+While set, the
 membership-gated routes — public send, TreeKEM encrypt/decrypt, and the
 secure encrypt/open/reseal family — refuse with the typed HTTP **409
 `fork_quarantined`** (counted per group in `/diagnostics/groups` as
 `fork_quarantine_set` / `fork_quarantine_refusals`). The marker carries a
 forensic snapshot of both conflicting commit headers (no shared secrets, no
-TreeKEM material) and clears ONLY through an owner-anchored path: the
-verified owner head attestation on across-gap adoption, or a local
-owner-certified seal (`POST /groups/:id/state/seal`). A contested branch's
-own higher-revision commits never clear it; there is deliberately no
+TreeKEM material). The clear rule (round-2 maintainer decision, ADR-0064 §3
+"owner anchor = owner key") is deliberately narrow — the marker clears ONLY
+through an owner-anchored path, and BOTH local conditions must hold in
+addition to the strictly-greater-revision requirement:
+
+- **Explicit seal route**: the evidence-bearing seal endpoint
+  (`POST /groups/:id/state/seal` → `owner_certified_seal_with_eviction`),
+  AND the local install holds the **owner USER key** (the same
+  `owner_key_unavailable` fence as owner-axis invite minting: key loaded and
+  its derived user id equal to the policy owner — an agent-key seal carrying
+  only an ADR-0038 certificate verdict is NOT an owner anchor), AND the
+  sealed commit's revision is **strictly greater** than the evidenced
+  revision. The shared `seal_commit_owner_certified` wrapper used by ~22
+  routine mutation sites (rename, policy, add/ban/promote, …) never clears —
+  routine mutations on a quarantined group leave the marker in place.
+- **Tier-1 attestation-verified adoption**: across-gap adoption of a
+  `MemberAdded` anchored by the owner-signed head attestation, with the
+  terminal revision **strictly greater** than the evidenced revision.
+
+A contested branch's own commits never clear it (a same-revision sibling, a
+lower revision, or a seal without the owner user key all refuse); there is
+deliberately no
 automated eviction (ADR-0064 Decision 2). The marker is strictly local
 containment state: stripped from outbound signed-public bootstrap snapshots
 and rejected inbound, exactly like `invite_lineage` — a member that never

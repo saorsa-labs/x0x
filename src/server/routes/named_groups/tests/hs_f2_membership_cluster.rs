@@ -4970,17 +4970,20 @@ async fn adr0064_apply_commit(
     .await)
 }
 
-/// The #468 stale-removal shape on an OWNER-AXIS group: a canonically
-/// valid admin forks the chain, the conflicting twin reaches this node,
-/// and every existing check refuses it — ADR-0064 slice 1 adds the
-/// durable containment: the authenticated evidence sets the persistent
-/// quarantine marker (with its forensic snapshot), the membership-gated
-/// routes refuse with the typed 409 `fork_quarantined`, and the LOCAL
-/// owner-certified seal — one of the two owner-anchored clears — lifts
-/// it again. Without the marker, the joiner's data plane would keep
-/// serving the stale fork's view after every observable signal.
+/// Two EQUAL-REVISION twins sealed by the same local admin key on an
+/// OWNER-AXIS group (the conflicting twin classifies as StaleRevision
+/// evidence): ADR-0064 slice 1 adds the durable containment — the
+/// authenticated evidence sets the persistent quarantine marker (with
+/// its forensic snapshot), the membership-gated routes refuse with the
+/// typed 409 `fork_quarantined`, and the EXPLICIT owner-key seal route
+/// (revision strictly greater than the evidence) lifts it again. r2
+/// honesty note: this is NOT the full #468 stale-removal shape (removed
+/// admin, joiner seated at N, MemberAdded across a gap, attestation
+/// refusal) — that shape is only partially covered here via the
+/// adoption-clear test and the clear-rule negative controls in
+/// `fork_quarantine.rs`.
 #[tokio::test]
-async fn adr0064_owner_axis_stale_removal_sets_quarantine_and_gates_routes() -> Result<()> {
+async fn adr0064_owner_axis_twin_conflict_quarantines_gates_and_owner_seal_clears() -> Result<()> {
     let (state, _dir, owner_kp) = owner_authority_state().await?;
     let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group_id = "7d".repeat(32);
@@ -5165,5 +5168,95 @@ async fn adr0064_restart_preserves_marker_and_gate_still_refuses() -> Result<()>
         "typed fork-quarantine error after reload: {}",
         json.0
     );
+    Ok(())
+}
+
+/// ADR-0064 r2 item 3e: the SECOND owner-anchored clear — tier-1
+/// (owner-attestation-anchored) across-gap adoption on a joiner stub
+/// that already carries ≥1 applied commit. Positive arm: the terminal
+/// revision is strictly greater than the evidenced revision, so the
+/// attestation-verified adoption clears the marker. Negative arm
+/// (r2 item 2b): the same adoption with the marker AT the terminal
+/// revision still seats the joiner but must NOT clear — the contested
+/// branch can never buy a clear at or below the evidence it caused.
+/// A bare invite stub cannot hold evidence (empty commit_log), so the
+/// fixture seats the marker on the r3-stage stub, which retains its
+/// sealed base commit.
+#[tokio::test]
+async fn adr0064_adoption_clear_requires_strictly_greater_revision() -> Result<()> {
+    let terminal_revision = |stage: &R3Stage| -> u64 {
+        match &stage.member_added {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit: Some(commit),
+                ..
+            } => commit.revision,
+            _ => panic!("staged MemberAdded carries its terminal commit"),
+        }
+    };
+    async fn seat_marker(stage: &R3Stage, revision: u64) {
+        let terminal_header = {
+            let groups = stage.joiner_state.named_groups.read().await;
+            groups
+                .get(&stage.group_id)
+                .expect("stub")
+                .terminal_commit_header()
+        };
+        let mut groups = stage.joiner_state.named_groups.write().await;
+        groups
+            .get_mut(&stage.group_id)
+            .expect("stub")
+            .fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: stage.authority_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+            },
+            no_anchor: false,
+        });
+    }
+
+    // Positive: evidence revision strictly below the terminal.
+    let stage = r3_stage(0x9A).await?;
+    let terminal = terminal_revision(&stage);
+    assert!(terminal >= 1, "the staged terminal advances the chain");
+    seat_marker(&stage, terminal - 1).await;
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(result.accepted, "the attested adoption seats the joiner");
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(info.has_active_member(&stage.joiner_hex));
+        assert!(
+            !info.is_fork_quarantined(),
+            "tier-1 attestation-anchored adoption at revision {terminal} > evidence {} clears",
+            terminal - 1
+        );
+    }
+
+    // Negative: marker AT the terminal revision — adoption succeeds but
+    // never clears.
+    let stage = r3_stage(0x9B).await?;
+    let terminal = terminal_revision(&stage);
+    seat_marker(&stage, terminal).await;
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(
+        result.accepted,
+        "the quarantined stub still adopts (ingest must stay open)"
+    );
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            info.has_active_member(&stage.joiner_hex),
+            "joiner seated regardless of the marker"
+        );
+        assert!(
+            info.is_fork_quarantined(),
+            "adoption at revision == evidence revision does NOT clear"
+        );
+    }
     Ok(())
 }

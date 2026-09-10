@@ -3664,13 +3664,21 @@ async fn try_adopt_member_added_across_gap(
             state
                 .groups_diagnostics
                 .record_member_added_adopted(stable_id);
-            // ADR-0064 slice 1: for owner-axis groups this adoption ran
-            // the TIER-1 anchor — the owner-signed head attestation CAS
-            // against the terminal — which is one of the TWO
+            // ADR-0064 slice 1 → r2: for owner-axis groups this adoption
+            // ran the TIER-1 anchor — the owner-signed head attestation
+            // CAS against the terminal — which is one of the TWO
             // owner-anchored clears of the fork-quarantine marker (the
             // contested branch can never produce that attestation).
             // Tier-2 adoptions (no owner axis) never carry a marker.
-            if current.policy.admission.owner_certified_user_id().is_some() {
+            // r2: the terminal revision must be STRICTLY greater than the
+            // evidenced revision — an attested commit at or below the
+            // evidence revision never clears.
+            if current.policy.admission.owner_certified_user_id().is_some()
+                && adopted
+                    .fork_quarantine
+                    .as_ref()
+                    .is_some_and(|marker| commit.revision > marker.revision)
+            {
                 adopted.fork_quarantine = None;
             }
             tracing::info!(
@@ -17516,6 +17524,14 @@ async fn owner_certified_seal_with_eviction(
                             )))
                         }
                     };
+                // ADR-0064 r2: the explicit seal route is the ONLY local
+                // owner anchor that may clear the fork-quarantine marker —
+                // and only when the local install holds the owner USER key
+                // (the #469 A1b fence) and the sealed revision is strictly
+                // greater than the evidenced revision.
+                next.clear_fork_quarantine_on_explicit_owner_seal(
+                    state.agent.identity().user_keypair(),
+                );
                 drop(groups);
                 if !matches!(
                     persist_named_group_info(state, id, next).await,

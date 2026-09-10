@@ -1471,12 +1471,16 @@ async fn fork_quarantine_gate_parity_with_reverify_gate() -> Result<()> {
     // Quarantined by authenticated fork evidence (simulated here by the
     // marker itself; the set path is covered in hs_f2/fork_quarantine
     // tests) with a shared secret so encrypt would otherwise proceed.
+    // r2 clear rule: the marker revision (0) is strictly BELOW the
+    // revision the explicit seal will land at (1), so this fixture
+    // exercises the clearing arm of the parity — the refusing arms are
+    // pinned in fork_quarantine.rs.
     {
         let mut groups = state.named_groups.write().await;
         let live = groups.get_mut(&group_id).expect("group");
         live.shared_secret = Some(vec![5u8; 32]);
         live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
-            revision: 1,
+            revision: 0,
             state_hash: live.state_hash.clone(),
             committed_by: hex::encode(state.agent.agent_id().as_bytes()),
             observed_at_ms: now_millis_u64(),
