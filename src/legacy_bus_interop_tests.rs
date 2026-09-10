@@ -260,6 +260,83 @@ impl<S: tracing::Subscriber> Layer<S> for FallbackWitness {
     }
 }
 
+// ── #613 diagnostic: instrumented BusPair mirror ──────────────────────
+//
+// Same fixture and sequence as `Case::BusPair`, but the final typed-decrypt
+// barrier is caught instead of panicking, and on either outcome the run
+// dumps (a) every captured `dm.trace` / `sg.payload.trace` event and (b)
+// each agent's full `PubSubStageStatsSnapshot`. The last event stage for
+// the targeted request-id localizes where delivery stops:
+// publish → cache_insert → eager_recv → subscriber_deliver →
+// inbound_envelope_received → inbound_signature_verified →
+// inbound_trust_evaluated → decrypt (silent; surfaces only as the
+// decode_failed counter) → typed route. Test-only; no product change.
+#[derive(Default)]
+struct Diag613Fields {
+    fields: Vec<String>,
+}
+
+impl Visit for Diag613Fields {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.fields.push(format!("{}={}", field.name(), value));
+    }
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.fields.push(format!("{}={:?}", field.name(), value));
+    }
+}
+
+#[derive(Clone, Default)]
+struct Diag613Capture {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for Diag613Capture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let target = event.metadata().target();
+        if target != "dm.trace" && target != "sg.payload.trace" {
+            return;
+        }
+        let mut fields = Diag613Fields::default();
+        event.record(&mut fields);
+        let line = format!("{target} {}", fields.fields.join(" "));
+        self.events.lock().expect("diag capture lock").push(line);
+    }
+}
+
+fn install_diag613_capture() -> Diag613Capture {
+    let capture = Diag613Capture::default();
+    // A previously-installed global default is not fatal; events captured
+    // from this point on are the ones the diagnostic needs.
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(capture.clone()),
+    );
+    capture
+}
+
+fn diag613_dump(tag: &str, id_hex: &str, agents: &[Agent], capture: &Diag613Capture) {
+    eprintln!("DIAG613 {tag} targeted_request={id_hex}");
+    let events = capture.events.lock().expect("diag capture lock");
+    eprintln!("DIAG613 {tag} captured_events_total={}", events.len());
+    for line in events.iter() {
+        eprintln!("DIAG613 {tag} event {line}");
+    }
+    drop(events);
+    for agent in agents {
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        match agent.gossip_pubsub_stage_stats() {
+            Some(stats) => eprintln!(
+                "DIAG613 {tag} stats agent={}.. {}",
+                &agent_hex[..16.min(agent_hex.len())],
+                serde_json::to_string(&stats).unwrap_or_else(|_| "serialize_failed".into())
+            ),
+            None => eprintln!(
+                "DIAG613 {tag} stats agent={}.. <no gossip stage stats>",
+                &agent_hex[..16.min(agent_hex.len())]
+            ),
+        }
+    }
+}
+
 async fn gossip_send(
     sender: &Agent,
     recipient: &Agent,
@@ -323,6 +400,7 @@ async fn gossip_send(
 #[derive(Clone, Copy)]
 enum Case {
     BusPair,
+    Diag613,
     Fallback,
     Targeted,
     Subscription,
@@ -337,6 +415,7 @@ async fn run(case: Case) {
         let measurement_preparation = matches!(case, Case::Measurement).then(prepare_measurement);
         let roles: &[(&str, bool)] = match case {
             Case::BusPair => &[("L", false), ("D", false), ("O", true)],
+            Case::Diag613 => &[("L", false), ("D", false), ("O", true)],
             Case::Fallback => &[("O2", true), ("L2", false)],
             Case::Targeted => &[("S3", false), ("O3", true)],
             Case::Subscription => &[("D", false), ("O", true)],
@@ -377,6 +456,87 @@ async fn run(case: Case) {
                 delivered(&mut receivers[2], l, id_o, &payload_o).await;
                 assert!(!pubsub(o).is_topic_subscribed(DM_BUS_TOPIC).await);
                 eprintln!("ISSUE501 checkpoint=exact_ciphertext_viability result=observed request={}", hex::encode(id_o));
+            }
+            Case::Diag613 => {
+                let capture = install_diag613_capture();
+                let (l, d, o) = (&agents[0], &agents[1], &agents[2]);
+                let id_d = dm_send::fresh_request_id();
+                let id_o = dm_send::fresh_request_id();
+                assert_ne!(id_d, id_o);
+                let payload_d = marked("default-positive");
+                let payload_o = marked("optout-negative-and-exact-viability");
+                let wire_d = envelope(l, d, &keys[1], id_d, payload_d.clone());
+                let wire_o = envelope(l, o, &keys[2], id_o, payload_o.clone());
+                let id_o_hex = hex::encode(id_o);
+                let diag_traffic = AssertUnwindSafe(async {
+                let fanout_d = bounded("D-addressed bus publish", DELIVERY, l.publish_with_fanout(DM_BUS_TOPIC, wire_d)).await.expect("signed outer V2 bus publish");
+                delivered(&mut receivers[1], l, id_d, &payload_d).await;
+                eprintln!("DIAG613 bus_positive fanout={fanout_d}");
+                let fanout_o = bounded("O-addressed bus publish", DELIVERY, l.publish_with_fanout(DM_BUS_TOPIC, wire_o.clone())).await.expect("signed outer V2 bus publish");
+                absent(&mut receivers[2], id_o).await;
+                eprintln!("DIAG613 bus_negative fanout={fanout_o}");
+                let inbox_name = DmInboxService::inbox_topic_name(&o.agent_id());
+                let inbox_id = dm::dm_inbox_topic(&o.agent_id());
+                let inbox_id_hex = hex::encode(inbox_id.as_bytes());
+                eprintln!(
+                    "DIAG613 pre_targeted l_subscribed_to_target_topic={} o_subscribed_to_target_topic={} topic_id_hex8={}",
+                    pubsub(l).is_topic_subscribed(&inbox_name).await,
+                    pubsub(o).is_topic_subscribed(&inbox_name).await,
+                    &inbox_id_hex[..16.min(inbox_id_hex.len())]
+                );
+                // Optional #613 stall-forcing: pure-burn children spanning
+                // the targeted publish and the barrier wait, killed before
+                // the dump. Emulates CI CPU starvation inside the publish
+                // window without touching the SETUP budget.
+                let stall = std::env::var("X0X_613_STALL").ok().as_deref() == Some("1");
+                let mut burners = Vec::new();
+                if stall {
+                    for _ in 0..24 {
+                        if let Ok(child) = std::process::Command::new("perl")
+                            .arg("-e")
+                            .arg("my $x=0; $x++ while 1")
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            burners.push(child);
+                        }
+                    }
+                    eprintln!("DIAG613 stall burners={}", burners.len());
+                }
+                // Identical to the BusPair targeted publish: cold topic on L,
+                // same inner ciphertext bytes, fresh signed V2 carrier.
+                eprintln!("DIAG613 publishing");
+                bounded("exact O ciphertext targeted publish", DELIVERY,
+                    pubsub(l).publish_topic_id(inbox_name, inbox_id, Bytes::from(wire_o)))
+                    .await.expect("signed targeted publish");
+                let barrier = tokio::time::timeout(DELIVERY, receivers[2].recv()).await;
+                for mut child in burners {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                match barrier {
+                    Ok(Some(actual)) => {
+                        assert_eq!(actual.request_id, id_o, "exclusive request correlation");
+                        eprintln!("DIAG613 PASS typed decrypt delivery observed");
+                        diag613_dump("pass", &id_o_hex, &agents, &capture);
+                    }
+                    Ok(None) => {
+                        diag613_dump("receiver_closed", &id_o_hex, &agents, &capture);
+                        panic!("DIAG613 typed receiver channel closed before delivery");
+                    }
+                    Err(_) => {
+                        diag613_dump("nonarrival", &id_o_hex, &agents, &capture);
+                        panic!("DIAG613 typed decrypt delivery non-arrival reproduced");
+                    }
+                }
+                })
+                .catch_unwind()
+                .await;
+                if let Err(panic) = diag_traffic {
+                    diag613_dump("panic", &id_o_hex, &agents, &capture);
+                    std::panic::resume_unwind(panic);
+                }
             }
             Case::Fallback => {
                 let (o, l) = (&agents[0], &agents[1]);
@@ -430,6 +590,11 @@ async fn run(case: Case) {
 #[tokio::test]
 async fn bus_only_interop_default_positive_and_optout_negative() {
     run(Case::BusPair).await;
+}
+
+#[tokio::test]
+async fn diag613_typed_decrypt_nonarrival_instrumented() {
+    run(Case::Diag613).await;
 }
 
 #[tokio::test]
