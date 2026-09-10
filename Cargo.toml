@@ -136,6 +136,10 @@ tempfile = "3.14"
 # (#124 / WS1.3). Already present transitively via axum; listed here so the
 # `tower::ServiceExt` import resolves in `src/server/mod.rs` tests.
 tower = { version = "0.5", features = ["util"] }
+# Same crate the daemon uses for `TaskListId::from_topic`; the #557
+# integration test derives the snapshot file name from a topic without
+# re-implementing the derivation.
+blake3 = "1.5"
 
 [[bin]]
 name = "x0xd"

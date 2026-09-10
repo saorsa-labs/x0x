@@ -66,16 +66,66 @@ impl TaskListStorage {
         let serialized =
             bincode::serialize(task_list).map_err(crate::crdt::error::CrdtError::Serialization)?;
 
-        // Write to temporary file
-        let file_path = self.list_file_path(list_id);
-        let temp_path = file_path.with_extension("tmp");
-
-        fs::write(&temp_path, &serialized).await?;
-
-        // Atomically rename temp file to final location
-        fs::rename(&temp_path, &file_path).await?;
+        // Durable atomic write (see `write_snapshot_atomic`): the same
+        // standard the kv-store snapshots hold — unique temp file, fsync,
+        // rename, parent-dir fsync — so a crash or a concurrent save can
+        // never leave a torn or half-renamed snapshot behind.
+        write_snapshot_atomic(&self.list_file_path(list_id), &serialized)?;
 
         Ok(())
+    }
+
+    /// Load a task list snapshot, distinguishing "nothing on disk" from
+    /// "snapshot present but unusable".
+    ///
+    /// This is the restore path's contract (mirrors `kv::sync::load_snapshot`):
+    /// `Ok(None)` means first run, while ANY `Err` means a snapshot exists
+    /// but cannot be trusted — callers MUST fail closed rather than start an
+    /// empty replica over it (issue #557: a corrupt or truncated snapshot
+    /// must never silently install empty state).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is corrupted (invalid bincode), holds a
+    /// task list whose id does not match `list_id` (wrong or tampered file),
+    /// or a non-"not found" I/O error occurs.
+    pub async fn load_task_list_opt(
+        &self,
+        list_id: &TaskListId,
+    ) -> crate::crdt::error::Result<Option<TaskList>> {
+        let file_path = self.list_file_path(list_id);
+
+        let serialized = match fs::read(&file_path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut list: TaskList = bincode::deserialize(&serialized)
+            .map_err(crate::crdt::error::CrdtError::Serialization)?;
+
+        if list.id() != list_id {
+            return Err(crate::crdt::error::CrdtError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "task-list snapshot id mismatch for {list_id}: file holds a different list"
+                ),
+            )));
+        }
+
+        // Run the fail-closed admission gate on every task so a tampered or
+        // corrupted on-disk state cannot bypass provenance verification.
+        // Drops unauthenticated checkbox elements and restores attested
+        // elements censored by forged tombstones.
+        let dropped = list.admit_all();
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "purged unauthenticated checkbox elements during persistence load"
+            );
+        }
+
+        Ok(Some(list))
     }
 
     /// Load a task list from persistent storage.
@@ -139,8 +189,13 @@ impl TaskListStorage {
         while let Some(entry) = dir_entries.next_entry().await? {
             let path = entry.path();
 
-            // Skip temporary files (from failed writes)
-            if path.extension().is_some_and(|ext| ext == "tmp") {
+            // Skip temporary files (from failed/interrupted writes; the
+            // durable writer names them tmp.<pid>.<counter>).
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext == "tmp" || ext.starts_with("tmp."))
+            {
                 continue;
             }
 
@@ -180,6 +235,45 @@ impl TaskListStorage {
     }
 }
 
+/// Durable atomic file write: unique temp file in the same directory,
+/// fsync, rename over the destination, then (Unix) fsync the parent
+/// directory so the rename itself survives power loss — the same standard
+/// as the kv-store snapshot writer (`kv::sync::write_snapshot_atomic`).
+///
+/// A unique temp name (pid + counter) means two concurrent saves of the
+/// same list can never interleave writes into one torn temp file; the last
+/// rename wins and every intermediate file state is complete.
+///
+/// Platform note: on non-Unix targets the parent-directory fsync is
+/// skipped (std cannot fsync a directory handle there); the rename is
+/// still atomic, but its durability across power loss is not guaranteed.
+fn write_snapshot_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SNAPSHOT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let n = SNAPSHOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -198,6 +292,95 @@ mod tests {
 
     fn create_test_list(id: TaskListId, name: &str) -> TaskList {
         TaskList::new(id, name.to_string(), test_peer_id())
+    }
+
+    #[tokio::test]
+    async fn load_opt_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        assert!(storage
+            .load_task_list_opt(&test_list_id(0x10))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn load_opt_corrupt_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x11);
+        std::fs::write(dir.path().join(format!("{list_id}.bin")), b"not bincode").unwrap();
+        assert!(storage.load_task_list_opt(&list_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_opt_truncated_snapshot_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x12);
+        let list = create_test_list(list_id, "trunc");
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        // Truncate the durable snapshot mid-file.
+        let path = dir.path().join(format!("{list_id}.bin"));
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(storage.load_task_list_opt(&list_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_opt_id_mismatch_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        // Save under id A's file name, then ask for id B: the inner list id
+        // must not silently pass as B's state.
+        let a = test_list_id(0x13);
+        let b = test_list_id(0x14);
+        let list = create_test_list(a, "imposter");
+        std::fs::write(
+            dir.path().join(format!("{b}.bin")),
+            bincode::serialize(&list).unwrap(),
+        )
+        .unwrap();
+        assert!(storage.load_task_list_opt(&b).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_opt_roundtrip_returns_saved_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x15);
+        let list = create_test_list(list_id, "opt-roundtrip");
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        let loaded = storage.load_task_list_opt(&list_id).await.unwrap();
+        assert_eq!(
+            loaded.map(|l| l.name().to_string()),
+            Some("opt-roundtrip".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn save_writes_unique_tmp_and_leaves_no_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x16);
+        let list = create_test_list(list_id, "tmp-check");
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        let residue: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| x == "tmp" || x.starts_with("tmp."))
+            })
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "durable writer left tmp residue: {residue:?}"
+        );
     }
 
     #[tokio::test]

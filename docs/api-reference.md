@@ -1553,6 +1553,17 @@ plane. See `docs/primers/groups.md`.
 | POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task |
 | PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim <list> <task> [--fence-token <t>] [--delegation <hex>]` / `x0x tasks complete ...` | Update task state (`action` is chosen by the subcommand). `--fence-token` is the local-replica CAS precondition (409 on mismatch); `--delegation` is the hex ADR-0040 digest authorizing the claim |
 
+**Durability (#557): every list carries an on-disk content snapshot.** The
+daemon snapshots the full list state (task ids, titles, claim/complete
+provenance, order, version material) to `<data_dir>/task-lists/<list-id>.bin`
+after every local mutation and every merged remote delta, and restores it on
+restart **before** any network or local write is accepted — content survives a
+restart even when no live replica holds it. A corrupt, truncated, or
+foreign-list snapshot **fails closed**: the list is not rehydrated (REST 404
+until the file is repaired or removed) rather than silently starting empty.
+While a snapshot write is failing, local mutations are refused
+(`durability-degraded`) until a snapshot succeeds; remote merges continue.
+
 **Joining from a second machine = create a list with the SAME topic.** There
 is no join verb: the list id derives from the topic alone (`TaskListId::from_topic`),
 so another replica runs `POST /task-lists {"name":…,"topic":"<same topic>"}` and
