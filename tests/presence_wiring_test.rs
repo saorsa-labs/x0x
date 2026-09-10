@@ -24,6 +24,7 @@ fn loopback_network_config() -> x0x::network::NetworkConfig {
         bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         bootstrap_nodes: Vec::new(),
         port_mapping_enabled: false,
+        mdns_enabled: false,
         ..Default::default()
     }
 }

@@ -658,8 +658,13 @@ impl Drop for IdentityGuard {
 
 fn write_config(name: &str, data_dir: &std::path::Path, api_address: &str) -> PathBuf {
     let cfg = data_dir.join("config.toml");
+    // #417: this file spawns `x0xd` itself rather than going through the test
+    // harness, so it needs the hermeticity key explicitly. `bootstrap_peers`
+    // is already empty, which leaves mDNS as the ONE remaining way for this
+    // daemon to find — and auto-connect to — a live production daemon on the
+    // same machine.
     let body = format!(
-        "bind_address = \"0.0.0.0:0\"\napi_address = \"{api}\"\ndata_dir = \"{dir}\"\nlog_level = \"warn\"\nbootstrap_peers = []\ninstance_name = \"{name}\"\n",
+        "bind_address = \"0.0.0.0:0\"\napi_address = \"{api}\"\ndata_dir = \"{dir}\"\nlog_level = \"warn\"\nbootstrap_peers = []\nmdns_enabled = false\ninstance_name = \"{name}\"\n",
         api = api_address,
         dir = data_dir.display(),
     );

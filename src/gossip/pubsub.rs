@@ -773,7 +773,7 @@ impl PubSubManager {
                 "leaf_egress_soft_bytes_per_sec": self.egress_config.leaf_egress_soft_bytes_per_sec,
                 "leaf_egress_hard_bytes_per_sec": self.egress_config.leaf_egress_hard_bytes_per_sec,
                 "applies_to_leaf": !self.participation.forwards_passthrough(),
-                "sustained_cap_status": "experimental: pinned sg draft #51 ceiling; publication and full acceptance pending",
+                "sustained_cap_status": "experimental: published sg ceiling API; sustained-cap and field acceptance pending",
                 "byte_policy": "observe_only",
                 "window_secs": 60,
                 "sample_age_secs": meter.sampled_at.map(|at| at.elapsed().as_secs_f64()),

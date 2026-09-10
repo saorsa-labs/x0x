@@ -22,6 +22,31 @@ fn process_gossip_plane_id() -> &'static str {
     PLANE_ID.as_str()
 }
 
+/// The hermeticity line every fixture daemon gets (#417).
+///
+/// An unset `mdns_enabled` resolves to `true` — the production default — which
+/// leaves the fixture advertising and browsing on the LAN and AUTO-CONNECTING
+/// to whatever it finds, including a live `x0xd` on the developer's own machine.
+/// That is the #417 defect: test daemons join the prod mesh, inflate real
+/// announce volume, and make co-located test runs fail non-deterministically.
+/// The private plane above is NOT sufficient on its own — `network_id` only
+/// *namespaces* mDNS.
+///
+/// Returns `""` when the caller already set the key, so a test that deliberately
+/// exercises mDNS can opt back in; a duplicate TOML key is a parse error. This
+/// is duplicated in `cluster.rs` because integration tests `#[path]`-include
+/// each harness module on its own, with no shared crate root between them.
+fn hermetic_mdns_line(extra_config: &str) -> &'static str {
+    let caller_set_it = extra_config
+        .lines()
+        .any(|l| l.trim_start().starts_with("mdns_enabled"));
+    if caller_set_it {
+        ""
+    } else {
+        "mdns_enabled = false\n"
+    }
+}
+
 /// Per-test x0xd daemon fixture.
 pub struct DaemonFixture {
     process: Child,
@@ -92,11 +117,15 @@ impl DaemonFixture {
         } else {
             format!("network_id = \"{}\"\n", process_gossip_plane_id())
         };
+        // #417: hermetic by default — a private plane namespaces mDNS but does
+        // not stop the fixture advertising on the LAN, so turn mDNS off outright.
+        let mdns_line = hermetic_mdns_line(extra_config);
         let mut config = format!(
-            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nlog_level = \"warn\"\n{}{}instance_name = \"{}\"\n",
+            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nlog_level = \"warn\"\n{}{}{}instance_name = \"{}\"\n",
             tempdir.path().display(),
             bootstrap_line,
             network_line,
+            mdns_line,
             name,
         );
         if !extra_config.trim().is_empty() {
