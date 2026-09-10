@@ -139,6 +139,15 @@ pub struct GroupCounters {
     /// second device's self-leave — could previously sit queued forever
     /// with no other signal).
     pub membership_events_queued_revision_gap: u64,
+    /// ADR-0064 slice 1: owner-axis groups whose authenticated fork
+    /// evidence durably installed the persistent fork-quarantine marker
+    /// (owner-axis only — non-owner-axis groups are out of scope for
+    /// this slice and never increment it).
+    pub fork_quarantine_set: u64,
+    /// ADR-0064 slice 1: membership-gated route refusals (public send,
+    /// TreeKEM encrypt/decrypt, secure encrypt/open/reseal) while the
+    /// marker is set.
+    pub fork_quarantine_refusals: u64,
 }
 
 /// Per-group gauges for ADR 0028 causal predecessor delivery. Populated by the
@@ -245,6 +254,24 @@ impl GroupsDiagnostics {
         self.with_counters(group_id, |c| {
             c.membership_events_queued_revision_gap =
                 c.membership_events_queued_revision_gap.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 1: the persistent fork-quarantine marker was
+    /// durably installed for this group (owner-axis groups only — see
+    /// `GroupCounters::fork_quarantine_set`).
+    pub fn record_fork_quarantine_set(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_quarantine_set = c.fork_quarantine_set.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 1: a membership-gated route refused the group
+    /// because the fork-quarantine marker is set (typed 409
+    /// `fork_quarantined`).
+    pub fn record_fork_quarantine_refusal(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_quarantine_refusals = c.fork_quarantine_refusals.saturating_add(1);
         });
     }
 
@@ -634,16 +661,21 @@ impl GroupsDiagnostics {
             dst.causal_deduplicated = dst
                 .causal_deduplicated
                 .saturating_add(src.causal_deduplicated);
-            dst.causal_applied = dst.causal_applied.saturating_add(src.causal_applied);
+            dst.membership_events_queued_revision_gap = dst
+                .membership_events_queued_revision_gap
+                .saturating_add(src.membership_events_queued_revision_gap);
+            dst.fork_quarantine_set = dst
+                .fork_quarantine_set
+                .saturating_add(src.fork_quarantine_set);
+            dst.fork_quarantine_refusals = dst
+                .fork_quarantine_refusals
+                .saturating_add(src.fork_quarantine_refusals);
             dst.causal_expired = dst.causal_expired.saturating_add(src.causal_expired);
             dst.causal_invalid = dst.causal_invalid.saturating_add(src.causal_invalid);
             dst.causal_conflicted = dst.causal_conflicted.saturating_add(src.causal_conflicted);
             dst.causal_capacity_rejected = dst
                 .causal_capacity_rejected
                 .saturating_add(src.causal_capacity_rejected);
-            dst.membership_events_queued_revision_gap = dst
-                .membership_events_queued_revision_gap
-                .saturating_add(src.membership_events_queued_revision_gap);
             dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (None, Some(b)) => Some(b),

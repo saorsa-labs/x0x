@@ -2792,6 +2792,10 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
     // #468 A5: lineage is strictly LOCAL provenance — it must never leak
     // into the hashed bootstrap obligation nor ride an outbound snapshot.
     group.invite_lineage = None;
+    // ADR-0064: the fork-quarantine marker (and its forensic snapshot)
+    // is strictly LOCAL containment state — it never rides an outbound
+    // snapshot.
+    group.fork_quarantine = None;
     group.join_requests.clear();
     group.shared_secret = None;
     group.secret_epoch = 0;
@@ -2822,6 +2826,11 @@ pub(in crate::server) fn validate_public_group_bootstrap(
         // sender was NOT built by `signed_public_bootstrap_snapshot`
         // or is probing whether we ingest foreign fork evidence).
         || group.invite_lineage.is_some()
+        // ADR-0064: same rule for the fork-quarantine marker — an
+        // inbound snapshot carrying one is rejected wholesale
+        // (containment is per-node by design and never propagates;
+        // ADR-0064 Decision 3).
+        || group.fork_quarantine.is_some()
         || !group.has_active_member(local_agent_hex)
         || !group
             .caller_role(sender_hex)
@@ -3132,6 +3141,17 @@ async fn rollback_live_fork_evidence(
     });
     if matches {
         lineage.fork_evidence = None;
+        // ADR-0064: the quarantine marker was installed by the SAME
+        // (non-durable) mutation — roll it back on the same identity
+        // match so "retryable" covers the marker too, not just the
+        // lineage record.
+        if info.fork_quarantine.as_ref().is_some_and(|marker| {
+            marker.revision == rev
+                && marker.state_hash == hash
+                && marker.committed_by.eq_ignore_ascii_case(&by)
+        }) {
+            info.fork_quarantine = None;
+        }
     }
 }
 
@@ -3139,14 +3159,31 @@ async fn install_fork_evidence(
     state: &Arc<AppState>,
     group_key: &str,
     evidence: x0x::groups::ForkEvidence,
+    quarantine: Option<x0x::groups::ForkQuarantine>,
     persistence_lock_already_held: bool,
 ) -> bool {
     let install_key = group_key.to_string();
+    let marker_was_carried = quarantine.is_some();
     let install = |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
-        groups
-            .get_mut(&install_key)
-            .and_then(|info| info.invite_lineage.as_mut())
-            .is_some_and(|lineage| fork_evidence_first_complete_wins(lineage, &evidence))
+        let Some(info) = groups.get_mut(&install_key) else {
+            return false;
+        };
+        let Some(lineage) = info.invite_lineage.as_mut() else {
+            return false;
+        };
+        // ADR-0064: evidence and quarantine marker land in ONE
+        // first-complete-wins mutation — the marker is exactly as
+        // durable (and as retryable on failure) as the evidence record
+        // that justifies it.
+        if !fork_evidence_first_complete_wins(lineage, &evidence) {
+            return false;
+        }
+        if let Some(marker) = quarantine {
+            if let Some(info) = groups.get_mut(&install_key) {
+                info.fork_quarantine.get_or_insert(marker);
+            }
+        }
+        true
     };
     let outcome = if persistence_lock_already_held {
         persist_named_groups_mutation_unlocked(state, install).await
@@ -3154,7 +3191,16 @@ async fn install_fork_evidence(
         persist_named_groups_mutation(state, install).await
     };
     match outcome {
-        Ok(AtomicWriteOutcome::Durable) => true,
+        Ok(AtomicWriteOutcome::Durable) => {
+            if marker_was_carried {
+                // ADR-0064: counted only on the durable install — the
+                // same gate the once-only warn below uses.
+                state
+                    .groups_diagnostics
+                    .record_fork_quarantine_set(group_key);
+            }
+            true
+        }
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
             // r5 (Fable 2, held-lock path) → r6 (Codex 2, ORDINARY
             // live-ingress path too): the record IS live in the map,
@@ -3277,6 +3323,32 @@ async fn apply_terminal_stateful_event_with_evidence(
     }
 }
 
+/// ADR-0064 slice 1 (Guard A): the persistent quarantine marker for ONE
+/// authenticated conflict — OWNER-AXIS groups ONLY (the deliberate slice
+/// scope: Home-suite / owner-certified groups; every non-owner-axis group
+/// is byte-for-byte unchanged and never receives a marker). The marker
+/// carries the forensic [`x0x::groups::ForkSnapshot`] of both competing
+/// commit headers and never carries TreeKEM/shared-secret material (the
+/// snapshot type excludes it by construction).
+fn fork_quarantine_for_evidence(
+    current: &x0x::groups::GroupInfo,
+    evidence: &x0x::groups::ForkEvidence,
+    conflicting_commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> Option<x0x::groups::ForkQuarantine> {
+    current.policy.admission.owner_certified_user_id()?;
+    Some(x0x::groups::ForkQuarantine {
+        revision: evidence.revision,
+        state_hash: evidence.state_hash.clone(),
+        committed_by: evidence.committed_by.clone(),
+        observed_at_ms: evidence.observed_at_ms,
+        snapshot: x0x::groups::ForkSnapshot {
+            terminal_commit: current.terminal_commit_header(),
+            conflicting_commit: conflicting_commit.clone(),
+        },
+        no_anchor: false,
+    })
+}
+
 /// The shared error arm of the two central apply hooks: evaluate the
 /// rejection as a fork-evidence candidate and, when one is
 /// authenticated, install it durably and fire the once-only
@@ -3294,10 +3366,12 @@ async fn record_fork_evidence_on_apply_error(
         if let Some(evidence) =
             evaluate_fork_evidence_candidate(state, group_key, current, commit, error)
         {
+            let quarantine = fork_quarantine_for_evidence(current, &evidence, commit);
             let durable_install = install_fork_evidence(
                 state,
                 group_key,
                 evidence.clone(),
+                quarantine,
                 persistence_lock_already_held,
             )
             .await;
@@ -3590,6 +3664,15 @@ async fn try_adopt_member_added_across_gap(
             state
                 .groups_diagnostics
                 .record_member_added_adopted(stable_id);
+            // ADR-0064 slice 1: for owner-axis groups this adoption ran
+            // the TIER-1 anchor — the owner-signed head attestation CAS
+            // against the terminal — which is one of the TWO
+            // owner-anchored clears of the fork-quarantine marker (the
+            // contested branch can never produce that attestation).
+            // Tier-2 adoptions (no owner axis) never carry a marker.
+            if current.policy.admission.owner_certified_user_id().is_some() {
+                adopted.fork_quarantine = None;
+            }
             tracing::info!(
                 group_id = %LogHexId::group(stable_id),
                 member = agent_id,
@@ -11630,6 +11713,11 @@ pub(in crate::server) async fn get_named_group(
             // #468 A5: local invite-seat provenance (base, seat revision,
             // corroboration, first authenticated fork evidence).
             "invite_lineage": info.invite_lineage,
+            // ADR-0064 Guard A: the persistent fork-quarantine marker
+            // (with its forensic snapshot) — `null` when the group is
+            // not quarantined. Strictly local; never set for
+            // non-owner-axis groups in this slice.
+            "fork_quarantine": info.fork_quarantine,
             "home": info.home.as_ref().map(|home| serde_json::json!({
                 "primary_agent": home.primary_agent,
                 "provisioned_at_ms": home.provisioned_at_ms,
@@ -12179,6 +12267,10 @@ pub(in crate::server) async fn send_group_public_message(
         if let Some(resp) = reject_withdrawn_group(info) {
             return resp;
         }
+        if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+            return resp;
+        }
+
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
         }
@@ -18717,6 +18809,31 @@ fn reject_unverified_owner_certified_restore(
         )
     })
 }
+
+/// ADR-0064 slice 1 (Guard A): while the persistent fork-quarantine
+/// marker is set, the membership-gated surfaces refuse with the typed
+/// 409 `fork_quarantined` — public send, TreeKEM encrypt/decrypt, and
+/// the GSS secure encrypt/open/reseal family (the same enumerated set
+/// the ADR-0038 restore gate covers, plus outbound public sends).
+/// Inbound metadata events are deliberately NOT gated: the anchored
+/// clearing commit must still be able to arrive and apply. Owner-axis
+/// groups clear through the verified head attestation on adoption or a
+/// local owner-certified seal; non-owner-axis groups never receive a
+/// marker in this slice. Each refusal bumps the
+/// `fork_quarantine_refusals` diagnostic.
+fn reject_fork_quarantined(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    info.is_fork_quarantined().then(|| {
+        state
+            .groups_diagnostics
+            .record_fork_quarantine_refusal(group_id);
+        api_error(StatusCode::CONFLICT, "fork_quarantined")
+    })
+}
+
 #[cfg(test)]
 static POST_CRYPTO_FORCED_WITHDRAWN_GROUPS: std::sync::LazyLock<StdMutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
@@ -21593,6 +21710,9 @@ async fn treekem_group_encrypt(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            if let Some(resp) = reject_fork_quarantined(state, group_id_hex, info) {
+                return resp;
+            }
         }
     }
     let group = {
@@ -21696,6 +21816,9 @@ async fn treekem_group_decrypt(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            if let Some(resp) = reject_fork_quarantined(state, group_id_hex, info) {
+                return resp;
+            }
         }
     }
     let group = {
@@ -21774,6 +21897,10 @@ pub(in crate::server) async fn secure_group_encrypt(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
+    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+        return resp;
+    }
+
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
@@ -21977,6 +22104,10 @@ pub(in crate::server) async fn secure_group_decrypt(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
+    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+        return resp;
+    }
+
     if !info.has_active_member(&caller_hex) && !info.is_banned(&caller_hex) {
         // Removed/never-member callers can't decrypt.
         return forbidden("not a member");
@@ -22136,6 +22267,10 @@ pub(in crate::server) async fn secure_group_reseal(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
+    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+        return resp;
+    }
+
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
@@ -22721,6 +22856,10 @@ async fn record_recovery_fork_evidence(
         committed_by: journal_commit.committed_by.clone(),
         observed_at_ms: now_millis_u64(),
     };
+    // ADR-0064: same owner-axis-only rule as the live path — the
+    // recovery install writes the quarantine marker in the SAME store
+    // mutation as the evidence record.
+    let quarantine = fork_quarantine_for_evidence(live, &evidence, &journal_commit);
     for store_path in [named_groups_path, home_suite_groups_path] {
         let Ok(json) = tokio::fs::read_to_string(store_path).await else {
             continue;
@@ -22738,6 +22877,11 @@ async fn record_recovery_fork_evidence(
         };
         if !fork_evidence_first_complete_wins(lineage, &evidence) {
             continue;
+        }
+        // ADR-0064: install the marker with the evidence in the same
+        // store re-encode — one write, one rollback surface.
+        if let Some(marker) = quarantine.clone() {
+            record.fork_quarantine.get_or_insert(marker);
         }
         let Ok(merged) = serde_json::to_string(&store) else {
             tracing::warn!(
@@ -26876,8 +27020,16 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                                 &commit,
                                 &error,
                             ) {
-                                install_fork_evidence(state, &admission.group_id, evidence, false)
-                                    .await;
+                                let quarantine =
+                                    fork_quarantine_for_evidence(info, &evidence, &commit);
+                                install_fork_evidence(
+                                    state,
+                                    &admission.group_id,
+                                    evidence,
+                                    quarantine,
+                                    false,
+                                )
+                                .await;
                             }
                         }
                         return Err(format!(
@@ -30173,6 +30325,7 @@ pub(in crate::server) mod tests {
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
     mod cache_hardening_followup;
+    mod fork_quarantine;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod issue492_queue_admission;

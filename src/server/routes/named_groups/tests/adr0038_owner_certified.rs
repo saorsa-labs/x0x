@@ -1448,3 +1448,81 @@ async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Resul
     );
     Ok(())
 }
+
+/// ADR-0064 slice 1: the fork-quarantine gate shares the exact refusal
+/// SHAPE of the ADR-0038 restore gate above (typed 409 consulted by the
+/// same membership-gated surfaces) — and the same evidence-bearing seal
+/// that lifts the restore marker also lifts the fork marker, because a
+/// local owner-certified seal is one of the two owner-anchored clears.
+/// If either gate drifted (different status, untyped body, or a seal
+/// that leaves the node wedged), operators could not run one recovery
+/// procedure for both containment kinds.
+#[tokio::test]
+async fn fork_quarantine_gate_parity_with_reverify_gate() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7f".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    // Quarantined by authenticated fork evidence (simulated here by the
+    // marker itself; the set path is covered in hs_f2/fork_quarantine
+    // tests) with a shared secret so encrypt would otherwise proceed.
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.shared_secret = Some(vec![5u8; 32]);
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 1,
+            state_hash: live.state_hash.clone(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: live.terminal_commit_header(),
+                conflicting_commit: live.terminal_commit_header(),
+            },
+            no_anchor: false,
+        });
+    }
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "quarantined encrypt must 409");
+    assert_eq!(
+        json.0["error"].as_str(),
+        Some("fork_quarantined"),
+        "typed fork-quarantine error: {}",
+        json.0
+    );
+
+    // The evidence-bearing seal clears BOTH containment kinds.
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "seal clears quarantine: {body}");
+    let groups = state.named_groups.read().await;
+    let live = groups.get(&group_id).expect("group");
+    assert!(
+        !live.is_fork_quarantined(),
+        "fork marker cleared by the owner-certified seal"
+    );
+    assert!(
+        !live.owner_cert_reverify_required,
+        "restore marker also clear"
+    );
+    Ok(())
+}

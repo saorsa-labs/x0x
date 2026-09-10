@@ -211,3 +211,36 @@ not `null` — when disabled or unobserved):
 The token is **never gossiped, never announced, and never on `/peers`**: it
 is populated only in the raw-QUIC DM receive path and serialized only on the
 DM surfaces above.
+
+## Persistent fork quarantine (ADR-0064, Guard A — slice 1)
+
+Owner-axis groups (Home-suite / OwnerCertified admission — the groups whose
+commits go through `seal_commit_owner_certified` and the owner head
+attestation) carry a persistent, per-node fork-quarantine marker
+(`fork_quarantine` on the group record, exposed via `GET /groups/:id`). The
+marker is set only when a conflicting state-commit passes the authenticated
+fork-evidence gate (valid signature, committer an active admin in the
+retained predecessor roster — the same gate ADR-0059's deduplicated evidence
+uses), and it is written in the same atomic `named_groups.json` mutation as
+the evidence record, so it survives restarts. While set, the
+membership-gated routes — public send, TreeKEM encrypt/decrypt, and the
+secure encrypt/open/reseal family — refuse with the typed HTTP **409
+`fork_quarantined`** (counted per group in `/diagnostics/groups` as
+`fork_quarantine_set` / `fork_quarantine_refusals`). The marker carries a
+forensic snapshot of both conflicting commit headers (no shared secrets, no
+TreeKEM material) and clears ONLY through an owner-anchored path: the
+verified owner head attestation on across-gap adoption, or a local
+owner-certified seal (`POST /groups/:id/state/seal`). A contested branch's
+own higher-revision commits never clear it; there is deliberately no
+automated eviction (ADR-0064 Decision 2). The marker is strictly local
+containment state: stripped from outbound signed-public bootstrap snapshots
+and rejected inbound, exactly like `invite_lineage` — a member that never
+received the authenticated evidence is not contained (per-node scope,
+ADR-0064 Decision 3). **Non-owner-axis groups are out of scope for this
+slice**: they never receive a marker and their behaviour is byte-for-byte
+unchanged; their quarantine/recovery semantics (indefinite
+`quarantine_no_anchor` quarantine and the manual operator runbook) are
+deferred to the ADR follow-up (#472). Mixed-fleet note: the marker is a
+serde-default JSON field, so v0.41.4 binaries ignore it (and silently drop
+it if they rewrite the record — a downgrade loses containment, it never
+bricks).
