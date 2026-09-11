@@ -137,7 +137,15 @@ const DEFERRED: &[(Method, &str, &str)] = &[
     ),
     // Presence events are used globally by the GUI via WebSocket
     // rather than the named-groups discovery path.
-    // (nothing here — kept for future additions)
+    // ADR-0064 slice 3 (#472 decision 1): the manual fork-quarantine clear
+    // is an operator/ops endpoint (owner-key node clear or force+reason
+    // with an audit trail) — CLI + REST first; a GUI ops panel is deferred
+    // with the ADR-0064 runbook work.
+    (
+        Method::Post,
+        "/groups/:id/quarantine/clear",
+        "operator/ops endpoint; exposed via CLI + REST, GUI ops panel deferred (ADR-0064)",
+    ),
 ];
 
 /// One observed `api(...)` call: the first-argument expression text

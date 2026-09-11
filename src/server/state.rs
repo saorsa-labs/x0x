@@ -675,7 +675,7 @@ impl DaemonConfig {
         self.update.enabled
     }
 
-    ///
+    /// Resolve `bootstrap_peers` to a concrete dial list.
     /// - `Some(v)` → the operator's explicit peers, verbatim (including `[]`).
     /// - `None` → the embedded global bootstrap network
     ///   (`x0x::network::DEFAULT_BOOTSTRAP_PEERS`).

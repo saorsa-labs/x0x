@@ -966,7 +966,10 @@ fn mixed_fleet_json_shapes_decode_both_ways() {
     let mut with_map = f.candidate.clone();
     with_map.mandate_capability.insert(
         f.authority_hex.clone(),
-        x0x::groups::MandateCapabilityState { first_seen_ms: 7 },
+        x0x::groups::MandateCapabilityState {
+            first_seen_ms: 7,
+            ..Default::default()
+        },
     );
     let round: x0x::groups::GroupInfo =
         serde_json::from_str(&serde_json::to_string(&with_map).expect("json"))
@@ -1129,7 +1132,10 @@ async fn seed_capability(state: &AppState, group_id: &str, actor: &str, first_se
         .mandate_capability
         .insert(
             actor.to_string(),
-            x0x::groups::MandateCapabilityState { first_seen_ms },
+            x0x::groups::MandateCapabilityState {
+                first_seen_ms,
+                ..Default::default()
+            },
         );
 }
 
@@ -1146,7 +1152,7 @@ async fn apply_event_from(
 /// WHY (ADR-0064 §1b exact boundary): the refusal fires at
 /// `now >= first_seen + grace` — AT the deadline it refuses, one
 /// millisecond earlier it applies. The exact equality is pinned at unit
-/// level (deterministic); the apply path uses ±1s margins because the
+/// level (deterministic); the apply path uses ±60s margins because the
 /// wall clock ticks between seeding and apply. An off-by-one here either
 /// wedges a capable authority a day early or leaves the enforcement
 /// window open past the configured deadline.
@@ -1156,6 +1162,7 @@ fn grace_deadline_is_inclusive_at_unit_level() {
     let grace_ms = x0x::groups::mandate_grace_window_ms(grace_days);
     let state = x0x::groups::MandateCapabilityState {
         first_seen_ms: 1_000_000,
+        ..Default::default()
     };
     assert!(
         state.refusal_due(grace_days, 1_000_000 + grace_ms),
@@ -1175,7 +1182,8 @@ fn grace_deadline_is_inclusive_at_unit_level() {
     );
     // Poisoned clock record fails closed.
     assert!(x0x::groups::MandateCapabilityState {
-        first_seen_ms: u64::MAX
+        first_seen_ms: u64::MAX,
+        ..Default::default()
     }
     .refusal_due(grace_days, 0));
 }
@@ -1183,11 +1191,13 @@ fn grace_deadline_is_inclusive_at_unit_level() {
 #[tokio::test]
 async fn grace_boundary_deadline_refuses_before_deadline_applies() -> Result<()> {
     let grace_ms = x0x::groups::mandate_grace_window_ms(60);
-    // ±1s of wall-clock slack: seeding happens before the apply's own
-    // `now`, so the margins keep the comparison unambiguous.
+    // ±60s of wall-clock slack (r2 advisory E): seeding happens before
+    // the apply's own `now`, and a loaded CI runner can stall for seconds
+    // between the two — the margins keep the comparison unambiguous
+    // without approaching the 60-day window.
     for (offset, expect_accepted, label) in [
-        (-1_000i64, false, "past the deadline"),
-        (1_000, true, "before the deadline"),
+        (-60_000i64, false, "past the deadline"),
+        (60_000, true, "before the deadline"),
     ] {
         let (state, _dir, owner_kp, group_id, joiner_hex, pre_seal, cert) =
             receiver_stage().await?;
@@ -1331,11 +1341,29 @@ async fn refusal_is_byte_identical_not_queued_no_causal_side_effects() -> Result
         terminal,
         None,
     );
-    let before = serde_json::to_string(&live_record(state.as_ref(), &group_id).await)?;
+    let strip_map = |mut value: serde_json::Value| {
+        if let Some(record) = value.as_object_mut() {
+            record.remove("mandate_capability");
+        }
+        value
+    };
+    let before = serde_json::to_string(&strip_map(serde_json::to_value(
+        &live_record(state.as_ref(), &group_id).await,
+    )?))?;
     let result = apply_event(&state, event).await;
     assert!(!result.accepted, "past-grace absent mandate refuses");
-    let after = serde_json::to_string(&live_record(state.as_ref(), &group_id).await)?;
-    assert_eq!(before, after, "refusal leaves the record byte-identical");
+    let after_live = live_record(state.as_ref(), &group_id).await;
+    let after = serde_json::to_string(&strip_map(serde_json::to_value(&after_live)?))?;
+    assert_eq!(
+        before, after,
+        "refusal leaves the COMMITTED record byte-identical (the only write is the local-only capability map)"
+    );
+    let capability = after_live
+        .mandate_capability
+        .get(&actor_hex)
+        .expect("capability entry survives the refusal");
+    assert_eq!(capability.refusals, 1, "per-agent refusal counted");
+    assert!(capability.refusal_transition_counted);
     assert!(!live_record(state.as_ref(), &group_id)
         .await
         .has_active_member(&joiner_hex));
@@ -1645,40 +1673,25 @@ async fn call_clear(
     (status, body)
 }
 
-/// WHY (#472 decision 1): the two clear paths. (a) A FRESH verified owner
-/// head attestation — signed by the owner user key over the group's
-/// CURRENT head — clears without operator force. (b) `force` + non-empty
-/// `reason` clears with the audit trail. Anything else is a typed 409.
+/// WHY (#472 decision 1, r2 maintainer decision): the clear paths.
+/// (a) OWNER-KEY NODE — called without force on the install holding the
+///     owner user key, the endpoint mints a fresh quarantine-clear
+///     attestation over the CURRENT head under the dedicated domain,
+///     verifies it, and clears; a KEYLESS node gets the typed
+///     `owner_key_unavailable` 409. (b) `force` + non-empty `reason`
+///     clears on any node. Anything else is a typed 409.
 #[tokio::test]
-async fn manual_clear_attestation_and_force_paths() -> Result<()> {
+async fn manual_clear_owner_key_and_force_paths() -> Result<()> {
     let (state, _dir, owner_kp, group_id, _j, _p, _c) = receiver_stage().await?;
-    // A committed certificate for the local agent's seat gives the clear
-    // path its trusted owner public key.
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    {
-        let mut groups = state.named_groups.write().await;
-        let info = groups.get_mut(&group_id).expect("live record");
-        let local_pk = state
-            .agent
-            .identity()
-            .agent_keypair()
-            .public_key()
-            .as_bytes();
-        let cert =
-            x0x::identity::AgentCertificate::issue_for_public_key(&owner_kp, local_pk, None)?;
-        info.set_member_certificate(&local_hex, cert)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    }
     let info = quarantine_live(state.as_ref(), &group_id).await;
 
-    // (c) first: no force, no attestation → 409, marker stays.
+    // (c) force without a reason → 409, marker stays.
     let (status, body) = call_clear(
         &state,
         &group_id,
         ClearQuarantineRequest {
-            force: false,
+            force: true,
             reason: String::new(),
-            head_attestation: None,
         },
     )
     .await;
@@ -1690,40 +1703,19 @@ async fn manual_clear_attestation_and_force_paths() -> Result<()> {
             .is_some(),
         "refused clear leaves the marker"
     );
-    // force without a reason → 409.
-    let (status, body) = call_clear(
-        &state,
-        &group_id,
-        ClearQuarantineRequest {
-            force: true,
-            reason: String::new(),
-            head_attestation: None,
-        },
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
-    // (a) fresh owner head attestation over the CURRENT head → clears.
-    let attestation = HeadAttestation::sign(
-        info.stable_group_id(),
-        info.state_revision,
-        &info.state_hash,
-        &local_hex,
-        &owner_kp,
-    )
-    .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
+    // (a) owner-key node, no force → minted+verified attestation clears.
     let (status, body) = call_clear(
         &state,
         &group_id,
         ClearQuarantineRequest {
             force: false,
             reason: String::new(),
-            head_attestation: Some(attestation),
         },
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["cleared_by"], "attestation");
+    assert_eq!(body["cleared_by"], "owner-key");
     assert!(body["fork_quarantine"].is_null());
     assert!(live_record(state.as_ref(), &group_id)
         .await
@@ -1732,38 +1724,12 @@ async fn manual_clear_attestation_and_force_paths() -> Result<()> {
 
     // Re-quarantine and take the (b) force path.
     quarantine_live(state.as_ref(), &group_id).await;
-    // A STALE attestation (previous head) must NOT clear on its own.
-    let (status, _body) = call_clear(
-        &state,
-        &group_id,
-        ClearQuarantineRequest {
-            force: false,
-            reason: String::new(),
-            head_attestation: Some(
-                HeadAttestation::sign(
-                    info.stable_group_id(),
-                    info.state_revision.saturating_sub(1),
-                    "stale-head-hash",
-                    &local_hex,
-                    &owner_kp,
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
-            ),
-        },
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "stale attestation must not clear"
-    );
     let (status, body) = call_clear(
         &state,
         &group_id,
         ClearQuarantineRequest {
             force: true,
             reason: "ops runbook R1: false positive reviewed".to_string(),
-            head_attestation: None,
         },
     )
     .await;
@@ -1775,6 +1741,123 @@ async fn manual_clear_attestation_and_force_paths() -> Result<()> {
         .is_none());
     let row = diag_row(state.as_ref(), &group_id).await;
     assert_eq!(row.counters.fork_quarantine_manual_clears, 2);
+    let _ = (&info, &owner_kp);
+    Ok(())
+}
+
+/// WHY: a node WITHOUT the group's owner user key cannot take path (a) —
+/// the typed `owner_key_unavailable` 409 names the force path instead of
+/// failing opaquely.
+#[tokio::test]
+async fn manual_clear_keyless_node_gets_typed_owner_key_unavailable() -> Result<()> {
+    // Same group record, but the local install has NO user key.
+    let (owner_state, dir, owner_kp, group_id, _j, _p, _c) = receiver_stage().await?;
+    let marked = quarantine_live(owner_state.as_ref(), &group_id).await;
+    let keyless_dir = tempfile::tempdir()?;
+    let keyless_agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(keyless_dir.path().join("machine.key"))
+            .with_agent_key(AgentKeypair::generate()?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(keyless_dir.path().join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let keyless = secure_endpoint_test_state_at(keyless_dir.path(), keyless_agent).await?;
+    keyless
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), marked);
+    let (status, body) = call_clear(
+        &keyless,
+        &group_id,
+        ClearQuarantineRequest {
+            force: false,
+            reason: String::new(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("owner_key_unavailable")),
+        "typed refusal names the escape hatch: {body}"
+    );
+    // The force path still works on the keyless node.
+    let (status, _body) = call_clear(
+        &keyless,
+        &group_id,
+        ClearQuarantineRequest {
+            force: true,
+            reason: "keyless node, operator override".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    drop(dir);
+    let _ = &owner_kp;
+    Ok(())
+}
+
+/// WHY (item 7 of the r2 CI addendum): prove the endpoint through the
+/// REAL router + auth middleware (path resolution, durable-token gate),
+/// not only via the handler — the coverage marker for
+/// `POST /groups/:id/quarantine/clear` points here.
+#[tokio::test]
+async fn quarantine_clear_route_through_real_middleware() -> Result<()> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (state, _dir, _owner_kp, group_id, _j, _p, _c) = receiver_stage().await?;
+    quarantine_live(state.as_ref(), &group_id).await;
+    let app = axum::Router::new()
+        .route(
+            "/groups/:id/quarantine/clear",
+            axum::routing::post(clear_group_quarantine),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::server::auth::auth_middleware,
+        ))
+        .with_state(Arc::clone(&state));
+
+    // No token → 401 before the handler runs.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/groups/{group_id}/quarantine/clear"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("body builds"),
+        )
+        .await
+        .unwrap_or_else(|never| match never {});
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Durable token + owner-key node → the owner-key clear path.
+    let token = state.api_token.clone();
+    let response = app
+        .oneshot(
+            Request::post(format!("/groups/{group_id}/quarantine/clear"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("body builds"),
+        )
+        .await
+        .unwrap_or_else(|never| match never {});
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["cleared_by"], "owner-key");
+    assert!(body["fork_quarantine"].is_null());
+    assert!(live_record(state.as_ref(), &group_id)
+        .await
+        .fork_quarantine
+        .is_none());
     Ok(())
 }
 
@@ -1792,7 +1875,6 @@ async fn manual_clear_non_owner_axis_group_refuses() -> Result<()> {
         ClearQuarantineRequest {
             force: true,
             reason: "should not clear".to_string(),
-            head_attestation: None,
         },
     )
     .await;
@@ -1826,11 +1908,15 @@ async fn slice2_persisted_record_derives_grace_under_slice3() -> Result<()> {
             "aa".repeat(32),
             x0x::groups::MandateCapabilityState {
                 first_seen_ms: now - grace_ms,
+                ..Default::default()
             },
         );
         info.mandate_capability.insert(
             "bb".repeat(32),
-            x0x::groups::MandateCapabilityState { first_seen_ms: now },
+            x0x::groups::MandateCapabilityState {
+                first_seen_ms: now,
+                ..Default::default()
+            },
         );
     }
     // Durably persist the mutated record (the slice-2 JSON shape; no
@@ -1867,5 +1953,501 @@ async fn slice2_persisted_record_derives_grace_under_slice3() -> Result<()> {
         .iter()
         .any(|entry| entry.agent_id == "bb".repeat(32) && entry.state == "capable"));
     drop(dir);
+    Ok(())
+}
+
+/// WHY (r2 item 5): the TreeKEM sibling of the direct-add mint — the
+/// route must mint with `declared_epoch == guard.epoch()+1` and the event
+/// must carry that same epoch, or a previously warn-accepted direct add
+/// turns into `owner_mandate_invalid` on every mandate-aware peer. The
+/// negative arm documents exactly that regression class: a mandate whose
+/// declared epoch disagrees with the event's treekem_epoch is refused
+/// even though the signature itself is honest owner-key material.
+#[tokio::test]
+async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<()> {
+    let (authority, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "5e".repeat(32);
+    let group_id_bytes = hex::decode(&group_id)?;
+    let creator_seed = agent_treekem_seed(authority.agent.as_ref(), &group_id_bytes);
+    let treekem_group = x0x::mls::TreeKemMlsGroup::create(
+        group_id_bytes,
+        authority.agent.agent_id(),
+        &creator_seed,
+    )?;
+    let initial_epoch = treekem_group.epoch();
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "treekem-direct-add".to_string(),
+        String::new(),
+        authority.agent.agent_id(),
+        group_id.clone(),
+        owner_certified_policy(&owner_kp),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    info.shared_secret = None;
+    info.secret_epoch = initial_epoch;
+    info.security_binding = Some(format!("treekem:epoch={initial_epoch}"));
+    info.recompute_state_hash();
+    // Genesis + revision-1 base commit (the mint refuses genesis-less
+    // groups — a mandate minted against the mls-id fallback could never
+    // verify against the seal's derived stable id).
+    seal_commit_owner_certified(
+        authority.as_ref(),
+        &mut info,
+        authority.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    let base_before = info.clone();
+    authority
+        .treekem_groups
+        .write()
+        .await
+        .insert(group_id.clone(), Arc::new(Mutex::new(treekem_group)));
+    authority
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    // Joiner: owner-issued certificate (ADR-0038 admission) + a real
+    // TreeKEM key package.
+    let joiner_kp = AgentKeypair::generate()?;
+    let joiner_id = joiner_kp.agent_id();
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    let joiner_cert = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner_kp.public_key().as_bytes(),
+        None,
+    )?;
+    {
+        let cache = authority.agent.identity_discovery_cache();
+        cache.write().await.insert(
+            joiner_cert.agent_id()?,
+            x0x::DiscoveredAgent {
+                agent_id: joiner_cert.agent_id()?,
+                machine_id: x0x::identity::MachineId([0u8; 32]),
+                user_id: joiner_cert.user_id().ok(),
+                self_name: None,
+                addresses: Vec::new(),
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: joiner_cert.not_after(),
+                agent_certificate: Some(joiner_cert.clone()),
+                cert_digest: None,
+                agent_public_key: Vec::new(),
+            },
+        );
+    }
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(joiner_id, &[0x5E; 32])?;
+    let key_package_b64 = BASE64.encode(prepared.key_package_bytes());
+
+    NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST
+        .lock()
+        .expect("publish hook")
+        .clear();
+    let response = add_named_group_member(
+        State(Arc::clone(&authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(AddNamedGroupMemberRequest {
+            agent_id: joiner_hex.clone(),
+            display_name: None,
+            treekem_key_package_b64: Some(key_package_b64),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "TreeKEM direct add must succeed"
+    );
+
+    let published = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_topic, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .find_map(|event| match &event {
+            NamedGroupMetadataEvent::MemberAdded { agent_id, .. } if *agent_id == joiner_hex => {
+                Some(event)
+            }
+            _ => None,
+        })
+        .expect("published TreeKEM MemberAdded");
+    let (actor_field, mandate, commit, event_epoch) = match &published {
+        NamedGroupMetadataEvent::MemberAdded {
+            actor,
+            owner_mandate,
+            commit: Some(commit),
+            treekem_epoch,
+            ..
+        } => (
+            actor.clone(),
+            owner_mandate
+                .clone()
+                .expect("TreeKEM direct add mints a mandate"),
+            commit.clone(),
+            *treekem_epoch,
+        ),
+        _ => panic!("shape"),
+    };
+    let event_epoch = event_epoch.expect("TreeKEM direct add carries an epoch");
+    assert_eq!(
+        mandate.declared_epoch, event_epoch,
+        "declared_epoch must equal the event's treekem_epoch (guard.epoch()+1)"
+    );
+    assert!(event_epoch > initial_epoch);
+
+    // A peer (non-member, no local TreeKEM ratchet) applies the
+    // state-only arm and records Capable.
+    let peer_dir = tempfile::tempdir()?;
+    let peer_agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(peer_dir.path().join("machine.key"))
+            .with_agent_key(AgentKeypair::generate()?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(peer_dir.path().join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let peer = secure_endpoint_test_state_at(peer_dir.path(), peer_agent).await?;
+    peer.named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), base_before.clone());
+    let sender = authority.agent.agent_id();
+    let result =
+        apply_named_group_metadata_event_inner(&peer, published.clone(), sender, true, true, None)
+            .await;
+    // First admission with allow_queue=true (the subscriber path): a
+    // peer with no local TreeKEM ratchet DEFERS the event to the #492
+    // queue (treekem_not_ready) — exactly the production catch-up flow.
+    assert!(
+        !result.accepted,
+        "first admission defers to the revision-gap queue, not a drop"
+    );
+    let queued = peer
+        .treekem_pending_events
+        .read()
+        .await
+        .get(&group_id)
+        .map(|queue| queue.len())
+        .unwrap_or(0);
+    assert_eq!(
+        queued, 1,
+        "the event is QUEUED (redelivery path), never dropped"
+    );
+    // The queue-drain path (replay_pending_treekem_events re-applies
+    // with allow_queue=false): state-only apply for the non-member peer.
+    let replay =
+        apply_named_group_metadata_event_inner(&peer, published.clone(), sender, true, false, None)
+            .await;
+    assert!(
+        replay.accepted,
+        "peer applies the TreeKEM direct add on drain"
+    );
+    let peer_live = live_record(peer.as_ref(), &group_id).await;
+    assert!(peer_live.has_active_member(&joiner_hex));
+    assert!(
+        peer_live
+            .mandate_capability
+            .get(&actor_field)
+            .is_some_and(|capability| capability.first_seen_ms > 0),
+        "peer records Capable for the TreeKEM direct-add authority"
+    );
+
+    // Negative arm: an honestly owner-signed mandate whose declared epoch
+    // disagrees with the event's treekem_epoch must refuse as
+    // owner_mandate_invalid on a fresh peer (state byte-identical) — the
+    // exact regression class a wrong epoch at the mint site would ship.
+    let peer2_dir = tempfile::tempdir()?;
+    let peer2_agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(peer2_dir.path().join("machine.key"))
+            .with_agent_key(AgentKeypair::generate()?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(peer2_dir.path().join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let peer2 = secure_endpoint_test_state_at(peer2_dir.path(), peer2_agent).await?;
+    peer2
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), base_before.clone());
+    let mut wrong_epoch_mandate = mandate.clone();
+    wrong_epoch_mandate.declared_epoch = event_epoch + 1;
+    let signed_wrong = x0x::groups::OwnerMandate::sign(
+        &wrong_epoch_mandate.stable_group_id,
+        wrong_epoch_mandate.expected_terminal_revision,
+        &wrong_epoch_mandate.parent_state_hash,
+        &wrong_epoch_mandate.roster_root_after_add,
+        &wrong_epoch_mandate.policy_hash,
+        &wrong_epoch_mandate.public_meta_hash,
+        wrong_epoch_mandate.declared_epoch,
+        &wrong_epoch_mandate.joiner_agent_id,
+        &wrong_epoch_mandate.invite_secret_hash,
+        &wrong_epoch_mandate.admission_cert_digest,
+        &wrong_epoch_mandate.authority_agent_id,
+        wrong_epoch_mandate.issued_at_ms,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!("re-sign: {e}"))?;
+    let wrong_event = match published.clone() {
+        NamedGroupMetadataEvent::MemberAdded {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            display_name,
+            treekem_commit_b64,
+            treekem_welcome_b64,
+            welcome_ref,
+            treekem_epoch,
+            treekem_key_package_hash,
+            member_joined_recovery,
+            member_recovery_history,
+            certificate_b64,
+            ..
+        } => NamedGroupMetadataEvent::MemberAdded {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            display_name,
+            treekem_commit_b64,
+            treekem_welcome_b64,
+            welcome_ref,
+            treekem_epoch,
+            treekem_key_package_hash,
+            member_joined_recovery,
+            member_recovery_history,
+            certificate_b64,
+            owner_mandate: Some(signed_wrong),
+            commit: Some(commit),
+        },
+        _ => panic!("shape"),
+    };
+    let before = serde_json::to_string(&live_record(peer2.as_ref(), &group_id).await)?;
+    let result =
+        apply_named_group_metadata_event_inner(&peer2, wrong_event, sender, true, false, None)
+            .await;
+    assert!(
+        !result.accepted,
+        "declared_epoch != treekem_epoch must refuse as owner_mandate_invalid"
+    );
+    let after = serde_json::to_string(&live_record(peer2.as_ref(), &group_id).await)?;
+    assert_eq!(before, after, "refusal leaves the record byte-identical");
+    let row = diag_row(peer2.as_ref(), &group_id).await;
+    assert_eq!(row.counters.owner_mandate_invalid, 1);
+    Ok(())
+}
+
+/// WHY (r2 item 4): `mandate_capability_refusing_transitions` must be a
+/// PER-AGENT one-shot transition count, not a second name for
+/// `owner_mandate_missing`. Two refusals from the same agent count ONE
+/// Capable→Refusing transition; a later valid mandate restores Capable
+/// (the flag clears), so the next refusal is a NEW transition. The
+/// per-agent refusal total lives on the persisted capability state.
+#[tokio::test]
+async fn refusing_transitions_counted_per_agent_one_shot() -> Result<()> {
+    let (state, _dir, owner_kp, group_id, _j1, pre_seal, _cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let first_seen = now_millis_u64() - x0x::groups::mandate_grace_window_ms(60) - 1;
+    seed_capability(state.as_ref(), &group_id, &actor_hex, first_seen).await;
+
+    // Refusal #1: the Capable → Refusing transition.
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let joiner1 = AgentKeypair::generate()?;
+    let joiner1_hex = hex::encode(joiner1.agent_id().as_bytes());
+    let cert1 = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner1.public_key().as_bytes(),
+        None,
+    )?;
+    let pre1 = seat_write(
+        &live_record(state.as_ref(), &group_id).await,
+        &joiner1_hex,
+        &actor_hex,
+        &cert1,
+    );
+    let terminal1 = terminal_commit_for(&pre1, state.agent.identity().agent_keypair(), 2_000);
+    let _ = terminal;
+    assert!(
+        !apply_event(
+            &state,
+            member_added_event(
+                &group_id,
+                terminal1.revision,
+                &actor_hex,
+                &joiner1_hex,
+                &cert1,
+                terminal1,
+                None
+            ),
+        )
+        .await
+        .accepted
+    );
+
+    // Refusal #2 from the SAME agent: another refused event, NOT another
+    // transition.
+    let joiner2 = AgentKeypair::generate()?;
+    let joiner2_hex = hex::encode(joiner2.agent_id().as_bytes());
+    let cert2 = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner2.public_key().as_bytes(),
+        None,
+    )?;
+    let pre2 = seat_write(
+        &live_record(state.as_ref(), &group_id).await,
+        &joiner2_hex,
+        &actor_hex,
+        &cert2,
+    );
+    let terminal2 = terminal_commit_for(&pre2, state.agent.identity().agent_keypair(), 2_500);
+    assert!(
+        !apply_event(
+            &state,
+            member_added_event(
+                &group_id,
+                terminal2.revision,
+                &actor_hex,
+                &joiner2_hex,
+                &cert2,
+                terminal2,
+                None
+            ),
+        )
+        .await
+        .accepted
+    );
+
+    let row = diag_row(state.as_ref(), &group_id).await;
+    assert_eq!(
+        row.counters.owner_mandate_missing, 2,
+        "every refusal counts"
+    );
+    assert_eq!(
+        row.counters.mandate_capability_refusing_transitions, 1,
+        "one Capable→Refusing transition per episode"
+    );
+    let live = live_record(state.as_ref(), &group_id).await;
+    let capability = live
+        .mandate_capability
+        .get(&actor_hex)
+        .expect("capability entry");
+    assert_eq!(capability.refusals, 2, "per-agent refusals == 2");
+    assert_eq!(capability.first_seen_ms, first_seen, "clock retained");
+    assert!(
+        row.mandate_capability
+            .iter()
+            .any(|entry| entry.agent_id == actor_hex && entry.refusals == 2),
+        "per-agent refusals surfaced in /diagnostics/groups"
+    );
+
+    // A valid mandate restores Capable: the flag clears, so the NEXT
+    // refusal is a new transition (and the clock is still retained).
+    let joiner3 = AgentKeypair::generate()?;
+    let joiner3_hex = hex::encode(joiner3.agent_id().as_bytes());
+    let cert3 = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner3.public_key().as_bytes(),
+        None,
+    )?;
+    let pre3 = seat_write(
+        &live_record(state.as_ref(), &group_id).await,
+        &joiner3_hex,
+        &actor_hex,
+        &cert3,
+    );
+    let terminal3 = terminal_commit_for(&pre3, state.agent.identity().agent_keypair(), 3_000);
+    let mandate3 = mint_mandate_like_authority(
+        &pre3,
+        None,
+        0,
+        &joiner3_hex,
+        &actor_hex,
+        "s3r2-transitions",
+        &cert3,
+        &owner_kp,
+        1_500,
+    );
+    assert!(
+        apply_event(
+            &state,
+            member_added_event(
+                &group_id,
+                terminal3.revision,
+                &actor_hex,
+                &joiner3_hex,
+                &cert3,
+                terminal3,
+                Some(mandate3)
+            ),
+        )
+        .await
+        .accepted
+    );
+    let live = live_record(state.as_ref(), &group_id).await;
+    let capability = live
+        .mandate_capability
+        .get(&actor_hex)
+        .expect("capability entry");
+    assert!(
+        !capability.refusal_transition_counted,
+        "valid mandate restores Capable"
+    );
+    assert_eq!(capability.first_seen_ms, first_seen, "clock still retained");
+    assert_eq!(
+        capability.refusals, 2,
+        "valid mandates do not reset refusals"
+    );
+
+    let joiner4 = AgentKeypair::generate()?;
+    let joiner4_hex = hex::encode(joiner4.agent_id().as_bytes());
+    let cert4 = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner4.public_key().as_bytes(),
+        None,
+    )?;
+    let pre4 = seat_write(
+        &live_record(state.as_ref(), &group_id).await,
+        &joiner4_hex,
+        &actor_hex,
+        &cert4,
+    );
+    let terminal4 = terminal_commit_for(&pre4, state.agent.identity().agent_keypair(), 3_500);
+    assert!(
+        !apply_event(
+            &state,
+            member_added_event(
+                &group_id,
+                terminal4.revision,
+                &actor_hex,
+                &joiner4_hex,
+                &cert4,
+                terminal4,
+                None
+            ),
+        )
+        .await
+        .accepted
+    );
+    let row = diag_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.owner_mandate_missing, 3);
+    assert_eq!(
+        row.counters.mandate_capability_refusing_transitions, 2,
+        "refusal after a restored Capable is a NEW transition"
+    );
     Ok(())
 }

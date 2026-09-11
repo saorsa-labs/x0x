@@ -326,11 +326,24 @@ impl OwnerMandate {
 /// deadline on. No persisted enum grows a variant, and a later valid
 /// mandate from the same agent retains the clock (`or_insert` semantics
 /// at the recording site), exactly as ADR §1b requires.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MandateCapabilityState {
     /// Unix ms of the first capability observation from this agent.
     #[serde(default)]
     pub first_seen_ms: u64,
+    /// ADR-0064 §1b (slice 3 r2): absent-mandate events from this agent
+    /// that were refused with `owner_mandate_missing` — the per-agent
+    /// count the ADR's diagnostics require. Observational, local-only
+    /// (the committed group state is never touched by a refusal).
+    #[serde(default)]
+    pub refusals: u64,
+    /// Whether the CURRENT Refusing episode has already been counted as a
+    /// `Capable → Refusing` transition (set on the first refusal of the
+    /// episode, cleared by the next valid mandate from this agent — the
+    /// `Refusing → Capable` edge). Derives the one-shot transition count
+    /// `mandate_capability_refusing_transitions`.
+    #[serde(default)]
+    pub refusal_transition_counted: bool,
 }
 
 /// Milliseconds in `grace_days` days, saturating (ADR-0064 §1b clock).

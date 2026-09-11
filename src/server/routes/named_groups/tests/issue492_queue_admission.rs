@@ -473,7 +473,10 @@ fn refusing_capability_does_not_poison_queue_admission() {
     // state that refuses the event at apply time.
     f.info.mandate_capability.insert(
         actor.clone(),
-        x0x::groups::MandateCapabilityState { first_seen_ms: 1 },
+        x0x::groups::MandateCapabilityState {
+            first_seen_ms: 1,
+            ..Default::default()
+        },
     );
     let joiner = hex::encode(AgentId([0xA6; 32]).as_bytes());
     let commit = GroupStateCommit::sign(

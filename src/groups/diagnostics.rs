@@ -168,13 +168,15 @@ pub struct GroupCounters {
     /// window and carried no valid mandate (typed, retryable
     /// `owner_mandate_missing`; state byte-identical).
     pub owner_mandate_missing: u64,
-    /// ADR-0064 slice 3: decisions treating a recorded-capable authority
-    /// as `Refusing` (the derived state flips back to `Capable` on each
-    /// later valid mandate, so every refusal decision counts).
+    /// ADR-0064 §1b (slice 3 r2): one-shot `Capable → Refusing`
+    /// transitions per (group, authority agent) — counted on the FIRST
+    /// refusal of a Refusing episode; the next valid mandate from that
+    /// agent restores `Capable` so a later refusal counts again. The
+    /// per-agent refusal counts live on the capability map.
     pub mandate_capability_refusing_transitions: u64,
     /// ADR-0064 slice 3 (#472 decision 1): manual fork-quarantine clears
-    /// through `POST /groups/:id/quarantine/clear` (fresh verified owner
-    /// head attestation or `force` + non-empty reason).
+    /// through `POST /groups/:id/quarantine/clear` (owner-key node clear
+    /// or `force` + non-empty reason).
     pub fork_quarantine_manual_clears: u64,
 }
 
@@ -246,6 +248,10 @@ pub struct MandateCapabilityDiagnostic {
     /// Unix ms of the first capability observation (the grace clock
     /// anchor; retained across later valid mandates).
     pub first_seen_ms: u64,
+    /// ADR-0064 §1b (slice 3 r2): absent-mandate events from this agent
+    /// refused with `owner_mandate_missing` — the per-agent count,
+    /// sourced from the persisted capability map.
+    pub refusals: u64,
 }
 
 /// Process-wide diagnostics table, owned by `AppState`.
@@ -452,11 +458,20 @@ impl GroupsDiagnostics {
     /// ADR-0064 slice 3: an owner-axis `MemberAdded` was refused with the
     /// typed, retryable `owner_mandate_missing` — the event actor is a
     /// recorded-capable authority past its grace window and carried no
-    /// mandate. Every such refusal is also a refusing transition (the
-    /// derived state re-flips to `Capable` on the next valid mandate).
+    /// mandate. The per-agent breakdown lives on the persisted capability
+    /// map (`MandateCapabilityState::refusals`).
     pub fn record_owner_mandate_missing(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.owner_mandate_missing = c.owner_mandate_missing.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 §1b (slice 3 r2): a one-shot `Capable → Refusing`
+    /// transition — counted on the FIRST refusal of a Refusing episode;
+    /// the next valid mandate from that agent clears the episode (the
+    /// `Refusing → Capable` edge) so a later refusal counts again.
+    pub fn record_mandate_capability_refusing_transition(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
             c.mandate_capability_refusing_transitions =
                 c.mandate_capability_refusing_transitions.saturating_add(1);
         });
@@ -752,6 +767,13 @@ impl GroupsDiagnostics {
         });
     }
 
+    /// Record a coalesced exact-duplicate digest.
+    pub fn record_causal_deduplicated(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_deduplicated = c.causal_deduplicated.saturating_add(1);
+        });
+    }
+
     /// Record a queued approval successfully applied during drain.
     pub fn record_causal_applied(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
@@ -763,13 +785,6 @@ impl GroupsDiagnostics {
     pub fn record_causal_expired(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.causal_expired = c.causal_expired.saturating_add(1);
-        });
-    }
-
-    /// Record a coalesced exact-duplicate digest.
-    pub fn record_causal_deduplicated(&self, group_id: &str) {
-        self.with_counters(group_id, |c| {
-            c.causal_deduplicated = c.causal_deduplicated.saturating_add(1);
         });
     }
 
@@ -877,6 +892,7 @@ impl GroupsDiagnostics {
                             agent_id: agent_id.clone(),
                             state: capability.phase_label(mandate_grace_days, now_ms),
                             first_seen_ms: capability.first_seen_ms,
+                            refusals: capability.refusals,
                         })
                         .collect(),
                 });
@@ -1408,6 +1424,10 @@ mod tests {
         assert_eq!(
             merged.owner_mandate_invalid,
             dst.owner_mandate_invalid + src.owner_mandate_invalid
+        );
+        assert_eq!(
+            merged.owner_mandate_absent,
+            dst.owner_mandate_absent + src.owner_mandate_absent
         );
         assert_eq!(
             merged.owner_mandate_missing,

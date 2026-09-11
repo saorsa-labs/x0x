@@ -1201,14 +1201,11 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/groups/:id/quarantine/clear",
         cli_name: "groups quarantine clear",
-        description: "Manually clear the local fork-quarantine marker (fresh owner head attestation or --force with --reason)",
+        description: "Manually clear the local fork-quarantine marker (owner-key node clear or --force with --reason)",
         category: "named-groups",
         request: RequestSpec::Fields(&[
             RequestField::body("force", false),
             RequestField::body_as("reason", false, "--reason"),
-            // Owner-only JSON field: an inline HeadAttestation object the
-            // CLI does not synthesize (raw-HTTP/operators only).
-            RequestField::body_derived("head_attestation", false),
         ]),
     },
     EndpointDef {
