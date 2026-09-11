@@ -15568,8 +15568,16 @@ impl TaskListHandle {
     /// Returns an error if the task cannot be claimed.
     pub async fn claim_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
         // No local-version guard ⇒ unconditional (still advisory; concurrent
-        // remote claims coexist in the CRDT regardless).
-        self.claim_task_versioned(task_id, None).await.map(|_| ())
+        // remote claims coexist in the CRDT regardless). With no fence the
+        // only non-commit outcome is TaskMissing — an error for this legacy
+        // signature (the route surfaces it as a structured 404 instead).
+        match self.claim_task_versioned(task_id, None).await? {
+            TaskMutationOutcome::Committed { .. } => Ok(()),
+            TaskMutationOutcome::TaskMissing { .. } => Err(error::IdentityError::Storage(
+                std::io::Error::other(format!("claim_task failed: task not found: {task_id}")),
+            )),
+            TaskMutationOutcome::StaleLocalVersion { .. } => Ok(()),
+        }
     }
 
     /// Claim a task, optionally guarded by an expected list version.
@@ -15614,6 +15622,17 @@ impl TaskListHandle {
                         current: self.current_fence(current),
                     });
                 }
+            }
+            // Issue #643: a task a visibility read just saw can be
+            // transiently absent here (a stale bootstrap full-serve pruned
+            // it between the read and this claim). Surface that as the
+            // structured, retryable TaskMissing outcome — never a 500-class
+            // storage error the caller cannot distinguish from disk
+            // failure.
+            if list.get_task(&task_id).is_none() {
+                return Ok(TaskMutationOutcome::TaskMissing {
+                    current: self.current_fence(list.current_version()),
+                });
             }
             let seq = list.next_seq();
             list.claim_task(&task_id, self.agent_id, self.peer_id, seq, &self.signing)
@@ -15666,10 +15685,16 @@ impl TaskListHandle {
     ///
     /// Returns an error if the task cannot be completed.
     pub async fn complete_task(&self, task_id: crdt::TaskId) -> error::Result<()> {
-        // No local-version guard ⇒ unconditional (still advisory).
-        self.complete_task_versioned(task_id, None)
-            .await
-            .map(|_| ())
+        // No local-version guard ⇒ unconditional (still advisory). With no
+        // fence the only non-commit outcome is TaskMissing — an error for
+        // this legacy signature (the route surfaces it as a structured 404).
+        match self.complete_task_versioned(task_id, None).await? {
+            TaskMutationOutcome::Committed { .. } => Ok(()),
+            TaskMutationOutcome::TaskMissing { .. } => Err(error::IdentityError::Storage(
+                std::io::Error::other(format!("complete_task failed: task not found: {task_id}")),
+            )),
+            TaskMutationOutcome::StaleLocalVersion { .. } => Ok(()),
+        }
     }
 
     /// Complete a task, optionally guarded by an expected list version.
@@ -15701,6 +15726,13 @@ impl TaskListHandle {
                         current: self.current_fence(current),
                     });
                 }
+            }
+            // Issue #643: same structured TaskMissing outcome as the claim
+            // path — see claim_task_versioned.
+            if list.get_task(&task_id).is_none() {
+                return Ok(TaskMutationOutcome::TaskMissing {
+                    current: self.current_fence(list.current_version()),
+                });
             }
             let seq = list.next_seq();
             list.complete_task(&task_id, self.agent_id, self.peer_id, seq, &self.signing)
@@ -17175,6 +17207,17 @@ pub enum TaskMutationOutcome {
     /// nothing was mutated. Local staleness guard (stale revision) or a
     /// restart-epoch mismatch — never a distributed conflict.
     StaleLocalVersion {
+        /// The task list's current (unchanged) local fence token.
+        current: FenceToken,
+    },
+    /// The task id is not present on this replica right now; nothing was
+    /// mutated. NOT a hard error: during convergence a task a read just saw
+    /// can be transiently absent from the local CRDT state (e.g. a stale
+    /// bootstrap full-serve pruned it before its re-delivery merged — issue
+    /// #643), or it was deleted on another replica, or it never existed.
+    /// The caller should re-read the list and retry or give up; `current`
+    /// is the replica's unchanged local fence token for that re-read.
+    TaskMissing {
         /// The task list's current (unchanged) local fence token.
         current: FenceToken,
     },
@@ -19644,6 +19687,76 @@ mod tests {
         assert!(
             matches!(outcome2, crate::TaskMutationOutcome::Committed { .. }),
             "a post-restart token at the current revision must commit"
+        );
+
+        agent.shutdown().await;
+    }
+
+    /// #643: a claim against a task id this replica does not currently hold
+    /// (pruned by a stale bootstrap serve mid-convergence, deleted
+    /// elsewhere, or never present) must surface as the structured
+    /// retryable [`TaskMutationOutcome::TaskMissing`] — NOT a 500-class
+    /// storage error. The legacy `claim_task`/`complete_task` wrappers keep
+    /// erroring, while the route can map the typed outcome to 404.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn claim_of_absent_task_returns_structured_task_missing_outcome() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        let handle = agent
+            .create_task_list("absent-claim", "absent-claim-topic")
+            .await
+            .expect("create task list");
+        // A well-formed TaskId that was never added to this list.
+        let absent = crate::crdt::TaskId::from_bytes([0xAB; 32]);
+
+        // Unfenced claim: TaskMissing, not an error.
+        let outcome = handle
+            .claim_task_versioned(absent, None)
+            .await
+            .expect("absent claim is not an error outcome");
+        match outcome {
+            crate::TaskMutationOutcome::TaskMissing { current } => {
+                assert_eq!(
+                    current.revision,
+                    handle.version().await.revision,
+                    "an absent-task rejection must not change the revision"
+                );
+            }
+            other => panic!("expected TaskMissing, got {other:?}"),
+        }
+
+        // Fenced claim at the CURRENT token: still TaskMissing (the task,
+        // not the fence, is the problem).
+        let fence = handle.version().await;
+        let outcome = handle
+            .claim_task_versioned(absent, Some(fence))
+            .await
+            .expect("absent fenced claim is not an error outcome");
+        assert!(
+            matches!(outcome, crate::TaskMutationOutcome::TaskMissing { .. }),
+            "a fresh fence must not turn an absent task into a commit: {outcome:?}"
+        );
+
+        // Legacy wrapper keeps its Result signature: Err, and the list
+        // state is untouched (no revision churn from the rejections).
+        let err = handle.claim_task(absent).await.expect_err("legacy err");
+        assert!(
+            err.to_string().contains("task not found"),
+            "legacy error must name the absent task: {err}"
+        );
+        assert_eq!(
+            handle.version().await.revision,
+            fence.revision,
+            "TaskMissing outcomes must be non-mutating"
         );
 
         agent.shutdown().await;
