@@ -23,15 +23,21 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; YEL='\033[0;33m'; NC='\
 P=0; F=0; S=0
 AP=""; BP=""; CP=""
 AT=""; BT=""; CT=""
-USER_KEY_PATH="/tmp/x0x-fulltest-user.key"
+# #641: the user key needs its own disposable directory. `x0x user-id create`
+# also writes the ADR-0036 `owner.json` SIBLING of the key and refuses to
+# install a different UserId over an existing owner — a fixed /tmp key path
+# left that sibling behind and broke every later run's create. A mktemp -d
+# per run makes both files live and die together.
+USER_KEY_DIR=$(mktemp -d -t x0x-fulltest-owner.XXXXXX)
+USER_KEY_PATH="$USER_KEY_DIR/user.key"
 
 cleanup() {
   [ -n "$AP" ] && kill "$AP" 2>/dev/null || true
   [ -n "$BP" ] && kill "$BP" 2>/dev/null || true
   [ -n "$CP" ] && kill "$CP" 2>/dev/null || true
   wait "$AP" "$BP" "$CP" 2>/dev/null || true
-  rm -rf "$ADIR" "$BDIR" "$CDIR"
-  rm -f "$USER_KEY_PATH" "${STATUS_FILE:-}"
+  rm -rf "$ADIR" "$BDIR" "$CDIR" "$USER_KEY_DIR"
+  rm -f "${STATUS_FILE:-}"
 }
 trap cleanup EXIT
 
@@ -56,6 +62,9 @@ instance_name = "$name"
 data_dir = "$dir"
 bind_address = "127.0.0.1:$bind_port"
 api_address = "127.0.0.1:$api_port"
+# #648: mDNS off — with it enabled, foreign x0x nodes on the LAN appear as
+# peers and can wedge the loopback mesh (invalid-signature drops).
+mdns_enabled = false
 log_level = "warn"
 heartbeat_interval_secs = 2
 identity_ttl_secs = 6
@@ -65,7 +74,9 @@ presence_offline_timeout_secs = 3
 user_key_path = "$USER_KEY_PATH"
 bootstrap_peers = [$bootstrap]
 TOML
-  "$X0XD" --config "$dir/config.toml" --skip-update-check >"$dir/log" 2>&1 &
+  # #648: hermetic — never dial the embedded production bootstrap nodes;
+  # the explicit loopback bootstrap_peers above are the only seeds.
+  "$X0XD" --config "$dir/config.toml" --no-hard-coded-bootstrap --skip-update-check >"$dir/log" 2>&1 &
   echo $!
 }
 
@@ -1075,13 +1086,19 @@ R=$(bpst /agents/connect "{\"agent_id\":\"$AID\"}") >/dev/null
 WS_DIRECT_MSG="${PROOF_TOKEN}-ws-direct"
 WS_DIRECT_LOG=$(mktemp)
 if [ "$WS_AVAILABLE" = 1 ]; then
-  node tests/helpers/ws_probe.mjs direct-receive "$BA" "$BT" 20000 > "$WS_DIRECT_LOG" &
+  # #641: pass the expected message so the probe resolves only on the frame
+  # whose base64 payload equals it — group-control events ride the same
+  # /ws/direct lane and used to satisfy the probe's first-frame match.
+  node tests/helpers/ws_probe.mjs direct-receive "$BA" "$BT" 20000 "$WS_DIRECT_MSG" > "$WS_DIRECT_LOG" &
   WS_DIRECT_PID=$!
   sleep 3
   WS_SEND=$(node tests/helpers/ws_probe.mjs send-direct "$AA" "$AT" "$BID" "$WS_DIRECT_MSG" 2>/dev/null || echo '{"error":"ws_fail"}')
   chk "$WS_SEND" "pong" "GET /ws send_direct command"
   wait "$WS_DIRECT_PID" 2>/dev/null || true
-  chk "$(cat "$WS_DIRECT_LOG" 2>/dev/null || echo '{}')" "received" "GET /ws/direct receives direct_message frame"
+  # #641: assert on the probe's ok flag (it only reports ok after receiving
+  # the matching frame). The old "received" substring check was tautological
+  # — "received" is a JSON key the probe always prints.
+  chk "$(cat "$WS_DIRECT_LOG" 2>/dev/null || echo '{}')" "ok" "GET /ws/direct receives direct_message frame"
   check_contains "GET /ws/direct payload matched" "$(cat "$WS_DIRECT_LOG" 2>/dev/null || echo '{}')" "$(printf '%s' "$WS_DIRECT_MSG" | base64)"
 else
   skip "GET /ws send_direct command" "node>=21 WebSocket absent"

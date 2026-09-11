@@ -162,6 +162,9 @@ instance_name = "e2e-alice"
 data_dir = "/tmp/x0x-e2e-alice"
 bind_address = "127.0.0.1:19001"
 api_address = "127.0.0.1:19101"
+# Hermetic loopback mesh (#648): mDNS off so foreign x0x nodes on the LAN
+# can neither discover these daemons nor wedge their mesh.
+mdns_enabled = false
 log_level = "warn"
 bootstrap_peers = ["127.0.0.1:19002"]
 TOML
@@ -171,13 +174,16 @@ instance_name = "e2e-bob"
 data_dir = "/tmp/x0x-e2e-bob"
 bind_address = "127.0.0.1:19002"
 api_address = "127.0.0.1:19102"
+mdns_enabled = false
 log_level = "warn"
 bootstrap_peers = ["127.0.0.1:19001"]
 TOML
 
-$X0XD --config /tmp/x0x-e2e-alice/config.toml &>/tmp/x0x-e2e-alice/log &
+# #648: --no-hard-coded-bootstrap keeps the daemons off the production
+# bootstrap network; the loopback config peers above are the only seeds.
+$X0XD --config /tmp/x0x-e2e-alice/config.toml --no-hard-coded-bootstrap &>/tmp/x0x-e2e-alice/log &
 AP=$!
-$X0XD --config /tmp/x0x-e2e-bob/config.toml &>/tmp/x0x-e2e-bob/log &
+$X0XD --config /tmp/x0x-e2e-bob/config.toml --no-hard-coded-bootstrap &>/tmp/x0x-e2e-bob/log &
 BP=$!
 CP=""
 
@@ -558,6 +564,9 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[11/18] Named Groups — Full Lifecycle${NC}"
 
+# #642: membership flags for the ADR-0016 refusal controls below.
+BOB_JOINED=0
+
 # Create group
 R=$(Ap /groups '{"name":"E2E Comprehensive Group","description":"full lifecycle test"}')
 check_not_error "create named group" "$R"
@@ -596,6 +605,10 @@ print(json.dumps(d))
 
         # Bob joins via invite
         R=$(Bp /groups/join "{\"invite\":\"$INVITE\"}"); check_not_error "bob joins via invite" "$R"
+        # #642: the ADR-0016 refusal + promotion below only make sense when
+        # bob actually joined; track it so a failed invite path degrades to
+        # skips instead of a bogus positive-control failure.
+        echo "$R" | grep -q '"error"' || BOB_JOINED=1
     else
         skip "invite validation" "no invite_link returned"
         skip "bob joins via invite" "no invite_link"
@@ -607,7 +620,15 @@ print(json.dumps(d))
     # Get group info again — verify display name
     R=$(A "/groups/$NG"); check_contains "group has alice display name" "$R" "Alice the Admin"
 
-    # Alice leaves group
+    # Alice leaves group — #642: since ADR-0016 the sole admin may not leave
+    # while another member remains. Assert that refusal as a positive
+    # control, then promote bob so the leave is legal.
+    if [ "${BOB_JOINED:-0}" = 1 ]; then
+        R=$(Ad "/groups/$NG")
+        check_contains "sole-admin leave refused (ADR-0016)" "$R" "at least one admin"
+        R=$(Apa "/groups/$NG/members/$BID/role" '{"role":"admin"}')
+        check_not_error "promote bob to admin" "$R"
+    fi
     R=$(Ad "/groups/$NG"); check_not_error "alice leaves group" "$R"
 
     # Create second group with invite expiry
@@ -630,9 +651,18 @@ print(json.dumps(d))
 
         if [ -n "$INVITE2" ]; then
             R=$(Bp /groups/join "{\"invite\":\"$INVITE2\"}"); check_not_error "bob joins 2nd group" "$R"
+            echo "$R" | grep -q '"error"' || BOB_JOINED2=1
         fi
 
-        # Delete second group
+        # Delete second group — #642: DELETE /groups/:id routes through the
+        # same ADR-0016 last-admin guard. With bob still a member the delete
+        # is refused; assert that refusal, remove bob, then alice is the sole
+        # member and the delete becomes a terminal group deletion (#370).
+        if [ "${BOB_JOINED2:-0}" = 1 ]; then
+            R=$(Ad "/groups/$NG2")
+            check_contains "delete with members refused (ADR-0016)" "$R" "at least one admin"
+            R=$(Ad "/groups/$NG2/members/$BID"); check_not_error "remove bob from 2nd group" "$R"
+        fi
         R=$(Ad "/groups/$NG2"); check_not_error "delete 2nd group" "$R"
     fi
 
@@ -831,12 +861,14 @@ instance_name = "e2e-charlie"
 data_dir = "/tmp/x0x-e2e-charlie"
 bind_address = "127.0.0.1:19003"
 api_address = "127.0.0.1:19103"
+mdns_enabled = false
 log_level = "warn"
 bootstrap_peers = []
 TOML
 
-# Start charlie
-$X0XD --config /tmp/x0x-e2e-charlie/config.toml &>/tmp/x0x-e2e-charlie/log &
+# Start charlie (#648: hermetic — no embedded bootstrap, no mDNS; the
+# seedless-bootstrap proof below is the card import + /agents/connect path)
+$X0XD --config /tmp/x0x-e2e-charlie/config.toml --no-hard-coded-bootstrap &>/tmp/x0x-e2e-charlie/log &
 CP=$!
 
 # Wait for charlie to start

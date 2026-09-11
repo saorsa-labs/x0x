@@ -48,10 +48,25 @@ for node in "${NODES[@]}"; do
     DATA_DIRS[$node]="$WORK_DIR/$node"
     CONFIGS[$node]="$WORK_DIR/$node.toml"
     mkdir -p "${DATA_DIRS[$node]}"
+    # Hermetic loopback mesh (#648): fixed QUIC port per node, mDNS off, and
+    # every non-first node explicitly dials the first node. Without these the
+    # daemons can only find each other via mDNS, so a foreign x0x node on the
+    # LAN keeps them from meshing (invalid-signature drops, SWIM suspect
+    # timeouts). Verified on #648: exactly these three lines make the suite
+    # pass with a foreign node on the LAN.
+    quic_port=$(( ${API_PORTS[$node]} + 100 ))
+    if [ "$node" = "alice" ]; then
+        bootstrap=""
+    else
+        bootstrap="\"127.0.0.1:$(( ${API_PORTS[alice]} + 100 ))\""
+    fi
     cat > "${CONFIGS[$node]}" <<TOML
 instance_name = "$node"
 data_dir = "${DATA_DIRS[$node]}"
 api_address = "127.0.0.1:${API_PORTS[$node]}"
+bind_address = "127.0.0.1:$quic_port"
+mdns_enabled = false
+bootstrap_peers = [$bootstrap]
 log_level = "warn"
 TOML
     "$X0XD" \
@@ -59,7 +74,7 @@ TOML
         --no-hard-coded-bootstrap \
         > "$WORK_DIR/$node.x0xd.log" 2>&1 &
     DAEMON_PIDS+=("$!")
-    echo "started daemon $node pid=$! port=${API_PORTS[$node]}"
+    echo "started daemon $node pid=$! port=${API_PORTS[$node]} quic=$quic_port"
 done
 
 echo "waiting for daemons to bind /health..."
