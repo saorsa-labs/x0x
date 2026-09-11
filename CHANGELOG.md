@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Card interface hints now respect an explicit P2P bind address (#638).
+  ant-quic 0.27.50 honors an explicit `bind_address` exactly (previously the
+  QUIC socket silently bound wildcard), so a daemon bound to a specific IP —
+  loopback or a LAN address — is unreachable on every other interface.
+  `GET /agent/card?include_local_addresses=true` still advertised all of the
+  host's interface addresses with the QUIC port, and the connect ladder
+  ranks same-LAN IPv4 first while excluding loopback from the fast probes,
+  so `POST /agents/connect` burned ~6 s per dead hint before the one live
+  address — past the 20 s client budget of the
+  `f2_public_group_bootstrap_wiring` tests on interface-rich hosts (single
+  interface CI stayed green). Interface hints are now filtered to the bound
+  address for specifically bound listeners; wildcard-bound listeners and
+  observed/external addresses are unchanged.
+
 ## [v0.42.0] - 2026-09-11
 
 ### Changed
