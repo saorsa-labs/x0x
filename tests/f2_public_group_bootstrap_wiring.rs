@@ -211,9 +211,10 @@ fn safe_route(path: &str) -> &'static str {
 /// the hinted dial ever reaches the one live loopback address — past the
 /// 20 s client budget and this test's `POST agents_connect` timeout.
 /// `card_addresses` (src/server/routes/identity.rs) therefore suppresses
-/// non-loopback interface hints for loopback-bound listeners; with the card
-/// carrying only `127.0.0.1:<port>`, the connect lands on the hinted peer
-/// dial and completes in well under a second.
+/// interface hints that do not match the specifically bound listener
+/// address (loopback being this fixture's case); with the card carrying
+/// only `127.0.0.1:<port>`, the connect lands on the hinted peer dial and
+/// completes in well under a second.
 async fn start_daemon(dir: &Path) -> Daemon {
     let data_dir = dir.join("data");
     tokio::fs::create_dir_all(&data_dir)

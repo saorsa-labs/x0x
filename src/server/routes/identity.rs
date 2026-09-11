@@ -356,24 +356,27 @@ fn card_addresses(
     interface_addrs: impl IntoIterator<Item = std::net::SocketAddr>,
     include_local: bool,
 ) -> Vec<String> {
-    // ant-quic >= 0.27.50 honors an explicit interface bind exactly (its
-    // PR #274), so a daemon bound to loopback is unreachable on every other
-    // interface address. Interface hints are still guesses at best: before
-    // that fix they were accidentally true (the socket bound wildcard), now
-    // they are lies. Advertising them anyway makes dialers burn the local
-    // probe ladder on dead addresses before the one live loopback address
-    // (x0x ranks same-LAN IPv4 first and excludes loopback from the fast
-    // probes), which pushed same-host /agents/connect past a 20 s client
-    // budget (#638). Observed addresses stay untouched: they are empirical
-    // reports, and a loopback-bound listener cannot earn a non-loopback one.
-    let loopback_bound = local_addr.ip().is_loopback() && local_addr.port() != 0;
+    // ant-quic >= 0.27.50 honors an explicit interface bind exactly (its PR
+    // #274), so a daemon bound to a specific IP is unreachable on every
+    // other interface address — loopback is just the common case. Interface
+    // hints are guesses at best: before that fix they were accidentally
+    // true (the socket bound wildcard), on any other interface they are
+    // lies. Advertising them anyway makes dialers burn the local probe
+    // ladder on dead addresses before the one live bound address (x0x ranks
+    // same-LAN IPv4 first and excludes loopback from the fast probes), which
+    // pushed same-host /agents/connect past a 20 s client budget (#638).
+    // Observed addresses stay untouched: they are empirical reports, and a
+    // specifically bound listener cannot earn a report on another interface.
+    let specifically_bound = local_addr.port() != 0
+        && !local_addr.ip().is_unspecified()
+        && !local_addr.ip().is_multicast();
     let mut addresses: Vec<String> = external_addrs
         .iter()
         .filter(|addr| include_local || x0x::is_publicly_advertisable(**addr))
         .map(ToString::to_string)
         .collect();
     for addr in interface_addrs {
-        if loopback_bound && !addr.ip().is_loopback() {
+        if specifically_bound && addr.ip() != local_addr.ip() {
             continue;
         }
         if !include_local && !x0x::is_publicly_advertisable(addr) {
@@ -471,6 +474,24 @@ mod card_address_tests {
         assert_eq!(
             card_addresses(port_zero, &[], interfaces, true),
             vec!["192.168.1.89:5483", "100.112.232.91:5483"]
+        );
+    }
+
+    /// #638 generalisation: ANY specifically bound listener — not just
+    /// loopback — filters interface hints down to the bound address. A
+    /// daemon bound to one LAN IP must not advertise the host's other
+    /// interfaces (utun/CGNAT), which ant-quic 0.27.50 will never reach it
+    /// on.
+    #[test]
+    fn explicit_lan_bind_keeps_only_the_bound_interface_hint() {
+        let bound = "192.168.1.89:5483".parse().unwrap();
+        let interfaces = [
+            "192.168.1.89:5483".parse().unwrap(),
+            "100.112.232.91:5483".parse().unwrap(),
+        ];
+        assert_eq!(
+            card_addresses(bound, &[], interfaces, true),
+            vec!["192.168.1.89:5483"]
         );
     }
 
