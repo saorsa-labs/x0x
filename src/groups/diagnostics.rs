@@ -163,6 +163,21 @@ pub struct GroupCounters {
     /// mandate (pre-mandate authority or keyless tier; warn-accept until
     /// slice-3 enforcement).
     pub owner_mandate_absent: u64,
+    /// ADR-0064 slice 3: owner-axis `MemberAdded` events REFUSED because
+    /// the event actor is a recorded-capable authority past its grace
+    /// window and carried no valid mandate (typed, retryable
+    /// `owner_mandate_missing`; state byte-identical).
+    pub owner_mandate_missing: u64,
+    /// ADR-0064 §1b (slice 3 r2): one-shot `Capable → Refusing`
+    /// transitions per (group, authority agent) — counted on the FIRST
+    /// refusal of a Refusing episode; the next valid mandate from that
+    /// agent restores `Capable` so a later refusal counts again. The
+    /// per-agent refusal counts live on the capability map.
+    pub mandate_capability_refusing_transitions: u64,
+    /// ADR-0064 slice 3 (#472 decision 1): manual fork-quarantine clears
+    /// through `POST /groups/:id/quarantine/clear` (owner-key node clear
+    /// or `force` + non-empty reason).
+    pub fork_quarantine_manual_clears: u64,
 }
 
 /// Per-group gauges for ADR 0028 causal predecessor delivery. Populated by the
@@ -213,6 +228,30 @@ pub struct GroupDiagnostic {
     pub causal_queue_bytes: usize,
     /// Current predecessor relay outbox obligations for this group.
     pub causal_relay_obligations: usize,
+    /// ADR-0064 §1b: per-authority-agent capability phases observed for
+    /// this group (`capable`/`refusing`, derived from the persisted
+    /// `first_seen_ms` and the configured grace window). Agents with no
+    /// recorded capability are `unknown` and never appear — the absent
+    /// map entry IS that state.
+    pub mandate_capability: Vec<MandateCapabilityDiagnostic>,
+}
+
+/// One ADR-0064 §1b per-agent capability row in
+/// `GET /diagnostics/groups`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MandateCapabilityDiagnostic {
+    /// Hex agent id of the authority the state is recorded for.
+    pub agent_id: String,
+    /// Derived phase: `capable` or `refusing` (never `unknown` — an
+    /// unknown agent has no map entry and so no row).
+    pub state: &'static str,
+    /// Unix ms of the first capability observation (the grace clock
+    /// anchor; retained across later valid mandates).
+    pub first_seen_ms: u64,
+    /// ADR-0064 §1b (slice 3 r2): absent-mandate events from this agent
+    /// refused with `owner_mandate_missing` — the per-agent count,
+    /// sourced from the persisted capability map.
+    pub refusals: u64,
 }
 
 /// Process-wide diagnostics table, owned by `AppState`.
@@ -330,6 +369,15 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
         .causal_deduplicated
         .saturating_add(src.causal_deduplicated);
     dst.causal_applied = dst.causal_applied.saturating_add(src.causal_applied);
+    dst.owner_mandate_missing = dst
+        .owner_mandate_missing
+        .saturating_add(src.owner_mandate_missing);
+    dst.mandate_capability_refusing_transitions = dst
+        .mandate_capability_refusing_transitions
+        .saturating_add(src.mandate_capability_refusing_transitions);
+    dst.fork_quarantine_manual_clears = dst
+        .fork_quarantine_manual_clears
+        .saturating_add(src.fork_quarantine_manual_clears);
     dst.membership_events_queued_revision_gap = dst
         .membership_events_queued_revision_gap
         .saturating_add(src.membership_events_queued_revision_gap);
@@ -404,6 +452,36 @@ impl GroupsDiagnostics {
     pub fn record_owner_mandate_absent(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.owner_mandate_absent = c.owner_mandate_absent.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 3: an owner-axis `MemberAdded` was refused with the
+    /// typed, retryable `owner_mandate_missing` — the event actor is a
+    /// recorded-capable authority past its grace window and carried no
+    /// mandate. The per-agent breakdown lives on the persisted capability
+    /// map (`MandateCapabilityState::refusals`).
+    pub fn record_owner_mandate_missing(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.owner_mandate_missing = c.owner_mandate_missing.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 §1b (slice 3 r2): a one-shot `Capable → Refusing`
+    /// transition — counted on the FIRST refusal of a Refusing episode;
+    /// the next valid mandate from that agent clears the episode (the
+    /// `Refusing → Capable` edge) so a later refusal counts again.
+    pub fn record_mandate_capability_refusing_transition(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.mandate_capability_refusing_transitions =
+                c.mandate_capability_refusing_transitions.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 3 (#472 decision 1): the local fork-quarantine
+    /// marker was cleared through the manual endpoint.
+    pub fn record_fork_quarantine_manual_clear(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_quarantine_manual_clears = c.fork_quarantine_manual_clears.saturating_add(1);
         });
     }
 
@@ -734,7 +812,9 @@ impl GroupsDiagnostics {
     /// Build a snapshot for `GET /diagnostics/groups`. Joins the live
     /// per-group counters with the caller-supplied `members_v2` and
     /// subscription views (the daemon already holds those locks higher up
-    /// the call stack, so we keep this function pure-sync).
+    /// the call stack, so we keep this function pure-sync). The
+    /// ADR-0064 §1b grace window (days) derives each recorded
+    /// capability's `capable`/`refusing` phase at snapshot time.
     #[must_use]
     pub fn snapshot(
         &self,
@@ -742,11 +822,13 @@ impl GroupsDiagnostics {
         metadata_subscribed: &HashSet<String>,
         public_subscribed: &HashSet<String>,
         causal_gauges: &HashMap<String, CausalGauges>,
+        mandate_grace_days: u64,
     ) -> GroupsDiagnosticsSnapshot {
         let counters_guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let now_ms = super::now_millis();
 
         let stable_for_key = |key: &str| -> String {
             groups
@@ -803,6 +885,16 @@ impl GroupsDiagnostics {
                         .or_else(|| causal_gauges.get(&stable_id))
                         .map(|g| g.relay_obligations)
                         .unwrap_or(0),
+                    mandate_capability: info
+                        .mandate_capability
+                        .iter()
+                        .map(|(agent_id, capability)| MandateCapabilityDiagnostic {
+                            agent_id: agent_id.clone(),
+                            state: capability.phase_label(mandate_grace_days, now_ms),
+                            first_seen_ms: capability.first_seen_ms,
+                            refusals: capability.refusals,
+                        })
+                        .collect(),
                 });
         }
 
@@ -819,6 +911,9 @@ impl GroupsDiagnostics {
                     causal_queue_entries: 0,
                     causal_queue_bytes: 0,
                     causal_relay_obligations: 0,
+                    // Counters-only rows have no GroupInfo to derive
+                    // capability phases from (the map lives on the record).
+                    mandate_capability: Vec::new(),
                 });
             merge_counters(&mut row.counters, counters);
         }
@@ -864,7 +959,7 @@ mod tests {
         let mut pub_set = HashSet::new();
         pub_set.insert("g1".to_string());
 
-        let snap = diag.snapshot(&groups, &meta, &pub_set, &HashMap::new());
+        let snap = diag.snapshot(&groups, &meta, &pub_set, &HashMap::new(), 60);
         assert_eq!(snap.groups.len(), 2);
         let g1 = snap.groups.iter().find(|g| g.group_id == "g1").unwrap();
         assert_eq!(g1.counters.messages_received, 2);
@@ -910,7 +1005,13 @@ mod tests {
 
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
         groups.insert("grp".into(), group("Grp", "grp"));
-        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let snap = diag.snapshot(
+            &groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            60,
+        );
 
         let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
         assert_eq!(
@@ -937,7 +1038,13 @@ mod tests {
 
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
         groups.insert("grp".into(), group("Grp", "grp"));
-        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let snap = diag.snapshot(
+            &groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            60,
+        );
         let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
         assert_eq!(g.counters.messages_received, 1);
         assert_eq!(
@@ -953,7 +1060,13 @@ mod tests {
         let diag = GroupsDiagnostics::new();
         diag.record_other_drop("ghost");
         let groups: HashMap<String, GroupInfo> = HashMap::new();
-        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let snap = diag.snapshot(
+            &groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            60,
+        );
         assert_eq!(snap.groups.len(), 1);
         assert_eq!(snap.groups[0].group_id, "ghost");
         assert_eq!(snap.groups[0].members_v2_size, 0);
@@ -980,7 +1093,13 @@ mod tests {
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
         groups.insert("grp".into(), group("Grp", "grp"));
         groups.insert("other".into(), group("Other", "other"));
-        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let snap = diag.snapshot(
+            &groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            60,
+        );
         let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
         assert_eq!(
             g.counters.conflict_unauthenticated, 2,
@@ -1008,7 +1127,13 @@ mod tests {
 
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
         groups.insert("grp".into(), group("Grp", "grp"));
-        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let snap = diag.snapshot(
+            &groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            60,
+        );
         let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
         assert_eq!(
             g.counters.adoption_fork_evidence, 2,
@@ -1062,7 +1187,13 @@ mod tests {
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
         groups.insert("grp".into(), info);
         let diag = GroupsDiagnostics::new();
-        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let snap = diag.snapshot(
+            &groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            60,
+        );
         let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
         assert_eq!(g.counters.members_awaiting_certificate, 1);
     }
@@ -1127,6 +1258,9 @@ mod tests {
             owner_mandate_valid: base + 37,
             owner_mandate_invalid: base + 38,
             owner_mandate_absent: base + 39,
+            owner_mandate_missing: base + 40,
+            mandate_capability_refusing_transitions: base + 41,
+            fork_quarantine_manual_clears: base + 42,
         };
         let src = counters_with(1_000);
         let dst = counters_with(7);
@@ -1294,6 +1428,19 @@ mod tests {
         assert_eq!(
             merged.owner_mandate_absent,
             dst.owner_mandate_absent + src.owner_mandate_absent
+        );
+        assert_eq!(
+            merged.owner_mandate_missing,
+            dst.owner_mandate_missing + src.owner_mandate_missing
+        );
+        assert_eq!(
+            merged.mandate_capability_refusing_transitions,
+            dst.mandate_capability_refusing_transitions
+                + src.mandate_capability_refusing_transitions
+        );
+        assert_eq!(
+            merged.fork_quarantine_manual_clears,
+            dst.fork_quarantine_manual_clears + src.fork_quarantine_manual_clears
         );
         assert_eq!(merged.members_awaiting_certificate, gauge_before);
     }

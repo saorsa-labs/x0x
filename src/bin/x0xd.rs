@@ -572,6 +572,13 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
         let findings = x0x::server::config::diagnose_section_placement(&root);
         x0x::server::config::warn_section_misplacements(&findings);
     }
+    // ADR-0064 §1b: an out-of-range enforcement value changes security
+    // behaviour (a 0-day grace would refuse every recorded-capable
+    // authority's absent-mandate event immediately), so unlike unknown
+    // keys — warn-only — this refuses startup.
+    if let Err(message) = config.groups.validate() {
+        anyhow::bail!("invalid [groups] configuration: {message}");
+    }
     Ok(config)
 }
 

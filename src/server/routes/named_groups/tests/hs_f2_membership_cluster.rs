@@ -319,6 +319,7 @@ async fn diagnostics_row(
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
         &std::collections::HashMap::new(),
+        state.groups_config.mandate_grace_days,
     );
     snapshot
         .groups

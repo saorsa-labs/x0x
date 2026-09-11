@@ -458,3 +458,68 @@ fn member_added_with_owner_mandate_still_queues_on_revision_gap() {
         "mandate-free MemberAdded still queues (pre-slice-2 shape)"
     );
 }
+
+/// WHY (ADR-0064 slice 3): the `owner_mandate_missing` refusal happens at
+/// APPLY time — queue admission stays a SHAPE+ROLE check so a refused
+/// event's resend (the redelivery path) still queues on a genuine
+/// revision gap instead of being dropped. A refusing capability entry on
+/// the group record must not leak into the admission predicate.
+#[test]
+fn refusing_capability_does_not_poison_queue_admission() {
+    let mut f = Fixture::new();
+    let actor = hex::encode(f.member.agent_id().as_bytes());
+    f.info.set_member_role(&actor, GroupRole::Admin);
+    // A past-grace capability entry for the actor — the derived Refusing
+    // state that refuses the event at apply time.
+    f.info.mandate_capability.insert(
+        actor.clone(),
+        x0x::groups::MandateCapabilityState {
+            first_seen_ms: 1,
+            ..Default::default()
+        },
+    );
+    let joiner = hex::encode(AgentId([0xA6; 32]).as_bytes());
+    let commit = GroupStateCommit::sign(
+        f.info.stable_group_id().to_string(),
+        f.info.state_revision + 9,
+        Some("missing predecessor".into()),
+        "future roster".into(),
+        "policy".into(),
+        "metadata".into(),
+        None,
+        false,
+        1,
+        &f.member,
+    )
+    .expect("signed future commit");
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: f.info.stable_group_id().to_string(),
+        revision: f.info.roster_revision + 9,
+        actor: actor.clone(),
+        agent_id: joiner,
+        display_name: None,
+        treekem_commit_b64: Some("commit".to_string()),
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: Some(1),
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some("certificate".to_string()),
+        owner_mandate: None,
+        commit: Some(commit),
+    };
+    let mut queue = VecDeque::new();
+    let queued = admit_treekem_pending_event(
+        f.info.stable_group_id(),
+        &f.info,
+        &mut queue,
+        &event,
+        f.member.agent_id(),
+        &actor,
+    );
+    assert!(
+        queued.is_some(),
+        "refused-shape event still queues on a real revision gap"
+    );
+}

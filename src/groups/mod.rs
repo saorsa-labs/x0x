@@ -47,7 +47,8 @@ pub use self::owner_cert::{
     failing_active_members, verify_owner_certified_member, OwnerCertEvidence, OwnerCertFailure,
 };
 pub use self::owner_mandate::{
-    MandateCapabilityState, OwnerMandate, OwnerMandateError, OWNER_MANDATE_VERSION,
+    mandate_grace_window_ms, MandateCapabilityState, OwnerMandate, OwnerMandateError,
+    OWNER_MANDATE_VERSION,
 };
 pub use self::policy::{
     GroupAdmission, GroupConfidentiality, GroupDiscoverability, GroupPolicy, GroupPolicyPreset,

@@ -924,6 +924,7 @@ pub(in crate::server) async fn groups_diagnostics(
         &metadata_keys,
         &public_keys,
         &causal_gauges,
+        state.groups_config.mandate_grace_days,
     );
     let treekem_recovery_cache = state.treekem_member_key_packages.diagnostics().await;
     (

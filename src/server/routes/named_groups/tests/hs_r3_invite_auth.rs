@@ -145,6 +145,7 @@ async fn card_owner_axis_invite_requires_durable_owner() -> Result<()> {
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            state.groups_config.mandate_grace_days,
         );
         let stable_id = groups_snapshot
             .get(&"11".repeat(32))
@@ -911,6 +912,7 @@ async fn fork_evidence_records_once_and_survives_in_the_durable_record() -> Resu
                 &std::collections::HashSet::new(),
                 &std::collections::HashSet::new(),
                 &std::collections::HashMap::new(),
+                state.groups_config.mandate_grace_days,
             )
             .groups
             .iter()
@@ -946,6 +948,7 @@ async fn fork_evidence_records_once_and_survives_in_the_durable_record() -> Resu
                 &std::collections::HashSet::new(),
                 &std::collections::HashSet::new(),
                 &std::collections::HashMap::new(),
+                state.groups_config.mandate_grace_days,
             )
             .groups
             .iter()
@@ -1058,6 +1061,7 @@ async fn r4_diag_row(
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            state.groups_config.mandate_grace_days,
         )
         .groups
         .into_iter()

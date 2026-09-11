@@ -38,30 +38,30 @@ use routes::{
     apply_named_group_metadata_event, apply_named_group_metadata_event_inner_serialized,
     apply_upgrade, approve_join_request, ban_group_member, bootstrap_cache_stats,
     broadcast_current_manifest, cancel_join_request, causal_relay_step, check_upgrade,
-    connect_agent, connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
-    create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
-    create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
-    daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
-    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dm_diagnostics, enroll_device, ensure_named_group_listeners,
-    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
-    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
-    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
-    get_constitution, get_constitution_json, get_group_card, get_group_join_status,
-    get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
-    get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
-    gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_file_message,
-    handle_join_result_message, handle_treekem_catchup_request, handle_treekem_catchup_response,
-    handle_welcome_blob_message, health, history_diagnostics, history_list, history_message,
-    history_purge, history_scopes, history_search, history_stats, identity_revocations,
-    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
-    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
-    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
-    list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
-    load_named_groups_merged, load_predecessor_relay_outbox, load_treekem_member_key_packages,
-    machine_for_agent_handler, machines_by_user_handler,
-    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    clear_group_quarantine, connect_agent, connect_diagnostics_handler, connect_machine,
+    connectivity_diagnostics, create_discovery_subscription, create_group_invite,
+    create_group_kv_store, create_join_request, create_kv_store, create_mls_group,
+    create_mls_welcome, create_named_group, create_task_list, daemon_shutdown_hook, delete_contact,
+    delete_discovery_subscription, delete_kv_value, delete_machine, direct_connections,
+    direct_message_send_config, direct_send, discover_groups, discover_groups_nearby,
+    discovered_agent, discovered_agents, discovered_machine, discovered_machines, dm_diagnostics,
+    enroll_device, ensure_named_group_listeners, evaluate_trust, exec_cancel, exec_diagnostics,
+    exec_run, exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
+    file_transfer_status_handler, file_transfers_handler, find_agent, forward_add, forward_list,
+    forward_remove, get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
+    get_group_card, get_group_join_status, get_group_public_messages, get_group_state,
+    get_group_state_commits, get_kv_value, get_mls_group, get_named_group, get_named_group_members,
+    get_profile, get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
+    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
+    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
+    history_list, history_message, history_purge, history_scopes, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
+    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
+    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
+    list_tasks, load_causal_approval_queue, load_named_groups_merged,
+    load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
+    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
     now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
     owner_riders_list, owner_riders_revoke, peer_health_handler, peers, pin_machine, presence,
@@ -93,7 +93,7 @@ use routes::{
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
     default_api_address, default_bind_address, default_data_dir, validate_instance_name,
-    DaemonConfig, InstanceName, ServeOptions, ServerHandle, DEFAULT_QUIC_PORT,
+    DaemonConfig, DaemonGroupsConfig, InstanceName, ServeOptions, ServerHandle, DEFAULT_QUIC_PORT,
 };
 use state::{effective_self_update_enabled, AppState};
 use ws::{serve_gui, ws_diagnostics, ws_direct_handler, ws_handler, ws_sessions, WsOutboundStats};
@@ -844,6 +844,7 @@ pub async fn serve_with_options(
         key_move_ceremony_enabled: config.key_move.ceremony_enabled,
         history_record_topics: config.history.record_topics.clone(),
         history_config: config.history.clone(),
+        groups_config: config.groups.clone(),
         subscriptions: RwLock::new(HashMap::new()),
         task_lists: RwLock::new(HashMap::new()),
         kv_stores: RwLock::new(HashMap::new()),
@@ -1889,6 +1890,7 @@ pub async fn serve_with_options(
         .route("/groups/join", post(join_group_via_invite))
         .route("/groups/:id/join-status", get(get_group_join_status))
         .route("/groups/:id", get(get_named_group))
+        .route("/groups/:id/quarantine/clear", post(clear_group_quarantine))
         .route("/groups/:id", patch(update_named_group))
         .route("/groups/:id/policy", patch(update_group_policy))
         .route("/groups/:id/members", get(get_named_group_members))
