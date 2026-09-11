@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Instance-lock follow-ups from the #629 review (#645). Three gaps in the
+  #601 single-instance guard are closed. (1) `Drop for ServerHandle` used
+  to release `instance.lock` while the supervisor task was still draining,
+  so an embedded `serve()` caller that dropped the handle and immediately
+  re-served the same data dir briefly ran two servers on it; the guard now
+  lives in the supervisor task and is released only after it has finished
+  draining (a re-serve during the drain is refused with the ownership
+  error instead of overlapping). (2) On Unix, any open failure on an
+  existing lockfile was reported as "another instance owns this data dir"
+  — e.g. a root-owned `instance.lock` left by a `sudo` run told the
+  operator to kill a pid; only a Windows `ERROR_SHARING_VIOLATION` (where
+  the share-mode open is the guard) is now treated as contention, and
+  Unix surfaces the real I/O error. (3) A configured `identity_dir` shared
+  across two different data dirs was unguarded: two daemons loaded the
+  same machine/agent keys and both signed as one agent; the identity dir
+  now carries its own `instance.lock` (skipped when it is the data dir).
+  The Windows contention path also gains a runtime test
+  (`#[cfg(windows)]`) so it is no longer compile-only wherever Windows
+  tests run.
+
 ## [v0.42.1] - 2026-09-11
 
 ### Fixed
