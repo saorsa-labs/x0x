@@ -356,12 +356,29 @@ fn card_addresses(
     interface_addrs: impl IntoIterator<Item = std::net::SocketAddr>,
     include_local: bool,
 ) -> Vec<String> {
+    // ant-quic >= 0.27.50 honors an explicit interface bind exactly (its PR
+    // #274), so a daemon bound to a specific IP is unreachable on every
+    // other interface address — loopback is just the common case. Interface
+    // hints are guesses at best: before that fix they were accidentally
+    // true (the socket bound wildcard), on any other interface they are
+    // lies. Advertising them anyway makes dialers burn the local probe
+    // ladder on dead addresses before the one live bound address (x0x ranks
+    // same-LAN IPv4 first and excludes loopback from the fast probes), which
+    // pushed same-host /agents/connect past a 20 s client budget (#638).
+    // Observed addresses stay untouched: they are empirical reports, and a
+    // specifically bound listener cannot earn a report on another interface.
+    let specifically_bound = local_addr.port() != 0
+        && !local_addr.ip().is_unspecified()
+        && !local_addr.ip().is_multicast();
     let mut addresses: Vec<String> = external_addrs
         .iter()
         .filter(|addr| include_local || x0x::is_publicly_advertisable(**addr))
         .map(ToString::to_string)
         .collect();
     for addr in interface_addrs {
+        if specifically_bound && addr.ip() != local_addr.ip() {
+            continue;
+        }
         if !include_local && !x0x::is_publicly_advertisable(addr) {
             continue;
         }
@@ -420,9 +437,61 @@ mod card_address_tests {
             card_addresses(local, &external, interfaces, false),
             vec!["8.8.8.8:5483"]
         );
+        // #638: with an explicit loopback bind the interface hints are
+        // unreachable by construction and are suppressed; observed
+        // addresses keep their scope order.
         assert_eq!(
             card_addresses(local, &external, interfaces, true),
-            vec!["127.0.0.1:5483", "192.168.1.2:5483", "8.8.8.8:5483"]
+            vec!["127.0.0.1:5483", "8.8.8.8:5483"]
+        );
+    }
+
+    /// #638 regression: ant-quic 0.27.50 honors an explicit P2P bind, so a
+    /// loopback-bound daemon's card must not advertise the host's other
+    /// interface addresses (LAN, CGNAT/utun) — they are undialable, and the
+    /// connect ladder ranks them ahead of the one live loopback address.
+    #[test]
+    fn explicit_loopback_bind_suppresses_undialable_interface_hints() {
+        let local = "127.0.0.1:5483".parse().unwrap();
+        let interfaces = [
+            "192.168.1.89:5483".parse().unwrap(),
+            "100.112.232.91:5483".parse().unwrap(),
+        ];
+        assert_eq!(
+            card_addresses(local, &[], interfaces, true),
+            vec!["127.0.0.1:5483"]
+        );
+        // A wildcard listener really is reachable on every interface, so
+        // those hints stay advertised.
+        let wildcard = "0.0.0.0:5483".parse().unwrap();
+        assert_eq!(
+            card_addresses(wildcard, &[], interfaces, true),
+            vec!["192.168.1.89:5483", "100.112.232.91:5483"]
+        );
+        // A port-0 pseudo-address is not a usable listener; hint filtering
+        // keys off a real bind, matching the loopback-hint branch below.
+        let port_zero = "127.0.0.1:0".parse().unwrap();
+        assert_eq!(
+            card_addresses(port_zero, &[], interfaces, true),
+            vec!["192.168.1.89:5483", "100.112.232.91:5483"]
+        );
+    }
+
+    /// #638 generalisation: ANY specifically bound listener — not just
+    /// loopback — filters interface hints down to the bound address. A
+    /// daemon bound to one LAN IP must not advertise the host's other
+    /// interfaces (utun/CGNAT), which ant-quic 0.27.50 will never reach it
+    /// on.
+    #[test]
+    fn explicit_lan_bind_keeps_only_the_bound_interface_hint() {
+        let bound = "192.168.1.89:5483".parse().unwrap();
+        let interfaces = [
+            "192.168.1.89:5483".parse().unwrap(),
+            "100.112.232.91:5483".parse().unwrap(),
+        ];
+        assert_eq!(
+            card_addresses(bound, &[], interfaces, true),
+            vec!["192.168.1.89:5483"]
         );
     }
 

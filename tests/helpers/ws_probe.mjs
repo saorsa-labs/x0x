@@ -6,7 +6,7 @@ function usage() {
   console.error(`usage:
   ws_probe.mjs pubsub <base_url> <token> <topic> <message>
   ws_probe.mjs receive-pubsub <base_url> <token> <topic> <timeout_ms>
-  ws_probe.mjs direct-receive <base_url> <token> <timeout_ms>
+  ws_probe.mjs direct-receive <base_url> <token> <timeout_ms> [expected_message]
   ws_probe.mjs send-direct <base_url> <token> <agent_id> <message>
   ws_probe.mjs hold <path> <base_url> <token> <hold_ms>`);
   process.exit(2);
@@ -144,11 +144,22 @@ async function run() {
   }
 
   if (mode === 'direct-receive') {
-    if (args.length !== 3) usage();
-    const [baseUrl, token, timeoutMsRaw] = args;
+    if (args.length < 3 || args.length > 4) usage();
+    const [baseUrl, token, timeoutMsRaw, expected] = args;
     const timeoutMs = Number(timeoutMsRaw);
+    // #641: group-control events (e.g. member_banned) ride the /ws/direct
+    // lane as direct_message frames. With an expected message, resolve only
+    // on the frame whose base64 payload equals it; without one, keep the
+    // legacy any-direct_message behaviour.
+    const expectedPayload = expected === undefined ? null : b64(expected);
     const { ws, connected } = await connect('/ws/direct', baseUrl, token);
-    const received = await recvJson(ws, timeoutMs, (frame) => frame?.type === 'direct_message');
+    const received = await recvJson(
+      ws,
+      timeoutMs,
+      (frame) =>
+        frame?.type === 'direct_message'
+        && (expectedPayload === null || frame?.payload === expectedPayload),
+    );
     ws.close();
     console.log(JSON.stringify({ ok: true, mode, connected, received }));
     return;
