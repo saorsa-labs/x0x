@@ -46,6 +46,35 @@ All notable changes to this project will be documented in this file.
   *request* — not health acceptance, and not an automatic rollback (ADR-0061
   §6). Windows (#415) is unchanged and still has no supported managed policy.
 
+- **BREAKING (voice Data lane): the reliable lane is now AT-LEAST-ONCE —
+  #614, fixing #277.** The silent-loss mechanism was measured, not inferred:
+  `send_reliable`'s eviction path dropped an unfinished
+  `ant_quic::HighLevelSendStream`, and dropping such a stream *resets* it
+  (`DROPPED_UNFINISHED_ERROR_CODE`), discarding every still-buffered byte —
+  including frames from earlier calls that had already returned `Ok`. A lane
+  named "reliable" reported success for frames it never delivered. Each lane
+  now keeps a bounded window (256 frames / 256 KiB) of recently written
+  frames and replays them, in order, onto the replacement stream after an
+  eviction. Two contract consequences for callers:
+
+  - **Duplicates are possible** — retirement is by window, not
+    acknowledgement. Audio is safe (the jitter buffer drops repeated
+    `AudioDatagram.seq`), but **Data-lane payloads are opaque to x0x, so
+    Data callers own their own idempotency**.
+  - **Ordering is not guaranteed across a stream boundary** — replayed
+    frames ride a different QUIC stream than those queued after them.
+    Order within a single stream is unchanged.
+
+  Proof-based retirement (`finish()`/`stopped()` checkpoints) was implemented
+  and **withdrawn on evidence**: proving delivery requires rolling the lane
+  onto a fresh stream, and the resulting receiver-side reorder pushed
+  `voice_pipeline_delivers_decodable_audio` below its ≥99 % post-jitter gate
+  (2/5 all-green suite runs with checkpoints vs 6/6, 8/8, 5/5 with the
+  bounded window). The churn test that motivated the fix passes 10/10 in
+  isolation and fails 0/3 with the salvage removed — it genuinely exercises
+  the fix. Window age-out on calls longer than ~5 s of 50 fps audio is
+  normal steady state, not loss. Unblocks #580/#588/#590/#568.
+
 ### Added
 
 - **Daemon `mdns_enabled` TOML knob, and hermetic-by-default tests (#417).**
@@ -111,6 +140,38 @@ All notable changes to this project will be documented in this file.
   `/stores/:id/...` routes. Registration persists and rehydrates across
   daemon restarts. CLI: `x0x group store create`.
 
+- **Cross-scope durable-history discovery and search — #567, fixing #275.**
+  `GET /history/scopes` lists retained scopes with row counts and newest
+  timestamps, and `GET /history/search` now accepts an omitted scope, so
+  owners can find and search retained history without knowing a scope
+  first. Both discovery routes are owner-only; riders keep their explicitly
+  granted group-history access. Keyset pagination throughout. The CLI keeps
+  scoped search and adds cross-scope search. These APIs report **retained
+  local data only** — not complete peer history and not remote backfill.
+
+- **Per-peer DM capability and relay diagnostics — #587 (observability
+  only).** Bounded, read-only diagnostics distinguishing retained base
+  capability, extension, and relay observations, with an exact-agent filter
+  through the HTTP API and CLI (`x0x peer` surface). No cache refresh, no
+  enforcement change. Ships with a three-agent component fixture proving
+  asymmetric capability convergence over a relay: a legacy frame delivered
+  while the relay's extension publisher is held pending, a bound frame
+  after release, and rejection of a constructed signed digestless
+  downgrade.
+
+- **ADR-0064 accepted: owner-anchored fork authority (#620, #472).** The
+  owner mandate is computed pre-mutation over the authority's actual roster
+  (not the invite projection — the invite-derived variant was proven
+  unverifiable after any intervening roster change); alternate chains are
+  validated by ancestor-walk anchored at the owner head. Unblocks the fork
+  work in #472, #469 and #468. (ADR recovery: the draft had been left
+  unpushed in a worktree; accepted by David Irvine 2026-09-10.)
+
+- **#504 egress capture recipe shipped (#603).** Documentation artifact for
+  capturing per-topic Leaf egress under the live `leaf_max_eager_degree`
+  ceiling. Ships with the dead HyParView knob removal (see Removed);
+  **neither closes #504** and no runtime egress reduction is claimed.
+
 ### Fixed
 
 - **API watchdog no longer aborts live daemons — issue #600.** Shipped
@@ -161,6 +222,131 @@ All notable changes to this project will be documented in this file.
   announce (however authentic) or an adopted checkpoint claiming any
   non-Encrypted policy — or a different group binding — is rejected
   instead of silently un-encrypting replicas back onto plaintext paths.
+
+- **Home persistence is now recoverable as a unit — #617, fixing #471.**
+  `save_named_groups_checked_unlocked` writes the authoritative Home-Suite
+  sidecar first, then the legacy-safe roster file. A crash between the two
+  was always safe (the ordering is deliberate); the *failure* direction was
+  not: if the second write errored, the sidecar held the new record while
+  the roster held the old — and on next start the sidecar won, so a
+  mutation the caller was **told had failed** came back as committed state.
+  The sidecar's pre-write bytes are now captured and restored (or the new
+  sidecar removed entirely) when the roster write does not land.
+  `ReplacedNotDurable` is deliberately NOT rolled back — both files then
+  hold the new content and only durability is uncertain.
+
+- **Announce-blob fetches no longer steal each other's responses — #582
+  (#579).** Concurrent fetches share one response topic; a fetch for digest
+  A could consume a valid response for digest B, fail verification on the
+  mismatch, and stop before A's response arrived. Responses are now
+  selected by content digest before the existing verifier runs; unrelated
+  responses are ignored within the original deadline.
+
+- **Announce-blob responder terminates when both carriers close — #583
+  (#581).** One closed request carrier previously kept the responder
+  spinning on immediately-ready `None`s; it now exits only after both
+  carriers have closed and drained. Related: the capability advert service
+  now **owns** its responder (#599) — repeated starts no longer discard
+  responder handles, and ordinary shutdown aborts and joins the owned task.
+  No hard wall-clock cancellation guarantee is claimed.
+
+- **GSS store bindings validated before reuse — #578.** An existing
+  encrypted group store can no longer be reused or restored under mismatched
+  identity or authority (stable group id, trimmed app name, creator, current
+  membership, supported policy/backend are all checked; invalid bindings are
+  retired during refresh). A forward requested on port 0 is registered under
+  its actual bound address instead of `:0` for listing and removal.
+
+- **Forward opener must still be authoritative — #572 (#132).** A transport
+  machine can host a live agent B and a moved-away agent A still in
+  discovery. The shared stream gate excluded A, but a `ForwardV2` header
+  signed with A's old key passed its separate attestation/ACL gate.
+  Revocation, expiry and placement checks are now applied to the exact
+  authenticated header opener before target admission. The epic's remaining
+  items (isolated zero-acceptance proof, ephemeral-port bookkeeping,
+  NAT/relay acceptance) stay open.
+
+- **GUI: private Spaces can no longer land on generic storage — #569
+  (interim P1 containment for #565).** Wiki/Web previously built a Signed
+  store from a client-side Space-id alias; a Signed store is not bound to
+  group membership, so a private Space's plaintext page deltas went to the
+  generic `/stores` path with no membership filter. A private Space now
+  never touches the generic `/stores` API — it uses the group-bound opener
+  and addresses pages only by the identifier that opener returns; anything
+  not positively identified as intentionally public is treated as private,
+  so no daemon response can downgrade it. Legacy generic pages are not
+  read, copied or migrated. GUI-only; the full #565 fix remains open.
+  Follow-up (#574): page stores stay unavailable while any same-tab policy
+  update is pending, closing the delayed-response window where a stale
+  public-policy GET could permit a generic write after the backend had
+  committed private policy.
+
+- **Causal queue admission is authenticated — #577 (#492).** Unauthorized
+  causal-transition entries are now rejected before they can consume bounded
+  capacity or trigger catch-up fanout; valid members keep missing-predecessor
+  recovery, and replay discards entries that became unauthorized. The same
+  integration carries the legacy-bus inbox opt-out (flag defaults to
+  false), authenticated A2A response correlation, and isolated voice
+  datagram CI controls.
+
+- **Panic scanner actually scans — #588.** The Security workflow's panic
+  scanner treated its malformed regex as "no matches", so production
+  `.expect(...)` calls went undetected; the pattern is fixed in both scanner
+  paths and exercised by stdlib controls over temporary trees. The restored
+  check exposed a serialization panic in `forge_unattested_delta_bytes` —
+  it now returns the existing CRDT result type (**public API source break**:
+  the signature changes from returning bytes to returning a result). Five
+  A2A round-trip tests now propagate agent-setup errors, so a denied bind
+  can no longer pass before its assertions. Does not resolve the historical
+  missing-PeerId report.
+
+- **The published `agent.json` is now gated against the release tag — #624
+  (#514).** The staged release asset was previously validated only in a
+  mode where `--tag` is silently ignored, so the card that ships was never
+  compared against the tag it ships under (the stale `0.10.0` card in
+  v0.41.3 passed a green gate). On tag pushes the workflow now validates
+  the staged card with `--mode release_tag`, a new direct card-vs-tag check
+  fires, and `--tag` misuse outside `release_tag` mode is refused loudly
+  instead of silently ignored.
+
+- **Gossip egress diagnostics wording corrected — #590 (#504).** The
+  reported counter rates are now labelled send-attempt estimates, and the
+  residential-impact note is separated from wire occupancy, which was
+  never measured. Wording only — no counter, default or traffic-policy
+  change.
+
+- **Voice demo stops at its connection deadline — #555 (#273, partial).**
+  The reliable-lane demo previously continued into signaling when the
+  bidirectional connection never became visible; it now fails explicitly at
+  the 10 s deadline, rejecting a predicate that turns true exactly at the
+  boundary (mutation-proven). The remaining #273 legacy e2e lane/frame and
+  pacing items stay open.
+
+- **Docs aligned with source — #570, #568.** Home provisioning is
+  conditional (a second owner device joins the owner's advertised Home; an
+  offline install is never left Home-less); `GET /home` documents its three
+  200 shapes (`local` / `adoption_pending` / `elsewhere`); the rider CLI
+  rows match real commands. `SKILL.md` no longer claims individual
+  durable-ACK transport observation is unavailable — it documents
+  `observed_ack_ingress` and what omission means. Documentation only.
+
+- **Test and CI reliability wave (no production behaviour change).**
+  Hermetic-by-default isolation extended to the remaining full-default
+  network constructors, the dispatch benchmark, developer recipes and the
+  full-suite/doctest launcher (#592, #594, #596, #584, #586, #597);
+  convergence barriers recalibrated against **measured** CPU contention —
+  the asymmetric barriers 3 s → 15 s (#618) and, per #619/#607, SETUP
+  20 s → 60 s and the fixture DM timeout 4 s → 30 s, with DELIVERY left at
+  10 s after CI refuted the original hypothesis; the #501 controlled-load
+  deadline given real headroom (#610 — timing mode only; the separate
+  "no bus eager attempts" readiness defect is NOT addressed and needs its
+  own issue); fixture ports reserved before rolling startup (#552);
+  duplicate `--locked` canonicalized in the isolated nextest wrapper (#595);
+  the restart barrier asserts the gossip-plane surface actually published
+  to (#602); directional readiness and send-attempt diagnostics added
+  (#566, #591 — instrumentation only, the underlying convergence questions
+  stay open); MemberBanned recovery and certificate-resolution diagnostics
+  added (#560, #598 — **observability only**, neither fixes #531 nor #447).
 
 ### Removed
 
