@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.42.1] - 2026-09-11
+
 ### Fixed
 
 - Stranded local publishes now recover without waiting for anti-entropy
@@ -59,6 +61,13 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - saorsa-gossip pins bumped 0.5.76 → 0.5.77 (all eleven crates).
+
+### Tests
+
+- Shell e2e suites are hermetic: mDNS off, explicit bootstrap to the alice
+  daemon, fixed QUIC ports (#648 / #651). `e2e_lan.sh` remains the mDNS proof.
+- The #501 legacy-bus meter premise moved to saorsa-gossip-pubsub 0.5.77
+  (test, `scripts/ci/derive-legacy-bus-attempts.py`, `docs/legacy-compat.md`).
 
 ## [v0.42.0] - 2026-09-11
 
