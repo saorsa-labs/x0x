@@ -453,7 +453,9 @@ impl TaskListSync {
                                 // any holder could truncate local state at
                                 // will. Which tasks may be pruned is decided
                                 // by `prune_to_served_set` on holder-carried
-                                // deletion evidence (issue #643).
+                                // deletion evidence (issue #643), and only
+                                // for a writer the list's content policy
+                                // accepts (issue #654).
                                 let declared = listener_served
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -467,7 +469,7 @@ impl TaskListSync {
                                             .served_digest(&list_id)
                                             .is_some_and(|dg| dg == declared.digest)
                                     {
-                                        let pruned = list.prune_to_served_set(&delta);
+                                        let pruned = list.prune_to_served_set(&delta, writer);
                                         if pruned > 0 {
                                             tracing::info!(
                                                 "pruned {pruned} stale task(s) after \
@@ -1820,16 +1822,14 @@ mod tests {
     /// replica's obsolete tasks. The digest-verified full-replace adopt
     /// closes that: the serve's delta content is bound to the holder's
     /// declared digest, and since #643 the prune additionally requires
-    /// holder-carried DELETION EVIDENCE — the serve's LWW ordering register
-    /// retains the ids of tasks the holder once added, so a task absent
-    /// from the served set but present in the served ordering was deleted
-    /// by the holder and must go; a task in neither was never seen by the
-    /// holder and adds-win keeps it (see
+    /// holder-carried DELETION EVIDENCE. Since #654 the prune is also
+    /// gated by the list's content policy — an UNSIGNED serve (no
+    /// envelope-verified writer) fails closed exactly like its adds
+    /// would, which is why this test drives a signing pubsub (see
     /// `stale_full_serve_after_live_add_must_not_prune_the_live_task`).
     #[tokio::test(start_paused = true)]
     async fn digest_verified_full_serve_prunes_stale_tasks() {
-        let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = signed_pubsub().await;
         let topic = "tasks-240-prune-stale";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -2264,7 +2264,7 @@ mod tests {
         replica
             .merge_delta(&s2, peer(1), Some(&agent(1)))
             .expect("serve 2");
-        assert_eq!(replica.prune_to_served_set(&s2), 1);
+        assert_eq!(replica.prune_to_served_set(&s2, Some(&agent(1))), 1);
         assert!(replica.get_task(&doomed).is_none());
 
         // The holder RE-ADDS the task: a later serve must be accepted —
@@ -2350,7 +2350,7 @@ mod tests {
             "general merge must not delete on evidence entries"
         );
         assert_eq!(
-            replica.prune_to_served_set(&serve),
+            replica.prune_to_served_set(&serve, Some(&agent(1))),
             1,
             "the adopt gate prunes on explicit deletion evidence"
         );
@@ -2412,7 +2412,7 @@ mod tests {
             .merge_delta(&serve, peer(1), Some(&agent(1)))
             .expect("merge serve");
         assert_eq!(
-            replica.prune_to_served_set(&serve),
+            replica.prune_to_served_set(&serve, Some(&agent(1))),
             0,
             "an ordering mention is not deletion evidence"
         );
@@ -2420,5 +2420,96 @@ mod tests {
             replica.get_task(&phantom).is_some(),
             "adds-win keeps the live task the holder merely never saw"
         );
+    }
+
+    /// WHY (issue #654): deletion is content. `merge_delta` drops removal
+    /// evidence from a writer the list's policy would not accept content
+    /// from (a removed member, an unverified envelope), but the adopt-gate
+    /// prune acted directly on the wire delta — so on a group-scoped list
+    /// a holder the policy just rejected could still DELETE tasks via
+    /// empty-tag removal evidence in its serve, and the pruned replica
+    /// would then forward that evidence fleet-wide. The prune must obey
+    /// the same authorization as the merge that surrounds it.
+    #[test]
+    fn unauthorized_holder_removal_evidence_cannot_prune_group_list() {
+        let t1 = TaskId::from_bytes([1; 32]);
+        let doomed = TaskId::from_bytes([2; 32]);
+
+        // Holder (member agent(1)) deletes `doomed`; its full serve
+        // carries the deletion as explicit evidence and `t1` live.
+        let mut holder = TaskList::new(list_id(1), "Group".to_string(), peer(1));
+        holder
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("add t1");
+        holder
+            .add_task(make_task(2, peer(1)), peer(1), 2)
+            .expect("add doomed");
+        holder.remove_task(&doomed).expect("delete doomed");
+        let serve = holder.full_delta();
+        assert_eq!(
+            serve.removed_tasks.get(&doomed).map(|tags| tags.len()),
+            Some(0),
+            "the serve carries explicit deletion evidence"
+        );
+
+        // Group-scoped replica: only agent(1) may write content.
+        let make_replica = || {
+            let mut replica = TaskList::new(list_id(1), "Group".to_string(), peer(2));
+            replica.set_authorized_agents(std::collections::HashSet::from([agent(1)]));
+            replica
+                .add_task(make_task(1, peer(2)), peer(2), 1)
+                .expect("replica t1");
+            replica
+                .add_task(make_task(2, peer(2)), peer(2), 2)
+                .expect("replica doomed");
+            replica
+        };
+
+        // A non-member's serve: the merge drops its content, and the
+        // adopt prune must not act on its evidence either.
+        let mut replica = make_replica();
+        replica
+            .merge_delta(&serve, peer(9), Some(&agent(9)))
+            .expect("merge non-member serve");
+        assert_eq!(
+            replica.prune_to_served_set(&serve, Some(&agent(9))),
+            0,
+            "removal evidence from a writer the policy rejects must not prune"
+        );
+        assert!(
+            replica.get_task(&doomed).is_some(),
+            "the task survives the non-member's serve"
+        );
+        assert!(
+            !replica.known_removed_ids().contains(&doomed),
+            "the non-member's evidence must not even be recorded for forwarding"
+        );
+
+        // An unverified envelope (writer None) is not a content writer
+        // either — `merge_delta` treats it the same way.
+        let mut replica = make_replica();
+        replica
+            .merge_delta(&serve, peer(1), None)
+            .expect("merge unverified serve");
+        assert_eq!(
+            replica.prune_to_served_set(&serve, None),
+            0,
+            "an unverified envelope must not prune"
+        );
+        assert!(replica.get_task(&doomed).is_some());
+
+        // The same evidence from the authorized member still prunes —
+        // the gate must not break legitimate deletion cold-sync.
+        let mut replica = make_replica();
+        replica
+            .merge_delta(&serve, peer(1), Some(&agent(1)))
+            .expect("merge member serve");
+        assert_eq!(
+            replica.prune_to_served_set(&serve, Some(&agent(1))),
+            1,
+            "an authorized member's deletion evidence still prunes"
+        );
+        assert!(replica.get_task(&doomed).is_none());
+        assert!(replica.get_task(&t1).is_some(), "live task survives");
     }
 }
