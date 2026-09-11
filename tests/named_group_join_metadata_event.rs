@@ -305,10 +305,11 @@ async fn signed_member_joined_event(
     role: x0x::groups::GroupRole,
 ) -> Value {
     use base64::Engine as _;
-    let key_path = dirs::home_dir()
-        .expect("home dir")
-        .join(format!(".x0x-{}", member.name))
-        .join("agent.key");
+    // #609: cluster fixtures pin identity to `<data_dir>/identity` — never
+    // the home-derived `~/.x0x-<name>` path (that assumption is the leak
+    // class this issue fixes; it also silently rotted when the harness
+    // moved identity into the fixture).
+    let key_path = member.data_dir().join("identity").join("agent.key");
     let keypair = x0x::storage::load_agent_keypair_from(key_path)
         .await
         .expect("load member agent keypair");
