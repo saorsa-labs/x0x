@@ -767,3 +767,14 @@ async fn ws_stalled_reader_fills_queue_and_closes_1013() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+// Separate #287 diagnostic: the original stalled selector and helpers above
+// retain their historical send/status-only behavior.
+#[path = "harness/src/ws_backpressure_diagnostic.rs"]
+mod ws_backpressure_diagnostic;
+
+#[tokio::test]
+#[ignore]
+async fn ws_backpressure_matched_reader_acceptance() {
+    ws_backpressure_diagnostic::run().await;
+}

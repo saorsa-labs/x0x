@@ -54,6 +54,20 @@ pub struct DaemonFixture {
     api_token: String,
     tempdir: TempDir,
     identity_dir: PathBuf,
+    diagnostic_capture: Option<PathBuf>,
+    diagnostic_reaped: bool,
+}
+
+/// Opt-in cleanup observations remain available even when retaining them fails.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DiagnosticCleanup {
+    pub pid: u32,
+    pub reaped: bool,
+    pub deliberate_termination: Option<bool>,
+    pub exit: Option<String>,
+    pub capture_complete: bool,
+    pub identity_removed: bool,
+    pub errors: Vec<&'static str>,
 }
 
 #[allow(dead_code)]
@@ -158,6 +172,8 @@ impl DaemonFixture {
             api_token: String::new(),
             tempdir,
             identity_dir,
+            diagnostic_capture: None,
+            diagnostic_reaped: false,
         };
 
         fixture.wait_for_startup().await;
@@ -330,6 +346,15 @@ impl DaemonFixture {
 
 impl Drop for DaemonFixture {
     fn drop(&mut self) {
+        if self.diagnostic_capture.is_some() {
+            // The diagnostic explicitly reaps before success. Cancellation must
+            // never block indefinitely in Drop or manufacture a reap receipt.
+            if !self.diagnostic_reaped {
+                let _ = self.process.kill();
+                let _ = self.process.try_wait();
+            }
+            return;
+        }
         let _ = self.process.kill();
         let _ = self.process.wait();
         let _ = std::fs::remove_dir_all(&self.identity_dir);
@@ -361,4 +386,213 @@ fn find_x0xd_binary() -> PathBuf {
     }
 
     manifest_dir.join("target/release/x0xd")
+}
+
+#[allow(dead_code)]
+impl DaemonFixture {
+    /// Opt-in #287 capture. Returns Child ownership before asynchronous startup.
+    /// The caller supplies an exclusive private directory; defaults above stay null.
+    pub fn spawn_diagnostic(
+        directory: &Path,
+        plane: &str,
+        hash_binary: fn(&Path) -> std::io::Result<String>,
+    ) -> std::io::Result<Self> {
+        use std::io::Write;
+        let name = format!("ws287-{}", rand::random::<u64>());
+        let tempdir = tempfile::Builder::new()
+            .prefix("data-")
+            .tempdir_in(directory)?;
+        let config_path = tempdir.path().join("config.toml");
+        let identity_dir = dirs::home_dir()
+            .ok_or_else(|| std::io::Error::other("diagnostic home unavailable"))?
+            .join(format!(".x0x-{name}"));
+        let config = format!(
+            r#"bind_address = "0.0.0.0:0"
+api_address = "127.0.0.1:0"
+data_dir = {:?}
+log_level = "warn"
+bootstrap_peers = []
+network_id = {:?}
+instance_name = {:?}
+"#,
+            tempdir.path().to_string_lossy(),
+            plane,
+            name,
+        );
+        diagnostic_file(&config_path)?.write_all(config.as_bytes())?;
+        let binary = find_x0xd_binary().canonicalize()?;
+        let binary_hash = hash_binary(&binary)?;
+        let stdout = diagnostic_file(&directory.join("daemon.stdout"))?;
+        let stderr = diagnostic_file(&directory.join("daemon.stderr"))?;
+        let process = Command::new(&binary)
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--skip-update-check")
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()?;
+        let pid = process.id();
+        let fixture = Self {
+            process,
+            api_addr: String::new(),
+            api_token: String::new(),
+            tempdir,
+            identity_dir,
+            diagnostic_capture: Some(directory.to_owned()),
+            diagnostic_reaped: false,
+        };
+        // If this write fails, fixture Drop kills only this child; no success is credited.
+        let record = serde_json::json!({"schema":"x0x.issue287-daemon/1", "pid":pid,
+            "binary_path":binary, "binary_sha256":binary_hash, "phase":"spawned",
+            "same_build_binding":"UNVERIFIED_EXTERNAL_CUSTODY"});
+        serde_json::to_writer(diagnostic_file(&directory.join("spawn.json"))?, &record)?;
+        Ok(fixture)
+    }
+
+    /// Entire readiness sequence is bounded by the diagnostic's absolute deadline.
+    pub async fn diagnostic_ready(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), &'static str> {
+        let client = Self::client(Duration::from_secs(1));
+        loop {
+            if self.try_wait().map_err(|_| "CHILD_STATE_IO")?.is_some() {
+                return Err("SETUP_CHILD_EXIT");
+            }
+            if let Ok(text) = std::fs::read_to_string(self.port_file()) {
+                if let Ok(addr) = text.trim().parse::<std::net::SocketAddr>() {
+                    self.api_addr = addr.to_string();
+                } else if let Ok(port) = text.trim().parse::<u16>() {
+                    self.api_addr = format!("127.0.0.1:{port}");
+                }
+            }
+            if !self.api_addr.is_empty() {
+                let probe = async {
+                    let response = client.get(self.url("/health")).send().await.ok()?;
+                    if !response.status().is_success() {
+                        return None;
+                    }
+                    response.bytes().await.ok()?;
+                    let token = std::fs::read_to_string(self.token_file()).ok()?;
+                    if token.trim().is_empty() {
+                        return None;
+                    }
+                    Some(token.trim().to_owned())
+                };
+                match tokio::time::timeout_at(deadline, probe).await {
+                    Ok(Some(token)) => {
+                        self.api_token = token;
+                        return Ok(());
+                    }
+                    Err(_) => return Err("SETUP_DEADLINE"),
+                    Ok(None) => {}
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("SETUP_DEADLINE");
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+            )
+            .await;
+        }
+    }
+
+    /// A snapshot of this exact Child, never a PID search or a service proxy.
+    pub fn diagnostic_child(&mut self) -> std::io::Result<serde_json::Value> {
+        let status = self.try_wait()?;
+        Ok(
+            serde_json::json!({"pid":self.pid(), "alive":status.is_none(),
+            "exit":status.map(|s| s.to_string())}),
+        )
+    }
+
+    /// Explicit bounded cleanup before Drop; observed status survives later I/O failures.
+    pub async fn diagnostic_finish(&mut self, deadline: tokio::time::Instant) -> DiagnosticCleanup {
+        let mut receipt = DiagnosticCleanup {
+            pid: self.pid(),
+            reaped: false,
+            deliberate_termination: None,
+            exit: None,
+            capture_complete: false,
+            identity_removed: false,
+            errors: Vec::new(),
+        };
+        match self.diagnostic_reap(deadline).await {
+            Ok((status, deliberate)) => {
+                self.diagnostic_reaped = true;
+                receipt.reaped = true;
+                receipt.deliberate_termination = Some(deliberate);
+                receipt.exit = Some(status.to_string());
+            }
+            Err(code) => receipt.errors.push(code),
+        }
+        // These fallible actions cannot erase the already observed Child status.
+        if let Some(directory) = &self.diagnostic_capture {
+            let capture = (|| -> std::io::Result<()> {
+                let file = diagnostic_file(&directory.join("cleanup.json"))?;
+                serde_json::to_writer(
+                    &file,
+                    &serde_json::json!({"pid":receipt.pid,
+                    "reaped":receipt.reaped,"deliberate_termination":receipt.deliberate_termination,
+                    "exit":receipt.exit}),
+                )?;
+                file.sync_all()
+            })();
+            match capture {
+                Ok(()) => receipt.capture_complete = true,
+                Err(_) => receipt.errors.push("CHILD_CLEANUP_CAPTURE_IO"),
+            }
+        } else {
+            receipt.errors.push("CHILD_CLEANUP_CAPTURE_MISSING");
+        }
+        if receipt.reaped {
+            match std::fs::remove_dir_all(&self.identity_dir) {
+                Ok(()) => receipt.identity_removed = true,
+                Err(_) => receipt.errors.push("CHILD_IDENTITY_CLEANUP_IO"),
+            }
+        }
+        receipt
+    }
+
+    async fn diagnostic_reap(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(ExitStatus, bool), &'static str> {
+        // try_wait already reaps an exited child: retain that exact observation.
+        if let Some(status) = self.try_wait().map_err(|_| "CHILD_STATE_IO")? {
+            return Ok((status, false));
+        }
+        if self.process.kill().is_err() {
+            return self
+                .try_wait()
+                .map_err(|_| "CHILD_STATE_IO")?
+                .map(|status| (status, false))
+                .ok_or("CHILD_KILL_IO");
+        }
+        loop {
+            if let Some(status) = self.try_wait().map_err(|_| "CHILD_STATE_IO")? {
+                return Ok((status, true));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("CHILD_REAP_DEADLINE");
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(20)),
+            )
+            .await;
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn diagnostic_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
