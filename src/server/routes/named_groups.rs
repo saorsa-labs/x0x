@@ -3065,25 +3065,6 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     }
 }
 
-/// #458 r5c: run `enforce_last_admin_invariant` over a folded roster
-/// projection by materializing the minimal members view it checks.
-fn projection_last_admin_invariant(
-    projection: &std::collections::BTreeMap<
-        String,
-        x0x::groups::state_commit::RosterMemberSnapshot,
-    >,
-    withdrawn: bool,
-) -> Result<(), String> {
-    let mut members = std::collections::BTreeMap::new();
-    for (id, snap) in projection {
-        let mut member = x0x::groups::GroupMember::new_member(id.clone(), None, None, 0);
-        member.role = snap.role;
-        member.state = snap.state;
-        members.insert(id.clone(), member);
-    }
-    x0x::groups::enforce_last_admin_invariant(&members, withdrawn).map_err(|e| e.to_string())
-}
-
 /// The hash the served chain reaches (its last link's `state_hash`) — the
 /// value the owner attestation's head must equal for the CAS to bind the
 /// chain AND the terminal to one authority view.
@@ -3576,7 +3557,7 @@ async fn try_adopt_member_added_across_gap(
     treekem_epoch: Option<u64>,
     revision: u64,
     e: x0x::groups::state_commit::ApplyError,
-    chain: Vec<x0x::groups::state_commit::RetainedCommit>,
+    chain: &[x0x::groups::state_commit::RetainedCommit],
     head_attestation: Option<HeadAttestation>,
 ) -> Option<x0x::groups::GroupInfo> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -3606,16 +3587,8 @@ async fn try_adopt_member_added_across_gap(
         );
         None
     };
-    let admin_in = |roster: &std::collections::BTreeMap<
-        String,
-        x0x::groups::state_commit::RosterMemberSnapshot,
-    >,
-                    who: &str| {
-        roster.get(who).is_some_and(|snap| {
-            snap.state == x0x::groups::GroupMemberState::Active
-                && snap.role.at_least(x0x::groups::GroupRole::Admin)
-        })
-    };
+    // NOTE: `admin_in` folded into the extracted walk
+    // (`state_commit::validate_alternate_chain`).
 
     if chain.is_empty() {
         return refuse("no intervening chain provided");
@@ -3695,7 +3668,7 @@ async fn try_adopt_member_added_across_gap(
             );
         }
         // The attested head must ALSO be the head the served chain reaches.
-        if attestation.head_state_hash != previous_hash_initial(&chain, current) {
+        if attestation.head_state_hash != previous_hash_initial(chain, current) {
             return refuse("attested head does not match the served chain head");
         }
     } else {
@@ -3705,101 +3678,29 @@ async fn try_adopt_member_added_across_gap(
         );
     }
 
-    // Reconstructed state, folded link by link.
-    let mut roster = x0x::groups::state_commit::roster_projection(&current.members_v2);
-    let mut meta = current.public_meta();
-    let mut previous_hash = current.state_hash.clone();
-    let mut previous_revision = current.state_revision;
-    let mut chain_withdrawn = false;
-    for link in &chain {
-        if chain_withdrawn {
-            // #458 r5b: withdrawal is TERMINAL — a withdrawn link ends the
-            // group; nothing (link or terminal) may follow it.
-            return refuse("link follows a withdrawn (terminal) link in the chain");
-        }
-        if link.commit.withdrawn {
-            chain_withdrawn = true;
-        }
-        let commit_link = &link.commit;
-        if commit_link.revision != previous_revision + 1 {
-            return refuse("chain is not consecutive from the stub revision");
-        }
-        if commit_link.prev_state_hash.as_deref() != Some(previous_hash.as_str()) {
-            return refuse("chain prev_state_hash linkage broken (stale or forked chain)");
-        }
-        if commit_link.group_id != stable_id || commit_link.verify_structure().is_err() {
-            return refuse("chain commit signature/group binding invalid");
-        }
-        // Snapshot trust comes ONLY from re-deriving the signed root.
-        if x0x::groups::state_commit::roster_root_of_projection(&link.roster)
-            != commit_link.roster_root
-        {
-            return refuse("link roster snapshot does not re-derive its signed roster_root");
-        }
-        let Some(link_meta) = link.meta.clone() else {
-            return refuse("link predates sealed-meta retention (unreconstructable)");
-        };
-        if x0x::groups::compute_public_meta_hash(&link_meta) != commit_link.public_meta_hash {
-            return refuse("link sealed metadata does not re-derive its signed meta hash");
-        }
-        if commit_link.policy_hash != base_policy_hash {
-            return refuse("policy changed inside the gap (unreconstructable without the event)");
-        }
-        if !admin_in(&roster, &commit_link.committed_by) {
-            return refuse(
-                "link committer is not an active admin in the RECONSTRUCTED predecessor roster",
-            );
-        }
-        // #458 r5c/r6 — ROLE-CHANGE SMUGGLING (WONTFIX-with-justification,
-        // both reviewers): `GroupStateCommit` carries no action kind
-        // (state_commit.rs:193,438), so a role change sealed inside an
-        // internally consistent retained snapshot is indistinguishable
-        // here from any other admin-committed role change. That is NOT a
-        // new capability: an admin can change roles via ordinary commits
-        // anyway (ADR-0016 — role management IS an admin authority), and
-        // every adopted chain is anchored to the OWNER-SIGNED head
-        // attestation of the authority's REAL current head — so any role
-        // delta inside the chain is the authority's own sealed history,
-        // not attacker-injected state. A forked admin cannot get a
-        // smuggled chain anchored (it never holds the owner user key).
-        // The per-link `enforce_last_admin_invariant` below adds
-        // fail-closed coverage for deltas that strand the last admin.
-        if let Err(inv) = projection_last_admin_invariant(&link.roster, link.commit.withdrawn) {
-            let _ = inv;
-            return refuse("link folds to a roster that violates the last-admin invariant");
-        }
-        roster = link.roster.clone();
-        meta = link_meta;
-        previous_hash = commit_link.state_hash.clone();
-        previous_revision = commit_link.revision;
-    }
-
-    // Terminal: chain from the reconstruction head and verify EVERYTHING
-    // against the reconstruction — including a FULL hash equality.
-    if commit.revision != previous_revision + 1
-        || commit.prev_state_hash.as_deref() != Some(previous_hash.as_str())
-    {
-        return refuse("terminal commit does not chain from the reconstructed head");
-    }
-    if chain_withdrawn || commit.withdrawn {
-        // #458 r5b: a MemberAdded on a withdrawn group is meaningless —
-        // refuse adoption of any withdrawn chain or terminal outright.
-        return refuse("chain or terminal is withdrawn (terminal group state)");
-    }
-    if commit.group_id != stable_id {
-        return refuse("terminal commit group binding invalid");
-    }
-    if commit.policy_hash != base_policy_hash {
-        return refuse("terminal commit changes policy (unreconstructable)");
-    }
-    if commit.public_meta_hash != x0x::groups::compute_public_meta_hash(&meta) {
-        return refuse("terminal meta hash does not match the reconstruction");
-    }
-    if !admin_in(&roster, &commit.committed_by) {
-        return refuse(
-            "terminal committer is not an active admin in the reconstructed predecessor roster",
-        );
-    }
+    // #458 r4 / ADR-0064 Decision §2 (slice 4 item 1): the ANCESTOR WALK,
+    // extracted verbatim into
+    // `state_commit::validate_alternate_chain` — pure over the joiner's
+    // base, the served chain, and the terminal. Behaviour-preserving:
+    // every refusal reason string and their ORDER are identical to the
+    // inline fold this replaces.
+    let reconstruction = match x0x::groups::state_commit::validate_alternate_chain(
+        &x0x::groups::state_commit::AlternateChainBase {
+            group_id: stable_id,
+            base_revision: current.state_revision,
+            base_state_hash: &current.state_hash,
+            roster: &x0x::groups::state_commit::roster_projection(&current.members_v2),
+            meta: &current.public_meta(),
+            policy_hash: &base_policy_hash,
+        },
+        chain,
+        commit,
+    ) {
+        Ok(reconstruction) => reconstruction,
+        Err(reason) => return refuse(reason),
+    };
+    let roster = reconstruction.roster;
+    let meta = reconstruction.meta;
 
     // Fold the joiner into the reconstructed members and require the
     // terminal roster root, then the FULL state hash, to re-derive.
@@ -3825,7 +3726,7 @@ async fn try_adopt_member_added_across_gap(
             );
         }
     }
-    match adopted.finalize_adopted_commit_reconstructed(commit, &meta, &chain) {
+    match adopted.finalize_adopted_commit_reconstructed(commit, &meta, chain) {
         Ok(()) => {
             state
                 .groups_diagnostics
@@ -9083,7 +8984,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         treekem_epoch,
                         revision,
                         e.clone(),
-                        adopt_chain,
+                        &adopt_chain,
                         adopt_attestation,
                     ))
                     .await;

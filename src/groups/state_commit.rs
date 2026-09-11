@@ -953,6 +953,205 @@ pub fn validate_apply_terminal(
     validate_apply_with_terminal_mode(ctx, commit, action_kind, true)
 }
 
+// ─────────── ADR-0064 Decision §2: alternate-chain ancestor walk ───────────
+
+/// The known-good base a served alternate chain must fold from — the
+/// observing node's own retained head (joiner adoption) or a retained
+/// ancestor (fork classification). Every field is borrowed: the walk is
+/// a PURE function over the base, the served [`RetainedCommit`] links,
+/// and the terminal commit.
+#[derive(Debug, Clone, Copy)]
+pub struct AlternateChainBase<'a> {
+    /// The group's stable id (`GroupGenesis::group_id`).
+    pub group_id: &'a str,
+    /// The base's revision (the observing node's `state_revision`).
+    pub base_revision: u64,
+    /// The base's signed `state_hash` — the anchor every link must chain
+    /// from.
+    pub base_state_hash: &'a str,
+    /// The base's roster projection (what the first link's committer is
+    /// authorised against).
+    pub roster: &'a BTreeMap<String, RosterMemberSnapshot>,
+    /// The base's sealed public metadata.
+    pub meta: &'a GroupPublicMeta,
+    /// `compute_policy_hash` over the base's policy — a policy change
+    /// inside the gap is unreconstructable and must refuse.
+    pub policy_hash: &'a str,
+}
+
+/// The reconstructed head a fully validated alternate chain reaches:
+/// the folded roster projection, the folded metadata, and the terminal
+/// chain position (revision + state hash) the terminal commit was
+/// verified to chain from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlternateChainHead {
+    /// The roster projection after folding every served link.
+    pub roster: BTreeMap<String, RosterMemberSnapshot>,
+    /// The sealed metadata after folding every served link.
+    pub meta: GroupPublicMeta,
+    /// The reconstruction head's `state_hash` (the terminal's
+    /// `prev_state_hash`).
+    pub state_hash: String,
+    /// The reconstruction head's revision (the terminal's revision − 1).
+    pub revision: u64,
+}
+
+/// `committed_by` is an ACTIVE ADMIN in this roster projection (ADR-0016
+/// authority: role is decided on the committed PREDECESSOR roster, never
+/// the commit's self-asserted view).
+fn active_admin_in_projection(roster: &BTreeMap<String, RosterMemberSnapshot>, who: &str) -> bool {
+    roster.get(who).is_some_and(|snap| {
+        snap.state == GroupMemberState::Active && snap.role.at_least(GroupRole::Admin)
+    })
+}
+
+/// #458 r5c: run `enforce_last_admin_invariant` over a folded roster
+/// projection by materializing the minimal members view it checks.
+fn projection_last_admin_invariant(
+    projection: &BTreeMap<String, RosterMemberSnapshot>,
+    withdrawn: bool,
+) -> Result<(), String> {
+    let mut members = BTreeMap::new();
+    for (id, snap) in projection {
+        let mut member = GroupMember::new_member(id.clone(), None, None, 0);
+        member.role = snap.role;
+        member.state = snap.state;
+        members.insert(id.clone(), member);
+    }
+    enforce_last_admin_invariant(&members, withdrawn).map_err(|e| e.to_string())
+}
+
+/// ADR-0064 Decision §2 / #458 r4: validate a served chain of retained
+/// commits link-by-link from a known-good base, then the terminal
+/// commit's chaining and committer authority against the
+/// reconstruction. This is the ANCESTOR WALK — extracted verbatim from
+/// the joiner adoption path (`try_adopt_member_added_across_gap`) so the
+/// full-member fork classifier (slice 4) reuses the IDENTICAL rules:
+///
+/// - per link: consecutive revision from the base, prev-hash linkage
+///   anchored at the base's signed `state_hash`, signature + group
+///   binding (`verify_structure`), roster snapshot re-deriving the
+///   link's signed `roster_root`, sealed metadata re-deriving the signed
+///   meta hash, policy hash equal to the base's, committer an ACTIVE
+///   ADMIN in the RECONSTRUCTED predecessor roster (never the base and
+///   never the link's self-asserted view), and the folded roster
+///   satisfying the last-admin invariant;
+/// - terminal: chains from the reconstruction head, not withdrawn,
+///   group-bound, policy- and meta-consistent with the reconstruction,
+///   and committed by an active admin in the reconstructed predecessor
+///   roster.
+///
+/// PURE — no tracing, no diagnostics, no state mutation. The caller owns
+/// the owner-anchor question (tier-1 head attestation / owner mandate),
+/// which is orthogonal to per-link authority: the walk can fully
+/// validate a chain served by an admin who was already removed on the
+/// canonical branch, which is exactly why ADR-0064 refuses to decide
+/// eviction on the walk alone.
+///
+/// Returns the reconstruction on success; on failure the exact refusal
+/// reason string (the adoption path logs it verbatim).
+pub fn validate_alternate_chain(
+    base: &AlternateChainBase<'_>,
+    chain: &[RetainedCommit],
+    terminal: &GroupStateCommit,
+) -> Result<AlternateChainHead, &'static str> {
+    // Reconstructed state, folded link by link.
+    let mut roster = base.roster.clone();
+    let mut meta = base.meta.clone();
+    let mut previous_hash = base.base_state_hash.to_string();
+    let mut previous_revision = base.base_revision;
+    let mut chain_withdrawn = false;
+    for link in chain {
+        if chain_withdrawn {
+            // #458 r5b: withdrawal is TERMINAL — a withdrawn link ends the
+            // group; nothing (link or terminal) may follow it.
+            return Err("link follows a withdrawn (terminal) link in the chain");
+        }
+        if link.commit.withdrawn {
+            chain_withdrawn = true;
+        }
+        let commit_link = &link.commit;
+        if commit_link.revision != previous_revision + 1 {
+            return Err("chain is not consecutive from the stub revision");
+        }
+        if commit_link.prev_state_hash.as_deref() != Some(previous_hash.as_str()) {
+            return Err("chain prev_state_hash linkage broken (stale or forked chain)");
+        }
+        if commit_link.group_id != base.group_id || commit_link.verify_structure().is_err() {
+            return Err("chain commit signature/group binding invalid");
+        }
+        // Snapshot trust comes ONLY from re-deriving the signed root.
+        if roster_root_of_projection(&link.roster) != commit_link.roster_root {
+            return Err("link roster snapshot does not re-derive its signed roster_root");
+        }
+        let Some(link_meta) = link.meta.clone() else {
+            return Err("link predates sealed-meta retention (unreconstructable)");
+        };
+        if compute_public_meta_hash(&link_meta) != commit_link.public_meta_hash {
+            return Err("link sealed metadata does not re-derive its signed meta hash");
+        }
+        if commit_link.policy_hash != base.policy_hash {
+            return Err("policy changed inside the gap (unreconstructable without the event)");
+        }
+        if !active_admin_in_projection(&roster, &commit_link.committed_by) {
+            return Err(
+                "link committer is not an active admin in the RECONSTRUCTED predecessor roster",
+            );
+        }
+        // #458 r5c/r6 — ROLE-CHANGE SMUGGLING (WONTFIX-with-justification):
+        // `GroupStateCommit` carries no action kind, so a role change
+        // sealed inside an internally consistent retained snapshot is
+        // indistinguishable here from any other admin-committed role
+        // change. That is NOT a new capability: an admin can change roles
+        // via ordinary commits anyway (ADR-0016 — role management IS
+        // admin authority), and the caller anchors the chain
+        // independently (owner head attestation / mandate), so any role
+        // delta inside the chain is the authority's own sealed history.
+        // The per-link last-admin invariant adds fail-closed coverage for
+        // deltas that strand the last admin.
+        if projection_last_admin_invariant(&link.roster, link.commit.withdrawn).is_err() {
+            return Err("link folds to a roster that violates the last-admin invariant");
+        }
+        roster = link.roster.clone();
+        meta = link_meta;
+        previous_hash = commit_link.state_hash.clone();
+        previous_revision = commit_link.revision;
+    }
+
+    // Terminal: chain from the reconstruction head and verify EVERYTHING
+    // against the reconstruction.
+    if terminal.revision != previous_revision + 1
+        || terminal.prev_state_hash.as_deref() != Some(previous_hash.as_str())
+    {
+        return Err("terminal commit does not chain from the reconstructed head");
+    }
+    if chain_withdrawn || terminal.withdrawn {
+        // #458 r5b: a MemberAdded on a withdrawn group is meaningless —
+        // refuse any withdrawn chain or terminal outright.
+        return Err("chain or terminal is withdrawn (terminal group state)");
+    }
+    if terminal.group_id != base.group_id {
+        return Err("terminal commit group binding invalid");
+    }
+    if terminal.policy_hash != base.policy_hash {
+        return Err("terminal commit changes policy (unreconstructable)");
+    }
+    if terminal.public_meta_hash != compute_public_meta_hash(&meta) {
+        return Err("terminal meta hash does not match the reconstruction");
+    }
+    if !active_admin_in_projection(&roster, &terminal.committed_by) {
+        return Err(
+            "terminal committer is not an active admin in the reconstructed predecessor roster",
+        );
+    }
+    Ok(AlternateChainHead {
+        roster,
+        meta,
+        state_hash: previous_hash,
+        revision: previous_revision,
+    })
+}
+
 // ─────────────────────────────── Tests ──────────────────────────────────
 
 #[cfg(test)]
@@ -2082,5 +2281,314 @@ mod tests {
             root_with_bytes,
             "a member with no cert and no digest is a different committed roster"
         );
+    }
+
+    // ── ADR-0064 Decision §2 (slice 4): alternate-chain ancestor walk ──
+
+    use crate::identity::AgentKeypair;
+
+    fn snap(role: GroupRole, state: GroupMemberState) -> RosterMemberSnapshot {
+        RosterMemberSnapshot {
+            role,
+            state,
+            treekem_key_package_hash: None,
+            certificate_digest: None,
+        }
+    }
+
+    fn hex_id(byte: u8) -> String {
+        std::iter::repeat_n(format!("{byte:02x}"), 32).collect()
+    }
+
+    /// Build one walk fixture: base roster `{A: admin, B: admin}` at
+    /// revision 1 with a deterministic state hash, plus the signer
+    /// keypairs for A and B. Call [`WalkFixture::with_real_ids`] before
+    /// signing so the roster keys are the DERIVED agent ids.
+    struct WalkFixture {
+        group_id: String,
+        base_state_hash: String,
+        base: BTreeMap<String, RosterMemberSnapshot>,
+        meta: GroupPublicMeta,
+        policy_hash: String,
+        a: AgentKeypair,
+        b: AgentKeypair,
+    }
+
+    fn walk_fixture() -> WalkFixture {
+        let mut base = BTreeMap::new();
+        base.insert(
+            hex_id(0xA1),
+            snap(GroupRole::Admin, GroupMemberState::Active),
+        );
+        base.insert(
+            hex_id(0xB2),
+            snap(GroupRole::Admin, GroupMemberState::Active),
+        );
+        WalkFixture {
+            group_id: "c0".repeat(32),
+            base_state_hash: "ab".repeat(32),
+            base,
+            meta: GroupPublicMeta {
+                name: "walk".to_string(),
+                ..GroupPublicMeta::default()
+            },
+            policy_hash: compute_policy_hash(&GroupPolicy::default()),
+            a: AgentKeypair::generate().expect("A keypair"),
+            b: AgentKeypair::generate().expect("B keypair"),
+        }
+    }
+
+    impl WalkFixture {
+        fn a_id(&self) -> String {
+            hex::encode(self.a.agent_id().as_bytes())
+        }
+
+        fn b_id(&self) -> String {
+            hex::encode(self.b.agent_id().as_bytes())
+        }
+
+        /// Swap the fixture's placeholder ids for the REAL derived agent
+        /// ids (the committer-authority check matches `committed_by`
+        /// against roster keys).
+        fn with_real_ids(&mut self) {
+            let a = self.base.remove(&hex_id(0xA1)).expect("A seat");
+            let b = self.base.remove(&hex_id(0xB2)).expect("B seat");
+            self.base.insert(self.a_id(), a);
+            self.base.insert(self.b_id(), b);
+        }
+
+        fn base<'a>(&'a self, revision: u64, state_hash: &'a str) -> AlternateChainBase<'a> {
+            AlternateChainBase {
+                group_id: &self.group_id,
+                base_revision: revision,
+                base_state_hash: state_hash,
+                roster: &self.base,
+                meta: &self.meta,
+                policy_hash: &self.policy_hash,
+            }
+        }
+
+        /// One fully signed retained link with explicit withdrawn flag
+        /// and optional policy-hash override (re-signed, so the commit's
+        /// `state_hash` stays internally consistent — tampering a field
+        /// post-sign would fail `verify_structure` instead of the check
+        /// under test).
+        #[allow(clippy::too_many_arguments)]
+        fn link_signed(
+            &self,
+            signer: &AgentKeypair,
+            revision: u64,
+            prev: &str,
+            roster: BTreeMap<String, RosterMemberSnapshot>,
+            withdrawn: bool,
+            policy_override: Option<&str>,
+        ) -> RetainedCommit {
+            let commit = GroupStateCommit::sign(
+                self.group_id.clone(),
+                revision,
+                Some(prev.to_string()),
+                roster_root_of_projection(&roster),
+                policy_override.unwrap_or(&self.policy_hash).to_string(),
+                compute_public_meta_hash(&self.meta),
+                None,
+                withdrawn,
+                9_000,
+                signer,
+            )
+            .expect("signed link");
+            RetainedCommit {
+                commit,
+                roster,
+                meta: Some(self.meta.clone()),
+            }
+        }
+
+        fn link(
+            &self,
+            signer: &AgentKeypair,
+            revision: u64,
+            prev: &str,
+            roster: BTreeMap<String, RosterMemberSnapshot>,
+        ) -> RetainedCommit {
+            self.link_signed(signer, revision, prev, roster, false, None)
+        }
+
+        fn terminal(&self, signer: &AgentKeypair, revision: u64, prev: &str) -> GroupStateCommit {
+            GroupStateCommit::sign(
+                self.group_id.clone(),
+                revision,
+                Some(prev.to_string()),
+                roster_root_of_projection(&self.base),
+                self.policy_hash.clone(),
+                compute_public_meta_hash(&self.meta),
+                None,
+                false,
+                9_001,
+                signer,
+            )
+            .expect("signed terminal")
+        }
+    }
+
+    /// WHY (ADR-0064 attack matrix "promoted-after-base admin chain"):
+    /// the walk must see a promotion INSIDE the chain — B commits at
+    /// N+2 as a full admin even though the BASE roster seated B as a
+    /// plain member. Validating against the static base roster (G2's
+    /// wrongly-rejected shape) is the failure this pins out.
+    #[test]
+    fn alternate_walk_promoted_admin_accepted() {
+        let mut f = walk_fixture();
+        f.with_real_ids();
+        // B starts as a plain MEMBER at the base; A is the only admin.
+        f.base
+            .insert(f.b_id(), snap(GroupRole::Member, GroupMemberState::Active));
+        let base_hash = f.base_state_hash.clone();
+
+        // Link N+1: A promotes B (the folded roster seats B as admin).
+        let mut promoted = f.base.clone();
+        promoted.insert(f.b_id(), snap(GroupRole::Admin, GroupMemberState::Active));
+        let link = f.link(&f.a, 2, &base_hash, promoted.clone());
+
+        // Terminal N+2: signed by B — admin in the RECONSTRUCTED
+        // predecessor roster, member in the base.
+        let terminal = f.terminal(&f.b, 3, &link.commit.state_hash);
+        let head = validate_alternate_chain(
+            &f.base(1, &base_hash),
+            std::slice::from_ref(&link),
+            &terminal,
+        )
+        .expect("promoted-admin chain validates");
+        assert_eq!(head.revision, 2);
+        assert_eq!(head.roster, promoted);
+        assert_eq!(head.state_hash, link.commit.state_hash);
+
+        // Negative control: the same B-signed commit evaluated against
+        // the STALE base roster (no promotion link) is refused — the
+        // committer-authority check uses the reconstructed predecessor
+        // roster, and a member signer never passes it.
+        let direct = f.terminal(&f.b, 2, &base_hash);
+        let err = validate_alternate_chain(&f.base(1, &base_hash), &[], &direct)
+            .expect_err("member signer refused against the base roster");
+        assert_eq!(
+            err,
+            "terminal committer is not an active admin in the reconstructed predecessor roster"
+        );
+    }
+
+    /// WHY (#468 stale removal / ADR-0064 attack matrix "removed-admin
+    /// fork eviction attempt"): an admin removed by an earlier link of
+    /// the chain must lose committer authority for EVERY later link and
+    /// the terminal — the walk rejects exactly the stale-admin shape the
+    /// retained-base check used to admit.
+    #[test]
+    fn alternate_walk_removed_admin_refused() {
+        let mut f = walk_fixture();
+        f.with_real_ids();
+        let base_hash = f.base_state_hash.clone();
+
+        // Link N+1: B removes A (roster keeps only B, an admin — the
+        // last-admin invariant holds).
+        let mut without_a = f.base.clone();
+        without_a.remove(&f.a_id());
+        let removal = f.link(&f.b, 2, &base_hash, without_a.clone());
+
+        // Link N+2: signed by the REMOVED admin A — must be refused with
+        // the committer-authority reason (not a linkage or signature
+        // failure: A's signature and chain linkage are perfectly valid).
+        let mut a_back = without_a.clone();
+        a_back.insert(f.a_id(), snap(GroupRole::Admin, GroupMemberState::Active));
+        let stale = f.link(&f.a, 3, &removal.commit.state_hash, a_back);
+        let err = validate_alternate_chain(
+            &f.base(1, &base_hash),
+            &[removal.clone(), stale],
+            &f.terminal(&f.b, 4, &"cd".repeat(32)),
+        )
+        .expect_err("removed admin cannot commit later links");
+        assert_eq!(
+            err,
+            "link committer is not an active admin in the RECONSTRUCTED predecessor roster"
+        );
+
+        // Same refusal for the TERMINAL signed by the removed admin.
+        let stale_terminal = f.terminal(&f.a, 3, &removal.commit.state_hash);
+        let err = validate_alternate_chain(
+            &f.base(1, &base_hash),
+            std::slice::from_ref(&removal),
+            &stale_terminal,
+        )
+        .expect_err("removed admin cannot commit the terminal");
+        assert_eq!(
+            err,
+            "terminal committer is not an active admin in the reconstructed predecessor roster"
+        );
+    }
+
+    /// WHY (walk invariants): linkage, consecutiveness, policy stability
+    /// and withdrawal terminality each refuse with their exact reason —
+    /// the adoption path logs these verbatim, so the strings are
+    /// contract.
+    #[test]
+    fn alternate_walk_structural_refusals() {
+        let mut f = walk_fixture();
+        f.with_real_ids();
+        let base_hash = f.base_state_hash.clone();
+        let chain_roster = f.base.clone();
+
+        // Non-consecutive revision.
+        let skip = f.link(&f.a, 3, &base_hash, chain_roster.clone());
+        let err = validate_alternate_chain(
+            &f.base(1, &base_hash),
+            std::slice::from_ref(&skip),
+            &f.terminal(&f.a, 4, &"dd".repeat(32)),
+        )
+        .expect_err("non-consecutive refused");
+        assert_eq!(err, "chain is not consecutive from the stub revision");
+
+        // Broken prev-hash linkage.
+        let unlink = f.link(&f.a, 2, &"ee".repeat(32), chain_roster.clone());
+        let err = validate_alternate_chain(
+            &f.base(1, &base_hash),
+            std::slice::from_ref(&unlink),
+            &f.terminal(&f.a, 3, &"dd".repeat(32)),
+        )
+        .expect_err("broken linkage refused");
+        assert_eq!(
+            err,
+            "chain prev_state_hash linkage broken (stale or forked chain)"
+        );
+
+        // Policy changed inside the gap (re-signed under a different
+        // policy hash so the refusal is the policy check, not
+        // `verify_structure`).
+        let policy_shift = f.link_signed(
+            &f.a,
+            2,
+            &base_hash,
+            chain_roster.clone(),
+            false,
+            Some(&"ff".repeat(32)),
+        );
+        let err = validate_alternate_chain(
+            &f.base(1, &base_hash),
+            std::slice::from_ref(&policy_shift),
+            &f.terminal(&f.a, 3, &"dd".repeat(32)),
+        )
+        .expect_err("policy change refused");
+        assert_eq!(
+            err,
+            "policy changed inside the gap (unreconstructable without the event)"
+        );
+
+        // Withdrawal terminality: nothing follows a withdrawn link
+        // (re-signed with `withdrawn = true`).
+        let withdrawn = f.link_signed(&f.a, 2, &base_hash, chain_roster.clone(), true, None);
+        let after = f.link(&f.b, 3, &withdrawn.commit.state_hash, chain_roster);
+        let err = validate_alternate_chain(
+            &f.base(1, &base_hash),
+            &[withdrawn, after],
+            &f.terminal(&f.b, 4, &"dd".repeat(32)),
+        )
+        .expect_err("post-withdrawal link refused");
+        assert_eq!(err, "link follows a withdrawn (terminal) link in the chain");
     }
 }
