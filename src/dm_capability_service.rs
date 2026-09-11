@@ -453,9 +453,10 @@ impl CapabilityAdvertService {
             tokio::time::sleep(Duration::from_millis(FIRST_PUBLISH_DELAY_MS)).await;
             // L3 retirement: in on-demand mode (periodic == false) there is no
             // startup burst and no steady beat — the publisher wakes only for
-            // targeted/warm requests and capability upgrades, and publishes to
-            // the steady topic only on request-triggered cycles (warm-carrier
-            // requesters listen there).
+            // targeted/warm requests and capability upgrades, and answers
+            // requesters on the Critical response topic (#656: the steady
+            // topic never carries request-triggered copies; warm-carrier
+            // requesters get the targeted response like everyone else).
             let mut burst_idx: usize = if periodic {
                 0
             } else {
@@ -464,6 +465,13 @@ impl CapabilityAdvertService {
             let mut last_targeted_response_at: Option<tokio::time::Instant> = None;
             let mut targeted_response_pending = false;
             let mut requests_open = true;
+            // #656: whether the CURRENT publish cycle is a steady one (the
+            // startup beat, a timer beat, or a capability upgrade) rather
+            // than a cycle woken purely to answer a targeted request.
+            // Request-triggered cycles answer on the Critical response
+            // topic only — they must not re-broadcast the fleet-wide
+            // steady advert at the request rate.
+            let mut steady_cycle = true;
             loop {
                 while reannounce_rx.try_recv().is_ok() {
                     #[cfg(test)]
@@ -490,6 +498,12 @@ impl CapabilityAdvertService {
                         res = publisher_caps_rx.changed() => {
                             if res.is_ok() {
                                 burst_idx = 0;
+                                // The pending→ready transition is the
+                                // readiness announce: the first publishable
+                                // cycle after it is steady-worthy (#656),
+                                // even if an earlier request cycle cleared
+                                // the flag.
+                                steady_cycle = true;
                             }
                         }
                         request = reannounce_rx.recv(), if requests_open => {
@@ -509,7 +523,6 @@ impl CapabilityAdvertService {
                     }
                     continue;
                 }
-                let respond_on_steady = targeted_response_pending;
                 match build_signed_advert(
                     &publisher_signing,
                     self_agent_id,
@@ -524,6 +537,15 @@ impl CapabilityAdvertService {
                         // fully served for v1 semantics; new peers simply
                         // fall back to v1 relay frames until the next
                         // extension window.
+                        //
+                        // #656: this stays on EVERY cycle, including
+                        // request-triggered ones. A targeted refresh is
+                        // the only reliable delivery path for the digest
+                        // bit in on-demand mode (the default): a lone
+                        // node's initial-cycle extension publishes before
+                        // it has any gossip links, so the requester would
+                        // otherwise never learn the bit. Verified against
+                        // `asymmetric_signed_capability_convergence_over_relay`.
                         if let Ok(Some(ext)) = build_signed_digest_extension(
                             &publisher_signing,
                             self_agent_id,
@@ -566,7 +588,15 @@ impl CapabilityAdvertService {
                                 ),
                             }
                         }
-                        if periodic || respond_on_steady {
+                        // #656: the steady advert rides its own cadence —
+                        // the startup burst, the timer beat, or a capability
+                        // upgrade (`steady_cycle`). A targeted requester
+                        // already received its answer on the Critical
+                        // response topic above; republishing the fleet-wide
+                        // advert per request turned the 600 s documented
+                        // cadence into the request rate (27 nodes × 1
+                        // response-cycle/s ≈ the observed 77 caps msgs/s).
+                        if periodic && steady_cycle {
                             if let Err(e) = publisher_pubsub
                                 .publish(DM_CAPABILITY_TOPIC.to_string(), bytes)
                                 .await
@@ -594,12 +624,19 @@ impl CapabilityAdvertService {
                 tokio::pin!(publish_delay);
                 loop {
                     tokio::select! {
-                        _ = &mut publish_delay => break,
+                        _ = &mut publish_delay => {
+                            steady_cycle = true;
+                            break;
+                        }
                         res = publisher_caps_rx.changed() => {
                             if res.is_ok() {
                                 tracing::debug!("capability advert upgraded; republishing");
                                 burst_idx = 0;
                             }
+                            // A capability upgrade is steady-worthy: the
+                            // fleet should see the new state immediately,
+                            // not at the next timer beat.
+                            steady_cycle = true;
                             break;
                         }
                         request = reannounce_rx.recv(), if requests_open => {
@@ -619,6 +656,9 @@ impl CapabilityAdvertService {
                                         tracing::debug!(
                                             "verified capability request received; republishing"
                                         );
+                                        // #656: this cycle answers on the
+                                        // targeted response topic only.
+                                        steady_cycle = false;
                                         break;
                                     }
                                     // Bring the wake-up forward to the first
@@ -1482,6 +1522,108 @@ mod tests {
                 .await
                 .is_err(),
             "a request for another agent must not draw a response"
+        );
+
+        service.abort();
+    }
+
+    /// #656: a targeted capability refresh is point-to-point — the requester
+    /// is answered on the Critical response topic — and must NOT cost a
+    /// fleet-wide steady advert. Under `respond_on_steady`, N requests
+    /// inside one 600 s advert window put N extra signed adverts on
+    /// `x0x/caps/v1` (27 nodes × 1 response-cycle/s ≈ the observed 77 caps
+    /// msgs/s), a 600× amplification of the documented cadence.
+    #[tokio::test]
+    async fn targeted_requests_do_not_republish_the_steady_advert() {
+        let kp = AgentKeypair::generate().expect("keygen");
+        let signing = Arc::new(SigningContext::from_keypair(&kp));
+        let self_agent = kp.agent_id();
+
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
+        );
+        let store = Arc::new(CapabilityStore::new());
+        let (_caps_tx, caps_rx) =
+            tokio::sync::watch::channel(DmCapabilities::v2_durable_gossip_ready(vec![0xCE; 1184]));
+
+        // Advert-shaped counters on the steady topic and the targeted
+        // response topic. The steady topic also carries this test's
+        // warm-carrier REQUESTS (domain-prefixed); those fail the
+        // advert decode and are filtered, so the steady count is exactly
+        // A's own advert publications.
+        let mut steady = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let mut responses = pubsub
+            .subscribe(DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string())
+            .await;
+        let steady_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let response_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steady_counter = Arc::clone(&steady_seen);
+        tokio::spawn(async move {
+            while let Some(message) = steady.recv().await {
+                if CapabilityAdvert::from_postcard(&message.payload).is_ok() {
+                    steady_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        let response_counter = Arc::clone(&response_seen);
+        tokio::spawn(async move {
+            while let Some(message) = responses.recv().await {
+                if CapabilityAdvert::from_postcard(&message.payload).is_ok() {
+                    response_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+
+        // A runs the real publisher (periodic mode, the production
+        // interval); B is modeled by the raw request publishes below.
+        let service = CapabilityAdvertService::spawn(
+            Arc::clone(&pubsub),
+            Arc::clone(&signing),
+            self_agent,
+            MachineId([0x47; 32]),
+            caps_rx,
+            Arc::clone(&store),
+            Duration::from_secs(ADVERT_PUBLISH_INTERVAL_SECS),
+            true,
+        )
+        .await
+        .expect("spawn periodic service");
+
+        // Wait for the one periodic beat of this advert window (the
+        // FIRST_PUBLISH_DELAY_MS initial publish).
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while steady_seen.load(std::sync::atomic::Ordering::Relaxed) < 1
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // B sends three targeted requests inside the same advert window,
+        // spaced past the responder's 1 s coalescing window so each draws
+        // its own response.
+        for expected in 1..=3 {
+            publish_targeted_capability_request(&pubsub, self_agent)
+                .await
+                .expect("publish targeted request");
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while response_seen.load(std::sync::atomic::Ordering::Relaxed) < expected
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(1_150)).await;
+        }
+
+        // Quiet period, then the exact-count assertions.
+        assert_eq!(
+            response_seen.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "each request must draw exactly one targeted response"
+        );
+        assert_eq!(
+            steady_seen.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a point-to-point refresh must not cost a fleet-wide steady advert"
         );
 
         service.abort();

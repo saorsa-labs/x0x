@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`x0x/caps/v1` CPU amplification (#656).** One targeted capability
+  request caused the responder's publisher to also re-broadcast its signed
+  advert on the fleet-wide steady topic (`respond_on_steady` in
+  `DmCapabilityService`), turning the documented 600 s advert cadence into
+  the request rate — 27 nodes × 1 response-cycle/s × 3 publishes ≈ the
+  observed 77 caps msgs/s. The steady advert now rides its own cadence
+  only (startup burst, timer beat, or capability upgrade); a targeted
+  requester is answered solely on the Critical `caps/v1/response/targeted-v2`
+  topic it already listens on. The `caps/v2/digest` extension intentionally
+  still publishes on every advert cycle: a targeted refresh is the only
+  reliable delivery path for the `digest_support` bit in on-demand mode
+  (the default), where a lone node's initial-cycle extension publishes
+  before it has gossip links — restricting it to the periodic beat breaks
+  digest discovery (verified against
+  `asymmetric_signed_capability_convergence_over_relay`). Publish-side
+  cadence only; no caps topic is retired and no wire shape changes.
+
 ### Tests
 
 - `tests/e2e_deploy.sh` uploads the binary as a gzip stream with ssh keepalives
