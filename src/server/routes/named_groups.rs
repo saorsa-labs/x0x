@@ -3147,19 +3147,26 @@ fn previous_hash_initial(
 /// ADR-0064 slice 4 — the classification (owner-axis groups only;
 /// non-owner-axis evaluation is byte-for-byte the pre-slice-4 rule):
 ///
-/// (a) LEGITIMATE SUCCESSOR — the conflicting commit carries an owner
-///     mandate that ANCHORS its header (owner USER-key signature over
-///     the exact revision/parent/roster-root/policy/meta) and it chains
-///     CONSECUTIVELY through retained ancestry. No evidence is
-///     recorded; when a marker exists and the commit's revision is
-///     STRICTLY GREATER than the evidenced one, the marker CLEARS and
-///     the evidence gate re-arms (the clear rule's "owner-anchored
-///     commit" — not only a seal). This runs BEFORE the stored-evidence
-///     silence gate: an anchored successor must be able to clear even
-///     while old evidence sits in the lineage. A verifying anchor that
-///     FAILS the ancestry or strictly-greater fence counts an
-///     attributable refusal (`fork_quarantine_owner_anchored_refusals`)
-///     — the contested branch cannot silently probe the clear path.
+/// (a) OWNER-ANCHORED CONFLICT (r2, ADR §3 conformance) — the
+///     conflicting commit carries an owner mandate that ANCHORS its
+///     header (owner USER-key signature over the exact
+///     revision/parent/roster-root/policy/meta) and it chains
+///     CONSECUTIVELY through retained ancestry at a STRICTLY GREATER
+///     revision than the evidence. It is recorded as EVIDENCE with the
+///     `owner_anchored_conflict` label — the conflict path NEVER
+///     CLEARS: this node still holds the disowned sibling, so clearing
+///     would un-gate it while it keeps applying the disowned chain and
+///     the next canonical commit would re-quarantine the same
+///     divergence (flapping). A marker clears only when this node
+///     APPLIES an owner-anchored commit (the apply-path clear in the
+///     mandate-valid arm). This evaluation runs BEFORE the
+///     stored-evidence silence gate so an anchored conflicting commit
+///     is always classified; EVERY verifying anchor counts the
+///     attributable no-clear refusal
+///     (`fork_quarantine_owner_anchored_refusals`) — the contested
+///     branch cannot silently probe the clear path. An anchor that
+///     additionally FAILS the ancestry or strictly-greater fence
+///     records nothing at all.
 /// (b) SIGNER-ONLY (#472 decision 3) — the signer was an ACTIVE ADMIN
 ///     at the commit's claimed parent (the retained commit whose
 ///     `state_hash` the fork chains from), but the alternate chain is
@@ -3214,12 +3221,22 @@ fn evaluate_fork_evidence_candidate(
     };
     let now_ms = now_millis_u64();
 
-    // ADR-0064 slice 4 (a): the owner-anchor check runs BEFORE the
-    // stored-evidence silence gate — an anchored successor must be able
-    // to clear containment even while the lineage still carries the
-    // first fork's evidence. Only a structure-valid commit carrying a
-    // mandate that ANCHORS its exact header under the policy owner can
-    // reach the clear decision.
+    // ADR-0064 slice 4 (a) → r2 (ADR §3 conformance): the owner-anchor
+    // check runs BEFORE the stored-evidence silence gate so an anchored
+    // conflicting commit is always classified, but the CONFLICT PATH
+    // NEVER CLEARS — the Accepted ADR's clear rule ("the marker clears
+    // ONLY when this node APPLIES a commit C … a same-revision sibling
+    // — the contested branch itself — can never clear") wins over any
+    // looser reading: a conflicting anchored successor is reachable
+    // only while this node still HOLDS the disowned sibling (its own
+    // head or a retained twin), so clearing here would un-gate the node
+    // while it keeps applying the disowned chain and the next canonical
+    // commit would re-quarantine the same divergence (flapping).
+    // Instead the anchored conflicting commit is RECORDED AS EVIDENCE
+    // (`owner_anchored_conflict`) and the attributable
+    // no-clear-on-the-conflict-path counter fires; containment lifts
+    // only when an owner-anchored commit APPLIES (the apply-path clear
+    // in the mandate-valid arm).
     if let (Some(owner_id), Some(mandate)) = (
         current.policy.admission.owner_certified_user_id(),
         owner_mandate,
@@ -3227,6 +3244,9 @@ fn evaluate_fork_evidence_candidate(
         if commit.verify_structure().is_ok()
             && mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit)
         {
+            state
+                .groups_diagnostics
+                .record_fork_quarantine_owner_anchored_refusal(group_key);
             let chains_through_retained_ancestry = current
                 .commit_log
                 .iter()
@@ -3237,17 +3257,26 @@ fn evaluate_fork_evidence_candidate(
                 .fork_quarantine
                 .as_ref()
                 .is_none_or(|marker| commit.revision > marker.revision);
-            if !chains_through_retained_ancestry || !strictly_greater {
-                // Attributable refusal: the owner vouched for this
-                // commit header, but it does not chain through THIS
-                // node's retained ancestry (the contested branch's own
-                // head) or does not strictly advance past the evidence.
-                state
-                    .groups_diagnostics
-                    .record_fork_quarantine_owner_anchored_refusal(group_key);
-                return ForkEvidenceOutcome::NotEvidence;
+            if chains_through_retained_ancestry && strictly_greater {
+                // A coherent owner-anchored successor this node CANNOT
+                // apply (it conflicts with the head we hold): evidence
+                // with the `owner_anchored_conflict` label. The marker
+                // clears only when an anchored commit APPLIES.
+                return ForkEvidenceOutcome::Evidence(
+                    x0x::groups::ForkEvidence {
+                        revision: candidate_revision,
+                        state_hash: commit.state_hash.clone(),
+                        committed_by: commit.committed_by.clone(),
+                        observed_at_ms: now_millis_u64(),
+                    },
+                    Some(FORK_EVIDENCE_CLASSIFICATION_OWNER_ANCHORED),
+                );
             }
-            return ForkEvidenceOutcome::OwnerAnchoredSuccessor;
+            // Anchor verifies but the ancestry/strictly-greater fence
+            // refuses even coherent classification (the contested
+            // branch's own head, or a same-or-lower revision) — the
+            // attributable probe signal; nothing recorded.
+            return ForkEvidenceOutcome::NotEvidence;
         }
     }
 
@@ -3356,21 +3385,22 @@ fn evaluate_fork_evidence_candidate(
 /// variants — #451).
 pub(in crate::server) const FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY: &str = "signer_only";
 pub(in crate::server) const FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED: &str = "unauthorized_signer";
+pub(in crate::server) const FORK_EVIDENCE_CLASSIFICATION_OWNER_ANCHORED: &str =
+    "owner_anchored_conflict";
 
 /// ADR-0064 slice 4: the outcome of evaluating one rejected commit as
 /// fork evidence.
 enum ForkEvidenceOutcome {
     /// No evidence (unauthenticated, silenced, unclassifiable, or an
-    /// owner-anchored successor that was refused as a clear).
+    /// owner-anchored commit refused even coherent classification by
+    /// the ancestry/strictly-greater fence).
     NotEvidence,
     /// One authenticated evidence record, optionally classified against
-    /// the retained log (the snapshot label).
+    /// the retained log (the snapshot label). An
+    /// `owner_anchored_conflict` record is an owner-anchored successor
+    /// this node could not apply — r2: the conflict path never clears;
+    /// containment lifts only when an anchored commit APPLIES.
     Evidence(x0x::groups::ForkEvidence, Option<&'static str>),
-    /// ADR-0064 slice 4 (a): a mandate-anchored commit that chains
-    /// through retained ancestry at a strictly greater revision than
-    /// the evidence — the canonical successor. No evidence; the caller
-    /// clears the marker and re-arms the gate.
-    OwnerAnchoredSuccessor,
 }
 
 /// ADR-0064 slice 4: did the signer hold a seat in ANY retained roster
@@ -3656,6 +3686,8 @@ async fn apply_stateful_event_with_evidence(
 /// r5 (Codex 5): the TERMINAL twin of the central apply hook
 /// ([`apply_stateful_event_with_evidence`]) for `GroupDeleted`'s
 /// withdrawal commit — the terminal validator still routes its
+/// PrevHashMismatch/StaleRevision rejections through the SAME
+/// fork-evidence evaluation instead of bypassing the central wrapper.
 #[allow(clippy::too_many_arguments)]
 async fn apply_terminal_stateful_event_with_evidence(
     state: &Arc<AppState>,
@@ -3791,60 +3823,6 @@ async fn record_fork_evidence_on_apply_error(
                     );
                 }
             }
-            ForkEvidenceOutcome::OwnerAnchoredSuccessor => {
-                // ADR-0064 slice 4 (a) + Decision §3: a mandate-anchored
-                // commit that chains through retained ancestry at a
-                // strictly greater revision than the evidence is the
-                // canonical successor — clear the marker and re-arm the
-                // evidence gate. (evaluate only returns this outcome
-                // after the strictly-greater check passed.)
-                if current.fork_quarantine.is_some() {
-                    let clear_key = group_key.to_string();
-                    let clear_revision = commit.revision;
-                    let clear = |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
-                        let Some(info) = groups.get_mut(&clear_key) else {
-                            return false;
-                        };
-                        // Re-check under the guard: a concurrent writer
-                        // may have cleared or moved the marker.
-                        if info
-                            .fork_quarantine
-                            .as_ref()
-                            .is_some_and(|marker| clear_revision > marker.revision)
-                        {
-                            info.fork_quarantine = None;
-                            info.reset_fork_evidence_after_quarantine_clear();
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    let clear_outcome = if persistence_lock_already_held {
-                        persist_named_groups_mutation_unlocked(state, clear).await
-                    } else {
-                        persist_named_groups_mutation(state, clear).await
-                    };
-                    match clear_outcome {
-                        Ok(AtomicWriteOutcome::Durable) => {
-                            state
-                                .groups_diagnostics
-                                .record_fork_quarantine_owner_anchored_clear(group_key);
-                            tracing::info!(
-                                group_id = %LogHexId::group(group_key),
-                                revision = commit.revision,
-                                "ADR-0064: owner-anchored mandate-carrying successor cleared the fork quarantine"
-                            );
-                        }
-                        outcome => {
-                            tracing::warn!(
-                                group_id = %LogHexId::group(group_key),
-                                ?outcome,
-                                "ADR-0064: owner-anchored quarantine clear did not reach directory durability"
-                            );
-                        }
-                    }
-                }
-            }
             ForkEvidenceOutcome::NotEvidence => {}
         }
     }
@@ -3860,9 +3838,15 @@ async fn record_fork_evidence_on_apply_error(
 /// walk-authenticated evidence: install it with the `signer_only`
 /// classification and (owner-axis) the quarantine marker. A forged or
 /// self-inconsistent chain fails the walk and records nothing — the
-/// pre-slice-4 behaviour. A mandate that ANCHORS the refused terminal is
-/// the legitimate-successor shape; the single-commit evaluation inside
-/// the apply hook already handled its clear, so this never double-acts.
+/// pre-slice-4 behaviour. A mandate that ANCHORS the refused terminal
+/// was already classified by the single-commit evaluation in the apply
+/// hook (r2: as `owner_anchored_conflict` evidence, never a clear), so
+/// the lineage gate above prevents double-acting here.
+///
+/// `persistence_lock_already_held` MUST mirror the caller's
+/// `roster_lock_already_held`: the causal-replay path reaches this
+/// fn while HOLDING `named_groups_persistence_lock` (r2 review item 2
+/// — the locked persist self-deadlocks there).
 async fn classify_refused_joiner_fork_chain(
     state: &Arc<AppState>,
     group_key: &str,
@@ -3870,6 +3854,7 @@ async fn classify_refused_joiner_fork_chain(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     chain: &[x0x::groups::state_commit::RetainedCommit],
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
+    persistence_lock_already_held: bool,
 ) {
     // Only a joiner with a served chain and stored lineage reaches the
     // walk; already-installed evidence (the hook's classification) wins.
@@ -3923,7 +3908,14 @@ async fn classify_refused_joiner_fork_chain(
         commit,
         Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY),
     );
-    let durable = install_fork_evidence(state, group_key, evidence, quarantine, false).await;
+    let durable = install_fork_evidence(
+        state,
+        group_key,
+        evidence,
+        quarantine,
+        persistence_lock_already_held,
+    )
+    .await;
     if durable {
         state
             .groups_diagnostics
@@ -3947,7 +3939,6 @@ async fn try_adopt_member_added_across_gap(
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::GroupStateCommit,
     info: &x0x::groups::GroupInfo,
-
     actor: &str,
     actor_authorized: bool,
     agent_id: &str,
@@ -9449,6 +9440,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 &commit,
                                 &adopt_chain,
                                 owner_mandate.as_ref(),
+                                roster_lock_already_held,
                             )
                             .await;
                             tracing::debug!(
@@ -18424,33 +18416,45 @@ async fn owner_certified_seal_with_eviction(
                 // here, explicitly (no clean seal is minted to do it).
                 // Otherwise it stays set until a later all-clean seal.
                 if !in_grace_initially {
+                    // ADR-0064 slice 4 r2 (review item 3): the flag AND
+                    // the eviction-arm marker clear happen ONLY inside
+                    // the persist transaction — no pre-transaction
+                    // mutation under a bare map guard (the transaction's
+                    // `before` snapshot would carry the clear, so a
+                    // failed/non-durable persist could not roll it back),
+                    // and the outcome is surfaced exactly like the
+                    // all-clean arm instead of swallowed with `.ok()`:
+                    // non-durable → 503 with memory and disk still
+                    // quarantined.
                     let owner_user_key = state.agent.identity().user_keypair();
-                    let mut groups = state.named_groups.write().await;
-                    if let Some(info) = groups.get_mut(id) {
-                        info.owner_cert_reverify_required = false;
-                        // ADR-0064 slice 4 (slice-1 review non-blocking
-                        // (1)): the EVICTION arm of the explicit seal
-                        // route clears the fork marker under the SAME
-                        // fence as the all-clean arm — the local install
-                        // holds the owner USER key (#469 A1b) and the
-                        // sealed revision (bumped by the eviction seals)
-                        // is strictly greater than the evidenced one.
-                        // Before slice 4 an explicit seal that evicted
-                        // members left the fork marker set until the next
-                        // seal.
-                        info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
-                    }
-                    drop(groups);
                     let clear_key = id.to_string();
-                    persist_named_groups_mutation(state, |groups| {
+                    let persist_outcome = persist_named_groups_mutation(state, |groups| {
                         if let Some(info) = groups.get_mut(&clear_key) {
                             info.owner_cert_reverify_required = false;
+                            // ADR-0064 slice 4 (slice-1 review non-blocking
+                            // (1)): the EVICTION arm of the explicit seal
+                            // route clears the fork marker under the SAME
+                            // fence as the all-clean arm — the local
+                            // install holds the owner USER key (#469 A1b
+                            // fence) and the sealed revision (bumped by
+                            // the eviction seals) is strictly greater
+                            // than the evidenced one.
                             info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
                         }
                         true
                     })
-                    .await
-                    .ok();
+                    .await;
+                    if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
+                        tracing::warn!(
+                            group_id = %id,
+                            ?persist_outcome,
+                            "ADR-0064/ADR-0038: eviction-arm reverify-flag/fork-marker clear was not directory-durable — marker kept, refusing"
+                        );
+                        return Some(Err(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "named-group state is not directory-durable",
+                        )));
+                    }
                     return Some(Ok((commit, evicted_total.clone())));
                 }
                 // InGrace members remain (they were NOT evicted — not in
@@ -28137,12 +28141,10 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                                         }
                                     }
                                 }
-                                // ADR-0064 slice 4: recovery never carries
-                                // an owner mandate, so the
-                                // owner-anchored-successor clear is
-                                // unreachable here by construction.
-                                ForkEvidenceOutcome::OwnerAnchoredSuccessor
-                                | ForkEvidenceOutcome::NotEvidence => {}
+                                // ADR-0064 slice 4 r2: recovery never
+                                // carries an owner mandate, so no
+                                // anchored classification can arise here.
+                                ForkEvidenceOutcome::NotEvidence => {}
                             }
                         }
                         return Err(format!(

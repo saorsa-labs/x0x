@@ -193,11 +193,12 @@ pub struct GroupCounters {
     /// legitimate-successor clear on conflicting evidence) — the
     /// owner-anchored commit is not only a seal.
     pub fork_quarantine_owner_anchored_clears: u64,
-    /// ADR-0064 slice 4: a conflicting commit whose owner mandate
-    /// VERIFIES (the owner vouched for its header) but was REFUSED as a
-    /// clear — not through retained ancestry, or not strictly greater
-    /// than the evidenced revision. Attributable refusal so the
-    /// contested branch cannot silently probe the clear path.
+    /// ADR-0064 slice 4 (r2): a conflicting commit whose owner mandate
+    /// VERIFIES (the owner vouched for its header) — counted on EVERY
+    /// such conflict, because the conflict path NEVER clears (ADR §3:
+    /// a marker clears only when this node APPLIES an owner-anchored
+    /// commit). Attributable signal so the contested branch cannot
+    /// silently probe the clear path.
     pub fork_quarantine_owner_anchored_refusals: u64,
 }
 

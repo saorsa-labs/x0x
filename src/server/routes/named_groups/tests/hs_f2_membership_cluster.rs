@@ -5516,3 +5516,170 @@ async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
     );
     Ok(())
 }
+
+/// WHY (ADR-0064 slice 4 r2, review item 2 — DEADLOCK): the causal-replay
+/// loop calls the serialized apply with `roster_lock_already_held = true`
+/// while HOLDING `named_groups_persistence_lock`; a queued MemberAdded
+/// that replays into the refused-adoption arm must not try to take that
+/// lock again inside the joiner chain classification. Same #468 fixture
+/// as the sibling test, driven through the replay-shaped call under the
+/// held lock, bounded by a timeout so a regression FAILS instead of
+/// hanging the suite.
+#[tokio::test]
+async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> Result<()> {
+    let stage = issue458_stage(0x9E, false).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+
+    let a_kp = AgentKeypair::generate()?;
+    let a_hex = hex::encode(a_kp.agent_id().as_bytes());
+    let mut stub = stage.base_info.clone();
+    stub.add_member(
+        a_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        Some(authority_hex.clone()),
+        None,
+    );
+    let base_revision = stub.state_revision.saturating_add(1);
+    let base_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        base_revision,
+        Some(stub.state_hash.clone()),
+        x0x::groups::compute_roster_root(&stub.members_v2),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    stub.prev_state_hash = Some(stub.state_hash.clone());
+    stub.state_hash = base_commit.state_hash.clone();
+    stub.state_revision = base_revision;
+    stub.commit_log
+        .push(x0x::groups::state_commit::RetainedCommit {
+            commit: base_commit,
+            roster: x0x::groups::state_commit::roster_projection(&stub.members_v2),
+            meta: Some(stub.public_meta()),
+        });
+    stub.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: stub.state_revision,
+        base_hash: stub.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    });
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    let policy_hash = x0x::groups::compute_policy_hash(&stub.policy);
+    let mut fork_meta = stub.public_meta();
+    fork_meta.description = "a-fork-1".to_string();
+    let link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        base_revision.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        fork_meta.clone(),
+        &a_kp,
+    );
+    let mut fork_roster_with_joiner = stub.members_v2.clone();
+    fork_roster_with_joiner.insert(stage.joiner_hex.clone(), {
+        let mut m = x0x::groups::GroupMember::new_member(
+            stage.joiner_hex.clone(),
+            None,
+            None,
+            now_millis_u64(),
+        );
+        m.role = x0x::groups::GroupRole::Member;
+        m
+    });
+    let terminal = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        base_revision.saturating_add(2),
+        Some(link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&fork_roster_with_joiner),
+        policy_hash.clone(),
+        x0x::groups::compute_public_meta_hash(&fork_meta),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp,
+    )?;
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: terminal.revision,
+        actor: a_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(terminal.clone()),
+    };
+    let chain_key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(chain_key, vec![link]);
+
+    // The causal-replay shape: hold the persistence lock, drive the
+    // serialized apply with roster_lock_already_held = true. Bounded by a
+    // timeout so a deadlock regression FAILS rather than hangs.
+    let _guard = joiner_state.named_groups_persistence_lock.lock().await;
+    let mut replay_group_id: Option<String> = None;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        apply_named_group_metadata_event_inner_serialized(
+            &joiner_state,
+            event,
+            a_kp.agent_id(),
+            true,
+            false,
+            None,
+            None,
+            &mut replay_group_id,
+            true,
+            true,
+        ),
+    )
+    .await;
+    let result = outcome.expect(
+        "no deadlock: the joiner chain classification uses the UNLOCKED persist under the held lock",
+    );
+    assert!(
+        !result.accepted,
+        "the unattested removed-admin fork is refused"
+    );
+    let groups = joiner_state.named_groups.read().await;
+    let info = groups.get(&stage.group_id).expect("stub retained");
+    assert!(
+        info.fork_quarantine.as_ref().is_some_and(|marker| marker
+            .snapshot
+            .classification
+            .as_deref()
+            == Some("signer_only")),
+        "the evidence install completed under the held lock (unlocked persist)"
+    );
+    Ok(())
+}

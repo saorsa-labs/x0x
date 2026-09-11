@@ -1124,6 +1124,160 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
     let row2 = diag_row(&state, &group2).await;
     assert_eq!(row2.counters.fork_evidence_unauthorized_signer, 1);
     assert_eq!(row2.counters.fork_evidence_signer_only, 0);
+
+    // r2 advisory — parent-roster vs CURRENT-roster discrimination: A is
+    // admin at the claimed parent (the retained rev-1 seating commit)
+    // but REMOVED from the current roster (the canonical rev-2 removal
+    // is our head). A's conflicting twin claiming the rev-1 parent is
+    // `signer_only` — the classification reads the PARENT snapshot, so
+    // a current-roster check would have (wrongly) called A
+    // unauthenticated.
+    let group3 = "bc3".repeat(32);
+    let base3 =
+        cert_sealed_group_with_lineage(&state, &group3, owner_certified_policy(&owner_kp)).await?;
+    let a_kp3 = AgentKeypair::generate()?;
+    let a_hex3 = hex::encode(a_kp3.agent_id().as_bytes());
+    let cert3 = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        a_kp3.public_key().as_bytes(),
+        None,
+    )?;
+    state.agent.identity_discovery_cache().write().await.insert(
+        cert3.agent_id()?,
+        x0x::DiscoveredAgent {
+            agent_id: cert3.agent_id()?,
+            machine_id: x0x::identity::MachineId([0u8; 32]),
+            user_id: cert3.user_id().ok(),
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: 1,
+            last_seen: 1,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: cert3.not_after(),
+            agent_certificate: Some(cert3.clone()),
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        },
+    );
+    let seating_commit = {
+        let mut seated = base3.clone();
+        seated.add_member(
+            a_hex3.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(authority_hex.clone()),
+            None,
+        );
+        seated
+            .set_member_certificate(&a_hex3, cert3.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        seal_commit_owner_certified(
+            &state,
+            &mut seated,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        seated.commit_log.last().expect("sealed").commit.clone()
+    };
+    {
+        let current3 = live_record(&state, &group3).await;
+        let applied = apply_stateful_event_with_evidence(
+            &state,
+            &group3,
+            &current3,
+            &seating_commit,
+            None,
+            false,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.add_member(
+                    a_hex3.clone(),
+                    x0x::groups::GroupRole::Admin,
+                    Some(authority_hex.clone()),
+                    None,
+                );
+                next.set_member_certificate(&a_hex3, cert3.clone())
+                    .expect("seat cert");
+            },
+        )
+        .await
+        .expect("seating applies");
+        persist_applied(&state, &group3, applied).await?;
+    }
+    // Canonical removal of A at the next revision (our head).
+    {
+        let mut after = live_record(&state, &group3).await;
+        after.remove_member(&a_hex3, Some(authority_hex.clone()));
+        seal_commit_owner_certified(
+            &state,
+            &mut after,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        let commit = after.commit_log.last().expect("sealed").commit.clone();
+        let current3 = live_record(&state, &group3).await;
+        let applied = apply_stateful_event_with_evidence(
+            &state,
+            &group3,
+            &current3,
+            &commit,
+            None,
+            false,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.remove_member(&a_hex3, Some(authority_hex.clone()));
+            },
+        )
+        .await
+        .expect("removal applies");
+        persist_applied(&state, &group3, applied).await?;
+    }
+    let head3 = live_record(&state, &group3).await;
+    assert!(!head3
+        .members_v2
+        .iter()
+        .any(|(id, m)| { id == &a_hex3 && m.state == x0x::groups::GroupMemberState::Active }));
+    // A's conflicting twin claiming the RETAINED seating commit as
+    // parent (A was admin there), while our head is the removal.
+    let mut twin_meta = head3.public_meta();
+    twin_meta.description = "a-twin-from-seating".to_string();
+    let a_twin = x0x::groups::GroupStateCommit::sign(
+        head3.stable_group_id().to_string(),
+        seating_commit.revision.saturating_add(1),
+        Some(seating_commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&head3.members_v2),
+        x0x::groups::compute_policy_hash(&head3.policy),
+        x0x::groups::compute_public_meta_hash(&twin_meta),
+        head3.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp3,
+    )?;
+    let refused3 = apply_commit(&state, &group3, a_twin, "a-twin-from-seating").await?;
+    assert!(refused3.is_err());
+    {
+        let record = live_record(&state, &group3).await;
+        let marker = record.fork_quarantine.as_ref().expect("marker");
+        assert_eq!(
+            marker.committed_by, a_hex3,
+            "the removed admin's twin is the evidenced conflict"
+        );
+        assert_eq!(
+            marker.snapshot.classification.as_deref(),
+            Some("signer_only"),
+            "admin at the CLAIMED PARENT (the seating commit) — the parent snapshot decides, \
+             not the current roster where A is removed"
+        );
+    }
+    let row3 = diag_row(&state, &group3).await;
+    assert_eq!(row3.counters.fork_evidence_signer_only, 1);
     Ok(())
 }
 
@@ -1325,18 +1479,22 @@ async fn adr0064_contested_branch_anchored_commit_cannot_clear() -> Result<()> {
     Ok(())
 }
 
-/// WHY (ADR-0064 slice 4, Decision §3 + attack matrix "equal-revision
-/// valid-sibling forks / owner anchor decides"): a mandate-anchored
-/// conflicting commit that DOES chain through retained ancestry at a
-/// strictly greater revision than the evidence is the legitimate
-/// successor — no evidence, marker CLEARED, gate re-armed. Fixture: our
-/// head is the contested twin at rev 3; the owner anchors the OTHER
-/// twin's successor at rev 4 claiming our retained rev-2 parent… no —
-/// the honest shape: evidence at rev 2, our head advanced to rev 3 on
-/// the contested chain, and the owner anchors a rev-3 SIBLING (chains
-/// from our retained rev 2, StaleRevision against our head).
+/// WHY (ADR-0064 slice 4 r2, review item 1 — ADR §3 conformance): the
+/// CONFLICT PATH NEVER CLEARS. A mandate-anchored conflicting commit
+/// that chains through retained ancestry at strictly greater revision
+/// than the evidence is still a CONFLICT — this node holds the disowned
+/// sibling and would keep applying it, so clearing would un-gate the
+/// node and the next canonical commit would re-quarantine the same
+/// divergence (flapping). The Accepted ADR's clear rule ("a
+/// same-revision sibling — the contested branch itself — can never
+/// clear"; the marker clears ONLY when this node APPLIES commit C)
+/// wins over the round-1 reading. The anchored conflicting successor
+/// is recorded as `owner_anchored_conflict` EVIDENCE and the
+/// attributable no-clear counter fires; containment lifts only when an
+/// anchored commit APPLIES (the apply-path clear, pinned in
+/// tests/owner_mandate.rs::owner_anchored_apply_path_clears_quarantine).
 #[tokio::test]
-async fn adr0064_owner_anchored_successor_conflicting_commit_clears() -> Result<()> {
+async fn adr0064_owner_anchored_successor_conflicting_commit_never_clears() -> Result<()> {
     let (state, _dir, owner_kp) = owner_authority_state().await?;
     let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group_id = "be".repeat(32);
@@ -1380,8 +1538,9 @@ async fn adr0064_owner_anchored_successor_conflicting_commit_clears() -> Result<
     // The owner anchors the OTHER branch's rev-3 sibling: chains from
     // our RETAINED rev-2 commit (the fork-a twin we applied — its hash
     // is in our log), conflicts with our rev-3 head (StaleRevision
-    // twin), carries a verifying mandate. Signed directly over the
-    // retained parent so the claimed-parent/consecutiveness fence holds.
+    // twin), carries a verifying mandate, and is at revision 3 > the
+    // evidenced revision 2 — the coherent anchored successor shape.
+    // Round 1 cleared here; r2 records evidence instead.
     let current = live_record(&state, &group_id).await;
     let mut anchored_meta = current.public_meta();
     anchored_meta.description = "owner-anchored-3".to_string();
@@ -1417,7 +1576,6 @@ async fn adr0064_owner_anchored_successor_conflicting_commit_clears() -> Result<
     )
     .expect("sign anchored mandate");
 
-    let current = live_record(&state, &group_id).await;
     let outcome = apply_stateful_event_with_evidence(
         &state,
         &group_id,
@@ -1437,20 +1595,18 @@ async fn adr0064_owner_anchored_successor_conflicting_commit_clears() -> Result<
     );
     let record = live_record(&state, &group_id).await;
     assert!(
-        !record.is_fork_quarantined(),
-        "the owner-anchored legitimate successor CLEARS the marker"
-    );
-    assert!(
-        record
-            .invite_lineage
-            .as_ref()
-            .and_then(|lineage| lineage.fork_evidence.as_ref())
-            .is_none(),
-        "and re-arms the evidence gate"
+        record.is_fork_quarantined(),
+        "r2 (ADR §3): the conflict path NEVER clears — even a coherent anchored successor"
     );
     let row = diag_row(&state, &group_id).await;
-    assert_eq!(row.counters.fork_quarantine_owner_anchored_clears, 1);
-    assert_eq!(row.counters.fork_quarantine_owner_anchored_refusals, 0);
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_refusals, 1,
+        "the anchored conflicting commit counted an attributable no-clear"
+    );
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_clears, 0,
+        "no clear fired on the conflict path"
+    );
     Ok(())
 }
 

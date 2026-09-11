@@ -416,20 +416,26 @@ not fake a chain the node cannot see):
 
 | Classification | Condition | Outcome |
 |---|---|---|
-| legitimate successor | the commit carries an `OwnerMandate` that **anchors** its exact header (owner USER-key signature over the terminal revision/parent/roster-root/policy/meta; `OwnerMandate::anchors_commit` under the owner key derived from committed roster certificates) AND chains consecutively through retained ancestry, at a revision strictly greater than the evidence | no evidence; the marker CLEARS and the evidence gate re-arms |
+| `owner_anchored_conflict` | the commit carries an `OwnerMandate` that **anchors** its exact header (owner USER-key signature over the terminal revision/parent/roster-root/policy/meta; `OwnerMandate::anchors_commit` under the owner key derived from committed roster certificates) AND chains consecutively through retained ancestry, at a revision strictly greater than the evidence | evidence + quarantine marker with `classification: "owner_anchored_conflict"` — the owner anchored a successor this node CANNOT apply (it holds the disowned sibling); **the conflict path never clears** (r2, ADR §3) |
 | `signer_only` | the signer was an ACTIVE ADMIN at the claimed parent (or, for a joiner whose adoption was refused, the served chain walked clean from the joiner's base) but no owner anchor is reachable | evidence + quarantine marker; `classification: "signer_only"` on the forensic snapshot |
 | `unauthorized_signer` | the signer held a seat somewhere in the retained history but NOT active-admin at the claimed parent — an admin removed by the very commit the fork chains from, or a plain member signer | evidence + quarantine marker; `classification: "unauthorized_signer"` |
 | unauthenticated | the signature/structure fails, or the signer is unknown to the ENTIRE retained log | never evidence (the slice-1 invariant: an unauthenticated conflict cannot contain the node) |
 | degraded | the claimed parent is not retained (the fork chains from history this node never held) | the pre-slice-4 revision−1 retained-predecessor check decides, with no label |
 
-The legitimate-successor evaluation runs BEFORE the stored-evidence
-silence gate: an anchored successor must be able to clear even while the
-lineage still carries the first fork's evidence. A verifying anchor
-that FAILS the ancestry or strictly-greater fence (the contested branch
-publishing an owner-anchored N+3 from its own head) counts
-`fork_quarantine_owner_anchored_refusals` — the refusal is attributable,
-never a silent chain failure. Counters
-`fork_evidence_signer_only` / `fork_evidence_unauthorized_signer` /
+The owner-anchor evaluation runs BEFORE the stored-evidence silence
+gate so an anchored conflicting commit is always classified, and every
+verifying anchor counts the attributable
+`fork_quarantine_owner_anchored_refusals` — r2 (ADR §3): the CONFLICT
+path never clears. A marker clears ONLY when this node APPLIES an
+owner-anchored commit at strictly greater revision (see below);
+clearing on a conflicting anchored successor would un-gate a node that
+still holds the disowned sibling, and the next canonical commit would
+re-quarantine the same divergence. An anchor that additionally fails
+the ancestry or strictly-greater fence (the contested branch
+publishing an owner-anchored N+3 from its own head) records nothing at
+all — the counter alone is the probe signal, never a silent chain
+failure. Counters `fork_evidence_signer_only` /
+`fork_evidence_unauthorized_signer` /
 `fork_quarantine_owner_anchored_clears` ride `/diagnostics/groups`.
 Joiners whose tier-1 adoption was refused (the #468 stale-removal
 shape: a removed admin serving its own walk-perfect chain with no owner
@@ -440,19 +446,24 @@ base records nothing. Non-owner-axis groups keep the pre-slice-4
 evaluation byte-for-byte.
 
 **The complete clear rule.** The marker clears through owner-anchored
-paths ONLY, and slice 4 completes the set:
+paths ONLY, and every one of them clears on a commit this node APPLIES
+at a revision strictly greater than the evidence (r2, ADR §3 — a
+same-revision sibling, the contested branch itself, can never clear,
+and neither can a conflicting successor however well anchored):
 
 - the explicit seal route with the owner USER key and strictly greater
   revision (slice 1 r2) — now INCLUDING its eviction arm: an explicit
   seal that evicted failing members clears under exactly the same fence
-  (before slice 4 an evicting seal left the marker until the next one);
+  (before slice 4 an evicting seal left the marker until the next
+  seal; r2 additionally moved the clear INSIDE the persist transaction
+  so a non-durable clear answers 503 with the marker intact in memory
+  and on disk);
 - tier-1 attestation-verified adoption at strictly greater revision
   (slice 1 r2);
 - **a mandate-carrying `MemberAdded` whose `OwnerMandate` verifies** —
-  the ADR's "owner-anchored commit" is not only a seal. On the apply
+  the ADR's "owner-anchored commit" is not only a seal: on the APPLY
   path (gapless or walked adoption, so retained ancestry holds by
-  construction) it clears at strictly greater revision; as a CONFLICTING
-  commit it is the legitimate-successor row above;
+  construction) it clears at strictly greater revision;
 - the manual endpoint (slice 3).
 
 EVERY clear re-arms the stored fork-evidence silence gate
@@ -463,10 +474,17 @@ re-quarantines. The in-process once-only diagnostics remain
 identity-keyed, so a genuinely new fork identity still fires its warn.
 
 **Sidecar mirroring (#472 decision 6).** For owner-axis groups the
-quarantine marker AND the `mandate_capability` map persist in the
-`home-suite-groups.json` sidecar — the authoritative record — through
-the same compare-and-restore two-file write that keeps the pair
-recoverable as a unit. The load path merges sidecar-wins for
-owner-axis groups, so an old (or downgraded) binary rewriting
-`named_groups.json` alone — dropping fields it does not know — can
-never drop containment or the grace clocks.
+quarantine marker AND the `mandate_capability` map were ALREADY carried
+by the `home-suite-groups.json` sidecar — the authoritative record —
+through the pre-existing #451 split write (sidecar first, the
+`named_groups.json` placeholder second, #471 rollback restoring the
+sidecar) with serde-default fields since slices 1–2; the load path
+merges sidecar-wins for owner-axis groups, so an old (or downgraded)
+binary rewriting `named_groups.json` alone — dropping fields it does
+not know — can never drop containment or the grace clocks. Slice 4
+PINS that guarantee by test. Caveat: the protection covers legacy-view
+rewrites only — an OLD SIDECAR-AWARE binary that rewrites the SIDECAR
+itself (not just the placeholder) drops both fields from the
+authoritative record; a downgrade across a sidecar-aware version loses
+containment exactly as the ADR's migration table accepts ("never
+bricks").
