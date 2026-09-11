@@ -46,6 +46,14 @@ published 2026-09-06) contains `SignedKvTopic` / `x0x-msg-v3`. Current x0x
 **ant-quic 0.27.50**. Do **not** renew a publication-only G4 block against
 modern release or against reading those crates.
 
+**Moved (2026-09-11):** x0x now requires the coherent **0.5.77** gossip family
+(saorsa-gossip#54, stranded-publish recovery). The #501 meter premise — the
+`saorsa-gossip-pubsub` lock pin checked by
+`paired_controlled_load_bus_eager_attempts_default_vs_optout` and
+`scripts/ci/derive-legacy-bus-attempts.py` — moved with it to registry
+[pubsub 0.5.77](https://crates.io/crates/saorsa-gossip-pubsub/0.5.77)
+(checksum `73b1d21df86ce58ee075f88e2d9d978e746f313d089be2fcfe46fe484214789f`).
+
 **Still historical warning:** registry **0.5.75** (Aug 27) predates #48 despite
 the earlier workspace version string — never treat 0.5.75 as #48 adoption.
 
