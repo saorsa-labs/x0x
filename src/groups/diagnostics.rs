@@ -178,6 +178,29 @@ pub struct GroupCounters {
     /// through `POST /groups/:id/quarantine/clear` (owner-key node clear
     /// or `force` + non-empty reason).
     pub fork_quarantine_manual_clears: u64,
+    /// ADR-0064 slice 4 (#472 decision 3): fork evidence classified as
+    /// `signer_only` — the signer was an active admin at the conflicting
+    /// commit's claimed parent (or the joiner's served chain validated
+    /// through the ancestor walk) but the owner anchor is unavailable.
+    pub fork_evidence_signer_only: u64,
+    /// ADR-0064 slice 4: fork evidence classified as an UNAUTHORIZED
+    /// signer — held a seat somewhere in retained history but not
+    /// active-admin at the claimed parent (removed-admin fork chaining
+    /// from its own removal, or a plain member signer).
+    pub fork_evidence_unauthorized_signer: u64,
+    /// ADR-0064 slice 4 (Decision §3, r2): owner-anchored quarantine
+    /// clears via a mandate-carrying MemberAdded that this node APPLIES
+    /// (the apply-path clear — the only anchored clear; the conflict
+    /// path never clears) — the owner-anchored commit is not only a
+    /// seal.
+    pub fork_quarantine_owner_anchored_clears: u64,
+    /// ADR-0064 slice 4 (r2): a conflicting commit whose owner mandate
+    /// VERIFIES (the owner vouched for its header) — counted on EVERY
+    /// such conflict, because the conflict path NEVER clears (ADR §3:
+    /// a marker clears only when this node APPLIES an owner-anchored
+    /// commit). Attributable signal so the contested branch cannot
+    /// silently probe the clear path.
+    pub fork_quarantine_owner_anchored_refusals: u64,
 }
 
 /// Per-group gauges for ADR 0028 causal predecessor delivery. Populated by the
@@ -359,6 +382,18 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.owner_mandate_invalid = dst
         .owner_mandate_invalid
         .saturating_add(src.owner_mandate_invalid);
+    dst.fork_evidence_signer_only = dst
+        .fork_evidence_signer_only
+        .saturating_add(src.fork_evidence_signer_only);
+    dst.fork_evidence_unauthorized_signer = dst
+        .fork_evidence_unauthorized_signer
+        .saturating_add(src.fork_evidence_unauthorized_signer);
+    dst.fork_quarantine_owner_anchored_clears = dst
+        .fork_quarantine_owner_anchored_clears
+        .saturating_add(src.fork_quarantine_owner_anchored_clears);
+    dst.fork_quarantine_owner_anchored_refusals = dst
+        .fork_quarantine_owner_anchored_refusals
+        .saturating_add(src.fork_quarantine_owner_anchored_refusals);
     dst.owner_mandate_absent = dst
         .owner_mandate_absent
         .saturating_add(src.owner_mandate_absent);
@@ -463,6 +498,46 @@ impl GroupsDiagnostics {
     pub fn record_owner_mandate_missing(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.owner_mandate_missing = c.owner_mandate_missing.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 4 (#472 decision 3): one fork-evidence record was
+    /// classified `signer_only` — signer authenticated at the claimed
+    /// parent (or the served joiner chain walked clean) with no owner
+    /// anchor available.
+    pub fn record_fork_evidence_signer_only(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_evidence_signer_only = c.fork_evidence_signer_only.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 4: one fork-evidence record was classified as an
+    /// unauthorized signer (seat somewhere in retained history, not
+    /// active-admin at the claimed parent).
+    pub fn record_fork_evidence_unauthorized_signer(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_evidence_unauthorized_signer =
+                c.fork_evidence_unauthorized_signer.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 4 (Decision §3, r2): the fork-quarantine marker
+    /// was cleared by an owner-anchored mandate-carrying commit this
+    /// node APPLIED (the apply-path clear).
+    pub fn record_fork_quarantine_owner_anchored_clear(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_quarantine_owner_anchored_clears =
+                c.fork_quarantine_owner_anchored_clears.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 4: a verifying owner mandate on a conflicting
+    /// commit was REFUSED as a clear (ancestry/strictly-greater fence) —
+    /// the attributable contested-branch probe signal.
+    pub fn record_fork_quarantine_owner_anchored_refusal(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.fork_quarantine_owner_anchored_refusals =
+                c.fork_quarantine_owner_anchored_refusals.saturating_add(1);
         });
     }
 
@@ -1261,6 +1336,10 @@ mod tests {
             owner_mandate_missing: base + 40,
             mandate_capability_refusing_transitions: base + 41,
             fork_quarantine_manual_clears: base + 42,
+            fork_evidence_signer_only: base + 43,
+            fork_evidence_unauthorized_signer: base + 44,
+            fork_quarantine_owner_anchored_clears: base + 45,
+            fork_quarantine_owner_anchored_refusals: base + 46,
         };
         let src = counters_with(1_000);
         let dst = counters_with(7);
@@ -1441,6 +1520,23 @@ mod tests {
         assert_eq!(
             merged.fork_quarantine_manual_clears,
             dst.fork_quarantine_manual_clears + src.fork_quarantine_manual_clears
+        );
+        assert_eq!(
+            merged.fork_evidence_signer_only,
+            dst.fork_evidence_signer_only + src.fork_evidence_signer_only
+        );
+        assert_eq!(
+            merged.fork_evidence_unauthorized_signer,
+            dst.fork_evidence_unauthorized_signer + src.fork_evidence_unauthorized_signer
+        );
+        assert_eq!(
+            merged.fork_quarantine_owner_anchored_clears,
+            dst.fork_quarantine_owner_anchored_clears + src.fork_quarantine_owner_anchored_clears
+        );
+        assert_eq!(
+            merged.fork_quarantine_owner_anchored_refusals,
+            dst.fork_quarantine_owner_anchored_refusals
+                + src.fork_quarantine_owner_anchored_refusals
         );
         assert_eq!(merged.members_awaiting_certificate, gauge_before);
     }

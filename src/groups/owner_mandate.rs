@@ -313,6 +313,65 @@ impl OwnerMandate {
         }
         Ok(())
     }
+
+    /// ADR-0064 slice 4 (Decision §2/§3): does this mandate bind EXACTLY
+    /// the given commit header as its owner-anchored terminal — the
+    /// "owner-anchored commit" of the quarantine CLEAR rule — under the
+    /// given owner key? Unlike [`Self::verify_against_terminal`] this
+    /// runs on a commit that FAILED to apply locally (a conflicting
+    /// successor), so there is no candidate roster to re-derive: it
+    /// checks every HEADER-level binding the mandate makes against the
+    /// commit's own claims plus the owner signature. The commit's own
+    /// structure/signature must be validated separately by the caller
+    /// (`verify_structure`). The roster-root triple-equality runs only
+    /// when the commit actually applies; here the anchor question is
+    /// exactly "did the owner vouch for this commit header".
+    pub fn anchors_commit(
+        &self,
+        owner_public_key: &MlDsaPublicKey,
+        expected_owner: &UserId,
+        group_stable_id: &str,
+        commit: &GroupStateCommit,
+    ) -> bool {
+        if UserId::from_public_key(owner_public_key) != *expected_owner {
+            return false;
+        }
+        if self.version != OWNER_MANDATE_VERSION {
+            return false;
+        }
+        if self.stable_group_id != group_stable_id || commit.group_id != group_stable_id {
+            return false;
+        }
+        // The authority the mandate blesses must be the commit's signer.
+        if !self
+            .authority_agent_id
+            .eq_ignore_ascii_case(&commit.committed_by)
+        {
+            return false;
+        }
+        self.expected_terminal_revision == commit.revision
+            && commit.prev_state_hash.as_deref() == Some(self.parent_state_hash.as_str())
+            && self.roster_root_after_add == commit.roster_root
+            && self.policy_hash == commit.policy_hash
+            && self.public_meta_hash == commit.public_meta_hash
+            && self.signature_verifies(owner_public_key)
+    }
+
+    /// The raw owner-USER-key signature check over this mandate's
+    /// canonical preimage (shared by the full verify and the
+    /// anchors-commit predicate).
+    fn signature_verifies(&self, owner_public_key: &MlDsaPublicKey) -> bool {
+        let Ok(sig_bytes) = B64_STD.decode(&self.signature_b64) else {
+            return false;
+        };
+        let Ok(sig) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        else {
+            return false;
+        };
+        let digest = mandate_digest(&self.canonical_bytes());
+        verify_with_ml_dsa(owner_public_key, &digest, &sig).is_ok()
+    }
 }
 
 /// ADR-0064 §1b capability state for ONE authority agent. An ABSENT map

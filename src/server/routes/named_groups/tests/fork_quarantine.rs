@@ -117,6 +117,7 @@ async fn apply_commit(
         group_id,
         &current,
         &commit,
+        None,
         false,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
@@ -361,6 +362,7 @@ async fn adr0064_bootstrap_snapshot_strips_and_rejects_marker() -> Result<()> {
         snapshot: x0x::groups::ForkSnapshot {
             terminal_commit: info.terminal_commit_header(),
             conflicting_commit: info.terminal_commit_header(),
+            classification: None,
         },
         no_anchor: false,
     });
@@ -845,6 +847,974 @@ async fn adr0064_explicit_seal_without_owner_user_key_does_not_clear() -> Result
     assert!(
         record.is_fork_quarantined(),
         "no local owner user key → the seal is not an owner anchor and must not clear"
+    );
+    Ok(())
+}
+
+// ─────────── ADR-0064 slice 4: classification + clear completion ───────────
+
+/// Slice-4 fixture: like [`sealed_group_with_lineage`] but with the
+/// local agent's builder-issued certificate SEATED before the seal, so
+/// the roster carries committed owner-keyed material the
+/// owner-anchored-successor predicate can derive the owner public key
+/// from (`trusted_owner_public_key`).
+async fn cert_sealed_group_with_lineage(
+    state: &AppState,
+    group_id: &str,
+    policy: GroupPolicy,
+) -> Result<x0x::groups::GroupInfo> {
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "quarantine-s4-under-test".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.to_string(),
+        policy,
+    );
+    let creator_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let cert = state
+        .agent
+        .agent_certificate()
+        .expect("builder-issued certificate")
+        .clone();
+    info.set_member_certificate(&creator_hex, cert)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    seal_commit_owner_certified(
+        state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    info.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: info.state_revision,
+        base_hash: info.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    });
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.to_string(), info.clone());
+    Ok(info)
+}
+
+/// WHY (ADR-0064 slice 4, #472 decision 3): the classification labels
+/// the forensic snapshot with what the retained log could prove:
+/// `signer_only` for a signer who was an ACTIVE ADMIN at the
+/// conflicting commit's claimed parent, `unauthorized_signer` for a
+/// seat-holder who was NOT active-admin there (the removed-admin
+/// chaining-from-its-own-removal shape).
+#[tokio::test]
+async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "ba".repeat(32);
+    let base = cert_sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp))
+        .await?;
+
+    // (b) signer_only: the authority's own conflicting twin — it was an
+    // active admin at the twin's claimed parent (our retained base).
+    let fork_a = owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = owner_seal_variant(&state, &base, "fork-b").await?;
+    let fork_a_commit = fork_a.commit_log.last().expect("sealed").commit.clone();
+    let fork_b_commit = fork_b.commit_log.last().expect("sealed").commit.clone();
+    let first = apply_commit(&state, &group_id, fork_a_commit, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+    let second = apply_commit(&state, &group_id, fork_b_commit, "fork-b").await?;
+    assert!(second.is_err());
+    {
+        let record = live_record(&state, &group_id).await;
+        let marker = record.fork_quarantine.as_ref().expect("marker");
+        assert_eq!(
+            marker.committed_by, authority_hex,
+            "the twin is the evidenced conflict"
+        );
+        assert_eq!(
+            marker.snapshot.classification.as_deref(),
+            Some("signer_only"),
+            "signer was an active admin at the claimed parent"
+        );
+    }
+    let row = diag_row(&state, &group_id).await;
+    assert_eq!(row.counters.fork_evidence_signer_only, 1);
+    assert_eq!(row.counters.fork_evidence_unauthorized_signer, 0);
+
+    // (c) unauthorized_signer: a second admin A is seated then REMOVED
+    // canonically; A's later conflicting commit chains from the removal
+    // commit — A held a seat in retained history but was NOT an active
+    // admin at the claimed parent.
+    let group2 = "bb".repeat(32);
+    let base2 =
+        cert_sealed_group_with_lineage(&state, &group2, owner_certified_policy(&owner_kp)).await?;
+    let a_kp = AgentKeypair::generate()?;
+    let a_hex = hex::encode(a_kp.agent_id().as_bytes());
+    // Seat A WITH an owner-issued certificate (the owner-certified seal
+    // requires certifiable actives) and seed the discovery cache so the
+    // seal's evidence builder resolves it.
+    let a_cert = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        a_kp.public_key().as_bytes(),
+        None,
+    )?;
+    state.agent.identity_discovery_cache().write().await.insert(
+        a_cert.agent_id()?,
+        x0x::DiscoveredAgent {
+            agent_id: a_cert.agent_id()?,
+            machine_id: x0x::identity::MachineId([0u8; 32]),
+            user_id: a_cert.user_id().ok(),
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: 1,
+            last_seen: 1,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: a_cert.not_after(),
+            agent_certificate: Some(a_cert.clone()),
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        },
+    );
+    let mut removed = base2.clone();
+    removed.add_member(
+        a_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        Some(authority_hex.clone()),
+        None,
+    );
+    removed
+        .set_member_certificate(&a_hex, a_cert.clone())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    seal_commit_owner_certified(
+        &state,
+        &mut removed,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    let removal_commit = removed.commit_log.last().expect("sealed").commit.clone();
+    let current2 = live_record(&state, &group2).await;
+    let a_cert_for_seat = a_cert.clone();
+    let seated = apply_stateful_event_with_evidence(
+        &state,
+        &group2,
+        &current2,
+        &removal_commit,
+        None,
+        false,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.add_member(
+                a_hex.clone(),
+                x0x::groups::GroupRole::Admin,
+                Some(authority_hex.clone()),
+                None,
+            );
+            next.set_member_certificate(&a_hex, a_cert_for_seat.clone())
+                .expect("seat cert");
+        },
+    )
+    .await
+    .expect("seating applies (chains from the base)");
+    persist_applied(&state, &group2, seated).await?;
+    // Canonical removal of A at rev 3.
+    let mut after_removal = live_record(&state, &group2).await;
+    after_removal.remove_member(&a_hex, Some(authority_hex.clone()));
+    seal_commit_owner_certified(
+        &state,
+        &mut after_removal,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    let removal_commit = after_removal
+        .commit_log
+        .last()
+        .expect("sealed")
+        .commit
+        .clone();
+    let current3 = live_record(&state, &group2).await;
+    let removal_applied = apply_stateful_event_with_evidence(
+        &state,
+        &group2,
+        &current3,
+        &removal_commit,
+        None,
+        false,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.remove_member(&a_hex, Some(authority_hex.clone()));
+        },
+    )
+    .await
+    .expect("removal applies");
+    persist_applied(&state, &group2, removal_applied).await?;
+    let removal_head_hash = removal_commit.state_hash.clone();
+    let head = live_record(&state, &group2).await;
+    assert!(
+        head.commit_log
+            .iter()
+            .any(|rc| rc.roster.contains_key(&a_hex)),
+        "A is still visible in the retained history (its seating commit)"
+    );
+    // One more canonical commit so A's conflicting rev-4 twin (claiming
+    // the REMOVAL commit as parent) arrives as StaleRevision evidence
+    // rather than dying at the authority check.
+    let canonical4 = {
+        let mut next = live_record(&state, &group2).await;
+        next.description = "canonical-4".to_string();
+        seal_commit_owner_certified(
+            &state,
+            &mut next,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        next
+    };
+    let canonical4_commit = canonical4.commit_log.last().expect("sealed").commit.clone();
+    let applied4 = apply_commit(&state, &group2, canonical4_commit, "canonical-4").await?;
+    assert!(applied4.is_ok());
+    persist_applied(&state, &group2, applied4.expect("applied")).await?;
+    let head = live_record(&state, &group2).await;
+
+    // A's conflicting commit at rev 4 claiming the REMOVAL commit as its
+    // parent: claimed parent retained, A absent from its roster (removed
+    // there) but visible in earlier retained history. Distinct meta so
+    // the twin hash differs from our retained canonical-4.
+    let mut stale_meta = head.public_meta();
+    stale_meta.description = "removed-admin-fork".to_string();
+    let stale = x0x::groups::GroupStateCommit::sign(
+        head.stable_group_id().to_string(),
+        head.state_revision,
+        Some(removal_head_hash.clone()),
+        x0x::groups::compute_roster_root(&head.members_v2),
+        x0x::groups::compute_policy_hash(&head.policy),
+        x0x::groups::compute_public_meta_hash(&stale_meta),
+        head.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp,
+    )?;
+    assert_eq!(
+        stale.prev_state_hash.as_deref(),
+        Some(removal_head_hash.as_str()),
+        "the fork claims the removal commit as its parent"
+    );
+    let refused = apply_commit(&state, &group2, stale, "removed-admin-fork").await?;
+    assert!(refused.is_err(), "the removed admin's commit is refused");
+    {
+        let record = live_record(&state, &group2).await;
+        let marker = record.fork_quarantine.as_ref().expect("marker");
+        assert_eq!(marker.committed_by, a_hex);
+        assert_eq!(
+            marker.snapshot.classification.as_deref(),
+            Some("unauthorized_signer"),
+            "removed admin chaining from its own removal"
+        );
+    }
+    let row2 = diag_row(&state, &group2).await;
+    assert_eq!(row2.counters.fork_evidence_unauthorized_signer, 1);
+    assert_eq!(row2.counters.fork_evidence_signer_only, 0);
+
+    // r2 advisory — parent-roster vs CURRENT-roster discrimination: A is
+    // admin at the claimed parent (the retained rev-1 seating commit)
+    // but REMOVED from the current roster (the canonical rev-2 removal
+    // is our head). A's conflicting twin claiming the rev-1 parent is
+    // `signer_only` — the classification reads the PARENT snapshot, so
+    // a current-roster check would have (wrongly) called A
+    // unauthenticated.
+    let group3 = "bc3".repeat(32);
+    let base3 =
+        cert_sealed_group_with_lineage(&state, &group3, owner_certified_policy(&owner_kp)).await?;
+    let a_kp3 = AgentKeypair::generate()?;
+    let a_hex3 = hex::encode(a_kp3.agent_id().as_bytes());
+    let cert3 = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        a_kp3.public_key().as_bytes(),
+        None,
+    )?;
+    state.agent.identity_discovery_cache().write().await.insert(
+        cert3.agent_id()?,
+        x0x::DiscoveredAgent {
+            agent_id: cert3.agent_id()?,
+            machine_id: x0x::identity::MachineId([0u8; 32]),
+            user_id: cert3.user_id().ok(),
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: 1,
+            last_seen: 1,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: cert3.not_after(),
+            agent_certificate: Some(cert3.clone()),
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        },
+    );
+    let seating_commit = {
+        let mut seated = base3.clone();
+        seated.add_member(
+            a_hex3.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(authority_hex.clone()),
+            None,
+        );
+        seated
+            .set_member_certificate(&a_hex3, cert3.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        seal_commit_owner_certified(
+            &state,
+            &mut seated,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        seated.commit_log.last().expect("sealed").commit.clone()
+    };
+    {
+        let current3 = live_record(&state, &group3).await;
+        let applied = apply_stateful_event_with_evidence(
+            &state,
+            &group3,
+            &current3,
+            &seating_commit,
+            None,
+            false,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.add_member(
+                    a_hex3.clone(),
+                    x0x::groups::GroupRole::Admin,
+                    Some(authority_hex.clone()),
+                    None,
+                );
+                next.set_member_certificate(&a_hex3, cert3.clone())
+                    .expect("seat cert");
+            },
+        )
+        .await
+        .expect("seating applies");
+        persist_applied(&state, &group3, applied).await?;
+    }
+    // Canonical removal of A at the next revision (our head).
+    {
+        let mut after = live_record(&state, &group3).await;
+        after.remove_member(&a_hex3, Some(authority_hex.clone()));
+        seal_commit_owner_certified(
+            &state,
+            &mut after,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        let commit = after.commit_log.last().expect("sealed").commit.clone();
+        let current3 = live_record(&state, &group3).await;
+        let applied = apply_stateful_event_with_evidence(
+            &state,
+            &group3,
+            &current3,
+            &commit,
+            None,
+            false,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.remove_member(&a_hex3, Some(authority_hex.clone()));
+            },
+        )
+        .await
+        .expect("removal applies");
+        persist_applied(&state, &group3, applied).await?;
+    }
+    let head3 = live_record(&state, &group3).await;
+    assert!(!head3
+        .members_v2
+        .iter()
+        .any(|(id, m)| { id == &a_hex3 && m.state == x0x::groups::GroupMemberState::Active }));
+    // A's conflicting twin claiming the RETAINED seating commit as
+    // parent (A was admin there), while our head is the removal.
+    let mut twin_meta = head3.public_meta();
+    twin_meta.description = "a-twin-from-seating".to_string();
+    let a_twin = x0x::groups::GroupStateCommit::sign(
+        head3.stable_group_id().to_string(),
+        seating_commit.revision.saturating_add(1),
+        Some(seating_commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&head3.members_v2),
+        x0x::groups::compute_policy_hash(&head3.policy),
+        x0x::groups::compute_public_meta_hash(&twin_meta),
+        head3.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp3,
+    )?;
+    let refused3 = apply_commit(&state, &group3, a_twin, "a-twin-from-seating").await?;
+    assert!(refused3.is_err());
+    {
+        let record = live_record(&state, &group3).await;
+        let marker = record.fork_quarantine.as_ref().expect("marker");
+        assert_eq!(
+            marker.committed_by, a_hex3,
+            "the removed admin's twin is the evidenced conflict"
+        );
+        assert_eq!(
+            marker.snapshot.classification.as_deref(),
+            Some("signer_only"),
+            "admin at the CLAIMED PARENT (the seating commit) — the parent snapshot decides, \
+             not the current roster where A is removed"
+        );
+    }
+    let row3 = diag_row(&state, &group3).await;
+    assert_eq!(row3.counters.fork_evidence_signer_only, 1);
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 4, item 3iii / slice-1 residual): containment
+/// must not be one-shot. After ANY owner-anchored clear the stored
+/// fork-evidence silence gate re-arms, so a LATER authenticated fork
+/// re-evaluates, re-installs evidence and RE-QUARANTINES.
+#[tokio::test]
+async fn adr0064_quarantine_clears_then_reforks_requarantines() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "bc".repeat(32);
+    let base = cert_sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp))
+        .await?;
+
+    // Fork #1: equal-revision twins → evidence + marker at rev 2.
+    let fork_a = owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = owner_seal_variant(&state, &base, "fork-b").await?;
+    let fork_a_commit = fork_a.commit_log.last().expect("sealed").commit.clone();
+    let fork_b_commit = fork_b.commit_log.last().expect("sealed").commit.clone();
+    let first = apply_commit(&state, &group_id, fork_a_commit, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+    let second = apply_commit(&state, &group_id, fork_b_commit, "fork-b").await?;
+    assert!(second.is_err());
+    assert!(live_record(&state, &group_id).await.is_fork_quarantined());
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_set,
+        1
+    );
+
+    // Owner-anchored clear: the explicit owner-key seal at revision 4
+    // (wrapper seal 3, explicit 4) strictly past the evidence 2.
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "explicit seal clears: {body}");
+    {
+        let record = live_record(&state, &group_id).await;
+        assert!(!record.is_fork_quarantined(), "cleared");
+        assert!(
+            record
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref())
+                .is_none(),
+            "the evidence gate re-armed (stored evidence reset by the clear)"
+        );
+    }
+
+    // Fork #2: a NEW conflicting twin at revision 5 — the re-armed gate
+    // must let it re-evaluate and re-quarantine.
+    // The twin is signed directly over the SAME rev-4 parent the
+    // canonical commit claims, with different metadata (a re-seal of a
+    // clone would chain from the new head and simply apply).
+    let head4 = live_record(&state, &group_id).await;
+    let canonical = {
+        let mut next = head4.clone();
+        next.description = "canonical-5".to_string();
+        seal_commit_owner_certified(
+            &state,
+            &mut next,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        next
+    };
+    let canonical_commit = canonical.commit_log.last().expect("sealed").commit.clone();
+    let applied = apply_commit(&state, &group_id, canonical_commit, "canonical-5").await?;
+    assert!(applied.is_ok());
+    persist_applied(&state, &group_id, applied.expect("applied")).await?;
+    let mut twin5_meta = head4.public_meta();
+    twin5_meta.description = "twin-5-fork".to_string();
+    let twin5_commit = x0x::groups::GroupStateCommit::sign(
+        head4.stable_group_id().to_string(),
+        head4.state_revision.saturating_add(1),
+        Some(head4.state_hash.clone()),
+        x0x::groups::compute_roster_root(&head4.members_v2),
+        x0x::groups::compute_policy_hash(&head4.policy),
+        x0x::groups::compute_public_meta_hash(&twin5_meta),
+        head4.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        state.agent.identity().agent_keypair(),
+    )?;
+    let refused = apply_commit(&state, &group_id, twin5_commit, "twin-5-fork").await?;
+    assert!(refused.is_err(), "the second fork conflicts");
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        record.is_fork_quarantined(),
+        "containment is NOT one-shot: the post-clear fork re-quarantines"
+    );
+    assert!(
+        record
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .is_some_and(|evidence| evidence.revision == head4.state_revision + 1),
+        "fresh evidence recorded for the new fork"
+    );
+    let row = diag_row(&state, &group_id).await;
+    assert_eq!(
+        row.counters.fork_quarantine_set, 2,
+        "the marker was set twice (quarantine → clear → quarantine)"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 4, fault-matrix "contested-branch-cannot-clear"):
+/// the contested branch mints an honestly owner-SIGNED mandate over its
+/// own N+3 (the owner-defection shape) and publishes it. The
+/// owner-anchor evaluation RUNS (the mandate verifies — not short-
+/// circuited by the PrevHashMismatch apply failure) and is REFUSED on
+/// the retained-ancestry fence: the clear path is reached and refused,
+/// with an attributable counter, and the marker stays.
+#[tokio::test]
+async fn adr0064_contested_branch_anchored_commit_cannot_clear() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "bd".repeat(32);
+    let base = cert_sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp))
+        .await?;
+
+    // Quarantine: twins at rev 2 (we hold fork-a; fork-b is evidence).
+    let fork_a = owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = owner_seal_variant(&state, &base, "fork-b").await?;
+    let fork_a_commit = fork_a.commit_log.last().expect("sealed").commit.clone();
+    let fork_b_commit = fork_b.commit_log.last().expect("sealed").commit.clone();
+    let first = apply_commit(&state, &group_id, fork_a_commit, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+    let second = apply_commit(&state, &group_id, fork_b_commit, "fork-b").await?;
+    assert!(second.is_err());
+    assert!(live_record(&state, &group_id).await.is_fork_quarantined());
+
+    // The CONTESTED branch's own rev-3 commit, chaining from fork-b's
+    // head (NOT our retained history) — and an HONEST owner-key mandate
+    // over it (the owner vouches for the contested successor).
+    let contested3 = owner_seal_variant(&state, &fork_b, "contested-3").await?;
+    let contested_commit = contested3.commit_log.last().expect("sealed").commit.clone();
+    let mandate = x0x::groups::OwnerMandate::sign(
+        contested3.stable_group_id(),
+        contested_commit.revision,
+        contested_commit
+            .prev_state_hash
+            .as_deref()
+            .unwrap_or_default(),
+        &contested_commit.roster_root,
+        &contested_commit.policy_hash,
+        &contested_commit.public_meta_hash,
+        0,
+        &authority_hex,
+        "",
+        "",
+        &authority_hex,
+        now_millis_u64(),
+        &owner_kp,
+    )
+    .expect("sign contested mandate");
+
+    // Drive the hook with the mandate present: the anchor VERIFIES
+    // against the owner key derived from the roster certificate, so the
+    // clear evaluation RUNS — and must refuse on retained ancestry.
+    let current = live_record(&state, &group_id).await;
+    let refused = apply_stateful_event_with_evidence(
+        &state,
+        &group_id,
+        &current,
+        &contested_commit,
+        Some(&mandate),
+        false,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.description = "contested-3".to_string();
+        },
+    )
+    .await;
+    assert!(refused.is_err(), "the contested commit cannot apply here");
+
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        record.is_fork_quarantined(),
+        "a contested-ancestry anchored commit NEVER clears the marker"
+    );
+    let row = diag_row(&state, &group_id).await;
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_refusals, 1,
+        "the clear evaluation ran and refused — attributable, not a silent PrevHashMismatch"
+    );
+    assert_eq!(row.counters.fork_quarantine_owner_anchored_clears, 0);
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 4 r2, review item 1 — ADR §3 conformance): the
+/// CONFLICT PATH NEVER CLEARS. A mandate-anchored conflicting commit
+/// that chains through retained ancestry at strictly greater revision
+/// than the evidence is still a CONFLICT — this node holds the disowned
+/// sibling and would keep applying it, so clearing would un-gate the
+/// node and the next canonical commit would re-quarantine the same
+/// divergence (flapping). The Accepted ADR's clear rule ("a
+/// same-revision sibling — the contested branch itself — can never
+/// clear"; the marker clears ONLY when this node APPLIES commit C)
+/// wins over the round-1 reading. The anchored conflicting successor
+/// is recorded as `owner_anchored_conflict` EVIDENCE and the
+/// attributable no-clear counter fires; containment lifts only when an
+/// anchored commit APPLIES (the apply-path clear, pinned in
+/// tests/owner_mandate.rs::owner_anchored_apply_path_clears_quarantine).
+#[tokio::test]
+async fn adr0064_owner_anchored_successor_conflicting_commit_never_clears() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "be".repeat(32);
+    let base = cert_sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp))
+        .await?;
+
+    // Fork at rev 2: we keep fork-a; fork-b is evidence (marker rev 2).
+    let fork_a = owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = owner_seal_variant(&state, &base, "fork-b").await?;
+    let fork_a_commit = fork_a.commit_log.last().expect("sealed").commit.clone();
+    let fork_b_commit = fork_b.commit_log.last().expect("sealed").commit.clone();
+    let first = apply_commit(&state, &group_id, fork_a_commit.clone(), "fork-a").await?;
+    assert!(first.is_ok());
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+    let second = apply_commit(&state, &group_id, fork_b_commit.clone(), "fork-b").await?;
+    assert!(second.is_err());
+    assert!(live_record(&state, &group_id).await.is_fork_quarantined());
+
+    // Our head advances to rev 3 on OUR (contested) chain — retained.
+    let canonical3 = {
+        let mut next = live_record(&state, &group_id).await;
+        next.description = "our-chain-3".to_string();
+        seal_commit_owner_certified(
+            &state,
+            &mut next,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        next
+    };
+    let canonical3_commit = canonical3.commit_log.last().expect("sealed").commit.clone();
+    let applied3 = apply_commit(&state, &group_id, canonical3_commit, "our-chain-3").await?;
+    assert!(applied3.is_ok());
+    persist_applied(&state, &group_id, applied3.expect("applied")).await?;
+    assert!(
+        live_record(&state, &group_id).await.is_fork_quarantined(),
+        "ordinary applies never clear (owner anchor only)"
+    );
+
+    // The owner anchors the OTHER branch's rev-3 sibling: chains from
+    // our RETAINED rev-2 commit (the fork-a twin we applied — its hash
+    // is in our log), conflicts with our rev-3 head (StaleRevision
+    // twin), carries a verifying mandate, and is at revision 3 > the
+    // evidenced revision 2 — the coherent anchored successor shape.
+    // Round 1 cleared here; r2 records evidence instead.
+    let current = live_record(&state, &group_id).await;
+    let mut anchored_meta = current.public_meta();
+    anchored_meta.description = "owner-anchored-3".to_string();
+    let anchored_commit = x0x::groups::GroupStateCommit::sign(
+        current.stable_group_id().to_string(),
+        fork_a_commit.revision.saturating_add(1),
+        Some(fork_a_commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&current.members_v2),
+        x0x::groups::compute_policy_hash(&current.policy),
+        x0x::groups::compute_public_meta_hash(&anchored_meta),
+        current.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        state.agent.identity().agent_keypair(),
+    )?;
+    let mandate = x0x::groups::OwnerMandate::sign(
+        current.stable_group_id(),
+        anchored_commit.revision,
+        anchored_commit
+            .prev_state_hash
+            .as_deref()
+            .unwrap_or_default(),
+        &anchored_commit.roster_root,
+        &anchored_commit.policy_hash,
+        &anchored_commit.public_meta_hash,
+        0,
+        &authority_hex,
+        "",
+        "",
+        &authority_hex,
+        now_millis_u64(),
+        &owner_kp,
+    )
+    .expect("sign anchored mandate");
+
+    let outcome = apply_stateful_event_with_evidence(
+        &state,
+        &group_id,
+        &current,
+        &anchored_commit,
+        Some(&mandate),
+        false,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.description = "owner-anchored-3".to_string();
+        },
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "the anchored sibling still cannot APPLY (no rollback) — classification only"
+    );
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        record.is_fork_quarantined(),
+        "r2 (ADR §3): the conflict path NEVER clears — even a coherent anchored successor"
+    );
+    let row = diag_row(&state, &group_id).await;
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_refusals, 1,
+        "the anchored conflicting commit counted an attributable no-clear"
+    );
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_clears, 0,
+        "no clear fired on the conflict path"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 4, #472 decision 6 + the sidecar correction): for
+/// owner-axis groups the authoritative persisted record is the
+/// `home-suite-groups.json` SIDECAR, and it must carry the quarantine
+/// marker AND the mandate-capability map through the SAME
+/// compare-and-restore mutation (`persist_named_groups_mutation`) that
+/// keeps the two-file write recoverable as a unit — so an old (or
+/// downgraded) binary rewriting `named_groups.json` alone can never drop
+/// containment. The load path merges with the sidecar winning.
+#[tokio::test]
+async fn adr0064_sidecar_mirrors_marker_and_capability_survives_legacy_rewrite() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "bf".repeat(32);
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let base = cert_sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp))
+        .await?;
+
+    // Seat the marker + a capability-map entry through the STANDARD
+    // compare-and-restore mutation (the same write every production
+    // site uses — one atomic pair, #617-recoverable as a unit).
+    let terminal_header = base.terminal_commit_header();
+    persist_named_groups_mutation(&state, |groups| {
+        let Some(info) = groups.get_mut(&group_id) else {
+            return false;
+        };
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: info.state_revision,
+            state_hash: info.state_hash.clone(),
+            committed_by: authority_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header.clone(),
+                classification: Some("signer_only".to_string()),
+            },
+            no_anchor: false,
+        });
+        info.mandate_capability.insert(
+            authority_hex.clone(),
+            x0x::groups::MandateCapabilityState {
+                first_seen_ms: now_millis_u64(),
+                refusals: 0,
+                refusal_transition_counted: false,
+            },
+        );
+        true
+    })
+    .await?;
+
+    // The sidecar physically carries BOTH local-only fields.
+    let sidecar_json = tokio::fs::read_to_string(&state.home_suite_groups_path).await?;
+    let sidecar: HashMap<String, x0x::groups::GroupInfo> = serde_json::from_str(&sidecar_json)?;
+    let sidecar_entry = sidecar.get(&group_id).expect("sidecar entry");
+    assert!(sidecar_entry.fork_quarantine.is_some(), "marker in sidecar");
+    assert!(
+        sidecar_entry
+            .mandate_capability
+            .contains_key(&authority_hex),
+        "capability map in sidecar"
+    );
+
+    // Simulate an old binary rewriting `named_groups.json` WITHOUT the
+    // fields (it ignores/drops them).
+    let named_json = tokio::fs::read_to_string(&state.named_groups_path).await?;
+    let mut legacy: HashMap<String, serde_json::Value> = serde_json::from_str(&named_json)?;
+    if let Some(entry) = legacy.get_mut(&group_id) {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("fork_quarantine");
+            obj.remove("mandate_capability");
+        }
+    }
+    tokio::fs::write(&state.named_groups_path, serde_json::to_string(&legacy)?).await?;
+
+    // Load: the sidecar wins for owner-axis groups — containment and
+    // the capability clock survive the legacy rewrite.
+    let merged =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    let record = merged.get(&group_id).expect("merged record");
+    assert!(
+        record.is_fork_quarantined(),
+        "the marker survives an old binary rewriting named_groups.json"
+    );
+    assert!(
+        record.mandate_capability.contains_key(&authority_hex),
+        "the capability map survives the rewrite too"
+    );
+    Ok(())
+}
+
+/// WHY (r3): the `owner_anchored_conflict` label itself needs a fixture
+/// with NO prior evidence — the never-clears test's group already holds
+/// rev-2 twin evidence (first-complete-wins refuses a second install,
+/// so its marker keeps the ORIGINAL unclassified snapshot). Here the
+/// anchored sibling is the FIRST conflict: no marker, empty lineage →
+/// the anchored classification lands on the installed evidence and the
+/// marker's snapshot, and the attributable no-clear counter fires.
+#[tokio::test]
+async fn adr0064_owner_anchored_conflict_label_lands_on_fresh_evidence() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "b9".repeat(32);
+    let base = cert_sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp))
+        .await?;
+
+    // Advance to rev 2 canonically (no fork, no evidence, no marker).
+    let canonical2 = {
+        let mut next = base.clone();
+        next.description = "canonical-2".to_string();
+        seal_commit_owner_certified(
+            &state,
+            &mut next,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        next
+    };
+    let canonical2_commit = canonical2.commit_log.last().expect("sealed").commit.clone();
+    let applied = apply_commit(&state, &group_id, canonical2_commit, "canonical-2").await?;
+    assert!(applied.is_ok());
+    persist_applied(&state, &group_id, applied.expect("applied")).await?;
+    assert!(
+        !live_record(&state, &group_id).await.is_fork_quarantined(),
+        "no prior conflict — clean fixture"
+    );
+
+    // The owner-anchored rev-2 SIBLING: chains from the retained base
+    // (rev 1, consecutive), conflicts with our rev-2 head
+    // (StaleRevision), carries a verifying mandate — the first
+    // conflict this node sees.
+    let head = live_record(&state, &group_id).await;
+    let base_commit = base.commit_log.last().expect("base sealed").commit.clone();
+    let mut anchored_meta = head.public_meta();
+    anchored_meta.description = "owner-anchored-sibling-2".to_string();
+    let anchored_commit = x0x::groups::GroupStateCommit::sign(
+        head.stable_group_id().to_string(),
+        base_commit.revision.saturating_add(1),
+        Some(base_commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&head.members_v2),
+        x0x::groups::compute_policy_hash(&head.policy),
+        x0x::groups::compute_public_meta_hash(&anchored_meta),
+        head.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        state.agent.identity().agent_keypair(),
+    )?;
+    let mandate = x0x::groups::OwnerMandate::sign(
+        head.stable_group_id(),
+        anchored_commit.revision,
+        anchored_commit
+            .prev_state_hash
+            .as_deref()
+            .unwrap_or_default(),
+        &anchored_commit.roster_root,
+        &anchored_commit.policy_hash,
+        &anchored_commit.public_meta_hash,
+        0,
+        &authority_hex,
+        "",
+        "",
+        &authority_hex,
+        now_millis_u64(),
+        &owner_kp,
+    )
+    .expect("sign anchored mandate");
+
+    let outcome = apply_stateful_event_with_evidence(
+        &state,
+        &group_id,
+        &head,
+        &anchored_commit,
+        Some(&mandate),
+        false,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.description = "owner-anchored-sibling-2".to_string();
+        },
+    )
+    .await;
+    assert!(outcome.is_err(), "the anchored sibling still conflicts");
+
+    let record = live_record(&state, &group_id).await;
+    let marker = record.fork_quarantine.as_ref().expect("marker set");
+    assert_eq!(marker.revision, anchored_commit.revision);
+    assert_eq!(marker.committed_by, authority_hex);
+    assert_eq!(
+        marker.snapshot.classification.as_deref(),
+        Some("owner_anchored_conflict"),
+        "the FIRST conflict's evidence carries the anchored classification"
+    );
+    assert!(
+        record
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .is_some_and(|evidence| evidence.revision == anchored_commit.revision),
+        "the anchored sibling's evidence installed (no prior evidence to win)"
+    );
+    let row = diag_row(&state, &group_id).await;
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_refusals, 1,
+        "verifying anchor — attributable no-clear signal"
+    );
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_clears, 0,
+        "r2/ADR §3: the conflict path never clears"
     );
     Ok(())
 }

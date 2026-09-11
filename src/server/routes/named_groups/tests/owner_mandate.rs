@@ -1646,6 +1646,7 @@ async fn quarantine_live(state: &AppState, group_id: &str) -> x0x::groups::Group
         snapshot: x0x::groups::ForkSnapshot {
             terminal_commit: snapshot_commit.clone(),
             conflicting_commit: snapshot_commit,
+            classification: None,
         },
         no_anchor: false,
     });
@@ -2509,4 +2510,321 @@ fn quarantine_clear_domain_is_separate_from_join_attestation() {
         ),
         "the clear-domain attestation over identical fields verifies"
     );
+}
+
+/// WHY (ADR-0064 slice 4, Decision §2/§3): `anchors_commit` is the
+/// owner-anchor predicate for a CONFLICTING commit (one that failed to
+/// apply, so there is no candidate roster to re-derive) — it must bind
+/// EVERY header field the mandate signs to the commit's own claims and
+/// verify the owner signature, while a full roster re-derivation is
+/// deliberately out of scope (that runs on real apply). Perturbing any
+/// bound field, swapping the authority, or signing under the wrong key
+/// must each break the anchor independently of the commit signature.
+#[tokio::test]
+async fn anchors_commit_binds_the_full_header_under_the_owner_key() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "9a".repeat(32);
+    let base = sealed_group(&state, &group_id, owner_certified_policy(&owner_kp)).await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let joiner_kp = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+    let cert = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner_kp.public_key().as_bytes(),
+        None,
+    )?;
+    let candidate = seat_write(&base, &joiner_hex, &authority_hex, &cert);
+    let terminal = terminal_commit_for(&candidate, state.agent.identity().agent_keypair(), 9_000);
+    let mandate = mint_mandate_like_authority(
+        &candidate,
+        None,
+        0,
+        &joiner_hex,
+        &authority_hex,
+        "invite-secret",
+        &cert,
+        &owner_kp,
+        9_000,
+    );
+
+    // Control: the honest mandate anchors its own terminal.
+    assert!(
+        mandate.anchors_commit(
+            owner_kp.public_key(),
+            &owner_kp.user_id(),
+            base.stable_group_id(),
+            &terminal
+        ),
+        "an honestly minted mandate anchors the terminal it was minted over"
+    );
+
+    // Each header-bound field perturbed (still honestly SIGNED under a
+    // re-mint) must break the anchor against the unchanged terminal.
+    let wrong_root = {
+        let mut perturbed = candidate.clone();
+        perturbed.remove_member(&authority_hex, None);
+        mint_mandate_like_authority(
+            &perturbed,
+            None,
+            0,
+            &joiner_hex,
+            &authority_hex,
+            "invite-secret",
+            &cert,
+            &owner_kp,
+            9_001,
+        )
+    };
+    assert!(!wrong_root.anchors_commit(
+        owner_kp.public_key(),
+        &owner_kp.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+    let wrong_parent = mint_mandate_like_authority(
+        &candidate,
+        None,
+        0,
+        &joiner_hex,
+        &authority_hex,
+        "invite-secret",
+        &cert,
+        &owner_kp,
+        9_002,
+    );
+    let mut shifted = wrong_parent.clone();
+    shifted.parent_state_hash = "00".repeat(32);
+    assert!(!shifted.anchors_commit(
+        owner_kp.public_key(),
+        &owner_kp.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+    let mut wrong_authority = mandate.clone();
+    wrong_authority.authority_agent_id = joiner_hex.clone();
+    assert!(!wrong_authority.anchors_commit(
+        owner_kp.public_key(),
+        &owner_kp.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+    let mut wrong_group = mandate.clone();
+    wrong_group.stable_group_id = "9b".repeat(32);
+    assert!(!wrong_group.anchors_commit(
+        owner_kp.public_key(),
+        &owner_kp.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+
+    // A DIFFERENT owner's key never anchors (the policy-owner pin).
+    let stranger_owner = UserKeypair::from_seed(&[0x5Au8; 32])?;
+    assert!(!mandate.anchors_commit(
+        stranger_owner.public_key(),
+        &stranger_owner.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+
+    // r2 advisory — each re-SIGNED flip (honestly minted under the real
+    // owner key, so the signature always verifies; only the terminal
+    // comparison can catch it): parent, revision, policy, meta.
+    let flipped = |parent: &str, revision: u64, policy: &str, meta: &str| {
+        x0x::groups::OwnerMandate::sign(
+            base.stable_group_id(),
+            revision,
+            parent,
+            &x0x::groups::compute_roster_root(&candidate.members_v2),
+            policy,
+            meta,
+            0,
+            &joiner_hex,
+            &blake3_hex_of("invite-secret"),
+            &x0x::groups::owner_cert::certificate_digest_hex(&cert),
+            &authority_hex,
+            9_100,
+            &owner_kp,
+        )
+        .expect("re-signed flip")
+    };
+    let real_policy = x0x::groups::compute_policy_hash(&candidate.policy);
+    let real_meta = x0x::groups::compute_public_meta_hash(&candidate.public_meta());
+    let real_parent = candidate.state_hash.clone();
+    let real_revision = candidate.state_revision.saturating_add(1);
+    let assert_not_anchored = |m: &x0x::groups::OwnerMandate, why: &str| {
+        assert!(
+            !m.anchors_commit(
+                owner_kp.public_key(),
+                &owner_kp.user_id(),
+                base.stable_group_id(),
+                &terminal
+            ),
+            "{why}: the header comparison must refuse independently of the signature"
+        );
+    };
+    assert_not_anchored(
+        &flipped(&"00".repeat(32), real_revision, &real_policy, &real_meta),
+        "flipped parent hash",
+    );
+    assert_not_anchored(
+        &flipped(&real_parent, real_revision + 1, &real_policy, &real_meta),
+        "flipped terminal revision",
+    );
+    assert_not_anchored(
+        &flipped(&real_parent, real_revision, &"ff".repeat(32), &real_meta),
+        "flipped policy hash",
+    );
+    assert_not_anchored(
+        &flipped(&real_parent, real_revision, &real_policy, &"ee".repeat(32)),
+        "flipped meta hash",
+    );
+    // Control: the exact re-signed control still anchors.
+    assert!(
+        flipped(&real_parent, real_revision, &real_policy, &real_meta).anchors_commit(
+            owner_kp.public_key(),
+            &owner_kp.user_id(),
+            base.stable_group_id(),
+            &terminal
+        )
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 4 r2, review item 1 — the ADR-conformant positive):
+/// the owner-anchored commit that CLEARS is the one this node APPLIES. A
+/// mandate-carrying `MemberAdded` that verifies on the real apply arm
+/// (chains from the receiver's retained head) clears the fork marker at
+/// strictly greater revision and re-arms the evidence gate; at EQUAL
+/// revision it applies but never clears (the fence). The conflict path
+/// never clears (pinned in fork_quarantine::
+/// adr0064_owner_anchored_successor_conflicting_commit_never_clears).
+#[tokio::test]
+async fn owner_anchored_apply_path_clears_quarantine() -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "e1-invite-secret",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+
+    // Pre-seat the fork marker BELOW the terminal revision, with stored
+    // evidence the clear must re-arm.
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("receiver group");
+        let terminal_header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: terminal.revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: actor_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+        if let Some(lineage) = live.invite_lineage.as_mut() {
+            lineage.fork_evidence = Some(x0x::groups::ForkEvidence {
+                revision: terminal.revision.saturating_sub(1),
+                state_hash: "evidenced-conflict-hash".to_string(),
+                committed_by: actor_hex.clone(),
+                observed_at_ms: now_millis_u64(),
+            });
+        }
+    }
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    let result = apply_event(&state, event).await;
+    assert!(result.accepted, "the anchored MemberAdded applies");
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert!(live.has_active_member(&joiner_hex));
+        assert!(
+            !live.is_fork_quarantined(),
+            "an APPLIED owner-anchored commit at strictly greater revision clears the marker"
+        );
+        assert!(
+            live.invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref())
+                .is_none(),
+            "and re-arms the evidence gate"
+        );
+    }
+    let row = diag_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.fork_quarantine_owner_anchored_clears, 1);
+
+    // Equal-revision negative: a fresh receiver at the SAME shape with
+    // the marker AT the terminal revision applies but never clears.
+    let (state2, dir2, owner2, group2, joiner2, pre_seal2, cert2) = receiver_stage().await?;
+    let actor2_hex = hex::encode(state2.agent.agent_id().as_bytes());
+    let terminal2 = terminal_commit_for(&pre_seal2, state2.agent.identity().agent_keypair(), 3_000);
+    let mandate2 = mint_mandate_like_authority(
+        &pre_seal2,
+        None,
+        0,
+        &joiner2,
+        &actor2_hex,
+        "e1-invite-secret",
+        &cert2,
+        &owner2,
+        2_500,
+    );
+    {
+        let mut groups = state2.named_groups.write().await;
+        let live = groups.get_mut(&group2).expect("receiver group");
+        let terminal_header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: terminal2.revision,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: actor2_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    let event2 = member_added_event(
+        &group2,
+        terminal2.revision,
+        &actor2_hex,
+        &joiner2,
+        &cert2,
+        terminal2,
+        Some(mandate2),
+    );
+    let result2 = apply_event(&state2, event2).await;
+    assert!(result2.accepted, "applies regardless of the marker");
+    {
+        let groups = state2.named_groups.read().await;
+        let live = groups.get(&group2).expect("group");
+        assert!(
+            live.is_fork_quarantined(),
+            "an applied anchored commit AT the evidence revision does NOT clear (strictly-greater fence)"
+        );
+    }
+    drop(dir);
+    drop(dir2);
+    Ok(())
 }

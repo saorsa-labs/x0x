@@ -223,6 +223,24 @@ pub struct ForkSnapshot {
     pub terminal_commit: state_commit::GroupStateCommit,
     /// The authenticated conflicting commit that triggered the evidence.
     pub conflicting_commit: state_commit::GroupStateCommit,
+    /// ADR-0064 slice 4 (#472 decision 3): how the conflicting commit
+    /// was classified against the retained log while no chain-fetch
+    /// surface exists for full members:
+    /// - `signer_only` — the signer was an ACTIVE ADMIN at the commit's
+    ///   claimed parent (or the joiner's served chain validated through
+    ///   the ancestor walk) but the owner anchor is unavailable; the
+    ///   classification rests on the signer, never the full chain;
+    /// - `unauthorized_signer` — the signer held a seat somewhere in the
+    ///   retained history but NOT active-admin at the claimed parent
+    ///   (e.g. an admin removed by the canonical commit the fork claims
+    ///   to chain from, or a plain member signer).
+    ///
+    /// `None` = the pre-slice-4 unclassified shape (the claimed parent
+    /// is not retained, so only the legacy revision−1 signer check
+    /// ran). A serde-default STRING field, never a new enum variant
+    /// (#451): old records decode as `None`, old binaries ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
 }
 
 /// ADR-0064 (Guard A): persistent per-node fork-quarantine marker for
@@ -995,6 +1013,24 @@ impl GroupInfo {
             return;
         }
         self.fork_quarantine = None;
+        // Slice 4: the clear re-arms the evidence gate (see
+        // `reset_fork_evidence_after_quarantine_clear`).
+        self.reset_fork_evidence_after_quarantine_clear();
+    }
+
+    /// ADR-0064 slice 4 (Decision §3, slice-1 residual): EVERY marker
+    /// clear re-arms the stored fork-evidence silence gate
+    /// (`invite_lineage.fork_evidence`). Before slice 4 a clear left the
+    /// stored evidence in place, so `evaluate_fork_evidence_candidate`
+    /// silenced every later conflict — containment was one-shot per
+    /// group per node. Resetting the gate makes the next authenticated
+    /// conflict re-evaluate, re-install evidence, and re-quarantine.
+    /// The in-process diagnostics once-set is identity-keyed, so a
+    /// genuinely NEW fork identity still fires its once-only warn.
+    pub fn reset_fork_evidence_after_quarantine_clear(&mut self) {
+        if let Some(lineage) = self.invite_lineage.as_mut() {
+            lineage.fork_evidence = None;
+        }
     }
 
     /// ADR-0038 (review B3): seal WITHOUT auto-pruning — for the sequential
