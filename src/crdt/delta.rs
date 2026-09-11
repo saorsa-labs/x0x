@@ -171,11 +171,13 @@ impl TaskList {
     /// safe superset of any incremental change — this is the producer used to
     /// answer cold-start state requests (see `TaskListSync`). The OR-Set tags
     /// are synthetic because the receiver re-derives membership on merge —
-    /// but they must be FRESH per entry (F3, fix-loop): the digest-verified
-    /// adopt prunes stale tasks with a local observe-remove, which
-    /// tombstones the tags a previous full delta used, and a hardcoded tag
-    /// would then be silently rejected on a later serve that re-adds the
-    /// task — a permanent re-add deadlock.
+    /// but they must be FRESH per entry (F3, fix-loop): after a prune the
+    /// receiver's OR-Set carries tombstones for the previously served
+    /// tags, and a hardcoded tag would couple every re-serve to that
+    /// tombstone state. (crdt-sync's `OrSet::add` un-tombstones the very
+    /// tag it re-adds, so a same-tag re-serve is typically accepted
+    /// anyway — fresh tags keep serves self-contained regardless of the
+    /// receiver's tombstone state, which is the only portable guarantee.)
     #[must_use]
     pub fn full_delta(&self) -> TaskListDelta {
         let mut delta = TaskListDelta::new(self.version());

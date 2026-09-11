@@ -325,9 +325,11 @@ impl TaskList {
     /// A serve's task set alone cannot distinguish "holder deleted T" from
     /// "holder never merged T's add" — its snapshot may predate a live add
     /// this replica already holds — and pruning on absence observe-removes
-    /// NEWER local knowledge, tombstones T's tags against re-delivery, and
-    /// makes a task a visibility read just saw vanish before the claim
-    /// (#643). The ordering register is no evidence either: `reorder`
+    /// NEWER local knowledge (leaving tombstoned tags behind, though
+    /// crdt-sync's `OrSet::add` un-tombstones a re-added tag, so a
+    /// deliberate re-delivery still lands), and makes a task a visibility
+    /// read just saw vanish before the claim (#643).
+    /// The ordering register is no evidence either: `reorder`
     /// rebuilds it from live ids only (a delete followed by any reorder
     /// forgets the deletion — false keep, and the stale replica's later
     /// fresh-tag re-serve resurrects the task fleet-wide), and out-of-order
@@ -339,10 +341,12 @@ impl TaskList {
     /// deletion cannot be un-remembered by reorders or LWW races. A task
     /// the serve still carries in `added_tasks` is live (re-added) and is
     /// never pruned. Each pruned task goes through
-    /// [`delta_remove_task`](Self::delta_remove_task) — a LOCAL
-    /// observe-remove (its current tags are tombstoned, so a later re-add
-    /// with fresh tags still wins) — the same semantics as merging a
-    /// removal delta.
+    /// [`delta_remove_task`](Self::delta_remove_task) — a local
+    /// observe-remove — and its id is recorded in the raise-only evidence
+    /// set, so the deletion survives later reorders and this replica's
+    /// own serves forward it. Re-add semantics are plain OR-Set
+    /// adds-win: crdt-sync's `OrSet::add` un-tombstones a re-added tag,
+    /// so nothing here blocks a deliberate re-delivery or re-add.
     ///
     /// Callers MUST have verified the delta against the serving holder's
     /// declared digest first — without that binding, any holder could

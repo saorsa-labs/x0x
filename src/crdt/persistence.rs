@@ -275,9 +275,12 @@ const SNAPSHOT_MAGIC: &[u8; 8] = b"X0XTLS1\0";
 ///
 /// Readers accept BOTH magics: a v1 body decodes with an empty evidence
 /// set (degrades to "no evidence", the safe direction — the adopt gate
-/// prunes nothing). A v0.42.0 binary reading a v2 file fails the magic
-/// check fail-closed, same policy as v1 ("refuse to guess at a foreign
-/// file") — downgrades must re-create or discard snapshots.
+/// prunes nothing). Writers emit v2 ONLY when the list actually carries
+/// evidence (`encode_snapshot`); an evidence-free list persists as v1, so
+/// a v0.42.0 downgrade never meets a v2 file unless the replica genuinely
+/// recorded a removal — in which case the fail-closed magic check (same
+/// policy as v1, "refuse to guess at a foreign file") is the price of
+/// having persisted evidence at all.
 const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"X0XTLS2\0";
 
 /// Owned v1 snapshot body (decode side; no removal evidence).
@@ -296,27 +299,58 @@ struct SnapshotBodyV2 {
     known_removed: std::collections::HashSet<TaskId>,
 }
 
-/// Borrowing snapshot body (encode side — avoids cloning the list).
+/// Borrowing v1 snapshot body (encode side — avoids cloning the list).
+#[derive(serde::Serialize)]
+struct SnapshotBodyRefV1<'a> {
+    list: &'a TaskList,
+    seq_counter: u64,
+}
+
+/// Borrowing v2 snapshot body (encode side — avoids cloning the list).
 #[derive(serde::Serialize)]
 struct SnapshotBodyRef<'a> {
     list: &'a TaskList,
     seq_counter: u64,
     known_removed: &'a std::collections::HashSet<TaskId>,
 }
-/// Encode a task list into v2 snapshot bytes (magic + body).
+
+/// Encode a task list into snapshot bytes, choosing the SMALLEST format
+/// that round-trips its state (round 3 review):
+///
+/// - no removal evidence ⇒ **v1** — byte-identical to what v0.42.0
+///   writes and reads, so a downgrade (the upgrade path has rollback)
+///   never hits an unreadable snapshot. This is the only shape produced
+///   in production today: no task-removal route exists, so
+///   `known_removed` is empty on every fleet replica.
+/// - evidence present ⇒ **v2** — a v0.42.0 reader fails the magic check
+///   fail-closed on it, but this only occurs on replicas that recorded an
+///   actual removal (crate-API consumers), the price of persisting
+///   evidence at all.
 ///
 /// # Errors
 ///
 /// Returns an error if bincode serialization of the envelope fails.
 fn encode_snapshot(list: &TaskList) -> crate::crdt::error::Result<Vec<u8>> {
-    let body = SnapshotBodyRef {
-        list,
-        seq_counter: list.seq_counter_value(),
-        known_removed: list.known_removed_ids(),
+    let seq_counter = list.seq_counter_value();
+    let (magic, bytes) = if list.known_removed_ids().is_empty() {
+        let body = SnapshotBodyRefV1 { list, seq_counter };
+        (
+            SNAPSHOT_MAGIC,
+            bincode::serialize(&body).map_err(crate::crdt::error::CrdtError::Serialization)?,
+        )
+    } else {
+        let body = SnapshotBodyRef {
+            list,
+            seq_counter,
+            known_removed: list.known_removed_ids(),
+        };
+        (
+            SNAPSHOT_MAGIC_V2,
+            bincode::serialize(&body).map_err(crate::crdt::error::CrdtError::Serialization)?,
+        )
     };
-    let bytes = bincode::serialize(&body).map_err(crate::crdt::error::CrdtError::Serialization)?;
-    let mut out = Vec::with_capacity(SNAPSHOT_MAGIC_V2.len() + bytes.len());
-    out.extend_from_slice(SNAPSHOT_MAGIC_V2);
+    let mut out = Vec::with_capacity(magic.len() + bytes.len());
+    out.extend_from_slice(magic);
     out.extend_from_slice(&bytes);
     Ok(out)
 }
@@ -729,6 +763,13 @@ mod tests {
         list.remove_task(&doomed).unwrap();
 
         storage.save_task_list(&list_id, &list).await.unwrap();
+
+        // Evidence present ⇒ the file MUST be v2 on disk.
+        let raw = std::fs::read(dir.path().join(format!("{list_id}.bin"))).unwrap();
+        assert!(
+            raw.starts_with(SNAPSHOT_MAGIC_V2.as_slice()),
+            "a list carrying removal evidence persists as v2"
+        );
         let loaded = storage.load_task_list(&list_id).await.unwrap();
 
         // Observable through the public surface: the loaded list's full
@@ -768,6 +809,50 @@ mod tests {
             loaded.full_delta().removed_tasks.is_empty(),
             "a v1 snapshot restores with no evidence — safe direction"
         );
+    }
+
+    /// WHY (round 3 review): `encode_snapshot` must write the SMALLEST
+    /// format that round-trips the state. No production task-removal path
+    /// exists, so every fleet replica has empty `known_removed` — and
+    /// every fleet snapshot must therefore stay v1, byte-compatible with
+    /// the v0.42.0 reader (whose rollback/downgrade path re-reads these
+    /// files). Writing v2 unconditionally would have broken downgrades
+    /// fleet-wide for zero gain.
+    #[tokio::test]
+    async fn evidence_free_list_persists_as_v1_bytes() {
+        use crate::crdt::{TaskId, TaskItem, TaskMetadata};
+        use crate::identity::AgentId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TaskListStorage::new(dir.path().to_path_buf());
+        let list_id = test_list_id(0x23);
+        let mut list = create_test_list(list_id, "no-evidence");
+
+        // Ordinary production shape: tasks, claims, no removals.
+        let agent = AgentId([1; 32]);
+        let metadata = TaskMetadata::new("t".to_string(), "d".to_string(), 128, agent, 1000);
+        list.add_task(
+            TaskItem::new(TaskId::from_bytes([1; 32]), metadata, test_peer_id()),
+            test_peer_id(),
+            1,
+        )
+        .unwrap();
+
+        storage.save_task_list(&list_id, &list).await.unwrap();
+        let raw = std::fs::read(dir.path().join(format!("{list_id}.bin"))).unwrap();
+        assert!(
+            raw.starts_with(SNAPSHOT_MAGIC.as_slice()),
+            "an evidence-free list must persist as v1 (v0.42.0-readable)"
+        );
+        assert!(
+            !raw.starts_with(SNAPSHOT_MAGIC_V2.as_slice()),
+            "v2 must be reserved for snapshots that carry evidence"
+        );
+
+        // And it still round-trips through the dual-magic reader.
+        let loaded = storage.load_task_list(&list_id).await.unwrap();
+        assert_eq!(loaded.task_count(), 1);
+        assert!(loaded.full_delta().removed_tasks.is_empty());
     }
 
     #[tokio::test]
