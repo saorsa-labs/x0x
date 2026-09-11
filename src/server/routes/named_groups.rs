@@ -9272,15 +9272,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                     );
                             }
                             // Per-agent observational counts on the
-                            // persisted capability map (compare-and-restore
+                            // persisted capability map — same
+                            // compare-and-restore mutation as every other
+                            // map write. `get_mut` (never `or_default`):
+                            // if the entry vanished between the refusal
+                            // read and this persist, skip — a missing
+                            // entry must not be re-minted as a
+                            // `first_seen_ms = 0` permanently-Refusing
+                            // record.
                             let group_key = resolved_group_key.clone();
                             let actor_key = actor.clone();
                             if let Err(error) = persist_named_groups_mutation(state, |groups| {
-                                if let Some(record) = groups.get_mut(&group_key) {
-                                    let entry =
-                                        record.mandate_capability.entry(actor_key).or_default();
-                                    entry.refusals = entry.refusals.saturating_add(1);
-                                    entry.refusal_transition_counted = true;
+                                if let Some(capability) =
+                                    groups.get_mut(&group_key).and_then(|record| {
+                                        record.mandate_capability.get_mut(&actor_key)
+                                    })
+                                {
+                                    capability.refusals = capability.refusals.saturating_add(1);
+                                    capability.refusal_transition_counted = true;
                                 }
                                 true
                             })

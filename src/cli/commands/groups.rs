@@ -79,9 +79,9 @@ pub async fn decrypt(
 }
 
 /// `x0x groups quarantine clear` — POST /groups/:id/quarantine/clear
-/// (ADR-0064 slice 3): clear the LOCAL fork-quarantine marker. The
-/// owner-attestation path is raw-HTTP-only; the CLI covers the operator
-/// `--force --reason` override.
+/// (ADR-0064 slice 3): clear the LOCAL fork-quarantine marker. Clears on
+/// a node holding the group's owner user key (no flags needed);
+/// otherwise requires the operator `--force --reason` override.
 pub async fn quarantine_clear(
     client: &DaemonClient,
     group_id: &str,

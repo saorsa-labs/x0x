@@ -1257,12 +1257,13 @@ enum GroupsSub {
 /// `x0x groups quarantine …` — ADR-0064 local fork-quarantine ops.
 #[derive(Subcommand)]
 enum QuarantineSub {
-    /// Clear the LOCAL fork-quarantine marker (requires --force with
-    /// --reason, or a fresh owner head attestation via raw HTTP).
+    /// Clear the LOCAL fork-quarantine marker: clears on a node holding
+    /// the group's owner user key (no flags needed); otherwise requires
+    /// --force with --reason.
     Clear {
         /// Group ID (hex).
         group_id: String,
-        /// Operator override: clear without an owner attestation.
+        /// Operator override: clear on a node without the owner key.
         #[arg(long)]
         force: bool,
         /// Audit-trail reason (required with --force).

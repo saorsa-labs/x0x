@@ -1121,7 +1121,8 @@ fn head_attestation_mandate_epoch_check() {
 
 /// Seed a capability entry directly on the LIVE record — the persisted
 /// shape slice 2 owns (`BTreeMap<agent, MandateCapabilityState{first_seen_ms}>`;
-/// the `Refusing` phase is DERIVED, never persisted).
+/// the `Refusing` phase is DERIVED at read time — only the
+/// per-agent observation data persists).
 async fn seed_capability(state: &AppState, group_id: &str, actor: &str, first_seen_ms: u64) {
     state
         .named_groups
@@ -2348,6 +2349,13 @@ async fn refusing_transitions_counted_per_agent_one_shot() -> Result<()> {
         .expect("capability entry");
     assert_eq!(capability.refusals, 2, "per-agent refusals == 2");
     assert_eq!(capability.first_seen_ms, first_seen, "clock retained");
+    // r3 safety advisory: the persist-side update can never (re)mint an
+    // entry — a vanished entry is skipped, so `first_seen_ms = 0`
+    // (permanently-Refusing under any clock) is unreachable.
+    assert_ne!(
+        capability.first_seen_ms, 0,
+        "refusal persist must never mint a zero clock"
+    );
     assert!(
         row.mandate_capability
             .iter()
@@ -2450,4 +2458,55 @@ async fn refusing_transitions_counted_per_agent_one_shot() -> Result<()> {
         "refusal after a restored Capable is a NEW transition"
     );
     Ok(())
+}
+
+/// WHY (r3 item 2): the join attestation and the quarantine-clear
+/// attestation sign the SAME field shape over the SAME head, so domain
+/// separation is the ONLY thing that keeps a join attestation (owner
+/// blesses a joiner's seat) from clearing a quarantine (owner blesses
+/// this node's local containment state). Sign the identical fields under
+/// the join domain and the clear verification MUST fail — a refactor
+/// back to one shared `canonical_bytes` fails here.
+#[test]
+fn quarantine_clear_domain_is_separate_from_join_attestation() {
+    let owner = UserKeypair::from_seed(&[0x3E; 32]).expect("owner key");
+    let owner_id = owner.user_id();
+    let stable_id = "7f".repeat(32);
+    let local_hex = "1a".repeat(32);
+    // A join-domain attestation over the exact fields the clear path
+    // checks (honest owner signature, correct head, correct agent).
+    let join_domain =
+        HeadAttestation::sign(&stable_id, 12, "head-state-hash-r3", &local_hex, &owner)
+            .expect("sign under the join domain");
+    assert!(
+        !join_domain.verify_quarantine_clear(
+            owner.public_key(),
+            &owner_id,
+            &stable_id,
+            12,
+            "head-state-hash-r3",
+            &local_hex,
+        ),
+        "a join-domain attestation must never clear a quarantine"
+    );
+    // Control: the same fields under the clear domain verify.
+    let clear_domain = HeadAttestation::sign_quarantine_clear(
+        &stable_id,
+        12,
+        "head-state-hash-r3",
+        &local_hex,
+        &owner,
+    )
+    .expect("sign under the clear domain");
+    assert!(
+        clear_domain.verify_quarantine_clear(
+            owner.public_key(),
+            &owner_id,
+            &stable_id,
+            12,
+            "head-state-hash-r3",
+            &local_hex,
+        ),
+        "the clear-domain attestation over identical fields verifies"
+    );
 }

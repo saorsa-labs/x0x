@@ -377,7 +377,13 @@ local wall clock (the same source as `first_seen_ms`, so a node is
 self-consistent); a backwards clock jump flips a `Refusing` authority
 back to warn-accept until the clock recovers — accepted because both
 sides of the skew fail toward the ADR-0016 checks rather than any new
-attack surface, and `refusing` is a derived phase, never persisted state.
+attack surface, and the `refusing` PHASE itself is never persisted: it
+is derived from `first_seen_ms` at read time (what persists is the
+per-agent observation data — `first_seen_ms`, `refusals`, and the
+episode flag — all local-only). Cost note: every refused event writes
+the capability map once (one `named_groups` persist per refused event,
+bounded by the stale install's event rate; the committed group state is
+untouched).
 `[groups] mandate_grace_days` is validated (≥ 1) only in `x0xd`'s config
 loader (`load_config`, which also serves `--check`); embedded
 `serve_with_options` callers construct `DaemonConfig` programmatically
