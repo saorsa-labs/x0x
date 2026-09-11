@@ -296,26 +296,41 @@ impl TaskList {
         *h.finalize().as_bytes()
     }
 
-    /// Remove local tasks absent from a digest-verified full-state serve
-    /// (`delta.added_tasks` is then the verified complete task set).
+    /// Remove local tasks a digest-verified full-state serve evidences the
+    /// holder DELETED (issue #643 refinement of the #240 deletion cold-sync).
     ///
-    /// This is the deletion cold-sync path (issue #240): a plain full-delta
-    /// merge only upserts, so tasks the holder deleted while this replica
-    /// was away would otherwise linger forever. Each stale task is removed
-    /// via [`delta_remove_task`](Self::delta_remove_task) — a LOCAL
-    /// observe-remove (its current tags are tombstoned, so a later re-add
-    /// with fresh tags still wins; the tombstones also reject cache replays
-    /// of the pre-delete adds) — the same semantics as merging a removal
-    /// delta.
+    /// A plain full-delta merge only upserts, so tasks the holder deleted
+    /// while this replica was away would otherwise linger forever. But the
+    /// serve's task set alone cannot distinguish "holder deleted T" from
+    /// "holder never merged T's add" (its snapshot may predate a live add
+    /// this replica already holds) — pruning on absence alone observe-removes
+    /// NEWER local knowledge, tombstones T's tags against re-delivery, and
+    /// makes a task that a visibility read just saw vanish before the claim
+    /// (issue #643). The serve's LWW ordering register supplies the causal
+    /// evidence: `add_task` appends the id and `remove_task` deliberately
+    /// keeps ordering entries, so an id present in the serve's ordering but
+    /// absent from its task set marks a holder-side deletion (state causally
+    /// after T's add), while an id in neither was never seen by the holder —
+    /// its absence is ignorance, not deletion, and OR-Set adds-win keeps the
+    /// local task. Each removed task goes through
+    /// [`delta_remove_task`](Self::delta_remove_task) — a LOCAL
+    /// observe-remove (tombstoned tags, so a later re-add with fresh tags
+    /// still wins) — the same semantics as merging a removal delta.
     ///
     /// Callers MUST have verified the delta against the serving holder's
     /// declared digest first — without that binding, any holder could
     /// truncate local state at will.
     pub(crate) fn prune_to_served_set(&mut self, delta: &TaskListDelta) -> usize {
+        let holder_knew: std::collections::HashSet<&TaskId> = delta
+            .ordering_update
+            .as_ref()
+            .map(|o| o.get().iter().collect())
+            .unwrap_or_default();
         let stale: Vec<TaskId> = self
             .task_data
             .keys()
             .filter(|id| !delta.added_tasks.contains_key(*id))
+            .filter(|id| holder_knew.contains(*id))
             .copied()
             .collect();
         let mut pruned = 0;

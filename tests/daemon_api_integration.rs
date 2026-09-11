@@ -2316,6 +2316,60 @@ async fn daemon_api_claim_malformed_fence_token_is_rejected_non_mutating() -> Re
     Ok(())
 }
 
+/// WHY (issue #643): a claim can address a task a read just saw while
+/// convergence settles (a stale bootstrap full-serve pruned it before its
+/// re-delivery merged), or a task deleted elsewhere / never present. That
+/// must surface as a structured, retryable 404 — never a 500-class storage
+/// failure the caller cannot distinguish from disk faults. Pre-fix, this
+/// exact request returned 500 `claim_task failed: task not found`.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_claim_absent_task_returns_structured_retryable_404() -> Result<()> {
+    let d = daemon().await;
+    let (list_id, _task_id) = create_task_list_item(&d, "Absent target").await?;
+
+    // A well-formed 64-hex task id that was never on this list.
+    let absent = fake_id();
+    let listed = list_task_list_items(&d, &list_id).await?;
+    let version_before = listed["version"].as_u64();
+    let fence_before = listed["fence_token"].as_str().map(str::to_string);
+
+    let (status, body) =
+        patch_task_raw(&d, &list_id, &absent, serde_json::json!({"action":"claim"})).await?;
+    ensure!(
+        status == StatusCode::NOT_FOUND,
+        "absent task claim must be 404, got {status}: {body:?}"
+    );
+    ensure!(
+        body["error"] == "task_not_found",
+        "absent task claim must report task_not_found: {body:?}"
+    );
+    ensure!(
+        body["retryable"] == true,
+        "task_not_found must be marked retryable: {body:?}"
+    );
+    ensure!(
+        body["ok"] == false,
+        "task_not_found must not report ok:true: {body:?}"
+    );
+
+    // Non-mutating: the list version is unchanged and the echoed fence token
+    // (when present) is the current one, so a retrying client re-reads
+    // against up-to-date state.
+    let listed_after = list_task_list_items(&d, &list_id).await?;
+    ensure!(
+        listed_after["version"].as_u64() == version_before,
+        "absent task claim must not change the version: {listed_after:?}"
+    );
+    if let (Some(before), Some(echoed)) = (fence_before.as_deref(), body["fence_token"].as_str()) {
+        ensure!(
+            echoed == before,
+            "echoed fence_token must equal the current token: {echoed:?} != {before:?}"
+        );
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // Network (5)
 // ===========================================================================

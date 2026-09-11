@@ -590,6 +590,24 @@ pub(in crate::server) async fn update_task(
                 "cas": { "scope": "local_replica" },
             })),
         ),
+        // Issue #643: a task a caller just read can be transiently absent
+        // from this replica while convergence settles (a stale bootstrap
+        // full-serve pruned it before its re-delivery merged), or it was
+        // deleted elsewhere, or it never existed. That is a structured,
+        // retryable 404 — NOT a 500-class storage failure: the caller
+        // re-reads the list (the echoed fence token is the current one) and
+        // retries or gives up. Non-mutating by construction.
+        Ok(x0x::TaskMutationOutcome::TaskMissing { current }) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "task_not_found",
+                "retryable": true,
+                "current_version": current.revision,
+                "fence_token": current.to_wire(),
+                "cas": { "scope": "local_replica" },
+            })),
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }
