@@ -566,6 +566,13 @@ ordinary `/stores` record. See the [encrypted-store API design](https://github.c
 
 Claims are advisory (never exclusive); `fence_token` fences your own local replica across restarts. Task ownership transfer rides ADR-0040 delegation (claiming ≠ ownership).
 
+A claim/complete against a task absent from THIS replica right now returns a
+retryable `404 {"error":"task_not_found","retryable":true,...}` (with the
+current `fence_token`), not a 500: during convergence a task a read just saw
+can be transiently absent (a stale bootstrap full-serve pruned it before its
+re-delivery merged), or it was deleted elsewhere / never existed. Re-read the
+list and retry, or conclude it is gone.
+
 **Joining a task list from a second machine = create a list with the SAME topic.** There is no join verb for task lists: the list id derives from the topic alone (`TaskListId::from_topic`), so a second machine runs `x0x tasks create <any-name> <same-topic>` and its replica converges via the state-sync side channel (cold-start bootstrap, then deltas). A plain `x0x subscribe <topic>` does NOT materialize the list — without the create, no replica exists to answer the bootstrap. KV stores are the contrast: they DO have a join verb (`POST /stores/:id/join`, anchored on the owner's agent_id).
 
 ### 4.6 Files

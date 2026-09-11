@@ -1690,6 +1690,24 @@ same value. Two daemons at the same token will BOTH accept, because the guard
 cannot provide cross-replica exclusion. Without `fence_token`, the mutation is
 unconditional (still advisory).
 
+#### Transient task absence: 404 `task_not_found` is retryable
+
+Claim/complete can address a task that a `GET` moments earlier showed: while
+convergence settles, a bootstrap full-state serve that predates the task can
+transiently remove it from this replica before its re-delivery merges back in
+(OR-Set adds-win restores it). A deleted-elsewhere or never-existed task id
+produces the same signal. None of these are server faults, so they are never a
+`500` — the mutation does nothing and returns **404 Not Found** with a
+machine-readable, retryable body:
+
+```json
+{"ok":false,"error":"task_not_found","retryable":true,"current_version":9,"fence_token":"1779123456789:9","cas":{"scope":"local_replica"}}
+```
+
+The correct client behavior is to re-read the list (`GET
+/task-lists/:id/tasks` — `fence_token` is already current) and retry the
+claim, or conclude the task is gone if it stays absent.
+
 ## Key-value stores
 
 | Method | Endpoint | CLI | Purpose |
