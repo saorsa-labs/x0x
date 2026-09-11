@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`announce/v3/blob` CPU amplification (#656).** The blob responder's
+  cache-first branch let every node that had ever cached peer X's blob
+  answer a request for X, so one miss drew a broadcast response from every
+  cache holder (observed 46.7 msgs/s, 825 KB/s against a documented
+  0.045 fetches/s steady state). `AnnounceBlobCache::serve_request` now
+  answers only when this node owns the requested digest (its own current
+  `(user_id, agent_certificate)` pair); cached peer blobs are no longer
+  served. The responder's 1 s coalescing window is now tracked per digest
+  (bounded at 256 entries, stalest evicted) instead of one global instant,
+  so a busy blob no longer starves unrelated digests into the fetcher's
+  5 s timeout-retry loop. Publish-side only; request/response wire shapes
+  unchanged, 0.41.x/0.42.0 peers unaffected.
+
 ### Tests
 
 - `tests/e2e_deploy.sh` uploads the binary as a gzip stream with ssh keepalives

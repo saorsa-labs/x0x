@@ -65,8 +65,17 @@ pub(crate) const BLOB_FETCH_TIMEOUT_SECS: u64 = 5;
 
 /// A verified requester can make peers serve blobs, but must not be able to
 /// amplify traffic without bound. Mirrors the caps responder's coalescing
-/// window (`dm_capability_service.rs`).
+/// window (`dm_capability_service.rs`). Tracked PER DIGEST (#656): one
+/// global instant starved every unrelated blob whenever a single digest was
+/// busy — a dropped request was silently discarded, retrying only after the
+/// fetcher's 5 s deadline.
 const MIN_RESPONSE_INTERVAL_SECS: u64 = 1;
+
+/// Bound for the per-digest coalescing window. Matches the cache cap
+/// (`BLOB_CACHE_MAX_ENTRIES`): at fleet scale each node owns one blob, so a
+/// window entry per served digest is the natural unit. The stalest entry is
+/// evicted on overflow.
+const RESPONSE_WINDOW_MAX_DIGESTS: usize = 256;
 
 /// The serving daemon's current `(user_id, agent_certificate)` pair, shared
 /// with the responder task so consent changes are picked up live.
@@ -337,21 +346,23 @@ impl AnnounceBlobCache {
         None
     }
 
-    /// Serve a blob request from our own cache or our current announcement
-    /// state. Called by the targeted-request handler when a peer asks for
-    /// a digest. The response is the bincode of the served agent's
+    /// Serve a blob request from our own current announcement state only.
+    /// Called by the targeted-request handler when a peer asks for a
+    /// digest. The response is the bincode of the served agent's
     /// `(user_id, agent_certificate)` pair.
+    ///
+    /// OWNER-ONLY (#656): a cached peer blob is deliberately NOT served.
+    /// Every node that ever cached peer X's blob would otherwise become a
+    /// responder for X, so one request draws a broadcast response from
+    /// every cache holder — a mesh of N caches is a mesh of N amplifiers.
+    /// The owner is always a valid responder, and fetchers verify the
+    /// served bytes against the requested digest anyway.
     pub async fn serve_request(
         &self,
         digest: &[u8; 32],
         current_user_id: &Option<identity::UserId>,
         current_agent_certificate: &Option<identity::AgentCertificate>,
     ) -> Option<Vec<u8>> {
-        // Check the cache first.
-        if let Some(cached) = self.get(digest).await {
-            return bincode::serialize(&(&cached.user_id, &cached.agent_certificate)).ok();
-        }
-        // Check if it matches our own current pair.
         if crate::announce_v3::cert_digest(current_user_id, current_agent_certificate) == *digest {
             return bincode::serialize(&(current_user_id, current_agent_certificate)).ok();
         }
@@ -795,8 +806,9 @@ fn decode_blob_request_from(encoded: &[u8]) -> Option<AnnounceBlobRequest> {
 /// domain-prefixed request with [`AnnounceBlobCache::serve_request`]'s pair
 /// bytes under `ANNOUNCE_BLOB_RESPONSE_DOMAIN`. Mirrors the caps
 /// warm-targeted-request responder (`dm_capability_service.rs`), including
-/// the 1-response-per-second coalescing window so a burst of requests
-/// cannot turn into a blob storm.
+/// a 1-response-per-second PER-DIGEST coalescing window so a burst of
+/// requests cannot turn into a blob storm without starving unrelated
+/// digests (#656).
 ///
 /// `own_pair` is read live per request, so consent changes (a new user→agent
 /// certificate) are served without a restart.
@@ -811,11 +823,7 @@ pub async fn spawn_blob_responder(
         .await;
 
     let handle = tokio::spawn(async move {
-        let mut last_response = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(
-                MIN_RESPONSE_INTERVAL_SECS + 1,
-            ))
-            .unwrap_or_else(std::time::Instant::now);
+        let mut last_response_by_digest: HashMap<[u8; 32], std::time::Instant> = HashMap::new();
         loop {
             // Drain whichever carrier delivers first; both decode the same
             // domain-prefixed request shape.
@@ -863,12 +871,18 @@ pub async fn spawn_blob_responder(
                 .diagnostics
                 .pair_available
                 .fetch_add(1, Ordering::Relaxed);
-            // Coalesce: at most one response per window, like the caps
-            // responder. A dropped response is retried by the next beat.
+            // Coalesce per digest: at most one response per window per
+            // blob, like the caps responder. A dropped response is retried
+            // by the next beat. The window is keyed by digest (#656) so a
+            // busy blob never silences unrelated digests.
             let now = std::time::Instant::now();
-            if now.duration_since(last_response)
-                < std::time::Duration::from_secs(MIN_RESPONSE_INTERVAL_SECS)
-            {
+            let within_window = last_response_by_digest
+                .get(&request.digest)
+                .is_some_and(|last| {
+                    now.duration_since(*last)
+                        < std::time::Duration::from_secs(MIN_RESPONSE_INTERVAL_SECS)
+                });
+            if within_window {
                 #[cfg(test)]
                 cache
                     .diagnostics
@@ -876,7 +890,21 @@ pub async fn spawn_blob_responder(
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            last_response = now;
+            if !last_response_by_digest.contains_key(&request.digest)
+                && last_response_by_digest.len() >= RESPONSE_WINDOW_MAX_DIGESTS
+            {
+                // Bound the window map: evict the stalest tracked digest.
+                // Entries older than the window are already inert, so this
+                // only trims bookkeeping.
+                if let Some((stalest, _)) = last_response_by_digest
+                    .iter()
+                    .min_by_key(|(_, last)| *last)
+                    .map(|(digest, last)| (*digest, *last))
+                {
+                    last_response_by_digest.remove(&stalest);
+                }
+            }
+            last_response_by_digest.insert(request.digest, now);
             // Wrap the pair bytes in the typed response envelope so the
             // fetcher's decode_blob_response round-trips (a bare pair tuple
             // does not deserialize as AnnounceBlobResponse).
@@ -1265,6 +1293,36 @@ mod tests {
         assert!(cache.serve_request(&unknown, &None, &None).await.is_none());
     }
 
+    /// serve_request (#656): a digest that only exists in OUR CACHE (a
+    /// peer's blob) must NOT be served. Cache-first serving turned every
+    /// node that had ever cached peer X's blob into a responder for X, so
+    /// one request drew a broadcast response from every cache holder.
+    #[tokio::test]
+    async fn serve_request_never_serves_a_cached_peer_blob() {
+        let (cert, user_kp, _agent_kp) = issued_cert();
+        let peer_user_id = Some(user_kp.user_id());
+        let cache = AnnounceBlobCache::new(None);
+        let digest = crate::announce_v3::cert_digest(&peer_user_id, &Some(cert.clone()));
+        cache
+            .insert_verified(CachedBlob {
+                digest,
+                payload_version: 1,
+                user_id: peer_user_id,
+                agent_certificate: Some(cert),
+                fetched_at_unix: 1,
+            })
+            .await;
+
+        // The cache HITS for the peer digest...
+        assert!(cache.get(&digest).await.is_some());
+        // ...but serving is owner-only: with our own (different, anonymous)
+        // pair the request goes unanswered.
+        assert!(
+            cache.serve_request(&digest, &None, &None).await.is_none(),
+            "a cached peer blob must not be served by a non-owner"
+        );
+    }
+
     // ── Hermetic protocol tests (issue #417: no prod dialing — local
     //    pubsub delivery only, mirroring the caps-service test harness) ──
 
@@ -1330,7 +1388,9 @@ mod tests {
             let digest = crate::announce_v3::cert_digest(&user_id, &Some(cert.clone()));
 
             let pubsub = make_pubsub().await;
-            // Serving agent: cache with the pair pre-cached + live pair source.
+            // Serving agent: it OWNS the pair (owner-only serving, #656) and
+            // still carries a pre-cached copy — proving a cache hit alone no
+            // longer makes a node a responder.
             let serving_cache = Arc::new(AnnounceBlobCache::new(None));
             serving_cache
                 .insert_verified(CachedBlob {
@@ -1341,7 +1401,7 @@ mod tests {
                     fetched_at_unix: 1,
                 })
                 .await;
-            let own_pair = shared_cert_pair(None, None);
+            let own_pair = shared_cert_pair(user_id, Some(cert.clone()));
             spawn_blob_responder(Arc::clone(&pubsub), serving_cache, own_pair)
                 .await
                 .expect("responder spawns");
@@ -1381,6 +1441,144 @@ mod tests {
 
             let stats = fetching_cache.snapshot();
             assert!(stats.blob_fetches_ok >= 1, "metering must count the fetch");
+        }
+
+        /// #656 fixture: A announces (owns) a pair; B and C have ALREADY
+        /// cached A's blob; D requests it. Business rule: a cert blob is
+        /// served by its OWNER — a mesh of N caches is a mesh of N
+        /// amplifiers, and under cache-first serving this exact fixture put
+        /// THREE responses on the wire for one request. Then, still inside
+        /// what used to be one global 1 s coalescing window, D requests C's
+        /// digest: it must be answered, proving the window is per digest
+        /// and one busy blob cannot starve unrelated owners.
+        #[tokio::test]
+        async fn blob_request_is_answered_once_by_the_owner_only() {
+            let (cert_a, user_a, _) = issued_cert();
+            let (cert_b, user_b, _) = issued_cert();
+            let (cert_c, user_c, _) = issued_cert();
+            let user_a = Some(user_a.user_id());
+            let user_b = Some(user_b.user_id());
+            let user_c = Some(user_c.user_id());
+            let digest_a = crate::announce_v3::cert_digest(&user_a, &Some(cert_a.clone()));
+            let digest_c = crate::announce_v3::cert_digest(&user_c, &Some(cert_c.clone()));
+
+            let pubsub = make_pubsub().await;
+
+            // Fleet-wide response counter: every domain-prefixed blob
+            // RESPONSE on the topic, keyed by the digest of the pair bytes
+            // it carries (the same match rule the fetcher uses).
+            let mut counter_sub = pubsub.subscribe(ANNOUNCE_BLOB_TOPIC.to_string()).await;
+            let counts = Arc::new(std::sync::Mutex::new(HashMap::<[u8; 32], usize>::new()));
+            let counter_counts = Arc::clone(&counts);
+            tokio::spawn(async move {
+                while let Some(message) = counter_sub.recv().await {
+                    let Some(payload) = message.payload.strip_prefix(ANNOUNCE_BLOB_RESPONSE_DOMAIN)
+                    else {
+                        continue;
+                    };
+                    let Some(response) = decode_blob_response(payload) else {
+                        continue;
+                    };
+                    let digest: [u8; 32] = blake3::hash(&response.announcement_bytes).into();
+                    *counter_counts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(digest)
+                        .or_insert(0) += 1;
+                }
+            });
+
+            // A: owner of digest_a, empty cache — it serves from its own
+            // live pair.
+            spawn_blob_responder(
+                Arc::clone(&pubsub),
+                Arc::new(AnnounceBlobCache::new(None)),
+                shared_cert_pair(user_a, Some(cert_a.clone())),
+            )
+            .await
+            .expect("responder A spawns");
+            // B and C: owners of their OWN pairs, with A's blob already
+            // cached — the cache-first amplifier fixture.
+            for (user, cert) in [(user_b, cert_b), (user_c, cert_c.clone())] {
+                let cache = Arc::new(AnnounceBlobCache::new(None));
+                cache
+                    .insert_verified(CachedBlob {
+                        digest: digest_a,
+                        payload_version: 7,
+                        user_id: user_a,
+                        agent_certificate: Some(cert_a.clone()),
+                        fetched_at_unix: 1,
+                    })
+                    .await;
+                spawn_blob_responder(
+                    Arc::clone(&pubsub),
+                    cache,
+                    shared_cert_pair(user, Some(cert)),
+                )
+                .await
+                .expect("responder spawns");
+            }
+            // Let the responders' subscriptions register (same
+            // registration race the caps-service tests sleep for).
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let count = |digest: &[u8; 32]| {
+                counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(digest)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let requester = crate::identity::AgentKeypair::generate()
+                .expect("requester keypair")
+                .agent_id();
+
+            // D requests A's blob. Exactly one response may exist
+            // fleet-wide: the owner's.
+            pubsub
+                .publish(
+                    ANNOUNCE_BLOB_TOPIC.to_string(),
+                    Bytes::from(encode_blob_request(&digest_a, &requester)),
+                )
+                .await
+                .expect("publish request for A's blob");
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while count(&digest_a) < 1 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            // Quiet period: no further responses may arrive for the same
+            // request (this is the exact-count assertion, not a lower
+            // bound — cache-first serving produced three here).
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(
+                count(&digest_a),
+                1,
+                "exactly ONE publish fleet-wide: the owner's"
+            );
+
+            // Inside the old 1 s global window, D requests C's blob. The
+            // per-digest window must let C answer: under the global
+            // instant, B and C had just burned their window answering for
+            // A, so C's own digest was silently starved.
+            pubsub
+                .publish(
+                    ANNOUNCE_BLOB_TOPIC.to_string(),
+                    Bytes::from(encode_blob_request(&digest_c, &requester)),
+                )
+                .await
+                .expect("publish request for C's blob");
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while count(&digest_c) < 1 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(
+                count(&digest_c),
+                1,
+                "a second digest inside the old window must still be answered, exactly once"
+            );
+            assert_eq!(count(&digest_a), 1, "no late responses for A's blob");
         }
 
         /// Forged responder: serves tampered pair bytes whose digest DOES
