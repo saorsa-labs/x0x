@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.42.0] - 2026-09-11
+
 ### Changed
 
 - **BREAKING (managed installs): self-update refuses a conflicting restart
@@ -447,6 +449,8 @@ All notable changes to this project will be documented in this file.
   close #504.
 
 ## [v0.41.4] - 2026-09-07
+
+_Never tagged; these changes shipped as part of v0.42.0._
 
 Patch candidate: experimental Leaf eager-degree selection + named gossip egress
 meters (#504 slice 1), test-oracle settle for detached eager fanout, and
