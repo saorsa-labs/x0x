@@ -43,7 +43,10 @@ MESH_ANCHOR="${MESH_ANCHOR:-nyc}"
 MESH_DISCOVER_SECS="${MESH_DISCOVER_SECS:-45}"
 MESH_SETTLE_SECS="${MESH_SETTLE_SECS:-45}"
 VERSION="$(grep '^version = ' "$PROJECT_DIR/Cargo.toml" | head -1 | cut -d '"' -f2)"
-SSH="ssh -C -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
+# Keepalives: the 57 MB upload to the APAC/Hetzner hosts can stall silently;
+# ServerAlive* turns a dead session into a failure instead of an indefinite hang
+# (two stalls on 2026-09-11 cost ~40 min of the v0.42.1 rollout).
+SSH="ssh -C -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
 
 # CLI overrides (--mesh-verify / --skip-mesh-verify)
 for arg in "$@"; do
@@ -116,7 +119,8 @@ for node in "${NODE_NAMES[@]}"; do
     # Stream to a temp path and install atomically. These hosts accept SSH
     # command execution reliably, but SFTP/scp in-place replacement can fail.
     echo -n "    Uploading binary... "
-    if cat "$BINARY" | $SSH root@"$ip" 'cat > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
+    # gzip stream: ~60% fewer bytes on the wire than ssh -C alone for the release binary.
+    if gzip -1 -c "$BINARY" | $SSH root@"$ip" 'gunzip -c > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
         echo -e "${GREEN}done${NC}"
     else
         echo -e "${RED}failed${NC}"
