@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Task-claim 500 `task not found` after a visible read (#643).** A replica
+  could answer a visibility read for a task and then fail the claim with
+  HTTP 500 `claim_task failed: task not found`. Two layers now hold. (1)
+  `claim`/`complete` against a task absent from the local replica return the
+  new structured, retryable `404 {"error":"task_not_found","retryable":true}`
+  with the current `fence_token` — never a 500-class storage error — and
+  `docs/api-reference.md` documents the contract. (2) Root cause closed in
+  the CRDT: the bootstrap full-serve adopt gate pruned ANY local task absent
+  from a digest-verified serve, but the digest only proves the serve equals
+  the holder's state at serve time — an in-flight serve answered before the
+  holder merged a live add removed the just-seen task. The prune now fires
+  only on explicit, monotone holder-carried removal evidence (empty-tag-set
+  `removed_tasks` entries in the full serve, backed by a raise-only
+  observed-removed set persisted in a v2 task-list snapshot envelope;
+  v0.42.0 v1 snapshots still load, degrading safely to no evidence). Old
+  peers' serves carry no evidence and prune nothing (safer than the old
+  absence rule); deletion cold-sync survives delete→reorder sequences that
+  previously lost the deletion and let stale replicas resurrect removed
+  tasks fleet-wide with fresh OR-Set tags.
+
 ## [v0.42.0] - 2026-09-11
 
 ### Changed

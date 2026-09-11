@@ -1915,30 +1915,43 @@ mod tests {
     /// equals the holder's COMPLETE state at serve time — it does NOT prove
     /// that state is fresh relative to this replica. A serve solicited
     /// before the holder merged a live add delta can arrive AFTER this
-    /// replica already merged the add; without a freshness guard the prune
-    /// gate observe-removes the task, so a visibility read (GET) and a
-    /// subsequent claim disagree and the claim fails `task not found`
-    /// (observed as HTTP 500 in the convergence soak, run 10 of
-    /// 20260911-092818). The prune may only fire while local content is
-    /// exactly what it was when this replica last asked for state: any
-    /// live delta merged since then is NEWER knowledge than the serve and
-    /// adds-win must keep it. Deletion cold-sync (the gate's purpose) is
-    /// unaffected: there local content is unchanged since the request.
+    /// replica already merged the add; pruning on absence observe-removes
+    /// the task, so a visibility read (GET) and a subsequent claim
+    /// disagree and the claim fails `task not found` (observed as HTTP 500
+    /// in the convergence soak, run 10 of 20260911-092818). The prune
+    /// fires ONLY on explicit holder-carried removal evidence
+    /// (empty-tag-set `removed_tasks` entries, #643 round 2) — a task the
+    /// serve merely lacks is newer knowledge than the serve and adds-win
+    /// keeps it.
+    ///
+    /// The stale holder here is NON-EMPTY (it carries an older task): that
+    /// is the only serve shape production emits — responders with empty
+    /// lists stay silent — and it makes the serve's digest and entry_count
+    /// exactly what a live mesh would declare.
     #[tokio::test(start_paused = true)]
     async fn stale_full_serve_after_live_add_must_not_prune_the_live_task() {
         let pubsub = signed_pubsub().await;
         let topic = "tasks-643-stale-serve-race";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // The holder's PRE-add state: an empty full serve, snapshot and
-        // declaration captured together exactly as the responder loop does.
+        // The holder's PRE-add state: a real, non-empty full serve
+        // (carrying the older task t0), snapshot and declaration captured
+        // together exactly as the responder loop does.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        holder_list
+            .add_task(make_task(0, peer(1)), peer(1), 1)
+            .expect("holder t0");
         let (stale_serve, stale_digest, stale_count) = {
             let digest = holder_list.served_digest();
             let count = holder_list.task_count() as u32;
             (holder_list.full_delta(), digest, count)
         };
-        assert_eq!(stale_count, 0, "the stale serve predates the add");
+        assert_eq!(stale_count, 1, "the stale serve must be production-shaped");
+        assert_eq!(stale_count as usize, stale_serve.added_tasks.len());
+        assert!(
+            stale_serve.removed_tasks.is_empty(),
+            "no deletion evidence in flight — only absence"
+        );
 
         // The live add: T exists on the holder only as a published delta.
         let task = make_task(5, peer(1));
@@ -2267,6 +2280,145 @@ mod tests {
         assert!(
             replica.get_task(&doomed).is_some(),
             "a re-served task must be accepted after a prune"
+        );
+    }
+
+    /// WHY (issue #643 round 2, review case a): `reorder` rebuilds the
+    /// LWW ordering register from LIVE ids only, so after a delete any
+    /// reorder strips the deleted id from the ordering — the round-1
+    /// "ordering names deleted ids" evidence rule then failed to prune,
+    /// the stale replica kept the task with live tags, and its next full
+    /// serve re-served the deleted task with FRESH tags — fleet-wide
+    /// resurrection (#226 class). Deletion evidence must ride a MONOTONE
+    /// carrier: the raise-only observed-removed set, carried in the serve
+    /// as empty-tag-set `removed_tasks` entries. Delete → reorder → serve
+    /// must still prune, and the pruned replica must not re-serve the
+    /// task.
+    #[test]
+    fn delete_then_reorder_full_serve_still_prunes_without_resurrection() {
+        let t1 = TaskId::from_bytes([1; 32]);
+        let doomed = TaskId::from_bytes([2; 32]);
+
+        // Holder: {t1, doomed}, then DELETES doomed, then REORDERS to the
+        // live set — the register no longer names doomed.
+        let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
+        holder
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("add t1");
+        holder
+            .add_task(make_task(2, peer(1)), peer(1), 2)
+            .expect("add doomed");
+        holder.remove_task(&doomed).expect("delete doomed");
+        holder
+            .reorder(vec![t1], peer(1))
+            .expect("reorder to live set");
+
+        // The serve is a REAL full serve from the post-reorder holder.
+        let serve = holder.full_delta();
+        assert!(
+            !serve.added_tasks.contains_key(&doomed),
+            "deleted task is not served live"
+        );
+        assert_eq!(
+            serve.removed_tasks.get(&doomed).map(|tags| tags.len()),
+            Some(0),
+            "the monotone evidence carrier still names the deletion"
+        );
+        assert!(
+            !serve
+                .ordering_update
+                .as_ref()
+                .is_some_and(|o| o.get().contains(&doomed)),
+            "pin the hazard: the ordering register DID forget the deletion"
+        );
+
+        // A stale replica still holding both tasks merges the serve (which
+        // must NOT delete on general merge) and then the digest-verified
+        // adopt prunes doomed on the explicit evidence.
+        let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
+        replica
+            .add_task(make_task(1, peer(2)), peer(2), 1)
+            .expect("replica t1");
+        replica
+            .add_task(make_task(2, peer(2)), peer(2), 2)
+            .expect("replica doomed (stale — the deletion not yet merged)");
+        replica
+            .merge_delta(&serve, peer(1), Some(&agent(1)))
+            .expect("merge serve");
+        assert!(
+            replica.get_task(&doomed).is_some(),
+            "general merge must not delete on evidence entries"
+        );
+        assert_eq!(
+            replica.prune_to_served_set(&serve),
+            1,
+            "the adopt gate prunes on explicit deletion evidence"
+        );
+        assert!(replica.get_task(&doomed).is_none());
+        assert!(replica.get_task(&t1).is_some(), "live task survives");
+
+        // No resurrection: the pruned replica's own serve carries doomed
+        // only as evidence — never as a fresh-tagged live entry.
+        let re_serve = replica.full_delta();
+        assert!(
+            !re_serve.added_tasks.contains_key(&doomed),
+            "a pruned replica must not re-serve the deleted task"
+        );
+        assert_eq!(
+            re_serve.removed_tasks.get(&doomed).map(|tags| tags.len()),
+            Some(0),
+            "the replica forwards the deletion evidence onward"
+        );
+    }
+
+    /// WHY (issue #643 round 2, review case b): out-of-order delivery can
+    /// land a reorder delta whose ordering register names a task whose ADD
+    /// has not arrived yet (delta.rs documents this as expected). An
+    /// ordering mention is therefore not deletion evidence; under the
+    /// round-1 rule this shape false-pruned a task the holder never even
+    /// carried. Only explicit empty-tag-set removal evidence may prune.
+    #[test]
+    fn ordering_entry_without_add_or_evidence_is_not_pruned() {
+        let phantom = TaskId::from_bytes([7; 32]);
+
+        // Holder: {t1} only; its serve's ordering register is grafted to
+        // ALSO name `phantom` — a reorder delta that outran phantom's add.
+        let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
+        holder
+            .add_task(make_task(1, peer(1)), peer(1), 1)
+            .expect("add t1");
+        let mut serve = holder.full_delta();
+        let ordering = serve.ordering_update.as_mut().expect("full serve ordering");
+        let mut grafted = ordering.get().clone();
+        grafted.push(phantom);
+        *ordering = saorsa_gossip_crdt_sync::LwwRegister::new(grafted);
+        assert!(
+            !serve.added_tasks.contains_key(&phantom),
+            "the add never arrived"
+        );
+        assert!(
+            !serve.removed_tasks.contains_key(&phantom),
+            "no deletion evidence exists"
+        );
+
+        // A replica holding phantom (its add landed separately) merges the
+        // serve and runs the adopt prune: the ordering mention must not
+        // remove phantom.
+        let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
+        replica
+            .add_task(make_task(7, peer(2)), peer(2), 1)
+            .expect("seed phantom");
+        replica
+            .merge_delta(&serve, peer(1), Some(&agent(1)))
+            .expect("merge serve");
+        assert_eq!(
+            replica.prune_to_served_set(&serve),
+            0,
+            "an ordering mention is not deletion evidence"
+        );
+        assert!(
+            replica.get_task(&phantom).is_some(),
+            "adds-win keeps the live task the holder merely never saw"
         );
     }
 }

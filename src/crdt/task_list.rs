@@ -126,6 +126,27 @@ pub struct TaskList {
     #[serde(skip, default = "default_seq_counter")]
     seq_counter: Arc<AtomicU64>,
 
+    /// Raise-only record of task ids this replica has OBSERVED removed —
+    /// its own `remove_task` or a removal merged from a delta (issue #643
+    /// round 2: deletion cold-sync evidence).
+    ///
+    /// Deletion evidence must be monotone: the #240 digest-verified adopt
+    /// prunes a local task ONLY when the serving holder carries explicit
+    /// removal evidence for it, never on mere absence from the serve — a
+    /// serve's snapshot can predate a live add this replica already merged
+    /// (issue #643). Ids are never removed from this set (a re-added task
+    /// is simply excluded from the served evidence while live), so a
+    /// delete cannot be un-remembered by reorders or LWW races — unlike
+    /// the ordering register, which `reorder` rebuilds from live ids only.
+    ///
+    /// `serde(skip)` like `seq_counter`: NOT inlined into snapshots (the
+    /// bincode snapshot body is positional; an inlined trailing field
+    /// would break v1 snapshot decoding) — it travels in the versioned
+    /// snapshot envelope instead, and in full serves as empty-tag-set
+    /// `removed_tasks` entries (see [`TaskList::full_delta`]).
+    #[serde(skip, default)]
+    known_removed: HashSet<TaskId>,
+
     /// Optional authorized-member set for group-scoped lists.
     ///
     /// When set, the admission gate rejects checkbox elements whose attesting
@@ -159,6 +180,7 @@ impl TaskList {
             name: LwwRegister::new(name),
             version: 0,
             seq_counter: Arc::new(AtomicU64::new(0)),
+            known_removed: HashSet::new(),
             authorized_agents: None,
         }
     }
@@ -296,45 +318,45 @@ impl TaskList {
         *h.finalize().as_bytes()
     }
 
-    /// Remove local tasks a digest-verified full-state serve evidences the
-    /// holder DELETED (issue #643 refinement of the #240 deletion cold-sync).
+    /// Remove local tasks a digest-verified full-state serve carries
+    /// EXPLICIT removal evidence for (issue #643 round 2; refines the
+    /// #240 deletion cold-sync).
     ///
-    /// A plain full-delta merge only upserts, so tasks the holder deleted
-    /// while this replica was away would otherwise linger forever. But the
-    /// serve's task set alone cannot distinguish "holder deleted T" from
-    /// "holder never merged T's add" (its snapshot may predate a live add
-    /// this replica already holds) — pruning on absence alone observe-removes
+    /// A serve's task set alone cannot distinguish "holder deleted T" from
+    /// "holder never merged T's add" — its snapshot may predate a live add
+    /// this replica already holds — and pruning on absence observe-removes
     /// NEWER local knowledge, tombstones T's tags against re-delivery, and
-    /// makes a task that a visibility read just saw vanish before the claim
-    /// (issue #643). The serve's LWW ordering register supplies the causal
-    /// evidence: `add_task` appends the id and `remove_task` deliberately
-    /// keeps ordering entries, so an id present in the serve's ordering but
-    /// absent from its task set marks a holder-side deletion (state causally
-    /// after T's add), while an id in neither was never seen by the holder —
-    /// its absence is ignorance, not deletion, and OR-Set adds-win keeps the
-    /// local task. Each removed task goes through
+    /// makes a task a visibility read just saw vanish before the claim
+    /// (#643). The ordering register is no evidence either: `reorder`
+    /// rebuilds it from live ids only (a delete followed by any reorder
+    /// forgets the deletion — false keep, and the stale replica's later
+    /// fresh-tag re-serve resurrects the task fleet-wide), and out-of-order
+    /// delivery can name a task whose add never arrived (false prune).
+    ///
+    /// The evidence carrier is the serve's `removed_tasks` entries with an
+    /// EMPTY tag set: a raise-only id set the holder observed removed (see
+    /// [`Self::full_delta`]). Ids are remembered monotonically, so a
+    /// deletion cannot be un-remembered by reorders or LWW races. A task
+    /// the serve still carries in `added_tasks` is live (re-added) and is
+    /// never pruned. Each pruned task goes through
     /// [`delta_remove_task`](Self::delta_remove_task) — a LOCAL
-    /// observe-remove (tombstoned tags, so a later re-add with fresh tags
-    /// still wins) — the same semantics as merging a removal delta.
+    /// observe-remove (its current tags are tombstoned, so a later re-add
+    /// with fresh tags still wins) — the same semantics as merging a
+    /// removal delta.
     ///
     /// Callers MUST have verified the delta against the serving holder's
     /// declared digest first — without that binding, any holder could
     /// truncate local state at will.
     pub(crate) fn prune_to_served_set(&mut self, delta: &TaskListDelta) -> usize {
-        let holder_knew: std::collections::HashSet<&TaskId> = delta
-            .ordering_update
-            .as_ref()
-            .map(|o| o.get().iter().collect())
-            .unwrap_or_default();
-        let stale: Vec<TaskId> = self
-            .task_data
-            .keys()
-            .filter(|id| !delta.added_tasks.contains_key(*id))
-            .filter(|id| holder_knew.contains(*id))
-            .copied()
+        let evidenced: Vec<TaskId> = delta
+            .removed_tasks
+            .iter()
+            .filter(|(id, tags)| tags.is_empty() && !delta.added_tasks.contains_key(*id))
+            .filter(|(id, _)| self.task_data.contains_key(*id))
+            .map(|(id, _)| *id)
             .collect();
         let mut pruned = 0;
-        for id in stale {
+        for id in evidenced {
             self.delta_remove_task(&id);
             pruned += 1;
         }
@@ -368,6 +390,26 @@ impl TaskList {
         if self.seq_counter.load(Ordering::Relaxed) < floor {
             self.seq_counter.store(floor, Ordering::Relaxed);
         }
+    }
+
+    /// The raise-only set of task ids this replica has observed removed
+    /// (deletion cold-sync evidence, issue #643 round 2).
+    ///
+    /// Read by the snapshot envelope (`crdt::persistence`) so evidence
+    /// survives a restart, and by [`TaskList::full_delta`] so full serves
+    /// carry it onward as empty-tag-set `removed_tasks` entries.
+    pub(crate) fn known_removed_ids(&self) -> &HashSet<TaskId> {
+        &self.known_removed
+    }
+
+    /// Union `ids` into the observed-removed evidence (raise-only).
+    ///
+    /// Called on the persistence restore path (envelope-carried evidence)
+    /// and when a merged full serve carries removal evidence for tasks
+    /// this replica does not (yet) hold — so this replica's own serves
+    /// forward the evidence (mirrors `restore_seq_counter`).
+    pub(crate) fn record_removed_evidence<I: IntoIterator<Item = TaskId>>(&mut self, ids: I) {
+        self.known_removed.extend(ids);
     }
 
     /// Get the task list ID.
@@ -480,10 +522,15 @@ impl TaskList {
         self.add_task_core(task, peer_id, seq)
     }
 
-    /// Remove a task during delta merge without bumping version. No-op if the
-    /// task does not exist locally.
+    /// Remove a task during delta merge without bumping version. No-op if
+    /// the task does not exist locally — but the id is STILL recorded as
+    /// observed-removed evidence (issue #643 round 2): every caller of this
+    /// helper (explicit removal deltas and the digest-verified adopt prune)
+    /// represents a deletion this replica has now seen, and a later serve
+    /// from this replica must forward that evidence.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn delta_remove_task(&mut self, task_id: &TaskId) {
+        self.known_removed.insert(*task_id);
         if self.task_data.contains_key(task_id) {
             let _ = self.tasks.remove(task_id);
             self.task_data.remove(task_id);
@@ -560,6 +607,9 @@ impl TaskList {
         if !self.task_data.contains_key(task_id) {
             return Err(CrdtError::TaskNotFound(*task_id));
         }
+        // Record the deletion as cold-sync evidence (issue #643 round 2):
+        // raise-only, so this replica's later full serves carry it.
+        self.known_removed.insert(*task_id);
 
         // Remove from OR-Set (marks as tombstone)
         self.tasks
@@ -752,6 +802,11 @@ impl TaskList {
         let before = self.state_fingerprint();
         let scope = self.id;
         let authorized = self.authorized_agents.clone();
+
+        // Union the observed-removed evidence (raise-only, issue #643
+        // round 2) so a full-state merge never forgets a deletion either.
+        let other_removed: Vec<TaskId> = other.known_removed_ids().iter().copied().collect();
+        self.record_removed_evidence(other_removed);
 
         // Merge OR-Set (task membership)
         self.tasks

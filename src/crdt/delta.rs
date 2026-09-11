@@ -31,7 +31,17 @@ pub struct TaskListDelta {
     /// Tasks that were added (task_id -> (task, unique_tag))
     pub added_tasks: HashMap<TaskId, (TaskItem, UniqueTag)>,
 
-    /// Tasks that were removed (task_id -> set of tags to remove)
+    /// Tasks that were removed. Two encodings share this map (issue #643
+    /// round 2):
+    ///
+    /// - **Non-empty tag set** — a removal delta: observe-remove these
+    ///   exact tags; `merge_delta` force-removes the id.
+    /// - **Empty tag set** — deletion cold-sync EVIDENCE from a full
+    ///   serve: the holder observed this id removed (a raise-only set
+    ///   tracked on `TaskList`). `merge_delta` does NOT remove on it;
+    ///   only the digest-verified adopt gate (`TaskList::prune_to_served_set`,
+    ///   crate-internal) may prune on it, so a stale serve snapshot can
+    ///   never delete a live add the replica holds.
     pub removed_tasks: HashMap<TaskId, HashSet<UniqueTag>>,
 
     /// Updates to existing tasks (task_id -> full task state)
@@ -177,6 +187,22 @@ impl TaskList {
             delta.added_tasks.insert(task_id, ((*task).clone(), tag));
         }
 
+        // Carry the raise-only observed-removed evidence (issue #643
+        // round 2) as empty-tag-set `removed_tasks` entries. This is the
+        // ONLY thing that lets a digest-verified full serve distinguish
+        // "holder deleted T" from "holder's snapshot merely predates T's
+        // add": the adopt gate prunes on this explicit evidence, never on
+        // absence (see `TaskList::prune_to_served_set`). Ids the serve
+        // still carries live are re-adds and are excluded.
+        let live: std::collections::HashSet<&TaskId> = delta.added_tasks.keys().collect();
+        for id in self.known_removed_ids() {
+            if !live.contains(id) {
+                delta
+                    .removed_tasks
+                    .insert(*id, std::collections::HashSet::new());
+            }
+        }
+
         // Carry the registers themselves (value + clock) so a cold-start
         // snapshot merges by causality and cannot clobber a newer local
         // ordering/name on an already-populated peer.
@@ -282,10 +308,23 @@ impl TaskList {
         }
 
         // Apply removed tasks (no version bump; deferred to commit_revision).
+        // Two encodings (see `removed_tasks`): a NON-EMPTY tag set is a
+        // removal delta — force-remove. An EMPTY tag set is deletion
+        // cold-sync evidence carried by a full serve — record it
+        // (raise-only) so this replica's own serves forward it, but do
+        // NOT remove here: general merge must never delete on a stale
+        // holder's snapshot (only the digest-verified adopt gate may,
+        // issue #643 round 2).
         if content_allowed {
-            for task_id in delta.removed_tasks.keys() {
-                self.delta_remove_task(task_id);
+            let mut evidence: Vec<TaskId> = Vec::new();
+            for (task_id, tags) in &delta.removed_tasks {
+                if tags.is_empty() {
+                    evidence.push(*task_id);
+                } else {
+                    self.delta_remove_task(task_id);
+                }
             }
+            self.record_removed_evidence(evidence);
         }
 
         // Apply task updates (upsert: merge if exists, insert if missing).
