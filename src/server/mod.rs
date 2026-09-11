@@ -15,6 +15,7 @@ mod auth;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;
+mod instance_lock;
 mod rider_auth;
 mod routes;
 mod sse;
@@ -364,6 +365,15 @@ pub async fn serve_with_options(
         .await
         .context("failed to create data directory")?;
 
+    // Issue #601: explicit single-instance guard on the data directory.
+    // Taken BEFORE the startup update check, the API listener, identity
+    // load/generation, or any other subsystem initialises — and independent
+    // of `[history] enabled` (the previous implicit guard was SQLite's
+    // EXCLUSIVE lock on history.db, which covered only that file and
+    // surfaced as a history subsystem error). Held for the lifetime of the
+    // returned ServerHandle; process exit releases it even on crash.
+    let instance_lock =
+        instance_lock::InstanceLock::acquire(&config.data_dir).map_err(anyhow::Error::new)?;
     // Startup banner
     tracing::info!(
         version = %x0x::VERSION,
@@ -2223,6 +2233,7 @@ pub async fn serve_with_options(
         local_addr: actual_api_addr,
         cancel,
         task: Some(task),
+        _instance_lock: instance_lock,
     })
 }
 

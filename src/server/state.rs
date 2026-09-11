@@ -154,6 +154,10 @@ pub struct ServerHandle {
     // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
     // handle out without conflicting with the `Drop` impl (which only cancels).
     pub(super) task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    /// Issue #601: the data-directory single-instance lock, held for the
+    /// server's lifetime. Dropping or consuming the handle drops this guard
+    /// and releases the lock; process exit releases it unconditionally.
+    pub(super) _instance_lock: super::instance_lock::InstanceLock,
 }
 
 impl ServerHandle {
