@@ -4976,6 +4976,35 @@ mod tests {
             );
         }
     }
+    /// saorsa-gossip 0.5.77 (x0x #613 / #611 / #336): a local publish whose
+    /// EAGER fan-out attempted peers but delivered to none is no longer
+    /// stranded until anti-entropy — it queues a self-IHAVE and runs one
+    /// bounded retry. The recovery is counted on the stage-stats snapshot,
+    /// and `GET /diagnostics/gossip` serialises that snapshot verbatim, so
+    /// operators can only see the mechanism fire if these five keys survive
+    /// the serde seam. Pinning the names here makes a silent crate-side
+    /// rename (or a pin regression to 0.5.76) fail this test instead of
+    /// quietly blanking the diagnostics.
+    #[tokio::test]
+    async fn stage_stats_expose_stranded_publish_recovery_counters() {
+        let manager = slice1_manager(2, false).await;
+        let stages = serde_json::to_value(manager.stage_stats()).unwrap();
+        let obj = stages.as_object().unwrap();
+        let counters = [
+            "stranded_publish_ihave_queued",
+            "stranded_publishes_recovered_by_pull",
+            "stranded_publishes_recovered_by_retry",
+            "stranded_publish_retry_failed",
+            "stranded_publish_cache_miss",
+        ];
+        for key in counters {
+            assert_eq!(
+                obj.get(key).and_then(|v| v.as_u64()),
+                Some(0),
+                "fresh manager must expose `{key}` as a zero u64 counter"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

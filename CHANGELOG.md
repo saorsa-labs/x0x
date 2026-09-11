@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Stranded local publishes now recover without waiting for anti-entropy
+  (#613, #611, #336). saorsa-gossip 0.5.77 (saorsa-labs/saorsa-gossip#54)
+  fixes the crate-side mechanism: a publish whose EAGER fan-out attempted
+  peers but delivered to none used to return `Ok` and rely on the
+  pending-IHAVE flush — which advertises to lazy members only, so an
+  all-eager topic had no delivery path until the 30 s anti-entropy sweep.
+  The crate now queues a self-IHAVE to the attempted peers and runs one
+  bounded retry after `2 × PER_PEER_REPUBLISH_TIMEOUT`, excluding peers
+  that already pulled the message. No wire-format change. Five new
+  counters appear under `stages` in `GET /diagnostics/gossip`:
+  `stranded_publish_ihave_queued`, `stranded_publishes_recovered_by_pull`,
+  `stranded_publishes_recovered_by_retry`, `stranded_publish_retry_failed`,
+  `stranded_publish_cache_miss` (the first equals the sum of the other
+  four). A wiring test pins the key names at the serde seam.
+
 - Card interface hints now respect an explicit P2P bind address (#638).
   ant-quic 0.27.50 honors an explicit `bind_address` exactly (previously the
   QUIC socket silently bound wildcard), so a daemon bound to a specific IP —
@@ -19,6 +34,10 @@ All notable changes to this project will be documented in this file.
   interface CI stayed green). Interface hints are now filtered to the bound
   address for specifically bound listeners; wildcard-bound listeners and
   observed/external addresses are unchanged.
+
+### Changed
+
+- saorsa-gossip pins bumped 0.5.76 → 0.5.77 (all eleven crates).
 
 ## [v0.42.0] - 2026-09-11
 
