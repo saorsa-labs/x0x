@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Gossip announce/identity adverts now respect an explicit P2P bind address
+  (#650). The #638/#649 card fix suppressed undialable interface hints for
+  specifically bound listeners (ant-quic 0.27.50 honours `bind_address`
+  exactly), but the three gossip producers — `HeartbeatContext::announce()`,
+  `Agent::announce_identity()`, and `Agent::announcement_addresses()` —
+  still pushed every interface address (and the UDP-probed global IPv6)
+  unconditionally, so a loopback- or LAN-bound daemon's card and its gossip
+  advert disagreed and dialing peers burned the 3 s + 3 s per-hint local
+  probe budget on dead addresses before reaching the one live bind. All
+  three now share one dialable-hints helper (with the card, via
+  `is_specific_interface_bind`): specifically bound listeners advertise
+  only the bound address; wildcard-bound listeners (production bootstraps
+  bind `[::]`) and observed/external addresses are unchanged.
+
 ## [v0.42.1] - 2026-09-11
 
 ### Fixed
