@@ -77,6 +77,55 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Persistent per-node fork quarantine for owner-axis groups — ADR-0064
+  slice 1 (#635, issues #468/#469/#472).** Home-suite / OwnerCertified
+  groups now carry a durable `fork_quarantine` marker (set only on
+  authenticated fork evidence, surviving restarts; forensic snapshot of
+  both conflicting commit headers, no secrets) and, while it is set, the
+  membership-gated routes (public send, TreeKEM encrypt/decrypt,
+  `secure/encrypt|decrypt|reseal`) refuse with the typed 409
+  `fork_quarantined`. The marker is strictly local (stripped from
+  outbound bootstrap snapshots, rejected inbound), and clears only
+  through owner-anchored paths at strictly greater revision. Non-owner-axis
+  groups are untouched. Operator procedures:
+  `docs/runbooks/fork-quarantine.md`.
+- **Owner mandate on invite-derived seatings, verify-if-present — ADR-0064
+  slice 2 (#636, issues #468/#469/#472).** An authority holding the
+  group's owner USER key mints an `OwnerMandate` (owner-key signature
+  over a 13-field deterministic preimage, domain
+  `x0x.owner-mandate.v2\0`) at the pre-mutation point; it rides the
+  `MemberAdded` event as a serde-default field (v0.41.4 peers ignore
+  it). Receivers verify when present (`owner_mandate_invalid` rejects
+  with the local record byte-identical) and record per-authority-agent
+  capability for slice 3's grace machine; absence warns and applies
+  (`owner_mandate_absent`). The implemented v2 preimage is recorded as
+  ADR-0064 errata (docs/adr/README.md).
+- **Mandate grace enforcement + manual quarantine clear — ADR-0064 slice 3
+  (#637, issues #468/#469/#472).** After a per-daemon grace window
+  (default 60 days, `[groups] mandate_grace_days`, validated ≥ 1), an
+  absent-mandate owner-axis `MemberAdded` from a recorded-capable
+  authority is refused with the typed, retryable `owner_mandate_missing`
+  (never-observed/keyless authorities warn-accept indefinitely). Direct
+  admin adds mint mandates too. New `POST /groups/:id/quarantine/clear`
+  (CLI `x0x groups quarantine clear <id>`) clears the local marker — no
+  flags on a node holding the owner user key (fresh
+  `x0x.quarantine-clear-attest.v1` attestation minted and verified), or
+  `--force --reason` as the audited operator override. Per-agent
+  `mandate_capability` diagnostics rows on `/diagnostics/groups`.
+- **Alternate-chain classification + complete clear rule — ADR-0064
+  slice 4 (#640, issues #468/#469/#472).** Conflicting commits on
+  owner-axis groups are classified against the retained log before
+  becoming evidence (`owner_anchored_conflict` / `signer_only` /
+  `unauthorized_signer` on the forensic snapshot; a chain-fetch surface
+  is follow-up #639). The joiner-side #468 shape (a removed admin
+  serving a walk-perfect fork) now quarantines on walk-authenticated
+  evidence. The clear rule completed: a mandate-carrying `MemberAdded`
+  clears on the apply path, the explicit seal's eviction arm clears under
+  the same owner-key fence (inside the persist transaction), the conflict
+  path NEVER clears, and every clear re-arms the fork-evidence gate.
+  Sidecar mirroring of the marker and capability map through
+  `home-suite-groups.json` pinned by test (downgrade across a
+  sidecar-aware version loses containment, never bricks).
 - **Daemon `mdns_enabled` TOML knob, and hermetic-by-default tests (#417).**
   `x0xd` hard-coded ant-quic's mDNS discovery to on with no way to disable it,
   so every locally-started test and CI daemon advertised on the LAN and

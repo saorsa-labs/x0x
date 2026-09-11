@@ -488,6 +488,20 @@ curl -X POST "http://$API/groups/<gid>/secure/encrypt" -H "Authorization: Bearer
   -H "Content-Type: application/json" -d '{"payload_b64":"'$(echo -n secret | base64 | tr -d '\n')'"}'
 ```
 
+> **ADR-0064 fork quarantine + owner mandate**: on owner-axis (Home /
+> OwnerCertified) groups, a node holding AUTHENTICATED fork evidence
+> carries a persistent per-node `fork_quarantine` marker (visible on
+> `GET /groups/:id`), and while it is set the membership-gated routes
+> (public send, TreeKEM encrypt/decrypt, `secure/encrypt|decrypt|reseal`)
+> refuse with **409 `fork_quarantined`** — that is local containment
+> pending an owner-anchored advance, not a permanent verdict; reads and
+> the state chain keep working. A post-grace absent-mandate `MemberAdded`
+> from a recorded-capable authority is refused with the typed,
+> **retryable** `owner_mandate_missing` (retry the send after the
+> authority is fixed — never rejoin). Grace default 60 days
+> (`[groups] mandate_grace_days`). Manual clear only per the
+> [fork quarantine runbook](https://github.com/saorsa-labs/x0x/blob/main/docs/runbooks/fork-quarantine.md).
+
 **Admin & advanced** (full shapes in the [API Reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md)): roles (`PATCH .../members/:id/role`), policy axes (`PATCH .../policy`), bans, access requests (`.../requests`), group rename (`PUT .../display-name`, CLI `x0x group set-name`), the signed state chain (`.../state`, `.../state/commits`, `.../state/seal`, `.../state/withdraw`), the local fork-quarantine clear (`.../quarantine/clear`, CLI `x0x groups quarantine clear <id> --force --reason ...` — ADR-0064; clears on a node holding the group's owner user key, or with force+reason), discovery (`/groups/discover?q=`, `nearby`, `discover/subscribe`), group cards (`x0x://group/...`), and the sealed-envelope family (`secure/decrypt`, `secure/reseal`, `/groups/secure/open-envelope`). CLI: `x0x group set-role|policy|ban|requests|state|state-seal|delete|discover|card|secure-decrypt|secure-reseal|...`.
 
 ### 4.4 Delegation (ADR-0040)
@@ -723,7 +737,7 @@ The complete read-only snapshot inventory is `/diagnostics/connectivity`
 buckets), `/diagnostics/gossip` (drop detection and participation),
 `/diagnostics/transport` (connection accounting), `/diagnostics/relay` (ADR-0035
 metering), `/diagnostics/dm` (DM counters and per-peer state),
-`/diagnostics/groups` (ingest and drop buckets), `/diagnostics/history`
+`/diagnostics/groups` (ingest and drop buckets; ADR-0064 fork-quarantine and owner-mandate counters, plus per-agent `mandate_capability` rows — see the [fork quarantine runbook](https://github.com/saorsa-labs/x0x/blob/main/docs/runbooks/fork-quarantine.md)), `/diagnostics/history`
 (writer/reaper), `/diagnostics/connect` (ACL allow/deny),
 `/diagnostics/ws` (outbound-queue health), and `/diagnostics/exec` (counters
 and ACL summary).
@@ -771,6 +785,8 @@ Use the [full API reference](https://github.com/saorsa-labs/x0x/blob/main/docs/a
 | Join then immediate post → `403 members-only` | membership commits asynchronously | poll `GET /groups/<gid>/members` until your id is `active` |
 | `sub-agent lacks the required roster role` | rider scope granted but sub-agent not a member | add the sub-agent to the group (TreeKEM adds need its key package) |
 | `recipient_ack_semantics_unavailable` (same fleet) | peer's capability advert not cached yet | the daemon publishes ONE bounded capability refresh before refusing — if the 409 still comes back, YOU retry the send (it is not retried for you); check `/diagnostics/dm` |
+| **409 `fork_quarantined`** on group send / secure / TreeKEM routes | ADR-0064: this node holds authenticated fork evidence for an owner-axis group (persistent per-node marker on `GET /groups/:id`; snapshot `classification` names `owner_anchored_conflict` / `signer_only` / `unauthorized_signer`) | let the owner anchor advance past the evidence revision (adoption, mandate-carrying apply, or an explicit owner-key `state/seal`), or run the manual clear per the [fork quarantine runbook](https://github.com/saorsa-labs/x0x/blob/main/docs/runbooks/fork-quarantine.md) — `x0x groups quarantine clear <id>` on the owner-key node, else `--force --reason`; every clear re-arms, so resolve the divergence, don't just force |
+| **409 `owner_mandate_missing`** on a group event (retryable) | ADR-0064 §1b: post-grace absent mandate from an authority agent whose capability was observed (`mandate_capability` rows on `/diagnostics/groups`: `state:"refusing"`, `first_seen_ms`, `refusals`) | fix the AUTHORITY — it needs the group's owner user key to mint mandates (upgrade/re-key it); then retry; never-observed (keyless) authorities warn-accept and never hit this |
 
 ### 7.5 Configuration (TOML) & storage
 
@@ -814,6 +830,11 @@ candidates = []                       # relay-candidate hex agent ids
 
 [key_move]                            # ADR-0043 roaming moves — experimental; 501 while false
 ceremony_enabled = false
+
+[groups]                              # ADR-0064 owner-mandate enforcement
+mandate_grace_days = 60               # grace before a recorded-capable authority's mandate-less
+                                      # MemberAdded is refused (owner_mandate_missing). Default 60
+                                      # (one release cycle); validated >= 1 — x0xd refuses to start on 0.
 
 ```
 
