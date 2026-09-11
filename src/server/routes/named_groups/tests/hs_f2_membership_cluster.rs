@@ -1507,6 +1507,7 @@ async fn issue458r2_adoption_refuses_commit_signed_by_non_actor() -> Result<()> 
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64,
+            owner_mandate: None,
             commit: Some(forged_commit),
         }
     };
@@ -3667,6 +3668,7 @@ async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: joiner_cert_b64,
+        owner_mandate: None,
         commit: Some(terminal_commit),
     };
 
@@ -3844,6 +3846,7 @@ async fn issue458r5_stale_joiner_removed_admin_fork_rejected() -> Result<()> {
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: joiner_cert_b64,
+        owner_mandate: None,
         commit: Some(terminal_commit.clone()),
     };
     let attacker_id = attacker.agent_id();
@@ -4024,6 +4027,7 @@ async fn issue458r5_withdrawn_link_refused() -> Result<()> {
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: joiner_cert_b64,
+        owner_mandate: None,
         commit: Some(terminal.clone()),
     };
     // Fresh owner attestation for the MUTATED head (the withdrawn link's
@@ -4191,6 +4195,7 @@ async fn r6c_targeted_refusal(
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: joiner_cert_b64,
+        owner_mandate: None,
         commit: Some(terminal.clone()),
     };
     let attestation = x0x::server::routes::named_groups::HeadAttestation::sign(

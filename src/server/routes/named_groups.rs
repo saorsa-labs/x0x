@@ -533,6 +533,8 @@ impl HeadAttestation {
         expected_owner: &crate::identity::UserId,
         terminal: &x0x::groups::GroupStateCommit,
         member_agent_id: &str,
+        mandate: Option<&x0x::groups::OwnerMandate>,
+        terminal_epoch: Option<u64>,
     ) -> bool {
         use base64::Engine as _;
         // The key must BE the admission owner's.
@@ -541,6 +543,17 @@ impl HeadAttestation {
         }
         if self.member_agent_id != member_agent_id {
             return false;
+        }
+        // ADR-0064 slice 2 (Decision §1a, two-phase closure): when the
+        // event carries an owner mandate, the terminal's ACTUAL TreeKEM
+        // epoch must equal the mandate's declared epoch — the mandate is
+        // pre-mutation intent, and this pins it to the epoch the
+        // mutation actually produced. Enforced only when the event
+        // carries an epoch (GSS/legacy events have none to bind).
+        if let Some(mandate) = mandate {
+            if terminal_epoch.is_some_and(|epoch| epoch != mandate.declared_epoch) {
+                return false;
+            }
         }
         // CAS: the attested head is exactly the terminal's parent.
         if terminal
@@ -1159,6 +1172,16 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// `None` for every legacy event.
         #[serde(default)]
         certificate_b64: Option<String>,
+        /// ADR-0064 slice 2: the pre-mutation owner USER-key mandate,
+        /// minted by the seating authority over its CURRENT roster +
+        /// the seat-write BEFORE TreeKEM mutation / persist (Decision
+        /// §1a). Present only when the authority holds the owner user
+        /// key (#469 A1b fence) and the group has an owner axis; absent
+        /// otherwise and for every pre-mandate authority (serde
+        /// default — old binaries ignore the key, #451). Verify-if-
+        /// present on receivers in this slice; enforcement is slice 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_mandate: Option<x0x::groups::OwnerMandate>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -2772,7 +2795,6 @@ static DROP_INITIAL_VOLLEY_KINDS: std::sync::LazyLock<HashSet<&'static str>> =
 fn drop_initial_volley(event: &NamedGroupMetadataEvent) -> bool {
     DROP_INITIAL_VOLLEY_KINDS.contains(named_group_metadata_event_kind(event))
 }
-
 pub(in crate::server) fn signed_public_bootstrap_snapshot(
     mut group: x0x::groups::GroupInfo,
 ) -> Option<x0x::groups::GroupInfo> {
@@ -2796,6 +2818,9 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
     // is strictly LOCAL containment state — it never rides an outbound
     // snapshot.
     group.fork_quarantine = None;
+    // ADR-0064 (§1b): the per-agent mandate-capability map is local
+    // observation state — it never rides an outbound snapshot.
+    group.mandate_capability.clear();
     group.join_requests.clear();
     group.shared_secret = None;
     group.secret_epoch = 0;
@@ -2831,6 +2856,10 @@ pub(in crate::server) fn validate_public_group_bootstrap(
         // (containment is per-node by design and never propagates;
         // ADR-0064 Decision 3).
         || group.fork_quarantine.is_some()
+        // ADR-0064 (§1b): same rule for the mandate-capability map —
+        // local per-agent observation state, never legitimately minted
+        // into an outbound snapshot.
+        || !group.mandate_capability.is_empty()
         || !group.has_active_member(local_agent_hex)
         || !group
             .caller_role(sender_hex)
@@ -3417,6 +3446,8 @@ async fn try_adopt_member_added_across_gap(
     display_name: Option<String>,
     treekem_key_package_hash: Option<String>,
     owner_certified_certificate: Option<x0x::identity::AgentCertificate>,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
+    treekem_epoch: Option<u64>,
     revision: u64,
     e: x0x::groups::state_commit::ApplyError,
     chain: Vec<x0x::groups::state_commit::RetainedCommit>,
@@ -3525,8 +3556,17 @@ async fn try_adopt_member_added_across_gap(
         let Some(attestation) = head_attestation.as_ref() else {
             return refuse("no owner head attestation — unanchorable gap, refusing fast-forward");
         };
-        if !attestation.verify_against_terminal(&owner_public_key, &owner, commit, agent_id) {
-            return refuse("owner head attestation fails verification or CAS against the terminal");
+        if !attestation.verify_against_terminal(
+            &owner_public_key,
+            &owner,
+            commit,
+            agent_id,
+            owner_mandate,
+            treekem_epoch,
+        ) {
+            return refuse(
+                "owner head attestation fails verification, CAS, or mandate-epoch check against the terminal",
+            );
         }
         // The attested head must ALSO be the head the served chain reaches.
         if attestation.head_state_hash != previous_hash_initial(&chain, current) {
@@ -5276,7 +5316,7 @@ fn authorized_treekem_membership_event_for_queue(
             actor,
             // ADR-0038 round-2: accept cert-bearing adds (see the frontier
             // pattern above).
-            certificate_b64: _,
+            owner_mandate: _,
             commit: Some(_),
             treekem_commit_b64: Some(_),
             treekem_epoch: Some(_),
@@ -8738,6 +8778,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             member_joined_recovery,
             member_recovery_history,
             certificate_b64,
+            owner_mandate,
             commit,
         } => {
             // ADR-0038 review B1 (+round-2): receivers enforce OwnerCertified
@@ -8912,6 +8953,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         display_name.clone(),
                         treekem_key_package_hash.clone(),
                         owner_certified_certificate.clone(),
+                        owner_mandate.as_ref(),
+                        treekem_epoch,
                         revision,
                         e.clone(),
                         adopt_chain,
@@ -8976,6 +9019,93 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                 }
             };
+            // ADR-0064 slice 2: VERIFY-IF-PRESENT owner mandate on the
+            // owner axis (both the gapless apply and the across-gap
+            // adoption land here with `next` holding the seated roster).
+            // A PRESENT mandate that fails any binding REJECTS with the
+            // local state byte-identical (`next` is a clone; nothing
+            // persisted yet). An ABSENT mandate applies exactly as today
+            // — warn + `owner_mandate_absent`; the capability/grace
+            // refusal (`owner_mandate_missing`) is slice 3. A mandate on
+            // a NON-owner-axis group is inert by construction (this
+            // whole block is behind the owner-axis predicate), so those
+            // groups stay byte-for-byte unchanged.
+            if let Some(owner) = info.policy.admission.owner_certified_user_id().copied() {
+                match owner_mandate.as_ref() {
+                    Some(mandate) => {
+                        // Trusted owner material: the event's committed
+                        // certificate (verified against the owner above)
+                        // carries the OWNER's user public key.
+                        let owner_public_key =
+                            owner_certified_certificate.as_ref().and_then(|cert| {
+                                ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes())
+                                    .ok()
+                            });
+                        let Some(owner_public_key) = owner_public_key else {
+                            state
+                                .groups_diagnostics
+                                .record_owner_mandate_invalid(&resolved_group_key);
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&agent_id),
+                                "MemberAdded: mandate present but no trusted owner public key — rejecting (state unchanged)"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        };
+                        let committed_digest = owner_certified_certificate
+                            .as_ref()
+                            .map(x0x::groups::owner_cert::certificate_digest_hex);
+                        match mandate.verify_against_terminal(
+                            &owner_public_key,
+                            &owner,
+                            &next,
+                            &commit,
+                            &actor,
+                            &agent_id,
+                            treekem_epoch,
+                            committed_digest.as_deref(),
+                        ) {
+                            Ok(()) => {
+                                state
+                                    .groups_diagnostics
+                                    .record_owner_mandate_valid(&resolved_group_key);
+                                // ADR-0064 §1b: first VALID mandate from
+                                // this authority agent records capability
+                                // (Unknown → Capable{first_seen_ms});
+                                // `or_insert` keeps the FIRST observation.
+                                next.mandate_capability
+                                    .entry(actor.clone())
+                                    .or_insert_with(|| x0x::groups::MandateCapabilityState {
+                                        first_seen_ms: now_millis_u64(),
+                                    });
+                            }
+                            Err(reason) => {
+                                state
+                                    .groups_diagnostics
+                                    .record_owner_mandate_invalid(&resolved_group_key);
+                                tracing::warn!(
+                                    group_id = %LogHexId::group(&resolved_group_key),
+                                    member = %LogHexId::agent(&agent_id),
+                                    reason = %reason,
+                                    "MemberAdded: invalid owner mandate — rejecting with state byte-identical (ADR-0064)"
+                                );
+                                return ApplyMetadataResult::REJECTED;
+                            }
+                        }
+                    }
+                    None => {
+                        state
+                            .groups_diagnostics
+                            .record_owner_mandate_absent(&resolved_group_key);
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&agent_id),
+                            actor = %LogHexId::agent(&actor),
+                            "MemberAdded: no owner mandate on owner-axis group (ADR-0064 verify-if-present: applied; capability not recorded; enforcement lands in slice 3)"
+                        );
+                    }
+                }
+            }
             // #468 A5: this commit SEATED the local agent (gapless direct
             // apply or across-gap adoption) — finalize the pending
             // lineage's `seated_at_revision` so intermediate commits
@@ -10788,6 +10918,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let mut treekem_epoch = None;
             let mut treekem_commit = None;
             let mut treekem_welcome = None;
+            // ADR-0064 slice 2: minted in BOTH branches below at the
+            // pre-mutation point (before `seal_commit_owner_certified`).
+            let owner_mandate;
             next.roster_revision = next.roster_revision.saturating_add(1);
             next.add_member_with_kem(
                 member_agent_id.clone(),
@@ -10879,6 +11012,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 };
                 next.security_binding = Some(binding);
                 next.secret_epoch = expected_epoch;
+                // ADR-0064 slice 2: mint the owner mandate at the
+                // pre-mutation point — `next` holds the seat-write and
+                // the epoch is the TreeKEM epoch the terminal will
+                // carry; still nothing is sealed, mutated or persisted.
+                owner_mandate = mint_owner_mandate_for_member_joined(
+                    state,
+                    &next,
+                    expected_epoch,
+                    &member_agent_id,
+                    &inviter_agent_id,
+                    &invite_secret,
+                    owner_certified_admission.as_ref(),
+                    now_ms,
+                )
+                .await;
                 let commit =
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(commit) => commit,
@@ -10940,6 +11088,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 treekem_welcome = Some(out.welcome);
                 commit
             } else {
+                // ADR-0064 slice 2: same pre-mutation mint point for the
+                // non-TreeKEM planes — no epoch to declare (0).
+                owner_mandate = mint_owner_mandate_for_member_joined(
+                    state,
+                    &next,
+                    0,
+                    &member_agent_id,
+                    &inviter_agent_id,
+                    &invite_secret,
+                    owner_certified_admission.as_ref(),
+                    now_ms,
+                )
+                .await;
                 match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                     Ok(commit) => commit,
                     Err(e) => {
@@ -11060,6 +11221,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     use base64::Engine as _;
                     BASE64.encode(bincode::serialize(cert).unwrap_or_default())
                 }),
+                owner_mandate,
                 commit: Some(commit),
             };
             // #477 T4(b): park in the seat→Result staging interval — a
@@ -14775,6 +14937,21 @@ pub(in crate::server) async fn join_group_via_invite(
                 fork_evidence: None,
             });
 
+            // ADR-0064 slice 2 (§1b capability predicate): an owner-axis
+            // invite whose InviteV4 OWNER COUNTERSIGNATURE just verified
+            // (above, `verify_v4_owner_countersignature`) proves the
+            // INVITER's install holds the owner USER key — record mandate
+            // capability for that agent (Unknown → Capable{first_seen})
+            // on the stub, persisted with the group record. `or_insert`
+            // keeps the first observation.
+            if invite_owner_id.is_some() && invite.owner_countersignature_b64.is_some() {
+                info.mandate_capability
+                    .entry(invite.inviter.clone())
+                    .or_insert_with(|| x0x::groups::MandateCapabilityState {
+                        first_seen_ms: now_millis_u64(),
+                    });
+            }
+
             // r4 (addendum item 9): the base-roster materialization above
             // seated every projection member DIGEST-ONLY (certificate
             // bytes never ride the projection). Hydrate the digest-only
@@ -15497,6 +15674,10 @@ pub(in crate::server) async fn add_named_group_member(
                 use base64::Engine as _;
                 BASE64.encode(bincode::serialize(cert).unwrap_or_default())
             }),
+            // ADR-0064 scope: mandates are minted only on the
+            // invite-derived MemberJoined path (the mandate preimage
+            // binds the invite secret); direct admin adds carry none.
+            owner_mandate: None,
             commit: Some(commit),
         };
         (metadata_topic, event, members, epoch, bootstrap_group)
@@ -15742,6 +15923,10 @@ async fn add_treekem_named_group_member(
             use base64::Engine as _;
             BASE64.encode(bincode::serialize(cert).unwrap_or_default())
         }),
+        // ADR-0064 scope: mandates are minted only on the
+        // invite-derived MemberJoined path (the mandate preimage
+        // binds the invite secret); direct admin adds carry none.
+        owner_mandate: None,
         commit: Some(commit),
     };
     cache_treekem_member_key_package(
@@ -18657,6 +18842,90 @@ pub(in crate::server) async fn seal_commit_owner_certified(
     }
     info.seal_commit_with_owner_certs(signing_kp, now_ms, &verdict)
         .map(|(commit, _evicted)| commit)
+}
+
+/// ADR-0064 slice 2 (Decision §1/§1a): mint the owner USER-key mandate
+/// at the PRE-MUTATION point of an invite-derived seat. `pre_seal` is
+/// the authority's live-info clone with the seat-write ALREADY applied
+/// (member added, certificate installed) but BEFORE
+/// [`seal_commit_owner_certified`] runs — every preimage member is
+/// therefore derived from the authority's ACTUAL current roster, never
+/// the possibly-stale invite projection (the r2 `{owner,A,B,joiner}`
+/// case). `declared_epoch` is the TreeKEM epoch the terminal event will
+/// carry (`guard.epoch() + 1`), or `0` on planes with no epoch to bind.
+///
+/// Capability-gated exactly like the #469 A1b invite fence: the group
+/// must have an owner axis AND the local install must hold the owner
+/// USER key whose derived `UserId` equals the policy owner — otherwise
+/// `None` (keyless-owner admins and non-owner-axis groups simply omit
+/// the mandate; nothing about the seat changes). Pure intent: the
+/// returned value is data only, published with the event after persist
+/// succeeds. A successful mint counts `owner_mandate_minted`.
+#[allow(clippy::too_many_arguments)]
+async fn mint_owner_mandate_for_member_joined(
+    state: &AppState,
+    pre_seal: &x0x::groups::GroupInfo,
+    declared_epoch: u64,
+    joiner_agent_id: &str,
+    authority_agent_id: &str,
+    invite_secret: &str,
+    admission_cert: Option<&x0x::identity::AgentCertificate>,
+    now_ms: u64,
+) -> Option<x0x::groups::OwnerMandate> {
+    let owner = pre_seal
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .copied()?;
+    // #469 A1b fence: the key must be loaded AND BE the policy owner's.
+    let owner_kp = state
+        .agent
+        .identity()
+        .user_keypair()
+        .filter(|kp| crate::identity::UserId::from_public_key(kp.public_key()) == owner)?;
+    if pre_seal.genesis.is_none() {
+        // Without genesis the stable id is the mls id here but the
+        // seal materializes a derived one — a mandate minted now could
+        // never verify against the terminal. Omit (absent ⇒ warn-accept
+        // tier) rather than mint an unverifiable anchor.
+        tracing::warn!(
+            group_id = %LogHexId::group(&pre_seal.mls_group_id),
+            "ADR-0064: omitting owner mandate — group has no genesis record pre-seal"
+        );
+        return None;
+    }
+    let invite_secret_hash = hex::encode(blake3::hash(invite_secret.as_bytes()).as_bytes());
+    let admission_cert_digest = admission_cert
+        .map(x0x::groups::owner_cert::certificate_digest_hex)
+        .unwrap_or_default();
+    let group_key = pre_seal.stable_group_id().to_string();
+    let mandate = x0x::groups::OwnerMandate::sign(
+        pre_seal.stable_group_id(),
+        pre_seal.state_revision.saturating_add(1),
+        &pre_seal.state_hash,
+        &x0x::groups::compute_roster_root(&pre_seal.members_v2),
+        &x0x::groups::compute_policy_hash(&pre_seal.policy),
+        &x0x::groups::compute_public_meta_hash(&pre_seal.public_meta()),
+        declared_epoch,
+        joiner_agent_id,
+        &invite_secret_hash,
+        &admission_cert_digest,
+        authority_agent_id,
+        now_ms,
+        owner_kp,
+    )
+    .map_err(|e| {
+        tracing::warn!(
+            group_id = %LogHexId::group(&group_key),
+            "ADR-0064: failed to mint owner mandate: {e}"
+        );
+        e
+    })
+    .ok()?;
+    state
+        .groups_diagnostics
+        .record_owner_mandate_minted(&group_key);
+    Some(mandate)
 }
 
 /// ADR-0038 admission gate for one prospective member. `Ok(())` admits;
@@ -30350,6 +30619,7 @@ pub(in crate::server) mod tests {
     mod hs_r3_invite_auth;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
+    mod owner_mandate;
     mod pr291_restart_marker_matrix;
     mod wp_c;
 
@@ -40389,6 +40659,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(fake_group_state_commit(&group_id, 2, &admin_hex)),
         };
         assert!(authorized_treekem_membership_event_for_queue(
@@ -40516,6 +40787,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
         };
 
@@ -40895,6 +41167,7 @@ pub(in crate::server) mod tests {
             treekem_epoch: Some(3),
             treekem_key_package_hash: None,
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(x0x::groups::GroupStateCommit {
                 group_id: info.stable_group_id().to_string(),
                 revision: 3,
@@ -40957,6 +41230,7 @@ pub(in crate::server) mod tests {
                 member_joined_recovery: None,
                 member_recovery_history: Vec::new(),
                 certificate_b64: None,
+                owner_mandate: None,
                 commit: None,
             }),
             chain: Vec::new(),
@@ -41118,6 +41392,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: None,
         };
         let json = serde_json::to_value(event);
@@ -41309,6 +41584,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_added));
@@ -41369,6 +41645,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(fake_commit(2, "state-1")),
         };
         let ban_epoch_3 = NamedGroupMetadataEvent::MemberBanned {
@@ -41437,6 +41714,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(commit),
         };
 

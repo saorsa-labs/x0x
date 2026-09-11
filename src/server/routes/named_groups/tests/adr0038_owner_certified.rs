@@ -916,6 +916,7 @@ async fn receiver_rejects_member_added_without_committed_certificate() -> Result
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: None,
+        owner_mandate: None,
         commit: None,
     };
     let should_exit = apply_named_group_metadata_event_inner(
@@ -991,6 +992,7 @@ async fn receiver_rejects_member_added_for_revoked_target() -> Result<()> {
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: Some(BASE64.encode(bincode::serialize(&cert)?)),
+        owner_mandate: None,
         commit: None,
     };
     let should_exit = apply_named_group_metadata_event_inner(

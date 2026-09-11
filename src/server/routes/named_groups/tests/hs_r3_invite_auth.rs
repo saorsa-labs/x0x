@@ -2859,6 +2859,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
         };
         let result =
@@ -3301,6 +3302,119 @@ async fn base_seated_rejoin_hydrates_certificate_without_bridge_event() -> Resul
             .and_then(|seat| seat.certificate.clone()),
         Some(joiner_cert),
         "the hydrated bytes reached the durable record"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 2 §1b, round-2 review item 3): an owner-axis
+/// InviteV4 whose OWNER COUNTERSIGNATURE verifies proves the INVITER's
+/// install holds the owner USER key — that observation is the capability
+/// record slice 3's grace clock reads, so it must land on the joiner's
+/// stub (keyed by the inviter agent) the moment the verified invite is
+/// consumed. A countersignature-less invite must leave NO entry.
+#[tokio::test]
+async fn countersigned_invite_records_inviter_mandate_capability() -> Result<()> {
+    let (authority, _dir, owner_kp) = r3_owner_authority_state().await?;
+    let group_id = "77".repeat(32);
+    r3_insert_group(&authority, &group_id, r3_owner_certified_policy(&owner_kp)).await;
+    let info = authority
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .context("authority group")?;
+    let (invite, _) = assemble_signed_v4_invite(
+        &authority,
+        &info,
+        x0x::groups::invite::DEFAULT_EXPIRY_SECS,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("v4 mint failed: {e:?}"))?;
+    let inviter_hex = invite.inviter.clone();
+    // The minted owner-axis invite carries the owner countersignature.
+    assert!(
+        invite.owner_countersignature_b64.is_some(),
+        "authority holding the owner user key must countersign"
+    );
+
+    async fn joiner_for(suffix: &str) -> Result<(tempfile::TempDir, Arc<Agent>)> {
+        let dir = tempfile::tempdir()?;
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(dir.path().join(format!("machine-{suffix}.key")))
+                .with_agent_key(AgentKeypair::generate()?)
+                .with_agent_cert_path(dir.path().join(format!("agent-{suffix}.cert")))
+                // Same owner user key as `r3_owner_authority_state` (seed
+                // 0xE1) so the builder issues the joiner a certificate
+                // chaining to the admission owner (ADR-0038 fail-fast).
+                .with_user_key(UserKeypair::from_seed(&[0xE1u8; 32])?)
+                .with_peer_cache_disabled()
+                .with_contact_store_path(dir.path().join(format!("contacts-{suffix}.json")))
+                .build()
+                .await?,
+        );
+        Ok((dir, agent))
+    }
+    let owner_pin = hex::encode(owner_kp.user_id().as_bytes());
+    async fn join(
+        state: Arc<AppState>,
+        link: String,
+        owner_pin: &str,
+    ) -> Result<(StatusCode, serde_json::Value)> {
+        let response = join_group_via_invite(
+            State(state),
+            Json(JoinGroupRequest {
+                invite: link,
+                display_name: None,
+                mode: Some("home".to_string()),
+                expected_owner_user_id: Some(owner_pin.to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = response_json(response).await?.1;
+        Ok((status, body))
+    }
+
+    // Positive: verified countersignature ⇒ capability recorded for the
+    // inviter agent on the joiner's stub.
+    let (dir, agent) = joiner_for("cap").await?;
+    let joiner = secure_endpoint_test_state_at(dir.path(), agent).await?;
+    let (status, body) = join(Arc::clone(&joiner), invite.to_link(), &owner_pin).await?;
+    assert_eq!(status, StatusCode::OK, "join accepted: {body}");
+    let capability = {
+        let groups = joiner.named_groups.read().await;
+        groups
+            .values()
+            .find(|g| g.stable_group_id() == group_id)
+            .map(|g| g.mandate_capability.clone())
+    };
+    let recorded = capability.as_ref().and_then(|m| m.get(&inviter_hex));
+    assert!(
+        recorded.is_some_and(|state| state.first_seen_ms > 0),
+        "the countersigning inviter is recorded as mandate-capable with a real first-seen time"
+    );
+
+    // Negative: countersignature stripped ⇒ typed refusal, NO entry.
+    let (dir, agent) = joiner_for("nocap").await?;
+    let joiner_b = secure_endpoint_test_state_at(dir.path(), agent).await?;
+    let mut stripped = invite.clone();
+    stripped.owner_countersignature_b64 = None;
+    let (status, body) = join(Arc::clone(&joiner_b), stripped.to_link(), &owner_pin).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "refused: {body}");
+    assert_eq!(body["error"], "invite_owner_countersignature_missing");
+    let capability_b = {
+        let groups = joiner_b.named_groups.read().await;
+        groups
+            .values()
+            .find(|g| g.stable_group_id() == group_id)
+            .map(|g| g.mandate_capability.clone())
+    };
+    assert!(
+        capability_b.is_none_or(|m| m.is_empty()),
+        "no capability without a verified owner countersignature"
     );
     Ok(())
 }

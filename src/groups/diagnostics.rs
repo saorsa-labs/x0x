@@ -148,6 +148,21 @@ pub struct GroupCounters {
     /// TreeKEM encrypt/decrypt, secure encrypt/open/reseal) while the
     /// marker is set.
     pub fork_quarantine_refusals: u64,
+    /// ADR-0064 slice 2: owner USER-key mandates minted by THIS install
+    /// at the pre-mutation point of an invite-derived seat (owner-axis
+    /// groups where the local agent holds the owner user key).
+    pub owner_mandate_minted: u64,
+    /// ADR-0064 slice 2: inbound owner-axis `MemberAdded` events whose
+    /// PRESENT mandate verified (verify-if-present; capability recorded).
+    pub owner_mandate_valid: u64,
+    /// ADR-0064 slice 2: inbound owner-axis `MemberAdded` events whose
+    /// present mandate FAILED verification — rejected with state
+    /// byte-identical.
+    pub owner_mandate_invalid: u64,
+    /// ADR-0064 slice 2: owner-axis `MemberAdded` events applied with NO
+    /// mandate (pre-mandate authority or keyless tier; warn-accept until
+    /// slice-3 enforcement).
+    pub owner_mandate_absent: u64,
 }
 
 /// Per-group gauges for ADR 0028 causal predecessor delivery. Populated by the
@@ -290,9 +305,27 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.member_added_events_rejected_state_chain_gap = dst
         .member_added_events_rejected_state_chain_gap
         .saturating_add(src.member_added_events_rejected_state_chain_gap);
+    dst.fork_quarantine_set = dst
+        .fork_quarantine_set
+        .saturating_add(src.fork_quarantine_set);
+    dst.fork_quarantine_refusals = dst
+        .fork_quarantine_refusals
+        .saturating_add(src.fork_quarantine_refusals);
+    dst.owner_mandate_minted = dst
+        .owner_mandate_minted
+        .saturating_add(src.owner_mandate_minted);
+    dst.owner_mandate_valid = dst
+        .owner_mandate_valid
+        .saturating_add(src.owner_mandate_valid);
+    dst.owner_mandate_invalid = dst
+        .owner_mandate_invalid
+        .saturating_add(src.owner_mandate_invalid);
+    dst.owner_mandate_absent = dst
+        .owner_mandate_absent
+        .saturating_add(src.owner_mandate_absent);
+    dst.causal_queued = dst.causal_queued.saturating_add(src.causal_queued);
     dst.causal_relayed = dst.causal_relayed.saturating_add(src.causal_relayed);
     dst.causal_retried = dst.causal_retried.saturating_add(src.causal_retried);
-    dst.causal_queued = dst.causal_queued.saturating_add(src.causal_queued);
     dst.causal_deduplicated = dst
         .causal_deduplicated
         .saturating_add(src.causal_deduplicated);
@@ -300,12 +333,6 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.membership_events_queued_revision_gap = dst
         .membership_events_queued_revision_gap
         .saturating_add(src.membership_events_queued_revision_gap);
-    dst.fork_quarantine_set = dst
-        .fork_quarantine_set
-        .saturating_add(src.fork_quarantine_set);
-    dst.fork_quarantine_refusals = dst
-        .fork_quarantine_refusals
-        .saturating_add(src.fork_quarantine_refusals);
     dst.causal_expired = dst.causal_expired.saturating_add(src.causal_expired);
     dst.causal_invalid = dst.causal_invalid.saturating_add(src.causal_invalid);
     dst.causal_conflicted = dst.causal_conflicted.saturating_add(src.causal_conflicted);
@@ -344,6 +371,39 @@ impl GroupsDiagnostics {
         self.with_counters(group_id, |c| {
             c.messages_received = c.messages_received.saturating_add(1);
             c.last_message_at_ms = Some(now_ms);
+        });
+    }
+
+    /// ADR-0064 slice 2: an owner mandate was minted by this install at
+    /// the pre-mutation point of an invite-derived seat.
+    pub fn record_owner_mandate_minted(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.owner_mandate_minted = c.owner_mandate_minted.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 2: an inbound owner-axis `MemberAdded` carried a
+    /// mandate that verified (verify-if-present; capability recorded).
+    pub fn record_owner_mandate_valid(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.owner_mandate_valid = c.owner_mandate_valid.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 2: an inbound owner-axis `MemberAdded` carried a
+    /// mandate that FAILED verification — the event was rejected with
+    /// state byte-identical.
+    pub fn record_owner_mandate_invalid(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.owner_mandate_invalid = c.owner_mandate_invalid.saturating_add(1);
+        });
+    }
+
+    /// ADR-0064 slice 2: an owner-axis `MemberAdded` applied with NO
+    /// mandate (warn-accept until slice-3 enforcement).
+    pub fn record_owner_mandate_absent(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.owner_mandate_absent = c.owner_mandate_absent.saturating_add(1);
         });
     }
 
@@ -1063,9 +1123,13 @@ mod tests {
             membership_events_queued_revision_gap: base + 33,
             fork_quarantine_set: base + 34,
             fork_quarantine_refusals: base + 35,
+            owner_mandate_minted: base + 36,
+            owner_mandate_valid: base + 37,
+            owner_mandate_invalid: base + 38,
+            owner_mandate_absent: base + 39,
         };
-        let dst = counters_with(7);
         let src = counters_with(1_000);
+        let dst = counters_with(7);
         let gauge_before = dst.members_awaiting_certificate;
         let mut merged = dst.clone();
         merge_counters(&mut merged, &src);
@@ -1215,6 +1279,22 @@ mod tests {
             dst.fork_quarantine_refusals + src.fork_quarantine_refusals
         );
         // The gauge is recomputed at snapshot time, never merged.
+        assert_eq!(
+            merged.owner_mandate_minted,
+            dst.owner_mandate_minted + src.owner_mandate_minted
+        );
+        assert_eq!(
+            merged.owner_mandate_valid,
+            dst.owner_mandate_valid + src.owner_mandate_valid
+        );
+        assert_eq!(
+            merged.owner_mandate_invalid,
+            dst.owner_mandate_invalid + src.owner_mandate_invalid
+        );
+        assert_eq!(
+            merged.owner_mandate_absent,
+            dst.owner_mandate_absent + src.owner_mandate_absent
+        );
         assert_eq!(merged.members_awaiting_certificate, gauge_before);
     }
 }
