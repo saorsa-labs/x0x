@@ -335,6 +335,26 @@ impl TaskList {
         self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Current sequence-counter ceiling (last issued seq).
+    ///
+    /// Read by the snapshot envelope (`crdt::persistence`) so the counter —
+    /// which is `serde(skip)` because wire peers run their own counters —
+    /// survives a restart (same rationale as `KvStore::seq_counter_value`).
+    pub(crate) fn seq_counter_value(&self) -> u64 {
+        self.seq_counter.load(Ordering::Relaxed)
+    }
+
+    /// Raise the sequence counter to `floor` if it is lower.
+    ///
+    /// Called on the persistence restore path so freshly minted
+    /// `(PeerId, seq)` OR-Set tags and `TaskId`s can never collide with
+    /// ones issued before a restart. Never lowers the counter.
+    pub(crate) fn restore_seq_counter(&self, floor: u64) {
+        if self.seq_counter.load(Ordering::Relaxed) < floor {
+            self.seq_counter.store(floor, Ordering::Relaxed);
+        }
+    }
+
     /// Get the task list ID.
     #[must_use]
     pub fn id(&self) -> &TaskListId {

@@ -15444,9 +15444,11 @@ impl TaskListHandle {
             let mut list = self.sync.write().await;
             list.set_authorized_agents(agents);
         }
-        // #557: keep the snapshot coherent with the authorization change.
-        // Best-effort — this setter has no error surface, and rehydration
-        // re-derives the set from the live group anyway.
+        // The snapshot carries neither the authorized set (serde(skip) on
+        // TaskList — rehydration re-derives it from the live group) nor a
+        // version bump for this mutation, so the version-gated snapshot
+        // writer skips this persist: a no-op today by construction. Kept so
+        // the snapshot follows immediately if either fact ever changes.
         if let Err(e) = self.sync.persist().await {
             tracing::warn!("failed to persist authorized-agents update: {e}");
         }
@@ -15459,7 +15461,7 @@ impl TaskListHandle {
             let mut list = self.sync.write().await;
             list.clear_authorized_agents();
         }
-        // #557: see set_authorized_agents.
+        // See set_authorized_agents: version-gated to a no-op today.
         if let Err(e) = self.sync.persist().await {
             tracing::warn!("failed to persist authorized-agents clear: {e}");
         }
