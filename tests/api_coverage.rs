@@ -500,6 +500,11 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Post,
+        "/groups/:id/quarantine/clear",
+        quarantine_clear_route_through_real_middleware
+    ),
+    covered!(
+        Post,
         "/groups/:id/state/withdraw",
         c2_late_subscriber_recovers_via_digest_pull_without_republish
     ),
@@ -569,6 +574,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/home.rs",
         include_str!("../src/server/routes/home.rs"),
+    ),
+    // ADR-0064 slice 3: the manual quarantine-clear route's coverage lives
+    // in the named_groups lib tests (router + auth middleware).
+    (
+        "src/server/routes/named_groups/tests/owner_mandate.rs",
+        include_str!("../src/server/routes/named_groups/tests/owner_mandate.rs"),
     ),
     // #477: the join-status route's coverage lives in the named_groups
     // lib tests (the wp_b_477 T-matrix: T7 drives the live terminal path).

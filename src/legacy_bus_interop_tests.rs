@@ -26,7 +26,21 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
 
 const PREFIX: &[u8] = b"x0x-501-interop\0";
-const SETUP: Duration = Duration::from_secs(20);
+// #607 contention recalibration. SETUP wraps real network convergence steps
+// (QUIC pair dials, gossip-plane admission) that degrade ~16x under CI CPU
+// oversubscription (measured 253 ms isolated -> 4007 ms at 5x; worst local
+// 5x completing dial 5.9 s, leaving only 3.4x headroom at the old 20 s).
+// 60 s keeps >= 10x headroom over the measured worst case. POSITIVE deadline.
+//
+// DELIVERY stays at 10 s deliberately: this cycle's CI (PR #619 Coverage,
+// 2026-09-10) PROVED the one DELIVERY site that fires under CI — "receiver
+// typed decrypt delivery" after the targeted exact-ciphertext publish — is
+// non-arrival, not slowness: it still failed with a 60 s budget (62.78 s
+// test) while the first bus delivery in the same run completed
+// (default_bus_positive observed). The other DELIVERY sites' measured 5x
+// worst is 4.5 s, inside 10 s with >= 2.2x headroom. The non-arrival defect
+// is tracked in #613 and must NOT be papered over with a bigger budget.
+const SETUP: Duration = Duration::from_secs(60);
 const DELIVERY: Duration = Duration::from_secs(10);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(300);
 
@@ -274,7 +288,7 @@ async fn gossip_send(
     let subscriber = tracing_subscriber::registry().with(witness.clone());
     let signing = SigningContext::from_keypair(sender.identity.agent_keypair());
     let mut stages = DurableSendStages::default();
-    let config = DmSendConfig {
+    let mut config = DmSendConfig {
         max_retries: 0,
         require_gossip: true,
         require_gossip_ack: true,
@@ -285,6 +299,15 @@ async fn gossip_send(
     // send_via_gossip builds inner V1 when durable ACK is false. This calls the
     // production gossip helper directly, NOT Agent::send_direct route selection.
     assert!(!config.require_durable_app_ack);
+    // #607: the default per-attempt budget (RTT fallback 250 ms x 16 = 4 s,
+    // dm.rs dm_attempt_timeout) fires under CI CPU contention before the
+    // outer DELIVERY bound (observed 1/10 failures at local 5x with
+    // `Timeout { retries: 0, elapsed: 4.31 s }`). This is a POSITIVE
+    // deadline: it awaits the v1 gossip ACK. Raise the fixture's own
+    // per-attempt budget to the dm.rs ceiling for the same recalibration
+    // reason as SETUP/DELIVERY; retries stay 0 and the fallback witness
+    // count assertion is unchanged.
+    config.timeout_per_attempt = Duration::from_secs(30);
     let receipt = bounded(
         "production gossip helper and v1 ACK",
         DELIVERY,
@@ -759,7 +782,10 @@ struct RejectedReadiness {
     reason: String,
     last_observation: Option<serde_json::Value>,
     last_rejection_reason: Option<String>,
-    diagnostics: ReadinessDiagnostics,
+    // #604: boxed so `Result<_, RejectedReadiness>` stays under the
+    // `result_large_err` threshold (288 bytes unboxed). Field access and
+    // `&self` borrows are unchanged via `Box`'s `Deref`.
+    diagnostics: Box<ReadinessDiagnostics>,
 }
 
 // One absolute deadline owns acquisition and polling. Only the full object
@@ -778,7 +804,7 @@ where
         reason: "final diamond readiness deadline elapsed".into(),
         last_observation: None,
         last_rejection_reason: None,
-        diagnostics: ReadinessDiagnostics::new(start, deadline),
+        diagnostics: Box::new(ReadinessDiagnostics::new(start, deadline)),
     };
     let identities = readiness_identities(topology);
     loop {
@@ -2177,7 +2203,7 @@ fn readiness_diagnostic_checks_identity_clock_overflow_and_closed_fallback() {
         reason: "inert rejection".into(),
         last_observation: None,
         last_rejection_reason: None,
-        diagnostics: diag,
+        diagnostics: Box::new(diag),
     };
     let mut retained = raw.clone();
     retained["phase"] = serde_json::json!("setup");

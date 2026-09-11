@@ -168,6 +168,88 @@ async fn announce_full_cert(state: &AppState, cert: x0x::identity::AgentCertific
         .insert(agent_id, entry);
 }
 
+#[derive(Clone, Copy)]
+enum BlobDiagnosticRole {
+    Owner,
+    Joiner,
+}
+
+// All values are independent per-agent lifetime totals. No target digest,
+// observation window, coherent snapshot, pending count or causal inference.
+fn format_blob_diagnostics(
+    role: BlobDiagnosticRole,
+    stats: &crate::announce_blob::AnnounceBlobCacheStats,
+) -> String {
+    let role = match role {
+        BlobDiagnosticRole::Owner => "owner",
+        BlobDiagnosticRole::Joiner => "joiner",
+    };
+    let fields = [
+        ("blob_cache_hits", stats.blob_cache_hits),
+        ("blob_cache_misses", stats.blob_cache_misses),
+        ("blob_fetches_ok", stats.blob_fetches_ok),
+        ("blob_fetches_failed", stats.blob_fetches_failed),
+        ("fetches_spawned", stats.diagnostics.fetches_spawned),
+        (
+            "terminal_both_carriers_failed",
+            stats.diagnostics.terminal_both_carriers_failed,
+        ),
+        (
+            "terminal_deadline_elapsed",
+            stats.diagnostics.terminal_deadline_elapsed,
+        ),
+        (
+            "terminal_subscription_closed",
+            stats.diagnostics.terminal_subscription_closed,
+        ),
+        (
+            "terminal_verifier_error",
+            stats.diagnostics.terminal_verifier_error,
+        ),
+        ("responses_seen", stats.diagnostics.responses_seen),
+        (
+            "responses_skipped_malformed",
+            stats.diagnostics.responses_skipped_malformed,
+        ),
+        (
+            "responses_skipped_mismatched_digest",
+            stats.diagnostics.responses_skipped_mismatched_digest,
+        ),
+        (
+            "verified_requests_decoded",
+            stats.diagnostics.verified_requests_decoded,
+        ),
+        ("unknown_digest", stats.diagnostics.unknown_digest),
+        ("pair_available", stats.diagnostics.pair_available),
+        ("coalesced_dropped", stats.diagnostics.coalesced_dropped),
+        (
+            "response_publish_ok_local",
+            stats.diagnostics.response_publish_ok_local,
+        ),
+        (
+            "publish_failed_local",
+            stats.diagnostics.publish_failed_local,
+        ),
+    ];
+    let mut line = String::from(
+        "counters_are_independent_relaxed_no_snapshot_pending_not_exact scope=per_agent_lifetime_no_digest_window_attempt_attribution",
+    );
+    for (name, value) in fields {
+        line.push_str(&format!(" {role}_{name}={value}"));
+    }
+    line
+}
+
+fn emit_joiner_blob_diagnostics(joiner: &Agent) {
+    eprintln!(
+        "DIAG cert-resolution-blob {}",
+        format_blob_diagnostics(
+            BlobDiagnosticRole::Joiner,
+            &joiner.announce_blob_cache.snapshot()
+        )
+    );
+}
+
 /// Emit a bounded, privacy-minimal snapshot when a certificate wait expires.
 ///
 /// The cache uses `try_read` so a diagnostic cannot extend or mask the wait.
@@ -212,7 +294,7 @@ fn emit_certificate_resolution_diagnostics(state: &AppState, joiner_id: x0x::ide
             "DIAG cert-resolution-state cache_busy={} entry_present={} ",
             "digest_present={} cert_present={} digest_matches_cert={} ",
             "cert_binds_joiner={} blob_cache_hits={} blob_cache_misses={} ",
-            "blob_fetches_ok={} blob_fetches_failed={}"
+            "blob_fetches_ok={} blob_fetches_failed={} {}"
         ),
         cache_busy,
         entry_present,
@@ -224,6 +306,7 @@ fn emit_certificate_resolution_diagnostics(state: &AppState, joiner_id: x0x::ide
         blob_stats.blob_cache_misses,
         blob_stats.blob_fetches_ok,
         blob_stats.blob_fetches_failed,
+        format_blob_diagnostics(BlobDiagnosticRole::Owner, &blob_stats),
     );
 }
 
@@ -236,6 +319,7 @@ async fn diagnostics_row(
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
         &std::collections::HashMap::new(),
+        state.groups_config.mandate_grace_days,
     );
     snapshot
         .groups
@@ -1424,6 +1508,7 @@ async fn issue458r2_adoption_refuses_commit_signed_by_non_actor() -> Result<()> 
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64,
+            owner_mandate: None,
             commit: Some(forged_commit),
         }
     };
@@ -1786,6 +1871,7 @@ fn spawn_restart_lifecycle_diag(
     mut events: tokio::sync::broadcast::Receiver<(ant_quic::PeerId, ant_quic::PeerLifecycleEvent)>,
     watched: ant_quic::PeerId,
     started: std::time::Instant,
+    side: &'static str,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1793,7 +1879,7 @@ fn spawn_restart_lifecycle_diag(
                 Ok((peer, event)) => {
                     let scope = if peer == watched { "joiner" } else { "other" };
                     eprintln!(
-                        "DIAG hs_f2_restart phase=owner_lifecycle elapsed_ms={} \
+                        "DIAG hs_f2_restart phase={side}_lifecycle elapsed_ms={} \
                          peer={scope} event={event:?}",
                         started.elapsed().as_millis()
                     );
@@ -2503,10 +2589,9 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     // BEFORE the dial, so a `Replaced`/`Closed` for the joiner — during the
     // reconnect or later inside the gossip barrier — is recorded with its
     // reason instead of vanishing.
-    let _lifecycle_diag = owner_net
-        .subscribe_all_peer_events()
-        .await
-        .map(|events| spawn_restart_lifecycle_diag(events, joiner_peer, reconnect_started));
+    let _lifecycle_diag = owner_net.subscribe_all_peer_events().await.map(|events| {
+        spawn_restart_lifecycle_diag(events, joiner_peer, reconnect_started, "owner")
+    });
     owner_net.connect_addr(joiner_addr).await?;
     // #510: the old gate was `owner_net.is_connected(&joiner_peer)` — raw
     // ant-quic transport truth. The certified announce that follows publishes
@@ -2604,6 +2689,7 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     });
     if cert_event.is_none() {
         emit_certificate_resolution_diagnostics(owner_state.as_ref(), joiner_id);
+        emit_joiner_blob_diagnostics(&joiner_agent);
     }
     assert!(
         cert_event.is_some_and(|event| event.agent_id == joiner_id),
@@ -3244,13 +3330,71 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     drop(owner_agent);
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
+    // #510 RCA instrumentation (mirrors the TreeKEM variant): watch BOTH
+    // sides' ant-quic lifecycle streams from before the dial, and poll BOTH
+    // sides' surfaces during the reconnect gate. The 2026-09-10 CI failure
+    // showed the owner's transport connection dropping within ~1s of the
+    // barrier while the joiner kept `counterpart_connected=1` for the whole
+    // 20s window (a possible stale/joiner-side view — the #278 zombie
+    // lineage). The owner-side `Closed { reason }` plus the joiner's
+    // simultaneous belief that it is still connected is exactly the evidence
+    // that distinguishes a genuine transport drop from a stale joiner view.
+    let real_home_reconnect_started = std::time::Instant::now();
+    let _real_home_owner_lifecycle = owner_agent
+        .network()
+        .expect("restarted owner network")
+        .subscribe_all_peer_events()
+        .await
+        .map(|events| {
+            spawn_restart_lifecycle_diag(
+                events,
+                joiner_peer,
+                real_home_reconnect_started,
+                "real_home_owner",
+            )
+        });
+    let _real_home_joiner_lifecycle = joiner_agent
+        .network()
+        .expect("joiner network")
+        .subscribe_all_peer_events()
+        .await
+        .map(|events| {
+            spawn_restart_lifecycle_diag(
+                events,
+                ant_quic::PeerId(owner_agent.machine_id().0),
+                real_home_reconnect_started,
+                "real_home_joiner",
+            )
+        });
     owner_agent
         .network()
         .expect("restarted owner network")
         .connect_addr(joiner_addr)
         .await?;
+    eprintln!(
+        "DIAG hs_f2_restart phase=real_home_connect_returned elapsed_ms={}",
+        real_home_reconnect_started.elapsed().as_millis()
+    );
     deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut real_home_poll = 0u32;
     while std::time::Instant::now() < deadline {
+        if real_home_poll.is_multiple_of(10) {
+            let owner_surface = restart_peer_surface(
+                owner_agent.network().expect("restarted owner network"),
+                &joiner_peer,
+            )
+            .await;
+            let joiner_surface = restart_peer_surface(
+                joiner_agent.network().expect("joiner network"),
+                &ant_quic::PeerId(owner_agent.machine_id().0),
+            )
+            .await;
+            eprintln!(
+                "DIAG hs_f2_restart phase=real_home_reconnect_poll elapsed_ms={} \
+                 poll={real_home_poll} owner[{owner_surface}] joiner[{joiner_surface}]",
+                real_home_reconnect_started.elapsed().as_millis()
+            );
+        }
         if owner_agent
             .network()
             .expect("restarted owner network")
@@ -3259,6 +3403,7 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
         {
             break;
         }
+        real_home_poll = real_home_poll.saturating_add(1);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(
@@ -3268,6 +3413,10 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
             .is_connected(&joiner_peer)
             .await,
         "restarted owner must reconnect"
+    );
+    restart_readiness_diag(
+        "real_home_reconnect_established",
+        real_home_reconnect_started,
     );
     // Readiness barrier replacing the old fixed 2 s settle: prove gossip
     // pubsub routes BOTH directions before the one-shot certified announce.
@@ -3583,6 +3732,7 @@ async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: joiner_cert_b64,
+        owner_mandate: None,
         commit: Some(terminal_commit),
     };
 
@@ -3760,6 +3910,7 @@ async fn issue458r5_stale_joiner_removed_admin_fork_rejected() -> Result<()> {
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: joiner_cert_b64,
+        owner_mandate: None,
         commit: Some(terminal_commit.clone()),
     };
     let attacker_id = attacker.agent_id();
@@ -3940,6 +4091,7 @@ async fn issue458r5_withdrawn_link_refused() -> Result<()> {
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: joiner_cert_b64,
+        owner_mandate: None,
         commit: Some(terminal.clone()),
     };
     // Fresh owner attestation for the MUTATED head (the withdrawn link's
@@ -4107,6 +4259,7 @@ async fn r6c_targeted_refusal(
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: joiner_cert_b64,
+        owner_mandate: None,
         commit: Some(terminal.clone()),
     };
     let attestation = x0x::server::routes::named_groups::HeadAttestation::sign(
@@ -4699,6 +4852,897 @@ async fn issue458r4_adoption_hydrates_reconstructed_digest_only_seats() -> Resul
             .and_then(|seat| seat.certificate.clone()),
         Some(filler_cert),
         "the hydrated certificate persisted with the adopted roster"
+    );
+    Ok(())
+}
+
+#[test]
+fn blob_diagnostic_formatter_preserves_closed_numeric_fields_and_roles() {
+    use crate::announce_blob::{AnnounceBlobCacheStats, AnnounceBlobDiagnostics};
+    let stats = AnnounceBlobCacheStats {
+        blob_cache_hits: 1,
+        blob_cache_misses: 2,
+        blob_fetches_ok: 3,
+        blob_fetches_failed: 4,
+        diagnostics: AnnounceBlobDiagnostics {
+            fetches_spawned: 5,
+            terminal_both_carriers_failed: 6,
+            terminal_deadline_elapsed: 7,
+            terminal_subscription_closed: 8,
+            terminal_verifier_error: 9,
+            responses_seen: 10,
+            responses_skipped_malformed: 11,
+            responses_skipped_mismatched_digest: 12,
+            verified_requests_decoded: 13,
+            unknown_digest: 14,
+            pair_available: 15,
+            coalesced_dropped: 16,
+            response_publish_ok_local: 17,
+            publish_failed_local: 18,
+        },
+    };
+    let expected_names = [
+        "blob_cache_hits",
+        "blob_cache_misses",
+        "blob_fetches_ok",
+        "blob_fetches_failed",
+        "fetches_spawned",
+        "terminal_both_carriers_failed",
+        "terminal_deadline_elapsed",
+        "terminal_subscription_closed",
+        "terminal_verifier_error",
+        "responses_seen",
+        "responses_skipped_malformed",
+        "responses_skipped_mismatched_digest",
+        "verified_requests_decoded",
+        "unknown_digest",
+        "pair_available",
+        "coalesced_dropped",
+        "response_publish_ok_local",
+        "publish_failed_local",
+    ];
+    for (role, prefix) in [
+        (BlobDiagnosticRole::Owner, "owner"),
+        (BlobDiagnosticRole::Joiner, "joiner"),
+    ] {
+        let text = format_blob_diagnostics(role, &stats);
+        let parts: Vec<_> = text.split_whitespace().collect();
+        assert_eq!(parts.len(), expected_names.len() + 2);
+        assert_eq!(
+            parts[0],
+            "counters_are_independent_relaxed_no_snapshot_pending_not_exact"
+        );
+        assert_eq!(
+            parts[1],
+            "scope=per_agent_lifetime_no_digest_window_attempt_attribution"
+        );
+        for (i, name) in expected_names.into_iter().enumerate() {
+            assert_eq!(parts[i + 2], format!("{prefix}_{name}={}", i + 1));
+        }
+    }
+}
+
+#[test]
+fn blob_diagnostic_formatter_does_not_infer_pending_or_normalize_observations() {
+    let mut stats = crate::announce_blob::AnnounceBlobCacheStats::default();
+    // Deliberately incoherent across a read interval; output must remain raw.
+    stats.diagnostics.terminal_deadline_elapsed = u64::MAX;
+    stats.diagnostics.responses_skipped_malformed = 7;
+    stats.diagnostics.responses_skipped_mismatched_digest = 11;
+    let text = format_blob_diagnostics(BlobDiagnosticRole::Owner, &stats);
+    assert!(text.contains("owner_fetches_spawned=0"));
+    assert!(text.contains(&format!("owner_terminal_deadline_elapsed={}", u64::MAX)));
+    assert!(text.contains("owner_responses_skipped_malformed=7"));
+    assert!(text.contains("owner_responses_skipped_mismatched_digest=11"));
+    let fields: Vec<_> = text.split_whitespace().skip(2).collect();
+    assert!(fields.iter().all(|field| field
+        .split_once('=')
+        .is_some_and(|(_, value)| value.parse::<u64>().is_ok())));
+    assert!(!fields.iter().any(|field| [
+        "in_flight",
+        "pending",
+        "identity",
+        "payload",
+        "agent_id",
+        "peer_id"
+    ]
+    .iter()
+    .any(|name| field.contains(name))));
+}
+
+// ── ADR-0064 slice 1 (Guard A): owner-axis fork quarantine ─────────────
+
+/// Clone the base, mutate the description, and seal through the
+/// PRODUCTION owner-certified seal path (the same wrapper every
+/// authority commit site uses).
+async fn adr0064_owner_seal_variant(
+    state: &AppState,
+    base: &x0x::groups::GroupInfo,
+    description: &str,
+) -> Result<x0x::groups::GroupInfo> {
+    let mut v = base.clone();
+    v.description = description.to_string();
+    seal_commit_owner_certified(
+        state,
+        &mut v,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    Ok(v)
+}
+
+/// An owner-axis group with a sealed base commit and a lineage record —
+/// the joiner-side shape on which conflicts produce evidence (and, from
+/// ADR-0064 slice 1, the quarantine marker).
+async fn adr0064_sealed_owner_group_with_lineage(
+    state: &AppState,
+    group_id: &str,
+    policy: GroupPolicy,
+) -> Result<x0x::groups::GroupInfo> {
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "quarantine-e2e".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.to_string(),
+        policy,
+    );
+    seal_commit_owner_certified(
+        state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    info.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: info.state_revision,
+        base_hash: info.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    });
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.to_string(), info.clone());
+    Ok(info)
+}
+
+/// Drive one state-commit through the REAL central apply hook.
+async fn adr0064_apply_commit(
+    state: &Arc<AppState>,
+    group_id: &str,
+    commit: x0x::groups::state_commit::GroupStateCommit,
+    description: &str,
+) -> Result<Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError>> {
+    let current = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .expect("group record present");
+    let mutation = description.to_string();
+    Ok(apply_stateful_event_with_evidence(
+        state,
+        group_id,
+        &current,
+        &commit,
+        None,
+        false,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.description = mutation;
+        },
+    )
+    .await)
+}
+
+/// Two EQUAL-REVISION twins sealed by the same local admin key on an
+/// OWNER-AXIS group (the conflicting twin classifies as StaleRevision
+/// evidence): ADR-0064 slice 1 adds the durable containment — the
+/// authenticated evidence sets the persistent quarantine marker (with
+/// its forensic snapshot), the membership-gated routes refuse with the
+/// typed 409 `fork_quarantined`, and the EXPLICIT owner-key seal route
+/// (revision strictly greater than the evidence) lifts it again. r2
+/// honesty note: this is NOT the full #468 stale-removal shape (removed
+/// admin, joiner seated at N, MemberAdded across a gap, attestation
+/// refusal) — that shape is only partially covered here via the
+/// adoption-clear test and the clear-rule negative controls in
+/// `fork_quarantine.rs`.
+#[tokio::test]
+async fn adr0064_owner_axis_twin_conflict_quarantines_gates_and_owner_seal_clears() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "7d".repeat(32);
+    let base = adr0064_sealed_owner_group_with_lineage(
+        &state,
+        &group_id,
+        owner_certified_policy(&owner_kp),
+    )
+    .await?;
+
+    // Two different validly-signed commits at revision 2 (same prev):
+    // whichever applies second is the stale fork.
+    let fork_a = adr0064_owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = adr0064_owner_seal_variant(&state, &base, "fork-b").await?;
+    let fork_a_commit = fork_a.commit_log.last().expect("sealed").commit.clone();
+    let fork_b_commit = fork_b.commit_log.last().expect("sealed").commit.clone();
+
+    let first = adr0064_apply_commit(&state, &group_id, fork_a_commit.clone(), "fork-a").await?;
+    assert!(first.is_ok(), "the first fork applies cleanly: {first:?}");
+    persist_named_groups_mutation(&state, |groups| {
+        let info = groups.get_mut(&group_id).expect("group");
+        *info = first.expect("applied");
+        true
+    })
+    .await?;
+
+    // The conflicting twin: refused AND contained.
+    let second = adr0064_apply_commit(&state, &group_id, fork_b_commit.clone(), "fork-b").await?;
+    assert!(second.is_err(), "the conflicting twin must be refused");
+    {
+        let groups = state.named_groups.read().await;
+        let record = groups.get(&group_id).expect("group");
+        let marker = record
+            .fork_quarantine
+            .as_ref()
+            .expect("owner-axis conflict sets the persistent marker");
+        assert_eq!(marker.revision, 2);
+        assert_eq!(marker.state_hash, fork_b_commit.state_hash);
+        assert_eq!(marker.committed_by, authority_hex);
+        assert!(!marker.no_anchor, "owner-axis groups have an anchor");
+        // Forensic snapshot: our terminal vs the conflicting commit.
+        assert_eq!(
+            marker.snapshot.terminal_commit.state_hash, fork_a_commit.state_hash,
+            "the snapshot's terminal is the observing node's head"
+        );
+        assert_eq!(
+            marker.snapshot.conflicting_commit.state_hash,
+            fork_b_commit.state_hash
+        );
+    }
+    let row = diagnostics_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.fork_quarantine_set, 1);
+
+    // The gate: secure encrypt refuses with the typed 409 while the
+    // marker is set (parity with the ADR-0038 restore gate).
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    let body: serde_json::Value = json.0;
+    assert_eq!(status, StatusCode::CONFLICT, "gated while quarantined");
+    assert_eq!(
+        body["error"].as_str(),
+        Some("fork_quarantined"),
+        "typed quarantine error: {body}"
+    );
+    let row = diagnostics_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.fork_quarantine_refusals, 1);
+
+    // The LOCAL owner-certified seal is an owner-anchored clear: the
+    // evidence-bearing seal re-verifies the roster and lifts the marker.
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "seal clears the quarantine: {body}");
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "marker cleared by the owner-certified seal"
+    );
+    Ok(())
+}
+
+/// Blueprint fault matrix "restart mid-quarantine": the marker is
+/// PERSISTED (unlike the ADR-0038 `#[serde(skip)]` transient) — a full
+/// store reload through `load_named_groups_merged` must carry it back
+/// verbatim and the gate must still refuse. A transient marker would
+/// silently un-contain the node on every restart.
+#[tokio::test]
+async fn adr0064_restart_preserves_marker_and_gate_still_refuses() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7e".repeat(32);
+    let base = adr0064_sealed_owner_group_with_lineage(
+        &state,
+        &group_id,
+        owner_certified_policy(&owner_kp),
+    )
+    .await?;
+
+    let fork_a = adr0064_owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = adr0064_owner_seal_variant(&state, &base, "fork-b").await?;
+    let fork_a_commit = fork_a.commit_log.last().expect("sealed").commit.clone();
+    let fork_b_commit = fork_b.commit_log.last().expect("sealed").commit.clone();
+
+    let first = adr0064_apply_commit(&state, &group_id, fork_a_commit, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_named_groups_mutation(&state, |groups| {
+        let info = groups.get_mut(&group_id).expect("group");
+        *info = first.expect("applied");
+        true
+    })
+    .await?;
+    let second = adr0064_apply_commit(&state, &group_id, fork_b_commit, "fork-b").await?;
+    assert!(second.is_err());
+    let live_marker = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .expect("group")
+        .fork_quarantine
+        .clone()
+        .expect("marker set before restart");
+
+    // Persist → restart-load through the real merged loader.
+    assert!(save_named_groups(&state).await);
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    let reloaded_marker = reloaded
+        .get(&group_id)
+        .expect("group survives the reload")
+        .fork_quarantine
+        .clone();
+    assert_eq!(
+        reloaded_marker,
+        Some(live_marker),
+        "the quarantine marker (snapshot included) reloads verbatim from disk"
+    );
+
+    // Install the reloaded store as the live map. The loader sets the
+    // ADR-0038 restore flag for owner-certified groups; clear ONLY that
+    // transient (it is a separate, seal-liftable gate) so this test
+    // isolates the FORK gate's post-restart posture.
+    *state.named_groups.write().await = reloaded;
+    {
+        let mut groups = state.named_groups.write().await;
+        let record = groups.get_mut(&group_id).expect("group");
+        record.owner_cert_reverify_required = false;
+    }
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the gate still refuses after the restart"
+    );
+    assert_eq!(
+        json.0["error"].as_str(),
+        Some("fork_quarantined"),
+        "typed fork-quarantine error after reload: {}",
+        json.0
+    );
+    Ok(())
+}
+
+/// ADR-0064 r2 item 3e: the SECOND owner-anchored clear — tier-1
+/// (owner-attestation-anchored) across-gap adoption on a joiner stub
+/// that already carries ≥1 applied commit. Positive arm: the terminal
+/// revision is strictly greater than the evidenced revision, so the
+/// attestation-verified adoption clears the marker. Negative arm
+/// (r2 item 2b): the same adoption with the marker AT the terminal
+/// revision still seats the joiner but must NOT clear — the contested
+/// branch can never buy a clear at or below the evidence it caused.
+/// A bare invite stub cannot hold evidence (empty commit_log), so the
+/// fixture seats the marker on the r3-stage stub, which retains its
+/// sealed base commit.
+#[tokio::test]
+async fn adr0064_adoption_clear_requires_strictly_greater_revision() -> Result<()> {
+    let terminal_revision = |stage: &R3Stage| -> u64 {
+        match &stage.member_added {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit: Some(commit),
+                ..
+            } => commit.revision,
+            _ => panic!("staged MemberAdded carries its terminal commit"),
+        }
+    };
+    async fn seat_marker(stage: &R3Stage, revision: u64) {
+        let terminal_header = {
+            let groups = stage.joiner_state.named_groups.read().await;
+            groups
+                .get(&stage.group_id)
+                .expect("stub")
+                .terminal_commit_header()
+        };
+        let mut groups = stage.joiner_state.named_groups.write().await;
+        groups
+            .get_mut(&stage.group_id)
+            .expect("stub")
+            .fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: stage.authority_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+
+    // Positive: evidence revision strictly below the terminal.
+    let stage = r3_stage(0x9A).await?;
+    let terminal = terminal_revision(&stage);
+    assert!(terminal >= 1, "the staged terminal advances the chain");
+    seat_marker(&stage, terminal - 1).await;
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(result.accepted, "the attested adoption seats the joiner");
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(info.has_active_member(&stage.joiner_hex));
+        assert!(
+            !info.is_fork_quarantined(),
+            "tier-1 attestation-anchored adoption at revision {terminal} > evidence {} clears",
+            terminal - 1
+        );
+    }
+
+    // Negative: marker AT the terminal revision — adoption succeeds but
+    // never clears.
+    let stage = r3_stage(0x9B).await?;
+    let terminal = terminal_revision(&stage);
+    seat_marker(&stage, terminal).await;
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(
+        result.accepted,
+        "the quarantined stub still adopts (ingest must stay open)"
+    );
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            info.has_active_member(&stage.joiner_hex),
+            "joiner seated regardless of the marker"
+        );
+        assert!(
+            info.is_fork_quarantined(),
+            "adoption at revision == evidence revision does NOT clear"
+        );
+    }
+    Ok(())
+}
+
+/// WHY (#468 / ADR-0064 slice 4, blueprint fault matrix "stale removal"):
+/// the REAL #468 shape. The joiner's invite base (revision N) seats a
+/// second admin A; the CANONICAL chain removes A at N+1 — invisible to
+/// the joiner, which is exactly why the retained-base checks cannot see
+/// it. A's install keeps driving the join it invited: it serves its own
+/// fork N+1'..N+2' (the MemberAdded terminal) WITHOUT the owner head
+/// attestation (the owner refuses to attest a removed admin's chain —
+/// the attestation refusal). Tier-1 adoption refuses; the served chain
+/// runs through the extracted ancestor walk (A IS an active admin at
+/// the joiner's base, so the fork is internally perfect); with no owner
+/// anchor reachable, the joiner quarantines on the walk-authenticated
+/// evidence, records the `signer_only` classification, and stays
+/// pending.
+#[tokio::test]
+async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
+    let stage = issue458_stage(0x9D, false).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+
+    // The joiner's invite base: founder admin + admin A (A invited the
+    // joiner). Hand-sealed so the retained base commit covers the
+    // {authority, A} roster the fork walks from.
+    let a_kp = AgentKeypair::generate()?;
+    let a_hex = hex::encode(a_kp.agent_id().as_bytes());
+    let mut stub = stage.base_info.clone();
+    stub.add_member(
+        a_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        Some(authority_hex.clone()),
+        None,
+    );
+    let base_revision = stub.state_revision.saturating_add(1);
+    let base_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        base_revision,
+        Some(stub.state_hash.clone()),
+        x0x::groups::compute_roster_root(&stub.members_v2),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    stub.prev_state_hash = Some(stub.state_hash.clone());
+    stub.state_hash = base_commit.state_hash.clone();
+    stub.state_revision = base_revision;
+    stub.commit_log
+        .push(x0x::groups::state_commit::RetainedCommit {
+            commit: base_commit,
+            roster: x0x::groups::state_commit::roster_projection(&stub.members_v2),
+            meta: Some(stub.public_meta()),
+        });
+    stub.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: stub.state_revision,
+        base_hash: stub.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    });
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    // A's fork: link N+1' (A commits a metadata change over the base
+    // roster) then the MemberAdded terminal N+2' seating the joiner.
+    let policy_hash = x0x::groups::compute_policy_hash(&stub.policy);
+    let mut fork_meta = stub.public_meta();
+    fork_meta.description = "a-fork-1".to_string();
+    let link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        base_revision.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        fork_meta.clone(),
+        &a_kp,
+    );
+    let mut fork_roster_with_joiner = stub.members_v2.clone();
+    fork_roster_with_joiner.insert(stage.joiner_hex.clone(), {
+        let mut m = x0x::groups::GroupMember::new_member(
+            stage.joiner_hex.clone(),
+            None,
+            None,
+            now_millis_u64(),
+        );
+        m.role = x0x::groups::GroupRole::Member;
+        m
+    });
+    let terminal = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        base_revision.saturating_add(2),
+        Some(link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&fork_roster_with_joiner),
+        policy_hash.clone(),
+        x0x::groups::compute_public_meta_hash(&fork_meta),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp,
+    )?;
+
+    // The joiner's certificate (owner-issued — the receiver gate needs
+    // committed certificate evidence) and the MemberAdded event.
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: terminal.revision,
+        actor: a_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(terminal.clone()),
+    };
+
+    // Serve the fork chain with the join result — NO head attestation
+    // (the #468 attestation refusal: the owner will not anchor a
+    // removed admin's chain).
+    let chain_key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(chain_key, vec![link]);
+
+    let result =
+        apply_named_group_metadata_event(&joiner_state, event, a_kp.agent_id(), true, None).await;
+    assert!(
+        !result.accepted,
+        "the unattested removed-admin fork is refused"
+    );
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert!(
+            !info.has_active_member(&stage.joiner_hex),
+            "the joiner stays pending (tier-1 anchor refused)"
+        );
+        let marker = info.fork_quarantine.as_ref().expect("quarantine marker");
+        assert_eq!(marker.revision, terminal.revision);
+        assert_eq!(marker.committed_by, a_hex);
+        assert_eq!(
+            marker.snapshot.classification.as_deref(),
+            Some("signer_only"),
+            "the served chain walked clean (A was admin at the base) — signer-only, no owner anchor"
+        );
+        assert!(
+            info.invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref())
+                .is_some(),
+            "walk-authenticated evidence installed"
+        );
+    }
+    let row = diagnostics_row(joiner_state.as_ref(), &stage.group_id).await;
+    assert_eq!(row.counters.fork_evidence_signer_only, 1);
+    assert_eq!(row.counters.fork_quarantine_set, 1);
+
+    // Negative control: the same fork with a STRANGER-signed link (the
+    // chain does not validate from the base) records nothing.
+    let (joiner2_state, _jdir2) = joiner_state_for(&stage).await?;
+    let mut stub2 = stub.clone();
+    stub2.fork_quarantine = None;
+    if let Some(lineage) = stub2.invite_lineage.as_mut() {
+        lineage.fork_evidence = None;
+    }
+    joiner2_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub2);
+    let stranger = AgentKeypair::generate()?;
+    let stranger_link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        base_revision.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        fork_meta.clone(),
+        &stranger,
+    );
+    let stranger_terminal = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        base_revision.saturating_add(2),
+        Some(stranger_link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&fork_roster_with_joiner),
+        policy_hash.clone(),
+        x0x::groups::compute_public_meta_hash(&fork_meta),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp,
+    )?;
+    let event2 = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: stranger_terminal.revision,
+        actor: a_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(stranger_terminal),
+    };
+    let chain_key2 = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner2_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(chain_key2, vec![stranger_link]);
+    let result2 =
+        apply_named_group_metadata_event(&joiner2_state, event2, a_kp.agent_id(), true, None).await;
+    assert!(!result2.accepted);
+    let groups = joiner2_state.named_groups.read().await;
+    let info = groups.get(&stage.group_id).expect("stub retained");
+    assert!(
+        !info.is_fork_quarantined(),
+        "a chain that does not validate from the base is NOT evidence"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 4 r2, review item 2 — DEADLOCK): the causal-replay
+/// loop calls the serialized apply with `roster_lock_already_held = true`
+/// while HOLDING `named_groups_persistence_lock`; a queued MemberAdded
+/// that replays into the refused-adoption arm must not try to take that
+/// lock again inside the joiner chain classification. Same #468 fixture
+/// as the sibling test, driven through the replay-shaped call under the
+/// held lock, bounded by a timeout so a regression FAILS instead of
+/// hanging the suite.
+#[tokio::test]
+async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> Result<()> {
+    let stage = issue458_stage(0x9E, false).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+
+    let a_kp = AgentKeypair::generate()?;
+    let a_hex = hex::encode(a_kp.agent_id().as_bytes());
+    let mut stub = stage.base_info.clone();
+    stub.add_member(
+        a_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        Some(authority_hex.clone()),
+        None,
+    );
+    let base_revision = stub.state_revision.saturating_add(1);
+    let base_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        base_revision,
+        Some(stub.state_hash.clone()),
+        x0x::groups::compute_roster_root(&stub.members_v2),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    stub.prev_state_hash = Some(stub.state_hash.clone());
+    stub.state_hash = base_commit.state_hash.clone();
+    stub.state_revision = base_revision;
+    stub.commit_log
+        .push(x0x::groups::state_commit::RetainedCommit {
+            commit: base_commit,
+            roster: x0x::groups::state_commit::roster_projection(&stub.members_v2),
+            meta: Some(stub.public_meta()),
+        });
+    stub.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: stub.state_revision,
+        base_hash: stub.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    });
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    let policy_hash = x0x::groups::compute_policy_hash(&stub.policy);
+    let mut fork_meta = stub.public_meta();
+    fork_meta.description = "a-fork-1".to_string();
+    let link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        base_revision.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        fork_meta.clone(),
+        &a_kp,
+    );
+    let mut fork_roster_with_joiner = stub.members_v2.clone();
+    fork_roster_with_joiner.insert(stage.joiner_hex.clone(), {
+        let mut m = x0x::groups::GroupMember::new_member(
+            stage.joiner_hex.clone(),
+            None,
+            None,
+            now_millis_u64(),
+        );
+        m.role = x0x::groups::GroupRole::Member;
+        m
+    });
+    let terminal = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        base_revision.saturating_add(2),
+        Some(link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&fork_roster_with_joiner),
+        policy_hash.clone(),
+        x0x::groups::compute_public_meta_hash(&fork_meta),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp,
+    )?;
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: terminal.revision,
+        actor: a_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(terminal.clone()),
+    };
+    let chain_key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(chain_key, vec![link]);
+
+    // The causal-replay shape: hold the persistence lock, drive the
+    // serialized apply with roster_lock_already_held = true. Bounded by a
+    // timeout so a deadlock regression FAILS rather than hangs.
+    let _guard = joiner_state.named_groups_persistence_lock.lock().await;
+    let mut replay_group_id: Option<String> = None;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        apply_named_group_metadata_event_inner_serialized(
+            &joiner_state,
+            event,
+            a_kp.agent_id(),
+            true,
+            false,
+            None,
+            None,
+            &mut replay_group_id,
+            true,
+            true,
+        ),
+    )
+    .await;
+    let result = outcome.expect(
+        "no deadlock: the joiner chain classification uses the UNLOCKED persist under the held lock",
+    );
+    assert!(
+        !result.accepted,
+        "the unattested removed-admin fork is refused"
+    );
+    let groups = joiner_state.named_groups.read().await;
+    let info = groups.get(&stage.group_id).expect("stub retained");
+    assert!(
+        info.fork_quarantine.as_ref().is_some_and(|marker| marker
+            .snapshot
+            .classification
+            .as_deref()
+            == Some("signer_only")),
+        "the evidence install completed under the held lock (unlocked persist)"
     );
     Ok(())
 }

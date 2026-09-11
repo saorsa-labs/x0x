@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 178,
+  "endpoint_count": 179,
   "endpoints": [
     {
       "category": "status",
@@ -2119,6 +2119,30 @@
             "cli": "--expiry",
             "in": "body",
             "name": "expiry_secs",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "groups quarantine clear",
+      "description": "Manually clear the local fork-quarantine marker (owner-key node clear or --force with --reason)",
+      "method": "POST",
+      "path": "/groups/:id/quarantine/clear",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "force",
+            "required": false
+          },
+          {
+            "cli": "--reason",
+            "in": "body",
+            "name": "reason",
             "required": false
           }
         ],

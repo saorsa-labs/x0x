@@ -503,8 +503,8 @@ async fn api_token_file_is_0600() {
 #[ignore]
 async fn api_token_stable_across_restart_same_data_dir() {
     let name = unique_name("tokrestart");
-    let _ident = IdentityGuard(identity_dir_for(&name));
     let dir = tempfile::TempDir::new().unwrap();
+    let _ident = IdentityGuard(identity_dir_for(dir.path()));
 
     let mut first = spawn_with_data_dir(&name, dir.path());
     let token1 = read_token(dir.path());
@@ -560,8 +560,8 @@ async fn bind_failure_exits_without_hanging() {
     let port = blocker.local_addr().unwrap().port();
 
     let name = unique_name("bindfail");
-    let _ident = IdentityGuard(identity_dir_for(&name));
     let dir = tempfile::TempDir::new().unwrap();
+    let _ident = IdentityGuard(identity_dir_for(dir.path()));
     let mut child = spawn_with_api_addr(&name, dir.path(), &format!("127.0.0.1:{port}"));
 
     let exited = wait_for_exit(&mut child, Duration::from_secs(15));
@@ -588,8 +588,8 @@ async fn bind_failure_exits_without_hanging() {
 #[ignore]
 async fn check_flag_does_not_start_server() {
     let name = unique_name("checkflag");
-    let _ident = IdentityGuard(identity_dir_for(&name));
     let dir = tempfile::TempDir::new().unwrap();
+    let _ident = IdentityGuard(identity_dir_for(dir.path()));
     let cfg = write_config(&name, dir.path(), "127.0.0.1:0");
 
     let mut child = Command::new(x0xd_bin())
@@ -641,14 +641,17 @@ fn unique_name(tag: &str) -> String {
     format!("char-{tag}-{}", rand::random::<u32>())
 }
 
-fn identity_dir_for(name: &str) -> PathBuf {
-    dirs::home_dir()
-        .expect("home dir")
-        .join(format!(".x0x-{name}"))
+/// #609: this file spawns `x0xd` itself (the #608-noted harness bypass), so
+/// it must own identity the same way the harness now does — an explicit
+/// `identity_dir` INSIDE the test's temp data dir. The previous shape let the
+/// daemon derive `$HOME/.x0x-<name>` (writing real key files under whichever
+/// home the process inherited) and cleaned up only if the test finished.
+fn identity_dir_for(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("identity")
 }
 
-/// Removes the per-instance identity dir (`~/.x0x-<name>`) on drop so custom
-/// spawns don't leak key material into the developer's home directory.
+/// Removes the fixture identity dir on drop. Redundant with the TempDir that
+/// hosts it (belt and braces: a future refactor could move it back out).
 struct IdentityGuard(PathBuf);
 impl Drop for IdentityGuard {
     fn drop(&mut self) {
@@ -664,9 +667,10 @@ fn write_config(name: &str, data_dir: &std::path::Path, api_address: &str) -> Pa
     // daemon to find — and auto-connect to — a live production daemon on the
     // same machine.
     let body = format!(
-        "bind_address = \"0.0.0.0:0\"\napi_address = \"{api}\"\ndata_dir = \"{dir}\"\nlog_level = \"warn\"\nbootstrap_peers = []\nmdns_enabled = false\ninstance_name = \"{name}\"\n",
+        "bind_address = \"0.0.0.0:0\"\napi_address = \"{api}\"\ndata_dir = \"{dir}\"\nidentity_dir = \"{ident}\"\nlog_level = \"warn\"\nbootstrap_peers = []\nmdns_enabled = false\ninstance_name = \"{name}\"\n",
         api = api_address,
         dir = data_dir.display(),
+        ident = identity_dir_for(data_dir).display(),
     );
     std::fs::write(&cfg, body).unwrap();
     cfg

@@ -916,6 +916,7 @@ async fn receiver_rejects_member_added_without_committed_certificate() -> Result
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: None,
+        owner_mandate: None,
         commit: None,
     };
     let should_exit = apply_named_group_metadata_event_inner(
@@ -991,6 +992,7 @@ async fn receiver_rejects_member_added_for_revoked_target() -> Result<()> {
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: Some(BASE64.encode(bincode::serialize(&cert)?)),
+        owner_mandate: None,
         commit: None,
     };
     let should_exit = apply_named_group_metadata_event_inner(
@@ -1445,6 +1447,399 @@ async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Resul
         StatusCode::OK,
         "secure ops must work after the quarantine lifted: {}",
         json.0
+    );
+    Ok(())
+}
+
+/// ADR-0064 slice 1: the fork-quarantine gate shares the exact refusal
+/// SHAPE of the ADR-0038 restore gate above (typed 409 consulted by the
+/// same membership-gated surfaces) — and the same evidence-bearing seal
+/// that lifts the restore marker also lifts the fork marker, because a
+/// local owner-certified seal is one of the two owner-anchored clears.
+/// If either gate drifted (different status, untyped body, or a seal
+/// that leaves the node wedged), operators could not run one recovery
+/// procedure for both containment kinds.
+#[tokio::test]
+async fn fork_quarantine_gate_parity_with_reverify_gate() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7f".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    // Quarantined by authenticated fork evidence (simulated here by the
+    // marker itself; the set path is covered in hs_f2/fork_quarantine
+    // tests) with a shared secret so encrypt would otherwise proceed.
+    // r2 clear rule: the marker revision (0) is strictly BELOW the
+    // revision the explicit seal will land at (1), so this fixture
+    // exercises the clearing arm of the parity — the refusing arms are
+    // pinned in fork_quarantine.rs.
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.shared_secret = Some(vec![5u8; 32]);
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 0,
+            state_hash: live.state_hash.clone(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: live.terminal_commit_header(),
+                conflicting_commit: live.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "quarantined encrypt must 409");
+    assert_eq!(
+        json.0["error"].as_str(),
+        Some("fork_quarantined"),
+        "typed fork-quarantine error: {}",
+        json.0
+    );
+
+    // The evidence-bearing seal clears BOTH containment kinds.
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "seal clears quarantine: {body}");
+    let groups = state.named_groups.read().await;
+    let live = groups.get(&group_id).expect("group");
+    assert!(
+        !live.is_fork_quarantined(),
+        "fork marker cleared by the owner-certified seal"
+    );
+    assert!(
+        !live.owner_cert_reverify_required,
+        "restore marker also clear"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 4, item 3ii / slice-1 review non-blocking (1)):
+/// the EVICTION arm of the explicit seal route must clear the
+/// fork-quarantine marker under the SAME fence as the all-clean arm —
+/// the local install holds the owner USER key and the sealed revision
+/// (bumped past the evidence by the eviction seals) is strictly greater.
+/// Before slice 4 an explicit seal that evicted members left the fork
+/// marker set until the NEXT seal. The keyless-owner negative keeps the
+/// fence honest.
+#[tokio::test]
+async fn adr0064_s4_eviction_arm_of_explicit_seal_clears_under_owner_fence() -> Result<()> {
+    // Positive arm: owner-key node, marker below the eviction revision.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "73".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused-invite",
+    )
+    .await;
+    let member = AgentKeypair::generate()?;
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
+    announce_cert_for(state.as_ref(), cert.clone()).await;
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(state.agent.agent_id().as_bytes())),
+            None,
+        );
+        live.shared_secret = Some(vec![7u8; 32]);
+        // Pre-seat the fork marker (hand-seated like the adoption-clear
+        // fixture: a bare stub cannot hold real evidence).
+        let terminal_header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 0,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    // Self-revoke the member so the seal's verdict FAILS it → eviction.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(member.agent_id()),
+        member.public_key(),
+        member.secret_key(),
+        now,
+        Some("adr0064 s4 eviction-arm clear test".to_string()),
+    )?;
+    state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, Some(&cert))?;
+
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "evicting seal succeeds: {body}");
+    assert!(
+        !body["evicted"].as_array().unwrap_or(&Vec::new()).is_empty(),
+        "the seal actually evicted (the eviction arm, not the all-clean arm): {body}"
+    );
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert!(
+            !live.is_fork_quarantined(),
+            "the eviction arm clears the marker on the owner-key node"
+        );
+    }
+
+    // Negative arm (r2 advisory): a KEYLESS-owner admin on the REAL
+    // eviction arm, with the marker seated at revision 1 so the
+    // strictly-greater fence is genuinely exercised — the eviction seal
+    // lands at revision 1 (base revision 0 + one evicted transition),
+    // and 1 > 1 is false, so even the fence alone would refuse; without
+    // the owner USER key BOTH fences refuse and the marker stays.
+    let (state2, _dir2) = secure_endpoint_test_state().await?;
+    let owner2 = UserKeypair::from_seed(&[0xC9u8; 32])?;
+    let group2 = "74".repeat(32);
+    insert_owner_group(
+        state2.as_ref(),
+        &group2,
+        owner_certified_policy(&owner2),
+        "unused-invite",
+    )
+    .await;
+    let local2_hex = hex::encode(state2.agent.agent_id().as_bytes());
+    let member2 = AgentKeypair::generate()?;
+    let member2_hex = hex::encode(member2.agent_id().as_bytes());
+    let cert2 = x0x::identity::AgentCertificate::issue(&owner2, &member2)?;
+    announce_cert_for(state2.as_ref(), cert2.clone()).await;
+    {
+        let mut groups = state2.named_groups.write().await;
+        let live = groups.get_mut(&group2).expect("group");
+        let local_cert = x0x::identity::AgentCertificate::issue_for_public_key(
+            &owner2,
+            state2
+                .agent
+                .identity()
+                .agent_keypair()
+                .public_key()
+                .as_bytes(),
+            None,
+        )?;
+        live.set_member_certificate(&local2_hex, local_cert)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        live.add_member(
+            member2_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local2_hex.clone()),
+            None,
+        );
+        live.shared_secret = Some(vec![7u8; 32]);
+        let terminal_header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 1,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: local2_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    // Self-revoke member2 so the verdict FAILS it — the seal takes the
+    // EVICTION arm (one evicted transition at revision 1).
+    let now2 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let record2 = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(member2.agent_id()),
+        member2.public_key(),
+        member2.secret_key(),
+        now2,
+        Some("adr0064 s4 eviction-arm fenced negative".to_string()),
+    )?;
+    state2
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record2, Some(&cert2))?;
+    let response2 = seal_group_state(
+        State(Arc::clone(&state2)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group2.clone()),
+    )
+    .await
+    .into_response();
+    let (status2, body2) = response_json(response2).await?;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "the evicting seal succeeds: {body2}"
+    );
+    assert!(
+        !body2["evicted"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .is_empty(),
+        "the negative arm exercises the EVICTION arm: {body2}"
+    );
+    let live2 = {
+        let groups = state2.named_groups.read().await;
+        groups.get(&group2).expect("group").clone()
+    };
+    assert_eq!(
+        live2.state_revision, 1,
+        "the eviction seal landed at revision 1"
+    );
+    assert!(
+        live2.is_fork_quarantined(),
+        "keyless node AND revision 1 !> marker 1 — the eviction arm is not an owner anchor here"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0064 slice 4 r2, review item 3): the eviction arm's marker
+/// clear must live INSIDE the persist transaction — a forced persist
+/// failure leaves memory AND disk quarantined and the route answers 503
+/// (exactly like the all-clean arm), never a 200 with an un-gated
+/// in-memory marker over a quarantined disk.
+#[tokio::test]
+async fn adr0064_s4_eviction_arm_non_durable_clear_keeps_marker_and_503s() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "75".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused-invite",
+    )
+    .await;
+    let member = AgentKeypair::generate()?;
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
+    announce_cert_for(state.as_ref(), cert.clone()).await;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex.clone()),
+            None,
+        );
+        live.shared_secret = Some(vec![7u8; 32]);
+        let terminal_header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 0,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: authority_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(member.agent_id()),
+        member.public_key(),
+        member.secret_key(),
+        now,
+        Some("adr0064 s4 eviction-arm non-durable test".to_string()),
+    )?;
+    state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, Some(&cert))?;
+
+    // Make the fixture durable FIRST so the reload below sees the
+    // record; then force every save in the eviction arm to fail — the
+    // route must refuse (503, exactly like the all-clean arm) with the
+    // marker intact in memory and on disk, never a 200 over an
+    // un-gated in-memory clear. (The injected fault cell is global, so
+    // the first failing save may be the eviction transition's own
+    // persist; the asserted contract — non-durable never 200s and the
+    // marker survives — is the same transaction surface either way.)
+    persist_named_groups_mutation(&state, |_| true).await?;
+    let _fault = set_save_fault(SaveFault::Error);
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "non-durable eviction-arm clear refuses with 503: {body}"
+    );
+    drop(_fault);
+
+    // Memory still quarantined (the transaction rolled back — no
+    // pre-transaction mutation survived) and the reload agrees.
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert!(
+            live.is_fork_quarantined(),
+            "memory keeps the marker when the clear is not durable"
+        );
+    }
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    let persisted = reloaded.get(&group_id).expect("group persisted");
+    assert!(
+        persisted.is_fork_quarantined(),
+        "disk keeps the marker when the clear is not durable"
     );
     Ok(())
 }

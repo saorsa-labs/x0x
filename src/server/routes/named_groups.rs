@@ -444,6 +444,25 @@ pub(in crate::server) struct AddNamedGroupMemberRequest {
     treekem_key_package_b64: Option<String>,
 }
 
+/// Request body for POST /groups/:id/quarantine/clear (ADR-0064 slice 3,
+/// #472 decision 1, r2 maintainer decision). Either the node holds the
+/// owner USER key for the group (path a: the endpoint itself mints and
+/// verifies a fresh quarantine-clear attestation over the CURRENT head)
+/// or `force == true` with a non-empty `reason` (path b) clears the LOCAL
+/// marker; never gossiped. Remote-owner attestation submission is OUT of
+/// scope: an attestation minted elsewhere cannot be supplied in the body.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct ClearQuarantineRequest {
+    /// Path (b): explicit operator override. Requires a non-empty reason.
+    #[serde(default)]
+    force: bool,
+    /// Audit-trail reason. Required with `force`; logged at info (capped
+    /// at 256 chars) and surfaced through the `fork_quarantine_manual_clears`
+    /// counter.
+    #[serde(default)]
+    reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(in crate::server) struct WelcomeRef {
     welcome_id: String,
@@ -487,8 +506,29 @@ impl HeadAttestation {
         head_state_hash: &str,
         member_agent_id: &str,
     ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(160);
-        buf.extend_from_slice(b"x0x.join-head-attest.v1\0");
+        Self::canonical_bytes_with_domain(
+            b"x0x.join-head-attest.v1\0",
+            group_id,
+            head_revision,
+            head_state_hash,
+            member_agent_id,
+        )
+    }
+
+    /// Domain-separated canonical bytes. The join attestation and the
+    /// ADR-0064 quarantine-clear attestation sign the SAME field shape
+    /// over the SAME head, so they MUST differ by domain: a join
+    /// attestation over `(revision, hash)` for member M must never be
+    /// usable to clear a quarantine (and vice versa).
+    fn canonical_bytes_with_domain(
+        domain: &[u8],
+        group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        member_agent_id: &str,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(domain.len() + 160);
+        buf.extend_from_slice(domain);
         buf.extend_from_slice(group_id.as_bytes());
         buf.push(0);
         buf.extend_from_slice(&head_revision.to_le_bytes());
@@ -533,6 +573,8 @@ impl HeadAttestation {
         expected_owner: &crate::identity::UserId,
         terminal: &x0x::groups::GroupStateCommit,
         member_agent_id: &str,
+        mandate: Option<&x0x::groups::OwnerMandate>,
+        terminal_epoch: Option<u64>,
     ) -> bool {
         use base64::Engine as _;
         // The key must BE the admission owner's.
@@ -541,6 +583,17 @@ impl HeadAttestation {
         }
         if self.member_agent_id != member_agent_id {
             return false;
+        }
+        // ADR-0064 slice 2 (Decision §1a, two-phase closure): when the
+        // event carries an owner mandate, the terminal's ACTUAL TreeKEM
+        // epoch must equal the mandate's declared epoch — the mandate is
+        // pre-mutation intent, and this pins it to the epoch the
+        // mutation actually produced. Enforced only when the event
+        // carries an epoch (GSS/legacy events have none to bind).
+        if let Some(mandate) = mandate {
+            if terminal_epoch.is_some_and(|epoch| epoch != mandate.declared_epoch) {
+                return false;
+            }
         }
         // CAS: the attested head is exactly the terminal's parent.
         if terminal
@@ -560,6 +613,92 @@ impl HeadAttestation {
             return false;
         };
         let canonical = Self::canonical_bytes(
+            &self.group_id,
+            self.head_revision,
+            &self.head_state_hash,
+            &self.member_agent_id,
+        );
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            owner_public_key,
+            &canonical,
+            &sig,
+        )
+        .is_ok()
+    }
+
+    /// ADR-0064 slice 3 r2 (#472 decision 1): the owner-key-node
+    /// quarantine-clear attestation. The endpoint on a node holding the
+    /// owner USER key mints this FRESH over the group's CURRENT terminal
+    /// head (revision + state hash) for the LOCAL agent, under a domain
+    /// DISTINCT from the join attestation — a join attestation over
+    /// `(revision, hash)` for a member must never clear a quarantine,
+    /// and vice versa. Freshness is exactly "attests the head this node
+    /// currently holds": an attestation over any earlier head fails
+    /// verification.
+    fn sign_quarantine_clear(
+        group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        local_agent_hex: &str,
+        owner_kp: &crate::identity::UserKeypair,
+    ) -> Result<Self, String> {
+        use base64::Engine as _;
+        let canonical = Self::canonical_bytes_with_domain(
+            b"x0x.quarantine-clear-attest.v1\0",
+            group_id,
+            head_revision,
+            head_state_hash,
+            local_agent_hex,
+        );
+        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            owner_kp.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| format!("quarantine-clear attestation sign: {e:?}"))?;
+        Ok(Self {
+            group_id: group_id.to_string(),
+            head_revision,
+            head_state_hash: head_state_hash.to_string(),
+            member_agent_id: local_agent_hex.to_string(),
+            signature_b64: BASE64.encode(sig.as_bytes()),
+        })
+    }
+
+    /// Verify a [`Self::sign_quarantine_clear`] attestation under the
+    /// owner public key: the key must BE the policy owner, the attested
+    /// head must be exactly the group's CURRENT `(stable id, revision,
+    /// state hash)`, the subject must be the local agent, and the
+    /// signature must verify over the quarantine-clear domain.
+    fn verify_quarantine_clear(
+        &self,
+        owner_public_key: &ant_quic::MlDsaPublicKey,
+        expected_owner: &crate::identity::UserId,
+        stable_group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        local_agent_hex: &str,
+    ) -> bool {
+        use base64::Engine as _;
+        if &crate::identity::UserId::from_public_key(owner_public_key) != expected_owner {
+            return false;
+        }
+        if self.group_id != stable_group_id
+            || self.head_revision != head_revision
+            || self.head_state_hash != head_state_hash
+            || self.member_agent_id != local_agent_hex
+        {
+            return false;
+        }
+        let Ok(sig_bytes) = BASE64.decode(&self.signature_b64) else {
+            return false;
+        };
+        let Ok(sig) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        else {
+            return false;
+        };
+        let canonical = Self::canonical_bytes_with_domain(
+            b"x0x.quarantine-clear-attest.v1\0",
             &self.group_id,
             self.head_revision,
             &self.head_state_hash,
@@ -1159,6 +1298,16 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// `None` for every legacy event.
         #[serde(default)]
         certificate_b64: Option<String>,
+        /// ADR-0064 slice 2: the pre-mutation owner USER-key mandate,
+        /// minted by the seating authority over its CURRENT roster +
+        /// the seat-write BEFORE TreeKEM mutation / persist (Decision
+        /// §1a). Present only when the authority holds the owner user
+        /// key (#469 A1b fence) and the group has an owner axis; absent
+        /// otherwise and for every pre-mandate authority (serde
+        /// default — old binaries ignore the key, #451). Verify-if-
+        /// present on receivers in this slice; enforcement is slice 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_mandate: Option<x0x::groups::OwnerMandate>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -2772,7 +2921,6 @@ static DROP_INITIAL_VOLLEY_KINDS: std::sync::LazyLock<HashSet<&'static str>> =
 fn drop_initial_volley(event: &NamedGroupMetadataEvent) -> bool {
     DROP_INITIAL_VOLLEY_KINDS.contains(named_group_metadata_event_kind(event))
 }
-
 pub(in crate::server) fn signed_public_bootstrap_snapshot(
     mut group: x0x::groups::GroupInfo,
 ) -> Option<x0x::groups::GroupInfo> {
@@ -2792,6 +2940,13 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
     // #468 A5: lineage is strictly LOCAL provenance — it must never leak
     // into the hashed bootstrap obligation nor ride an outbound snapshot.
     group.invite_lineage = None;
+    // ADR-0064: the fork-quarantine marker (and its forensic snapshot)
+    // is strictly LOCAL containment state — it never rides an outbound
+    // snapshot.
+    group.fork_quarantine = None;
+    // ADR-0064 (§1b): the per-agent mandate-capability map is local
+    // observation state — it never rides an outbound snapshot.
+    group.mandate_capability.clear();
     group.join_requests.clear();
     group.shared_secret = None;
     group.secret_epoch = 0;
@@ -2822,6 +2977,15 @@ pub(in crate::server) fn validate_public_group_bootstrap(
         // sender was NOT built by `signed_public_bootstrap_snapshot`
         // or is probing whether we ingest foreign fork evidence).
         || group.invite_lineage.is_some()
+        // ADR-0064: same rule for the fork-quarantine marker — an
+        // inbound snapshot carrying one is rejected wholesale
+        // (containment is per-node by design and never propagates;
+        // ADR-0064 Decision 3).
+        || group.fork_quarantine.is_some()
+        // ADR-0064 (§1b): same rule for the mandate-capability map —
+        // local per-agent observation state, never legitimately minted
+        // into an outbound snapshot.
+        || !group.mandate_capability.is_empty()
         || !group.has_active_member(local_agent_hex)
         || !group
             .caller_role(sender_hex)
@@ -2901,25 +3065,6 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     }
 }
 
-/// #458 r5c: run `enforce_last_admin_invariant` over a folded roster
-/// projection by materializing the minimal members view it checks.
-fn projection_last_admin_invariant(
-    projection: &std::collections::BTreeMap<
-        String,
-        x0x::groups::state_commit::RosterMemberSnapshot,
-    >,
-    withdrawn: bool,
-) -> Result<(), String> {
-    let mut members = std::collections::BTreeMap::new();
-    for (id, snap) in projection {
-        let mut member = x0x::groups::GroupMember::new_member(id.clone(), None, None, 0);
-        member.role = snap.role;
-        member.state = snap.state;
-        members.insert(id.clone(), member);
-    }
-    x0x::groups::enforce_last_admin_invariant(&members, withdrawn).map_err(|e| e.to_string())
-}
-
 /// The hash the served chain reaches (its last link's `state_hash`) — the
 /// value the owner attestation's head must equal for the CAS to bind the
 /// chain AND the terminal to one authority view.
@@ -2986,8 +3131,11 @@ fn previous_hash_initial(
 ///   (identical hash = ordinary duplicate replay; revision outside
 ///   retained history = unclassifiable).
 /// - A candidate becomes ONE recorded `ForkEvidence` only when its
-///   signature verifies (`verify_structure`) AND its committer was an
-///   ACTIVE ADMIN in the retained predecessor roster.
+///   signature verifies (`verify_structure`) AND its signer is
+///   authenticated against the retained log (see the classification
+///   below — ADR-0064 slice 4 re-anchored this from "revision−1 in the
+///   retained chain" to the commit's CLAIMED PARENT where the retained
+///   log holds it).
 /// - Evidence is deduplicated by the STORED record: once the group's
 ///   lineage carries ANY evidence, EVERY later conflict — identical or
 ///   different — is fully silent (no classification, no warn, no
@@ -2995,23 +3143,61 @@ fn previous_hash_initial(
 ///   install nothing is marked seen, so a failed/rolled-back persist
 ///   leaves the identical conflict RETRYABLE (the r3 pre-install
 ///   once-only set suppressed retries — reversed by design).
+///
+/// ADR-0064 slice 4 — the classification (owner-axis groups only;
+/// non-owner-axis evaluation is byte-for-byte the pre-slice-4 rule):
+///
+/// (a) OWNER-ANCHORED CONFLICT (r2, ADR §3 conformance) — the
+///     conflicting commit carries an owner mandate that ANCHORS its
+///     header (owner USER-key signature over the exact
+///     revision/parent/roster-root/policy/meta) and it chains
+///     CONSECUTIVELY through retained ancestry at a STRICTLY GREATER
+///     revision than the evidence. It is recorded as EVIDENCE with the
+///     `owner_anchored_conflict` label — the conflict path NEVER
+///     CLEARS: this node still holds the disowned sibling, so clearing
+///     would un-gate it while it keeps applying the disowned chain and
+///     the next canonical commit would re-quarantine the same
+///     divergence (flapping). A marker clears only when this node
+///     APPLIES an owner-anchored commit (the apply-path clear in the
+///     mandate-valid arm). This evaluation runs BEFORE the
+///     stored-evidence silence gate so an anchored conflicting commit
+///     is always classified; EVERY verifying anchor counts the
+///     attributable no-clear refusal
+///     (`fork_quarantine_owner_anchored_refusals`) — the contested
+///     branch cannot silently probe the clear path. An anchor that
+///     additionally FAILS the ancestry or strictly-greater fence
+///     records nothing at all.
+/// (b) SIGNER-ONLY (#472 decision 3) — the signer was an ACTIVE ADMIN
+///     at the commit's claimed parent (the retained commit whose
+///     `state_hash` the fork chains from), but the alternate chain is
+///     unavailable to full members (no chain-fetch surface exists yet;
+///     issue #639 tracks it). Evidence + quarantine marker,
+///     snapshot `classification: "signer_only"`.
+/// (c) UNAUTHORIZED SIGNER — the signer held a seat somewhere in the
+///     retained history but NOT active-admin at the claimed parent (an
+///     admin removed by the canonical commit the fork claims to chain
+///     from, or a plain member signer). Evidence + quarantine marker,
+///     snapshot `classification: "unauthorized_signer"`.
+/// Signers unknown to the ENTIRE retained log are NOT evidence (the
+/// pre-slice-4 invariant is preserved: an unauthenticated conflict can
+/// never contain the local node — only a seat-holder, delivered through
+/// the admin-sender-gated event arms, can set the marker).
+/// (−) DEGRADED — the claimed parent is not retained (the fork chains
+///     from history this node never held): the pre-slice-4 revision−1
+///     retained-predecessor check decides, with no classification label.
+///     This is the documented decision-3 degradation — do not fake a
+///     chain this node cannot see.
 fn evaluate_fork_evidence_candidate(
     state: &Arc<AppState>,
     group_key: &str,
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
     error: &x0x::groups::state_commit::ApplyError,
-) -> Option<x0x::groups::ForkEvidence> {
-    // r4 (addendum item 7): after the first STORED evidence, silence ALL
-    // diagnostics for this group's conflicts — a different post-first
-    // conflict must not warn either (first COMPLETE evidence wins).
-    if current
-        .invite_lineage
-        .as_ref()
-        .is_some_and(|lineage| lineage.fork_evidence.is_some())
-    {
-        return None;
-    }
+) -> ForkEvidenceOutcome {
+    // The candidate SHAPES are evaluated before the silence gate EXCEPT
+    // where noted: the shape checks determine whether this rejection is
+    // evidence material at all.
     let candidate_revision = match error {
         x0x::groups::state_commit::ApplyError::PrevHashMismatch { .. } => commit.revision,
         x0x::groups::state_commit::ApplyError::StaleRevision { got, .. } => {
@@ -3022,32 +3208,243 @@ fn evaluate_fork_evidence_candidate(
                 .find(|rc| rc.commit.revision == *got)
             else {
                 // Outside retained history — unclassifiable, no evidence.
-                return None;
+                return ForkEvidenceOutcome::NotEvidence;
             };
             if retained.commit.state_hash == commit.state_hash {
                 // Same revision, identical hash — an ordinary duplicate
                 // replay, NOT evidence.
-                return None;
+                return ForkEvidenceOutcome::NotEvidence;
             }
             *got
         }
-        _ => return None,
+        _ => return ForkEvidenceOutcome::NotEvidence,
     };
-
-    // Authenticate the candidate: structure + signature + signer binding.
     let now_ms = now_millis_u64();
-    if !fork_candidate_authenticated(current, commit) {
+
+    // ADR-0064 slice 4 (a) → r2 (ADR §3 conformance): the owner-anchor
+    // check runs BEFORE the stored-evidence silence gate so an anchored
+    // conflicting commit is always classified, but the CONFLICT PATH
+    // NEVER CLEARS — the Accepted ADR's clear rule ("the marker clears
+    // ONLY when this node APPLIES a commit C … a same-revision sibling
+    // — the contested branch itself — can never clear") wins over any
+    // looser reading: a conflicting anchored successor is reachable
+    // only while this node still HOLDS the disowned sibling (its own
+    // head or a retained twin), so clearing here would un-gate the node
+    // while it keeps applying the disowned chain and the next canonical
+    // commit would re-quarantine the same divergence (flapping).
+    // Instead the anchored conflicting commit is RECORDED AS EVIDENCE
+    // (`owner_anchored_conflict`) and the attributable
+    // no-clear-on-the-conflict-path counter fires; containment lifts
+    // only when an owner-anchored commit APPLIES (the apply-path clear
+    // in the mandate-valid arm).
+    if let (Some(owner_id), Some(mandate)) = (
+        current.policy.admission.owner_certified_user_id(),
+        owner_mandate,
+    ) {
+        if commit.verify_structure().is_ok()
+            && mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit)
+        {
+            state
+                .groups_diagnostics
+                .record_fork_quarantine_owner_anchored_refusal(group_key);
+            let chains_through_retained_ancestry = current
+                .commit_log
+                .iter()
+                .rev()
+                .find(|rc| commit.prev_state_hash.as_deref() == Some(rc.commit.state_hash.as_str()))
+                .is_some_and(|parent| parent.commit.revision + 1 == commit.revision);
+            let strictly_greater = current
+                .fork_quarantine
+                .as_ref()
+                .is_none_or(|marker| commit.revision > marker.revision);
+            if chains_through_retained_ancestry && strictly_greater {
+                // A coherent owner-anchored successor this node CANNOT
+                // apply (it conflicts with the head we hold): evidence
+                // with the `owner_anchored_conflict` label. The marker
+                // clears only when an anchored commit APPLIES.
+                return ForkEvidenceOutcome::Evidence(
+                    x0x::groups::ForkEvidence {
+                        revision: candidate_revision,
+                        state_hash: commit.state_hash.clone(),
+                        committed_by: commit.committed_by.clone(),
+                        observed_at_ms: now_millis_u64(),
+                    },
+                    Some(FORK_EVIDENCE_CLASSIFICATION_OWNER_ANCHORED),
+                );
+            }
+            // Anchor verifies but the ancestry/strictly-greater fence
+            // refuses even coherent classification (the contested
+            // branch's own head, or a same-or-lower revision) — the
+            // attributable probe signal; nothing recorded.
+            return ForkEvidenceOutcome::NotEvidence;
+        }
+    }
+
+    // r4 (addendum item 7): after the first STORED evidence, silence ALL
+    // diagnostics for this group's conflicts — a different post-first
+    // conflict must not warn either (first COMPLETE evidence wins).
+    if current
+        .invite_lineage
+        .as_ref()
+        .is_some_and(|lineage| lineage.fork_evidence.is_some())
+    {
+        return ForkEvidenceOutcome::NotEvidence;
+    }
+
+    // Non-owner-axis groups: byte-for-byte the pre-slice-4 rule.
+    if current.policy.admission.owner_certified_user_id().is_none() {
+        if !fork_candidate_authenticated(current, commit) {
+            state
+                .groups_diagnostics
+                .record_conflict_unauthenticated(group_key, now_ms);
+            return ForkEvidenceOutcome::NotEvidence;
+        }
+        return ForkEvidenceOutcome::Evidence(
+            x0x::groups::ForkEvidence {
+                revision: candidate_revision,
+                state_hash: commit.state_hash.clone(),
+                committed_by: commit.committed_by.clone(),
+                observed_at_ms: now_millis_u64(),
+            },
+            None,
+        );
+    }
+
+    // Owner-axis classification: structure first — a commit whose
+    // signature/state-hash does not verify is never evidence.
+    if commit.verify_structure().is_err() {
         state
             .groups_diagnostics
             .record_conflict_unauthenticated(group_key, now_ms);
-        return None;
+        return ForkEvidenceOutcome::NotEvidence;
     }
+    // The claimed parent: the retained commit whose `state_hash` the
+    // conflicting commit chains from (the fork point ADR-0064 §2 walks
+    // from — the first link is all the retained log can anchor for a
+    // full member; the joiner path additionally walks its served chain
+    // in the MemberAdded error arm).
+    let claimed_parent = current
+        .commit_log
+        .iter()
+        .rev()
+        .find(|rc| commit.prev_state_hash.as_deref() == Some(rc.commit.state_hash.as_str()));
+    let evidence = |classification: Option<&'static str>| {
+        ForkEvidenceOutcome::Evidence(
+            x0x::groups::ForkEvidence {
+                revision: candidate_revision,
+                state_hash: commit.state_hash.clone(),
+                committed_by: commit.committed_by.clone(),
+                observed_at_ms: now_millis_u64(),
+            },
+            classification,
+        )
+    };
+    match claimed_parent {
+        Some(parent) => {
+            let signer_snapshot = parent.roster.get(&commit.committed_by);
+            let active_admin_at_parent = signer_snapshot.is_some_and(|snap| {
+                snap.state == x0x::groups::GroupMemberState::Active
+                    && snap.role.at_least(x0x::groups::GroupRole::Admin)
+            });
+            let held_seat_at_parent = signer_snapshot
+                .is_some_and(|snap| snap.state == x0x::groups::GroupMemberState::Active);
+            if active_admin_at_parent {
+                // (b) signer-only: authenticated at the claimed parent,
+                // owner anchor unavailable, full chain unavailable.
+                evidence(Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY))
+            } else if held_seat_at_parent || signer_retained_anywhere(current, commit) {
+                // (c) unauthorized at the claimed parent, but a KNOWN
+                // seat — the removed-admin-chaining-from-its-own-removal
+                // shape and the member-signer shape.
+                evidence(Some(FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED))
+            } else {
+                // Unknown to the entire retained log: never evidence
+                // (the slice-1 invariant — an unauthenticated conflict
+                // cannot contain the local node).
+                state
+                    .groups_diagnostics
+                    .record_conflict_unauthenticated(group_key, now_ms);
+                ForkEvidenceOutcome::NotEvidence
+            }
+        }
+        None => {
+            // (−) degraded: the claimed parent is not retained. The
+            // pre-slice-4 revision−1 check decides; no label.
+            if !fork_candidate_authenticated(current, commit) {
+                state
+                    .groups_diagnostics
+                    .record_conflict_unauthenticated(group_key, now_ms);
+                return ForkEvidenceOutcome::NotEvidence;
+            }
+            evidence(None)
+        }
+    }
+}
 
-    Some(x0x::groups::ForkEvidence {
-        revision: candidate_revision,
-        state_hash: commit.state_hash.clone(),
-        committed_by: commit.committed_by.clone(),
-        observed_at_ms: now_millis_u64(),
+/// ADR-0064 slice 4 snapshot classification labels (strings, never enum
+/// variants — #451).
+pub(in crate::server) const FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY: &str = "signer_only";
+pub(in crate::server) const FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED: &str = "unauthorized_signer";
+pub(in crate::server) const FORK_EVIDENCE_CLASSIFICATION_OWNER_ANCHORED: &str =
+    "owner_anchored_conflict";
+
+/// ADR-0064 slice 4: the outcome of evaluating one rejected commit as
+/// fork evidence.
+enum ForkEvidenceOutcome {
+    /// No evidence (unauthenticated, silenced, unclassifiable, or an
+    /// owner-anchored commit refused even coherent classification by
+    /// the ancestry/strictly-greater fence).
+    NotEvidence,
+    /// One authenticated evidence record, optionally classified against
+    /// the retained log (the snapshot label). An
+    /// `owner_anchored_conflict` record is an owner-anchored successor
+    /// this node could not apply — r2: the conflict path never clears;
+    /// containment lifts only when an anchored commit APPLIES.
+    Evidence(x0x::groups::ForkEvidence, Option<&'static str>),
+}
+
+/// ADR-0064 slice 4: did the signer hold a seat in ANY retained roster
+/// projection (the "known seat" half of the unauthorized-signer
+/// classification — a removed admin stays visible in the retained
+/// history it was removed from)?
+fn signer_retained_anywhere(
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> bool {
+    current
+        .commit_log
+        .iter()
+        .any(|rc| rc.roster.contains_key(&commit.committed_by))
+}
+
+/// ADR-0064 slice 4: derive the trusted owner USER public key from any
+/// committed roster certificate whose derived `UserId` equals the
+/// policy's admission owner — the same ADR-0038 committed-evidence
+/// trust the quarantine-clear endpoint uses. Returns `None` when the
+/// roster carries no usable certificate (the anchor check then fails
+/// closed).
+fn trusted_owner_public_key(
+    current: &x0x::groups::GroupInfo,
+    owner_id: &crate::identity::UserId,
+) -> Option<ant_quic::MlDsaPublicKey> {
+    current.members_v2.values().find_map(|member| {
+        let cert = member.certificate.as_ref()?;
+        let pk = ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok()?;
+        (crate::identity::UserId::from_public_key(&pk) == *owner_id).then_some(pk)
+    })
+}
+
+/// ADR-0064 slice 4 (a): the owner-anchor predicate for a conflicting
+/// commit — the mandate must anchor the commit's exact header under a
+/// trusted owner key derived from the roster's committed certificates.
+fn mandate_anchors_commit_under_trusted_owner(
+    current: &x0x::groups::GroupInfo,
+    owner_id: &crate::identity::UserId,
+    mandate: &x0x::groups::OwnerMandate,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> bool {
+    trusted_owner_public_key(current, owner_id).is_some_and(|owner_pk| {
+        mandate.anchors_commit(&owner_pk, owner_id, current.stable_group_id(), commit)
     })
 }
 
@@ -3132,6 +3529,17 @@ async fn rollback_live_fork_evidence(
     });
     if matches {
         lineage.fork_evidence = None;
+        // ADR-0064: the quarantine marker was installed by the SAME
+        // (non-durable) mutation — roll it back on the same identity
+        // match so "retryable" covers the marker too, not just the
+        // lineage record.
+        if info.fork_quarantine.as_ref().is_some_and(|marker| {
+            marker.revision == rev
+                && marker.state_hash == hash
+                && marker.committed_by.eq_ignore_ascii_case(&by)
+        }) {
+            info.fork_quarantine = None;
+        }
     }
 }
 
@@ -3139,14 +3547,31 @@ async fn install_fork_evidence(
     state: &Arc<AppState>,
     group_key: &str,
     evidence: x0x::groups::ForkEvidence,
+    quarantine: Option<x0x::groups::ForkQuarantine>,
     persistence_lock_already_held: bool,
 ) -> bool {
     let install_key = group_key.to_string();
+    let marker_was_carried = quarantine.is_some();
     let install = |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
-        groups
-            .get_mut(&install_key)
-            .and_then(|info| info.invite_lineage.as_mut())
-            .is_some_and(|lineage| fork_evidence_first_complete_wins(lineage, &evidence))
+        let Some(info) = groups.get_mut(&install_key) else {
+            return false;
+        };
+        let Some(lineage) = info.invite_lineage.as_mut() else {
+            return false;
+        };
+        // ADR-0064: evidence and quarantine marker land in ONE
+        // first-complete-wins mutation — the marker is exactly as
+        // durable (and as retryable on failure) as the evidence record
+        // that justifies it.
+        if !fork_evidence_first_complete_wins(lineage, &evidence) {
+            return false;
+        }
+        if let Some(marker) = quarantine {
+            if let Some(info) = groups.get_mut(&install_key) {
+                info.fork_quarantine.get_or_insert(marker);
+            }
+        }
+        true
     };
     let outcome = if persistence_lock_already_held {
         persist_named_groups_mutation_unlocked(state, install).await
@@ -3154,7 +3579,16 @@ async fn install_fork_evidence(
         persist_named_groups_mutation(state, install).await
     };
     match outcome {
-        Ok(AtomicWriteOutcome::Durable) => true,
+        Ok(AtomicWriteOutcome::Durable) => {
+            if marker_was_carried {
+                // ADR-0064: counted only on the durable install — the
+                // same gate the once-only warn below uses.
+                state
+                    .groups_diagnostics
+                    .record_fork_quarantine_set(group_key);
+            }
+            true
+        }
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
             // r5 (Fable 2, held-lock path) → r6 (Codex 2, ORDINARY
             // live-ingress path too): the record IS live in the map,
@@ -3220,11 +3654,13 @@ fn fork_evidence_first_complete_wins(
 /// (`current`); the INSTALL + durable persist are awaited INLINE
 /// (r3 Fable 2 — the r1/r2 detached spawn + `try_write` shape could
 /// never run under a live reader and discarded the persist error).
+#[allow(clippy::too_many_arguments)]
 async fn apply_stateful_event_with_evidence(
     state: &Arc<AppState>,
     group_key: &str,
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
     action: x0x::groups::ActionKind,
     mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
@@ -3237,6 +3673,7 @@ async fn apply_stateful_event_with_evidence(
                 group_key,
                 current,
                 commit,
+                owner_mandate,
                 persistence_lock_already_held,
                 &e,
             )
@@ -3251,11 +3688,13 @@ async fn apply_stateful_event_with_evidence(
 /// withdrawal commit — the terminal validator still routes its
 /// PrevHashMismatch/StaleRevision rejections through the SAME
 /// fork-evidence evaluation instead of bypassing the central wrapper.
+#[allow(clippy::too_many_arguments)]
 async fn apply_terminal_stateful_event_with_evidence(
     state: &Arc<AppState>,
     group_key: &str,
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
     action: x0x::groups::ActionKind,
     mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
@@ -3268,6 +3707,7 @@ async fn apply_terminal_stateful_event_with_evidence(
                 group_key,
                 current,
                 commit,
+                owner_mandate,
                 persistence_lock_already_held,
                 &e,
             )
@@ -3277,54 +3717,217 @@ async fn apply_terminal_stateful_event_with_evidence(
     }
 }
 
+/// ADR-0064 slice 1 (Guard A): the persistent quarantine marker for ONE
+/// authenticated conflict — OWNER-AXIS groups ONLY (the deliberate slice
+/// scope: Home-suite / owner-certified groups; every non-owner-axis group
+/// is byte-for-byte unchanged and never receives a marker). The marker
+/// carries the forensic [`x0x::groups::ForkSnapshot`] of both competing
+/// commit headers and never carries TreeKEM/shared-secret material (the
+/// snapshot type excludes it by construction).
+fn fork_quarantine_for_evidence(
+    current: &x0x::groups::GroupInfo,
+    evidence: &x0x::groups::ForkEvidence,
+    conflicting_commit: &x0x::groups::state_commit::GroupStateCommit,
+    classification: Option<&'static str>,
+) -> Option<x0x::groups::ForkQuarantine> {
+    current.policy.admission.owner_certified_user_id()?;
+    Some(x0x::groups::ForkQuarantine {
+        revision: evidence.revision,
+        state_hash: evidence.state_hash.clone(),
+        committed_by: evidence.committed_by.clone(),
+        observed_at_ms: evidence.observed_at_ms,
+        snapshot: x0x::groups::ForkSnapshot {
+            terminal_commit: current.terminal_commit_header(),
+            conflicting_commit: conflicting_commit.clone(),
+            classification: classification.map(str::to_string),
+        },
+        no_anchor: false,
+    })
+}
+
 /// The shared error arm of the two central apply hooks: evaluate the
-/// rejection as a fork-evidence candidate and, when one is
-/// authenticated, install it durably and fire the once-only
-/// diagnostics. Extracted so the terminal twin cannot drift from the
-/// ordinary hook's rules.
+/// rejection as fork evidence and act on the outcome — install one
+/// authenticated record durably and fire the once-only diagnostics
+/// (r2: the conflict path never clears, so installing evidence is the
+/// ONLY action this arm takes). Extracted so the terminal twin cannot
+/// drift from the ordinary hook's rules. `owner_mandate` is `Some`
+/// only on the `MemberAdded` arm (the one event kind that can carry an
+/// owner anchor).
 async fn record_fork_evidence_on_apply_error(
     state: &Arc<AppState>,
     group_key: &str,
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
     error: &x0x::groups::state_commit::ApplyError,
 ) {
     if current.invite_lineage.is_some() {
-        if let Some(evidence) =
-            evaluate_fork_evidence_candidate(state, group_key, current, commit, error)
-        {
-            let durable_install = install_fork_evidence(
-                state,
-                group_key,
-                evidence.clone(),
-                persistence_lock_already_held,
-            )
-            .await;
-            // r4 (addendum item 7): the once-only diagnostics
-            // (warn + `adoption_fork_evidence`) fire ONLY after
-            // the record reached directory durability — a
-            // ReplacedNotDurable/Err/NotReplaced install is NOT
-            // marked seen, so the identical conflict stays
-            // retryable instead of being silenced by a record
-            // that never landed (the r3 pre-install marking).
-            if durable_install
-                && state.groups_diagnostics.record_fork_evidence_once(
+        match evaluate_fork_evidence_candidate(
+            state,
+            group_key,
+            current,
+            commit,
+            owner_mandate,
+            error,
+        ) {
+            ForkEvidenceOutcome::Evidence(evidence, classification) => {
+                let quarantine =
+                    fork_quarantine_for_evidence(current, &evidence, commit, classification);
+                let durable_install = install_fork_evidence(
+                    state,
                     group_key,
-                    evidence.revision,
-                    &evidence.state_hash,
-                    &evidence.committed_by,
+                    evidence.clone(),
+                    quarantine,
+                    persistence_lock_already_held,
                 )
-            {
-                tracing::warn!(
-                    group_id = %LogHexId::group(group_key),
-                    revision = evidence.revision,
-                    state_hash = %evidence.state_hash,
-                    committed_by = %LogHexId::agent(&evidence.committed_by),
-                    "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
-                );
+                .await;
+                // ADR-0064 slice 4: the classification counters fire on
+                // the same durable gate as the once-only diagnostics.
+                if durable_install {
+                    match classification {
+                        Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY) => {
+                            state
+                                .groups_diagnostics
+                                .record_fork_evidence_signer_only(group_key);
+                        }
+                        Some(FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED) => {
+                            state
+                                .groups_diagnostics
+                                .record_fork_evidence_unauthorized_signer(group_key);
+                        }
+                        _ => {}
+                    }
+                }
+                // r4 (addendum item 7): the once-only diagnostics
+                // (warn + `adoption_fork_evidence`) fire ONLY after
+                // the record reached directory durability — a
+                // ReplacedNotDurable/Err/NotReplaced install is NOT
+                // marked seen, so the identical conflict stays
+                // retryable instead of being silenced by a record
+                // that never landed (the r3 pre-install marking).
+                if durable_install
+                    && state.groups_diagnostics.record_fork_evidence_once(
+                        group_key,
+                        evidence.revision,
+                        &evidence.state_hash,
+                        &evidence.committed_by,
+                    )
+                {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(group_key),
+                        revision = evidence.revision,
+                        state_hash = %evidence.state_hash,
+                        committed_by = %LogHexId::agent(&evidence.committed_by),
+                        classification = classification.unwrap_or("unclassified"),
+                        "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
+                    );
+                }
             }
+            ForkEvidenceOutcome::NotEvidence => {}
         }
+    }
+}
+
+/// ADR-0064 slice 4 (#468 stale removal / Decision §2): the joiner-side
+/// ancestor-walk classification. Runs ONLY in the `MemberAdded` error
+/// arm AFTER the tier-1/tier-2 adoption REFUSED — the joiner holds the
+/// SERVED chain (staged with the join result), which full members never
+/// receive (#472 decision 3). The walk validates the chain from the
+/// joiner's own base exactly like the adoption path; when every link
+/// authenticates but no owner anchor was reached, the fork is
+/// walk-authenticated evidence: install it with the `signer_only`
+/// classification and (owner-axis) the quarantine marker. A forged or
+/// self-inconsistent chain fails the walk and records nothing — the
+/// pre-slice-4 behaviour. A mandate that ANCHORS the refused terminal
+/// was already classified by the single-commit evaluation in the apply
+/// hook (r2: as `owner_anchored_conflict` evidence, never a clear), so
+/// the lineage gate above prevents double-acting here.
+///
+/// `persistence_lock_already_held` MUST mirror the caller's
+/// `roster_lock_already_held`: the causal-replay path reaches this
+/// fn while HOLDING `named_groups_persistence_lock` (r2 review item 2
+/// — the locked persist self-deadlocks there).
+async fn classify_refused_joiner_fork_chain(
+    state: &Arc<AppState>,
+    group_key: &str,
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    chain: &[x0x::groups::state_commit::RetainedCommit],
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
+    persistence_lock_already_held: bool,
+) {
+    // Only a joiner with a served chain and stored lineage reaches the
+    // walk; already-installed evidence (the hook's classification) wins.
+    if chain.is_empty() || current.invite_lineage.is_none() {
+        return;
+    }
+    if current
+        .invite_lineage
+        .as_ref()
+        .is_some_and(|lineage| lineage.fork_evidence.is_some())
+    {
+        return;
+    }
+    if commit.verify_structure().is_err() {
+        return;
+    }
+    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
+    // this same mandate; if it produced a successor, the lineage gate
+    // above is still empty and the marker was handled there — never
+    // record the owner's own anchored chain as fork evidence.
+    if let (Some(owner_id), Some(mandate)) = (
+        current.policy.admission.owner_certified_user_id(),
+        owner_mandate,
+    ) {
+        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
+            return;
+        }
+    }
+    let base = x0x::groups::state_commit::AlternateChainBase {
+        group_id: current.stable_group_id(),
+        base_revision: current.state_revision,
+        base_state_hash: &current.state_hash,
+        roster: &x0x::groups::state_commit::roster_projection(&current.members_v2),
+        meta: &current.public_meta(),
+        policy_hash: &x0x::groups::compute_policy_hash(&current.policy),
+    };
+    if x0x::groups::state_commit::validate_alternate_chain(&base, chain, commit).is_err() {
+        // A chain that does not validate from OUR base is not
+        // authenticated evidence of anything this node can anchor.
+        return;
+    }
+    let evidence = x0x::groups::ForkEvidence {
+        revision: commit.revision,
+        state_hash: commit.state_hash.clone(),
+        committed_by: commit.committed_by.clone(),
+        observed_at_ms: now_millis_u64(),
+    };
+    let quarantine = fork_quarantine_for_evidence(
+        current,
+        &evidence,
+        commit,
+        Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY),
+    );
+    let durable = install_fork_evidence(
+        state,
+        group_key,
+        evidence,
+        quarantine,
+        persistence_lock_already_held,
+    )
+    .await;
+    if durable {
+        state
+            .groups_diagnostics
+            .record_fork_evidence_signer_only(group_key);
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            revision = commit.revision,
+            state_hash = %commit.state_hash,
+            committed_by = %LogHexId::agent(&commit.committed_by),
+            "#468/ADR-0064: joiner fork chain walk-authenticated without an owner anchor — quarantined on evidence (no eviction)"
+        );
     }
 }
 
@@ -3343,9 +3946,11 @@ async fn try_adopt_member_added_across_gap(
     display_name: Option<String>,
     treekem_key_package_hash: Option<String>,
     owner_certified_certificate: Option<x0x::identity::AgentCertificate>,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
+    treekem_epoch: Option<u64>,
     revision: u64,
     e: x0x::groups::state_commit::ApplyError,
-    chain: Vec<x0x::groups::state_commit::RetainedCommit>,
+    chain: &[x0x::groups::state_commit::RetainedCommit],
     head_attestation: Option<HeadAttestation>,
 ) -> Option<x0x::groups::GroupInfo> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -3375,16 +3980,8 @@ async fn try_adopt_member_added_across_gap(
         );
         None
     };
-    let admin_in = |roster: &std::collections::BTreeMap<
-        String,
-        x0x::groups::state_commit::RosterMemberSnapshot,
-    >,
-                    who: &str| {
-        roster.get(who).is_some_and(|snap| {
-            snap.state == x0x::groups::GroupMemberState::Active
-                && snap.role.at_least(x0x::groups::GroupRole::Admin)
-        })
-    };
+    // NOTE: `admin_in` folded into the extracted walk
+    // (`state_commit::validate_alternate_chain`).
 
     if chain.is_empty() {
         return refuse("no intervening chain provided");
@@ -3451,11 +4048,20 @@ async fn try_adopt_member_added_across_gap(
         let Some(attestation) = head_attestation.as_ref() else {
             return refuse("no owner head attestation — unanchorable gap, refusing fast-forward");
         };
-        if !attestation.verify_against_terminal(&owner_public_key, &owner, commit, agent_id) {
-            return refuse("owner head attestation fails verification or CAS against the terminal");
+        if !attestation.verify_against_terminal(
+            &owner_public_key,
+            &owner,
+            commit,
+            agent_id,
+            owner_mandate,
+            treekem_epoch,
+        ) {
+            return refuse(
+                "owner head attestation fails verification, CAS, or mandate-epoch check against the terminal",
+            );
         }
         // The attested head must ALSO be the head the served chain reaches.
-        if attestation.head_state_hash != previous_hash_initial(&chain, current) {
+        if attestation.head_state_hash != previous_hash_initial(chain, current) {
             return refuse("attested head does not match the served chain head");
         }
     } else {
@@ -3465,101 +4071,29 @@ async fn try_adopt_member_added_across_gap(
         );
     }
 
-    // Reconstructed state, folded link by link.
-    let mut roster = x0x::groups::state_commit::roster_projection(&current.members_v2);
-    let mut meta = current.public_meta();
-    let mut previous_hash = current.state_hash.clone();
-    let mut previous_revision = current.state_revision;
-    let mut chain_withdrawn = false;
-    for link in &chain {
-        if chain_withdrawn {
-            // #458 r5b: withdrawal is TERMINAL — a withdrawn link ends the
-            // group; nothing (link or terminal) may follow it.
-            return refuse("link follows a withdrawn (terminal) link in the chain");
-        }
-        if link.commit.withdrawn {
-            chain_withdrawn = true;
-        }
-        let commit_link = &link.commit;
-        if commit_link.revision != previous_revision + 1 {
-            return refuse("chain is not consecutive from the stub revision");
-        }
-        if commit_link.prev_state_hash.as_deref() != Some(previous_hash.as_str()) {
-            return refuse("chain prev_state_hash linkage broken (stale or forked chain)");
-        }
-        if commit_link.group_id != stable_id || commit_link.verify_structure().is_err() {
-            return refuse("chain commit signature/group binding invalid");
-        }
-        // Snapshot trust comes ONLY from re-deriving the signed root.
-        if x0x::groups::state_commit::roster_root_of_projection(&link.roster)
-            != commit_link.roster_root
-        {
-            return refuse("link roster snapshot does not re-derive its signed roster_root");
-        }
-        let Some(link_meta) = link.meta.clone() else {
-            return refuse("link predates sealed-meta retention (unreconstructable)");
-        };
-        if x0x::groups::compute_public_meta_hash(&link_meta) != commit_link.public_meta_hash {
-            return refuse("link sealed metadata does not re-derive its signed meta hash");
-        }
-        if commit_link.policy_hash != base_policy_hash {
-            return refuse("policy changed inside the gap (unreconstructable without the event)");
-        }
-        if !admin_in(&roster, &commit_link.committed_by) {
-            return refuse(
-                "link committer is not an active admin in the RECONSTRUCTED predecessor roster",
-            );
-        }
-        // #458 r5c/r6 — ROLE-CHANGE SMUGGLING (WONTFIX-with-justification,
-        // both reviewers): `GroupStateCommit` carries no action kind
-        // (state_commit.rs:193,438), so a role change sealed inside an
-        // internally consistent retained snapshot is indistinguishable
-        // here from any other admin-committed role change. That is NOT a
-        // new capability: an admin can change roles via ordinary commits
-        // anyway (ADR-0016 — role management IS an admin authority), and
-        // every adopted chain is anchored to the OWNER-SIGNED head
-        // attestation of the authority's REAL current head — so any role
-        // delta inside the chain is the authority's own sealed history,
-        // not attacker-injected state. A forked admin cannot get a
-        // smuggled chain anchored (it never holds the owner user key).
-        // The per-link `enforce_last_admin_invariant` below adds
-        // fail-closed coverage for deltas that strand the last admin.
-        if let Err(inv) = projection_last_admin_invariant(&link.roster, link.commit.withdrawn) {
-            let _ = inv;
-            return refuse("link folds to a roster that violates the last-admin invariant");
-        }
-        roster = link.roster.clone();
-        meta = link_meta;
-        previous_hash = commit_link.state_hash.clone();
-        previous_revision = commit_link.revision;
-    }
-
-    // Terminal: chain from the reconstruction head and verify EVERYTHING
-    // against the reconstruction — including a FULL hash equality.
-    if commit.revision != previous_revision + 1
-        || commit.prev_state_hash.as_deref() != Some(previous_hash.as_str())
-    {
-        return refuse("terminal commit does not chain from the reconstructed head");
-    }
-    if chain_withdrawn || commit.withdrawn {
-        // #458 r5b: a MemberAdded on a withdrawn group is meaningless —
-        // refuse adoption of any withdrawn chain or terminal outright.
-        return refuse("chain or terminal is withdrawn (terminal group state)");
-    }
-    if commit.group_id != stable_id {
-        return refuse("terminal commit group binding invalid");
-    }
-    if commit.policy_hash != base_policy_hash {
-        return refuse("terminal commit changes policy (unreconstructable)");
-    }
-    if commit.public_meta_hash != x0x::groups::compute_public_meta_hash(&meta) {
-        return refuse("terminal meta hash does not match the reconstruction");
-    }
-    if !admin_in(&roster, &commit.committed_by) {
-        return refuse(
-            "terminal committer is not an active admin in the reconstructed predecessor roster",
-        );
-    }
+    // #458 r4 / ADR-0064 Decision §2 (slice 4 item 1): the ANCESTOR WALK,
+    // extracted verbatim into
+    // `state_commit::validate_alternate_chain` — pure over the joiner's
+    // base, the served chain, and the terminal. Behaviour-preserving:
+    // every refusal reason string and their ORDER are identical to the
+    // inline fold this replaces.
+    let reconstruction = match x0x::groups::state_commit::validate_alternate_chain(
+        &x0x::groups::state_commit::AlternateChainBase {
+            group_id: stable_id,
+            base_revision: current.state_revision,
+            base_state_hash: &current.state_hash,
+            roster: &x0x::groups::state_commit::roster_projection(&current.members_v2),
+            meta: &current.public_meta(),
+            policy_hash: &base_policy_hash,
+        },
+        chain,
+        commit,
+    ) {
+        Ok(reconstruction) => reconstruction,
+        Err(reason) => return refuse(reason),
+    };
+    let roster = reconstruction.roster;
+    let meta = reconstruction.meta;
 
     // Fold the joiner into the reconstructed members and require the
     // terminal roster root, then the FULL state hash, to re-derive.
@@ -3585,11 +4119,31 @@ async fn try_adopt_member_added_across_gap(
             );
         }
     }
-    match adopted.finalize_adopted_commit_reconstructed(commit, &meta, &chain) {
+    match adopted.finalize_adopted_commit_reconstructed(commit, &meta, chain) {
         Ok(()) => {
             state
                 .groups_diagnostics
                 .record_member_added_adopted(stable_id);
+            // ADR-0064 slice 1 → r2: for owner-axis groups this adoption
+            // ran the TIER-1 anchor — the owner-signed head attestation
+            // CAS against the terminal — which is one of the TWO
+            // owner-anchored clears of the fork-quarantine marker (the
+            // contested branch can never produce that attestation).
+            // Tier-2 adoptions (no owner axis) never carry a marker.
+            // r2: the terminal revision must be STRICTLY greater than the
+            // evidenced revision — an attested commit at or below the
+            // evidence revision never clears.
+            if current.policy.admission.owner_certified_user_id().is_some()
+                && adopted
+                    .fork_quarantine
+                    .as_ref()
+                    .is_some_and(|marker| commit.revision > marker.revision)
+            {
+                adopted.fork_quarantine = None;
+                // Slice 4: every clear re-arms the evidence gate — the
+                // next authenticated conflict re-quarantines.
+                adopted.reset_fork_evidence_after_quarantine_clear();
+            }
             tracing::info!(
                 group_id = %LogHexId::group(stable_id),
                 member = agent_id,
@@ -5185,7 +5739,7 @@ fn authorized_treekem_membership_event_for_queue(
             actor,
             // ADR-0038 round-2: accept cert-bearing adds (see the frontier
             // pattern above).
-            certificate_b64: _,
+            owner_mandate: _,
             commit: Some(_),
             treekem_commit_b64: Some(_),
             treekem_epoch: Some(_),
@@ -5324,24 +5878,28 @@ fn treekem_state_frontier_gap_reason(
     {
         return None;
     }
-    // #482 (design r2 item 1): waive the ROSTER-clock gap ONLY for an
-    // authenticated SELF-leave (actor == target) on MemberRemoved — the
-    // exact wedge shape from HS-E1, where the leaver's roster clock ran
-    // ahead of ours because InviteV4 stubs seed both clocks from
-    // base_state_revision. A global waiver would let any member poison
-    // the roster clock (roster_revision is NOT committed by the state
-    // hash, so a u64::MAX event revision would saturate ours via max).
-    // The apply path clamps the adopted roster revision to local+1, so
-    // even a self-leave cannot inflate our clock arbitrarily.
-    let is_authenticated_self_leave = matches!(
-        event,
-        NamedGroupMetadataEvent::MemberRemoved { actor, agent_id, .. }
-            if actor.eq_ignore_ascii_case(agent_id)
-    );
-    if frontier.commit.revision > info.state_revision.saturating_add(1)
-        || (!is_authenticated_self_leave
-            && frontier.revision > info.roster_revision.saturating_add(1))
-    {
+    // #482 (design r2 item 1) / #492 (item 1): waive the ROSTER-clock gap
+    // for adjacent hash-linked commits regardless of event kind. Without
+    // the waiver, an event whose signed commit is the genuine next link
+    // in our chain still took an avoidable first-admission deferral plus
+    // a catch-up round trip whenever the sender's unauthenticated roster
+    // counter ran ahead (InviteV4 stubs seed both clocks from
+    // base_state_revision). The queue's recovery —
+    // replay_pending_treekem_events re-applies retained entries with
+    // allow_queue = false on every admitted catch-up response — made
+    // that deferral conditional, not harmless: it holds only while the
+    // pending entry survives its TTL/cap and a responder answers, which
+    // is exactly what never holds for the #482 self-leave/two-member
+    // shape (the leaver has dropped its record; no third peer exists).
+    // The signed state chain below (exact revision+1 AND prev-state-hash
+    // link) remains the only admission authority — `roster_revision` is
+    // not hash-committed, and every production apply path adopts an
+    // event roster revision solely through adopt_roster_revision's +1
+    // clamp (the sole raw seed is the inviter-signed InviteV4 stub,
+    // which produces the divergence rather than adopting it) — so a
+    // poison u64::MAX revision advances our clock by exactly one, never
+    // saturates it.
+    if frontier.commit.revision > info.state_revision.saturating_add(1) {
         return Some("revision_gap".to_string());
     }
     if frontier.commit.prev_state_hash.as_deref() != Some(info.state_hash.as_str()) {
@@ -8643,6 +9201,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             member_joined_recovery,
             member_recovery_history,
             certificate_b64,
+            owner_mandate,
             commit,
         } => {
             // ADR-0038 review B1 (+round-2): receivers enforce OwnerCertified
@@ -8736,6 +9295,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -8817,9 +9377,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         display_name.clone(),
                         treekem_key_package_hash.clone(),
                         owner_certified_certificate.clone(),
+                        owner_mandate.as_ref(),
+                        treekem_epoch,
                         revision,
                         e.clone(),
-                        adopt_chain,
+                        &adopt_chain,
                         adopt_attestation,
                     ))
                     .await;
@@ -8858,6 +9420,30 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             next
                         }
                         None => {
+                            // ADR-0064 slice 4 (#468, the REAL stale-removal
+                            // shape): the joiner's own add was refused by the
+                            // tier-1/tier-2 adoption path (no owner head
+                            // attestation — exactly the removed-admin fork
+                            // the joiner cannot anchor). The single-commit
+                            // evaluation inside the apply hook could not
+                            // authenticate the terminal against the retained
+                            // log (its claimed parent is the FORK's first
+                            // link, which the joiner never retained); the
+                            // SERVED chain is the one thing the joiner holds
+                            // — run the extracted ancestor walk over it and,
+                            // when every link validates from our base but no
+                            // owner anchor was reached, quarantine on the
+                            // walk-authenticated evidence.
+                            classify_refused_joiner_fork_chain(
+                                state,
+                                &resolved_group_key,
+                                &current,
+                                &commit,
+                                &adopt_chain,
+                                owner_mandate.as_ref(),
+                                roster_lock_already_held,
+                            )
+                            .await;
                             tracing::debug!(
                                 target: "treekem.trace",
                                 stage = "apply_metadata_event_reject",
@@ -8881,6 +9467,213 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                 }
             };
+            // ADR-0064 slice 2 + 3: owner-mandate enforcement on the
+            // owner axis (both the gapless apply and the across-gap
+            // adoption land here with `next` holding the seated roster).
+            // A PRESENT mandate that fails any binding REJECTS with the
+            // local state byte-identical (`next` is a clone; nothing
+            // persisted yet). An ABSENT mandate applies with warn +
+            // `owner_mandate_absent` UNLESS the event actor is a
+            // recorded-capable authority past its grace window — then
+            // the typed, retryable `owner_mandate_missing` refusal
+            // (slice 3). A mandate on a NON-owner-axis group is inert
+            // by construction (this whole block is behind the
+            // owner-axis predicate), so those groups stay
+            // byte-for-byte unchanged.
+            if let Some(owner) = info.policy.admission.owner_certified_user_id().copied() {
+                match owner_mandate.as_ref() {
+                    Some(mandate) => {
+                        // Trusted owner material: the event's committed
+                        // certificate (verified against the owner above)
+                        // carries the OWNER's user public key.
+                        let owner_public_key =
+                            owner_certified_certificate.as_ref().and_then(|cert| {
+                                ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes())
+                                    .ok()
+                            });
+                        let Some(owner_public_key) = owner_public_key else {
+                            state
+                                .groups_diagnostics
+                                .record_owner_mandate_invalid(&resolved_group_key);
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&agent_id),
+                                "MemberAdded: mandate present but no trusted owner public key — rejecting (state unchanged)"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        };
+                        let committed_digest = owner_certified_certificate
+                            .as_ref()
+                            .map(x0x::groups::owner_cert::certificate_digest_hex);
+                        match mandate.verify_against_terminal(
+                            &owner_public_key,
+                            &owner,
+                            &next,
+                            &commit,
+                            &actor,
+                            &agent_id,
+                            treekem_epoch,
+                            committed_digest.as_deref(),
+                        ) {
+                            Ok(()) => {
+                                state
+                                    .groups_diagnostics
+                                    .record_owner_mandate_valid(&resolved_group_key);
+                                // ADR-0064 §1b: first VALID mandate from
+                                // this authority agent records capability
+                                // (Unknown → Capable{first_seen_ms});
+                                // `or_insert` keeps the FIRST observation
+                                // (clock retained). A valid mandate is
+                                // also the Refusing → Capable edge, so an
+                                // existing entry's transition flag is
+                                // cleared — the NEXT refusal is a new
+                                // Capable → Refusing transition.
+                                next.mandate_capability
+                                    .entry(actor.clone())
+                                    .and_modify(|capability| {
+                                        capability.refusal_transition_counted = false;
+                                    })
+                                    .or_insert_with(|| x0x::groups::MandateCapabilityState {
+                                        first_seen_ms: now_millis_u64(),
+                                        refusals: 0,
+                                        refusal_transition_counted: false,
+                                    });
+                                // ADR-0064 slice 4 (Decision §3): a
+                                // mandate-carrying MemberAdded that
+                                // VERIFIES is an owner-anchored commit —
+                                // the clear rule's anchor is not only a
+                                // seal. It reached here through the
+                                // gapless apply (chains from the
+                                // retained head) or the walked adoption,
+                                // so "chaining through retained ancestry"
+                                // holds by construction; when its revision
+                                // is STRICTLY GREATER than the evidenced
+                                // one, clear the marker and re-arm the
+                                // evidence gate.
+                                if next
+                                    .fork_quarantine
+                                    .as_ref()
+                                    .is_some_and(|marker| commit.revision > marker.revision)
+                                {
+                                    next.fork_quarantine = None;
+                                    next.reset_fork_evidence_after_quarantine_clear();
+                                    state
+                                        .groups_diagnostics
+                                        .record_fork_quarantine_owner_anchored_clear(
+                                            &resolved_group_key,
+                                        );
+                                    tracing::info!(
+                                        group_id = %LogHexId::group(&resolved_group_key),
+                                        revision = commit.revision,
+                                        "ADR-0064: mandate-carrying MemberAdded cleared the fork quarantine (owner-anchored commit)"
+                                    );
+                                }
+                            }
+                            Err(reason) => {
+                                state
+                                    .groups_diagnostics
+                                    .record_owner_mandate_invalid(&resolved_group_key);
+                                tracing::warn!(
+                                    group_id = %LogHexId::group(&resolved_group_key),
+                                    member = %LogHexId::agent(&agent_id),
+                                    reason = %reason,
+                                    "MemberAdded: invalid owner mandate — rejecting with state byte-identical (ADR-0064)"
+                                );
+                                return ApplyMetadataResult::REJECTED;
+                            }
+                        }
+                    }
+                    None => {
+                        // ADR-0064 §1b (slice 3): the per-agent grace
+                        // state machine. An absent mandate from a
+                        // NEVER-observed authority stays warn-accept
+                        // (Unknown — the keyless tier, #472 decision 7);
+                        // from a RECORDED-capable authority past its
+                        // grace window it is refused with the typed,
+                        // retryable `owner_mandate_missing`. The refusal
+                        // leaves the COMMITTED group state byte-identical
+                        // and never queues a revision gap; the only
+                        // written state is the local-only observational
+                        // capability map (per-agent refusal counts, r2),
+                        // which sits outside the state hash. The
+                        // sender-side bounded resend (or a later
+                        // mandate-carrying event from the same authority)
+                        // is the redelivery path.
+                        let grace_days = state.groups_config.mandate_grace_days;
+                        let now_ms = now_millis_u64();
+                        let refusing = info
+                            .mandate_capability
+                            .get(&actor)
+                            .is_some_and(|capability| capability.refusal_due(grace_days, now_ms));
+                        if refusing {
+                            // First refusal of this Refusing episode (a
+                            // valid mandate clears the flag): the one-shot
+                            // Capable → Refusing transition.
+                            let first_transition = !info
+                                .mandate_capability
+                                .get(&actor)
+                                .is_some_and(|capability| capability.refusal_transition_counted);
+                            state
+                                .groups_diagnostics
+                                .record_owner_mandate_missing(&resolved_group_key);
+                            if first_transition {
+                                state
+                                    .groups_diagnostics
+                                    .record_mandate_capability_refusing_transition(
+                                        &resolved_group_key,
+                                    );
+                            }
+                            // Per-agent observational counts on the
+                            // persisted capability map — same
+                            // compare-and-restore mutation as every other
+                            // map write. `get_mut` (never `or_default`):
+                            // if the entry vanished between the refusal
+                            // read and this persist, skip — a missing
+                            // entry must not be re-minted as a
+                            // `first_seen_ms = 0` permanently-Refusing
+                            // record.
+                            let group_key = resolved_group_key.clone();
+                            let actor_key = actor.clone();
+                            if let Err(error) = persist_named_groups_mutation(state, |groups| {
+                                if let Some(capability) =
+                                    groups.get_mut(&group_key).and_then(|record| {
+                                        record.mandate_capability.get_mut(&actor_key)
+                                    })
+                                {
+                                    capability.refusals = capability.refusals.saturating_add(1);
+                                    capability.refusal_transition_counted = true;
+                                }
+                                true
+                            })
+                            .await
+                            {
+                                tracing::warn!(
+                                    group_id = %LogHexId::group(&resolved_group_key),
+                                    "failed to persist per-agent mandate refusal count: {error}"
+                                );
+                            }
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&agent_id),
+                                actor = %LogHexId::agent(&actor),
+                                reason = "owner_mandate_missing",
+                                grace_days,
+                                "MemberAdded: capable authority past grace window without a mandate — rejecting, committed state byte-identical (ADR-0064 §1b; retryable)"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                        state
+                            .groups_diagnostics
+                            .record_owner_mandate_absent(&resolved_group_key);
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&agent_id),
+                            actor = %LogHexId::agent(&actor),
+                            "MemberAdded: no owner mandate on owner-axis group (ADR-0064: applied; capability not recorded)"
+                        );
+                    }
+                }
+            }
             // #468 A5: this commit SEATED the local agent (gapless direct
             // apply or across-gap adoption) — finalize the pending
             // lineage's `seated_at_revision` so intermediate commits
@@ -9150,6 +9943,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 action_kind,
                 |next| {
@@ -9289,6 +10083,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9353,6 +10148,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9420,6 +10216,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9477,6 +10274,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9606,6 +10404,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9676,6 +10475,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::NonMemberRequest,
                 |next| {
@@ -9847,6 +10647,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -10048,6 +10849,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -10104,6 +10906,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::NonMemberRequest,
                 |next| {
@@ -10176,6 +10979,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -10693,6 +11497,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let mut treekem_epoch = None;
             let mut treekem_commit = None;
             let mut treekem_welcome = None;
+            // ADR-0064 slice 2: minted in BOTH branches below at the
+            // pre-mutation point (before `seal_commit_owner_certified`).
+            let owner_mandate;
             next.roster_revision = next.roster_revision.saturating_add(1);
             next.add_member_with_kem(
                 member_agent_id.clone(),
@@ -10784,6 +11591,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 };
                 next.security_binding = Some(binding);
                 next.secret_epoch = expected_epoch;
+                // ADR-0064 slice 2: mint the owner mandate at the
+                // pre-mutation point — `next` holds the seat-write and
+                // the epoch is the TreeKEM epoch the terminal will
+                // carry; still nothing is sealed, mutated or persisted.
+                owner_mandate = mint_owner_mandate_for_seat(
+                    state,
+                    &next,
+                    expected_epoch,
+                    &member_agent_id,
+                    &inviter_agent_id,
+                    &invite_secret,
+                    owner_certified_admission.as_ref(),
+                    now_ms,
+                )
+                .await;
                 let commit =
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(commit) => commit,
@@ -10845,6 +11667,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 treekem_welcome = Some(out.welcome);
                 commit
             } else {
+                // ADR-0064 slice 2: same pre-mutation mint point for the
+                // non-TreeKEM planes — no epoch to declare (0).
+                owner_mandate = mint_owner_mandate_for_seat(
+                    state,
+                    &next,
+                    0,
+                    &member_agent_id,
+                    &inviter_agent_id,
+                    &invite_secret,
+                    owner_certified_admission.as_ref(),
+                    now_ms,
+                )
+                .await;
                 match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                     Ok(commit) => commit,
                     Err(e) => {
@@ -10965,6 +11800,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     use base64::Engine as _;
                     BASE64.encode(bincode::serialize(cert).unwrap_or_default())
                 }),
+                owner_mandate,
                 commit: Some(commit),
             };
             // #477 T4(b): park in the seat→Result staging interval — a
@@ -11630,6 +12466,11 @@ pub(in crate::server) async fn get_named_group(
             // #468 A5: local invite-seat provenance (base, seat revision,
             // corroboration, first authenticated fork evidence).
             "invite_lineage": info.invite_lineage,
+            // ADR-0064 Guard A: the persistent fork-quarantine marker
+            // (with its forensic snapshot) — `null` when the group is
+            // not quarantined. Strictly local; never set for
+            // non-owner-axis groups in this slice.
+            "fork_quarantine": info.fork_quarantine,
             "home": info.home.as_ref().map(|home| serde_json::json!({
                 "primary_agent": home.primary_agent,
                 "provisioned_at_ms": home.provisioned_at_ms,
@@ -11640,6 +12481,161 @@ pub(in crate::server) async fn get_named_group(
             "warnings": super::home::home_roaming_warning_for(&info)
                 .map(|warning| vec![warning])
                 .unwrap_or_default(),
+        })),
+    )
+}
+
+/// POST /groups/:id/quarantine/clear — ADR-0064 slice 3, #472 decision 1
+/// (r2 maintainer decision).
+///
+/// Manually clears the LOCAL (per-node, never gossiped) fork-quarantine
+/// marker. Two paths, either suffices:
+/// (a) OWNER-KEY NODE: called without `force` on a node whose install
+///     holds the owner USER key for this group (the #469 A1b fence —
+///     loaded AND derived `UserId` == policy owner), the endpoint itself
+///     mints a FRESH quarantine-clear attestation over the group's
+///     CURRENT terminal head under the dedicated
+///     `x0x.quarantine-clear-attest.v1` domain (never the join domain),
+///     verifies it, and clears. Remote-owner attestation submission is
+///     OUT of scope — an attestation minted elsewhere cannot be supplied.
+/// (b) `force == true` AND a non-empty `reason` (the operator override;
+///     the reason is the audit trail, logged capped at 256 chars).
+///
+/// Without the owner key and without force the endpoint answers 409 with
+/// a typed reason: `owner_key_unavailable` (owner-axis group, keyless
+/// local install — use the force path deliberately) or `force_required`
+/// (no owner axis to attest with). A group without a marker (including
+/// every non-owner-axis group, which never sets one) answers 409 —
+/// nothing to clear. Requires the local API token (same auth layer as
+/// every `/groups` route). Increments `fork_quarantine_manual_clears`
+/// and returns the updated `fork_quarantine: null` view.
+pub(in crate::server) async fn clear_group_quarantine(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ClearQuarantineRequest>,
+) -> impl IntoResponse {
+    let conflict = |reason: &str| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": reason })),
+        )
+    };
+    let (stable_group_id, head_revision, head_state_hash, owner, marker_present) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return not_found("group not found");
+        };
+        (
+            info.stable_group_id().to_string(),
+            info.state_revision,
+            info.state_hash.clone(),
+            info.policy.admission.owner_certified_user_id().copied(),
+            info.fork_quarantine.is_some(),
+        )
+    };
+    if !marker_present {
+        return conflict("group is not quarantined (no fork_quarantine marker)");
+    }
+    // Path (b): the operator override. `force` without a reason is a
+    // malformed override — it never silently falls back to the
+    // owner-key path.
+    if req.force && req.reason.trim().is_empty() {
+        return conflict("force=true requires a non-empty reason (the audit trail)");
+    }
+    let force_ok = req.force;
+    // Path (a): the local install holds the OWNER user key (#469 A1b
+    // fence) — mint a fresh quarantine-clear attestation over the
+    // CURRENT head and verify it before clearing.
+    let mut owner_key_ok = false;
+    if !force_ok {
+        let Some(owner) = owner.as_ref() else {
+            return conflict(
+                "force_required: group has no owner axis to attest with — \
+                 clear with force=true and a non-empty reason",
+            );
+        };
+        let Some(owner_kp) = state
+            .agent
+            .identity()
+            .user_keypair()
+            .filter(|kp| crate::identity::UserId::from_public_key(kp.public_key()) == *owner)
+        else {
+            return conflict(
+                "owner_key_unavailable: this install does not hold the group's \
+                 owner user key — clear with force=true and a non-empty reason",
+            );
+        };
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let attestation = match HeadAttestation::sign_quarantine_clear(
+            &stable_group_id,
+            head_revision,
+            &head_state_hash,
+            &local_hex,
+            owner_kp,
+        ) {
+            Ok(attestation) => attestation,
+            Err(error) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&stable_group_id),
+                    "quarantine clear: failed to mint owner attestation: {error}"
+                );
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to mint quarantine-clear attestation",
+                );
+            }
+        };
+        if !attestation.verify_quarantine_clear(
+            owner_kp.public_key(),
+            owner,
+            &stable_group_id,
+            head_revision,
+            &head_state_hash,
+            &local_hex,
+        ) {
+            // Our own fresh mint failed verification — key/signing
+            // material inconsistency, not an operator error.
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "quarantine-clear attestation failed self-verification",
+            );
+        }
+        owner_key_ok = true;
+    }
+    let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
+    let outcome = persist_named_groups_mutation(&state, |groups| {
+        if let Some(info) = groups.get_mut(&id) {
+            info.fork_quarantine = None;
+            // ADR-0064 slice 4: the manual clear also re-arms the
+            // evidence gate — the next authenticated conflict
+            // re-quarantines (containment is not one-shot).
+            info.reset_fork_evidence_after_quarantine_clear();
+        }
+        true
+    })
+    .await;
+    if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
+    state
+        .groups_diagnostics
+        .record_fork_quarantine_manual_clear(&stable_group_id);
+    tracing::info!(
+        group_id = %LogHexId::group(&stable_group_id),
+        cleared_by,
+        reason = %req.reason.chars().take(256).collect::<String>(),
+        "ADR-0064: fork quarantine manually cleared (local node only)"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": stable_group_id,
+            "cleared_by": cleared_by,
+            "fork_quarantine": serde_json::Value::Null,
         })),
     )
 }
@@ -12179,6 +13175,10 @@ pub(in crate::server) async fn send_group_public_message(
         if let Some(resp) = reject_withdrawn_group(info) {
             return resp;
         }
+        if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+            return resp;
+        }
+
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
         }
@@ -14671,6 +15671,23 @@ pub(in crate::server) async fn join_group_via_invite(
                 fork_evidence: None,
             });
 
+            // ADR-0064 slice 2 (§1b capability predicate): an owner-axis
+            // invite whose InviteV4 OWNER COUNTERSIGNATURE just verified
+            // (above, `verify_v4_owner_countersignature`) proves the
+            // INVITER's install holds the owner USER key — record mandate
+            // capability for that agent (Unknown → Capable{first_seen})
+            // on the stub, persisted with the group record. `or_insert`
+            // keeps the first observation.
+            if invite_owner_id.is_some() && invite.owner_countersignature_b64.is_some() {
+                info.mandate_capability
+                    .entry(invite.inviter.clone())
+                    .or_insert_with(|| x0x::groups::MandateCapabilityState {
+                        first_seen_ms: now_millis_u64(),
+                        refusals: 0,
+                        refusal_transition_counted: false,
+                    });
+            }
+
             // r4 (addendum item 9): the base-roster materialization above
             // seated every projection member DIGEST-ONLY (certificate
             // bytes never ride the projection). Hydrate the digest-only
@@ -15321,6 +16338,23 @@ pub(in crate::server) async fn add_named_group_member(
             }
         }
         let revision = next.roster_revision;
+        // ADR-0064 slice 3 (round-2 advisory A1): direct admin adds on an
+        // owner-key install mint the same pre-mutation mandate — a
+        // Capable authority's own direct adds must never be refused by
+        // its peers. No epoch to declare on the GSS plane (0); no invite
+        // secret exists for a direct add, so the empty-string hash is
+        // bound (the verifier does not recompute it).
+        let owner_mandate = mint_owner_mandate_for_seat(
+            state.as_ref(),
+            &next,
+            0,
+            &agent_hex,
+            &actor_hex,
+            "",
+            owner_certified_admission.as_ref(),
+            now_ms,
+        )
+        .await;
         let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
         {
             Ok(c) => c,
@@ -15393,6 +16427,9 @@ pub(in crate::server) async fn add_named_group_member(
                 use base64::Engine as _;
                 BASE64.encode(bincode::serialize(cert).unwrap_or_default())
             }),
+            // ADR-0064 slice 3: the pre-mutation mandate minted above
+            // (None on keyless-owner installs and non-owner-axis groups).
+            owner_mandate,
             commit: Some(commit),
         };
         (metadata_topic, event, members, epoch, bootstrap_group)
@@ -15559,6 +16596,20 @@ async fn add_treekem_named_group_member(
         );
     };
     next.security_binding = Some(binding);
+    // ADR-0064 slice 3 (round-2 advisory A1): the TreeKEM sibling of the
+    // GSS direct-add mint — declared epoch is the epoch this add's TreeKEM
+    // commit will carry.
+    let owner_mandate = mint_owner_mandate_for_seat(
+        state.as_ref(),
+        &next,
+        treekem_epoch,
+        &agent_hex,
+        &actor_hex,
+        "",
+        owner_certified_admission.as_ref(),
+        now_ms,
+    )
+    .await;
     let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
@@ -15638,6 +16689,9 @@ async fn add_treekem_named_group_member(
             use base64::Engine as _;
             BASE64.encode(bincode::serialize(cert).unwrap_or_default())
         }),
+        // ADR-0064 slice 3: the pre-mutation mandate minted above (None
+        // on keyless-owner installs and non-owner-axis groups).
+        owner_mandate,
         commit: Some(commit),
     };
     cache_treekem_member_key_package(
@@ -17363,19 +18417,45 @@ async fn owner_certified_seal_with_eviction(
                 // here, explicitly (no clean seal is minted to do it).
                 // Otherwise it stays set until a later all-clean seal.
                 if !in_grace_initially {
-                    let mut groups = state.named_groups.write().await;
-                    if let Some(info) = groups.get_mut(id) {
-                        info.owner_cert_reverify_required = false;
-                    }
-                    drop(groups);
-                    persist_named_groups_mutation(state, |groups| {
-                        if let Some(info) = groups.get_mut(id) {
+                    // ADR-0064 slice 4 r2 (review item 3): the flag AND
+                    // the eviction-arm marker clear happen ONLY inside
+                    // the persist transaction — no pre-transaction
+                    // mutation under a bare map guard (the transaction's
+                    // `before` snapshot would carry the clear, so a
+                    // failed/non-durable persist could not roll it back),
+                    // and the outcome is surfaced exactly like the
+                    // all-clean arm instead of swallowed with `.ok()`:
+                    // non-durable → 503 with memory and disk still
+                    // quarantined.
+                    let owner_user_key = state.agent.identity().user_keypair();
+                    let clear_key = id.to_string();
+                    let persist_outcome = persist_named_groups_mutation(state, |groups| {
+                        if let Some(info) = groups.get_mut(&clear_key) {
                             info.owner_cert_reverify_required = false;
+                            // ADR-0064 slice 4 (slice-1 review non-blocking
+                            // (1)): the EVICTION arm of the explicit seal
+                            // route clears the fork marker under the SAME
+                            // fence as the all-clean arm — the local
+                            // install holds the owner USER key (#469 A1b
+                            // fence) and the sealed revision (bumped by
+                            // the eviction seals) is strictly greater
+                            // than the evidenced one.
+                            info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
                         }
                         true
                     })
-                    .await
-                    .ok();
+                    .await;
+                    if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
+                        tracing::warn!(
+                            group_id = %id,
+                            ?persist_outcome,
+                            "ADR-0064/ADR-0038: eviction-arm reverify-flag/fork-marker clear was not directory-durable — marker kept, refusing"
+                        );
+                        return Some(Err(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "named-group state is not directory-durable",
+                        )));
+                    }
                     return Some(Ok((commit, evicted_total.clone())));
                 }
                 // InGrace members remain (they were NOT evicted — not in
@@ -17424,6 +18504,14 @@ async fn owner_certified_seal_with_eviction(
                             )))
                         }
                     };
+                // ADR-0064 r2: the explicit seal route is the ONLY local
+                // owner anchor that may clear the fork-quarantine marker —
+                // and only when the local install holds the owner USER key
+                // (the #469 A1b fence) and the sealed revision is strictly
+                // greater than the evidenced revision.
+                next.clear_fork_quarantine_on_explicit_owner_seal(
+                    state.agent.identity().user_keypair(),
+                );
                 drop(groups);
                 if !matches!(
                     persist_named_group_info(state, id, next).await,
@@ -18547,6 +19635,96 @@ pub(in crate::server) async fn seal_commit_owner_certified(
         .map(|(commit, _evicted)| commit)
 }
 
+/// ADR-0064 (Decision §1/§1a; slice-3 closes the seat-path advisory):
+/// mint the owner USER-key mandate at the PRE-MUTATION point of a seat
+/// write — the invite-derived MemberJoined handler AND the direct
+/// admin-add routes (a Capable authority's own direct adds must never be
+/// refused by its peers). `pre_seal` is the authority's live-info clone
+/// with the seat-write ALREADY applied (member added, certificate
+/// installed) but BEFORE [`seal_commit_owner_certified`] runs — every
+/// preimage member is therefore derived from the authority's ACTUAL
+/// current roster, never the possibly-stale invite projection (the r2
+/// `{owner,A,B,joiner}` case). `declared_epoch` is the TreeKEM epoch the
+/// terminal event will carry (`guard.epoch() + 1`), or `0` on planes
+/// with no epoch to bind. `invite_secret` is the invite's secret for
+/// MemberJoined seats and the EMPTY string for direct admin adds (the
+/// preimage still binds its hash; the verifier does not recompute it,
+/// so the two producers share one shape).
+///
+/// Capability-gated exactly like the #469 A1b invite fence: the group
+/// must have an owner axis AND the local install must hold the owner
+/// USER key whose derived `UserId` equals the policy owner — otherwise
+/// `None` (keyless-owner admins and non-owner-axis groups simply omit
+/// the mandate; nothing about the seat changes). Pure intent: the
+/// returned value is data only, published with the event after persist
+/// succeeds. A successful mint counts `owner_mandate_minted`.
+#[allow(clippy::too_many_arguments)]
+async fn mint_owner_mandate_for_seat(
+    state: &AppState,
+    pre_seal: &x0x::groups::GroupInfo,
+    declared_epoch: u64,
+    joiner_agent_id: &str,
+    authority_agent_id: &str,
+    invite_secret: &str,
+    admission_cert: Option<&x0x::identity::AgentCertificate>,
+    now_ms: u64,
+) -> Option<x0x::groups::OwnerMandate> {
+    let owner = pre_seal
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .copied()?;
+    // #469 A1b fence: the key must be loaded AND BE the policy owner's.
+    let owner_kp = state
+        .agent
+        .identity()
+        .user_keypair()
+        .filter(|kp| crate::identity::UserId::from_public_key(kp.public_key()) == owner)?;
+    if pre_seal.genesis.is_none() {
+        // Without genesis the stable id is the mls id here but the
+        // seal materializes a derived one — a mandate minted now could
+        // never verify against the terminal. Omit (absent ⇒ warn-accept
+        // tier) rather than mint an unverifiable anchor.
+        tracing::warn!(
+            group_id = %LogHexId::group(&pre_seal.mls_group_id),
+            "ADR-0064: omitting owner mandate — group has no genesis record pre-seal"
+        );
+        return None;
+    }
+    let invite_secret_hash = hex::encode(blake3::hash(invite_secret.as_bytes()).as_bytes());
+    let admission_cert_digest = admission_cert
+        .map(x0x::groups::owner_cert::certificate_digest_hex)
+        .unwrap_or_default();
+    let group_key = pre_seal.stable_group_id().to_string();
+    let mandate = x0x::groups::OwnerMandate::sign(
+        pre_seal.stable_group_id(),
+        pre_seal.state_revision.saturating_add(1),
+        &pre_seal.state_hash,
+        &x0x::groups::compute_roster_root(&pre_seal.members_v2),
+        &x0x::groups::compute_policy_hash(&pre_seal.policy),
+        &x0x::groups::compute_public_meta_hash(&pre_seal.public_meta()),
+        declared_epoch,
+        joiner_agent_id,
+        &invite_secret_hash,
+        &admission_cert_digest,
+        authority_agent_id,
+        now_ms,
+        owner_kp,
+    )
+    .map_err(|e| {
+        tracing::warn!(
+            group_id = %LogHexId::group(&group_key),
+            "ADR-0064: failed to mint owner mandate: {e}"
+        );
+        e
+    })
+    .ok()?;
+    state
+        .groups_diagnostics
+        .record_owner_mandate_minted(&group_key);
+    Some(mandate)
+}
+
 /// ADR-0038 admission gate for one prospective member. `Ok(())` admits;
 /// `Err(failure)` rejects (invite-accept or direct admin add — admin role
 /// is INERT for admission in an OwnerCertified group, so this runs after,
@@ -18717,6 +19895,31 @@ fn reject_unverified_owner_certified_restore(
         )
     })
 }
+
+/// ADR-0064 slice 1 (Guard A): while the persistent fork-quarantine
+/// marker is set, the membership-gated surfaces refuse with the typed
+/// 409 `fork_quarantined` — public send, TreeKEM encrypt/decrypt, and
+/// the GSS secure encrypt/open/reseal family (the same enumerated set
+/// the ADR-0038 restore gate covers, plus outbound public sends).
+/// Inbound metadata events are deliberately NOT gated: the anchored
+/// clearing commit must still be able to arrive and apply. Owner-axis
+/// groups clear through the verified head attestation on adoption or a
+/// local owner-certified seal; non-owner-axis groups never receive a
+/// marker in this slice. Each refusal bumps the
+/// `fork_quarantine_refusals` diagnostic.
+fn reject_fork_quarantined(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    info.is_fork_quarantined().then(|| {
+        state
+            .groups_diagnostics
+            .record_fork_quarantine_refusal(group_id);
+        api_error(StatusCode::CONFLICT, "fork_quarantined")
+    })
+}
+
 #[cfg(test)]
 static POST_CRYPTO_FORCED_WITHDRAWN_GROUPS: std::sync::LazyLock<StdMutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
@@ -21593,6 +22796,9 @@ async fn treekem_group_encrypt(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            if let Some(resp) = reject_fork_quarantined(state, group_id_hex, info) {
+                return resp;
+            }
         }
     }
     let group = {
@@ -21696,6 +22902,9 @@ async fn treekem_group_decrypt(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            if let Some(resp) = reject_fork_quarantined(state, group_id_hex, info) {
+                return resp;
+            }
         }
     }
     let group = {
@@ -21774,6 +22983,10 @@ pub(in crate::server) async fn secure_group_encrypt(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
+    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+        return resp;
+    }
+
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
@@ -21977,6 +23190,10 @@ pub(in crate::server) async fn secure_group_decrypt(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
+    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+        return resp;
+    }
+
     if !info.has_active_member(&caller_hex) && !info.is_banned(&caller_hex) {
         // Removed/never-member callers can't decrypt.
         return forbidden("not a member");
@@ -22136,6 +23353,10 @@ pub(in crate::server) async fn secure_group_reseal(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
+    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+        return resp;
+    }
+
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
@@ -22721,6 +23942,10 @@ async fn record_recovery_fork_evidence(
         committed_by: journal_commit.committed_by.clone(),
         observed_at_ms: now_millis_u64(),
     };
+    // ADR-0064: same owner-axis-only rule as the live path — the
+    // recovery install writes the quarantine marker in the SAME store
+    // mutation as the evidence record.
+    let quarantine = fork_quarantine_for_evidence(live, &evidence, &journal_commit, None);
     for store_path in [named_groups_path, home_suite_groups_path] {
         let Ok(json) = tokio::fs::read_to_string(store_path).await else {
             continue;
@@ -22738,6 +23963,11 @@ async fn record_recovery_fork_evidence(
         };
         if !fork_evidence_first_complete_wins(lineage, &evidence) {
             continue;
+        }
+        // ADR-0064: install the marker with the evidence in the same
+        // store re-encode — one write, one rollback surface.
+        if let Some(marker) = quarantine.clone() {
+            record.fork_quarantine.get_or_insert(marker);
         }
         let Ok(merged) = serde_json::to_string(&store) else {
             tracing::warn!(
@@ -26869,15 +28099,53 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                         // only on success, under the persistence lock we
                         // do NOT hold yet).
                         if info.invite_lineage.is_some() {
-                            if let Some(evidence) = evaluate_fork_evidence_candidate(
+                            match evaluate_fork_evidence_candidate(
                                 state,
                                 &admission.group_id,
                                 info,
                                 &commit,
+                                None,
                                 &error,
                             ) {
-                                install_fork_evidence(state, &admission.group_id, evidence, false)
+                                ForkEvidenceOutcome::Evidence(evidence, classification) => {
+                                    let quarantine = fork_quarantine_for_evidence(
+                                        info,
+                                        &evidence,
+                                        &commit,
+                                        classification,
+                                    );
+                                    let durable = install_fork_evidence(
+                                        state,
+                                        &admission.group_id,
+                                        evidence,
+                                        quarantine,
+                                        false,
+                                    )
                                     .await;
+                                    if durable {
+                                        match classification {
+                                            Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY) => {
+                                                state
+                                                    .groups_diagnostics
+                                                    .record_fork_evidence_signer_only(
+                                                        &admission.group_id,
+                                                    );
+                                            }
+                                            Some(FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED) => {
+                                                state
+                                                    .groups_diagnostics
+                                                    .record_fork_evidence_unauthorized_signer(
+                                                        &admission.group_id,
+                                                    );
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                // ADR-0064 slice 4 r2: recovery never
+                                // carries an owner mandate, so no
+                                // anchored classification can arise here.
+                                ForkEvidenceOutcome::NotEvidence => {}
                             }
                         }
                         return Err(format!(
@@ -30173,10 +31441,12 @@ pub(in crate::server) mod tests {
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
     mod cache_hardening_followup;
+    mod fork_quarantine;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
+    mod owner_mandate;
     mod pr291_restart_marker_matrix;
     mod wp_c;
 
@@ -30848,6 +32118,7 @@ pub(in crate::server) mod tests {
             agent,
             history_record_topics: Vec::new(),
             history_config: x0x::history::HistoryConfig::default(),
+            groups_config: crate::server::DaemonGroupsConfig::default(),
             subscriptions: RwLock::new(HashMap::new()),
             task_lists: RwLock::new(HashMap::new()),
             kv_stores: RwLock::new(HashMap::new()),
@@ -31579,6 +32850,7 @@ pub(in crate::server) mod tests {
                         &std::collections::HashSet::new(),
                         &std::collections::HashSet::new(),
                         &HashMap::new(),
+                        state.groups_config.mandate_grace_days,
                     )
                     .groups
                     .into_iter()
@@ -31870,6 +33142,7 @@ pub(in crate::server) mod tests {
                     &std::collections::HashSet::new(),
                     &std::collections::HashSet::new(),
                     &HashMap::new(),
+                    state.groups_config.mandate_grace_days,
                 )
                 .groups
                 .into_iter()
@@ -32802,6 +34075,7 @@ pub(in crate::server) mod tests {
                         &std::collections::HashSet::new(),
                         &std::collections::HashSet::new(),
                         &HashMap::new(),
+                        state.groups_config.mandate_grace_days,
                     )
                     .groups
                     .into_iter()
@@ -32942,6 +34216,7 @@ pub(in crate::server) mod tests {
                         &std::collections::HashSet::new(),
                         &std::collections::HashSet::new(),
                         &HashMap::new(),
+                        state.groups_config.mandate_grace_days,
                     )
                     .groups
                     .into_iter()
@@ -33977,6 +35252,7 @@ pub(in crate::server) mod tests {
                     &std::collections::HashSet::new(),
                     &std::collections::HashSet::new(),
                     &HashMap::new(),
+                    state.groups_config.mandate_grace_days,
                 )
                 .groups
                 .into_iter()
@@ -34903,6 +36179,206 @@ pub(in crate::server) mod tests {
             .context("read response body")?;
         let body = serde_json::from_slice(&bytes).context("decode response body")?;
         Ok((status, body))
+    }
+
+    // ====================================================================
+    // Issue #372 — the "live zero-member group" state is UNREACHABLE on
+    // the committed-state path: `enforce_last_admin_invariant` (invoked
+    // by every seal/apply, groups/mod.rs apply paths) refuses any
+    // non-withdrawn roster with zero active admins, and the last
+    // member of a sealable roster is necessarily an admin (the
+    // invariant holds inductively on every committed transition).
+    // These tests pin that refusal so a future change cannot start
+    // persisting empty live rosters, and characterize what the
+    // concurrent last-two-members race (#372's real residual — needs
+    // the ADR-0016 protocol decision per the issue triage) actually
+    // converges to: a stale single-survivor view, never a zero-member
+    // live group.
+    // ====================================================================
+
+    async fn foreign_roster_state(
+        n_admins: usize,
+        n_members: usize,
+    ) -> Result<(
+        Arc<AppState>,
+        tempfile::TempDir,
+        String,
+        x0x::groups::GroupInfo,
+        Vec<x0x::identity::AgentKeypair>,
+        Vec<x0x::identity::AgentKeypair>,
+    )> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let group_id = "5c".repeat(32);
+        let admins: Vec<_> = (0..n_admins.max(1))
+            .map(|_| x0x::identity::AgentKeypair::generate())
+            .collect::<Result<_, _>>()?;
+        let members: Vec<_> = (0..n_members)
+            .map(|_| x0x::identity::AgentKeypair::generate())
+            .collect::<Result<_, _>>()?;
+        let creator = admins[0].agent_id();
+        let creator_hex = hex::encode(creator.as_bytes());
+        let mut parent = x0x::groups::GroupInfo::with_policy(
+            "372 roster".to_string(),
+            String::new(),
+            creator,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        parent.roster_revision = 1;
+        parent.shared_secret = Some(vec![9; 32]);
+        for admin in &admins {
+            parent.add_member(
+                hex::encode(admin.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Admin,
+                Some(creator_hex.clone()),
+                None,
+            );
+        }
+        for member in &members {
+            parent.add_member(
+                hex::encode(member.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(creator_hex.clone()),
+                None,
+            );
+        }
+        parent.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), parent.clone());
+        Ok((state, dir, group_id, parent, admins, members))
+    }
+
+    /// The actor's committed self-removal transition sealed from `parent`.
+    async fn signed_self_leave_event(
+        state: &AppState,
+        parent: &x0x::groups::GroupInfo,
+        group_id: &str,
+        leaver: &x0x::identity::AgentKeypair,
+    ) -> Result<NamedGroupMetadataEvent> {
+        let leaver_hex = hex::encode(leaver.agent_id().as_bytes());
+        let mut committed = parent.clone();
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        let commit = seal_commit_owner_certified(state, &mut committed, leaver, 2_000).await?;
+        Ok(NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.to_string(),
+            revision,
+            actor: leaver_hex,
+            agent_id: hex::encode(leaver.agent_id().as_bytes()),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(commit),
+        })
+    }
+
+    #[tokio::test]
+    async fn metadata_removal_emptying_roster_is_rejected_not_persisted() -> Result<()> {
+        // WHY (#372): the issue's literal artifact — a persisted LIVE
+        // zero-member group — must stay impossible. The refusal happens
+        // at the EARLIEST layer: `seal_commit_owner_certified` itself
+        // refuses to produce a commit for a transition that would leave
+        // a live roster with zero active admins (the last member of any
+        // sealable roster is necessarily an admin — the invariant holds
+        // inductively on every committed transition). No emptying
+        // commit can therefore exist, so no apply path can persist one;
+        // the holder's store is untouched and no tombstone is minted
+        // from an invalid transition.
+        let (state, _dir, group_id, parent, admins, _members) = foreign_roster_state(1, 0).await?;
+        let sole_admin = admins.into_iter().next().context("sole admin")?;
+        let sole_admin_hex = hex::encode(sole_admin.agent_id().as_bytes());
+        let mut emptying = parent.clone();
+        emptying.roster_revision = emptying.roster_revision.saturating_add(1);
+        emptying.remove_member(&sole_admin_hex, Some(sole_admin_hex.clone()));
+        let seal = seal_commit_owner_certified(&state, &mut emptying, &sole_admin, 2_000).await;
+        assert!(
+            seal.is_err(),
+            "sealing a live zero-admin (hence zero-member) roster must be refused"
+        );
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("pre-event view retained");
+        assert!(!info.withdrawn, "no tombstone from an invalid transition");
+        assert_eq!(
+            info.active_member_count(),
+            parent.active_member_count(),
+            "roster untouched by the refused transition"
+        );
+        assert!(
+            info.shared_secret.is_some(),
+            "key material untouched by the refused transition"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn member_self_leave_with_admin_survivor_applies_and_stays_live() -> Result<()> {
+        // WHY: the invariant must refuse only EMPTYING removals — an
+        // ordinary member self-leave with an admin survivor is the
+        // legitimate Proceed shape and must keep applying.
+        let (state, _dir, group_id, parent, admins, members) = foreign_roster_state(1, 1).await?;
+        let admin_hex = hex::encode(admins[0].agent_id().as_bytes());
+        let member = members.into_iter().next().context("member")?;
+        let event = signed_self_leave_event(&state, &parent, &group_id, &member).await?;
+        let applied =
+            apply_named_group_metadata_event(&state, event, member.agent_id(), true, None).await;
+        assert!(applied.accepted, "a survivor self-leave must apply");
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group retained");
+        assert!(!info.withdrawn, "a survivor keeps the group live");
+        assert!(info.has_active_member(&admin_hex));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_last_two_admins_race_converges_to_survivor_view_not_zero() -> Result<()> {
+        // WHY (#372 characterization): two admins self-leave inside the
+        // same window, each sealing from the same two-admin parent
+        // (sibling commits). A third-party holder applies the first
+        // valid leave (roster: the other admin, LIVE); the sibling is
+        // refused on the commit-chain mismatch. The worst reachable
+        // state is therefore a stale single-survivor view with no
+        // tombstone — the documented residual awaiting the ADR-0016
+        // protocol decision — and NEVER a persisted live zero-member
+        // group.
+        let (state, _dir, group_id, parent, admins, _members) = foreign_roster_state(2, 0).await?;
+        let mut admins = admins.into_iter();
+        let admin_a = admins.next().context("admin a")?;
+        let admin_b = admins.next().context("admin b")?;
+        let b_hex = hex::encode(admin_b.agent_id().as_bytes());
+        let event_a = signed_self_leave_event(&state, &parent, &group_id, &admin_a).await?;
+        let event_b = signed_self_leave_event(&state, &parent, &group_id, &admin_b).await?;
+
+        let applied =
+            apply_named_group_metadata_event(&state, event_a, admin_a.agent_id(), true, None).await;
+        assert!(applied.accepted, "the first valid self-leave applies");
+
+        let applied =
+            apply_named_group_metadata_event(&state, event_b, admin_b.agent_id(), true, None).await;
+        assert!(
+            !applied.accepted,
+            "the sibling self-leave is refused on the commit-chain mismatch"
+        );
+
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group retained");
+        assert!(
+            !info.withdrawn,
+            "no tombstone exists for the race (residual)"
+        );
+        assert_eq!(
+            info.active_member_count(),
+            1,
+            "worst reachable state: a stale single-survivor view"
+        );
+        assert!(
+            info.has_active_member(&b_hex),
+            "the survivor is the peer the first leaver's commit left behind"
+        );
+        Ok(())
     }
 
     #[test]
@@ -38478,7 +39954,7 @@ pub(in crate::server) mod tests {
         let empty_topics = HashSet::new();
         state
             .groups_diagnostics
-            .snapshot(&groups, &empty_topics, &empty_topics, &HashMap::new())
+            .snapshot(&groups, &empty_topics, &empty_topics, &HashMap::new(), 60)
             .groups
             .into_iter()
             .find(|row| row.group_id == group_id)
@@ -40217,6 +41693,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(fake_group_state_commit(&group_id, 2, &admin_hex)),
         };
         assert!(authorized_treekem_membership_event_for_queue(
@@ -40344,6 +41821,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
         };
 
@@ -40723,6 +42201,7 @@ pub(in crate::server) mod tests {
             treekem_epoch: Some(3),
             treekem_key_package_hash: None,
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(x0x::groups::GroupStateCommit {
                 group_id: info.stable_group_id().to_string(),
                 revision: 3,
@@ -40785,6 +42264,7 @@ pub(in crate::server) mod tests {
                 member_joined_recovery: None,
                 member_recovery_history: Vec::new(),
                 certificate_b64: None,
+                owner_mandate: None,
                 commit: None,
             }),
             chain: Vec::new(),
@@ -40946,6 +42426,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: None,
         };
         let json = serde_json::to_value(event);
@@ -41137,6 +42618,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_added));
@@ -41197,6 +42679,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(fake_commit(2, "state-1")),
         };
         let ban_epoch_3 = NamedGroupMetadataEvent::MemberBanned {
@@ -41265,6 +42748,7 @@ pub(in crate::server) mod tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             certificate_b64: None,
+            owner_mandate: None,
             commit: Some(commit),
         };
 
@@ -41695,6 +43179,7 @@ pub(in crate::server) mod tests {
                 &HashSet::new(),
                 &HashSet::new(),
                 &HashMap::new(),
+                state.groups_config.mandate_grace_days,
             )
             .groups
             .iter()
@@ -41717,6 +43202,7 @@ pub(in crate::server) mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            state.groups_config.mandate_grace_days,
         );
         let after = snap
             .groups
@@ -41743,6 +43229,7 @@ pub(in crate::server) mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            60,
         );
         let row = snap
             .groups

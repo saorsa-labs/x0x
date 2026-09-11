@@ -1199,6 +1199,17 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/groups/:id/quarantine/clear",
+        cli_name: "groups quarantine clear",
+        description: "Manually clear the local fork-quarantine marker (owner-key node clear or --force with --reason)",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[
+            RequestField::body("force", false),
+            RequestField::body_as("reason", false, "--reason"),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/groups/join",
         cli_name: "group join",
         description: "Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)",

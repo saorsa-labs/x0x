@@ -211,3 +211,284 @@ not `null` — when disabled or unobserved):
 The token is **never gossiped, never announced, and never on `/peers`**: it
 is populated only in the raw-QUIC DM receive path and serialized only on the
 DM surfaces above.
+
+## Persistent fork quarantine (ADR-0064, Guard A — slice 1)
+
+Owner-axis groups (Home-suite / OwnerCertified admission — the groups whose
+commits go through `seal_commit_owner_certified` and the owner head
+attestation) carry a persistent, per-node fork-quarantine marker
+(`fork_quarantine` on the group record, exposed via `GET /groups/:id`). The
+marker is set only when a conflicting state-commit passes the authenticated
+fork-evidence gate (valid signature, committer an active admin in the
+retained predecessor roster — the same gate ADR-0059's deduplicated evidence
+uses), and it is written in the same atomic group-store mutation as the
+evidence record (through the standard `persist_named_groups_mutation`
+compare-and-restore path), so it survives restarts. For owner-axis groups the
+authoritative record is the `home-suite-groups.json` sidecar; the legacy
+`named_groups.json` view holds a placeholder that also carries the marker.
+While set, the
+membership-gated routes — public send, TreeKEM encrypt/decrypt, and the
+secure encrypt/open/reseal family — refuse with the typed HTTP **409
+`fork_quarantined`** (counted per group in `/diagnostics/groups` as
+`fork_quarantine_set` / `fork_quarantine_refusals`). The marker carries a
+forensic snapshot of both conflicting commit headers (no shared secrets, no
+TreeKEM material). The clear rule (round-2 maintainer decision, ADR-0064 §3
+"owner anchor = owner key") is deliberately narrow — the marker clears ONLY
+through an owner-anchored path, and BOTH local conditions must hold in
+addition to the strictly-greater-revision requirement:
+
+- **Explicit seal route**: the evidence-bearing seal endpoint
+  (`POST /groups/:id/state/seal` → `owner_certified_seal_with_eviction`),
+  AND the local install holds the **owner USER key** (the same
+  `owner_key_unavailable` fence as owner-axis invite minting: key loaded and
+  its derived user id equal to the policy owner — an agent-key seal carrying
+  only an ADR-0038 certificate verdict is NOT an owner anchor), AND the
+  sealed commit's revision is **strictly greater** than the evidenced
+  revision. The shared `seal_commit_owner_certified` wrapper used by ~22
+  routine mutation sites (rename, policy, add/ban/promote, …) never clears —
+  routine mutations on a quarantined group leave the marker in place.
+- **Tier-1 attestation-verified adoption**: across-gap adoption of a
+  `MemberAdded` anchored by the owner-signed head attestation, with the
+  terminal revision **strictly greater** than the evidenced revision.
+
+A contested branch's own commits never clear it (a same-revision sibling, a
+lower revision, or a seal without the owner user key all refuse); there is
+deliberately no
+automated eviction (ADR-0064 Decision 2). The marker is strictly local
+containment state: stripped from outbound signed-public bootstrap snapshots
+and rejected inbound, exactly like `invite_lineage` — a member that never
+received the authenticated evidence is not contained (per-node scope,
+ADR-0064 Decision 3). **Non-owner-axis groups are out of scope for this
+slice**: they never receive a marker and their behaviour is byte-for-byte
+unchanged; their quarantine/recovery semantics (indefinite
+`quarantine_no_anchor` quarantine and the manual operator runbook) are
+deferred to the ADR follow-up (#472); the operator procedure that DID land
+— ordinary groups ungated, evidence and diagnostics only — is documented in
+[docs/runbooks/fork-quarantine.md](runbooks/fork-quarantine.md) §5.
+Mixed-fleet note: the marker is a
+serde-default JSON field, so v0.41.4 binaries ignore it (and silently drop
+it if they rewrite the record — a downgrade loses containment, it never
+bricks).
+
+## Owner mandate (ADR-0064, Decision §1 — slice 2, verify-if-present)
+
+When a seating authority that holds the owner USER key seats a member through
+an invite (`MemberJoined` → `MemberAdded`), it mints an **owner mandate**: an
+owner-user-key signature over a preimage deterministically derived at the
+pre-mutation point — the group's stable id, the authority agent, the roster
+root over the authority's CURRENT roster plus the seat-write (never the
+possibly-stale invite projection), the terminal revision/parent hash the
+commit will chain from, the declared TreeKEM epoch, the joiner, the invite
+secret's hash, and the admission certificate digest. The mandate rides the
+`MemberAdded` event as an optional serde-default field (`owner_mandate`), so
+older binaries simply ignore it (#451 mixed-fleet safety), and installs that
+hold no owner key (the keyless tier) omit it. In this slice the mandate is
+**verify-if-present** on every receiver: a present mandate that fails any
+binding (signature, roster-root triple-equality against the receiver's own
+re-derived candidate and the terminal commit, anchor revision/parent,
+authority/joiner identity, epoch) rejects the event with the local state
+byte-identical (`owner_mandate_invalid` in `/diagnostics/groups`), while an
+absent mandate applies exactly as before (warned and counted as
+`owner_mandate_absent`) — refusal for absence is deliberately NOT implemented
+yet. Each verified mandate (or owner-countersigned InviteV4 observed at join)
+records a per-authority-agent capability entry (`mandate_capability` on the
+group record, local-only like `invite_lineage`) that slice 3's grace state
+machine will read to decide when a mandate-capable authority's mandate-less
+events must be refused. The existing post-mutation head attestation remains
+the terminal CAS confirmation and now additionally requires the terminal's
+TreeKEM epoch to match the mandate's declared epoch when both are present.
+
+Preimage errata (recorded for #472; the Accepted ADR body is immutable):
+ the implemented v2 preimage signs the §1a members PLUS a `version` byte,
+ the `authority_agent_id`, and `issued_at_ms` — strictly stronger bindings
+ the per-authority capability map (§1b) requires; every later
+ implementation must diff against this v2 shape, not the §1a formula
+ alone.
+
+## Mandate grace enforcement + manual quarantine clear (ADR-0064 §1b, slice 3)
+
+**Grace state machine (per group, per authority agent).** The capability
+entries slice 2 persists (`mandate_capability` → `first_seen_ms`) drive a
+derived state: an agent with NO entry is `Unknown` (never observed
+capability — the keyless tier, warn-accept indefinitely, #472 decision 7);
+an agent WITH an entry is `Capable` until `now ≥ first_seen_ms + grace`,
+then `Refusing`. The grace window defaults to **60 days** (one release
+cycle) and is configured per daemon as `[groups] mandate_grace_days`
+(validated ≥ 1 at startup — 0 would refuse every capable authority's
+events the moment capability is recorded, so the daemon refuses to start
+on it). The clock is LOCAL wall-clock and persisted with the map; a later
+valid mandate from the same agent does NOT reset it (`Refusing → Capable`
+on that event, clock retained — a compromised authority cannot reset its
+own window at will).
+
+**The refusal.** An owner-axis `MemberAdded` with NO mandate whose event
+actor is in the `Refusing` phase is rejected with the typed, retryable
+reason `owner_mandate_missing`: the local record stays byte-identical,
+nothing is queued as a revision gap, and queue admission is unaffected
+(the sender-side bounded resend, or a mandate-carrying re-issue, is the
+redelivery path). Counters: `owner_mandate_missing` (refused events) and
+`mandate_capability_refusing_transitions` (one-shot Capable→Refusing
+transitions per agent — a valid mandate restores Capable, so the next
+refusal counts again) in `/diagnostics/groups`, with the per-agent
+refusal totals on the capability rows. Absent mandates from `Unknown` or in-grace
+`Capable` authorities keep applying with warn + `owner_mandate_absent`,
+exactly as in slice 2 — non-owner-axis groups are entirely unchanged.
+
+**Direct admin adds mint too.** Every seat path on a node holding the
+owner user key mints the pre-mutation mandate: the invite-derived
+`MemberJoined` handler AND the direct admin-add routes
+(`POST /groups/:id/members` on both planes; the invite-secret slot in the
+preimage binds the empty string's hash for direct adds). A capable
+authority's own direct adds therefore never hit the refusal.
+
+**Per-agent diagnostics.** `GET /diagnostics/groups` now exposes, per
+group, `mandate_capability: [{agent_id, state: "capable"|"refusing",
+first_seen_ms, refusals}]` — the derived phases under the configured
+grace window plus the per-agent refused-event count
+(`unknown` agents have no row; the absent map entry IS that state). The
+refusal writes only these observational fields on the local-only
+capability map; the COMMITTED group state stays byte-identical.
+
+**Manual quarantine clear (#472 decision 1, r2 maintainer decision).**
+`POST /groups/:id/quarantine/clear` (local API token; CLI
+`x0x groups quarantine clear <id> --force --reason <REASON>`) clears the
+LOCAL, per-node marker — it is never gossiped — when EITHER
+
+- the node itself holds the owner USER key for the group (the #469 A1b
+  fence): the endpoint MINTS a fresh quarantine-clear attestation over
+  the group's CURRENT terminal head (revision + state hash) for this
+  node's agent under the dedicated `x0x.quarantine-clear-attest.v1`
+  domain — deliberately distinct from the join-attestation domain, so a
+  join attestation over the same head can never clear a quarantine —
+  verifies it, and clears (`cleared_by: "owner-key"`); or
+- `force == true` AND a non-empty `reason` (the operator override).
+
+Remote-owner attestation submission is OUT of scope for this endpoint:
+an attestation minted on another node cannot be supplied in the body. A
+keyless node asking without force gets a typed 409
+(`owner_key_unavailable`); a group with no owner axis gets
+`force_required`. A group with no marker (including every non-owner-axis
+group, which never sets one) answers 409. Every successful clear
+increments `fork_quarantine_manual_clears` and logs at info with the
+reason (the audit trail; the logged reason is capped at 256 chars) and
+returns the updated `fork_quarantine: null` view. The owner-key path is
+owner-controlled; the force path is the documented operator escape hatch
+and should name a runbook/reference in the reason — the full operator
+procedure is [docs/runbooks/fork-quarantine.md](runbooks/fork-quarantine.md).
+
+**Clock and validation caveats.** The grace deadline uses the node's
+local wall clock (the same source as `first_seen_ms`, so a node is
+self-consistent); a backwards clock jump flips a `Refusing` authority
+back to warn-accept until the clock recovers — accepted because both
+sides of the skew fail toward the ADR-0016 checks rather than any new
+attack surface, and the `refusing` PHASE itself is never persisted: it
+is derived from `first_seen_ms` at read time (what persists is the
+per-agent observation data — `first_seen_ms`, `refusals`, and the
+episode flag — all local-only). Cost note: every refused event writes
+the capability map once (one `named_groups` persist per refused event,
+bounded by the stale install's event rate; the committed group state is
+untouched).
+`[groups] mandate_grace_days` is validated (≥ 1) only in `x0xd`'s config
+loader (`load_config`, which also serves `--check`); embedded
+`serve_with_options` callers construct `DaemonConfig` programmatically
+and bypass the check.
+
+## Alternate-chain classification + complete clear rule (ADR-0064, slice 4)
+
+**The ancestor walk is shared machinery.** The per-link chain fold the
+joiner adoption path has used since #458 r4 — consecutive revisions,
+prev-hash linkage anchored at the base's signed hash, per-link signature
+and roster/meta re-derivation, policy stability, committer an active
+admin in the RECONSTRUCTED predecessor roster, last-admin invariant, and
+the terminal's chaining and authority against the reconstruction — is
+extracted into `x0x::groups::state_commit::validate_alternate_chain`, a
+pure function over `(base, chain, terminal)`. The adoption path calls
+it unchanged; the fork-evidence classifier below reuses the identical
+rules. This is what makes the promoted-admin fix real: a chain that
+promotes B at N+1 validates B's N+2 commit against the FOLDED roster,
+never the stale base (and a member signer never passes against any
+reconstruction).
+
+**Full-member fork classification (#472 decision 3).** A conflicting
+state-commit on an owner-axis group is now classified against the
+retained commit log before it becomes evidence. The retained commit
+whose `state_hash` equals the conflicting commit's `prev_state_hash` is
+its **claimed parent** — the fork point ADR-0064 §2 walks from; the
+first link is all a full member can anchor, because gossip carries no
+alternate-chain fetch surface yet (issue #639 tracks it — do not fake
+a chain the node cannot see):
+
+| Classification | Condition | Outcome |
+|---|---|---|
+| `owner_anchored_conflict` | the commit carries an `OwnerMandate` that **anchors** its exact header (owner USER-key signature over the terminal revision/parent/roster-root/policy/meta; `OwnerMandate::anchors_commit` under the owner key derived from committed roster certificates) AND chains consecutively through retained ancestry, at a revision strictly greater than the evidence | evidence + quarantine marker with `classification: "owner_anchored_conflict"` — the owner anchored a successor this node CANNOT apply (it holds the disowned sibling); **the conflict path never clears** (r2, ADR §3) |
+| `signer_only` | the signer was an ACTIVE ADMIN at the claimed parent (or, for a joiner whose adoption was refused, the served chain walked clean from the joiner's base) but no owner anchor is reachable | evidence + quarantine marker; `classification: "signer_only"` on the forensic snapshot |
+| `unauthorized_signer` | the signer held a seat somewhere in the retained history but NOT active-admin at the claimed parent — an admin removed by the very commit the fork chains from, or a plain member signer | evidence + quarantine marker; `classification: "unauthorized_signer"` |
+| unauthenticated | the signature/structure fails, or the signer is unknown to the ENTIRE retained log | never evidence (the slice-1 invariant: an unauthenticated conflict cannot contain the node) |
+| degraded | the claimed parent is not retained (the fork chains from history this node never held) | the pre-slice-4 revision−1 retained-predecessor check decides, with no label |
+
+The owner-anchor evaluation runs BEFORE the stored-evidence silence
+gate so an anchored conflicting commit is always classified, and every
+verifying anchor counts the attributable
+`fork_quarantine_owner_anchored_refusals` — r2 (ADR §3): the CONFLICT
+path never clears. A marker clears ONLY when this node APPLIES an
+owner-anchored commit at strictly greater revision (see below);
+clearing on a conflicting anchored successor would un-gate a node that
+still holds the disowned sibling, and the next canonical commit would
+re-quarantine the same divergence. An anchor that additionally fails
+the ancestry or strictly-greater fence (the contested branch
+publishing an owner-anchored N+3 from its own head) records nothing at
+all — the counter alone is the probe signal, never a silent chain
+failure. Counters `fork_evidence_signer_only` /
+`fork_evidence_unauthorized_signer` /
+`fork_quarantine_owner_anchored_clears` ride `/diagnostics/groups`.
+Joiners whose tier-1 adoption was refused (the #468 stale-removal
+shape: a removed admin serving its own walk-perfect chain with no owner
+head attestation) run the walk over the SERVED chain and quarantine on
+the walk-authenticated evidence with the `signer_only` label — the
+joiner stays pending. A served chain that does not validate from the
+base records nothing. Non-owner-axis groups keep the pre-slice-4
+evaluation byte-for-byte.
+
+**The complete clear rule.** The marker clears through owner-anchored
+paths ONLY, and every one of them clears on a commit this node APPLIES
+at a revision strictly greater than the evidence (r2, ADR §3 — a
+same-revision sibling, the contested branch itself, can never clear,
+and neither can a conflicting successor however well anchored):
+
+- the explicit seal route with the owner USER key and strictly greater
+  revision (slice 1 r2) — now INCLUDING its eviction arm: an explicit
+  seal that evicted failing members clears under exactly the same fence
+  (before slice 4 an evicting seal left the marker until the next
+  seal; r2 additionally moved the clear INSIDE the persist transaction
+  so a non-durable clear answers 503 with the marker intact in memory
+  and on disk);
+- tier-1 attestation-verified adoption at strictly greater revision
+  (slice 1 r2);
+- **a mandate-carrying `MemberAdded` whose `OwnerMandate` verifies** —
+  the ADR's "owner-anchored commit" is not only a seal: on the APPLY
+  path (gapless or walked adoption, so retained ancestry holds by
+  construction) it clears at strictly greater revision;
+- the manual endpoint (slice 3).
+
+EVERY clear re-arms the stored fork-evidence silence gate
+(`invite_lineage.fork_evidence` is reset with the marker): containment
+is no longer one-shot per group per node — after a clear, the next
+authenticated conflict re-evaluates, re-installs evidence, and
+re-quarantines. The in-process once-only diagnostics remain
+identity-keyed, so a genuinely new fork identity still fires its warn.
+
+**Sidecar mirroring (#472 decision 6).** For owner-axis groups the
+quarantine marker AND the `mandate_capability` map were ALREADY carried
+by the `home-suite-groups.json` sidecar — the authoritative record —
+through the pre-existing #451 split write (sidecar first, the
+`named_groups.json` placeholder second, #471 rollback restoring the
+sidecar) with serde-default fields since slices 1–2; the load path
+merges sidecar-wins for owner-axis groups, so an old (or downgraded)
+binary rewriting `named_groups.json` alone — dropping fields it does
+not know — can never drop containment or the grace clocks. Slice 4
+PINS that guarantee by test. Caveat: the protection covers legacy-view
+rewrites only — an OLD SIDECAR-AWARE binary that rewrites the SIDECAR
+itself (not just the placeholder) drops both fields from the
+authoritative record; a downgrade across a sidecar-aware version loses
+containment exactly as the ADR's migration table accepts ("never
+bricks").

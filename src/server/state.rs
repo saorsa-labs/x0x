@@ -154,6 +154,10 @@ pub struct ServerHandle {
     // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
     // handle out without conflicting with the `Drop` impl (which only cancels).
     pub(super) task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    /// Issue #601: the data-directory single-instance lock, held for the
+    /// server's lifetime. Dropping or consuming the handle drops this guard
+    /// and releases the lock; process exit releases it unconditionally.
+    pub(super) _instance_lock: super::instance_lock::InstanceLock,
 }
 
 impl ServerHandle {
@@ -326,6 +330,10 @@ pub struct DaemonConfig {
     /// Gossip overlay configuration (TOML: `[gossip]`).
     #[serde(default)]
     pub gossip: x0x::gossip::GossipConfig,
+
+    /// Named-group enforcement configuration (TOML: `[groups]`).
+    #[serde(default)]
+    pub groups: DaemonGroupsConfig,
 
     /// How often to re-announce identity (seconds).
     #[serde(default = "default_heartbeat_interval")]
@@ -593,6 +601,55 @@ fn default_update_repo() -> String {
     "saorsa-labs/x0x".to_string()
 }
 
+/// Named-group enforcement configuration (TOML `[groups]`).
+///
+/// ADR-0064 §1b: the mandate grace window. Defaults to 60 days (one
+/// release cycle) so a mixed fleet never wedges while authorities roll
+/// out mandate production; members begin refusing absent mandates from
+/// a RECORDED-capable authority only after this window elapses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonGroupsConfig {
+    /// Grace window in days before an absent-mandate event from a
+    /// recorded-capable authority is refused with `owner_mandate_missing`.
+    /// Must be ≥ 1 (0 would refuse every capable authority's event the
+    /// moment capability is recorded — a fleet brick, not an enforcement).
+    #[serde(default = "default_mandate_grace_days")]
+    pub mandate_grace_days: u64,
+}
+
+impl Default for DaemonGroupsConfig {
+    fn default() -> Self {
+        Self {
+            mandate_grace_days: default_mandate_grace_days(),
+        }
+    }
+}
+
+impl DaemonGroupsConfig {
+    /// Validate the section. `mandate_grace_days` must be ≥ 1: the daemon
+    /// refuses to start on 0 rather than silently entering
+    /// refuse-everything enforcement (unlike unknown keys — warn-only —
+    /// an out-of-range value here changes security behaviour).
+    ///
+    /// # Errors
+    /// Returns a human-readable message naming the key and the bound.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mandate_grace_days == 0 {
+            return Err(
+                "config key `mandate_grace_days` under `[groups]` must be >= 1 \
+                 (0 would refuse every recorded-capable authority's \
+                 absent-mandate event immediately)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_mandate_grace_days() -> u64 {
+    60
+}
+
 fn default_heartbeat_interval() -> u64 {
     x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS
 }
@@ -623,7 +680,6 @@ impl DaemonConfig {
     }
 
     /// Resolve `bootstrap_peers` to a concrete dial list.
-    ///
     /// - `Some(v)` → the operator's explicit peers, verbatim (including `[]`).
     /// - `None` → the embedded global bootstrap network
     ///   (`x0x::network::DEFAULT_BOOTSTRAP_PEERS`).
@@ -676,6 +732,7 @@ impl Default for DaemonConfig {
             history: default_history_config(),
             gossip: x0x::gossip::GossipConfig::default(),
             key_move: KeyMoveConfig::default(),
+            groups: DaemonGroupsConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             legacy_announce: false,
             identity_ttl_secs: default_identity_ttl(),
@@ -715,6 +772,10 @@ pub(super) struct AppState {
     /// The `[history]` config as loaded — surfaced by `/history/stats` so
     /// operators can see the retention bounds in force.
     pub(super) history_config: x0x::history::HistoryConfig,
+    /// The `[groups]` config as loaded — the ADR-0064 §1b mandate grace
+    /// window consulted by the MemberAdded enforcement arm and surfaced
+    /// (derived) in `/diagnostics/groups` capability phases.
+    pub(super) groups_config: DaemonGroupsConfig,
     pub(super) subscriptions: RwLock<HashMap<String, RestSubscription>>,
     pub(super) task_lists: RwLock<HashMap<String, TaskListHandle>>,
     pub(super) kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
@@ -1043,6 +1104,35 @@ pub(super) struct CachedUpgradeCheck {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn groups_config_defaults_and_validation() {
+        // WHY (ADR-0064 §1b): 60 days is one release cycle — the default
+        // must keep a mixed fleet warn-accepting while authorities roll
+        // out mandate production; 0 would refuse every capable
+        // authority's absent-mandate event immediately, so the daemon
+        // must refuse to start on it.
+        let default = DaemonGroupsConfig::default();
+        assert_eq!(default.mandate_grace_days, 60);
+        assert!(default.validate().is_ok());
+
+        let zero: DaemonGroupsConfig = toml::from_str("mandate_grace_days = 0\n").expect("parses");
+        assert_eq!(zero.mandate_grace_days, 0);
+        let err = zero.validate().expect_err("0 must be rejected");
+        assert!(err.contains("mandate_grace_days"), "{err}");
+
+        let one: DaemonGroupsConfig = toml::from_str("mandate_grace_days = 1\n").expect("parses");
+        assert_eq!(one.mandate_grace_days, 1);
+        assert!(one.validate().is_ok());
+
+        // Absent section → derived default (serde default on the section);
+        // present section → the operator's value verbatim.
+        let daemon: DaemonConfig = toml::from_str("").expect("empty config");
+        assert_eq!(daemon.groups.mandate_grace_days, 60);
+        let daemon: DaemonConfig =
+            toml::from_str("[groups]\nmandate_grace_days = 5\n").expect("section parses");
+        assert_eq!(daemon.groups.mandate_grace_days, 5);
+    }
+
     use super::*;
 
     #[test]

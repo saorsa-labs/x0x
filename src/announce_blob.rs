@@ -135,6 +135,47 @@ pub struct AnnounceBlobCacheStats {
     pub blob_cache_misses: u64,
     pub blob_fetches_ok: u64,
     pub blob_fetches_failed: u64,
+    #[cfg(test)]
+    pub(crate) diagnostics: AnnounceBlobDiagnostics,
+}
+
+/// Independent per-agent lifetime observations, not a coherent task census.
+#[cfg(test)]
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct AnnounceBlobDiagnostics {
+    pub(crate) fetches_spawned: u64,
+    pub(crate) terminal_both_carriers_failed: u64,
+    pub(crate) terminal_deadline_elapsed: u64,
+    pub(crate) terminal_subscription_closed: u64,
+    pub(crate) terminal_verifier_error: u64,
+    pub(crate) responses_seen: u64,
+    pub(crate) responses_skipped_malformed: u64,
+    pub(crate) responses_skipped_mismatched_digest: u64,
+    pub(crate) verified_requests_decoded: u64,
+    pub(crate) unknown_digest: u64,
+    pub(crate) pair_available: u64,
+    pub(crate) coalesced_dropped: u64,
+    pub(crate) response_publish_ok_local: u64,
+    pub(crate) publish_failed_local: u64,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AnnounceBlobDiagnosticCounters {
+    fetches_spawned: AtomicU64,
+    terminal_both_carriers_failed: AtomicU64,
+    terminal_deadline_elapsed: AtomicU64,
+    terminal_subscription_closed: AtomicU64,
+    terminal_verifier_error: AtomicU64,
+    responses_seen: AtomicU64,
+    responses_skipped_malformed: AtomicU64,
+    responses_skipped_mismatched_digest: AtomicU64,
+    verified_requests_decoded: AtomicU64,
+    unknown_digest: AtomicU64,
+    pair_available: AtomicU64,
+    coalesced_dropped: AtomicU64,
+    response_publish_ok_local: AtomicU64,
+    publish_failed_local: AtomicU64,
 }
 
 /// Internal LRU bookkeeping — access order for eviction.
@@ -154,6 +195,8 @@ pub struct AnnounceBlobCache {
     stats_misses: AtomicU64,
     stats_fetches_ok: AtomicU64,
     stats_fetches_failed: AtomicU64,
+    #[cfg(test)]
+    diagnostics: AnnounceBlobDiagnosticCounters,
 }
 
 impl AnnounceBlobCache {
@@ -168,6 +211,8 @@ impl AnnounceBlobCache {
             stats_misses: AtomicU64::new(0),
             stats_fetches_ok: AtomicU64::new(0),
             stats_fetches_failed: AtomicU64::new(0),
+            #[cfg(test)]
+            diagnostics: AnnounceBlobDiagnosticCounters::default(),
         };
         cache.load_from_disk();
         cache
@@ -262,6 +307,10 @@ impl AnnounceBlobCache {
         let digest = *digest;
         let agent_id = *agent_id;
         let machine_id = *machine_id;
+        #[cfg(test)]
+        self.diagnostics
+            .fetches_spawned
+            .fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             match fetch_and_verify(&pubsub, &cache, &digest, &agent_id, &machine_id).await {
                 Ok(blob) => {
@@ -316,6 +365,50 @@ impl AnnounceBlobCache {
             blob_cache_misses: self.stats_misses.load(Ordering::Relaxed),
             blob_fetches_ok: self.stats_fetches_ok.load(Ordering::Relaxed),
             blob_fetches_failed: self.stats_fetches_failed.load(Ordering::Relaxed),
+            #[cfg(test)]
+            diagnostics: AnnounceBlobDiagnostics {
+                fetches_spawned: self.diagnostics.fetches_spawned.load(Ordering::Relaxed),
+                terminal_both_carriers_failed: self
+                    .diagnostics
+                    .terminal_both_carriers_failed
+                    .load(Ordering::Relaxed),
+                terminal_deadline_elapsed: self
+                    .diagnostics
+                    .terminal_deadline_elapsed
+                    .load(Ordering::Relaxed),
+                terminal_subscription_closed: self
+                    .diagnostics
+                    .terminal_subscription_closed
+                    .load(Ordering::Relaxed),
+                terminal_verifier_error: self
+                    .diagnostics
+                    .terminal_verifier_error
+                    .load(Ordering::Relaxed),
+                responses_seen: self.diagnostics.responses_seen.load(Ordering::Relaxed),
+                responses_skipped_malformed: self
+                    .diagnostics
+                    .responses_skipped_malformed
+                    .load(Ordering::Relaxed),
+                responses_skipped_mismatched_digest: self
+                    .diagnostics
+                    .responses_skipped_mismatched_digest
+                    .load(Ordering::Relaxed),
+                verified_requests_decoded: self
+                    .diagnostics
+                    .verified_requests_decoded
+                    .load(Ordering::Relaxed),
+                unknown_digest: self.diagnostics.unknown_digest.load(Ordering::Relaxed),
+                pair_available: self.diagnostics.pair_available.load(Ordering::Relaxed),
+                coalesced_dropped: self.diagnostics.coalesced_dropped.load(Ordering::Relaxed),
+                response_publish_ok_local: self
+                    .diagnostics
+                    .response_publish_ok_local
+                    .load(Ordering::Relaxed),
+                publish_failed_local: self
+                    .diagnostics
+                    .publish_failed_local
+                    .load(Ordering::Relaxed),
+            },
         }
     }
 
@@ -454,6 +547,11 @@ async fn fetch_and_verify(
         ),
     );
     if let (Err(t), Err(w)) = (&targeted, &warm) {
+        #[cfg(test)]
+        cache
+            .diagnostics
+            .terminal_both_carriers_failed
+            .fetch_add(1, Ordering::Relaxed);
         return Err(format!(
             "both blob request carriers failed: targeted={t}; warm={w}"
         ));
@@ -470,18 +568,47 @@ async fn fetch_and_verify(
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            #[cfg(test)]
+            cache
+                .diagnostics
+                .terminal_deadline_elapsed
+                .fetch_add(1, Ordering::Relaxed);
             return Err("announce blob fetch timed out".to_string());
         }
         let message = match tokio::time::timeout(remaining, responses.recv()).await {
             Ok(Some(message)) => message,
-            Ok(None) => return Err("blob response subscription closed".to_string()),
-            Err(_) => return Err("announce blob fetch timed out".to_string()),
+            Ok(None) => {
+                #[cfg(test)]
+                cache
+                    .diagnostics
+                    .terminal_subscription_closed
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err("blob response subscription closed".to_string());
+            }
+            Err(_) => {
+                #[cfg(test)]
+                cache
+                    .diagnostics
+                    .terminal_deadline_elapsed
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err("announce blob fetch timed out".to_string());
+            }
         };
         let Some(payload) = message.payload.strip_prefix(ANNOUNCE_BLOB_RESPONSE_DOMAIN) else {
             // A request or foreign message on the topic — not ours.
             continue;
         };
+        #[cfg(test)]
+        cache
+            .diagnostics
+            .responses_seen
+            .fetch_add(1, Ordering::Relaxed);
         let Some(response) = decode_blob_response(payload) else {
+            #[cfg(test)]
+            cache
+                .diagnostics
+                .responses_skipped_malformed
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         };
         // Responses for concurrent requests share this topic. Ignore other
@@ -492,9 +619,17 @@ async fn fetch_and_verify(
             expected_agent_id,
             0,
         ) else {
+            #[cfg(test)]
+            cache
+                .diagnostics
+                .responses_skipped_mismatched_digest
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         };
         return result.map_err(|e| {
+            #[cfg(test)]
+            cache.diagnostics.terminal_verifier_error.fetch_add(1, Ordering::Relaxed);
+
             tracing::warn!(
                 target: "announce.blob",
                 agent = %hex::encode(expected_agent_id.as_bytes()),
@@ -697,6 +832,12 @@ pub async fn spawn_blob_responder(
             let Some(request) = decode_blob_request_from(encoded) else {
                 continue;
             };
+            // Only verified, sender-bearing, domain-matched and decoded requests.
+            #[cfg(test)]
+            cache
+                .diagnostics
+                .verified_requests_decoded
+                .fetch_add(1, Ordering::Relaxed);
             let (own_user, own_cert) = own_pair
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -705,6 +846,11 @@ pub async fn spawn_blob_responder(
                 .serve_request(&request.digest, &own_user, &own_cert)
                 .await
             else {
+                #[cfg(test)]
+                cache
+                    .diagnostics
+                    .unknown_digest
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     target: "announce.blob",
                     digest = %hex::encode(request.digest),
@@ -712,12 +858,22 @@ pub async fn spawn_blob_responder(
                 );
                 continue;
             };
+            #[cfg(test)]
+            cache
+                .diagnostics
+                .pair_available
+                .fetch_add(1, Ordering::Relaxed);
             // Coalesce: at most one response per window, like the caps
             // responder. A dropped response is retried by the next beat.
             let now = std::time::Instant::now();
             if now.duration_since(last_response)
                 < std::time::Duration::from_secs(MIN_RESPONSE_INTERVAL_SECS)
             {
+                #[cfg(test)]
+                cache
+                    .diagnostics
+                    .coalesced_dropped
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             last_response = now;
@@ -732,7 +888,18 @@ pub async fn spawn_blob_responder(
                 .publish(ANNOUNCE_BLOB_TOPIC.to_string(), Bytes::from(prefixed))
                 .await
             {
+                #[cfg(test)]
+                cache
+                    .diagnostics
+                    .publish_failed_local
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(target: "announce.blob", %e, "blob response publish failed");
+            } else {
+                #[cfg(test)]
+                cache
+                    .diagnostics
+                    .response_publish_ok_local
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     });
