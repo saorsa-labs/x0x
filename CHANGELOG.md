@@ -20,6 +20,13 @@ All notable changes to this project will be documented in this file.
   only the bound address; wildcard-bound listeners (production bootstraps
   bind `[::]`) and observed/external addresses are unchanged.
 
+### Tests
+
+- `tests/e2e_deploy.sh` uploads the binary as a gzip stream with ssh keepalives
+  (`ServerAliveInterval=15`, `ServerAliveCountMax=4`), so a stalled upload to a
+  far host fails fast instead of hanging the rollout.
+
+
 ## [v0.42.1] - 2026-09-11
 
 ### Fixed
