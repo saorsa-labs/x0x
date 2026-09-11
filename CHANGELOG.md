@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Group task-list policy now gates the bootstrap prune (#654).** The
+  digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
+  acted directly on the wire delta's removal evidence, so on a
+  group-scoped list a holder the content policy would reject (a
+  non-member, or an unsigned serve with no envelope-verified writer)
+  could still DELETE tasks by serving empty-tag removal evidence — and
+  the pruned replica would forward that evidence fleet-wide. Deletion is
+  content: the prune now applies the same `is_authorized_content_writer`
+  check as `merge_delta` (open lists keep accepting any verified writer,
+  so deletion cold-sync is unchanged there). Also from the #652 review:
+  dropped the inert `#[serde(default)]` on `SnapshotBodyV2.known_removed`
+  (bincode is positional — a default could never engage; the v1/v2 split
+  is the magic prefix) and the stale `#[allow(dead_code)]` on
+  `delta_remove_task` (it has production call sites).
+
 ## [v0.42.1] - 2026-09-11
 
 ### Fixed
