@@ -4967,6 +4967,7 @@ async fn adr0064_apply_commit(
         group_id,
         &current,
         &commit,
+        None,
         false,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
@@ -5219,6 +5220,7 @@ async fn adr0064_adoption_clear_requires_strictly_greater_revision() -> Result<(
             snapshot: x0x::groups::ForkSnapshot {
                 terminal_commit: terminal_header.clone(),
                 conflicting_commit: terminal_header,
+                classification: None,
             },
             no_anchor: false,
         });
@@ -5264,5 +5266,253 @@ async fn adr0064_adoption_clear_requires_strictly_greater_revision() -> Result<(
             "adoption at revision == evidence revision does NOT clear"
         );
     }
+    Ok(())
+}
+
+/// WHY (#468 / ADR-0064 slice 4, blueprint fault matrix "stale removal"):
+/// the REAL #468 shape. The joiner's invite base (revision N) seats a
+/// second admin A; the CANONICAL chain removes A at N+1 — invisible to
+/// the joiner, which is exactly why the retained-base checks cannot see
+/// it. A's install keeps driving the join it invited: it serves its own
+/// fork N+1'..N+2' (the MemberAdded terminal) WITHOUT the owner head
+/// attestation (the owner refuses to attest a removed admin's chain —
+/// the attestation refusal). Tier-1 adoption refuses; the served chain
+/// runs through the extracted ancestor walk (A IS an active admin at
+/// the joiner's base, so the fork is internally perfect); with no owner
+/// anchor reachable, the joiner quarantines on the walk-authenticated
+/// evidence, records the `signer_only` classification, and stays
+/// pending.
+#[tokio::test]
+async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
+    let stage = issue458_stage(0x9D, false).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+
+    // The joiner's invite base: founder admin + admin A (A invited the
+    // joiner). Hand-sealed so the retained base commit covers the
+    // {authority, A} roster the fork walks from.
+    let a_kp = AgentKeypair::generate()?;
+    let a_hex = hex::encode(a_kp.agent_id().as_bytes());
+    let mut stub = stage.base_info.clone();
+    stub.add_member(
+        a_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        Some(authority_hex.clone()),
+        None,
+    );
+    let base_revision = stub.state_revision.saturating_add(1);
+    let base_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        base_revision,
+        Some(stub.state_hash.clone()),
+        x0x::groups::compute_roster_root(&stub.members_v2),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    stub.prev_state_hash = Some(stub.state_hash.clone());
+    stub.state_hash = base_commit.state_hash.clone();
+    stub.state_revision = base_revision;
+    stub.commit_log
+        .push(x0x::groups::state_commit::RetainedCommit {
+            commit: base_commit,
+            roster: x0x::groups::state_commit::roster_projection(&stub.members_v2),
+            meta: Some(stub.public_meta()),
+        });
+    stub.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: stub.state_revision,
+        base_hash: stub.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    });
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    // A's fork: link N+1' (A commits a metadata change over the base
+    // roster) then the MemberAdded terminal N+2' seating the joiner.
+    let policy_hash = x0x::groups::compute_policy_hash(&stub.policy);
+    let mut fork_meta = stub.public_meta();
+    fork_meta.description = "a-fork-1".to_string();
+    let link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        base_revision.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        fork_meta.clone(),
+        &a_kp,
+    );
+    let mut fork_roster_with_joiner = stub.members_v2.clone();
+    fork_roster_with_joiner.insert(stage.joiner_hex.clone(), {
+        let mut m = x0x::groups::GroupMember::new_member(
+            stage.joiner_hex.clone(),
+            None,
+            None,
+            now_millis_u64(),
+        );
+        m.role = x0x::groups::GroupRole::Member;
+        m
+    });
+    let terminal = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        base_revision.saturating_add(2),
+        Some(link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&fork_roster_with_joiner),
+        policy_hash.clone(),
+        x0x::groups::compute_public_meta_hash(&fork_meta),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp,
+    )?;
+
+    // The joiner's certificate (owner-issued — the receiver gate needs
+    // committed certificate evidence) and the MemberAdded event.
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: terminal.revision,
+        actor: a_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(terminal.clone()),
+    };
+
+    // Serve the fork chain with the join result — NO head attestation
+    // (the #468 attestation refusal: the owner will not anchor a
+    // removed admin's chain).
+    let chain_key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(chain_key, vec![link]);
+
+    let result =
+        apply_named_group_metadata_event(&joiner_state, event, a_kp.agent_id(), true, None).await;
+    assert!(
+        !result.accepted,
+        "the unattested removed-admin fork is refused"
+    );
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert!(
+            !info.has_active_member(&stage.joiner_hex),
+            "the joiner stays pending (tier-1 anchor refused)"
+        );
+        let marker = info.fork_quarantine.as_ref().expect("quarantine marker");
+        assert_eq!(marker.revision, terminal.revision);
+        assert_eq!(marker.committed_by, a_hex);
+        assert_eq!(
+            marker.snapshot.classification.as_deref(),
+            Some("signer_only"),
+            "the served chain walked clean (A was admin at the base) — signer-only, no owner anchor"
+        );
+        assert!(
+            info.invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref())
+                .is_some(),
+            "walk-authenticated evidence installed"
+        );
+    }
+    let row = diagnostics_row(joiner_state.as_ref(), &stage.group_id).await;
+    assert_eq!(row.counters.fork_evidence_signer_only, 1);
+    assert_eq!(row.counters.fork_quarantine_set, 1);
+
+    // Negative control: the same fork with a STRANGER-signed link (the
+    // chain does not validate from the base) records nothing.
+    let (joiner2_state, _jdir2) = joiner_state_for(&stage).await?;
+    let mut stub2 = stub.clone();
+    stub2.fork_quarantine = None;
+    if let Some(lineage) = stub2.invite_lineage.as_mut() {
+        lineage.fork_evidence = None;
+    }
+    joiner2_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub2);
+    let stranger = AgentKeypair::generate()?;
+    let stranger_link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        base_revision.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        fork_meta.clone(),
+        &stranger,
+    );
+    let stranger_terminal = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        base_revision.saturating_add(2),
+        Some(stranger_link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&fork_roster_with_joiner),
+        policy_hash.clone(),
+        x0x::groups::compute_public_meta_hash(&fork_meta),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &a_kp,
+    )?;
+    let event2 = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: stranger_terminal.revision,
+        actor: a_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(stranger_terminal),
+    };
+    let chain_key2 = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner2_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(chain_key2, vec![stranger_link]);
+    let result2 =
+        apply_named_group_metadata_event(&joiner2_state, event2, a_kp.agent_id(), true, None).await;
+    assert!(!result2.accepted);
+    let groups = joiner2_state.named_groups.read().await;
+    let info = groups.get(&stage.group_id).expect("stub retained");
+    assert!(
+        !info.is_fork_quarantined(),
+        "a chain that does not validate from the base is NOT evidence"
+    );
     Ok(())
 }

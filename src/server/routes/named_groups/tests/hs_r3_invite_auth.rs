@@ -864,6 +864,7 @@ async fn fork_evidence_records_once_and_survives_in_the_durable_record() -> Resu
             group_id,
             &current,
             &commit,
+            None,
             false,
             x0x::groups::ActionKind::AdminOrHigher,
             |next| {
@@ -2228,6 +2229,7 @@ async fn r4_apply_through_wrapper(
         group_id,
         &current,
         &commit,
+        None,
         lock_held,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {

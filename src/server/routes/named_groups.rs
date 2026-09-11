@@ -3131,8 +3131,11 @@ fn previous_hash_initial(
 ///   (identical hash = ordinary duplicate replay; revision outside
 ///   retained history = unclassifiable).
 /// - A candidate becomes ONE recorded `ForkEvidence` only when its
-///   signature verifies (`verify_structure`) AND its committer was an
-///   ACTIVE ADMIN in the retained predecessor roster.
+///   signature verifies (`verify_structure`) AND its signer is
+///   authenticated against the retained log (see the classification
+///   below — ADR-0064 slice 4 re-anchored this from "revision−1 in the
+///   retained chain" to the commit's CLAIMED PARENT where the retained
+///   log holds it).
 /// - Evidence is deduplicated by the STORED record: once the group's
 ///   lineage carries ANY evidence, EVERY later conflict — identical or
 ///   different — is fully silent (no classification, no warn, no
@@ -3140,23 +3143,54 @@ fn previous_hash_initial(
 ///   install nothing is marked seen, so a failed/rolled-back persist
 ///   leaves the identical conflict RETRYABLE (the r3 pre-install
 ///   once-only set suppressed retries — reversed by design).
+///
+/// ADR-0064 slice 4 — the classification (owner-axis groups only;
+/// non-owner-axis evaluation is byte-for-byte the pre-slice-4 rule):
+///
+/// (a) LEGITIMATE SUCCESSOR — the conflicting commit carries an owner
+///     mandate that ANCHORS its header (owner USER-key signature over
+///     the exact revision/parent/roster-root/policy/meta) and it chains
+///     CONSECUTIVELY through retained ancestry. No evidence is
+///     recorded; when a marker exists and the commit's revision is
+///     STRICTLY GREATER than the evidenced one, the marker CLEARS and
+///     the evidence gate re-arms (the clear rule's "owner-anchored
+///     commit" — not only a seal). This runs BEFORE the stored-evidence
+///     silence gate: an anchored successor must be able to clear even
+///     while old evidence sits in the lineage. A verifying anchor that
+///     FAILS the ancestry or strictly-greater fence counts an
+///     attributable refusal (`fork_quarantine_owner_anchored_refusals`)
+///     — the contested branch cannot silently probe the clear path.
+/// (b) SIGNER-ONLY (#472 decision 3) — the signer was an ACTIVE ADMIN
+///     at the commit's claimed parent (the retained commit whose
+///     `state_hash` the fork chains from), but the alternate chain is
+///     unavailable to full members (no chain-fetch surface exists yet;
+///     the follow-up issue tracks it). Evidence + quarantine marker,
+///     snapshot `classification: "signer_only"`.
+/// (c) UNAUTHORIZED SIGNER — the signer held a seat somewhere in the
+///     retained history but NOT active-admin at the claimed parent (an
+///     admin removed by the canonical commit the fork claims to chain
+///     from, or a plain member signer). Evidence + quarantine marker,
+///     snapshot `classification: "unauthorized_signer"`.
+/// Signers unknown to the ENTIRE retained log are NOT evidence (the
+/// pre-slice-4 invariant is preserved: an unauthenticated conflict can
+/// never contain the local node — only a seat-holder, delivered through
+/// the admin-sender-gated event arms, can set the marker).
+/// (−) DEGRADED — the claimed parent is not retained (the fork chains
+///     from history this node never held): the pre-slice-4 revision−1
+///     retained-predecessor check decides, with no classification label.
+///     This is the documented decision-3 degradation — do not fake a
+///     chain this node cannot see.
 fn evaluate_fork_evidence_candidate(
     state: &Arc<AppState>,
     group_key: &str,
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
     error: &x0x::groups::state_commit::ApplyError,
-) -> Option<x0x::groups::ForkEvidence> {
-    // r4 (addendum item 7): after the first STORED evidence, silence ALL
-    // diagnostics for this group's conflicts — a different post-first
-    // conflict must not warn either (first COMPLETE evidence wins).
-    if current
-        .invite_lineage
-        .as_ref()
-        .is_some_and(|lineage| lineage.fork_evidence.is_some())
-    {
-        return None;
-    }
+) -> ForkEvidenceOutcome {
+    // The candidate SHAPES are evaluated before the silence gate EXCEPT
+    // where noted: the shape checks determine whether this rejection is
+    // evidence material at all.
     let candidate_revision = match error {
         x0x::groups::state_commit::ApplyError::PrevHashMismatch { .. } => commit.revision,
         x0x::groups::state_commit::ApplyError::StaleRevision { got, .. } => {
@@ -3167,32 +3201,220 @@ fn evaluate_fork_evidence_candidate(
                 .find(|rc| rc.commit.revision == *got)
             else {
                 // Outside retained history — unclassifiable, no evidence.
-                return None;
+                return ForkEvidenceOutcome::NotEvidence;
             };
             if retained.commit.state_hash == commit.state_hash {
                 // Same revision, identical hash — an ordinary duplicate
                 // replay, NOT evidence.
-                return None;
+                return ForkEvidenceOutcome::NotEvidence;
             }
             *got
         }
-        _ => return None,
+        _ => return ForkEvidenceOutcome::NotEvidence,
     };
-
-    // Authenticate the candidate: structure + signature + signer binding.
     let now_ms = now_millis_u64();
-    if !fork_candidate_authenticated(current, commit) {
+
+    // ADR-0064 slice 4 (a): the owner-anchor check runs BEFORE the
+    // stored-evidence silence gate — an anchored successor must be able
+    // to clear containment even while the lineage still carries the
+    // first fork's evidence. Only a structure-valid commit carrying a
+    // mandate that ANCHORS its exact header under the policy owner can
+    // reach the clear decision.
+    if let (Some(owner_id), Some(mandate)) = (
+        current.policy.admission.owner_certified_user_id(),
+        owner_mandate,
+    ) {
+        if commit.verify_structure().is_ok()
+            && mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit)
+        {
+            let chains_through_retained_ancestry = current
+                .commit_log
+                .iter()
+                .rev()
+                .find(|rc| commit.prev_state_hash.as_deref() == Some(rc.commit.state_hash.as_str()))
+                .is_some_and(|parent| parent.commit.revision + 1 == commit.revision);
+            let strictly_greater = current
+                .fork_quarantine
+                .as_ref()
+                .is_none_or(|marker| commit.revision > marker.revision);
+            if !chains_through_retained_ancestry || !strictly_greater {
+                // Attributable refusal: the owner vouched for this
+                // commit header, but it does not chain through THIS
+                // node's retained ancestry (the contested branch's own
+                // head) or does not strictly advance past the evidence.
+                state
+                    .groups_diagnostics
+                    .record_fork_quarantine_owner_anchored_refusal(group_key);
+                return ForkEvidenceOutcome::NotEvidence;
+            }
+            return ForkEvidenceOutcome::OwnerAnchoredSuccessor;
+        }
+    }
+
+    // r4 (addendum item 7): after the first STORED evidence, silence ALL
+    // diagnostics for this group's conflicts — a different post-first
+    // conflict must not warn either (first COMPLETE evidence wins).
+    if current
+        .invite_lineage
+        .as_ref()
+        .is_some_and(|lineage| lineage.fork_evidence.is_some())
+    {
+        return ForkEvidenceOutcome::NotEvidence;
+    }
+
+    // Non-owner-axis groups: byte-for-byte the pre-slice-4 rule.
+    if current.policy.admission.owner_certified_user_id().is_none() {
+        if !fork_candidate_authenticated(current, commit) {
+            state
+                .groups_diagnostics
+                .record_conflict_unauthenticated(group_key, now_ms);
+            return ForkEvidenceOutcome::NotEvidence;
+        }
+        return ForkEvidenceOutcome::Evidence(
+            x0x::groups::ForkEvidence {
+                revision: candidate_revision,
+                state_hash: commit.state_hash.clone(),
+                committed_by: commit.committed_by.clone(),
+                observed_at_ms: now_millis_u64(),
+            },
+            None,
+        );
+    }
+
+    // Owner-axis classification: structure first — a commit whose
+    // signature/state-hash does not verify is never evidence.
+    if commit.verify_structure().is_err() {
         state
             .groups_diagnostics
             .record_conflict_unauthenticated(group_key, now_ms);
-        return None;
+        return ForkEvidenceOutcome::NotEvidence;
     }
+    // The claimed parent: the retained commit whose `state_hash` the
+    // conflicting commit chains from (the fork point ADR-0064 §2 walks
+    // from — the first link is all the retained log can anchor for a
+    // full member; the joiner path additionally walks its served chain
+    // in the MemberAdded error arm).
+    let claimed_parent = current
+        .commit_log
+        .iter()
+        .rev()
+        .find(|rc| commit.prev_state_hash.as_deref() == Some(rc.commit.state_hash.as_str()));
+    let evidence = |classification: Option<&'static str>| {
+        ForkEvidenceOutcome::Evidence(
+            x0x::groups::ForkEvidence {
+                revision: candidate_revision,
+                state_hash: commit.state_hash.clone(),
+                committed_by: commit.committed_by.clone(),
+                observed_at_ms: now_millis_u64(),
+            },
+            classification,
+        )
+    };
+    match claimed_parent {
+        Some(parent) => {
+            let signer_snapshot = parent.roster.get(&commit.committed_by);
+            let active_admin_at_parent = signer_snapshot.is_some_and(|snap| {
+                snap.state == x0x::groups::GroupMemberState::Active
+                    && snap.role.at_least(x0x::groups::GroupRole::Admin)
+            });
+            let held_seat_at_parent = signer_snapshot
+                .is_some_and(|snap| snap.state == x0x::groups::GroupMemberState::Active);
+            if active_admin_at_parent {
+                // (b) signer-only: authenticated at the claimed parent,
+                // owner anchor unavailable, full chain unavailable.
+                evidence(Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY))
+            } else if held_seat_at_parent || signer_retained_anywhere(current, commit) {
+                // (c) unauthorized at the claimed parent, but a KNOWN
+                // seat — the removed-admin-chaining-from-its-own-removal
+                // shape and the member-signer shape.
+                evidence(Some(FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED))
+            } else {
+                // Unknown to the entire retained log: never evidence
+                // (the slice-1 invariant — an unauthenticated conflict
+                // cannot contain the local node).
+                state
+                    .groups_diagnostics
+                    .record_conflict_unauthenticated(group_key, now_ms);
+                ForkEvidenceOutcome::NotEvidence
+            }
+        }
+        None => {
+            // (−) degraded: the claimed parent is not retained. The
+            // pre-slice-4 revision−1 check decides; no label.
+            if !fork_candidate_authenticated(current, commit) {
+                state
+                    .groups_diagnostics
+                    .record_conflict_unauthenticated(group_key, now_ms);
+                return ForkEvidenceOutcome::NotEvidence;
+            }
+            evidence(None)
+        }
+    }
+}
 
-    Some(x0x::groups::ForkEvidence {
-        revision: candidate_revision,
-        state_hash: commit.state_hash.clone(),
-        committed_by: commit.committed_by.clone(),
-        observed_at_ms: now_millis_u64(),
+/// ADR-0064 slice 4 snapshot classification labels (strings, never enum
+/// variants — #451).
+pub(in crate::server) const FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY: &str = "signer_only";
+pub(in crate::server) const FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED: &str = "unauthorized_signer";
+
+/// ADR-0064 slice 4: the outcome of evaluating one rejected commit as
+/// fork evidence.
+enum ForkEvidenceOutcome {
+    /// No evidence (unauthenticated, silenced, unclassifiable, or an
+    /// owner-anchored successor that was refused as a clear).
+    NotEvidence,
+    /// One authenticated evidence record, optionally classified against
+    /// the retained log (the snapshot label).
+    Evidence(x0x::groups::ForkEvidence, Option<&'static str>),
+    /// ADR-0064 slice 4 (a): a mandate-anchored commit that chains
+    /// through retained ancestry at a strictly greater revision than
+    /// the evidence — the canonical successor. No evidence; the caller
+    /// clears the marker and re-arms the gate.
+    OwnerAnchoredSuccessor,
+}
+
+/// ADR-0064 slice 4: did the signer hold a seat in ANY retained roster
+/// projection (the "known seat" half of the unauthorized-signer
+/// classification — a removed admin stays visible in the retained
+/// history it was removed from)?
+fn signer_retained_anywhere(
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> bool {
+    current
+        .commit_log
+        .iter()
+        .any(|rc| rc.roster.contains_key(&commit.committed_by))
+}
+
+/// ADR-0064 slice 4: derive the trusted owner USER public key from any
+/// committed roster certificate whose derived `UserId` equals the
+/// policy's admission owner — the same ADR-0038 committed-evidence
+/// trust the quarantine-clear endpoint uses. Returns `None` when the
+/// roster carries no usable certificate (the anchor check then fails
+/// closed).
+fn trusted_owner_public_key(
+    current: &x0x::groups::GroupInfo,
+    owner_id: &crate::identity::UserId,
+) -> Option<ant_quic::MlDsaPublicKey> {
+    current.members_v2.values().find_map(|member| {
+        let cert = member.certificate.as_ref()?;
+        let pk = ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok()?;
+        (crate::identity::UserId::from_public_key(&pk) == *owner_id).then_some(pk)
+    })
+}
+
+/// ADR-0064 slice 4 (a): the owner-anchor predicate for a conflicting
+/// commit — the mandate must anchor the commit's exact header under a
+/// trusted owner key derived from the roster's committed certificates.
+fn mandate_anchors_commit_under_trusted_owner(
+    current: &x0x::groups::GroupInfo,
+    owner_id: &crate::identity::UserId,
+    mandate: &x0x::groups::OwnerMandate,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> bool {
+    trusted_owner_public_key(current, owner_id).is_some_and(|owner_pk| {
+        mandate.anchors_commit(&owner_pk, owner_id, current.stable_group_id(), commit)
     })
 }
 
@@ -3402,11 +3624,13 @@ fn fork_evidence_first_complete_wins(
 /// (`current`); the INSTALL + durable persist are awaited INLINE
 /// (r3 Fable 2 — the r1/r2 detached spawn + `try_write` shape could
 /// never run under a live reader and discarded the persist error).
+#[allow(clippy::too_many_arguments)]
 async fn apply_stateful_event_with_evidence(
     state: &Arc<AppState>,
     group_key: &str,
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
     action: x0x::groups::ActionKind,
     mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
@@ -3419,6 +3643,7 @@ async fn apply_stateful_event_with_evidence(
                 group_key,
                 current,
                 commit,
+                owner_mandate,
                 persistence_lock_already_held,
                 &e,
             )
@@ -3431,13 +3656,13 @@ async fn apply_stateful_event_with_evidence(
 /// r5 (Codex 5): the TERMINAL twin of the central apply hook
 /// ([`apply_stateful_event_with_evidence`]) for `GroupDeleted`'s
 /// withdrawal commit — the terminal validator still routes its
-/// PrevHashMismatch/StaleRevision rejections through the SAME
-/// fork-evidence evaluation instead of bypassing the central wrapper.
+#[allow(clippy::too_many_arguments)]
 async fn apply_terminal_stateful_event_with_evidence(
     state: &Arc<AppState>,
     group_key: &str,
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
     action: x0x::groups::ActionKind,
     mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
@@ -3450,6 +3675,7 @@ async fn apply_terminal_stateful_event_with_evidence(
                 group_key,
                 current,
                 commit,
+                owner_mandate,
                 persistence_lock_already_held,
                 &e,
             )
@@ -3470,6 +3696,7 @@ fn fork_quarantine_for_evidence(
     current: &x0x::groups::GroupInfo,
     evidence: &x0x::groups::ForkEvidence,
     conflicting_commit: &x0x::groups::state_commit::GroupStateCommit,
+    classification: Option<&'static str>,
 ) -> Option<x0x::groups::ForkQuarantine> {
     current.policy.admission.owner_certified_user_id()?;
     Some(x0x::groups::ForkQuarantine {
@@ -3480,61 +3707,234 @@ fn fork_quarantine_for_evidence(
         snapshot: x0x::groups::ForkSnapshot {
             terminal_commit: current.terminal_commit_header(),
             conflicting_commit: conflicting_commit.clone(),
+            classification: classification.map(str::to_string),
         },
         no_anchor: false,
     })
 }
 
 /// The shared error arm of the two central apply hooks: evaluate the
-/// rejection as a fork-evidence candidate and, when one is
-/// authenticated, install it durably and fire the once-only
-/// diagnostics. Extracted so the terminal twin cannot drift from the
-/// ordinary hook's rules.
+/// rejection as fork evidence and act on the outcome — install one
+/// authenticated record durably and fire the once-only diagnostics, or
+/// run the ADR-0064 slice-4 owner-anchored-successor CLEAR. Extracted so
+/// the terminal twin cannot drift from the ordinary hook's rules.
+/// `owner_mandate` is `Some` only on the `MemberAdded` arm (the one
+/// event kind that can carry an owner anchor).
 async fn record_fork_evidence_on_apply_error(
     state: &Arc<AppState>,
     group_key: &str,
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
     error: &x0x::groups::state_commit::ApplyError,
 ) {
     if current.invite_lineage.is_some() {
-        if let Some(evidence) =
-            evaluate_fork_evidence_candidate(state, group_key, current, commit, error)
-        {
-            let quarantine = fork_quarantine_for_evidence(current, &evidence, commit);
-            let durable_install = install_fork_evidence(
-                state,
-                group_key,
-                evidence.clone(),
-                quarantine,
-                persistence_lock_already_held,
-            )
-            .await;
-            // r4 (addendum item 7): the once-only diagnostics
-            // (warn + `adoption_fork_evidence`) fire ONLY after
-            // the record reached directory durability — a
-            // ReplacedNotDurable/Err/NotReplaced install is NOT
-            // marked seen, so the identical conflict stays
-            // retryable instead of being silenced by a record
-            // that never landed (the r3 pre-install marking).
-            if durable_install
-                && state.groups_diagnostics.record_fork_evidence_once(
+        match evaluate_fork_evidence_candidate(
+            state,
+            group_key,
+            current,
+            commit,
+            owner_mandate,
+            error,
+        ) {
+            ForkEvidenceOutcome::Evidence(evidence, classification) => {
+                let quarantine =
+                    fork_quarantine_for_evidence(current, &evidence, commit, classification);
+                let durable_install = install_fork_evidence(
+                    state,
                     group_key,
-                    evidence.revision,
-                    &evidence.state_hash,
-                    &evidence.committed_by,
+                    evidence.clone(),
+                    quarantine,
+                    persistence_lock_already_held,
                 )
-            {
-                tracing::warn!(
-                    group_id = %LogHexId::group(group_key),
-                    revision = evidence.revision,
-                    state_hash = %evidence.state_hash,
-                    committed_by = %LogHexId::agent(&evidence.committed_by),
-                    "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
-                );
+                .await;
+                // ADR-0064 slice 4: the classification counters fire on
+                // the same durable gate as the once-only diagnostics.
+                if durable_install {
+                    match classification {
+                        Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY) => {
+                            state
+                                .groups_diagnostics
+                                .record_fork_evidence_signer_only(group_key);
+                        }
+                        Some(FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED) => {
+                            state
+                                .groups_diagnostics
+                                .record_fork_evidence_unauthorized_signer(group_key);
+                        }
+                        _ => {}
+                    }
+                }
+                // r4 (addendum item 7): the once-only diagnostics
+                // (warn + `adoption_fork_evidence`) fire ONLY after
+                // the record reached directory durability — a
+                // ReplacedNotDurable/Err/NotReplaced install is NOT
+                // marked seen, so the identical conflict stays
+                // retryable instead of being silenced by a record
+                // that never landed (the r3 pre-install marking).
+                if durable_install
+                    && state.groups_diagnostics.record_fork_evidence_once(
+                        group_key,
+                        evidence.revision,
+                        &evidence.state_hash,
+                        &evidence.committed_by,
+                    )
+                {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(group_key),
+                        revision = evidence.revision,
+                        state_hash = %evidence.state_hash,
+                        committed_by = %LogHexId::agent(&evidence.committed_by),
+                        classification = classification.unwrap_or("unclassified"),
+                        "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
+                    );
+                }
             }
+            ForkEvidenceOutcome::OwnerAnchoredSuccessor => {
+                // ADR-0064 slice 4 (a) + Decision §3: a mandate-anchored
+                // commit that chains through retained ancestry at a
+                // strictly greater revision than the evidence is the
+                // canonical successor — clear the marker and re-arm the
+                // evidence gate. (evaluate only returns this outcome
+                // after the strictly-greater check passed.)
+                if current.fork_quarantine.is_some() {
+                    let clear_key = group_key.to_string();
+                    let clear_revision = commit.revision;
+                    let clear = |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
+                        let Some(info) = groups.get_mut(&clear_key) else {
+                            return false;
+                        };
+                        // Re-check under the guard: a concurrent writer
+                        // may have cleared or moved the marker.
+                        if info
+                            .fork_quarantine
+                            .as_ref()
+                            .is_some_and(|marker| clear_revision > marker.revision)
+                        {
+                            info.fork_quarantine = None;
+                            info.reset_fork_evidence_after_quarantine_clear();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    let clear_outcome = if persistence_lock_already_held {
+                        persist_named_groups_mutation_unlocked(state, clear).await
+                    } else {
+                        persist_named_groups_mutation(state, clear).await
+                    };
+                    match clear_outcome {
+                        Ok(AtomicWriteOutcome::Durable) => {
+                            state
+                                .groups_diagnostics
+                                .record_fork_quarantine_owner_anchored_clear(group_key);
+                            tracing::info!(
+                                group_id = %LogHexId::group(group_key),
+                                revision = commit.revision,
+                                "ADR-0064: owner-anchored mandate-carrying successor cleared the fork quarantine"
+                            );
+                        }
+                        outcome => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(group_key),
+                                ?outcome,
+                                "ADR-0064: owner-anchored quarantine clear did not reach directory durability"
+                            );
+                        }
+                    }
+                }
+            }
+            ForkEvidenceOutcome::NotEvidence => {}
         }
+    }
+}
+
+/// ADR-0064 slice 4 (#468 stale removal / Decision §2): the joiner-side
+/// ancestor-walk classification. Runs ONLY in the `MemberAdded` error
+/// arm AFTER the tier-1/tier-2 adoption REFUSED — the joiner holds the
+/// SERVED chain (staged with the join result), which full members never
+/// receive (#472 decision 3). The walk validates the chain from the
+/// joiner's own base exactly like the adoption path; when every link
+/// authenticates but no owner anchor was reached, the fork is
+/// walk-authenticated evidence: install it with the `signer_only`
+/// classification and (owner-axis) the quarantine marker. A forged or
+/// self-inconsistent chain fails the walk and records nothing — the
+/// pre-slice-4 behaviour. A mandate that ANCHORS the refused terminal is
+/// the legitimate-successor shape; the single-commit evaluation inside
+/// the apply hook already handled its clear, so this never double-acts.
+async fn classify_refused_joiner_fork_chain(
+    state: &Arc<AppState>,
+    group_key: &str,
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    chain: &[x0x::groups::state_commit::RetainedCommit],
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
+) {
+    // Only a joiner with a served chain and stored lineage reaches the
+    // walk; already-installed evidence (the hook's classification) wins.
+    if chain.is_empty() || current.invite_lineage.is_none() {
+        return;
+    }
+    if current
+        .invite_lineage
+        .as_ref()
+        .is_some_and(|lineage| lineage.fork_evidence.is_some())
+    {
+        return;
+    }
+    if commit.verify_structure().is_err() {
+        return;
+    }
+    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
+    // this same mandate; if it produced a successor, the lineage gate
+    // above is still empty and the marker was handled there — never
+    // record the owner's own anchored chain as fork evidence.
+    if let (Some(owner_id), Some(mandate)) = (
+        current.policy.admission.owner_certified_user_id(),
+        owner_mandate,
+    ) {
+        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
+            return;
+        }
+    }
+    let base = x0x::groups::state_commit::AlternateChainBase {
+        group_id: current.stable_group_id(),
+        base_revision: current.state_revision,
+        base_state_hash: &current.state_hash,
+        roster: &x0x::groups::state_commit::roster_projection(&current.members_v2),
+        meta: &current.public_meta(),
+        policy_hash: &x0x::groups::compute_policy_hash(&current.policy),
+    };
+    if x0x::groups::state_commit::validate_alternate_chain(&base, chain, commit).is_err() {
+        // A chain that does not validate from OUR base is not
+        // authenticated evidence of anything this node can anchor.
+        return;
+    }
+    let evidence = x0x::groups::ForkEvidence {
+        revision: commit.revision,
+        state_hash: commit.state_hash.clone(),
+        committed_by: commit.committed_by.clone(),
+        observed_at_ms: now_millis_u64(),
+    };
+    let quarantine = fork_quarantine_for_evidence(
+        current,
+        &evidence,
+        commit,
+        Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY),
+    );
+    let durable = install_fork_evidence(state, group_key, evidence, quarantine, false).await;
+    if durable {
+        state
+            .groups_diagnostics
+            .record_fork_evidence_signer_only(group_key);
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            revision = commit.revision,
+            state_hash = %commit.state_hash,
+            committed_by = %LogHexId::agent(&commit.committed_by),
+            "#468/ADR-0064: joiner fork chain walk-authenticated without an owner anchor — quarantined on evidence (no eviction)"
+        );
     }
 }
 
@@ -3547,6 +3947,7 @@ async fn try_adopt_member_added_across_gap(
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::GroupStateCommit,
     info: &x0x::groups::GroupInfo,
+
     actor: &str,
     actor_authorized: bool,
     agent_id: &str,
@@ -3747,6 +4148,9 @@ async fn try_adopt_member_added_across_gap(
                     .is_some_and(|marker| commit.revision > marker.revision)
             {
                 adopted.fork_quarantine = None;
+                // Slice 4: every clear re-arms the evidence gate — the
+                // next authenticated conflict re-quarantines.
+                adopted.reset_fork_evidence_after_quarantine_clear();
             }
             tracing::info!(
                 group_id = %LogHexId::group(stable_id),
@@ -8899,6 +9303,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9023,6 +9428,29 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             next
                         }
                         None => {
+                            // ADR-0064 slice 4 (#468, the REAL stale-removal
+                            // shape): the joiner's own add was refused by the
+                            // tier-1/tier-2 adoption path (no owner head
+                            // attestation — exactly the removed-admin fork
+                            // the joiner cannot anchor). The single-commit
+                            // evaluation inside the apply hook could not
+                            // authenticate the terminal against the retained
+                            // log (its claimed parent is the FORK's first
+                            // link, which the joiner never retained); the
+                            // SERVED chain is the one thing the joiner holds
+                            // — run the extracted ancestor walk over it and,
+                            // when every link validates from our base but no
+                            // owner anchor was reached, quarantine on the
+                            // walk-authenticated evidence.
+                            classify_refused_joiner_fork_chain(
+                                state,
+                                &resolved_group_key,
+                                &current,
+                                &commit,
+                                &adopt_chain,
+                                owner_mandate.as_ref(),
+                            )
+                            .await;
                             tracing::debug!(
                                 target: "treekem.trace",
                                 stage = "apply_metadata_event_reject",
@@ -9117,6 +9545,36 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                         refusals: 0,
                                         refusal_transition_counted: false,
                                     });
+                                // ADR-0064 slice 4 (Decision §3): a
+                                // mandate-carrying MemberAdded that
+                                // VERIFIES is an owner-anchored commit —
+                                // the clear rule's anchor is not only a
+                                // seal. It reached here through the
+                                // gapless apply (chains from the
+                                // retained head) or the walked adoption,
+                                // so "chaining through retained ancestry"
+                                // holds by construction; when its revision
+                                // is STRICTLY GREATER than the evidenced
+                                // one, clear the marker and re-arm the
+                                // evidence gate.
+                                if next
+                                    .fork_quarantine
+                                    .as_ref()
+                                    .is_some_and(|marker| commit.revision > marker.revision)
+                                {
+                                    next.fork_quarantine = None;
+                                    next.reset_fork_evidence_after_quarantine_clear();
+                                    state
+                                        .groups_diagnostics
+                                        .record_fork_quarantine_owner_anchored_clear(
+                                            &resolved_group_key,
+                                        );
+                                    tracing::info!(
+                                        group_id = %LogHexId::group(&resolved_group_key),
+                                        revision = commit.revision,
+                                        "ADR-0064: mandate-carrying MemberAdded cleared the fork quarantine (owner-anchored commit)"
+                                    );
+                                }
                             }
                             Err(reason) => {
                                 state
@@ -9492,6 +9950,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 action_kind,
                 |next| {
@@ -9631,6 +10090,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9695,6 +10155,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9762,6 +10223,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9819,6 +10281,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -9948,6 +10411,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -10018,6 +10482,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::NonMemberRequest,
                 |next| {
@@ -10189,6 +10654,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -10390,6 +10856,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -10446,6 +10913,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::NonMemberRequest,
                 |next| {
@@ -10518,6 +10986,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &resolved_group_key,
                 &current,
                 &commit,
+                None,
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
@@ -12144,6 +12613,10 @@ pub(in crate::server) async fn clear_group_quarantine(
     let outcome = persist_named_groups_mutation(&state, |groups| {
         if let Some(info) = groups.get_mut(&id) {
             info.fork_quarantine = None;
+            // ADR-0064 slice 4: the manual clear also re-arms the
+            // evidence gate — the next authenticated conflict
+            // re-quarantines (containment is not one-shot).
+            info.reset_fork_evidence_after_quarantine_clear();
         }
         true
     })
@@ -17951,14 +18424,28 @@ async fn owner_certified_seal_with_eviction(
                 // here, explicitly (no clean seal is minted to do it).
                 // Otherwise it stays set until a later all-clean seal.
                 if !in_grace_initially {
+                    let owner_user_key = state.agent.identity().user_keypair();
                     let mut groups = state.named_groups.write().await;
                     if let Some(info) = groups.get_mut(id) {
                         info.owner_cert_reverify_required = false;
+                        // ADR-0064 slice 4 (slice-1 review non-blocking
+                        // (1)): the EVICTION arm of the explicit seal
+                        // route clears the fork marker under the SAME
+                        // fence as the all-clean arm — the local install
+                        // holds the owner USER key (#469 A1b) and the
+                        // sealed revision (bumped by the eviction seals)
+                        // is strictly greater than the evidenced one.
+                        // Before slice 4 an explicit seal that evicted
+                        // members left the fork marker set until the next
+                        // seal.
+                        info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
                     }
                     drop(groups);
+                    let clear_key = id.to_string();
                     persist_named_groups_mutation(state, |groups| {
-                        if let Some(info) = groups.get_mut(id) {
+                        if let Some(info) = groups.get_mut(&clear_key) {
                             info.owner_cert_reverify_required = false;
+                            info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
                         }
                         true
                     })
@@ -23453,7 +23940,7 @@ async fn record_recovery_fork_evidence(
     // ADR-0064: same owner-axis-only rule as the live path — the
     // recovery install writes the quarantine marker in the SAME store
     // mutation as the evidence record.
-    let quarantine = fork_quarantine_for_evidence(live, &evidence, &journal_commit);
+    let quarantine = fork_quarantine_for_evidence(live, &evidence, &journal_commit, None);
     for store_path in [named_groups_path, home_suite_groups_path] {
         let Ok(json) = tokio::fs::read_to_string(store_path).await else {
             continue;
@@ -27607,23 +28094,55 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                         // only on success, under the persistence lock we
                         // do NOT hold yet).
                         if info.invite_lineage.is_some() {
-                            if let Some(evidence) = evaluate_fork_evidence_candidate(
+                            match evaluate_fork_evidence_candidate(
                                 state,
                                 &admission.group_id,
                                 info,
                                 &commit,
+                                None,
                                 &error,
                             ) {
-                                let quarantine =
-                                    fork_quarantine_for_evidence(info, &evidence, &commit);
-                                install_fork_evidence(
-                                    state,
-                                    &admission.group_id,
-                                    evidence,
-                                    quarantine,
-                                    false,
-                                )
-                                .await;
+                                ForkEvidenceOutcome::Evidence(evidence, classification) => {
+                                    let quarantine = fork_quarantine_for_evidence(
+                                        info,
+                                        &evidence,
+                                        &commit,
+                                        classification,
+                                    );
+                                    let durable = install_fork_evidence(
+                                        state,
+                                        &admission.group_id,
+                                        evidence,
+                                        quarantine,
+                                        false,
+                                    )
+                                    .await;
+                                    if durable {
+                                        match classification {
+                                            Some(FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY) => {
+                                                state
+                                                    .groups_diagnostics
+                                                    .record_fork_evidence_signer_only(
+                                                        &admission.group_id,
+                                                    );
+                                            }
+                                            Some(FORK_EVIDENCE_CLASSIFICATION_UNAUTHORIZED) => {
+                                                state
+                                                    .groups_diagnostics
+                                                    .record_fork_evidence_unauthorized_signer(
+                                                        &admission.group_id,
+                                                    );
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                // ADR-0064 slice 4: recovery never carries
+                                // an owner mandate, so the
+                                // owner-anchored-successor clear is
+                                // unreachable here by construction.
+                                ForkEvidenceOutcome::OwnerAnchoredSuccessor
+                                | ForkEvidenceOutcome::NotEvidence => {}
                             }
                         }
                         return Err(format!(

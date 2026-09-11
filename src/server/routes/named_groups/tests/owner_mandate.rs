@@ -1646,6 +1646,7 @@ async fn quarantine_live(state: &AppState, group_id: &str) -> x0x::groups::Group
         snapshot: x0x::groups::ForkSnapshot {
             terminal_commit: snapshot_commit.clone(),
             conflicting_commit: snapshot_commit,
+            classification: None,
         },
         no_anchor: false,
     });
@@ -2509,4 +2510,120 @@ fn quarantine_clear_domain_is_separate_from_join_attestation() {
         ),
         "the clear-domain attestation over identical fields verifies"
     );
+}
+
+/// WHY (ADR-0064 slice 4, Decision §2/§3): `anchors_commit` is the
+/// owner-anchor predicate for a CONFLICTING commit (one that failed to
+/// apply, so there is no candidate roster to re-derive) — it must bind
+/// EVERY header field the mandate signs to the commit's own claims and
+/// verify the owner signature, while a full roster re-derivation is
+/// deliberately out of scope (that runs on real apply). Perturbing any
+/// bound field, swapping the authority, or signing under the wrong key
+/// must each break the anchor independently of the commit signature.
+#[tokio::test]
+async fn anchors_commit_binds_the_full_header_under_the_owner_key() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "9a".repeat(32);
+    let base = sealed_group(&state, &group_id, owner_certified_policy(&owner_kp)).await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let joiner_kp = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+    let cert = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner_kp.public_key().as_bytes(),
+        None,
+    )?;
+    let candidate = seat_write(&base, &joiner_hex, &authority_hex, &cert);
+    let terminal = terminal_commit_for(&candidate, state.agent.identity().agent_keypair(), 9_000);
+    let mandate = mint_mandate_like_authority(
+        &candidate,
+        None,
+        0,
+        &joiner_hex,
+        &authority_hex,
+        "invite-secret",
+        &cert,
+        &owner_kp,
+        9_000,
+    );
+
+    // Control: the honest mandate anchors its own terminal.
+    assert!(
+        mandate.anchors_commit(
+            owner_kp.public_key(),
+            &owner_kp.user_id(),
+            base.stable_group_id(),
+            &terminal
+        ),
+        "an honestly minted mandate anchors the terminal it was minted over"
+    );
+
+    // Each header-bound field perturbed (still honestly SIGNED under a
+    // re-mint) must break the anchor against the unchanged terminal.
+    let wrong_root = {
+        let mut perturbed = candidate.clone();
+        perturbed.remove_member(&authority_hex, None);
+        mint_mandate_like_authority(
+            &perturbed,
+            None,
+            0,
+            &joiner_hex,
+            &authority_hex,
+            "invite-secret",
+            &cert,
+            &owner_kp,
+            9_001,
+        )
+    };
+    assert!(!wrong_root.anchors_commit(
+        owner_kp.public_key(),
+        &owner_kp.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+    let wrong_parent = mint_mandate_like_authority(
+        &candidate,
+        None,
+        0,
+        &joiner_hex,
+        &authority_hex,
+        "invite-secret",
+        &cert,
+        &owner_kp,
+        9_002,
+    );
+    let mut shifted = wrong_parent.clone();
+    shifted.parent_state_hash = "00".repeat(32);
+    assert!(!shifted.anchors_commit(
+        owner_kp.public_key(),
+        &owner_kp.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+    let mut wrong_authority = mandate.clone();
+    wrong_authority.authority_agent_id = joiner_hex.clone();
+    assert!(!wrong_authority.anchors_commit(
+        owner_kp.public_key(),
+        &owner_kp.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+    let mut wrong_group = mandate.clone();
+    wrong_group.stable_group_id = "9b".repeat(32);
+    assert!(!wrong_group.anchors_commit(
+        owner_kp.public_key(),
+        &owner_kp.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+
+    // A DIFFERENT owner's key never anchors (the policy-owner pin).
+    let stranger_owner = UserKeypair::from_seed(&[0x5Au8; 32])?;
+    assert!(!mandate.anchors_commit(
+        stranger_owner.public_key(),
+        &stranger_owner.user_id(),
+        base.stable_group_id(),
+        &terminal
+    ));
+    Ok(())
 }
