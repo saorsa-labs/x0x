@@ -144,20 +144,26 @@ pub(super) const fn effective_self_update_enabled(
 /// and router build, `api.port` write) has already completed by the time the
 /// handle is returned, so [`local_addr`](ServerHandle::local_addr) is readable
 /// immediately, which matters when binding `127.0.0.1:0` for tests.
-///
 /// Dropping the handle requests shutdown (the supervisor is cancelled) but does
 /// not block; await [`wait`](ServerHandle::wait) or
 /// [`shutdown_and_wait`](ServerHandle::shutdown_and_wait) to observe completion.
+/// The data-dir (and, when configured, shared-identity-dir) instance locks are
+/// held by the supervisor task itself and released only after it has finished
+/// draining (#645) — so after dropping the handle without awaiting completion,
+/// a re-serve on the same directories is refused with the instance-lock
+/// ownership error until that drain completes, never silently overlapped.
 pub struct ServerHandle {
     pub(super) local_addr: SocketAddr,
     pub(super) cancel: tokio_util::sync::CancellationToken,
     // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
     // handle out without conflicting with the `Drop` impl (which only cancels).
     pub(super) task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
-    /// Issue #601: the data-directory single-instance lock, held for the
-    /// server's lifetime. Dropping or consuming the handle drops this guard
-    /// and releases the lock; process exit releases it unconditionally.
-    pub(super) _instance_lock: super::instance_lock::InstanceLock,
+    // Issue #601/#645: the data-dir and identity-dir instance locks are NOT
+    // fields here. They are moved into the supervisor task by
+    // `serve_with_options` so they are released only after the supervisor has
+    // finished draining — a `Drop` here used to release them while the
+    // supervisor was still tearing down, letting an embedded caller overlap
+    // two servers on one data dir (#645).
 }
 
 impl ServerHandle {
@@ -219,7 +225,9 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         // No detached daemon: dropping the handle requests shutdown. Drop does
-        // not block — callers that need to observe completion use `wait`.
+        // not block — callers that need to observe completion use `wait`. The
+        // instance locks live in the supervisor task (see the struct comment)
+        // and are released only once it finishes draining.
         self.cancel.cancel();
     }
 }
