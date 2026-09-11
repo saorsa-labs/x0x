@@ -200,6 +200,20 @@ fn safe_route(path: &str) -> &'static str {
 /// Start a hermetic daemon: loopback-only, ephemeral API and QUIC ports, all
 /// state under `dir`, and — critically for this test — an explicitly EMPTY
 /// bootstrap-peer list, so the two daemons never form a gossip mesh.
+///
+/// REGRESSION NOTE (#638): ant-quic 0.27.50 honors the explicit
+/// `bind_address = 127.0.0.1` exactly (previously the QUIC socket silently
+/// bound wildcard, which made every interface address on the host — LAN,
+/// utun/CGNAT — accidentally dialable). Since that fix, advertising those
+/// interface hints in the card would make `/agents/connect` burn its local
+/// probe ladder on undialable addresses (same-LAN IPv4 ranked first,
+/// loopback excluded from the fast probes: ~6 s per dead interface) before
+/// the hinted dial ever reaches the one live loopback address — past the
+/// 20 s client budget and this test's `POST agents_connect` timeout.
+/// `card_addresses` (src/server/routes/identity.rs) therefore suppresses
+/// non-loopback interface hints for loopback-bound listeners; with the card
+/// carrying only `127.0.0.1:<port>`, the connect lands on the hinted peer
+/// dial and completes in well under a second.
 async fn start_daemon(dir: &Path) -> Daemon {
     let data_dir = dir.join("data");
     tokio::fs::create_dir_all(&data_dir)
