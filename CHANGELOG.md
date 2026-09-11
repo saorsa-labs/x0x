@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **SIGTERM exit bound enforced (#371).** The 5 s bounded-shutdown watchdog
+  never fired exactly when it was needed. It ran as a tokio task, and
+  teardown can freeze the async runtime it supervises — measured on an
+  `--all-features` build, once the heap-profiler finalization blocked the
+  main future after graceful shutdown completed, every tokio timer in the
+  process stopped firing and SIGTERM→exit ran 6.8–8.4 s (the original
+  report's class of "needs SIGKILL" hangs). The watchdog is now a plain OS
+  thread that polls the shutdown token and forces `libc::_exit(0)` at the
+  deadline — `std::process::exit` itself was proven to block on the
+  profiling allocator's global mutex, held by the overrunning teardown.
+  Healthy graceful shutdowns are unaffected (default-feature builds still
+  exit at ~2–3 s, well before the deadline; the watchdog only cuts short
+  teardown that overruns). New regression test
+  `sigterm_exits_within_bounded_deadline` fails on the old behaviour.
+
 ## [v0.42.1] - 2026-09-11
 
 ### Fixed

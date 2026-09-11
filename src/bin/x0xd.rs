@@ -383,17 +383,46 @@ async fn main() -> anyhow::Result<()> {
     // SIGTERM exit for 13+ minutes. Graceful teardown still gets its window
     // (peer-cache flush, connection closes); past the deadline the daemon
     // exits so the operator-visible contract holds: x0xd terminates within
-    // SHUTDOWN_EXIT_DEADLINE of the first shutdown signal. The in-crate
-    // flusher fix (select on a shutdown token) lands with saorsa-gossip.
+    // SHUTDOWN_EXIT_DEADLINE of the first shutdown signal.
+    //
+    // #371: the watchdog is deliberately an ordinary OS thread, not a tokio
+    // task. Measured on an --all-features build, once the post-shutdown tail
+    // blocked the block_on thread (heap-profiler finalization), every tokio
+    // timer in the process stopped firing: the previous tokio-task watchdog
+    // armed on cancellation but never went off, and SIGTERM→exit ran 6.8–8.4 s
+    // past the 5 s contract with no forced-exit marker. A std thread with
+    // plain sleeps keeps time no matter what state the async runtime — or any
+    // blocking teardown join — is in.
     const SHUTDOWN_EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
     {
         let cancel = handle.cancellation_token();
-        tokio::spawn(async move {
-            cancel.cancelled().await;
-            tokio::time::sleep(SHUTDOWN_EXIT_DEADLINE).await;
-            eprintln!("x0xd: graceful shutdown exceeded {SHUTDOWN_EXIT_DEADLINE:?}; forcing exit");
-            std::process::exit(0);
-        });
+        let spawn_result = std::thread::Builder::new()
+            .name("x0xd-exit-watchdog".to_string())
+            .spawn(move || {
+                // Poll the token: arming must not depend on the async
+                // runtime either. 50 ms cadence bounds detection latency.
+                while !cancel.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                std::thread::sleep(SHUTDOWN_EXIT_DEADLINE);
+                eprintln!(
+                    "x0xd: graceful shutdown exceeded {SHUTDOWN_EXIT_DEADLINE:?}; forcing exit"
+                );
+                // _exit, not process::exit: exit() runs std's rt cleanup,
+                // which deallocates through the global allocator — and under
+                // the dhat profiling allocator that lock is held by the very
+                // teardown overrunning the deadline, so exit() itself blocks
+                // and the bound is missed (#371). _exit skips all cleanup;
+                // the eprintln above is an unbuffered write and the graceful
+                // path has already flushed by the time the deadline expires.
+                // Exit code 0 preserves the "clean stop" contract (#261/#363).
+                unsafe { libc::_exit(0) };
+            });
+        if let Err(e) = spawn_result {
+            // Best-effort by construction (same stance as the API watchdog):
+            // a failed thread spawn must not take the daemon down.
+            tracing::warn!("failed to spawn shutdown-exit watchdog thread: {e}");
+        }
     }
     handle.wait().await
 }
