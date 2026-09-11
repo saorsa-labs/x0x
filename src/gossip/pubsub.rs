@@ -4976,6 +4976,7 @@ mod tests {
             );
         }
     }
+
     /// saorsa-gossip 0.5.77 (x0x #613 / #611 / #336): a local publish whose
     /// EAGER fan-out attempted peers but delivered to none is no longer
     /// stranded until anti-entropy — it queues a self-IHAVE and runs one

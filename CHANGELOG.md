@@ -15,7 +15,7 @@ All notable changes to this project will be documented in this file.
   The crate now queues a self-IHAVE to the attempted peers and runs one
   bounded retry after `2 × PER_PEER_REPUBLISH_TIMEOUT`, excluding peers
   that already pulled the message. No wire-format change. Five new
-  counters appear under `stages` in `GET /diagnostics/gossip`:
+  counters appear under `pubsub_stages` in `GET /diagnostics/gossip`:
   `stranded_publish_ihave_queued`, `stranded_publishes_recovered_by_pull`,
   `stranded_publishes_recovered_by_retry`, `stranded_publish_retry_failed`,
   `stranded_publish_cache_miss` (the first equals the sum of the other
