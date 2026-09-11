@@ -1029,6 +1029,10 @@ async function createChannel(spaceId){
       channelModalError('The channel list in this space is damaged, so no channel was created.');
       return;
     }
+    if(!Array.isArray(channels)){
+      channelModalError('The channel list in this space is damaged, so no channel was created.');
+      return;
+    }
   }
   if(channels.some(c=>c&&c.name===name)){
     channelModalError('A channel named #'+name+' already exists in this space.');
