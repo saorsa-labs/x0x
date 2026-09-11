@@ -296,7 +296,14 @@ pub(in crate::server) async fn create_task_list(
     if state.task_lists.read().await.contains_key(&id) {
         return api_error(StatusCode::CONFLICT, "task list already exists");
     }
-    match state.agent.create_task_list(&req.name, &req.topic).await {
+    // #557: the persistent variant arms per-list content snapshots under the
+    // instance data dir (`task-lists/<id>.bin`) so restarts restore content,
+    // not just the registration; it fails closed on a corrupt snapshot.
+    match state
+        .agent
+        .create_task_list_persistent(&req.name, &req.topic, &state.task_list_state_dir)
+        .await
+    {
         Ok(handle) => {
             let version = handle.version().await;
             // Apply group authorization at the CRDT layer so remote admission

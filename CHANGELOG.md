@@ -189,6 +189,23 @@ All notable changes to this project will be documented in this file.
   `/stores/:id/...` routes. Registration persists and rehydrates across
   daemon restarts. CLI: `x0x group store create`.
 
+- **Task-list content is durable across restarts — issue #557.** Task
+  lists previously lived only in the in-memory replica plus peer deltas, so
+  a daemon restart with no live holder rehydrated a durable-looking,
+  permanently empty list. Every task list with a state directory now
+  snapshots to `<data_dir>/task-lists/<id>.bin` on every local mutation
+  (before the delta is published) and on every merged remote delta
+  (best-effort), with kv-snapshot durability (unique tmp + fsync + rename +
+  parent-dir fsync). Restore is fail-closed: a missing file is a clean
+  first run, while a corrupt, truncated, foreign, or id-mismatched
+  snapshot refuses to rehydrate rather than silently installing empty
+  state. The snapshot is a versioned envelope, `X0XTLS1\0` magic +
+  `bincode(SnapshotBody { list, seq_counter })`: the seq counter is
+  `serde(skip)` on `TaskList` but must survive restarts, or a re-added
+  same-title task mints the same TaskId/OR-Set tag as a pre-restart one
+  and silently merges into it. The envelope is introduced unreleased — no
+  bare-bincode snapshot ever shipped — so files without the magic fail
+  closed with no migration path.
 - **Cross-scope durable-history discovery and search — #567, fixing #275.**
   `GET /history/scopes` lists retained scopes with row counts and newest
   timestamps, and `GET /history/search` now accepts an omitted scope, so

@@ -670,12 +670,25 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
             if state.task_lists.read().await.contains_key(&entry.id) {
                 return RehydrateOutcome::AlreadyPresent; // re-created via REST since startup
             }
+            // #557: restore content from the per-list snapshot before any
+            // network write is accepted; a corrupt snapshot fails closed
+            // (Skipped — entry stays for the next restart) rather than
+            // silently installing empty state.
             let result = match entry.role.as_str() {
-                ROLE_JOINED => state.agent.join_task_list(&entry.topic).await,
+                ROLE_JOINED => {
+                    state
+                        .agent
+                        .join_task_list_persistent(&entry.topic, &state.task_list_state_dir)
+                        .await
+                }
                 ROLE_CREATED => {
                     state
                         .agent
-                        .create_task_list(&entry.name, &entry.topic)
+                        .create_task_list_persistent(
+                            &entry.name,
+                            &entry.topic,
+                            &state.task_list_state_dir,
+                        )
                         .await
                 }
                 other => {

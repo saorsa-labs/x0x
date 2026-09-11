@@ -791,6 +791,11 @@ pub(super) struct AppState {
     /// store contents — and in particular `AppendOnly` immutability knowledge
     /// — survive a daemon restart instead of coming back as empty replicas.
     pub(super) kv_store_state_dir: PathBuf,
+    /// Directory holding per-list task-list state snapshots
+    /// (`task-lists/<list-id-hex>.bin`, issue #557). Restored on
+    /// create/join/rehydrate so task content survives a daemon restart even
+    /// when no live replica holds it.
+    pub(super) task_list_state_dir: PathBuf,
     /// Serializes snapshot-and-write of `crdt-subscriptions.json` so an older
     /// in-memory snapshot cannot rename over a newer one after a concurrent
     /// `crdt_subscriptions::record` (the snapshot-after-unlock lost update).

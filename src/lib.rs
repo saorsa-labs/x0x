@@ -13773,6 +13773,46 @@ impl Agent {
     /// let list = agent.create_task_list("Sprint Planning", "team-sprint").await?;
     /// ```
     pub async fn create_task_list(&self, name: &str, topic: &str) -> error::Result<TaskListHandle> {
+        self.task_list_inner(topic, Some(name.to_string()), None)
+            .await
+    }
+
+    /// Create (or restore) a task list with an on-disk state snapshot.
+    ///
+    /// Like [`create_task_list`](Self::create_task_list) but the full list
+    /// state (task ids, titles, claim/complete provenance, order, version
+    /// material) is snapshotted to `state_dir/<list-id-hex>.bin` after every
+    /// local mutation and every merged remote delta, and restored here on
+    /// restart — BEFORE any network or local write is accepted (issue #557:
+    /// content must survive a restart with no live replica holding it).
+    ///
+    /// # Errors
+    ///
+    /// - Gossip runtime not initialized.
+    /// - A snapshot exists but is corrupt/truncated, belongs to a different
+    ///   list, or the state directory is not writable. All of these FAIL
+    ///   CLOSED — silently starting empty would claim durability while
+    ///   discarding persisted content.
+    pub async fn create_task_list_persistent(
+        &self,
+        name: &str,
+        topic: &str,
+        state_dir: &std::path::Path,
+    ) -> error::Result<TaskListHandle> {
+        self.task_list_inner(topic, Some(name.to_string()), Some(state_dir))
+            .await
+    }
+
+    /// Shared create/join constructor (mirrors `create_kv_store_inner`):
+    /// restores from the snapshot when persistence is requested, arms it
+    /// BEFORE the background loops start, and proves writability with an
+    /// initial snapshot so a "persistent" list never runs on a dead disk.
+    async fn task_list_inner(
+        &self,
+        topic: &str,
+        name: Option<String>,
+        state_dir: Option<&std::path::Path>,
+    ) -> error::Result<TaskListHandle> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
                 "gossip runtime not initialized - configure agent with network first",
@@ -13784,7 +13824,27 @@ impl Agent {
         // every replica of this list agrees on it — it is the attestation scope
         // bound into claim/complete signatures. See TaskListId::from_topic.
         let list_id = crdt::TaskListId::from_topic(topic);
-        let task_list = crdt::TaskList::new(list_id, name.to_string(), peer_id);
+        let storage = state_dir.map(|d| crdt::TaskListStorage::new(d.to_path_buf()));
+        let task_list = match &storage {
+            Some(store) => match store.load_task_list_opt(&list_id).await {
+                Ok(Some(restored)) => {
+                    tracing::info!(topic, "restored task list content from local snapshot");
+                    restored
+                }
+                Ok(None) => crdt::TaskList::new(list_id, name.unwrap_or_default(), peer_id),
+                // Corrupt/truncated/foreign snapshot: fail closed, loudly.
+                // Starting an empty replica here would silently discard the
+                // persisted content (issue #557).
+                Err(e) => {
+                    return Err(error::IdentityError::Storage(std::io::Error::other(
+                        format!(
+                            "task-list snapshot for topic {topic} unreadable ({e});                              refusing to start with amnesia — repair or remove the                              snapshot file explicitly"
+                        ),
+                    )));
+                }
+            },
+            None => crdt::TaskList::new(list_id, name.unwrap_or_default(), peer_id),
+        };
 
         let sync = crdt::TaskListSync::new(
             task_list,
@@ -13799,7 +13859,22 @@ impl Agent {
             )))
         })?;
 
+        // Arm persistence BEFORE start so no merged delta can land
+        // unpersisted, and write an initial snapshot so the file exists from
+        // the first moment the list does.
+        if let Some(store) = &storage {
+            sync.set_persistence(store.clone(), list_id);
+        }
         let sync = std::sync::Arc::new(sync);
+        if storage.is_some() {
+            // Fail closed at registration: refuse to run a "persistent"
+            // task list whose snapshot cannot even be written once.
+            sync.persist().await.map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "task-list snapshot dir is not writable ({e}); refusing to start a                      persistent task list without durability"
+                )))
+            })?;
+        }
         sync.start_with_spawner(|fut| self.spawn_tracked(fut))
             .await
             .map_err(|e| {
@@ -13843,52 +13918,22 @@ impl Agent {
     /// let list = agent.join_task_list("team-sprint").await?;
     /// ```
     pub async fn join_task_list(&self, topic: &str) -> error::Result<TaskListHandle> {
-        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
-            error::IdentityError::Storage(std::io::Error::other(
-                "gossip runtime not initialized - configure agent with network first",
-            ))
-        })?;
+        self.task_list_inner(topic, None, None).await
+    }
 
-        let peer_id = runtime.peer_id();
-        // Create empty task list; it will be populated via delta sync. The id
-        // MUST match the creator's — derive it from the shared topic alone (see
-        // create_task_list / TaskListId::from_topic), otherwise the scope bound
-        // into remote claim attestations won't verify and claims never converge.
-        let list_id = crdt::TaskListId::from_topic(topic);
-        let task_list = crdt::TaskList::new(list_id, String::new(), peer_id);
-
-        let sync = crdt::TaskListSync::new(
-            task_list,
-            std::sync::Arc::clone(runtime.pubsub()),
-            topic.to_string(),
-            peer_id,
-        )
-        .map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "task list sync creation failed: {}",
-                e
-            )))
-        })?;
-
-        let sync = std::sync::Arc::new(sync);
-        sync.start_with_spawner(|fut| self.spawn_tracked(fut))
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "task list sync start failed: {}",
-                    e
-                )))
-            })?;
-
-        Ok(TaskListHandle {
-            sync,
-            agent_id: self.agent_id(),
-            peer_id,
-            replica_epoch: TaskListHandle::fresh_epoch(),
-            signing: std::sync::Arc::new(gossip::SigningContext::from_keypair(
-                self.identity.agent_keypair(),
-            )),
-        })
+    /// Join (or restore) a task list with an on-disk state snapshot.
+    ///
+    /// Like [`join_task_list`](Self::join_task_list) but a previously
+    /// persisted local replica is restored first — offline-held state
+    /// survives the restart, and later remote deltas merge on top. Error
+    /// semantics match [`create_task_list_persistent`](Self::create_task_list_persistent)
+    /// (fail closed on a corrupt snapshot).
+    pub async fn join_task_list_persistent(
+        &self,
+        topic: &str,
+        state_dir: &std::path::Path,
+    ) -> error::Result<TaskListHandle> {
+        self.task_list_inner(topic, None, Some(state_dir)).await
     }
 }
 
@@ -15395,15 +15440,31 @@ impl TaskListHandle {
         &self,
         agents: std::collections::HashSet<identity::AgentId>,
     ) {
-        let mut list = self.sync.write().await;
-        list.set_authorized_agents(agents);
+        {
+            let mut list = self.sync.write().await;
+            list.set_authorized_agents(agents);
+        }
+        // The snapshot carries neither the authorized set (serde(skip) on
+        // TaskList — rehydration re-derives it from the live group) nor a
+        // version bump for this mutation, so the version-gated snapshot
+        // writer skips this persist: a no-op today by construction. Kept so
+        // the snapshot follows immediately if either fact ever changes.
+        if let Err(e) = self.sync.persist().await {
+            tracing::warn!("failed to persist authorized-agents update: {e}");
+        }
     }
 
     /// Clear the authorized-member set (revert to open admission for all
     /// validly-attested operations).
     pub async fn clear_authorized_agents(&self) {
-        let mut list = self.sync.write().await;
-        list.clear_authorized_agents();
+        {
+            let mut list = self.sync.write().await;
+            list.clear_authorized_agents();
+        }
+        // See set_authorized_agents: version-gated to a no-op today.
+        if let Err(e) = self.sync.persist().await {
+            tracing::warn!("failed to persist authorized-agents clear: {e}");
+        }
     }
 
     /// Test-only: override the per-replica epoch so a pre-restart fence token
@@ -15456,6 +15517,9 @@ impl TaskListHandle {
         title: String,
         description: String,
     ) -> error::Result<(crdt::TaskId, u64)> {
+        // Durability gate (#557): while persistence is armed and degraded, no
+        // new local mutations are accepted until a snapshot succeeds.
+        self.sync.ensure_durable().await.map_err(durability_err)?;
         let (task_id, version, delta) = {
             let mut list = self.sync.write().await;
             let seq = list.next_seq();
@@ -15474,7 +15538,19 @@ impl TaskListHandle {
             let delta = crdt::TaskListDelta::for_add(task_id, task, tag, version);
             (task_id, version, delta)
         };
-        // Best-effort replication: local mutation succeeded regardless
+        // Durability before announcement (#557, mirrors the kv put path):
+        // persist the committed mutation and DO NOT publish if the snapshot
+        // fails — announcing state the disk never saw loses it on restart.
+        // The in-memory mutation stays applied (CRDT state cannot be safely
+        // unwound); the caller sees the error, the list is flagged degraded,
+        // and further local mutations are refused until a persist succeeds.
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "add_task applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; task list is durability-degraded"
+            )))
+        })?;
+        // Best-effort replication: local mutation + snapshot succeeded
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish add_task delta: {}", e);
         }
@@ -15525,6 +15601,8 @@ impl TaskListHandle {
         task_id: crdt::TaskId,
         expected: Option<FenceToken>,
     ) -> error::Result<TaskMutationOutcome> {
+        // Durability gate (#557): see add_task_versioned.
+        self.sync.ensure_durable().await.map_err(durability_err)?;
         let (fence, delta, advisory) = {
             let mut list = self.sync.write().await;
             if let Some(expected) = expected {
@@ -15565,6 +15643,13 @@ impl TaskListHandle {
                 advisory,
             )
         };
+        // Durability before announcement (#557): see add_task_versioned.
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "claim applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; task list is durability-degraded"
+            )))
+        })?;
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish claim_task delta: {}", e);
         }
@@ -15605,6 +15690,8 @@ impl TaskListHandle {
         task_id: crdt::TaskId,
         expected: Option<FenceToken>,
     ) -> error::Result<TaskMutationOutcome> {
+        // Durability gate (#557): see add_task_versioned.
+        self.sync.ensure_durable().await.map_err(durability_err)?;
         let (fence, delta, advisory) = {
             let mut list = self.sync.write().await;
             if let Some(expected) = expected {
@@ -15642,6 +15729,13 @@ impl TaskListHandle {
                 advisory,
             )
         };
+        // Durability before announcement (#557): see add_task_versioned.
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "complete applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; task list is durability-degraded"
+            )))
+        })?;
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish complete_task delta: {}", e);
         }
@@ -15722,6 +15816,8 @@ impl TaskListHandle {
     ///
     /// Returns an error if reordering fails.
     pub async fn reorder(&self, task_ids: Vec<crdt::TaskId>) -> error::Result<()> {
+        // Durability gate (#557): see add_task_versioned.
+        self.sync.ensure_durable().await.map_err(durability_err)?;
         let delta = {
             let mut list = self.sync.write().await;
             list.reorder(task_ids.clone(), self.peer_id).map_err(|e| {
@@ -15737,11 +15833,28 @@ impl TaskListHandle {
                 list.current_version(),
             )
         };
+        // Durability before announcement (#557): see add_task_versioned.
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "reorder applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; task list is durability-degraded"
+            )))
+        })?;
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
             tracing::warn!("failed to publish reorder delta: {}", e);
         }
         Ok(())
     }
+}
+
+/// Error mapping for the `ensure_durable` gate on TaskListHandle local
+/// mutations (#557). Kept as a fn so every mutation surfaces the identical
+/// message shape as the kv-store path.
+fn durability_err(e: crdt::CrdtError) -> error::IdentityError {
+    error::IdentityError::Storage(std::io::Error::other(format!(
+        "task list durability degraded: snapshot persistence failing ({e}); \
+         local mutations refused until a snapshot succeeds"
+    )))
 }
 
 // ---------------------------------------------------------------------------

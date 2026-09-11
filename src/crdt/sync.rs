@@ -13,7 +13,8 @@
 //!
 //! This provides eventual consistency across all peers sharing the same topic.
 
-use crate::crdt::{Result, TaskList, TaskListDelta};
+use crate::crdt::persistence::TaskListStorage;
+use crate::crdt::{Result, TaskList, TaskListDelta, TaskListId};
 use crate::gossip::wire::{decode_delta, encode_delta};
 use crate::gossip::PubSubManager;
 use crate::identity::AgentId;
@@ -198,6 +199,15 @@ pub struct TaskListSync {
     /// Topic name for this task list.
     topic: String,
 
+    /// Optional persistence context. When armed (see
+    /// [`set_persistence`](Self::set_persistence)), the full list state is
+    /// snapshotted to disk after every local mutation and every merged
+    /// remote delta, so a restart restores task content — ids, titles,
+    /// claim/complete provenance, order and version material — instead of
+    /// coming back as an empty replica (issue #557). Mirrors
+    /// `KvStoreSync::persist`.
+    persist: std::sync::Mutex<Option<Arc<TaskPersistCtx>>>,
+
     /// This node's gossip peer id — identifies our deltas and state
     /// requests on the wire.
     local_peer_id: PeerId,
@@ -227,6 +237,59 @@ impl Drop for TaskListSync {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
+}
+
+/// Shared persistence context for one task list's snapshot file (mirrors
+/// `kv::sync::PersistCtx`).
+struct TaskPersistCtx {
+    /// Storage backend (directory + per-list file naming).
+    storage: TaskListStorage,
+    /// The list this context persists — the snapshot file name key.
+    list_id: TaskListId,
+    /// Serializes snapshot commits AND records the last durably-persisted
+    /// list version. `(version, bytes)` are captured under this lock, so
+    /// commit order equals capture order — a concurrent persist burst can
+    /// never rename an older snapshot over a newer one — and the version
+    /// gate skips writes that would not advance durable state.
+    gate: tokio::sync::Mutex<Option<u64>>,
+    /// True after a failed snapshot write; cleared by the next success.
+    /// While set, LOCAL mutations are refused (fail-closed for what this
+    /// node controls); remote-delta merges continue (replication is not
+    /// wedged).
+    degraded: std::sync::atomic::AtomicBool,
+}
+
+/// Capture the list's `(version, bytes)` under the list read lock and the
+/// commit gate, then write atomically. The gate both serializes snapshot
+/// commits and records the last durably-persisted version, so commit order
+/// equals capture order — a concurrent persist burst can never rename an
+/// older snapshot over a newer one — and the version gate skips writes that
+/// would not advance durable state. Success clears the degraded flag;
+/// failure sets it and is error-logged here (callers decide whether to
+/// propagate — local mutations must, remote merges must not).
+async fn persist_snapshot(task_list: &RwLock<TaskList>, ctx: &TaskPersistCtx) -> Result<()> {
+    let result = async {
+        let mut last = ctx.gate.lock().await;
+        let snapshot = task_list.read().await.clone();
+        let version = snapshot.current_version();
+        if last.is_some_and(|l| l >= version) {
+            // Durable state already at (or beyond) this version.
+            return Ok(());
+        }
+        ctx.storage.save_task_list(&ctx.list_id, &snapshot).await?;
+        *last = Some(version);
+        Ok(())
+    }
+    .await;
+    ctx.degraded
+        .store(result.is_err(), std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = &result {
+        tracing::error!(
+            "task-list snapshot persist failed for list {}: {e} — list is durability-degraded; local mutations are refused until a snapshot succeeds",
+            ctx.list_id
+        );
+    }
+    result
 }
 
 impl TaskListSync {
@@ -272,6 +335,7 @@ impl TaskListSync {
             pubsub,
             topic,
             local_peer_id,
+            persist: std::sync::Mutex::new(None),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: tokio_util::sync::CancellationToken::new(),
         })
@@ -337,6 +401,10 @@ impl TaskListSync {
         let bootstrap_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let listener_served = Arc::clone(&served_evidence);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
+        // #557: snapshot merged remote deltas when persistence is armed.
+        // Best-effort by design — a failing disk must never wedge
+        // replication (the degraded flag refuses LOCAL mutations instead).
+        let listener_persist = self.persist_ctx();
 
         spawn(Box::pin(async move {
             loop {
@@ -359,46 +427,60 @@ impl TaskListSync {
                 };
                 match decode_delta::<TaskListDelta>(&msg.payload) {
                     Ok((peer_id, delta)) => {
-                        let mut list = task_list.write().await;
-                        // Layer A (issue #349): the V2-envelope-verified
-                        // sender is the writer identity; the payload
-                        // `peer_id` stays an OR-Set tag only (I3).
-                        let writer = msg.sender.as_ref();
-                        if let Err(e) = list.merge_delta(&delta, peer_id, writer) {
-                            tracing::warn!("Failed to merge remote delta: {}", e);
-                        } else if listener_bootstrap_active
-                            .load(std::sync::atomic::Ordering::Relaxed)
+                        let mut merged_ok = false;
                         {
-                            // Digest-verified full-replace adopt (issue
-                            // #240, deletion cold-sync): while
-                            // bootstrapping, when the sender's latest v2
-                            // declaration matches this delta's served
-                            // content (digest AND task count), the delta IS
-                            // that holder's complete state — prune local
-                            // tasks it does not carry. Without verification
-                            // any holder could truncate local state at
-                            // will.
-                            let declared = listener_served
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .digests
-                                .get(&peer_id)
-                                .copied();
-                            if let Some(declared) = declared {
-                                let list_id = *list.id();
-                                if delta.added_tasks.len() == declared.entry_count as usize
-                                    && delta
-                                        .served_digest(&list_id)
-                                        .is_some_and(|dg| dg == declared.digest)
-                                {
-                                    let pruned = list.prune_to_served_set(&delta);
-                                    if pruned > 0 {
-                                        tracing::info!(
-                                            "pruned {pruned} stale task(s) after \
+                            let mut list = task_list.write().await;
+                            // Layer A (issue #349): the V2-envelope-verified
+                            // sender is the writer identity; the payload
+                            // `peer_id` stays an OR-Set tag only (I3).
+                            let writer = msg.sender.as_ref();
+                            if let Err(e) = list.merge_delta(&delta, peer_id, writer) {
+                                tracing::warn!("Failed to merge remote delta: {}", e);
+                            } else {
+                                merged_ok = true;
+                            }
+                            if merged_ok
+                                && listener_bootstrap_active
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                // Digest-verified full-replace adopt (issue
+                                // #240, deletion cold-sync): while
+                                // bootstrapping, when the sender's latest v2
+                                // declaration matches this delta's served
+                                // content (digest AND task count), the delta IS
+                                // that holder's complete state — prune local
+                                // tasks it does not carry. Without verification
+                                // any holder could truncate local state at
+                                // will.
+                                let declared = listener_served
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .digests
+                                    .get(&peer_id)
+                                    .copied();
+                                if let Some(declared) = declared {
+                                    let list_id = *list.id();
+                                    if delta.added_tasks.len() == declared.entry_count as usize
+                                        && delta
+                                            .served_digest(&list_id)
+                                            .is_some_and(|dg| dg == declared.digest)
+                                    {
+                                        let pruned = list.prune_to_served_set(&delta);
+                                        if pruned > 0 {
+                                            tracing::info!(
+                                                "pruned {pruned} stale task(s) after \
                                              digest-verified full serve for list {}",
-                                            list.id()
-                                        );
+                                                list.id()
+                                            );
+                                        }
                                     }
+                                }
+                            }
+                        } // write guard released before persisting
+                        if merged_ok {
+                            if let Some(ctx) = &listener_persist {
+                                if let Err(e) = persist_snapshot(&task_list, ctx).await {
+                                    tracing::warn!("failed to persist merged task-list delta: {e}");
                                 }
                             }
                         }
@@ -782,6 +864,74 @@ impl TaskListSync {
             .map_err(|e| crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}")))?;
 
         Ok(())
+    }
+
+    /// Arm on-disk snapshot persistence for this list.
+    ///
+    /// After this call the full list state is snapshotted through
+    /// `storage` after every local mutation and every merged remote delta.
+    /// Must be called BEFORE [`start`](Self::start) so no merged delta can
+    /// land unpersisted (the daemon's persistent create/join paths write an
+    /// initial snapshot immediately after arming — see
+    /// [`persist`](Self::persist)).
+    pub fn set_persistence(&self, storage: TaskListStorage, list_id: TaskListId) {
+        if let Ok(mut guard) = self.persist.lock() {
+            *guard = Some(Arc::new(TaskPersistCtx {
+                storage,
+                list_id,
+                gate: tokio::sync::Mutex::new(None),
+                degraded: std::sync::atomic::AtomicBool::new(false),
+            }));
+        }
+    }
+
+    /// Clone the armed persistence context, if any.
+    fn persist_ctx(&self) -> Option<Arc<TaskPersistCtx>> {
+        self.persist.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Snapshot the list to the configured storage (`Ok` no-op when
+    /// persistence is not armed).
+    ///
+    /// On success the last durably-persisted version advances, so repeat or
+    /// racing persists can never regress durable state. On failure the list
+    /// is flagged **durability-degraded**
+    /// ([`durability_degraded`](Self::durability_degraded)) and this returns
+    /// `Err`: callers on the LOCAL-mutation path must surface it (and not
+    /// publish the delta — durability before announcement); the remote-merge
+    /// path only logs, so a failing disk never wedges replication.
+    ///
+    /// # Errors
+    ///
+    /// Serialization or I/O failure writing the snapshot.
+    pub async fn persist(&self) -> Result<()> {
+        match self.persist_ctx() {
+            Some(ctx) => persist_snapshot(&self.task_list, &ctx).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Whether a prior snapshot write failed and has not yet succeeded
+    /// again. Local mutations are refused in this state (fail-closed).
+    pub fn durability_degraded(&self) -> bool {
+        self.persist_ctx()
+            .is_some_and(|c| c.degraded.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// If the list is durability-degraded, retry persisting the CURRENT
+    /// state before any new mutation is accepted. `Ok` when not degraded,
+    /// not persistent, or the retry succeeded.
+    ///
+    /// # Errors
+    ///
+    /// The retry failed — the caller must refuse the local mutation.
+    pub async fn ensure_durable(&self) -> Result<()> {
+        match self.persist_ctx() {
+            Some(ctx) if ctx.degraded.load(std::sync::atomic::Ordering::Relaxed) => {
+                persist_snapshot(&self.task_list, &ctx).await
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Get a read-only reference to the task list.

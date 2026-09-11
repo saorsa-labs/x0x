@@ -993,3 +993,142 @@ async fn joined_store_syncs_after_owner_returns_late() {
     )
     .await;
 }
+
+/// WHY (issue #557): registration persistence alone is not durability —
+/// task-list CONTENT must survive a daemon restart even when NO live replica
+/// holds it. The registration manifest rehydrates the handle, but before
+/// #557 the rehydrated replica started from `TaskList::new` (empty) and the
+/// only recovery path was the state-request side channel to a peer. A solo
+/// daemon (no peers, ever) therefore restarted into a durable-looking,
+/// permanently empty list: `GET /task-lists/:id/tasks` answered `ok:true`
+/// with zero tasks while the disk held no content at all.
+#[tokio::test]
+#[ignore]
+async fn task_list_content_survives_restart_with_no_live_replica() {
+    let (mut alice, _bind) = cluster::solo().await;
+    let suffix = rand::random::<u32>();
+    let list_topic = format!("solo-restart-{suffix}");
+
+    // Create + mutate: one task, claimed, so the recovered state must carry
+    // id, title, claim provenance, and version material.
+    let r = alice
+        .post(
+            "/task-lists",
+            serde_json::json!({ "name": "solo-restart", "topic": list_topic }),
+        )
+        .await;
+    assert_eq!(r.status(), 201, "create task list");
+    let r = alice
+        .post(
+            &format!("/task-lists/{list_topic}/tasks"),
+            serde_json::json!({ "title": "survives-restart", "description": "557" }),
+        )
+        .await;
+    assert!(r.status().is_success(), "add task");
+    let added = r.json::<serde_json::Value>().await.expect("add json");
+    let task_id = added["task_id"].as_str().expect("task_id").to_string();
+    let pre_version = added["version"].as_u64().expect("version");
+    let r = alice
+        .patch(
+            &format!("/task-lists/{list_topic}/tasks/{task_id}"),
+            serde_json::json!({ "action": "claim" }),
+        )
+        .await;
+    assert!(r.status().is_success(), "claim task");
+    let alice_id = alice.agent_id().await;
+
+    // Hard stop: no live replica of this list exists anywhere (solo plane).
+    alice.stop();
+    alice.start().await;
+
+    // Content must come back from local disk with NO peer to pull from.
+    poll_until(
+        &alice,
+        &format!("/task-lists/{list_topic}/tasks"),
+        "post-restart content recovery from disk (no live replica)",
+        120,
+        |json| {
+            json["tasks"].as_array().is_some_and(|ts| {
+                ts.iter().any(|t| {
+                    t["id"].as_str() == Some(task_id.as_str())
+                        && t["title"].as_str() == Some("survives-restart")
+                        && t["claimed_by"].as_str() == Some(alice_id.as_str())
+                })
+            })
+        },
+    )
+    .await;
+
+    // Version material survived too (claim bumped it past the add version).
+    let r = alice.get(&format!("/task-lists/{list_topic}/tasks")).await;
+    let json = r.json::<serde_json::Value>().await.expect("tasks json");
+    let version = json["version"].as_u64().expect("post-restart version");
+    assert!(
+        version >= pre_version,
+        "post-restart version {version} regressed below pre-restart {pre_version}"
+    );
+}
+
+/// WHY (issue #557): a corrupt or truncated on-disk task-list snapshot must
+/// NEVER silently install empty state. The daemon may refuse to rehydrate
+/// the list (404 until repaired) but must not answer `ok:true` with an
+/// empty task set over a corrupt file — that would claim durability while
+/// discarding the persisted content.
+#[tokio::test]
+#[ignore]
+async fn corrupt_task_list_snapshot_does_not_silently_install_empty_state() {
+    let (mut alice, _bind) = cluster::solo().await;
+    let suffix = rand::random::<u32>();
+    let list_topic = format!("corrupt-snapshot-{suffix}");
+
+    let r = alice
+        .post(
+            "/task-lists",
+            serde_json::json!({ "name": "corrupt-snapshot", "topic": list_topic }),
+        )
+        .await;
+    assert_eq!(r.status(), 201, "create task list");
+    let r = alice
+        .post(
+            &format!("/task-lists/{list_topic}/tasks"),
+            serde_json::json!({ "title": "must-not-vanish" }),
+        )
+        .await;
+    assert!(r.status().is_success(), "add task");
+
+    // A snapshot must exist before we corrupt it; otherwise this test
+    // silently degrades into the happy path.
+    let snapshot_dir = alice.data_dir().join("task-lists");
+    let snapshot = find_snapshot_for(&snapshot_dir, &list_topic).expect(
+        "task-list snapshot file exists after add (task-lists/<id>.bin under the data dir)",
+    );
+
+    alice.stop();
+    std::fs::write(&snapshot, b"\x00truncated-not-a-tasklist").expect("corrupt snapshot");
+    alice.start().await;
+
+    // Give rehydration a moment, then require fail-closed behaviour: either
+    // the list is not served at all, or it is served with its content —
+    // never `ok:true` + empty tasks over a corrupt snapshot.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let r = alice.get(&format!("/task-lists/{list_topic}/tasks")).await;
+    let json = r.json::<serde_json::Value>().await.expect("tasks json");
+    let silently_empty =
+        json["ok"].as_bool() == Some(true) && json["tasks"].as_array().is_some_and(Vec::is_empty);
+    assert!(
+        !silently_empty,
+        "corrupt snapshot was silently replaced by empty state: {json}"
+    );
+}
+
+/// Locate the on-disk snapshot for `list_topic`: the file name is the
+/// hex-encoded `TaskListId::from_topic(topic)` — blake3 keyed by the
+/// `x0x.tasklist.id.v1` domain then the topic bytes — derived here with the
+/// same crate rather than re-implemented differently.
+fn find_snapshot_for(dir: &std::path::Path, list_topic: &str) -> Option<std::path::PathBuf> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"x0x.tasklist.id.v1");
+    hasher.update(list_topic.as_bytes());
+    let candidate = dir.join(format!("{}.bin", hasher.finalize()));
+    candidate.exists().then_some(candidate)
+}

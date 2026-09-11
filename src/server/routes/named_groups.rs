@@ -32125,6 +32125,7 @@ pub(in crate::server) mod tests {
             crdt_subscriptions: RwLock::new(crdt_subscriptions::CrdtSubscriptionManifest::default()),
             crdt_subscriptions_path: data_dir.join("crdt-subscriptions.json"),
             kv_store_state_dir: data_dir.join("kv-stores"),
+            task_list_state_dir: data_dir.join("task-lists"),
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
