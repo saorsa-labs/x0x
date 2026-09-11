@@ -411,8 +411,8 @@ retained commit log before it becomes evidence. The retained commit
 whose `state_hash` equals the conflicting commit's `prev_state_hash` is
 its **claimed parent** — the fork point ADR-0064 §2 walks from; the
 first link is all a full member can anchor, because gossip carries no
-alternate-chain fetch surface yet (the follow-up issue tracks it — do
-not fake a chain the node cannot see):
+alternate-chain fetch surface yet (issue #639 tracks it — do not fake
+a chain the node cannot see):
 
 | Classification | Condition | Outcome |
 |---|---|---|

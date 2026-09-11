@@ -3171,7 +3171,7 @@ fn previous_hash_initial(
 ///     at the commit's claimed parent (the retained commit whose
 ///     `state_hash` the fork chains from), but the alternate chain is
 ///     unavailable to full members (no chain-fetch surface exists yet;
-///     the follow-up issue tracks it). Evidence + quarantine marker,
+///     issue #639 tracks it). Evidence + quarantine marker,
 ///     snapshot `classification: "signer_only"`.
 /// (c) UNAUTHORIZED SIGNER — the signer held a seat somewhere in the
 ///     retained history but NOT active-admin at the claimed parent (an
@@ -3747,11 +3747,12 @@ fn fork_quarantine_for_evidence(
 
 /// The shared error arm of the two central apply hooks: evaluate the
 /// rejection as fork evidence and act on the outcome — install one
-/// authenticated record durably and fire the once-only diagnostics, or
-/// run the ADR-0064 slice-4 owner-anchored-successor CLEAR. Extracted so
-/// the terminal twin cannot drift from the ordinary hook's rules.
-/// `owner_mandate` is `Some` only on the `MemberAdded` arm (the one
-/// event kind that can carry an owner anchor).
+/// authenticated record durably and fire the once-only diagnostics
+/// (r2: the conflict path never clears, so installing evidence is the
+/// ONLY action this arm takes). Extracted so the terminal twin cannot
+/// drift from the ordinary hook's rules. `owner_mandate` is `Some`
+/// only on the `MemberAdded` arm (the one event kind that can carry an
+/// owner anchor).
 async fn record_fork_evidence_on_apply_error(
     state: &Arc<AppState>,
     group_key: &str,

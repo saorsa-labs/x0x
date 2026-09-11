@@ -188,10 +188,11 @@ pub struct GroupCounters {
     /// active-admin at the claimed parent (removed-admin fork chaining
     /// from its own removal, or a plain member signer).
     pub fork_evidence_unauthorized_signer: u64,
-    /// ADR-0064 slice 4 (Decision §3): owner-anchored quarantine clears
-    /// via a mandate-carrying MemberAdded (apply-path clear or the
-    /// legitimate-successor clear on conflicting evidence) — the
-    /// owner-anchored commit is not only a seal.
+    /// ADR-0064 slice 4 (Decision §3, r2): owner-anchored quarantine
+    /// clears via a mandate-carrying MemberAdded that this node APPLIES
+    /// (the apply-path clear — the only anchored clear; the conflict
+    /// path never clears) — the owner-anchored commit is not only a
+    /// seal.
     pub fork_quarantine_owner_anchored_clears: u64,
     /// ADR-0064 slice 4 (r2): a conflicting commit whose owner mandate
     /// VERIFIES (the owner vouched for its header) — counted on EVERY
@@ -520,9 +521,9 @@ impl GroupsDiagnostics {
         });
     }
 
-    /// ADR-0064 slice 4 (Decision §3): the fork-quarantine marker was
-    /// cleared by an owner-anchored mandate-carrying commit (apply-path
-    /// or legitimate-successor clear on conflicting evidence).
+    /// ADR-0064 slice 4 (Decision §3, r2): the fork-quarantine marker
+    /// was cleared by an owner-anchored mandate-carrying commit this
+    /// node APPLIED (the apply-path clear).
     pub fn record_fork_quarantine_owner_anchored_clear(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.fork_quarantine_owner_anchored_clears =

@@ -1697,3 +1697,124 @@ async fn adr0064_sidecar_mirrors_marker_and_capability_survives_legacy_rewrite()
     );
     Ok(())
 }
+
+/// WHY (r3): the `owner_anchored_conflict` label itself needs a fixture
+/// with NO prior evidence — the never-clears test's group already holds
+/// rev-2 twin evidence (first-complete-wins refuses a second install,
+/// so its marker keeps the ORIGINAL unclassified snapshot). Here the
+/// anchored sibling is the FIRST conflict: no marker, empty lineage →
+/// the anchored classification lands on the installed evidence and the
+/// marker's snapshot, and the attributable no-clear counter fires.
+#[tokio::test]
+async fn adr0064_owner_anchored_conflict_label_lands_on_fresh_evidence() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "b9".repeat(32);
+    let base = cert_sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp))
+        .await?;
+
+    // Advance to rev 2 canonically (no fork, no evidence, no marker).
+    let canonical2 = {
+        let mut next = base.clone();
+        next.description = "canonical-2".to_string();
+        seal_commit_owner_certified(
+            &state,
+            &mut next,
+            state.agent.identity().agent_keypair(),
+            now_millis_u64(),
+        )
+        .await?;
+        next
+    };
+    let canonical2_commit = canonical2.commit_log.last().expect("sealed").commit.clone();
+    let applied = apply_commit(&state, &group_id, canonical2_commit, "canonical-2").await?;
+    assert!(applied.is_ok());
+    persist_applied(&state, &group_id, applied.expect("applied")).await?;
+    assert!(
+        !live_record(&state, &group_id).await.is_fork_quarantined(),
+        "no prior conflict — clean fixture"
+    );
+
+    // The owner-anchored rev-2 SIBLING: chains from the retained base
+    // (rev 1, consecutive), conflicts with our rev-2 head
+    // (StaleRevision), carries a verifying mandate — the first
+    // conflict this node sees.
+    let head = live_record(&state, &group_id).await;
+    let base_commit = base.commit_log.last().expect("base sealed").commit.clone();
+    let mut anchored_meta = head.public_meta();
+    anchored_meta.description = "owner-anchored-sibling-2".to_string();
+    let anchored_commit = x0x::groups::GroupStateCommit::sign(
+        head.stable_group_id().to_string(),
+        base_commit.revision.saturating_add(1),
+        Some(base_commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&head.members_v2),
+        x0x::groups::compute_policy_hash(&head.policy),
+        x0x::groups::compute_public_meta_hash(&anchored_meta),
+        head.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        state.agent.identity().agent_keypair(),
+    )?;
+    let mandate = x0x::groups::OwnerMandate::sign(
+        head.stable_group_id(),
+        anchored_commit.revision,
+        anchored_commit
+            .prev_state_hash
+            .as_deref()
+            .unwrap_or_default(),
+        &anchored_commit.roster_root,
+        &anchored_commit.policy_hash,
+        &anchored_commit.public_meta_hash,
+        0,
+        &authority_hex,
+        "",
+        "",
+        &authority_hex,
+        now_millis_u64(),
+        &owner_kp,
+    )
+    .expect("sign anchored mandate");
+
+    let outcome = apply_stateful_event_with_evidence(
+        &state,
+        &group_id,
+        &head,
+        &anchored_commit,
+        Some(&mandate),
+        false,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.description = "owner-anchored-sibling-2".to_string();
+        },
+    )
+    .await;
+    assert!(outcome.is_err(), "the anchored sibling still conflicts");
+
+    let record = live_record(&state, &group_id).await;
+    let marker = record.fork_quarantine.as_ref().expect("marker set");
+    assert_eq!(marker.revision, anchored_commit.revision);
+    assert_eq!(marker.committed_by, authority_hex);
+    assert_eq!(
+        marker.snapshot.classification.as_deref(),
+        Some("owner_anchored_conflict"),
+        "the FIRST conflict's evidence carries the anchored classification"
+    );
+    assert!(
+        record
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .is_some_and(|evidence| evidence.revision == anchored_commit.revision),
+        "the anchored sibling's evidence installed (no prior evidence to win)"
+    );
+    let row = diag_row(&state, &group_id).await;
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_refusals, 1,
+        "verifying anchor — attributable no-clear signal"
+    );
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_clears, 0,
+        "r2/ADR §3: the conflict path never clears"
+    );
+    Ok(())
+}
