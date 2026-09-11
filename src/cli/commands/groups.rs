@@ -78,6 +78,28 @@ pub async fn decrypt(
     Ok(())
 }
 
+/// `x0x groups quarantine clear` — POST /groups/:id/quarantine/clear
+/// (ADR-0064 slice 3): clear the LOCAL fork-quarantine marker. The
+/// owner-attestation path is raw-HTTP-only; the CLI covers the operator
+/// `--force --reason` override.
+pub async fn quarantine_clear(
+    client: &DaemonClient,
+    group_id: &str,
+    force: bool,
+    reason: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({
+        "force": force,
+        "reason": reason.unwrap_or_default(),
+    });
+    let resp = client
+        .post(&format!("/groups/{group_id}/quarantine/clear"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x groups welcome` — POST /mls/groups/:id/welcome
 pub async fn welcome(client: &DaemonClient, group_id: &str, agent_id: &str) -> Result<()> {
     client.ensure_running().await?;

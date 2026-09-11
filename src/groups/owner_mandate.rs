@@ -319,14 +319,58 @@ impl OwnerMandate {
 /// entry is the `Unknown` state (never observed capability from that
 /// agent — the keyless tier); a present entry records the FIRST time this
 /// agent proved it holds the owner USER key (a verified mandate or an
-/// owner-countersigned InviteV4 minted by its install). Slice 2 only
-/// records; the grace/`Refusing` derivation lands with slice 3 and reads
-/// `first_seen_ms` — no persisted enum grows a variant.
+/// owner-countersigned InviteV4 minted by its install).
+///
+/// Slice 3 derives the grace state machine from `first_seen_ms` alone —
+/// `Capable` while `now < first_seen_ms + grace`, `Refusing` from that
+/// deadline on. No persisted enum grows a variant, and a later valid
+/// mandate from the same agent retains the clock (`or_insert` semantics
+/// at the recording site), exactly as ADR §1b requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MandateCapabilityState {
     /// Unix ms of the first capability observation from this agent.
     #[serde(default)]
     pub first_seen_ms: u64,
+}
+
+/// Milliseconds in `grace_days` days, saturating (ADR-0064 §1b clock).
+#[must_use]
+pub fn mandate_grace_window_ms(grace_days: u64) -> u64 {
+    grace_days.saturating_mul(86_400_000)
+}
+
+impl MandateCapabilityState {
+    /// Whether the grace window has elapsed at `now_ms` under
+    /// `grace_days` — i.e. this agent is in the derived `Refusing`
+    /// phase and an absent-mandate owner-axis `MemberAdded` from it
+    /// must be refused with `owner_mandate_missing` (ADR-0064 §1b).
+    ///
+    /// Inclusive deadline: `now == first_seen + grace` refuses. A
+    /// `first_seen_ms + grace` overflow (a poisoned clock record) is
+    /// treated as past-grace — the state is local-only and
+    /// bootstrap-stripped, so fail-closed is the honest derivation.
+    #[must_use]
+    pub fn refusal_due(&self, grace_days: u64, now_ms: u64) -> bool {
+        match self
+            .first_seen_ms
+            .checked_add(mandate_grace_window_ms(grace_days))
+        {
+            Some(deadline) => now_ms >= deadline,
+            None => true,
+        }
+    }
+
+    /// The derived phase label for diagnostics: `capable` or `refusing`
+    /// (`unknown` never appears here — an unknown agent has no map
+    /// entry at all).
+    #[must_use]
+    pub fn phase_label(&self, grace_days: u64, now_ms: u64) -> &'static str {
+        if self.refusal_due(grace_days, now_ms) {
+            "refusing"
+        } else {
+            "capable"
+        }
+    }
 }
 
 #[cfg(test)]

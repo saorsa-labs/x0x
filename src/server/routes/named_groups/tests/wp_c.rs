@@ -208,6 +208,7 @@ async fn wp_c_482_counter_increments_on_queue() {
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
         &std::collections::HashMap::new(),
+        60,
     );
     let row = snapshot
         .groups

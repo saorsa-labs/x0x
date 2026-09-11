@@ -1240,12 +1240,34 @@ enum GroupsSub {
         #[arg(long)]
         epoch: u64,
     },
+    /// Manually clear a group's local fork-quarantine marker.
+    Quarantine {
+        #[command(subcommand)]
+        sub: QuarantineSub,
+    },
     /// Create a welcome message for a new member.
     Welcome {
         /// Group ID (hex).
         group_id: String,
         /// Agent ID to welcome (hex).
         agent_id: String,
+    },
+}
+
+/// `x0x groups quarantine …` — ADR-0064 local fork-quarantine ops.
+#[derive(Subcommand)]
+enum QuarantineSub {
+    /// Clear the LOCAL fork-quarantine marker (requires --force with
+    /// --reason, or a fresh owner head attestation via raw HTTP).
+    Clear {
+        /// Group ID (hex).
+        group_id: String,
+        /// Operator override: clear without an owner attestation.
+        #[arg(long)]
+        force: bool,
+        /// Audit-trail reason (required with --force).
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -2439,6 +2461,16 @@ async fn run(
                 ciphertext,
                 epoch,
             }) => commands::groups::decrypt(&client, &group_id, &ciphertext, epoch).await,
+            Some(GroupsSub::Quarantine { sub }) => match sub {
+                QuarantineSub::Clear {
+                    group_id,
+                    force,
+                    reason,
+                } => {
+                    commands::groups::quarantine_clear(&client, &group_id, force, reason.as_deref())
+                        .await
+                }
+            },
             Some(GroupsSub::Welcome { group_id, agent_id }) => {
                 commands::groups::welcome(&client, &group_id, &agent_id).await
             }

@@ -301,3 +301,61 @@ Preimage errata (recorded for #472; the Accepted ADR body is immutable):
  the per-authority capability map (§1b) requires; every later
  implementation must diff against this v2 shape, not the §1a formula
  alone.
+
+## Mandate grace enforcement + manual quarantine clear (ADR-0064 §1b, slice 3)
+
+**Grace state machine (per group, per authority agent).** The capability
+entries slice 2 persists (`mandate_capability` → `first_seen_ms`) drive a
+derived state: an agent with NO entry is `Unknown` (never observed
+capability — the keyless tier, warn-accept indefinitely, #472 decision 7);
+an agent WITH an entry is `Capable` until `now ≥ first_seen_ms + grace`,
+then `Refusing`. The grace window defaults to **60 days** (one release
+cycle) and is configured per daemon as `[groups] mandate_grace_days`
+(validated ≥ 1 at startup — 0 would refuse every capable authority's
+events the moment capability is recorded, so the daemon refuses to start
+on it). The clock is LOCAL wall-clock and persisted with the map; a later
+valid mandate from the same agent does NOT reset it (`Refusing → Capable`
+on that event, clock retained — a compromised authority cannot reset its
+own window at will).
+
+**The refusal.** An owner-axis `MemberAdded` with NO mandate whose event
+actor is in the `Refusing` phase is rejected with the typed, retryable
+reason `owner_mandate_missing`: the local record stays byte-identical,
+nothing is queued as a revision gap, and queue admission is unaffected
+(the sender-side bounded resend, or a mandate-carrying re-issue, is the
+redelivery path). Counters: `owner_mandate_missing` (refusals) and
+`mandate_capability_refusing_transitions` (refusing decisions) in
+`/diagnostics/groups`. Absent mandates from `Unknown` or in-grace
+`Capable` authorities keep applying with warn + `owner_mandate_absent`,
+exactly as in slice 2 — non-owner-axis groups are entirely unchanged.
+
+**Direct admin adds mint too.** Every seat path on a node holding the
+owner user key mints the pre-mutation mandate: the invite-derived
+`MemberJoined` handler AND the direct admin-add routes
+(`POST /groups/:id/members` on both planes; the invite-secret slot in the
+preimage binds the empty string's hash for direct adds). A capable
+authority's own direct adds therefore never hit the refusal.
+
+**Per-agent diagnostics.** `GET /diagnostics/groups` now exposes, per
+group, `mandate_capability: [{agent_id, state: "capable"|"refusing",
+first_seen_ms}]` — the derived phases under the configured grace window
+(`unknown` agents have no row; the absent map entry IS that state).
+
+**Manual quarantine clear (#472 decision 1).**
+`POST /groups/:id/quarantine/clear` (local API token; CLI
+`x0x groups quarantine clear <id> --force --reason <REASON>`) clears the
+LOCAL, per-node marker — it is never gossiped — when EITHER
+
+- a **fresh owner head attestation** is supplied in the body
+  (`head_attestation`): the owner-user-key attestation over the group's
+  CURRENT terminal head (revision + state hash) for this node's agent,
+  verified against the owner public key derived from a committed roster
+  certificate; or
+- `force == true` AND a non-empty `reason` (the operator override).
+
+A group with no marker (including every non-owner-axis group, which never
+sets one) answers 409. Every successful clear increments
+`fork_quarantine_manual_clears`, logs at info with the reason (the audit
+trail), and returns the updated `fork_quarantine: null` view. The
+attestation path is owner-controlled; the force path is the documented
+operator escape hatch and should name a runbook/reference in the reason.

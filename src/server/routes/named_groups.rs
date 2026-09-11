@@ -444,6 +444,26 @@ pub(in crate::server) struct AddNamedGroupMemberRequest {
     treekem_key_package_b64: Option<String>,
 }
 
+/// Request body for POST /groups/:id/quarantine/clear (ADR-0064 slice 3,
+/// #472 decision 1). Either a fresh verified owner head attestation
+/// (path a) or `force == true` with a non-empty `reason` (path b) clears
+/// the LOCAL marker; never gossiped.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct ClearQuarantineRequest {
+    /// Path (b): explicit operator override. Requires a non-empty reason.
+    #[serde(default)]
+    force: bool,
+    /// Audit-trail reason. Required with `force`; logged at info and
+    /// surfaced through the `fork_quarantine_manual_clears` counter.
+    #[serde(default)]
+    reason: String,
+    /// Path (a): a fresh owner head attestation over the group's CURRENT
+    /// terminal head. Verified against the trusted owner public key
+    /// derived from committed roster certificates; not CLI-expressible.
+    #[serde(default)]
+    head_attestation: Option<HeadAttestation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(in crate::server) struct WelcomeRef {
     welcome_id: String,
@@ -561,6 +581,56 @@ impl HeadAttestation {
             .as_deref()
             .is_none_or(|prev| prev != self.head_state_hash.as_str())
             || terminal.revision != self.head_revision.saturating_add(1)
+        {
+            return false;
+        }
+        let Ok(sig_bytes) = BASE64.decode(&self.signature_b64) else {
+            return false;
+        };
+        let Ok(sig) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        else {
+            return false;
+        };
+        let canonical = Self::canonical_bytes(
+            &self.group_id,
+            self.head_revision,
+            &self.head_state_hash,
+            &self.member_agent_id,
+        );
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            owner_public_key,
+            &canonical,
+            &sig,
+        )
+        .is_ok()
+    }
+
+    /// ADR-0064 slice 3 (#472 decision 1): verify a FRESH owner head
+    /// attestation for the manual quarantine clear — the owner blesses
+    /// the group's CURRENT terminal head (revision + state hash) for the
+    /// local agent, under the owner public key taken from TRUSTED
+    /// material (a committed roster certificate). Unlike
+    /// [`Self::verify_against_terminal`] there is no join terminal to
+    /// CAS against: freshness is exactly "attests the head this node
+    /// currently holds" — an attestation over any earlier head fails.
+    fn verify_against_head(
+        &self,
+        owner_public_key: &ant_quic::MlDsaPublicKey,
+        expected_owner: &crate::identity::UserId,
+        stable_group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        local_agent_hex: &str,
+    ) -> bool {
+        use base64::Engine as _;
+        if &crate::identity::UserId::from_public_key(owner_public_key) != expected_owner {
+            return false;
+        }
+        if self.group_id != stable_group_id
+            || self.head_revision != head_revision
+            || self.head_state_hash != head_state_hash
+            || self.member_agent_id != local_agent_hex
         {
             return false;
         }
@@ -9019,17 +9089,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                 }
             };
-            // ADR-0064 slice 2: VERIFY-IF-PRESENT owner mandate on the
+            // ADR-0064 slice 2 + 3: owner-mandate enforcement on the
             // owner axis (both the gapless apply and the across-gap
             // adoption land here with `next` holding the seated roster).
             // A PRESENT mandate that fails any binding REJECTS with the
             // local state byte-identical (`next` is a clone; nothing
-            // persisted yet). An ABSENT mandate applies exactly as today
-            // — warn + `owner_mandate_absent`; the capability/grace
-            // refusal (`owner_mandate_missing`) is slice 3. A mandate on
-            // a NON-owner-axis group is inert by construction (this
-            // whole block is behind the owner-axis predicate), so those
-            // groups stay byte-for-byte unchanged.
+            // persisted yet). An ABSENT mandate applies with warn +
+            // `owner_mandate_absent` UNLESS the event actor is a
+            // recorded-capable authority past its grace window — then
+            // the typed, retryable `owner_mandate_missing` refusal
+            // (slice 3). A mandate on a NON-owner-axis group is inert
+            // by construction (this whole block is behind the
+            // owner-axis predicate), so those groups stay
+            // byte-for-byte unchanged.
             if let Some(owner) = info.policy.admission.owner_certified_user_id().copied() {
                 match owner_mandate.as_ref() {
                     Some(mandate) => {
@@ -9094,6 +9166,38 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         }
                     }
                     None => {
+                        // ADR-0064 §1b (slice 3): the per-agent grace
+                        // state machine. An absent mandate from a
+                        // NEVER-observed authority stays warn-accept
+                        // (Unknown — the keyless tier, #472 decision 7);
+                        // from a RECORDED-capable authority past its
+                        // grace window it is refused with the typed,
+                        // retryable `owner_mandate_missing`. The refusal
+                        // happens on the pre-install clone: the live
+                        // record is byte-identical, nothing is queued as
+                        // a revision gap, and the sender-side bounded
+                        // resend (or a later mandate-carrying event from
+                        // the same authority) is the redelivery path.
+                        let grace_days = state.groups_config.mandate_grace_days;
+                        let now_ms = now_millis_u64();
+                        let refusing = info
+                            .mandate_capability
+                            .get(&actor)
+                            .is_some_and(|capability| capability.refusal_due(grace_days, now_ms));
+                        if refusing {
+                            state
+                                .groups_diagnostics
+                                .record_owner_mandate_missing(&resolved_group_key);
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&agent_id),
+                                actor = %LogHexId::agent(&actor),
+                                reason = "owner_mandate_missing",
+                                grace_days,
+                                "MemberAdded: capable authority past grace window without a mandate — rejecting with state byte-identical (ADR-0064 §1b; retryable)"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
                         state
                             .groups_diagnostics
                             .record_owner_mandate_absent(&resolved_group_key);
@@ -9101,7 +9205,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             group_id = %LogHexId::group(&resolved_group_key),
                             member = %LogHexId::agent(&agent_id),
                             actor = %LogHexId::agent(&actor),
-                            "MemberAdded: no owner mandate on owner-axis group (ADR-0064 verify-if-present: applied; capability not recorded; enforcement lands in slice 3)"
+                            "MemberAdded: no owner mandate on owner-axis group (ADR-0064: applied; capability not recorded)"
                         );
                     }
                 }
@@ -11016,7 +11120,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // pre-mutation point — `next` holds the seat-write and
                 // the epoch is the TreeKEM epoch the terminal will
                 // carry; still nothing is sealed, mutated or persisted.
-                owner_mandate = mint_owner_mandate_for_member_joined(
+                owner_mandate = mint_owner_mandate_for_seat(
                     state,
                     &next,
                     expected_epoch,
@@ -11090,7 +11194,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 // ADR-0064 slice 2: same pre-mutation mint point for the
                 // non-TreeKEM planes — no epoch to declare (0).
-                owner_mandate = mint_owner_mandate_for_member_joined(
+                owner_mandate = mint_owner_mandate_for_seat(
                     state,
                     &next,
                     0,
@@ -11902,6 +12006,120 @@ pub(in crate::server) async fn get_named_group(
             "warnings": super::home::home_roaming_warning_for(&info)
                 .map(|warning| vec![warning])
                 .unwrap_or_default(),
+        })),
+    )
+}
+
+/// POST /groups/:id/quarantine/clear — ADR-0064 slice 3, #472 decision 1.
+///
+/// Manually clears the LOCAL (per-node, never gossiped) fork-quarantine
+/// marker. Two paths, either suffices:
+/// (a) a fresh owner head attestation in the body, verified against the
+///     group's CURRENT terminal head under the owner public key derived
+///     from a committed roster certificate (trusted material — the same
+///     ADR-0038 chain the receiver arm trusts);
+/// (b) `force == true` AND a non-empty `reason` (the operator override;
+///     the reason is the audit trail).
+///
+/// Requires the local API token (same auth layer as every `/groups`
+/// route). Increments `fork_quarantine_manual_clears`, logs at info with
+/// the reason, and returns the updated `fork_quarantine: null` view.
+/// A group without a marker (including every non-owner-axis group, which
+/// never sets one) answers 409 — nothing to clear.
+pub(in crate::server) async fn clear_group_quarantine(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ClearQuarantineRequest>,
+) -> impl IntoResponse {
+    let conflict = |reason: &str| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": reason })),
+        )
+    };
+    let (stable_group_id, head_revision, head_state_hash, owner, marker_present) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return not_found("group not found");
+        };
+        (
+            info.stable_group_id().to_string(),
+            info.state_revision,
+            info.state_hash.clone(),
+            info.policy.admission.owner_certified_user_id().copied(),
+            info.fork_quarantine.is_some(),
+        )
+    };
+    if !marker_present {
+        return conflict("group is not quarantined (no fork_quarantine marker)");
+    }
+    // Path (a): a fresh, verified owner head attestation.
+    let mut attestation_ok = false;
+    if let (Some(attestation), Some(owner)) = (req.head_attestation.as_ref(), owner.as_ref()) {
+        // Trusted owner material: any active member's committed
+        // certificate carries the owner USER public key (ADR-0038 —
+        // every seat's cert chains to the policy owner).
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let groups = state.named_groups.read().await;
+        let trusted = groups.get(&id).and_then(|info| {
+            info.members_v2.values().find_map(|member| {
+                let cert = member.certificate.as_ref()?;
+                let pk = ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok()?;
+                attestation
+                    .verify_against_head(
+                        &pk,
+                        owner,
+                        &stable_group_id,
+                        head_revision,
+                        &head_state_hash,
+                        &local_hex,
+                    )
+                    .then_some(())
+            })
+        });
+        attestation_ok = trusted.is_some();
+    }
+    let force_ok = req.force && !req.reason.trim().is_empty();
+    if !attestation_ok && !force_ok {
+        return conflict(
+            "quarantine clear requires a fresh verified owner head attestation \
+             or force=true with a non-empty reason",
+        );
+    }
+    let cleared_by = if attestation_ok {
+        "attestation"
+    } else {
+        "force"
+    };
+    let outcome = persist_named_groups_mutation(&state, |groups| {
+        if let Some(info) = groups.get_mut(&id) {
+            info.fork_quarantine = None;
+        }
+        true
+    })
+    .await;
+    if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
+    state
+        .groups_diagnostics
+        .record_fork_quarantine_manual_clear(&stable_group_id);
+    tracing::info!(
+        group_id = %LogHexId::group(&stable_group_id),
+        cleared_by,
+        reason = %req.reason,
+        "ADR-0064: fork quarantine manually cleared (local node only)"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": stable_group_id,
+            "cleared_by": cleared_by,
+            "fork_quarantine": serde_json::Value::Null,
         })),
     )
 }
@@ -15602,6 +15820,23 @@ pub(in crate::server) async fn add_named_group_member(
             }
         }
         let revision = next.roster_revision;
+        // ADR-0064 slice 3 (round-2 advisory A1): direct admin adds on an
+        // owner-key install mint the same pre-mutation mandate — a
+        // Capable authority's own direct adds must never be refused by
+        // its peers. No epoch to declare on the GSS plane (0); no invite
+        // secret exists for a direct add, so the empty-string hash is
+        // bound (the verifier does not recompute it).
+        let owner_mandate = mint_owner_mandate_for_seat(
+            state.as_ref(),
+            &next,
+            0,
+            &agent_hex,
+            &actor_hex,
+            "",
+            owner_certified_admission.as_ref(),
+            now_ms,
+        )
+        .await;
         let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
         {
             Ok(c) => c,
@@ -15674,10 +15909,9 @@ pub(in crate::server) async fn add_named_group_member(
                 use base64::Engine as _;
                 BASE64.encode(bincode::serialize(cert).unwrap_or_default())
             }),
-            // ADR-0064 scope: mandates are minted only on the
-            // invite-derived MemberJoined path (the mandate preimage
-            // binds the invite secret); direct admin adds carry none.
-            owner_mandate: None,
+            // ADR-0064 slice 3: the pre-mutation mandate minted above
+            // (None on keyless-owner installs and non-owner-axis groups).
+            owner_mandate,
             commit: Some(commit),
         };
         (metadata_topic, event, members, epoch, bootstrap_group)
@@ -15844,6 +16078,20 @@ async fn add_treekem_named_group_member(
         );
     };
     next.security_binding = Some(binding);
+    // ADR-0064 slice 3 (round-2 advisory A1): the TreeKEM sibling of the
+    // GSS direct-add mint — declared epoch is the epoch this add's TreeKEM
+    // commit will carry.
+    let owner_mandate = mint_owner_mandate_for_seat(
+        state.as_ref(),
+        &next,
+        treekem_epoch,
+        &agent_hex,
+        &actor_hex,
+        "",
+        owner_certified_admission.as_ref(),
+        now_ms,
+    )
+    .await;
     let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
@@ -15923,10 +16171,9 @@ async fn add_treekem_named_group_member(
             use base64::Engine as _;
             BASE64.encode(bincode::serialize(cert).unwrap_or_default())
         }),
-        // ADR-0064 scope: mandates are minted only on the
-        // invite-derived MemberJoined path (the mandate preimage
-        // binds the invite secret); direct admin adds carry none.
-        owner_mandate: None,
+        // ADR-0064 slice 3: the pre-mutation mandate minted above (None
+        // on keyless-owner installs and non-owner-axis groups).
+        owner_mandate,
         commit: Some(commit),
     };
     cache_treekem_member_key_package(
@@ -18844,15 +19091,21 @@ pub(in crate::server) async fn seal_commit_owner_certified(
         .map(|(commit, _evicted)| commit)
 }
 
-/// ADR-0064 slice 2 (Decision §1/§1a): mint the owner USER-key mandate
-/// at the PRE-MUTATION point of an invite-derived seat. `pre_seal` is
-/// the authority's live-info clone with the seat-write ALREADY applied
-/// (member added, certificate installed) but BEFORE
-/// [`seal_commit_owner_certified`] runs — every preimage member is
-/// therefore derived from the authority's ACTUAL current roster, never
-/// the possibly-stale invite projection (the r2 `{owner,A,B,joiner}`
-/// case). `declared_epoch` is the TreeKEM epoch the terminal event will
-/// carry (`guard.epoch() + 1`), or `0` on planes with no epoch to bind.
+/// ADR-0064 (Decision §1/§1a; slice-3 closes the seat-path advisory):
+/// mint the owner USER-key mandate at the PRE-MUTATION point of a seat
+/// write — the invite-derived MemberJoined handler AND the direct
+/// admin-add routes (a Capable authority's own direct adds must never be
+/// refused by its peers). `pre_seal` is the authority's live-info clone
+/// with the seat-write ALREADY applied (member added, certificate
+/// installed) but BEFORE [`seal_commit_owner_certified`] runs — every
+/// preimage member is therefore derived from the authority's ACTUAL
+/// current roster, never the possibly-stale invite projection (the r2
+/// `{owner,A,B,joiner}` case). `declared_epoch` is the TreeKEM epoch the
+/// terminal event will carry (`guard.epoch() + 1`), or `0` on planes
+/// with no epoch to bind. `invite_secret` is the invite's secret for
+/// MemberJoined seats and the EMPTY string for direct admin adds (the
+/// preimage still binds its hash; the verifier does not recompute it,
+/// so the two producers share one shape).
 ///
 /// Capability-gated exactly like the #469 A1b invite fence: the group
 /// must have an owner axis AND the local install must hold the owner
@@ -18862,7 +19115,7 @@ pub(in crate::server) async fn seal_commit_owner_certified(
 /// returned value is data only, published with the event after persist
 /// succeeds. A successful mint counts `owner_mandate_minted`.
 #[allow(clippy::too_many_arguments)]
-async fn mint_owner_mandate_for_member_joined(
+async fn mint_owner_mandate_for_seat(
     state: &AppState,
     pre_seal: &x0x::groups::GroupInfo,
     declared_epoch: u64,
@@ -31291,6 +31544,7 @@ pub(in crate::server) mod tests {
             agent,
             history_record_topics: Vec::new(),
             history_config: x0x::history::HistoryConfig::default(),
+            groups_config: crate::server::DaemonGroupsConfig::default(),
             subscriptions: RwLock::new(HashMap::new()),
             task_lists: RwLock::new(HashMap::new()),
             kv_stores: RwLock::new(HashMap::new()),
@@ -32021,6 +32275,7 @@ pub(in crate::server) mod tests {
                         &std::collections::HashSet::new(),
                         &std::collections::HashSet::new(),
                         &HashMap::new(),
+                        state.groups_config.mandate_grace_days,
                     )
                     .groups
                     .into_iter()
@@ -32312,6 +32567,7 @@ pub(in crate::server) mod tests {
                     &std::collections::HashSet::new(),
                     &std::collections::HashSet::new(),
                     &HashMap::new(),
+                    state.groups_config.mandate_grace_days,
                 )
                 .groups
                 .into_iter()
@@ -33244,6 +33500,7 @@ pub(in crate::server) mod tests {
                         &std::collections::HashSet::new(),
                         &std::collections::HashSet::new(),
                         &HashMap::new(),
+                        state.groups_config.mandate_grace_days,
                     )
                     .groups
                     .into_iter()
@@ -33384,6 +33641,7 @@ pub(in crate::server) mod tests {
                         &std::collections::HashSet::new(),
                         &std::collections::HashSet::new(),
                         &HashMap::new(),
+                        state.groups_config.mandate_grace_days,
                     )
                     .groups
                     .into_iter()
@@ -34419,6 +34677,7 @@ pub(in crate::server) mod tests {
                     &std::collections::HashSet::new(),
                     &std::collections::HashSet::new(),
                     &HashMap::new(),
+                    state.groups_config.mandate_grace_days,
                 )
                 .groups
                 .into_iter()
@@ -38920,7 +39179,7 @@ pub(in crate::server) mod tests {
         let empty_topics = HashSet::new();
         state
             .groups_diagnostics
-            .snapshot(&groups, &empty_topics, &empty_topics, &HashMap::new())
+            .snapshot(&groups, &empty_topics, &empty_topics, &HashMap::new(), 60)
             .groups
             .into_iter()
             .find(|row| row.group_id == group_id)
@@ -42145,6 +42404,7 @@ pub(in crate::server) mod tests {
                 &HashSet::new(),
                 &HashSet::new(),
                 &HashMap::new(),
+                state.groups_config.mandate_grace_days,
             )
             .groups
             .iter()
@@ -42167,6 +42427,7 @@ pub(in crate::server) mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            state.groups_config.mandate_grace_days,
         );
         let after = snap
             .groups
@@ -42193,6 +42454,7 @@ pub(in crate::server) mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            60,
         );
         let row = snap
             .groups
