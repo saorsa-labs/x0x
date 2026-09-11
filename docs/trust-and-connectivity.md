@@ -262,7 +262,10 @@ ADR-0064 Decision 3). **Non-owner-axis groups are out of scope for this
 slice**: they never receive a marker and their behaviour is byte-for-byte
 unchanged; their quarantine/recovery semantics (indefinite
 `quarantine_no_anchor` quarantine and the manual operator runbook) are
-deferred to the ADR follow-up (#472). Mixed-fleet note: the marker is a
+deferred to the ADR follow-up (#472); the operator procedure that DID land
+— ordinary groups ungated, evidence and diagnostics only — is documented in
+[docs/runbooks/fork-quarantine.md](runbooks/fork-quarantine.md) §5.
+Mixed-fleet note: the marker is a
 serde-default JSON field, so v0.41.4 binaries ignore it (and silently drop
 it if they rewrite the record — a downgrade loses containment, it never
 bricks).
@@ -370,7 +373,8 @@ increments `fork_quarantine_manual_clears` and logs at info with the
 reason (the audit trail; the logged reason is capped at 256 chars) and
 returns the updated `fork_quarantine: null` view. The owner-key path is
 owner-controlled; the force path is the documented operator escape hatch
-and should name a runbook/reference in the reason.
+and should name a runbook/reference in the reason — the full operator
+procedure is [docs/runbooks/fork-quarantine.md](runbooks/fork-quarantine.md).
 
 **Clock and validation caveats.** The grace deadline uses the node's
 local wall clock (the same source as `first_seen_ms`, so a node is

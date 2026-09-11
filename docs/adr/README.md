@@ -153,6 +153,80 @@ Post-acceptance correction, 2026-08-29:
   transition. Details:
   [`docs/design/adr-0051-mechanics.md`](../design/adr-0051-mechanics.md).
 
+Post-acceptance decisions and corrections, 2026-09-10/11 (ADR 0064; every
+maintainer decision from #472 during slice implementation, PRs #635/#636/
+#637/#640; the ADR body is immutable, so the shipped deltas are recorded
+here — [`docs/trust-and-connectivity.md`](../trust-and-connectivity.md)
+ADR-0064 sections are the maintained mechanics, and
+[`docs/runbooks/fork-quarantine.md`](../runbooks/fork-quarantine.md) is the
+operator runbook):
+
+- **Manual clear surface (decision 1, refined in the slice-3 review)** —
+  `POST /groups/:id/quarantine/clear` (CLI `x0x groups quarantine clear
+  <id>`) clears the LOCAL marker. Without `force` it clears only on a node
+  holding the group's owner USER key: the endpoint MINTS a fresh
+  quarantine-clear attestation over the current head under the dedicated
+  `x0x.quarantine-clear-attest.v1` domain (never the join-attestation
+  domain, so a join attestation cannot double as a clear) and verifies it
+  before clearing. Otherwise `force: true` + non-empty `reason` is
+  required. Remote-owner attestation submission is out of scope. Per-node
+  only; logged and counted (`fork_quarantine_manual_clears`).
+- **Non-owner-axis (ordinary) groups are NOT gated (decision 2)** —
+  fork evidence is recorded and exposed in diagnostics only. Indefinite
+  quarantine with no recovery path would brick ordinary groups in the
+  wild, worse than the ADR-0016 equal-revision fork risk it prevents;
+  the marker type's `no_anchor` flag stays reserved (`false`). Gating
+  waits for an ADR defining their anchor. Operator procedure:
+  runbook §5.
+- **Signer-only classification + chain-fetch follow-up (decision 3)** —
+  slice 4 ships signer-only classification for full members (`signer_only`
+  / `unauthorized_signer` / `owner_anchored_conflict` labels on the
+  forensic snapshot); a chain-fetch surface is follow-up issue #639 —
+  gossip carries none, so only the first link is anchored and the
+  implementation deliberately does not fake a chain it cannot see.
+- **Item 4 split (decision 4)** — the content-addressed base snapshot for
+  rosters over the DM budget is NOT part of ADR-0064 and was split out at
+  slice-2 landing; the dedicated issue is not yet filed as of 2026-09-11
+  (tracked on the #472 residual list).
+- **Route coverage + ratchet epoch token deferral (decision 5)** —
+  history/delegations/kv route gating and the ratchet lifecycle epoch
+  token are deferred to a future ADR; #472 stays open as the tracker.
+- **Sidecar mirroring (decision 6, corrected twice)** — for owner-axis
+  groups the authoritative persisted record is the `home-suite-groups.json`
+  sidecar (`named_groups.json` holds the legacy placeholder; both carry
+  `fork_quarantine` and `mandate_capability` through the #451 split
+  write). No new code was needed: `merge_home_suite_groups` already
+  replaces whole owner-axis entries, and the fields were serde-default
+  persisted since slices 1–2; slice 4 pins it by test. Caveat: an OLD
+  SIDECAR-AWARE binary rewriting the sidecar drops both fields (a
+  downgrade across a sidecar-aware version loses containment, never
+  bricks).
+- **§1b ratified (decision 7)** — the never-observed-admin boundary
+  stands as written: the grace clock starts at first PROVEN capability;
+  forcing mandates from never-observed admins would break mixed-version
+  fleets (the keyless tier warn-accepts indefinitely).
+- **OwnerMandate v2 preimage (slice-2 reviews)** — the implemented
+  canonical preimage signs the §1a members PLUS `version`,
+  `authority_agent_id`, and `issued_at_ms` (13 bound fields total, also
+  including `joiner_agent_id`, `invite_secret_hash`,
+  `admission_cert_digest`), domain `x0x.owner-mandate.v2\0`, signed by
+  the owner USER key over the blake3 digest, domain-separated from
+  HeadAttestation / GroupStateCommit / invite signatures. Every later
+  implementation must diff against this v2 shape, not the §1a formula
+  alone.
+- **Clear-rule clarifications (slice-1 and slice-4 reviews)** — a marker
+  clears ONLY when this node APPLIES an owner-anchored commit at strictly
+  greater revision (tier-1 attestation-verified adoption, or a
+  mandate-carrying `MemberAdded` whose mandate verifies on the apply
+  path), or through the explicit seal route on an owner-key node (both
+  arms, including the eviction arm, with the clear inside the persist
+  transaction), or the manual endpoint. The conflict path NEVER clears —
+  the slice-4 task text's clear-on-anchored-conflicting-commit was
+  withdrawn before merge (it would un-quarantine a node still holding
+  the disowned sibling and re-quarantine on the next canonical commit);
+  such commits are recorded as `owner_anchored_conflict` evidence.
+  Every clear re-arms the stored fork-evidence silence gate.
+
 Not actioned from the audit, deliberately: ADR 0010's verdict is
 SUPERSEDED-BY-0012 (tombstone retained, nothing to relocate); the optional
 merges (0013 into 0009, 0022 into 0020) are forbidden as literal edits by
