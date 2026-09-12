@@ -787,7 +787,7 @@ impl PubSubManager {
                     "tracking_overflow": self.transport.repair_tracking_overflow.load(Ordering::Relaxed),
                     "iwant_matched_eager_attempt_msgs": self.transport.repair_msgs.load(Ordering::Relaxed),
                     "iwant_matched_eager_attempt_bytes": self.transport.repair_bytes.load(Ordering::Relaxed),
-                    "semantics": "subset of eager counters matching authenticated v2 in-flight IWANT peer/topic/message IDs; includes coincident same-message forwards, not confirmed delivery; anti_entropy stays separate"
+                    "semantics": "subset of eager counters matching v2 in-flight IWANT peer/topic/message IDs (unverified frame fields; PlumTree verifies the IWANT itself, #656); includes coincident same-message forwards, not confirmed delivery; anti_entropy stays separate"
                 }
             }
         })
