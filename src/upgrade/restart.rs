@@ -381,12 +381,14 @@ fn run_launchctl_print(target: &str) -> Result<Option<String>, String> {
 
 /// Plist-reader callback for [`readback_launchd_policy_in`]: the plist file
 /// as JSON, or `None` when it cannot be read or parsed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 type PlistReader<'a> = &'a dyn Fn(&Path) -> Option<serde_json::Value>;
 
 /// launchctl probe callback for [`readback_launchd_policy_in`]: given a full
 /// launchd service target (e.g. `gui/501/com.example.x0xd`), `Ok(Some(stdout))`
 /// when that domain holds the job, `Ok(None)` when it does not, `Err` when
 /// launchctl could not be run. `FnMut` so tests can record probe order.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 type LaunchctlPrint<'a> = &'a mut dyn FnMut(&str) -> Result<Option<String>, String>;
 
 /// The decision core of [`readback_launchd_policy`]: discover candidate
@@ -403,6 +405,7 @@ type LaunchctlPrint<'a> = &'a mut dyn FnMut(&str) -> Result<Option<String>, Stri
 /// so the refuse-vs-proceed decision table is unit-testable on any platform
 /// with captured probe output; every path that cannot confirm an
 /// unconditional keep-alive on this instance's job fails closed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn readback_launchd_policy_in(
     plist_dir: &Path,
     uid: u32,
