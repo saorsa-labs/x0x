@@ -3,6 +3,16 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+### Changed
+
+- saorsa-gossip pins bumped 0.5.77 → 0.5.78 (all eleven crates): PlumTree dedups
+  inbound EAGER by `msg_id` before the ML-DSA-65 verify (saorsa-labs/saorsa-gossip#56,
+  #674) — on a bootstrap ~28% of inbound EAGER frames were duplicates that were
+  verified and then discarded. New counter `eager_duplicate_dropped_pre_verify`
+  under `pubsub_stages` in `GET /diagnostics/gossip`; a wiring test pins the key.
+  The #501 legacy-bus meter premise moves to pubsub 0.5.78.
+
 ### Fixed
 
 - **Capability adverts went stale in on-demand mode (#664 regression).**

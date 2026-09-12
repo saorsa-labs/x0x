@@ -5242,6 +5242,27 @@ mod tests {
             );
         }
     }
+
+    /// saorsa-gossip 0.5.78 (x0x #674): PlumTree now dedups inbound EAGER by
+    /// msg_id BEFORE the ML-DSA-65 verify and counts the skipped verifies as
+    /// `eager_duplicate_dropped_pre_verify`. `GET /diagnostics/gossip` serialises
+    /// the stage snapshot verbatim, so the fleet can only prove the saving if the
+    /// key survives the serde seam; pin it so a crate rename (or a pin regression
+    /// to 0.5.77) fails here instead of blanking the diagnostics.
+    #[tokio::test]
+    async fn stage_stats_expose_eager_duplicate_dropped_pre_verify() {
+        let manager = slice1_manager(2, false).await;
+        let stages = serde_json::to_value(manager.stage_stats()).unwrap();
+        assert_eq!(
+            stages
+                .as_object()
+                .unwrap()
+                .get("eager_duplicate_dropped_pre_verify")
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "fresh manager must expose `eager_duplicate_dropped_pre_verify` as a zero u64 counter"
+        );
+    }
 }
 
 #[cfg(test)]

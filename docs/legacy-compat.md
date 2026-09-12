@@ -54,6 +54,14 @@ modern release or against reading those crates.
 [pubsub 0.5.77](https://crates.io/crates/saorsa-gossip-pubsub/0.5.77)
 (checksum `73b1d21df86ce58ee075f88e2d9d978e746f313d089be2fcfe46fe484214789f`).
 
+**Moved (2026-09-12):** x0x now requires the coherent **0.5.78** gossip family
+(saorsa-gossip#56, PlumTree dedups inbound EAGER before the ML-DSA-65 verify).
+The #501 meter premise (the `saorsa-gossip-pubsub` lock pin checked by
+`paired_controlled_load_bus_eager_attempts_default_vs_optout` and
+`scripts/ci/derive-legacy-bus-attempts.py`) moved with it to registry
+[pubsub 0.5.78](https://crates.io/crates/saorsa-gossip-pubsub/0.5.78)
+(checksum `a4003d64b7d2edbea274e14a30d5997aa8fd316a5b1cc9634310982f0287a863`).
+
 **Still historical warning:** registry **0.5.75** (Aug 27) predates #48 despite
 the earlier workspace version string — never treat 0.5.75 as #48 adoption.
 
