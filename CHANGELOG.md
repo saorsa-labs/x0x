@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 ### Fixed
 
+- **Stale capability adverts no longer cost an ML-DSA-65 verify (#674 item 1).**
+  `ingest_verified_capability_advert` and `ingest_verified_digest_extension`
+  (`src/dm_capability_service.rs`) consulted the signature verifier before
+  the store's last-write-wins staleness rule, so on a ~27-peer mesh nearly
+  every advert — the caps family is 43.5 unique msgs/s at two verifies per
+  frame against a 600 s publish cadence — was verified in full and then
+  discarded by `CapabilityStore::insert`. A new
+  `CapabilityStore::would_accept_advert` /
+  `would_accept_digest_extension` pre-check skips the verify for adverts
+  that could not change store state anyway. Safe by construction: the store
+  only ever holds verified entries, a replayed old advert can never refresh
+  the TTL (insert would reject it), and a genuinely newer advert still
+  reaches the verify. Skips are counted as `caps_advert_prefiltered_stale`
+  on `GET /diagnostics/dm`.
+
 - **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3
   rules out "a marker in isolation" establishing a supported deployment,
   but the supervised classification trusted `X0X_SUPERVISED=1` alone: a
@@ -63,6 +78,18 @@ All notable changes to this project will be documented in this file.
   `run_ws_writer_exits_after_flush_budget_with_close_still_blocked` (bounded
   exit + handoff) and integration
   `ws_slow_close_frame_survives_flush_budget_expiry` (self-DM-triggered
+
+### Added
+
+- **`inbound_by_topic` counters on `GET /diagnostics/gossip` (#674 item 4).**
+  Inbound PubSub frames and bytes are now attributed to a topic class
+  (`announce_blob`, `caps`, `dm_bus`, `presence`, `other`) and PlumTree kind
+  (`eager`, `ihave`, `iwant`, …), counted in `handle_incoming` off the
+  already-decoded header before any signature work — refused and
+  later-discarded frames still count. Previously inbound verify cost could
+  only be inferred from message-cache eviction rates. Keys are documented in
+  `docs/diagnostics.md`. The measurement gap this closes is what forced the
+  #674 design to proxy per-topic inbound rates from eviction counters.
 
 ### Tests
 

@@ -25,9 +25,9 @@ use saorsa_gossip_transport::GossipTransport;
 use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
@@ -143,6 +143,141 @@ impl PubSubStats {
             in_flight_decode,
             decode_to_delivery_drops,
         }
+    }
+}
+
+/// Inbound frames and bytes per (topic class, PlumTree message kind),
+/// counted off the already-decoded [`MessageHeader`] before any signature
+/// work (#674): `/diagnostics/gossip` could not previously attribute
+/// inbound cost to a topic, forcing eviction-rate inference. Exposed as
+/// `inbound_by_topic` on the `GET /diagnostics/gossip` snapshot.
+///
+/// Frames whose header does not decode are unclassifiable and are not
+/// counted (PlumTree still rejects them and warns).
+#[derive(Debug)]
+pub struct InboundByTopicStats {
+    /// One frames/bytes pair per `class * INBOUND_KIND_COUNT + kind` slot.
+    slots: [InboundSlot; INBOUND_CLASS_NAMES.len() * INBOUND_KIND_NAMES.len()],
+}
+
+#[derive(Debug, Default)]
+struct InboundSlot {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+}
+
+/// Stable `inbound_by_topic` class key names (#674): the four caps topics
+/// are one class, the identity blob-fetch topic is its own, plus the DM bus
+/// and presence beacons. Everything else lands in `other`.
+const INBOUND_CLASS_NAMES: [&str; 5] = ["announce_blob", "caps", "dm_bus", "presence", "other"];
+
+/// Stable `inbound_by_topic` kind key names, matching the lowercase naming
+/// sg uses for `outbound_by_kind`.
+const INBOUND_KIND_NAMES: [&str; 9] = [
+    "eager",
+    "ihave",
+    "iwant",
+    "ping",
+    "ack",
+    "find",
+    "presence",
+    "anti_entropy",
+    "shuffle",
+];
+
+/// Topic ids of the named classes, keyed for O(1) classification.
+static KNOWN_INBOUND_CLASSES: LazyLock<HashMap<TopicId, usize>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    let mut add = |name: &str, class: usize| {
+        map.insert(TopicId::from_entity(name.as_bytes()), class);
+    };
+    add(crate::announce_blob::ANNOUNCE_BLOB_TOPIC, 0);
+    for name in [
+        crate::dm_capability::DM_CAPABILITY_TOPIC,
+        crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC,
+        crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC,
+        crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC,
+    ] {
+        add(name, 1);
+    }
+    add(crate::dm_inbox::DM_BUS_TOPIC, 2);
+    add(crate::presence::GLOBAL_PRESENCE_TOPIC_NAME, 3);
+    map
+});
+
+fn inbound_topic_class(topic: &TopicId) -> usize {
+    KNOWN_INBOUND_CLASSES
+        .get(topic)
+        .copied()
+        .unwrap_or(INBOUND_CLASS_NAMES.len() - 1)
+}
+
+fn inbound_kind_index(kind: MessageKind) -> usize {
+    match kind {
+        MessageKind::Eager => 0,
+        MessageKind::IHave => 1,
+        MessageKind::IWant => 2,
+        MessageKind::Ping => 3,
+        MessageKind::Ack => 4,
+        MessageKind::Find => 5,
+        MessageKind::Presence => 6,
+        MessageKind::AntiEntropy => 7,
+        MessageKind::Shuffle => 8,
+    }
+}
+
+/// Snapshot of [`InboundByTopicStats`] for JSON serialization.
+///
+/// Serializes as `{ class: { kind: { "frames": n, "bytes": n } } }`;
+/// untouched class/kind pairs are omitted so a fresh daemon renders `{}`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct InboundByTopicSnapshot(
+    BTreeMap<&'static str, BTreeMap<&'static str, InboundKindCounters>>,
+);
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct InboundKindCounters {
+    frames: u64,
+    bytes: u64,
+}
+
+impl Default for InboundByTopicStats {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| InboundSlot::default()),
+        }
+    }
+}
+
+impl InboundByTopicStats {
+    /// Attribute one inbound frame. `frame_len` is the full wire length.
+    fn record(&self, header: &MessageHeader, frame_len: u64) {
+        let slot = &self.slots[inbound_topic_class(&header.topic) * INBOUND_KIND_NAMES.len()
+            + inbound_kind_index(header.kind)];
+        slot.frames.fetch_add(1, Ordering::Relaxed);
+        slot.bytes.fetch_add(frame_len, Ordering::Relaxed);
+    }
+
+    /// Take an atomic snapshot, omitting untouched class/kind pairs.
+    fn snapshot(&self) -> InboundByTopicSnapshot {
+        let mut classes: BTreeMap<&'static str, BTreeMap<&'static str, InboundKindCounters>> =
+            BTreeMap::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let (frames, bytes) = (
+                slot.frames.load(Ordering::Relaxed),
+                slot.bytes.load(Ordering::Relaxed),
+            );
+            if frames == 0 && bytes == 0 {
+                continue;
+            }
+            let class = INBOUND_CLASS_NAMES[index / INBOUND_KIND_NAMES.len()];
+            let kind = INBOUND_KIND_NAMES[index % INBOUND_KIND_NAMES.len()];
+            classes
+                .entry(class)
+                .or_default()
+                .insert(kind, InboundKindCounters { frames, bytes });
+        }
+        InboundByTopicSnapshot(classes)
     }
 }
 
@@ -445,6 +580,9 @@ pub struct PubSubManager {
     revocation_set: std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
     /// Drop-detection counters exposed at `GET /diagnostics/gossip`.
     stats: Arc<PubSubStats>,
+    /// Inbound frames/bytes per (topic class, kind) — `inbound_by_topic` on
+    /// `GET /diagnostics/gossip` (#674).
+    inbound_by_topic: InboundByTopicStats,
     /// Subscriber channels for `local:` topics (issue #89). These topics
     /// are same-daemon IPC: delivered only to local subscribers, never
     /// handed to PlumTree, never gossipped to remote peers.
@@ -662,6 +800,7 @@ impl PubSubManager {
             contacts: std::sync::OnceLock::new(),
             revocation_set: std::sync::OnceLock::new(),
             stats: Arc::new(PubSubStats::default()),
+            inbound_by_topic: InboundByTopicStats::default(),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
             participation: ParticipationMode::Leaf,
@@ -909,6 +1048,16 @@ impl PubSubManager {
     /// phase of inbound PubSub handling owns dispatcher wall-clock time.
     pub fn stage_stats(&self) -> saorsa_gossip_pubsub::PubSubStageStatsSnapshot {
         self.plumtree.stage_stats()
+    }
+
+    /// Snapshot of inbound frames/bytes per (topic class, PlumTree kind).
+    ///
+    /// Surfaced at `GET /diagnostics/gossip` as `inbound_by_topic` (#674)
+    /// so inbound cost can be attributed to a topic class directly instead
+    /// of being inferred from message-cache eviction rates.
+    #[must_use]
+    pub fn inbound_by_topic_snapshot(&self) -> InboundByTopicSnapshot {
+        self.inbound_by_topic.snapshot()
     }
 
     /// Attach a contact store for trust-based message filtering.
@@ -1353,15 +1502,23 @@ impl PubSubManager {
     /// Full nodes keep today's `handle_message` behaviour.
     pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
         self.ensure_eager_ceiling().await;
-        if self.refuse_leaf_unsubscribed_passthrough(&data) {
+        // One header decode serves the inbound-by-topic counters (#674),
+        // the Leaf refuse gate, and the IWANT repair tracker — no crypto.
+        let header = peek_pubsub_header(&data);
+        if let Some(header) = &header {
+            self.inbound_by_topic.record(header, data.len() as u64);
+        }
+        if self.refuse_leaf_unsubscribed_passthrough(header.as_ref(), &data) {
             return;
         }
-        let _repair_scope =
-            if peek_pubsub_header(&data).is_some_and(|header| header.kind == MessageKind::IWant) {
-                self.transport.track_iwant(peer, &data)
-            } else {
-                None
-            };
+        let _repair_scope = if header
+            .as_ref()
+            .is_some_and(|header| header.kind == MessageKind::IWant)
+        {
+            self.transport.track_iwant(peer, &data)
+        } else {
+            None
+        };
         if let Err(e) = self.plumtree.handle_message(peer, data).await {
             tracing::warn!(
                 "Failed to handle PlumTree pubsub message from {}: {e}",
@@ -1370,8 +1527,12 @@ impl PubSubManager {
         }
     }
 
-    fn refuse_leaf_unsubscribed_passthrough(&self, data: &[u8]) -> bool {
-        let Some(header) = peek_pubsub_header(data) else {
+    fn refuse_leaf_unsubscribed_passthrough(
+        &self,
+        header: Option<&MessageHeader>,
+        data: &[u8],
+    ) -> bool {
+        let Some(header) = header else {
             return false;
         };
         let subscribed = self
@@ -4394,6 +4555,81 @@ mod tests {
         assert_eq!(
             snap.unsubscribed_refused_frames, 0,
             "Full must keep today's unsubscribed pass-through"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_by_topic_counts_only_the_published_classes() {
+        // Why (#674): /diagnostics/gossip could not attribute inbound cost
+        // to a topic, so verify cost had to be inferred from cache eviction
+        // rates. Two hermetic nodes — B publishes on one caps-class topic
+        // and the announce blob topic, its recorded EAGER frames are the
+        // wire B→A, and A counts them off the decoded header alone. Exactly
+        // those two classes may move.
+        let node_b = test_node().await;
+        let node_a = test_node().await;
+        let signing = Arc::new(SigningContext::from_keypair(
+            &crate::identity::AgentKeypair::generate().unwrap(),
+        ));
+        let b = PubSubManager::new(node_b, Some(Arc::clone(&signing))).expect("publisher manager");
+        let a = PubSubManager::new_with_participation(
+            node_a,
+            None,
+            None,
+            ParticipationMode::Full,
+            "operator_relay",
+        )
+        .expect("receiver manager");
+        let relay_peer = PeerId::new([9; 32]);
+        *b.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![relay_peer],
+            sends: Vec::new(),
+        });
+        let caps = crate::dm_capability::DM_CAPABILITY_TOPIC;
+        let blob = crate::announce_blob::ANNOUNCE_BLOB_TOPIC;
+        for name in [caps, blob] {
+            let _sub = b.subscribe(name.to_string()).await;
+            b.set_topic_peers_for_test(TopicId::from_entity(name.as_bytes()), vec![relay_peer])
+                .await;
+            b.publish(name.to_string(), Bytes::from(format!("wire-{name}")))
+                .await
+                .expect("class publish");
+        }
+        let mut caps_bytes = 0_u64;
+        let mut blob_bytes = 0_u64;
+        for (peer, message) in recorded_eager(&b) {
+            let frame = postcard::to_stdvec(&message).unwrap();
+            let len = frame.len() as u64;
+            let topic = message.header.topic;
+            if topic == TopicId::from_entity(caps.as_bytes()) {
+                caps_bytes += len;
+            } else if topic == TopicId::from_entity(blob.as_bytes()) {
+                blob_bytes += len;
+            } else {
+                continue;
+            }
+            a.handle_incoming(peer, Bytes::from(frame)).await;
+        }
+
+        let snapshot = serde_json::to_value(a.inbound_by_topic_snapshot()).unwrap();
+        let classes = snapshot.as_object().expect("class map");
+        assert_eq!(
+            classes.len(),
+            2,
+            "only the two published classes may appear: {snapshot}"
+        );
+        assert_eq!(snapshot["caps"]["eager"]["frames"], 1);
+        assert_eq!(snapshot["caps"]["eager"]["bytes"], caps_bytes);
+        assert_eq!(snapshot["announce_blob"]["eager"]["frames"], 1);
+        assert_eq!(snapshot["announce_blob"]["eager"]["bytes"], blob_bytes);
+        assert_eq!(
+            snapshot["caps"].as_object().unwrap().len(),
+            1,
+            "only the delivered kind may appear under caps: {snapshot}"
+        );
+        assert!(
+            caps_bytes > 0 && blob_bytes > 0,
+            "bytes must be the real wire lengths"
         );
     }
 
