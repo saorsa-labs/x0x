@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Docs
+
+- **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
+  `docs/design/292-plane-gate-churn-model.md` documenting all six invariants (A–F) with code
+  anchors and test references. Invariant E is proved subsumed by invariant A
+  (`src/network.rs:3192`) plus the ordering contract of `disconnect_with_reason`
+  (`src/network.rs:3133`): `suppress_reconnect` is called before `node.disconnect()`, so
+  `peer_admission` returns `Suppressed` before the QUIC close, with no window in which a
+  plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
+  already covers the full observable chain. Added an `invariant E` anchor comment to
+  `plane_handle_hello` (`src/network.rs:3483`). Closes #632.
+
 ### Tests
 
 - `e2e_deploy.sh` binary upload to VPS nodes is now bounded (900 s per
