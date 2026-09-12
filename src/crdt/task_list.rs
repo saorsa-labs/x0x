@@ -351,7 +351,24 @@ impl TaskList {
     /// Callers MUST have verified the delta against the serving holder's
     /// declared digest first — without that binding, any holder could
     /// truncate local state at will.
-    pub(crate) fn prune_to_served_set(&mut self, delta: &TaskListDelta) -> usize {
+    ///
+    /// Policy (issue #654): deletion is content. `merge_delta` applies
+    /// and records removal evidence only from an envelope-verified writer
+    /// the list accepts content from — the adopt gate must not be a side
+    /// door around that decision. A holder whose adds the policy would
+    /// drop (non-member of a group-scoped list, or an unverified `None`
+    /// envelope) must not be able to prune either; on such writers the
+    /// prune is a no-op. Open lists (no authorized set) accept any
+    /// verified writer, as before.
+    pub(crate) fn prune_to_served_set(
+        &mut self,
+        delta: &TaskListDelta,
+        writer: Option<&AgentId>,
+    ) -> usize {
+        let content_allowed = writer.is_some_and(|w| self.is_authorized_content_writer(w));
+        if !content_allowed {
+            return 0;
+        }
         let evidenced: Vec<TaskId> = delta
             .removed_tasks
             .iter()
@@ -532,7 +549,6 @@ impl TaskList {
     /// helper (explicit removal deltas and the digest-verified adopt prune)
     /// represents a deletion this replica has now seen, and a later serve
     /// from this replica must forward that evidence.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn delta_remove_task(&mut self, task_id: &TaskId) {
         self.known_removed.insert(*task_id);
         if self.task_data.contains_key(task_id) {

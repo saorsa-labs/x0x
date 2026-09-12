@@ -295,7 +295,10 @@ struct SnapshotBody {
 struct SnapshotBodyV2 {
     list: TaskList,
     seq_counter: u64,
-    #[serde(default)]
+    /// No `serde(default)`: bincode is positional (non-self-describing),
+    /// so the field is always read from the stream — a default could
+    /// never engage, and every v2 writer always serializes it. The v1/v2
+    /// split is the magic prefix, not a missing field.
     known_removed: std::collections::HashSet<TaskId>,
 }
 
