@@ -3,6 +3,99 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Fixed
+
+- **Accept loop no longer exits permanently on a `None` accept (#677,
+  found during #510).** ant-quic's `accept()` returns `None` without
+  `register_connected_peer` when a re-keyed inbound registration lands on
+  the Rejected path (a simultaneous-open tiebreaker loser) or errors; the
+  x0x accept loop treated every `None` as shutdown and `break`ed — after
+  which the daemon never accepted another inbound connection until
+  restart. In the #510 CI signature this is why the rebuilt owner's dial
+  sat unadmitted while both sides drained the 20 s barrier. The loop now
+  `continue`s past a `None` and exits only when the endpoint is actually
+  shutting down (`Node::is_running`, the same token ant-quic's shutdown
+  drives; x0x's own shutdown aborts the task regardless). A rejected
+  accept consumed exactly one queued inbound, so continuing simply waits
+  for the next. Regression test drives the real `None` branch through a
+  one-shot test-only probe (organically producing a re-keyed Rejected
+  inbound requires winning a probabilistic tiebreaker) and asserts the
+  next inbound is still admitted.
+
+- **Reconnect Phase 2 falls back to ant-quic's internal bootstrap cache
+  when x0x's own cache misses (#510).** x0x's cache entries are dropped by
+  explicit disconnects and cache maintenance, while ant-quic's
+  `successful_candidates` map (fed by `record_bootstrap_direct_connection`
+  on every successful direct connection) survives them. A cache miss used
+  to abort `connect_cached_peer` with "not found in bootstrap cache", so
+  the reconnect silently did nothing — the rebuilt-owner #510 signature:
+  post-connect cleanup cleared the entry and `is_connected` stayed 0 for
+  the whole barrier. The miss now falls back to a peer-authenticated dial
+  with no address hints, letting the endpoint enrich the dial from its
+  internal cache (and peer directory); it fails cleanly when neither knows
+  the peer. Regression test: a cache-disabled node loses its connection →
+  reconnect still redials from the transport cache (fails on the
+  pre-fallback code by construction).
+
+- **Reconnect no longer dials the bootstrap cache into a peer that just
+  reconnected inbound (#510).** Between a reconnect attempt's top-of-attempt
+  `is_connected` check and its Phase 2 (`connect_cached_peer`) fallback,
+  Phase 1's discovery-cache dials can burn up to 5 s each — during which the
+  peer may recover via another path (a rebuilt owner dialing us with the
+  same machine key). The unguarded Phase 2 dial then opened a second
+  connection family alongside the just-established inbound one: a
+  simultaneous open whose ant-quic tiebreaker is a 50/50 coin flip, and
+  losing it left one side with `connected_peers = 0` for the whole barrier
+  window (the hs_f2 restart flake, ~3–5% of CI runs). `schedule_reconnect`
+  now re-checks `is_connected` at the call-site between the two phases and
+  aborts the attempt — defense in depth; the tiebreaker root cause is fixed
+  separately in ant-quic#277/#278. Regression:
+  `reconnect_phase2_dial_aborted_when_peer_connects_during_phase1`, which
+  forces the interleaving deterministically (blackholed old port, wire-level
+  proof Phase 1 is in flight, inbound re-dial, single-flight-tracker drain).
+
+### Changed
+
+- saorsa-gossip pins bumped 0.5.77 → 0.5.78 (all eleven crates): PlumTree dedups
+  inbound EAGER by `msg_id` before the ML-DSA-65 verify (saorsa-labs/saorsa-gossip#56,
+  #674) — on a bootstrap ~28% of inbound EAGER frames were duplicates that were
+  verified and then discarded. New counter `eager_duplicate_dropped_pre_verify`
+  under `pubsub_stages` in `GET /diagnostics/gossip`; a wiring test pins the key.
+  The #501 legacy-bus meter premise moves to pubsub 0.5.78.
+
+### Added
+
+- **`inbound_by_topic` counters on `GET /diagnostics/gossip` (#674 item 4).**
+  Inbound PubSub frames and bytes are now attributed to a topic class
+  (`announce_blob`, `caps`, `dm_bus`, `presence`, `other`) and PlumTree kind
+  (`eager`, `ihave`, `iwant`, …), counted in `handle_incoming` off the
+  already-decoded header before any signature work — refused and
+  later-discarded frames still count. Previously inbound verify cost could
+  only be inferred from message-cache eviction rates. Keys are documented in
+  `docs/diagnostics.md`. The measurement gap this closes is what forced the
+  #674 design to proxy per-topic inbound rates from eviction counters.
+
+### Tests
+
+- The hs_f2 restart tests no longer settle on a fixed 300 ms sleep between
+  the owner shutdown and rebuild (#510, replacing the #666 settle). Both
+  restart sites (`integration_treekem_home_rename_restart_single_announce_
+  end_to_end` and `integration_real_home_provision_rename_restart_join_e2e`)
+  now capture the owner's stable PeerId before the shutdown and poll (20 ms,
+  5 s `#510`-tagged bound) until the joiner observes the old connection as
+  gone, removing the reconnect-vs-`connect_addr` overlap that caused the
+  simultaneous open instead of guessing its duration.
+- The hs_f2 restart owners no longer disable the peer cache (#510). Both
+  `build_owner_agent` closures now point `.with_peer_cache_dir` at the
+  test's own `owner_dir/peers` instead of `with_peer_cache_disabled()`: the
+  bootstrap cache legitimately keeps the joiner's address across the
+  restart (same dir for the initial and rebuilt owner), and a disabled —
+  in-memory-only — cache turned any post-connect cleanup that drops the
+  entry into a PERMANENT disconnect for the rebuilt owner, whose reconnect
+  then had no address left to dial. The #456 hermeticity concern is cache
+  sharing, not persistence, so a per-test dir preserves isolation. The
+  deterministic settle wait is unchanged.
+
 ## [v0.42.2] - 2026-09-12
 ### Fixed
 
