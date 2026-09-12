@@ -27,6 +27,24 @@ All notable changes to this project will be documented in this file.
   `asymmetric_signed_capability_convergence_over_relay`). Publish-side
   cadence only; no caps topic is retired and no wire shape changes.
 
+- **`announce/v3/blob` CPU amplification (#656).** The blob responder's
+  cache-first branch let every node that had ever cached peer X's blob
+  answer a request for X, so one miss drew a broadcast response from every
+  cache holder (observed 46.7 msgs/s, 825 KB/s against a documented
+  steady state of ~0.045 fetches/s). The responder now answers only when
+  this node owns the requested digest (its own current
+  `(user_id, agent_certificate)` pair); cached peer blobs are no longer
+  served, and the shared anonymous digest (`(None, None)`, computed by
+  every cert-less node since user keys are opt-in) is never served — it
+  has no unique owner, and production requesters already exclude it via
+  `fetch_warranted`. The responder's 1 s coalescing window is now tracked
+  per digest instead of one global instant, so a busy blob (or a pair
+  rotation's fresh digest) is not starved into the fetcher's 5 s
+  timeout-retry loop; the map only ever holds this node's own served
+  digests, so it needs no bound. Publish-side only; request/response wire
+  shapes unchanged, 0.41.x/0.42.0 peers unaffected.
+
+
 - **Redundant ML-DSA verify per inbound IWANT (#656).** The 0.42.0 egress
   metering's `track_iwant` (`src/gossip/egress.rs`) performed a full
   ML-DSA-65 signature verification on every inbound IWANT frame solely to
