@@ -1807,19 +1807,34 @@ mod tests {
     /// The fixture is the consumer's half of that: agent A publishes in
     /// on-demand mode with a shortened advert window, NOBODY sends A a
     /// targeted request, and B ingests the mesh-wide topics into a store
-    /// whose TTL is shortened in the same proportion. B's record of A must
-    /// stay current — and keep passing the exact production strict-send
-    /// gate — across several TTL windows. On origin/main B's record expires
-    /// one TTL after A's single startup advert and never returns.
+    /// whose TTL is shortened too. B's record of A must stay current — and
+    /// keep passing the exact production strict-send gate — across several
+    /// TTL windows. On origin/main B's record expires one TTL after A's
+    /// single startup advert and never returns, whatever the TTL is.
+    ///
+    /// TIMING (CI round 2, run 103516993318). A paused tokio clock cannot
+    /// drive this fixture: the store's `expires_at` is a
+    /// `std::time::Instant` and its acceptance gate compares
+    /// `now_unix_ms()` SystemTime values, neither of which
+    /// `tokio::time::advance` moves — virtual time would freeze the TTL
+    /// instead of exercising it. So the test stays on the real clock and
+    /// buys determinism with ratio instead of luck: worst-case republish is
+    /// `ADVERT_WINDOW + ADVERT_WINDOW / 10` = 330 ms against a 3 s TTL,
+    /// leaving 2.67 s of slack for publish -> gossip -> ingest on every
+    /// refresh. The first version allowed 260 ms and lost it on a 2-vCPU
+    /// runner.
     #[tokio::test]
     async fn on_demand_publisher_refreshes_steady_advert_without_any_requests() {
-        // Shortened but proportional to production: the advert window is
-        // shorter than the cache TTL (600 s < 900 s there), so one
-        // on-time republish per window keeps every consumer current.
-        const ADVERT_WINDOW: Duration = Duration::from_millis(400);
-        const CACHE_TTL: Duration = Duration::from_millis(700);
-        // > 3 cache TTLs of observation after the first ingest.
-        const OBSERVE: Duration = Duration::from_millis(2_500);
+        // The advert window must stay well inside the cache TTL, as in
+        // production (600 s window, 900 s TTL). Shortened here on both
+        // sides and then widened: the TTL is 9x the worst-case republish
+        // interval, so scheduler jitter on a loaded runner cannot reach the
+        // expiry boundary.
+        const ADVERT_WINDOW: Duration = Duration::from_millis(300);
+        const CACHE_TTL: Duration = Duration::from_secs(3);
+        // Slightly over three cache TTLs of observation, so the record must
+        // survive on republishes alone many times over.
+        const OBSERVE: Duration = Duration::from_millis(9_500);
 
         let kp_a = AgentKeypair::generate().expect("keygen");
         let signing_a = Arc::new(SigningContext::from_keypair(&kp_a));
@@ -1833,18 +1848,24 @@ mod tests {
             PubSubManager::new(make_node().await, Some(Arc::clone(&signing_a))).expect("pubsub"),
         );
 
-        // B: a second agent's view of A, with the proportionally shortened
-        // cache TTL.
+        // B: a second agent's view of A, with the shortened cache TTL.
         let agent_b = AgentId([0x4B; 32]);
         let store_b = Arc::new(CapabilityStore::with_ttl(CACHE_TTL));
         let mut adverts_b = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
         let mut digests_b = pubsub
             .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
             .await;
+        // Counting ingested adverts separates the two ways this test can
+        // fail: zero republishes is the #664 regression itself, while
+        // republishes that arrive but land late would be ingest latency.
+        let ingested = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let advert_store = Arc::clone(&store_b);
+        let advert_counter = Arc::clone(&ingested);
         let advert_ingest = tokio::spawn(async move {
             while let Some(message) = adverts_b.recv().await {
-                ingest_verified_capability_advert(&advert_store, agent_b, &message);
+                if ingest_verified_capability_advert(&advert_store, agent_b, &message) {
+                    advert_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         });
         let digest_store = Arc::clone(&store_b);
@@ -1873,7 +1894,7 @@ mod tests {
         .expect("spawn on-demand service");
 
         // Wait for B's first sight of A (the initial publishable cycle).
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while store_b.lookup_binding(&agent_a).is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1884,20 +1905,36 @@ mod tests {
 
         // No targeted request is ever sent to A. Poll continuously: a single
         // observation of an expired record is the regression.
-        let until = std::time::Instant::now() + OBSERVE;
+        let started = std::time::Instant::now();
+        let until = started + OBSERVE;
         let mut samples: u32 = 0;
         while std::time::Instant::now() < until {
             let binding = store_b.lookup_binding(&agent_a);
             assert!(
                 crate::capability_binding_supports_durable_ack(binding.as_ref()),
-                "B's record of A went stale with no request traffic after {} sample(s): \
-                 a strict send would refuse with AckSemanticsUnavailable",
-                samples
+                "B's record of A went stale with no request traffic {} ms in \
+                 ({} sample(s), {} advert(s) ingested, {:?} cache TTL): a strict \
+                 send would refuse with AckSemanticsUnavailable",
+                started.elapsed().as_millis(),
+                samples,
+                ingested.load(std::sync::atomic::Ordering::Relaxed),
+                CACHE_TTL,
             );
             samples += 1;
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(samples > 0, "observation loop never sampled");
+
+        // The record survived on republishes, not on one long-lived entry:
+        // over `OBSERVE` the timer owes roughly `OBSERVE / ADVERT_WINDOW`
+        // adverts, and more than the three TTLs observed proves the cache
+        // was actually refilled rather than never expiring.
+        let republishes = ingested.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            republishes > 4,
+            "expected the on-demand timer to republish repeatedly over \
+             {OBSERVE:?}, saw {republishes}"
+        );
 
         // The `caps/v2/digest` extension rides the same publish cycle and
         // carries the same TTL, so a set bit this far past startup proves
