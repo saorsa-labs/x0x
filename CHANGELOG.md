@@ -3,7 +3,6 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
-
 ### Tests
 
 - `e2e_deploy.sh` binary upload to VPS nodes is now bounded (900 s per
@@ -14,6 +13,17 @@ All notable changes to this project will be documented in this file.
   (#682). Logic extracted into `tests/lib/deploy_upload.sh`
   (sourced by both `e2e_deploy.sh` and `tests/e2e_deploy_upload_test.sh`),
   which drives the library functions via `X0X_DEPLOY_SSH_CMD`.
+
+- **`hs_f2` restart e2e: bounded retry on the announce-blob fetch window
+  (#681).** The owner's `ensure_blob` spawns a single background fetch with a
+  5 s timeout; if the responder is slow under load the fetch times out and the
+  product would retry on its next heartbeat, but this test runs no
+  short-interval certified heartbeat. The cert-event wait is now a loop: each
+  iteration polls for `BLOB_FETCH_TIMEOUT_SECS + 3 s`; on timeout it
+  re-triggers `announce_identity` so `ensure_blob` spawns a fresh fetch. Total
+  wall time stays within the original 45 s guard. A `DIAG
+  hs_f2_restart phase=blob_fetch_window_missed` line is emitted on each retry
+  so CI logs show when the retry path was exercised.
 
 - The #510 settle barrier no longer panics when the transport fails to close
   the stale connection within 5 s (#510, ant-quic#283 workaround). ant-quic's
