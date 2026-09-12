@@ -3,19 +3,6 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
-
-### Added
-
-- **`inbound_by_topic` counters on `GET /diagnostics/gossip` (#674 item 4).**
-  Inbound PubSub frames and bytes are now attributed to a topic class
-  (`announce_blob`, `caps`, `dm_bus`, `presence`, `other`) and PlumTree kind
-  (`eager`, `ihave`, `iwant`, …), counted in `handle_incoming` off the
-  already-decoded header before any signature work — refused and
-  later-discarded frames still count. Previously inbound verify cost could
-  only be inferred from message-cache eviction rates. Keys are documented in
-  `docs/diagnostics.md`. The measurement gap this closes is what forced the
-  #674 design to proxy per-topic inbound rates from eviction counters.
-
 ### Fixed
 
 - **Stale capability adverts no longer cost an ML-DSA-65 verify (#674 item 1).**
@@ -33,6 +20,46 @@ All notable changes to this project will be documented in this file.
   reaches the verify. Skips are counted as `caps_advert_prefiltered_stale`
   on `GET /diagnostics/dm`.
 
+- **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3
+  rules out "a marker in isolation" establishing a supported deployment,
+  but the supervised classification trusted `X0X_SUPERVISED=1` alone: a
+  launchd job verified by `x0x autostart --repair` whose `KeepAlive` was
+  later removed or made conditional still classified `SupervisedExit`,
+  exited 0 for the upgrade — and nothing restarted it. The daemon went
+  down and stayed down, silently. `resolve_restart_plan` now requires, at
+  every apply, that the **loaded** launchd job policy for this exact
+  instance (matched by program basename plus argument tail, so
+  multi-instance `--name` jobs cannot verify each other) holds an
+  unconditional keep-alive — read back via `launchctl print`, never the
+  on-disk plist alone. Each label is probed in the `gui/<uid>` domain
+  first with a fallback to `user/<uid>` (the two per-user launchd domains
+  are disjoint, so a gui-only probe would refuse a legitimately-loaded
+  marker job forever — round-2 review), and the decision core is
+  unit-tested against captured `launchctl print` output for every
+  fail-closed arm. Anything short of a confirmed guarantee refuses the
+  apply before replacement with a diagnostic that names what was found.
+  `INVOCATION_ID`/systemd signals are unchanged (no launchd to read); the
+  systemd-side readback remains open under §3. Also documents the
+  platform-validated manual recovery procedure for a failed supervised
+  upgrade (#616, ADR-0061 §6) — diagnose, restore `<target>.backup`,
+  reconcile `upgrade-handoff.json`, re-enter through the manager — with
+  exact launchd and systemd commands, cross-linked from the new refusal
+  and from the apply logs.
+
+- **Group task-list policy now gates the bootstrap prune (#654).** The
+  digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
+  acted directly on the wire delta's removal evidence, so on a
+  group-scoped list a holder the content policy would reject (a
+  non-member, or an unsigned serve with no envelope-verified writer)
+  could still DELETE tasks by serving empty-tag removal evidence — and
+  the pruned replica would forward that evidence fleet-wide. Deletion is
+  content: the prune now applies the same `is_authorized_content_writer`
+  check as `merge_delta` (open lists keep accepting any verified writer,
+  so deletion cold-sync is unchanged there). Also from the #652 review:
+  dropped the inert `#[serde(default)]` on `SnapshotBodyV2.known_removed`
+  (bincode is positional — a default could never engage; the v1/v2 split
+  is the magic prefix) and the stale `#[allow(dead_code)]` on
+  `delta_remove_task` (it has production call sites).
 - **Slow-consumer Close(1013) survives the writer's flush budget (#287,
   round 2).** The WS writer owned the socket sink; when its bounded
   Close(1013) flush (2 s) expired against a stalled reader, the writer task
@@ -52,9 +79,42 @@ All notable changes to this project will be documented in this file.
   exit + handoff) and integration
   `ws_slow_close_frame_survives_flush_budget_expiry` (self-DM-triggered
 
+### Added
+
+- **`inbound_by_topic` counters on `GET /diagnostics/gossip` (#674 item 4).**
+  Inbound PubSub frames and bytes are now attributed to a topic class
+  (`announce_blob`, `caps`, `dm_bus`, `presence`, `other`) and PlumTree kind
+  (`eager`, `ihave`, `iwant`, …), counted in `handle_incoming` off the
+  already-decoded header before any signature work — refused and
+  later-discarded frames still count. Previously inbound verify cost could
+  only be inferred from message-cache eviction rates. Keys are documented in
+  `docs/diagnostics.md`. The measurement gap this closes is what forced the
+  #674 design to proxy per-topic inbound rates from eviction counters.
 
 ### Tests
 
+- A2A binding fixtures no longer fail on a transient setup dial under
+  full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
+  ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s
+  floor) can be starved or socket-errored by ambient suite load, after
+  which the dial ladder skips hole-punch by design (an address-only dial
+  cannot coordinate) and surfaces `AllStrategiesFailed` quoting
+  "address-only dial: hole-punch requires the target's PeerId" — the
+  reported release-gate flake. The setup dial is now retried once; a
+  persistent failure still fails the test loudly with the last error, so
+  no round-trip observation is skipped.
+
+- The two #316 loopback tests no longer flake under full parallel load
+  (#316). `direct_send_with_require_ack_round_trips_to_live_peer` asked
+  the post-send liveness probe for a 3 s budget — the daemon honours the
+  caller-supplied budget exactly, and the recorded ~18 s failures were
+  the probe starving under ambient suite load after the durable send
+  itself completed; the fixture now requests 10 s (the bundled GUI client
+  already ships 5 s) while the assertion stays strict (ok + finite RTT).
+  The setup dial of `suppressed_peer_inbound_redial_is_rejected` — the
+  0.16 s fast-fail was the same transient setup-dial class — gets the
+  same bounded retry. Observation windows, assertions, and the nextest
+  serial-group scheduling are unchanged.
 - **#287 root cause round 1 — fixture self-update contamination (the
   ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
   failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised

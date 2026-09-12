@@ -535,12 +535,22 @@ async fn direct_send_with_require_ack_round_trips_to_live_peer() {
 
     let payload = base64::engine::general_purpose::STANDARD.encode(b"plc-ack-test");
     let alice_client = alice.authed_client(DURABLE_SEND_CLIENT_TIMEOUT);
+    // Issue #316: 3000 ms starved under full-suite ambient load — both
+    // recorded failures (~18 s total) were the durable send completing and
+    // then the post-send probePeer exhausting its caller-supplied budget
+    // because the daemon processes had not been scheduled for seconds. The
+    // daemon clamps the budget to [100 ms, 30 s] and honours exactly what
+    // the caller asks, so this is a fixture choice, not a product deadline:
+    // the bundled GUI client already uses 5000. Give the probe the same
+    // order of headroom the send observer gets (DURABLE_SEND_CLIENT_TIMEOUT
+    // = 30 s). The assertion itself stays strict: the probe must still
+    // return ok with a finite RTT, or the test fails.
     let r = alice_client
         .post(alice.url("/direct/send"))
         .json(&serde_json::json!({
             "agent_id": bob_agent_id,
             "payload": payload,
-            "require_ack_ms": 3000,
+            "require_ack_ms": 10_000,
         }))
         .send()
         .await
