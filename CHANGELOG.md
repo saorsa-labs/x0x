@@ -54,7 +54,10 @@ All notable changes to this project will be documented in this file.
   `is_specific_interface_bind`): specifically bound listeners advertise
   only the bound address; wildcard-bound listeners (production bootstraps
   bind `[::]`) and observed/external addresses are unchanged.
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/main
 - **Group task-list policy now gates the bootstrap prune (#654).** The
   digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
   acted directly on the wire delta's removal evidence, so on a
@@ -69,7 +72,10 @@ All notable changes to this project will be documented in this file.
   (bincode is positional — a default could never engage; the v1/v2 split
   is the magic prefix) and the stale `#[allow(dead_code)]` on
   `delta_remove_task` (it has production call sites).
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/main
 
 ### Tests
 
