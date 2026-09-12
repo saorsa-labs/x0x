@@ -2575,6 +2575,17 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     // daemon restart is clean: shut the old agent down, THEN rebuild.
     owner_agent.shutdown().await;
     drop(owner_agent);
+    // #510: let the joiner's ant-quic finish unwinding the old connection's
+    // CONNECTION_CLOSE before the rebuilt owner dials it again. Without this
+    // settle the new handshake can arrive inside that window and be dropped as
+    // a stale generation, so `connect_addr` returns Ok yet `connected_peers`
+    // is 0 on the first barrier poll and stays 0 for the whole 20 s deadline
+    // (observed on CI only; local reconnects take 123–155 ms). 300 ms is ~2×
+    // the observed reconnect, far below the 10 s legacy grace and the 20 s
+    // barrier, and the barrier below still gates strictly on
+    // `gossip_plane_peers`, so a genuine never-connects failure still fails
+    // at the same assertion.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
     // Reconnect the restarted daemon to the joiner and let the mesh settle —
@@ -3328,6 +3339,9 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     // the replacement — shut the old agent down first, THEN rebuild.
     owner_agent.shutdown().await;
     drop(owner_agent);
+    // #510: same settle as the TreeKEM variant — let the joiner finish
+    // unwinding the old connection before the rebuilt owner dials it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
     // #510 RCA instrumentation (mirrors the TreeKEM variant): watch BOTH
