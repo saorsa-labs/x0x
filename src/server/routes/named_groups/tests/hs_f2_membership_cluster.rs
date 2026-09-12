@@ -3339,6 +3339,9 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     // the replacement — shut the old agent down first, THEN rebuild.
     owner_agent.shutdown().await;
     drop(owner_agent);
+    // #510: same settle as the TreeKEM variant — let the joiner finish
+    // unwinding the old connection before the rebuilt owner dials it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
     // #510 RCA instrumentation (mirrors the TreeKEM variant): watch BOTH
