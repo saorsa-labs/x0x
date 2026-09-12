@@ -590,6 +590,15 @@ impl std::fmt::Debug for PubSubManager {
 /// Delivery robustness is unchanged: PlumTree's lazy half (IHAVE/IWANT)
 /// still repairs peers outside the eager tree.
 const FULL_EAGER_DEGREE_CEILING: usize = 6;
+// Compile-time pin (#674 design C1): the ceiling must equal sg's promotion
+// floor so the all-cooled rescue path swaps eager members instead of growing
+// toward sg's stock 12. A runtime test cannot discriminate this in steady
+// state (any ceiling >= 6 promotes to 6), so the constant itself is the
+// contract; raising it past 6 (or using sg's `0` sentinel) fails to compile.
+const _: () = assert!(
+    FULL_EAGER_DEGREE_CEILING == 6,
+    "FULL_EAGER_DEGREE_CEILING must equal sg's MIN_EAGER_DEGREE (6); see #674 design C1"
+);
 
 impl PubSubManager {
     /// Create a new pub/sub manager.
@@ -2933,20 +2942,6 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
-    }
-
-    /// Pins the ceiling's value (#674 design C1): it must equal sg's promotion
-    /// floor so the all-cooled rescue path swaps eager members instead of
-    /// growing toward sg's stock 12. A behavioural test cannot discriminate
-    /// this in steady state (any ceiling >= 6 promotes to 6), so the constant
-    /// itself is the contract; raising it past 6 restores the rescue growth.
-    #[test]
-    fn full_eager_degree_ceiling_equals_sg_promotion_floor() {
-        assert_eq!(FULL_EAGER_DEGREE_CEILING, 6);
-        assert!(
-            FULL_EAGER_DEGREE_CEILING > 0,
-            "0 is sg's sentinel for the stock ceiling of 12"
-        );
     }
 
     #[tokio::test]
