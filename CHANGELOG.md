@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Changed
+
+- **Full-participation eager degree ceiling lowered from 12 to 6 (#674
+  item 3).** `ensure_eager_ceiling` passed sg's `0` sentinel (stock
+  `MAX_EAGER_DEGREE = 12`) for Full nodes; it now passes 6 — sg's
+  documented promotion floor (`MIN_EAGER_DEGREE`) — so a bootstrap's eager
+  fan-out per topic is bounded by the degree needed for coverage, not by
+  its peer count (measured anchor: up to 12 of ~27 peers, feeding 242.4
+  eager sends/s at 4.27 MB/s, the send path that owns the non-verify half
+  of daemon CPU). Robustness is preserved by PlumTree's lazy half: peers
+  outside the eager tree still receive IHAVE digests and repair via IWANT.
+  On sg 0.5.77 steady-state promotion is already MIN-bounded at 6, so the
+  change caps eager excursions (the all-cooled publish-rescue path can
+  reach the ceiling; degree maintenance demotes above it) rather than
+  shifting the steady state. Local topology parameter — no wire change.
+
 ### Fixed
 
 - **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3

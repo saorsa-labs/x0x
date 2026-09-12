@@ -578,6 +578,18 @@ impl std::fmt::Debug for PubSubManager {
     }
 }
 
+/// Eager degree ceiling for Full-participation nodes (#674 item 3).
+///
+/// Was `0` — sg's sentinel for its stock `MAX_EAGER_DEGREE = 12`. 6 is sg's
+/// documented promotion floor (`MIN_EAGER_DEGREE`), so a Full node's eager
+/// fan-out is bounded by the degree needed for coverage, not by its peer
+/// count: measured on the testnet anchor, a bootstrap eager-pushed to up to
+/// 12 peers per topic out of ~27 while carrying 242.4 eager sends/s at
+/// 4.27 MB/s — the send path that owns the non-verify half of daemon CPU.
+/// Delivery robustness is preserved by PlumTree's lazy half: peers outside
+/// the eager tree still receive IHAVE digests and can repair via IWANT.
+const FULL_EAGER_DEGREE_CEILING: usize = 6;
+
 impl PubSubManager {
     /// Create a new pub/sub manager.
     ///
@@ -699,7 +711,7 @@ impl PubSubManager {
         self.eager_ceiling_initialized
             .get_or_init(|| async {
                 let degree = if self.participation.forwards_passthrough() {
-                    0
+                    FULL_EAGER_DEGREE_CEILING
                 } else {
                     self.egress_config.leaf_max_eager_degree
                 };
@@ -2878,6 +2890,47 @@ mod tests {
                 !topics.contains(&TopicId::from_entity(name.as_bytes())),
                 "periodic refresh must use the stored raw DM ID"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_participation_eager_fanout_is_capped_at_six() {
+        // Why (#674 item 3): a Full node's fan-out is bounded by the eager
+        // degree needed for coverage, not by its peer count — sg's stock
+        // ceiling of 12 let a bootstrap eager-push to up to 12 peers per
+        // topic out of ~27, feeding the 242 sends/s · 4.27 MB/s relay send
+        // path. With 12 candidate peers, every publish must attempt
+        // exactly 6 EAGER sends (sg's promotion floor), before and after a
+        // membership refresh — never more, whatever the peer count.
+        let manager = slice1_manager(2, true).await;
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: (1..=12).rev().map(|id| PeerId::new([id; 32])).collect(),
+            sends: Vec::new(),
+        });
+        let name = "full-eager-ceiling";
+        let mut sub = manager.subscribe(name.into()).await;
+
+        for round in 0..2 {
+            if round == 1 {
+                manager.refresh_topic_peers().await;
+            }
+            let before = eager_outbound_attempt_msgs(&manager);
+            manager
+                .publish(name.into(), Bytes::from(vec![round]))
+                .await
+                .unwrap();
+            let attempted = (eager_outbound_attempt_msgs(&manager) - before) as usize;
+            let sends = await_eager_settled_attempts(&manager, attempted).await;
+            assert_eq!(
+                sends.len(),
+                6,
+                "Full eager fan-out must equal the 6-peer ceiling with 12 candidates"
+            );
+            recorded_eager(&manager);
+            assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap()
+                .is_some());
         }
     }
 
