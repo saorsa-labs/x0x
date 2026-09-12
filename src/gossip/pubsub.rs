@@ -716,6 +716,31 @@ impl std::fmt::Debug for PubSubManager {
     }
 }
 
+/// Eager degree ceiling for Full-participation nodes (#674 design C1).
+///
+/// Was `0` — sg's sentinel for its stock `MAX_EAGER_DEGREE = 12`. sg promotes
+/// eager peers up to `MIN_EAGER_DEGREE.min(ceiling)` and `MIN_EAGER_DEGREE` is
+/// 6, so in steady state a ceiling of 12 and a ceiling of 6 yield the SAME
+/// eager degree: this constant changes no steady-state send rate. What it
+/// bounds is the all-cooled publish rescue path, where sg grows the eager set
+/// toward the ceiling instead of swapping members — with 12 that growth is the
+/// send amplification the #380/#656 storms ride on; with 6 the set swaps.
+/// Delivery robustness is unchanged: PlumTree's lazy half (IHAVE/IWANT)
+/// still repairs peers outside the eager tree.
+const FULL_EAGER_DEGREE_CEILING: usize = 6;
+// Compile-time pin (#674 design C1): the ceiling must equal sg's promotion
+// floor so the all-cooled rescue path swaps eager members instead of growing
+// toward sg's stock 12. A runtime test cannot discriminate this in steady
+// state (any ceiling >= 6 promotes to 6), so the constant itself is the
+// contract; raising it past 6 (or using sg's `0` sentinel) fails to compile.
+// This does NOT track sg's floor: if a future saorsa-gossip raises
+// `MIN_EAGER_DEGREE`, revisit this value so x0x does not cap the backbone
+// below what sg intends.
+const _: () = assert!(
+    FULL_EAGER_DEGREE_CEILING == 6,
+    "FULL_EAGER_DEGREE_CEILING must equal sg's MIN_EAGER_DEGREE (6); see #674 design C1"
+);
+
 impl PubSubManager {
     /// Create a new pub/sub manager.
     ///
@@ -838,7 +863,7 @@ impl PubSubManager {
         self.eager_ceiling_initialized
             .get_or_init(|| async {
                 let degree = if self.participation.forwards_passthrough() {
-                    0
+                    FULL_EAGER_DEGREE_CEILING
                 } else {
                     self.egress_config.leaf_max_eager_degree
                 };
@@ -3039,6 +3064,47 @@ mod tests {
                 !topics.contains(&TopicId::from_entity(name.as_bytes())),
                 "periodic refresh must use the stored raw DM ID"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_participation_eager_fanout_meets_sg_floor_with_twelve_candidates() {
+        // Why (#674 design C1): with 12 candidate peers a Full node must eager-
+        // push to exactly sg's promotion floor (6) per publish, before and after
+        // a membership refresh. This pins the steady-state degree (a floor); it
+        // cannot discriminate the ceiling because sg promotes to
+        // MIN_EAGER_DEGREE.min(ceiling) and any ceiling >= 6 gives the same
+        // result — the ceiling's own value is pinned by
+        // `full_eager_degree_ceiling_equals_sg_promotion_floor` below.
+        let manager = slice1_manager(2, true).await;
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: (1..=12).rev().map(|id| PeerId::new([id; 32])).collect(),
+            sends: Vec::new(),
+        });
+        let name = "full-eager-ceiling";
+        let mut sub = manager.subscribe(name.into()).await;
+
+        for round in 0..2 {
+            if round == 1 {
+                manager.refresh_topic_peers().await;
+            }
+            let before = eager_outbound_attempt_msgs(&manager);
+            manager
+                .publish(name.into(), Bytes::from(vec![round]))
+                .await
+                .unwrap();
+            let attempted = (eager_outbound_attempt_msgs(&manager) - before) as usize;
+            let sends = await_eager_settled_attempts(&manager, attempted).await;
+            assert_eq!(
+                sends.len(),
+                6,
+                "Full eager fan-out must equal sg's 6-peer promotion floor with 12 candidates"
+            );
+            recorded_eager(&manager);
+            assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap()
+                .is_some());
         }
     }
 

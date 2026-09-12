@@ -3,16 +3,6 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
-
-### Changed
-
-- saorsa-gossip pins bumped 0.5.77 → 0.5.78 (all eleven crates): PlumTree dedups
-  inbound EAGER by `msg_id` before the ML-DSA-65 verify (saorsa-labs/saorsa-gossip#56,
-  #674) — on a bootstrap ~28% of inbound EAGER frames were duplicates that were
-  verified and then discarded. New counter `eager_duplicate_dropped_pre_verify`
-  under `pubsub_stages` in `GET /diagnostics/gossip`; a wiring test pins the key.
-  The #501 legacy-bus meter premise moves to pubsub 0.5.78.
-
 ### Fixed
 
 - **Capability adverts went stale in on-demand mode (#664 regression).**
@@ -109,6 +99,28 @@ All notable changes to this project will be documented in this file.
   `run_ws_writer_exits_after_flush_budget_with_close_still_blocked` (bounded
   exit + handoff) and integration
   `ws_slow_close_frame_survives_flush_budget_expiry` (self-DM-triggered
+
+### Changed
+
+- **Full-participation eager degree ceiling lowered from 12 to 6 (#674
+  design C1) — no steady-state send-rate change expected.** sg promotes
+  eager peers to `MIN_EAGER_DEGREE.min(ceiling)` and `MIN_EAGER_DEGREE` is
+  already 6, so a ceiling of 12 and a ceiling of 6 produce the same
+  steady-state degree; the measured 242.4 eager sends/s at 4.27 MB/s on the
+  testnet anchor come from an effective fan-out of ~2.1 and are NOT reduced
+  by this change. What it bounds is the all-cooled publish-rescue path,
+  where sg grows the eager set toward the ceiling instead of swapping
+  members — with 12 that growth is the send amplification the #380/#656
+  storms ride on; with 6 the set swaps. `ensure_eager_ceiling` now passes 6
+  instead of sg's `0` sentinel (stock 12). Delivery robustness unchanged
+  (PlumTree's lazy IHAVE/IWANT half still repairs peers outside the eager
+  tree). Local topology parameter — no wire change.
+- saorsa-gossip pins bumped 0.5.77 → 0.5.78 (all eleven crates): PlumTree dedups
+  inbound EAGER by `msg_id` before the ML-DSA-65 verify (saorsa-labs/saorsa-gossip#56,
+  #674) — on a bootstrap ~28% of inbound EAGER frames were duplicates that were
+  verified and then discarded. New counter `eager_duplicate_dropped_pre_verify`
+  under `pubsub_stages` in `GET /diagnostics/gossip`; a wiring test pins the key.
+  The #501 legacy-bus meter premise moves to pubsub 0.5.78.
 
 ### Added
 
