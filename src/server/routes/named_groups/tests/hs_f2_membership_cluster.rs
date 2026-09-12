@@ -2618,9 +2618,10 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
             // ant-quic#283 workaround: transport did not close the stale survivor;
             // force-disconnect so the joiner's connected_peers entry is removed
             // deterministically before the owner is rebuilt.
-            tracing::warn!(
-                "#510/ant-quic#283: settle barrier expired — stale owner connection \
-                 still live after 5 s; forcing joiner disconnect to unblock rebuild"
+            eprintln!(
+                "DIAG hs_f2_restart phase=settle_barrier_expired \
+                 action=disconnect_stale_owner reason=ant-quic#283 \
+                 peer={old_owner_peer}"
             );
             let _ = joiner_net.disconnect(&old_owner_peer).await;
             break;
@@ -3405,9 +3406,10 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
             // ant-quic#283 workaround: transport did not close the stale survivor;
             // force-disconnect so the joiner's connected_peers entry is removed
             // deterministically before the owner is rebuilt.
-            tracing::warn!(
-                "#510/ant-quic#283: settle barrier expired — stale owner connection \
-                 still live after 5 s; forcing joiner disconnect to unblock rebuild"
+            eprintln!(
+                "DIAG hs_f2_restart phase=settle_barrier_expired \
+                 action=disconnect_stale_owner reason=ant-quic#283 \
+                 peer={old_owner_peer}"
             );
             let _ = joiner_net.disconnect(&old_owner_peer).await;
             break;
