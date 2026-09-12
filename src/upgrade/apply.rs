@@ -105,9 +105,9 @@ impl AutoApplyUpgrader {
     /// cannot be resolved (ADR-0061 §1/§2) or when the handoff could not even
     /// be started (helper spawn failure) — the old process keeps running in
     /// both cases.
-    pub fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
+    pub async fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
         let target_path = current_binary_path()?;
-        let plan = self.resolve_restart_plan(&target_path)?;
+        let plan = self.resolve_restart_plan(&target_path).await?;
         self.trigger_restart(&plan, target_version)
     }
 
@@ -130,19 +130,24 @@ impl AutoApplyUpgrader {
     /// Every apply path calls this **before** replacing any binary, so a
     /// conflicting or unresolvable contract fails while the current image is
     /// still serving and the installed bytes are untouched.
-    pub fn resolve_restart_plan(
+    ///
+    /// Async because the launchd readback shells out (#671): the
+    /// plutil/launchctl subprocesses run via
+    /// [`restart::readback_launchd_policy_offloaded`] on the blocking pool so
+    /// a slow `launchctl` cannot stall the runtime worker mid-upgrade. The
+    /// readback is a no-op unless the recognized signal is the launchd
+    /// marker, so systemd and unsupervised applies shell out to nothing.
+    pub async fn resolve_restart_plan(
         &self,
         binary_path: &Path,
     ) -> Result<restart::RestartPlan, UpgradeError> {
         let signals = restart::SupervisionSignals::sample();
-        // ADR-0061 §3 (#615): at upgrade time — not only at
-        // `x0x autostart --repair` time — verify that the LOADED launchd
-        // policy behind the supervision marker still guarantees a restart
-        // after the supervised exit. `readback_launchd_policy` is a no-op
-        // unless the recognized signal is the launchd marker, so systemd
-        // and unsupervised applies shell out to nothing.
-        let launchd_readback =
-            restart::readback_launchd_policy(&signals, binary_path, &restart::current_argv());
+        let launchd_readback = restart::readback_launchd_policy_offloaded(
+            &signals,
+            binary_path,
+            &restart::current_argv(),
+        )
+        .await;
         restart::resolve_restart_plan(
             self.stop_on_upgrade,
             &signals,
@@ -197,10 +202,11 @@ impl AutoApplyUpgrader {
         // (§2) returns Err with the current process still serving and the
         // installed binaries untouched. The plan is then carried through
         // replacement and restart — never re-derived post-swap.
-        let restart_plan = self.resolve_restart_plan(&target_path)?;
+        let restart_plan = self.resolve_restart_plan(&target_path).await?;
         info!(
             mode = ?restart_plan.mode,
             supervision = restart_plan.supervision_signal.as_deref().unwrap_or("none"),
+            launchd = ?restart_plan.launchd_verified,
             stop_on_upgrade = self.stop_on_upgrade,
             data_root = %restart_plan.data_root.display(),
             spawns_helper = restart_plan.spawns_helper(),
