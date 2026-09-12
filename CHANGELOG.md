@@ -4,7 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`inbound_by_topic` counters on `GET /diagnostics/gossip` (#674 item 4).**
+  Inbound PubSub frames and bytes are now attributed to a topic class
+  (`announce_blob`, `caps`, `dm_bus`, `presence`, `other`) and PlumTree kind
+  (`eager`, `ihave`, `iwant`, …), counted in `handle_incoming` off the
+  already-decoded header before any signature work — refused and
+  later-discarded frames still count. Previously inbound verify cost could
+  only be inferred from message-cache eviction rates. Keys are documented in
+  `docs/diagnostics.md`. The measurement gap this closes is what forced the
+  #674 design to proxy per-topic inbound rates from eviction counters.
+
 ### Fixed
+
+- **Stale capability adverts no longer cost an ML-DSA-65 verify (#674 item 1).**
+  `ingest_verified_capability_advert` and `ingest_verified_digest_extension`
+  (`src/dm_capability_service.rs`) consulted the signature verifier before
+  the store's last-write-wins staleness rule, so on a ~27-peer mesh nearly
+  every advert — the caps family is 43.5 unique msgs/s at two verifies per
+  frame against a 600 s publish cadence — was verified in full and then
+  discarded by `CapabilityStore::insert`. A new
+  `CapabilityStore::would_accept_advert` /
+  `would_accept_digest_extension` pre-check skips the verify for adverts
+  that could not change store state anyway. Safe by construction: the store
+  only ever holds verified entries, a replayed old advert can never refresh
+  the TTL (insert would reject it), and a genuinely newer advert still
+  reaches the verify. Skips are counted as `caps_advert_prefiltered_stale`
+  on `GET /diagnostics/dm`.
 
 - **Slow-consumer Close(1013) survives the writer's flush budget (#287,
   round 2).** The WS writer owned the socket sink; when its bounded

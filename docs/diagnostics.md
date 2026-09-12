@@ -134,6 +134,45 @@ could not schedule the job (full queue / stopped worker). Read the pair as:
 These fields are measurement only. They are not a latency SLA. HTTP status
 codes and sender 504 stage timer field names are unchanged.
 
+## Inbound-by-topic counters (#674)
+
+`GET /diagnostics/gossip` carries an `inbound_by_topic` object that attributes
+inbound PubSub frames and bytes to a topic class, counted off the already-
+decoded PlumTree header before any signature work — so refused and later-
+discarded frames still count. Before this, inbound verify cost could only be
+inferred from per-topic message-cache eviction rates.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/diagnostics/gossip
+# "inbound_by_topic": {
+#   "caps":          { "eager": { "frames": 4312, "bytes": 98211304 } },
+#   "announce_blob": { "eager": { "frames": 2864, "bytes": 49132896 } }
+# }
+```
+
+Shape: `{ class: { kind: { "frames": n, "bytes": n } } }`. Untouched
+class/kind pairs are omitted, so a fresh daemon renders `{}`.
+
+Stable class keys:
+
+| Key | Topics |
+|---|---|
+| `announce_blob` | `x0x/announce/v3/blob` |
+| `caps` | `x0x/caps/v1`, `x0x/caps/v1/request/targeted-v2`, `x0x/caps/v1/response/targeted-v2`, `x0x/caps/v2/digest` |
+| `dm_bus` | `x0x/dm/v1/bus` |
+| `presence` | `x0x.presence.global` |
+| `other` | every other topic id |
+
+Stable kind keys (matching the lowercase naming of `pubsub_stages`
+`outbound_by_kind`): `eager`, `ihave`, `iwant`, `ping`, `ack`, `find`,
+`presence`, `anti_entropy`, `shuffle`. Frames whose header does not decode
+are unclassifiable and are not counted.
+
+The companion `/diagnostics/dm` counter `caps_advert_prefiltered_stale`
+counts capability adverts and digest extensions that were dropped by the
+freshness pre-check (#674) without an ML-DSA-65 verify because the store
+already held state at least as new.
+
 ## API-unserved watchdog (#384)
 
 The daemon arms a self-probe watchdog at startup: a dedicated OS thread

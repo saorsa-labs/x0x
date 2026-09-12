@@ -4122,6 +4122,18 @@ impl Agent {
             .map(|rt| rt.pubsub().stage_stats())
     }
 
+    /// Snapshot of inbound PubSub frames/bytes per (topic class, kind).
+    ///
+    /// Returns `None` when the agent has no gossip runtime. Exposed through
+    /// `GET /diagnostics/gossip` as `inbound_by_topic` (#674) so inbound
+    /// verify cost can be attributed to a topic class directly.
+    #[must_use]
+    pub fn gossip_inbound_by_topic(&self) -> Option<gossip::InboundByTopicSnapshot> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().inbound_by_topic_snapshot())
+    }
+
     /// Snapshot of ant-quic → gossip receive-pump diagnostics.
     ///
     /// Returns `None` when this agent was built without a network node.

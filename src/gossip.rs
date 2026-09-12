@@ -17,7 +17,8 @@ pub use participation::{
     RelayMetering, RELAY_BYTES_SEMANTICS,
 };
 pub use pubsub::{
-    PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot, SigningContext, Subscription,
+    InboundByTopicSnapshot, PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot,
+    SigningContext, Subscription,
 };
 pub use runtime::{
     DispatchQueueDepthSnapshot, DispatchQueueStatsSnapshot, DispatchStreamStats,
