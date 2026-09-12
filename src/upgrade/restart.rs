@@ -180,6 +180,355 @@ pub const fn supervised_exit_code() -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// I0b — loaded launchd policy readback (ADR-0061 §3, #615)
+// ---------------------------------------------------------------------------
+
+/// One launchd job's **loaded** policy, parsed from `launchctl print
+/// gui/<uid>/<label>` output.
+///
+/// The on-disk plist is not evidence at upgrade time: a loaded job can
+/// differ from its file, and `x0x autostart --repair` only ever verified the
+/// plist at repair time (#615). `launchctl print` reports what launchd will
+/// actually do after the process exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchdLoadedJob {
+    /// `program = …` — the executable launchd will (re)run.
+    pub program: PathBuf,
+    /// The `arguments = { … }` block: `ProgramArguments` verbatim.
+    pub arguments: Vec<String>,
+    /// Whether launchd holds an **unconditional** keep-alive on the job —
+    /// the `keepalive` token in the `properties = …` summary. Conditional
+    /// `KeepAlive` dictionaries do not set that token (verified against
+    /// loaded fixture jobs), so it is exactly the "restarts after exit 0"
+    /// guarantee the supervised exit depends on.
+    pub keepalive_unconditional: bool,
+}
+
+/// Parse the `launchctl print` dump for one job. `None` when the output is
+/// not a job dump (launchd error text, empty stdout): the caller fails
+/// closed on `None`.
+pub fn parse_launchd_loaded_job(print_output: &str) -> Option<LaunchdLoadedJob> {
+    let mut program: Option<PathBuf> = None;
+    let mut arguments: Vec<String> = Vec::new();
+    let mut keepalive_unconditional = false;
+    let mut in_arguments = false;
+    for line in print_output.lines() {
+        let trimmed = line.trim();
+        if in_arguments {
+            if trimmed == "}" {
+                in_arguments = false;
+            } else if !trimmed.is_empty() {
+                arguments.push(trimmed.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("program = ") {
+            // The dump repeats keys inside nested blocks; the first
+            // top-level `program` is the job's own.
+            program.get_or_insert_with(|| PathBuf::from(rest));
+        } else if trimmed == "arguments = {" {
+            in_arguments = true;
+        } else if let Some(rest) = trimmed.strip_prefix("properties = ") {
+            keepalive_unconditional = rest.split('|').any(|token| token.trim() == "keepalive");
+        }
+    }
+    Some(LaunchdLoadedJob {
+        program: program?,
+        arguments,
+        keepalive_unconditional,
+    })
+}
+
+/// Basename of a path-like string, ignoring any directory part.
+fn path_basename(s: &str) -> &str {
+    s.rsplit('/').next().unwrap_or(s)
+}
+
+/// Whether a loaded launchd job runs THIS daemon instance — the job whose
+/// program is our executable and whose flags select our instance.
+///
+/// Multi-instance installs (`--name alice` / `--name bob`) run one launchd
+/// job per instance; verifying against a sibling's healthy job while this
+/// instance's job lost `KeepAlive` would green-light an upgrade that strands
+/// this instance (#615). `argv[0]` may differ from the job's program path
+/// (symlinks, relative launch), so the identity is the program basename plus
+/// the argument tail.
+pub fn launchd_job_runs_this_instance(job: &LaunchdLoadedJob, argv: &[String]) -> bool {
+    let Some(argv0) = argv.first() else {
+        return false;
+    };
+    if path_basename(&job.program.to_string_lossy()) != path_basename(argv0) {
+        return false;
+    }
+    let job_tail: &[String] = job.arguments.get(1..).unwrap_or(&[]);
+    let argv_tail: &[String] = argv.get(1..).unwrap_or(&[]);
+    job_tail == argv_tail
+}
+
+/// Outcome of the upgrade-time loaded-policy readback behind the
+/// `X0X_SUPERVISED=1` marker. ADR-0061 §3: "loaded-policy readback
+/// establish support, not a marker in isolation."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchdPolicyReadback {
+    /// The loaded job that runs this instance holds an unconditional
+    /// keep-alive, so the supervisor is guaranteed to take the exit-0
+    /// restart request.
+    Verified {
+        /// The launchd label that was verified.
+        label: String,
+    },
+    /// Readback ran and could not confirm a guaranteed respawn. The apply
+    /// is refused: exiting into an unconfirmed policy is exactly the
+    /// silent-service-disappearance failure #615 closes.
+    NotGuaranteed {
+        /// Why the loaded policy could not be confirmed.
+        detail: String,
+    },
+    /// No launchd readback applies (the recognized signal is not the
+    /// marker, or the marker fired on a non-macOS supervisor, which has no
+    /// launchd to read). The marker stands on those supervisors; that
+    /// residual §3 gap is stated in #615 and not closed by it.
+    Unavailable {
+        /// Why readback does not apply.
+        detail: String,
+    },
+}
+
+/// The running process's argv as lossy strings. Shared by the restart
+/// resolver and the launchd readback so both reason about the same
+/// arguments.
+pub(crate) fn current_argv() -> Vec<String> {
+    std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Read back the LOADED launchd policy behind the `X0X_SUPERVISED=1` marker
+/// at upgrade time (#615).
+///
+/// Only the marker signal consults launchd: `INVOCATION_ID` and a `systemd`
+/// parent name a systemd unit, not a launchd job, and are out of #615's
+/// scope. On macOS, candidate labels come from the `~/Library/LaunchAgents`
+/// plists whose `ProgramArguments[0]` is this executable — the population
+/// `x0x autostart` generates and `--repair` migrates — and the verdict comes
+/// from `launchctl print` on each candidate's **loaded** state, never from
+/// the plist alone. Any outcome short of a confirmed unconditional
+/// keep-alive on the job running this exact instance is `NotGuaranteed`:
+/// fail closed.
+pub fn readback_launchd_policy(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+) -> LaunchdPolicyReadback {
+    if signals.invocation_id || !signals.x0x_supervised {
+        return LaunchdPolicyReadback::Unavailable {
+            detail: "the recognized supervision signal is not the launchd marker".to_string(),
+        };
+    }
+    info!(
+        executable = %executable.display(),
+        "Reading back the loaded launchd policy behind X0X_SUPERVISED=1 (ADR-0061 §3)"
+    );
+    readback_launchd_policy_macos(executable, argv)
+}
+
+/// launchd does not exist on this platform, so the marker cannot be
+/// cross-checked here. Fail-open is deliberate and bounded: #615 closes the
+/// macOS residual failure (`KeepAlive` altered after repair); a non-macOS
+/// supervisor honoring the marker keeps today's behaviour.
+#[cfg(not(target_os = "macos"))]
+fn readback_launchd_policy_macos(_executable: &Path, _argv: &[String]) -> LaunchdPolicyReadback {
+    LaunchdPolicyReadback::Unavailable {
+        detail: "loaded-policy readback exists for macOS launchd only".to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn readback_launchd_policy_macos(executable: &Path, argv: &[String]) -> LaunchdPolicyReadback {
+    let Some(plist_dir) = dirs::home_dir().map(|h| h.join("Library/LaunchAgents")) else {
+        return LaunchdPolicyReadback::NotGuaranteed {
+            detail: "cannot locate ~/Library/LaunchAgents".to_string(),
+        };
+    };
+    readback_launchd_policy_in(
+        &plist_dir,
+        // SAFETY: getuid cannot fail.
+        unsafe { libc::getuid() },
+        executable,
+        argv,
+        &plist_as_json,
+        &mut run_launchctl_print,
+    )
+}
+
+/// Real launchctl probe for [`readback_launchd_policy_in`]: run
+/// `launchctl print <target>`. `Ok(None)` when the domain does not hold the
+/// job (launchctl exits nonzero for an unknown service target); `Err` when
+/// launchctl itself could not be run.
+#[cfg(target_os = "macos")]
+fn run_launchctl_print(target: &str) -> Result<Option<String>, String> {
+    match std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(target)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+        }
+        Ok(_) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Plist-reader callback for [`readback_launchd_policy_in`]: the plist file
+/// as JSON, or `None` when it cannot be read or parsed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+type PlistReader<'a> = &'a dyn Fn(&Path) -> Option<serde_json::Value>;
+
+/// launchctl probe callback for [`readback_launchd_policy_in`]: given a full
+/// launchd service target (e.g. `gui/501/com.example.x0xd`), `Ok(Some(stdout))`
+/// when that domain holds the job, `Ok(None)` when it does not, `Err` when
+/// launchctl could not be run. `FnMut` so tests can record probe order.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+type LaunchctlPrint<'a> = &'a mut dyn FnMut(&str) -> Result<Option<String>, String>;
+
+/// The decision core of [`readback_launchd_policy`]: discover candidate
+/// labels from a LaunchAgents directory, probe each label's LOADED policy,
+/// and verdict on the job running this exact instance.
+///
+/// Each label is probed in the `gui/<uid>` domain first and falls back to
+/// `user/<uid>`: the two per-user domains are disjoint (a job bootstrapped
+/// into `user/<uid>` answers "Could not find service" from the gui probe),
+/// so probing gui alone would refuse a legitimately-loaded marker job
+/// forever (round-2 review of #615).
+///
+/// Split from the plutil/launchctl drivers — and free of any platform API —
+/// so the refuse-vs-proceed decision table is unit-testable on any platform
+/// with captured probe output; every path that cannot confirm an
+/// unconditional keep-alive on this instance's job fails closed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn readback_launchd_policy_in(
+    plist_dir: &Path,
+    uid: u32,
+    executable: &Path,
+    argv: &[String],
+    read_plist: PlistReader<'_>,
+    launchctl_print: LaunchctlPrint<'_>,
+) -> LaunchdPolicyReadback {
+    use LaunchdPolicyReadback::NotGuaranteed;
+
+    let entries = match std::fs::read_dir(plist_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return NotGuaranteed {
+                detail: format!("cannot read {}: {e}", plist_dir.display()),
+            };
+        }
+    };
+
+    let executable_basename = path_basename(&executable.to_string_lossy()).to_string();
+
+    // First refusal-worthy observation, kept for the diagnostic when no
+    // candidate verifies. A definitive answer (verified, or the loaded job
+    // running this instance lacking KeepAlive) returns immediately.
+    let mut refusal: Option<String> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("plist") {
+            continue;
+        }
+        let Some(job_plist) = read_plist(&path) else {
+            refusal.get_or_insert_with(|| format!("unreadable plist {}", path.display()));
+            continue;
+        };
+        let program = job_plist
+            .get("ProgramArguments")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|p| p.as_str())
+            .or_else(|| job_plist.get("Program").and_then(|p| p.as_str()));
+        if program.is_none_or(|p| path_basename(p) != executable_basename) {
+            continue; // not an x0xd job for this executable
+        }
+        let Some(label) = job_plist.get("Label").and_then(|l| l.as_str()) else {
+            refusal.get_or_insert_with(|| format!("plist {} has no Label", path.display()));
+            continue;
+        };
+        // Probe gui first; fall back to the user domain when gui does not
+        // hold the job (the domains are disjoint — see the function docs).
+        let gui_probe = launchctl_print(&format!("gui/{uid}/{label}"));
+        let loaded_stdout = match &gui_probe {
+            Ok(Some(stdout)) => Some(std::borrow::Cow::Borrowed(stdout.as_str())),
+            _ => match launchctl_print(&format!("user/{uid}/{label}")) {
+                Ok(Some(stdout)) => Some(std::borrow::Cow::Owned(stdout)),
+                Ok(None) => {
+                    refusal.get_or_insert_with(|| {
+                        format!(
+                            "job {label} ({}) is not loaded in either the gui or the user \
+                             launchd domain",
+                            path.display()
+                        )
+                    });
+                    continue;
+                }
+                Err(user_err) => {
+                    let why = match &gui_probe {
+                        Err(gui_err) => format!("{gui_err}; {user_err}"),
+                        _ => user_err,
+                    };
+                    refusal.get_or_insert_with(|| {
+                        format!("could not run launchctl print for job {label}: {why}")
+                    });
+                    continue;
+                }
+            },
+        };
+        let Some(loaded) = loaded_stdout.as_deref().and_then(parse_launchd_loaded_job) else {
+            refusal
+                .get_or_insert_with(|| format!("could not parse the loaded policy of job {label}"));
+            continue;
+        };
+        if !launchd_job_runs_this_instance(&loaded, argv) {
+            refusal.get_or_insert_with(|| {
+                format!("loaded job {label} runs different arguments, so it is not this instance")
+            });
+            continue;
+        }
+        if loaded.keepalive_unconditional {
+            return LaunchdPolicyReadback::Verified {
+                label: label.to_string(),
+            };
+        }
+        return NotGuaranteed {
+            detail: format!(
+                "loaded job {label} does not hold an unconditional KeepAlive, so nothing is \
+                 guaranteed to restart this instance after the upgrade exit"
+            ),
+        };
+    }
+    NotGuaranteed {
+        detail: refusal.unwrap_or_else(|| {
+            "no launchd job in ~/Library/LaunchAgents runs this executable, so nothing is \
+             guaranteed to restart it after the upgrade exit"
+                .to_string()
+        }),
+    }
+}
+
+/// Convert a plist to JSON via `plutil`. `None` when the file is not a
+/// parseable plist or plutil cannot run.
+#[cfg(target_os = "macos")]
+fn plist_as_json(path: &Path) -> Option<serde_json::Value> {
+    let out = std::process::Command::new("plutil")
+        .args(["-convert", "json", "-o", "-", "--"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
 /// The instance's restart contract could not be resolved, so no bytes may be
 /// replaced (ADR-0061 §1: failure "leaves the current process and installed
 /// binaries unchanged and reports the unresolved contract").
@@ -213,6 +562,30 @@ pub enum RestartOwnershipError {
         /// Which part of the contract is unresolved.
         what: &'static str,
         /// Why it could not be resolved.
+        detail: String,
+    },
+
+    /// The `X0X_SUPERVISED=1` marker fired, but the loaded launchd job
+    /// policy does not guarantee a respawn after the supervised exit status
+    /// (ADR-0061 §3, #615). Refused before replacement: exiting into an
+    /// unconfirmed policy is the silent-service-disappearance failure — the
+    /// daemon exits 0 for the upgrade and nothing restarts it.
+    #[error(
+        "refusing self-update: this instance reports {signal} but the loaded launchd job \
+         policy does not guarantee a restart after exit {exit_code} ({detail}). A supervised \
+         exit without a guaranteed respawn leaves the service down with the new bytes on \
+         disk. Restore an unconditional `KeepAlive` on the job — inspect it with \
+         `launchctl print gui/$(id -u)/<label>`, fix the plist, then `launchctl unload` and \
+         `launchctl load` it — and retry; if the daemon is already down after a supervised \
+         upgrade, follow the \"Manual recovery after a failed supervised upgrade\" procedure \
+         in docs/upgrade-system.md. No binaries were replaced."
+    )]
+    SupervisedPolicyNotGuaranteed {
+        /// The recognized signal that made this instance managed.
+        signal: String,
+        /// Exit status the supervisor would have to restart on.
+        exit_code: i32,
+        /// Why the loaded policy could not be confirmed.
         detail: String,
     },
 }
@@ -291,18 +664,38 @@ impl RestartPlan {
 /// `executable` is the binary that will be replaced; `data_root_hint` is the
 /// daemon's data directory (`None` falls back to the install directory for
 /// non-daemon callers). `api_addr` is the pre-upgrade API address.
+/// `launchd_readback` is the loaded-policy readback behind the
+/// [`SUPERVISED_ENV_VAR`] marker ([`readback_launchd_policy`]).
 ///
 /// Returns `Err` — leaving the caller to abort before replacing anything — on
-/// a conflicting managed configuration, or on any input that cannot be
-/// resolved or validated.
+/// a conflicting managed configuration, an unconfirmed launchd restart
+/// policy (§3, #615), or any input that cannot be resolved or validated.
 pub fn resolve_restart_plan(
     stop_on_upgrade: bool,
     signals: &SupervisionSignals,
     executable: &Path,
     data_root_hint: Option<&Path>,
     api_addr: Option<SocketAddr>,
+    launchd_readback: &LaunchdPolicyReadback,
 ) -> Result<RestartPlan, RestartOwnershipError> {
     let mode = plan_restart_mode(stop_on_upgrade, signals)?;
+
+    // ADR-0061 §3 (#615): the launchd marker is an operator assertion, not a
+    // respawn guarantee. Before choosing SupervisedExit on the marker alone,
+    // the LOADED launchd policy must confirm an unconditional keep-alive on
+    // the job running this instance — the marker-in-isolation check ruled out
+    // by §3 stranded jobs whose `KeepAlive` was altered after `--repair`.
+    // INVOCATION_ID / `systemd`-parent signals are not gated: they name a
+    // systemd unit, and the systemd-side readback is out of #615's scope.
+    if mode == RestartMode::SupervisedExit && !signals.invocation_id && signals.x0x_supervised {
+        if let LaunchdPolicyReadback::NotGuaranteed { detail } = launchd_readback {
+            return Err(RestartOwnershipError::SupervisedPolicyNotGuaranteed {
+                signal: format!("{SUPERVISED_ENV_VAR}=1"),
+                exit_code: supervised_exit_code(),
+                detail: detail.clone(),
+            });
+        }
+    }
 
     // The swap writes `<executable>.backup` beside the target and the helper
     // respawns from that directory. An install dir we cannot see is an
@@ -318,9 +711,7 @@ pub fn resolve_restart_plan(
             ),
         })?;
 
-    let argv: Vec<String> = std::env::args_os()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
+    let argv = current_argv();
     if argv.is_empty() {
         return Err(RestartOwnershipError::Unresolved {
             what: "process argv",
@@ -1286,6 +1677,7 @@ mod tests {
             &binary,
             Some(&data_root),
             Some(addr),
+            &readback_na(),
         )
         .expect("an unsupervised terminal run resolves");
 
@@ -1311,8 +1703,17 @@ mod tests {
             ..shell_parent_signals()
         };
 
-        let plan = resolve_restart_plan(true, &signals, &binary, Some(dir.path()), None)
-            .expect("supervised + stop_on_upgrade=true is a supported contract");
+        let plan = resolve_restart_plan(
+            true,
+            &signals,
+            &binary,
+            Some(dir.path()),
+            None,
+            &LaunchdPolicyReadback::Verified {
+                label: "com.example.x0xd".to_string(),
+            },
+        )
+        .expect("supervised + stop_on_upgrade=true is a supported contract");
 
         assert_eq!(plan.mode, RestartMode::SupervisedExit);
         assert!(
@@ -1339,12 +1740,453 @@ mod tests {
             &installed_binary(dir.path()),
             Some(dir.path()),
             None,
+            &readback_na(),
         )
         .expect_err("supervised + stop_on_upgrade=false must not resolve");
         assert!(matches!(
             err,
             RestartOwnershipError::SupervisedRestartConflict { .. }
         ));
+    }
+
+    /// `X0X_SUPERVISED=1` sampled from the environment — the launchd marker.
+    fn launchd_marker_signals() -> SupervisionSignals {
+        SupervisionSignals {
+            x0x_supervised: true,
+            ..shell_parent_signals()
+        }
+    }
+
+    /// A readback value for callers whose recognized signal is not the
+    /// launchd marker (the resolver ignores it there).
+    fn readback_na() -> LaunchdPolicyReadback {
+        LaunchdPolicyReadback::Unavailable {
+            detail: "not a launchd-marker instance".to_string(),
+        }
+    }
+
+    /// A `launchctl print gui/<uid>/<label>` dump for one job, in the exact
+    /// shape macOS emits (tab-indented `key = value`, the `arguments` brace
+    /// block, and the `properties` summary whose `keepalive` token appears
+    /// only while launchd holds an UNCONDITIONAL keep-alive — verified
+    /// against real loaded jobs for #615).
+    fn launchd_print_dump(args: &[&str], keepalive: bool) -> String {
+        let mut args_block = String::new();
+        for a in args {
+            args_block.push_str(&format!("\t\t{a}\n"));
+        }
+        let properties = if keepalive {
+            "keepalive | runatload | inferred program"
+        } else {
+            "runatload | inferred program"
+        };
+        format!(
+            "com.example.x0xd = {{\n\
+             \tactive count = 1\n\
+             \tpath = /Users/t/Library/LaunchAgents/com.example.x0xd.plist\n\
+             \ttype = LaunchAgent\n\
+             \tstate = running\n\
+             \n\
+             \tprogram = {program}\n\
+             \targuments = {{\n{args_block}\t}}\n\
+             \n\
+             \tstdout path = /Users/t/Library/Logs/x0xd.log\n\
+             \n\
+             \tproperties = {properties}\n\
+             }}\n",
+            program = args.first().copied().unwrap_or("/usr/local/bin/x0xd"),
+        )
+    }
+
+    #[test]
+    fn launchd_readback_parses_program_arguments_and_keepalive() {
+        // #615: the LOADED policy is the truth at upgrade time — a job whose
+        // plist said `KeepAlive: true` at repair time can have been reloaded
+        // with a conditional dict or no KeepAlive at all, and the plist on
+        // disk no longer proves anything about what launchd will do after
+        // exit 0. `launchctl print` is the readback: its `properties` summary
+        // carries the `keepalive` token exactly while launchd holds an
+        // unconditional keep-alive (conditional KeepAlive dictionaries do NOT
+        // set it — verified against fixture jobs loaded for #615).
+        let unconditional = parse_launchd_loaded_job(&launchd_print_dump(
+            &["/usr/local/bin/x0xd", "--name", "alice"],
+            true,
+        ))
+        .expect("a well-formed print dump parses");
+        assert_eq!(
+            unconditional,
+            LaunchdLoadedJob {
+                program: PathBuf::from("/usr/local/bin/x0xd"),
+                arguments: vec![
+                    "/usr/local/bin/x0xd".to_string(),
+                    "--name".to_string(),
+                    "alice".to_string(),
+                ],
+                keepalive_unconditional: true,
+            }
+        );
+
+        // Conditional KeepAlive (a dict in the plist): the loaded summary has
+        // no `keepalive` token, so an exit-0 respawn is NOT guaranteed.
+        let conditional =
+            parse_launchd_loaded_job(&launchd_print_dump(&["/usr/local/bin/x0xd"], false))
+                .expect("parses");
+        assert!(!conditional.keepalive_unconditional);
+
+        // Not a job dump at all: fail closed by parsing to nothing.
+        assert!(parse_launchd_loaded_job("launchctl: no such file").is_none());
+    }
+
+    #[test]
+    fn launchd_readback_matches_this_instance_not_a_sibling() {
+        // Multi-instance installs (--name alice / --name bob) run separate
+        // launchd jobs. Verifying against bob's healthy job while alice's job
+        // lost KeepAlive would green-light an upgrade that strands alice, so
+        // the match must compare the job's arguments to THIS process's argv —
+        // program basename plus the flags that select the instance.
+        let bob_job = parse_launchd_loaded_job(&launchd_print_dump(
+            &["/usr/local/bin/x0xd", "--name", "bob"],
+            true,
+        ))
+        .expect("parses");
+        let alice_argv = vec![
+            "/usr/local/bin/x0xd".to_string(),
+            "--name".to_string(),
+            "alice".to_string(),
+        ];
+        assert!(
+            !launchd_job_runs_this_instance(&bob_job, &alice_argv),
+            "a sibling instance's job must not verify this instance"
+        );
+
+        let alice_job = parse_launchd_loaded_job(&launchd_print_dump(
+            &["/opt/x0x/bin/x0xd", "--name", "alice"],
+            true,
+        ))
+        .expect("parses");
+        // argv[0] may differ in path (symlinks, relative launch) — the
+        // basename plus the flag tail is the identity.
+        assert!(launchd_job_runs_this_instance(&alice_job, &alice_argv));
+
+        // A job running some other program with coincidentally equal flags
+        // must not match.
+        let foreign = parse_launchd_loaded_job(&launchd_print_dump(&["/usr/local/bin/x0xd"], true))
+            .expect("parses");
+        assert!(!launchd_job_runs_this_instance(&foreign, &alice_argv));
+    }
+
+    #[test]
+    fn marker_without_a_guaranteed_respawn_is_refused_by_the_resolver() {
+        // #615 / ADR-0061 §3: `X0X_SUPERVISED=1` is a marker, and a marker in
+        // isolation is NOT support. The residual failure it leaves today: a
+        // job repaired when its plist had `KeepAlive: true`, later edited to
+        // a conditional KeepAlive or none, still classifies SupervisedExit,
+        // exits 0 for the upgrade — and nothing restarts it. The daemon goes
+        // down and stays down, silently. The resolver must refuse the update
+        // while the current binary still serves, exactly like the §2 conflict.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = installed_binary(dir.path());
+
+        let err = resolve_restart_plan(
+            true,
+            &launchd_marker_signals(),
+            &binary,
+            Some(dir.path()),
+            None,
+            &LaunchdPolicyReadback::NotGuaranteed {
+                detail: "loaded job com.example.x0xd does not hold an unconditional KeepAlive"
+                    .to_string(),
+            },
+        )
+        .expect_err("an unverifiable launchd policy must refuse the apply");
+
+        assert!(
+            matches!(
+                &err,
+                RestartOwnershipError::SupervisedPolicyNotGuaranteed { signal, .. }
+                    if signal == "X0X_SUPERVISED=1"
+            ),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("No binaries were replaced"),
+            "the refusal must state that nothing was mutated: {message}"
+        );
+        // #616: the operator path out of a failed supervised upgrade is the
+        // manual recovery procedure — the diagnostic must point at it.
+        assert!(
+            message.contains("docs/upgrade-system.md"),
+            "the refusal must cross-link the manual recovery procedure: {message}"
+        );
+    }
+
+    #[test]
+    fn marker_with_a_verified_loaded_policy_resolves_supervised_exit() {
+        // The positive half: readback found the loaded job for THIS instance
+        // and launchd holds an unconditional keep-alive on it, so the exit-0
+        // restart request has a guaranteed taker.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = installed_binary(dir.path());
+        let plan = resolve_restart_plan(
+            true,
+            &launchd_marker_signals(),
+            &binary,
+            Some(dir.path()),
+            None,
+            &LaunchdPolicyReadback::Verified {
+                label: "com.example.x0xd".to_string(),
+            },
+        )
+        .expect("a verified launchd policy is a supported contract");
+        assert_eq!(plan.mode, RestartMode::SupervisedExit);
+    }
+
+    #[test]
+    fn non_marker_signals_do_not_gate_on_a_launchd_readback() {
+        // INVOCATION_ID (systemd) is not a launchd marker: the readback is
+        // Unavailable on this platform, and the contract still resolves —
+        // the marker-in-isolation gap is a launchd-specific fix (#615); the
+        // systemd-side readback is deliberately out of its scope.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let signals = SupervisionSignals {
+            invocation_id: true,
+            ..shell_parent_signals()
+        };
+        let plan = resolve_restart_plan(
+            true,
+            &signals,
+            &installed_binary(dir.path()),
+            Some(dir.path()),
+            None,
+            &LaunchdPolicyReadback::Unavailable {
+                detail: "no launchd on a systemd unit".to_string(),
+            },
+        )
+        .expect("systemd signals do not require a launchd readback");
+        assert_eq!(plan.mode, RestartMode::SupervisedExit);
+    }
+
+    // ------------------------------------------------------------------------
+    // Round-2 (#615 review): the readback DECISION core — the code that
+    // decides refuse-vs-proceed on real Macs — driven with captured
+    // `launchctl print` output, so every fail-closed arm is pinned without
+    // touching real launchd or the developer's ~/Library/LaunchAgents.
+    // ------------------------------------------------------------------------
+
+    /// Write a LaunchAgents-style candidate plist as plain JSON (the reader
+    /// is injected in these tests, so no plutil is involved).
+    fn write_candidate_plist(dir: &Path, label: &str, program: &str, args: &[&str]) {
+        let mut argv = vec![program.to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        let plist = serde_json::json!({
+            "Label": label,
+            "ProgramArguments": argv,
+        });
+        std::fs::write(
+            dir.join(format!("{label}.plist")),
+            serde_json::to_string(&plist).expect("serialize fixture plist"),
+        )
+        .expect("write fixture plist");
+    }
+
+    /// The injected plist reader for the decision tests.
+    fn read_json_plist(path: &Path) -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+
+    const TEST_LABEL: &str = "com.example.x0xd";
+    const TEST_EXE: &str = "/usr/local/bin/x0xd";
+
+    #[test]
+    fn readback_decision_verifies_a_loaded_keepalive_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let dump = launchd_print_dump(&[TEST_EXE], true);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(Some(dump.clone())),
+        );
+        assert_eq!(
+            verdict,
+            LaunchdPolicyReadback::Verified {
+                label: TEST_LABEL.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn readback_decision_refuses_a_conditional_keepalive_job() {
+        // The #615 scenario itself: the plist still names this executable,
+        // the job is loaded, but the LOADED policy no longer guarantees a
+        // respawn after exit 0 — refuse rather than exit into a dead service.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let dump = launchd_print_dump(&[TEST_EXE], false);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(Some(dump.clone())),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("does not hold an unconditional KeepAlive"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readback_decision_falls_back_to_the_user_domain() {
+        // Round-2 review: `gui/<uid>` and `user/<uid>` are DISJOINT — a
+        // marker job bootstrapped into `user/<uid>` answers "Could not find
+        // service" from the gui probe. Probing gui alone refused such a job
+        // forever. The gui miss must fall back to `user/<uid>`, and gui must
+        // be probed FIRST (it is the domain `x0x autostart` loads into).
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let dump = launchd_print_dump(&[TEST_EXE], true);
+        let mut probed = Vec::new();
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |target| {
+                probed.push(target.to_string());
+                if target == "user/501/com.example.x0xd" {
+                    Ok(Some(dump.clone()))
+                } else {
+                    Ok(None)
+                }
+            },
+        );
+        assert_eq!(
+            verdict,
+            LaunchdPolicyReadback::Verified {
+                label: TEST_LABEL.to_string()
+            }
+        );
+        assert_eq!(
+            probed,
+            vec![
+                "gui/501/com.example.x0xd".to_string(),
+                "user/501/com.example.x0xd".to_string()
+            ],
+            "gui must be probed first, user only as fallback"
+        );
+    }
+
+    #[test]
+    fn readback_decision_refuses_a_job_not_loaded_in_either_domain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(None),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("not loaded in either the gui or the user launchd domain"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readback_decision_fails_closed_on_unparseable_loaded_policy() {
+        // launchctl "succeeds" but the dump is not a job dump (format drift,
+        // partial output): parsing to nothing must refuse, never guess.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(Some("launchctl: unexpected format drift".to_string())),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("could not parse the loaded policy"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readback_decision_refuses_when_only_a_sibling_instance_matches() {
+        // A loaded, healthy job for a DIFFERENT instance (--name bob) must
+        // not verify this instance, and the refusal must say why — the
+        // operator is told which job was inspected, not a bare "no job".
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &["--name", "bob"]);
+        let dump = launchd_print_dump(&[TEST_EXE, "--name", "bob"], true);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[
+                TEST_EXE.to_string(),
+                "--name".to_string(),
+                "alice".to_string(),
+            ],
+            &read_json_plist,
+            &mut |_target| Ok(Some(dump.clone())),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("runs different arguments"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readback_decision_refuses_when_no_plist_names_this_executable() {
+        // Marker set, but nothing in LaunchAgents even references this
+        // executable: an env-var-only marker with no supervisor is exactly
+        // the false positive §3 rules out — refuse with the honest reason.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(None),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(detail.contains("no launchd job"), "detail: {detail}");
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1361,6 +2203,7 @@ mod tests {
             &missing_install,
             Some(dir.path()),
             None,
+            &readback_na(),
         )
         .expect_err("a missing install directory is an unresolved contract");
         assert!(
@@ -1374,6 +2217,7 @@ mod tests {
             &installed_binary(dir.path()),
             Some(&dir.path().join("no-such-data-root")),
             None,
+            &readback_na(),
         )
         .expect_err("a missing data root is an unresolved contract");
         assert!(
@@ -1394,6 +2238,7 @@ mod tests {
             &binary,
             Some(dir.path()),
             None,
+            &readback_na(),
         )
         .expect("resolves");
         plan.argv = vec![
