@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3
+  rules out "a marker in isolation" establishing a supported deployment,
+  but the supervised classification trusted `X0X_SUPERVISED=1` alone: a
+  launchd job verified by `x0x autostart --repair` whose `KeepAlive` was
+  later removed or made conditional still classified `SupervisedExit`,
+  exited 0 for the upgrade — and nothing restarted it. The daemon went
+  down and stayed down, silently. `resolve_restart_plan` now requires, at
+  every apply, that the **loaded** launchd job policy for this exact
+  instance (matched by program basename plus argument tail, so
+  multi-instance `--name` jobs cannot verify each other) holds an
+  unconditional keep-alive — read back via `launchctl print`, never the
+  on-disk plist alone. Anything short of a confirmed guarantee refuses the
+  apply before replacement with a diagnostic that names what was found.
+  `INVOCATION_ID`/systemd signals are unchanged (no launchd to read); the
+  systemd-side readback remains open under §3. Also documents the
+  platform-validated manual recovery procedure for a failed supervised
+  upgrade (#616, ADR-0061 §6) — diagnose, restore `<target>.backup`,
+  reconcile `upgrade-handoff.json`, re-enter through the manager — with
+  exact launchd and systemd commands, cross-linked from the new refusal
+  and from the apply logs.
+
 - **SIGTERM exit bound enforced (#371).** The 5 s bounded-shutdown watchdog
   never fired exactly when it was needed. It ran as a tokio task, and
   teardown can freeze the async runtime it supervises — measured on an

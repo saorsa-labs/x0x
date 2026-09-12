@@ -39,11 +39,21 @@ the installed binaries untouched.
 - `SupervisedExit` — only when `[update] stop_on_upgrade = true` (the default)
   **and** one of three real signals is present: `INVOCATION_ID` is set
   (systemd unit), the parent's `comm` is `systemd`, or `X0X_SUPERVISED=1`
-  (explicit opt-in: launchd plist, Windows service). The daemon writes the
-  intent file, then exits 0 (100 on Windows) for the supervisor to re-exec the
-  new bytes, and launches **no** helper. A *missing TTY* is **not**
-  supervision — nohup/background/detached stdin never qualifies, and neither
-  does "some ancestor is launchd" (every macOS process has that).
+  (explicit opt-in: launchd plist, Windows service). On macOS the marker
+  alone is **not** enough: the resolver also reads back the **loaded**
+  launchd job policy for this instance (`launchctl print`, never the plist
+  alone — a loaded job can differ from its file) and requires an
+  unconditional `KeepAlive` on it (ADR-0061 §3, #615). A marker whose
+  loaded policy cannot be confirmed — `KeepAlive` removed or made
+  conditional after `x0x autostart --repair`, a job that is not loaded, no
+  job matching this instance's arguments — **refuses** the apply before
+  replacement, because exiting 0 into an unconfirmed policy is the
+  silent-service-disappearance failure. The refusal names what was found
+  and points at the manual recovery procedure below. The daemon then exits
+  0 (100 on Windows) for the supervisor to re-exec the new bytes, and
+  launches **no** helper. A *missing TTY* is **not** supervision —
+  nohup/background/detached stdin never qualifies, and neither does "some
+  ancestor is launchd" (every macOS process has that).
 - **Refused** — recognized supervision **and** `stop_on_upgrade = false`. That
   combination names two restart owners for one data root: the supervisor
   respawns its child while the handoff helper starts another (#493). Since
@@ -63,8 +73,124 @@ Installed bytes, a pending restart, observed readiness and recovery are four
 distinct facts, and the apply logs report them separately. A supervised exit
 is a **restart request** to the service manager — not health acceptance, and
 not an automatic rollback. Recovery on the supervised path is the operator's
-documented manual procedure; only the transactional handoff observes
+[manual recovery procedure](#manual-recovery-after-a-failed-supervised-upgrade-adr-0061-6);
+only the transactional handoff observes
 `/health` and restores the backup itself.
+
+### Manual recovery after a failed supervised upgrade (ADR-0061 §6)
+
+On the supervised path a successful apply installs the new bytes, writes the
+intent record, and exits 0 for the service manager. x0xd **never** rolls
+back automatically on this path — recovery is this manual procedure, run by
+the operator who owns the service manager. That is deliberate: a second,
+self-appointed restarter beside the manager is the #493 duplicate-daemon
+bug this design exists to prevent.
+
+The scenario: a migrated/supervised job took the supervised exit, the
+replacement failed to start, and the daemon is now down. Two artifacts
+survive the attempt and are all you need:
+
+- `<target>.backup` — the exact bytes that were serving before the swap,
+  written beside the installed binary (`<target>`).
+- `<data_dir>/upgrade-handoff.json` — the intent record: from/to versions,
+  `target_path`, `backup_path`, argv, cwd, old pid, API address. It is a
+  *diagnosis record*, not state the daemon needs to boot.
+
+`<data_dir>` is the instance's data directory —
+`~/Library/Application Support/x0x` on macOS (`x0x-<name>` for named
+instances), `~/.local/share/x0x` on Linux. Read both paths out of the
+intent file if you are unsure. Note that `UPGRADE_FAILED` is **never**
+written on this path — that artifact belongs to the transactional helper
+below; its absence is expected here.
+
+Work through the steps in order and stop as soon as `/health` answers.
+
+#### 1. Diagnose which stage failed
+
+macOS (launchd):
+
+```bash
+label=com.saorsalabs.x0xd   # adjust to your job's Label
+launchctl print "gui/$(id -u)/$label" | grep -E 'state =|last exit code|program =|properties ='
+cat "$HOME/Library/Application Support/x0x/upgrade-handoff.json"
+tail -n 100 "$HOME/Library/Logs/x0xd.log"        # the job's StandardErrorPath
+```
+
+Read it like this:
+
+- `state = running` and `/health` answers — the replacement came up late;
+  nothing to recover. Delete a stale intent file (step 3) and stop.
+- `last exit code` nonzero, repeatedly — the replacement starts but fails;
+  go to step 2.
+- `state = not running` with no respawn and no `keepalive` in `properties`
+  — the loaded job no longer holds an unconditional `KeepAlive` (removed or
+  made conditional since `x0x autostart --repair` verified it). Restore
+  `KeepAlive: true` in the plist and reload it first (`launchctl unload`
+  then `launchctl load`, the pair `--repair` prints), then go to step 2.
+  Until then every apply is refused with the loaded-policy diagnostic (#615).
+
+systemd (Linux, user unit as generated by `x0x autostart`):
+
+```bash
+systemctl --user status x0xd            # names the exit status, shows restart loop or not
+journalctl --user -u x0xd -n 100 --no-pager
+cat ~/.local/share/x0x/upgrade-handoff.json
+```
+
+For a system-level unit drop `--user` and read `sudo journalctl -u x0xd`.
+`Restart=no`/`on-failure` on a unit that exits 0 for upgrades is the same
+dead-job state as the missing-`KeepAlive` case above: fix the unit
+(`Restart=always`, `systemctl daemon-reload`) before restoring service.
+
+#### 2. Restore the known-good binary
+
+Only needed when the replacement will not start. On Unix a rename over the
+installed path is safe even if a copy is still running:
+
+```bash
+# <target> is the intent file's target_path (the job's program/ExecStart)
+mv <target>.backup <target>
+```
+
+There is no intent file and no backup to restore (the daemon died before
+writing them)? The installed bytes are the replacement — reinstall the
+previous release's binary at `<target>` by your usual means, then continue.
+
+#### 3. Reconcile the intent file and re-enter under the supervisor
+
+Delete the intent record once the running version is settled, so the next
+apply does not look like an in-flight attempt:
+
+```bash
+rm <data_dir>/upgrade-handoff.json
+```
+
+Then restart **through the manager** — never launch x0xd by hand beside the
+job; a manually started daemon plus a respawning job is two restart owners
+on one data root (#493):
+
+```bash
+# macOS (launchd) — restart the job now:
+launchctl kickstart -k "gui/$(id -u)/$label"
+# ...or, if you edited the plist (e.g. restoring KeepAlive), reload it:
+launchctl unload "$HOME/Library/LaunchAgents/$label.plist"
+launchctl load "$HOME/Library/LaunchAgents/$label.plist"
+
+# Linux (systemd, user unit; drop --user for a system unit):
+systemctl --user restart x0xd
+```
+
+#### 4. Verify, then retry the upgrade deliberately
+
+```bash
+curl -fsS http://127.0.0.1:12700/health | head -c 300; echo
+```
+
+`ok: true` with the expected `version` ⇒ recovered. Re-attempt the upgrade
+only after fixing whatever step 1 identified (a broken release will fail
+the same way again; a refused apply means the loaded policy still does not
+guarantee a respawn).
+
 
 ### Migrating an existing launchd job
 
@@ -86,7 +212,10 @@ x0xd, and a job without `KeepAlive: true` (a one-shot or conditional job is
 not a guaranteed respawn, so declaring it supervised would leave the daemon
 down after the upgrade exit). The change takes effect on the job's next load —
 `--repair` prints the `launchctl unload`/`load` commands rather than stopping
-a running daemon itself.
+a running daemon itself. The repair-time check is not the last word: every
+apply re-verifies the **loaded** job policy (#615 above), so a `KeepAlive`
+removed after repair refuses further upgrades instead of exiting into a job
+that will not restart.
 
 The handoff transaction (`upgrade::restart`):
 
