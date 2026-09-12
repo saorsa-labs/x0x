@@ -25,6 +25,7 @@ All notable changes to this project will be documented in this file.
   The Windows contention path also gains a runtime test
   (`#[cfg(windows)]`) so it is no longer compile-only wherever Windows
   tests run.
+
 - Gossip announce/identity adverts now respect an explicit P2P bind address
   (#650). The #638/#649 card fix suppressed undialable interface hints for
   specifically bound listeners (ant-quic 0.27.50 honours `bind_address`
