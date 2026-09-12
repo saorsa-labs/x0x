@@ -3,43 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+## [v0.42.2] - 2026-09-12
 ### Fixed
-
-- **Capability adverts went stale in on-demand mode (#664 regression).**
-  #664 correctly stopped the per-request re-broadcast of the fleet-wide
-  `x0x/caps/v1` advert, but the on-demand publisher's idle wake stayed at
-  3600 s — four times the consumer-side `ADVERT_CACHE_TTL_SECS` (900 s)
-  cache window. With `legacy_announce = false` (the production default)
-  there is no steady beat, so after the startup advert a node's advert was
-  refreshed only when some peer happened to send it a targeted request. A
-  peer nobody asked about dropped out of every consumer's cache one TTL
-  later and every strict ADR-0030 send to it refused with HTTP 409
-  `recipient ... has no current v2 durable-ACK capability advert`.
-  Observed on the 6-node testnet four hours after a rolling restart: NYC to
-  SFO durable DMs failed while the other four directions, which saw request
-  traffic, stayed healthy. The on-demand idle wake is now bounded by the
-  advert window and measured from the last successful steady publish, so a
-  request-triggered cycle inside the window cannot defer the next steady
-  publish by a whole extra window. Worst-case steady republish interval is
-  now `ADVERT_PUBLISH_INTERVAL_SECS` + one tenth of it (660 s) against the
-  900 s cache TTL, versus 3600 s before. The #664 storm reduction is
-  unchanged: request-triggered cycles still answer on the Critical
-  response topic and still emit at most one steady advert per window.
-  Cadence only — no caps topic is retired and no wire shape changes.
-- **Stale capability adverts no longer cost an ML-DSA-65 verify (#674 item 1).**
-  `ingest_verified_capability_advert` and `ingest_verified_digest_extension`
-  (`src/dm_capability_service.rs`) consulted the signature verifier before
-  the store's last-write-wins staleness rule, so on a ~27-peer mesh nearly
-  every advert — the caps family is 43.5 unique msgs/s at two verifies per
-  frame against a 600 s publish cadence — was verified in full and then
-  discarded by `CapabilityStore::insert`. A new
-  `CapabilityStore::would_accept_advert` /
-  `would_accept_digest_extension` pre-check skips the verify for adverts
-  that could not change store state anyway. Safe by construction: the store
-  only ever holds verified entries, a replayed old advert can never refresh
-  the TTL (insert would reject it), and a genuinely newer advert still
-  reaches the verify. Skips are counted as `caps_advert_prefiltered_stale`
-  on `GET /diagnostics/dm`.
 
 - **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3
   rules out "a marker in isolation" establishing a supported deployment,
@@ -66,7 +31,6 @@ All notable changes to this project will be documented in this file.
   reconcile `upgrade-handoff.json`, re-enter through the manager — with
   exact launchd and systemd commands, cross-linked from the new refusal
   and from the apply logs.
-
 - **Group task-list policy now gates the bootstrap prune (#654).** The
   digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
   acted directly on the wire delta's removal evidence, so on a
@@ -99,94 +63,42 @@ All notable changes to this project will be documented in this file.
   `run_ws_writer_exits_after_flush_budget_with_close_still_blocked` (bounded
   exit + handoff) and integration
   `ws_slow_close_frame_survives_flush_budget_expiry` (self-DM-triggered
+- **Stale capability adverts no longer cost an ML-DSA-65 verify (#674 item 1).**
+  `ingest_verified_capability_advert` and `ingest_verified_digest_extension`
+  (`src/dm_capability_service.rs`) consulted the signature verifier before
+  the store's last-write-wins staleness rule, so on a ~27-peer mesh nearly
+  every advert — the caps family is 43.5 unique msgs/s at two verifies per
+  frame against a 600 s publish cadence — was verified in full and then
+  discarded by `CapabilityStore::insert`. A new
+  `CapabilityStore::would_accept_advert` /
+  `would_accept_digest_extension` pre-check skips the verify for adverts
+  that could not change store state anyway. Safe by construction: the store
+  only ever holds verified entries, a replayed old advert can never refresh
+  the TTL (insert would reject it), and a genuinely newer advert still
+  reaches the verify. Skips are counted as `caps_advert_prefiltered_stale`
+  on `GET /diagnostics/dm`.
 
-### Changed
-
-- **Full-participation eager degree ceiling lowered from 12 to 6 (#674
-  design C1) — no steady-state send-rate change expected.** sg promotes
-  eager peers to `MIN_EAGER_DEGREE.min(ceiling)` and `MIN_EAGER_DEGREE` is
-  already 6, so a ceiling of 12 and a ceiling of 6 produce the same
-  steady-state degree; the measured 242.4 eager sends/s at 4.27 MB/s on the
-  testnet anchor come from an effective fan-out of ~2.1 and are NOT reduced
-  by this change. What it bounds is the all-cooled publish-rescue path,
-  where sg grows the eager set toward the ceiling instead of swapping
-  members — with 12 that growth is the send amplification the #380/#656
-  storms ride on; with 6 the set swaps. `ensure_eager_ceiling` now passes 6
-  instead of sg's `0` sentinel (stock 12). Delivery robustness unchanged
-  (PlumTree's lazy IHAVE/IWANT half still repairs peers outside the eager
-  tree). Local topology parameter — no wire change.
-- saorsa-gossip pins bumped 0.5.77 → 0.5.78 (all eleven crates): PlumTree dedups
-  inbound EAGER by `msg_id` before the ML-DSA-65 verify (saorsa-labs/saorsa-gossip#56,
-  #674) — on a bootstrap ~28% of inbound EAGER frames were duplicates that were
-  verified and then discarded. New counter `eager_duplicate_dropped_pre_verify`
-  under `pubsub_stages` in `GET /diagnostics/gossip`; a wiring test pins the key.
-  The #501 legacy-bus meter premise moves to pubsub 0.5.78.
-
-### Added
-
-- **`inbound_by_topic` counters on `GET /diagnostics/gossip` (#674 item 4).**
-  Inbound PubSub frames and bytes are now attributed to a topic class
-  (`announce_blob`, `caps`, `dm_bus`, `presence`, `other`) and PlumTree kind
-  (`eager`, `ihave`, `iwant`, …), counted in `handle_incoming` off the
-  already-decoded header before any signature work — refused and
-  later-discarded frames still count. Previously inbound verify cost could
-  only be inferred from message-cache eviction rates. Keys are documented in
-  `docs/diagnostics.md`. The measurement gap this closes is what forced the
-  #674 design to proxy per-topic inbound rates from eviction counters.
-
-### Tests
-
-- A2A binding fixtures no longer fail on a transient setup dial under
-  full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
-  ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s
-  floor) can be starved or socket-errored by ambient suite load, after
-  which the dial ladder skips hole-punch by design (an address-only dial
-  cannot coordinate) and surfaces `AllStrategiesFailed` quoting
-  "address-only dial: hole-punch requires the target's PeerId" — the
-  reported release-gate flake. The setup dial is now retried once; a
-  persistent failure still fails the test loudly with the last error, so
-  no round-trip observation is skipped.
-
-- The two #316 loopback tests no longer flake under full parallel load
-  (#316). `direct_send_with_require_ack_round_trips_to_live_peer` asked
-  the post-send liveness probe for a 3 s budget — the daemon honours the
-  caller-supplied budget exactly, and the recorded ~18 s failures were
-  the probe starving under ambient suite load after the durable send
-  itself completed; the fixture now requests 10 s (the bundled GUI client
-  already ships 5 s) while the assertion stays strict (ok + finite RTT).
-  The setup dial of `suppressed_peer_inbound_redial_is_rejected` — the
-  0.16 s fast-fail was the same transient setup-dial class — gets the
-  same bounded retry. Observation windows, assertions, and the nextest
-  serial-group scheduling are unchanged.
-- **#287 root cause round 1 — fixture self-update contamination (the
-  ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
-  failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised
-  on mDNS on the production gossip plane, joined a live mesh peer, received a
-  newer signed release manifest via the gossip update listener (gated there
-  on `[update] enabled` only — `--skip-update-check` did not suppress the
-  gossip listener in v0.34.3; current code computes
-  `effective_self_update_enabled`, which does), and replaced its own binary
-  mid-test — the process vanished under in-flight `POST /publish` requests,
-  which reqwest surfaces as `hyper::Error(IncompleteMessage)`. Reproduced
-  directly: a v0.34.3 daemon joined to the production plane sidelines its
-  binary and dies within seconds of a stall run, while the same binary
-  hermetic (mDNS off, private plane) fills the queue, counts drops, and
-  serves every publish. The hermeticity work (#337/#417/#609) removed the
-  contamination. Separately — and only visible once that noise was gone, on
-  hosts whose socket buffers outlast the writer's flush budget — the
-  close-frame delivery itself was broken; that product fix is the `### Fixed`
-  entry above. The test now (1) disables `[update]` for its daemon so it is
-  immune to the round-1 failure mode even if hermeticity regresses, and (2)
-  asserts REST availability through the close window — publish waves must
-  keep returning 200 while the stalled session fills, closes with 1013, and
-  tears down. The contract itself (bounded 1024-frame queue, drop-vs-close
-  feeder policies, 1013 close-frame delivery, REST-plane isolation) is
-  documented in `docs/api-reference.md`.
-
-## [v0.42.2] - 2026-09-12
-
-### Fixed
-
+- **Capability adverts went stale in on-demand mode (#664 regression).**
+  #664 correctly stopped the per-request re-broadcast of the fleet-wide
+  `x0x/caps/v1` advert, but the on-demand publisher's idle wake stayed at
+  3600 s — four times the consumer-side `ADVERT_CACHE_TTL_SECS` (900 s)
+  cache window. With `legacy_announce = false` (the production default)
+  there is no steady beat, so after the startup advert a node's advert was
+  refreshed only when some peer happened to send it a targeted request. A
+  peer nobody asked about dropped out of every consumer's cache one TTL
+  later and every strict ADR-0030 send to it refused with HTTP 409
+  `recipient ... has no current v2 durable-ACK capability advert`.
+  Observed on the 6-node testnet four hours after a rolling restart: NYC to
+  SFO durable DMs failed while the other four directions, which saw request
+  traffic, stayed healthy. The on-demand idle wake is now bounded by the
+  advert window and measured from the last successful steady publish, so a
+  request-triggered cycle inside the window cannot defer the next steady
+  publish by a whole extra window. Worst-case steady republish interval is
+  now `ADVERT_PUBLISH_INTERVAL_SECS` + one tenth of it (660 s) against the
+  900 s cache TTL, versus 3600 s before. The #664 storm reduction is
+  unchanged: request-triggered cycles still answer on the Critical
+  response topic and still emit at most one steady advert per window.
+  Cadence only — no caps topic is retired and no wire shape changes.
 - **`x0x/caps/v1` CPU amplification (#656).** One targeted capability
   request caused the responder's publisher to also re-broadcast its signed
   advert on the fleet-wide steady topic (`respond_on_steady` in
@@ -306,9 +218,88 @@ All notable changes to this project will be documented in this file.
   is the magic prefix) and the stale `#[allow(dead_code)]` on
   `delta_remove_task` (it has production call sites).
 
+### Changed
+
+- **Full-participation eager degree ceiling lowered from 12 to 6 (#674
+  design C1) — no steady-state send-rate change expected.** sg promotes
+  eager peers to `MIN_EAGER_DEGREE.min(ceiling)` and `MIN_EAGER_DEGREE` is
+  already 6, so a ceiling of 12 and a ceiling of 6 produce the same
+  steady-state degree; the measured 242.4 eager sends/s at 4.27 MB/s on the
+  testnet anchor come from an effective fan-out of ~2.1 and are NOT reduced
+  by this change. What it bounds is the all-cooled publish-rescue path,
+  where sg grows the eager set toward the ceiling instead of swapping
+  members — with 12 that growth is the send amplification the #380/#656
+  storms ride on; with 6 the set swaps. `ensure_eager_ceiling` now passes 6
+  instead of sg's `0` sentinel (stock 12). Delivery robustness unchanged
+  (PlumTree's lazy IHAVE/IWANT half still repairs peers outside the eager
+  tree). Local topology parameter — no wire change.
+- saorsa-gossip pins bumped 0.5.77 → 0.5.78 (all eleven crates): PlumTree dedups
+  inbound EAGER by `msg_id` before the ML-DSA-65 verify (saorsa-labs/saorsa-gossip#56,
+  #674) — on a bootstrap ~28% of inbound EAGER frames were duplicates that were
+  verified and then discarded. New counter `eager_duplicate_dropped_pre_verify`
+  under `pubsub_stages` in `GET /diagnostics/gossip`; a wiring test pins the key.
+  The #501 legacy-bus meter premise moves to pubsub 0.5.78.
+
+### Added
+
+- **`inbound_by_topic` counters on `GET /diagnostics/gossip` (#674 item 4).**
+  Inbound PubSub frames and bytes are now attributed to a topic class
+  (`announce_blob`, `caps`, `dm_bus`, `presence`, `other`) and PlumTree kind
+  (`eager`, `ihave`, `iwant`, …), counted in `handle_incoming` off the
+  already-decoded header before any signature work — refused and
+  later-discarded frames still count. Previously inbound verify cost could
+  only be inferred from message-cache eviction rates. Keys are documented in
+  `docs/diagnostics.md`. The measurement gap this closes is what forced the
+  #674 design to proxy per-topic inbound rates from eviction counters.
 
 ### Tests
 
+- The two #316 loopback tests no longer flake under full parallel load
+  (#316). `direct_send_with_require_ack_round_trips_to_live_peer` asked
+  the post-send liveness probe for a 3 s budget — the daemon honours the
+  caller-supplied budget exactly, and the recorded ~18 s failures were
+  the probe starving under ambient suite load after the durable send
+  itself completed; the fixture now requests 10 s (the bundled GUI client
+  already ships 5 s) while the assertion stays strict (ok + finite RTT).
+  The setup dial of `suppressed_peer_inbound_redial_is_rejected` — the
+  0.16 s fast-fail was the same transient setup-dial class — gets the
+  same bounded retry. Observation windows, assertions, and the nextest
+  serial-group scheduling are unchanged.
+- A2A binding fixtures no longer fail on a transient setup dial under
+  full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
+  ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s
+  floor) can be starved or socket-errored by ambient suite load, after
+  which the dial ladder skips hole-punch by design (an address-only dial
+  cannot coordinate) and surfaces `AllStrategiesFailed` quoting
+  "address-only dial: hole-punch requires the target's PeerId" — the
+  reported release-gate flake. The setup dial is now retried once; a
+  persistent failure still fails the test loudly with the last error, so
+  no round-trip observation is skipped.
+
+- **#287 root cause round 1 — fixture self-update contamination (the
+  ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
+  failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised
+  on mDNS on the production gossip plane, joined a live mesh peer, received a
+  newer signed release manifest via the gossip update listener (gated there
+  on `[update] enabled` only — `--skip-update-check` did not suppress the
+  gossip listener in v0.34.3; current code computes
+  `effective_self_update_enabled`, which does), and replaced its own binary
+  mid-test — the process vanished under in-flight `POST /publish` requests,
+  which reqwest surfaces as `hyper::Error(IncompleteMessage)`. Reproduced
+  directly: a v0.34.3 daemon joined to the production plane sidelines its
+  binary and dies within seconds of a stall run, while the same binary
+  hermetic (mDNS off, private plane) fills the queue, counts drops, and
+  serves every publish. The hermeticity work (#337/#417/#609) removed the
+  contamination. Separately — and only visible once that noise was gone, on
+  hosts whose socket buffers outlast the writer's flush budget — the
+  close-frame delivery itself was broken; that product fix is the `### Fixed`
+  entry above. The test now (1) disables `[update]` for its daemon so it is
+  immune to the round-1 failure mode even if hermeticity regresses, and (2)
+  asserts REST availability through the close window — publish waves must
+  keep returning 200 while the stalled session fills, closes with 1013, and
+  tears down. The contract itself (bounded 1024-frame queue, drop-vs-close
+  feeder policies, 1013 close-frame delivery, REST-plane isolation) is
+  documented in `docs/api-reference.md`.
 - `tests/e2e_deploy.sh` uploads the binary as a gzip stream with ssh keepalives
   (`ServerAliveInterval=15`, `ServerAliveCountMax=4`), so a stalled upload to a
   far host fails fast instead of hanging the rollout.
