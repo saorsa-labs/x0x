@@ -2943,7 +2943,10 @@ mod tests {
     #[test]
     fn full_eager_degree_ceiling_equals_sg_promotion_floor() {
         assert_eq!(FULL_EAGER_DEGREE_CEILING, 6);
-        assert!(FULL_EAGER_DEGREE_CEILING > 0, "0 is sg's sentinel for the stock ceiling of 12");
+        assert!(
+            FULL_EAGER_DEGREE_CEILING > 0,
+            "0 is sg's sentinel for the stock ceiling of 12"
+        );
     }
 
     #[tokio::test]
