@@ -23,6 +23,21 @@ All notable changes to this project will be documented in this file.
   digests, so it needs no bound. Publish-side only; request/response wire
   shapes unchanged, 0.41.x/0.42.0 peers unaffected.
 
+- **Redundant ML-DSA verify per inbound IWANT (#656).** The 0.42.0 egress
+  metering's `track_iwant` (`src/gossip/egress.rs`) performed a full
+  ML-DSA-65 signature verification on every inbound IWANT frame solely to
+  decide whether the `iwant_matched_eager_attempt_msgs`/`..._bytes`
+  diagnostic counters could track it — the same frame is verified again by
+  PlumTree in `handle_message`, which ignores unauthenticated IWANTs
+  before acting. At the profiled 106 IWANT/s that was ~4% of a core of
+  pure diagnostics overhead. Tracking now relies on PlumTree's own
+  verification: the cheap structural gates stay (exact decode, IWant
+  kind, v2 header, payload-hash binding, decodable id list), the keys are
+  documented as unverified frame fields, and the counter names are
+  unchanged. A forged IWANT cannot inflate the counters beyond the repair
+  sends its own (rejected) frame would have drawn.
+
+
 - **SIGTERM exit bound enforced (#371).** The 5 s bounded-shutdown watchdog
   never fired exactly when it was needed. It ran as a tokio task, and
   teardown can freeze the async runtime it supervises — measured on an
@@ -57,6 +72,7 @@ All notable changes to this project will be documented in this file.
   The Windows contention path also gains a runtime test
   (`#[cfg(windows)]`) so it is no longer compile-only wherever Windows
   tests run.
+
 
 - Gossip announce/identity adverts now respect an explicit P2P bind address
   (#650). The #638/#649 card fix suppressed undialable interface hints for
