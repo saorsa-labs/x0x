@@ -3,8 +3,16 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
-
 ### Tests
+
+- `e2e_deploy.sh` binary upload to VPS nodes is now bounded (900 s per
+  attempt), retried up to 3 times, and verified by comparing the remote
+  `stat -c %s` byte count against the local binary before the node is
+  restarted; a new post-mesh-wait straggler pass re-uploads and restarts
+  any node whose running version does not yet match the target version
+  (#682). Logic extracted into `tests/lib/deploy_upload.sh`
+  (sourced by both `e2e_deploy.sh` and `tests/e2e_deploy_upload_test.sh`),
+  which drives the library functions via `X0X_DEPLOY_SSH_CMD`.
 
 - **`hs_f2` restart e2e: bounded retry on the announce-blob fetch window
   (#681).** The owner's `ensure_blob` spawns a single background fetch with a

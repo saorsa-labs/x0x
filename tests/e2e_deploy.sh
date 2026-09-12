@@ -14,6 +14,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_DIR/target/x86_64-unknown-linux-gnu/release/x0xd"
+# shellcheck source=lib/deploy_upload.sh
+source "$SCRIPT_DIR/lib/deploy_upload.sh"
 RUNNER_SCRIPT="$SCRIPT_DIR/runners/x0x_test_runner.py"
 RUNNER_UNIT="$SCRIPT_DIR/runners/x0x-test-runner.service"
 
@@ -47,6 +49,10 @@ VERSION="$(grep '^version = ' "$PROJECT_DIR/Cargo.toml" | head -1 | cut -d '"' -
 # ServerAlive* turns a dead session into a failure instead of an indefinite hang
 # (two stalls on 2026-09-11 cost ~40 min of the v0.42.1 rollout).
 SSH="ssh -C -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
+# Allow offline testing: set X0X_DEPLOY_SSH_CMD to substitute a fake SSH.
+[ -n "${X0X_DEPLOY_SSH_CMD:-}" ] && SSH="$X0X_DEPLOY_SSH_CMD"
+# Per-node upload: up to 3 attempts, each capped at 900 s (#682).
+MAX_UPLOAD_ATTEMPTS=3
 
 # CLI overrides (--mesh-verify / --skip-mesh-verify)
 for arg in "$@"; do
@@ -104,6 +110,10 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[2/4] Deploy to 6 VPS bootstrap nodes${NC}"
 
+# Local binary size for upload verification.  stat flag differs on macOS (-f %z)
+# vs Linux (-c %s); fall back to the other if the first form fails.
+LOCAL_SIZE=$(stat -f %z "$BINARY" 2>/dev/null || stat -c %s "$BINARY" 2>/dev/null || echo "0")
+
 FAILED_NODES=()
 for node in "${NODE_NAMES[@]}"; do
     ip="${NODE_IPS[$node]}"
@@ -118,12 +128,10 @@ for node in "${NODE_NAMES[@]}"; do
 
     # Stream to a temp path and install atomically. These hosts accept SSH
     # command execution reliably, but SFTP/scp in-place replacement can fail.
-    echo -n "    Uploading binary... "
-    # gzip stream: ~60% fewer bytes on the wire than ssh -C alone for the release binary.
-    if gzip -1 -c "$BINARY" | $SSH root@"$ip" 'gunzip -c > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
-        echo -e "${GREEN}done${NC}"
-    else
-        echo -e "${RED}failed${NC}"
+    # gzip stream: ~60% fewer bytes on the wire than ssh -C alone.
+    # x0x_upload_binary retries up to MAX_UPLOAD_ATTEMPTS times (each capped
+    # at 900 s) and verifies the remote byte count before returning (#682).
+    if ! x0x_upload_binary "$ip"; then
         FAILED_NODES+=("$node")
         continue
     fi
@@ -254,6 +262,20 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[3/4] Waiting 30s for mesh formation...${NC}"
 sleep 30
+
+# ═════════════════════════════════════════════════════════════════════════
+# 3b. STRAGGLER RE-PUSH — nodes still on the old version after the main
+#     loop get one more bounded upload+restart cycle (#682).  Only nodes
+#     that completed the deploy loop without error are checked here; nodes
+#     in FAILED_NODES are already excluded from the per-node accounting in
+#     section 4 and are not retried again.
+# ═════════════════════════════════════════════════════════════════════════
+echo -e "\n${CYAN}[3b/4] Straggler version check${NC}"
+x0x_scan_and_repush_stragglers
+if [ "${STRAGGLERS_REPUSHED:-0}" -gt 0 ]; then
+    echo "  Waiting 10s for re-pushed stragglers to start..."
+    sleep 10
+fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # 4. VERIFY HEALTH, VERSION, MESH & COLLECT TOKENS
