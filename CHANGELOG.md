@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [v0.42.3] - 2026-09-12
+
 ### Fixed
 
 - **Accept loop no longer exits permanently on a `None` accept (#677,
