@@ -34,6 +34,13 @@ All notable changes to this project will be documented in this file.
   strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
   genuine never-reconnects regression still fails at the same place.
 
+### CI
+
+- Pin nextest to 0.9.144 in all three CI jobs (test, coverage, parity). nextest
+  0.9.126 has an output-drain race that can misattribute a slow test as failed
+  (#673). The `taiki-e/install-action@nextest` shorthand no longer floats to
+  latest; each step now uses `install-action@v2` with `tool: nextest@0.9.144`.
+
 ## [v0.42.3] - 2026-09-12
 
 ### Fixed
