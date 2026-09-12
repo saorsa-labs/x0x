@@ -14088,6 +14088,18 @@ type ReconnectTracker = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<[u8; 32], tokio::task::JoinHandle<()>>>,
 >;
 
+/// Test-only observation seam for the #510 between-phases guard in
+/// [`schedule_reconnect`]: records, per peer id, how many reconnect attempts
+/// actually reached the Phase 2 bootstrap-cache dial. Tests assert the count
+/// stays at zero when the peer recovered between Phase 1 and the guard,
+/// because that dial is what opens the second connection family of a
+/// simultaneous open (ant-quic#277/#278). Keyed by peer id so concurrently
+/// running reconnect tests never observe each other's attempts.
+#[cfg(test)]
+static RECONNECT_PHASE2_DIALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<[u8; 32], u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// Schedule a bounded, backoff reconnect for a peer that just disconnected.
 ///
 /// This closes the gap identified in the post-restart transport failure: when a
@@ -14296,6 +14308,33 @@ fn schedule_reconnect(
                         "reconnect aborted before bootstrap-cache dial: peer reconnect-suppressed",
                     );
                     break 'attempts;
+                }
+                // #510: Phase 1's dials can each burn
+                // RECONNECT_CANDIDATE_DIAL_TIMEOUT while the peer recovers
+                // via another path (inbound dial, mDNS auto-connect), which
+                // leaves the top-of-attempt `is_connected` check stale.
+                // Re-check at the call-site before the bootstrap-cache
+                // fallback: dialing an already-connected peer opens a second
+                // connection family (simultaneous open) whose ant-quic
+                // tiebreaker is a coin flip (ant-quic#277/#278) — losing it
+                // strands one side with connected_peers=0. The internal
+                // connected fast-path in connect_cached_peer has its own
+                // check→dial race, so the gate belongs here, where the whole
+                // Phase 1 window is covered.
+                if network.is_connected(&peer_id).await {
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        peer_id_prefix = %prefix,
+                        attempt,
+                        "reconnect cancelled: peer connected between phases",
+                    );
+                    break 'attempts;
+                }
+                #[cfg(test)]
+                {
+                    if let Ok(mut phase2_dials) = RECONNECT_PHASE2_DIALS.lock() {
+                        *phase2_dials.entry(peer_id_bytes).or_insert(0) += 1;
+                    }
                 }
                 match network.connect_cached_peer(peer_id).await {
                     Ok(_) => {
@@ -20757,6 +20796,227 @@ mod tests {
             );
             // bob dropped here; the next iteration builds a fresh bob.
         }
+    }
+
+    /// #510 TOCTOU guard: a reconnect attempt whose Phase 1 (discovery-cache
+    /// dials) fails must NOT reach the Phase 2 bootstrap-cache dial when the
+    /// peer became connected in between. That fallback dial is exactly what
+    /// opens the second connection family of the simultaneous open behind the
+    /// hs_f2 restart flake: the rebuilt owner (same machine.key, so the same
+    /// PeerId) dials us while our reconnect is still burning its Phase 1 dial
+    /// timeout on the owner's now-dead old port; once the new inbound
+    /// handshake completes our accept loop caches the owner's NEW address, and
+    /// a Phase 2 dial to it races the just-established inbound connection
+    /// through ant-quic's coin-flip tiebreaker (ant-quic#277/#278) — losing it
+    /// strands one side with `connected_peers = 0` for the whole barrier.
+    ///
+    /// The interleaving is forced deterministically: bob's old port is
+    /// squatted by a raw UDP socket so Phase 1's dial blackholes for its full
+    /// `RECONNECT_CANDIDATE_DIAL_TIMEOUT` (a wide, controlled window instead
+    /// of an instant refusal); the first QUIC Initial on that socket proves
+    /// Phase 1 is in flight, which proves the top-of-attempt `is_connected`
+    /// check already ran and saw bob disconnected; only then does the rebuilt
+    /// bob dial alice. The single-flight tracker draining is the
+    /// deterministic "attempt reached its decision" signal — an unguarded
+    /// Phase 2 entry strictly precedes the tracker removal the test waits
+    /// for, so the `RECONNECT_PHASE2_DIALS` assertion cannot race the would-be
+    /// bug.
+    ///
+    /// The network event listener is deliberately NOT started: its
+    /// PeerConnected abort would also cancel the reconnect task and mask a
+    /// missing guard. The fresh tracker means the between-phases check is the
+    /// ONLY thing that can stop the Phase 2 dial.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconnect_phase2_dial_aborted_when_peer_connects_during_phase1() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        // Same machine-key path on the rebuild below: same MachineId/PeerId —
+        // the #510 owner-restart shape.
+        let bob_machine_key = dir.path().join("bob-machine.key");
+        let bob = Agent::builder()
+            .with_machine_key(bob_machine_key.clone())
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+
+        let alice_network = alice.network().expect("alice network");
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let alice_addr =
+            normalize_loopback_addr(alice_network.bound_addr().await.expect("alice bound"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let bob_id = bob.machine_id().0;
+
+        // The pre-restart connection populates alice's bootstrap cache with
+        // bob@bob_addr — the cache Phase 2 would dial.
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects to bob");
+        assert_eq!(connected.0, bob.machine_id().0);
+        let connected_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
+        while tokio::time::Instant::now() < connected_deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "alice connected to bob before the restart"
+        );
+        // Quiesce before the shutdown (issue #241): a duplicate dial leg's
+        // delayed PeerConnected must not contaminate the post-restart
+        // is_connected reads below.
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
+
+        // Build the replacement BEFORE the shutdown so its inbound dial can
+        // fire at a controlled moment later.
+        let bob2 = Agent::builder()
+            .with_machine_key(bob_machine_key)
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("rebuilt bob");
+        let bob2_network = bob2.network().expect("rebuilt bob network");
+
+        // Restart: bob's old transport dies and alice must observe the
+        // disconnection before the reconnect is scheduled.
+        bob.shutdown().await;
+        let drop_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
+        while alice_network.is_connected(&bob_peer).await {
+            assert!(
+                tokio::time::Instant::now() < drop_deadline,
+                "alice should observe bob's shutdown promptly"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Squat bob's old port with a socket that never answers: Phase 1's
+        // dial to the discovery-cache address blackholes for its full
+        // RECONNECT_CANDIDATE_DIAL_TIMEOUT instead of failing instantly.
+        let old_port_socket = tokio::net::UdpSocket::bind(bob_addr)
+            .await
+            .expect("squat bob's old port");
+
+        // The reconnect attempt, driven through the production seam with a
+        // fresh tracker: Phase 1 has exactly one candidate — bob's dead old
+        // address.
+        let machine_cache =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        upsert_discovered_machine(
+            &machine_cache,
+            DiscoveredMachine {
+                machine_id: identity::MachineId(bob_id),
+                addresses: vec![bob_addr],
+                announced_at: 0,
+                last_seen: 1,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
+        )
+        .await;
+        let tracker: ReconnectTracker =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        schedule_reconnect(
+            std::sync::Arc::clone(alice_network),
+            std::sync::Arc::clone(&machine_cache),
+            alice.shutdown_token.clone(),
+            bob_id,
+            std::sync::Arc::clone(&tracker),
+        );
+
+        // Proof the attempt is past the top-of-attempt `is_connected` check
+        // and inside Phase 1's dial: the first QUIC Initial lands on the
+        // squatted port.
+        let mut wire = [0u8; 64];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15) * test_time_multiplier(),
+            old_port_socket.recv_from(&mut wire),
+        )
+        .await
+        .expect("phase 1 dial must reach bob's old port")
+        .expect("recv_from");
+
+        // The #510 recovery path: the rebuilt bob (same PeerId) dials alice
+        // while Phase 1 is still blackholing. Alice becomes connected to bob
+        // through this inbound leg — and her accept loop caches bob's NEW
+        // address, exactly the state a guardless Phase 2 would dial into a
+        // simultaneous open.
+        bob2_network
+            .connect_addr(alice_addr)
+            .await
+            .expect("rebuilt bob dials alice");
+        let inbound_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(10) * test_time_multiplier();
+        while !alice_network.is_connected(&bob_peer).await {
+            assert!(
+                tokio::time::Instant::now() < inbound_deadline,
+                "alice must accept the rebuilt bob's inbound dial"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Deterministic decision signal: the attempt task removes itself
+        // from the single-flight tracker when it finishes (Phase 1's dial
+        // timeout expires and the guard aborts; the failure cooldown is
+        // skipped because the peer is connected). An unguarded Phase 2 entry
+        // would have happened strictly BEFORE this removal.
+        let drain_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(30) * test_time_multiplier();
+        while !tracker.lock().expect("tracker lock").is_empty() {
+            assert!(
+                tokio::time::Instant::now() < drain_deadline,
+                "reconnect task must finish after its first attempt"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let phase2_dials = RECONNECT_PHASE2_DIALS
+            .lock()
+            .expect("phase2 dial counter lock")
+            .get(&bob_id)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            phase2_dials, 0,
+            "#510: reconnect must not dial the bootstrap cache (Phase 2) when the peer \
+             reconnected inbound during Phase 1 — that dial opens the second \
+             connection family of a simultaneous open whose ant-quic tiebreaker \
+             is a coin flip (ant-quic#277/#278)"
+        );
     }
 
     /// The announcement auto-connect gate must refuse to dial a peer whose

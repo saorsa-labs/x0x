@@ -2573,19 +2573,38 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     // joiner's single certified announce could be served by the leaked
     // old owner and its one-shot 5 s blob fetch had no retry). A real
     // daemon restart is clean: shut the old agent down, THEN rebuild.
+    // #510: capture the owner's PeerId BEFORE the shutdown — the rebuild
+    // reuses machine.key (build_owner_agent), so the PeerId is stable across
+    // the restart and this is the id the joiner's reconnect targets.
+    let old_owner_peer = ant_quic::PeerId(owner_agent.machine_id().0);
     owner_agent.shutdown().await;
     drop(owner_agent);
-    // #510: let the joiner's ant-quic finish unwinding the old connection's
-    // CONNECTION_CLOSE before the rebuilt owner dials it again. Without this
-    // settle the new handshake can arrive inside that window and be dropped as
-    // a stale generation, so `connect_addr` returns Ok yet `connected_peers`
-    // is 0 on the first barrier poll and stays 0 for the whole 20 s deadline
-    // (observed on CI only; local reconnects take 123–155 ms). 300 ms is ~2×
-    // the observed reconnect, far below the 10 s legacy grace and the 20 s
-    // barrier, and the barrier below still gates strictly on
-    // `gossip_plane_peers`, so a genuine never-connects failure still fails
-    // at the same assertion.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // #510: the old fixed 300 ms settle (#666) guessed how long the joiner
+    // needs to unwind the old connection. The actual hazard is the overlap
+    // between the joiner's scheduled reconnect and the rebuilt owner's
+    // connect_addr below: a reconnect whose Phase 2 (bootstrap-cache dial)
+    // fires in the gap between its is_connected check and the dial opens a
+    // second connection family alongside the owner's inbound dial — a
+    // simultaneous open whose ant-quic tiebreaker is a coin flip
+    // (ant-quic#277/#278); losing it leaves one side with connected_peers=0
+    // for the whole barrier. Waiting until the joiner OBSERVES the old
+    // connection as gone removes the overlap deterministically: while
+    // is_connected(old_owner_peer) holds, the reconnect's top-of-attempt
+    // check cannot pass; once it is false the joiner's bootstrap cache cannot
+    // yet carry the new owner address (it is only written after the new
+    // handshake completes), so an in-flight reconnect has nothing live to
+    // dial. 20 ms polls, 5 s bound; the strict gossip_plane_peers barrier
+    // below is unchanged, so a genuine never-connects failure still fails at
+    // the same assertion.
+    let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while joiner_net.is_connected(&old_owner_peer).await {
+        assert!(
+            std::time::Instant::now() < settle_deadline,
+            "#510: joiner must observe the old owner connection as gone within 5 s \
+             before the owner is rebuilt"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
     // Reconnect the restarted daemon to the joiner and let the mesh settle —
@@ -3337,11 +3356,25 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     // Restart barrier (identical to the TreeKEM Home variant): `Agent::drop`
     // alone leaks the old owner's network/PubSub/blob-responder tasks into
     // the replacement — shut the old agent down first, THEN rebuild.
+    // #510: same reconnect-vs-connect_addr overlap guard as the TreeKEM
+    // variant — capture the owner's stable PeerId (machine.key is reused),
+    // then wait until the joiner observes the old connection as gone (20 ms
+    // polls, 5 s bound) instead of a fixed 300 ms settle, so the joiner's
+    // scheduled reconnect cannot dial Phase 2 into the rebuilt owner's fresh
+    // inbound handshake (simultaneous open, ant-quic#277/#278).
+    let old_owner_peer = ant_quic::PeerId(owner_agent.machine_id().0);
     owner_agent.shutdown().await;
     drop(owner_agent);
-    // #510: same settle as the TreeKEM variant — let the joiner finish
-    // unwinding the old connection before the rebuilt owner dials it.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let joiner_net = joiner_agent.network().expect("joiner network");
+    let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while joiner_net.is_connected(&old_owner_peer).await {
+        assert!(
+            std::time::Instant::now() < settle_deadline,
+            "#510: joiner must observe the old owner connection as gone within 5 s \
+             before the owner is rebuilt"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
     // #510 RCA instrumentation (mirrors the TreeKEM variant): watch BOTH

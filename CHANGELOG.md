@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 ### Fixed
 
+- **Reconnect no longer dials the bootstrap cache into a peer that just
+  reconnected inbound (#510).** Between a reconnect attempt's top-of-attempt
+  `is_connected` check and its Phase 2 (`connect_cached_peer`) fallback,
+  Phase 1's discovery-cache dials can burn up to 5 s each — during which the
+  peer may recover via another path (a rebuilt owner dialing us with the
+  same machine key). The unguarded Phase 2 dial then opened a second
+  connection family alongside the just-established inbound one: a
+  simultaneous open whose ant-quic tiebreaker is a 50/50 coin flip, and
+  losing it left one side with `connected_peers = 0` for the whole barrier
+  window (the hs_f2 restart flake, ~3–5% of CI runs). `schedule_reconnect`
+  now re-checks `is_connected` at the call-site between the two phases and
+  aborts the attempt — defense in depth; the tiebreaker root cause is fixed
+  separately in ant-quic#277/#278. Regression:
+  `reconnect_phase2_dial_aborted_when_peer_connects_during_phase1`, which
+  forces the interleaving deterministically (blackholed old port, wire-level
+  proof Phase 1 is in flight, inbound re-dial, single-flight-tracker drain).
 - **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3
   rules out "a marker in isolation" establishing a supported deployment,
   but the supervised classification trusted `X0X_SUPERVISED=1` alone: a
@@ -66,6 +82,14 @@ All notable changes to this project will be documented in this file.
 
 ### Tests
 
+- The hs_f2 restart tests no longer settle on a fixed 300 ms sleep between
+  the owner shutdown and rebuild (#510, replacing the #666 settle). Both
+  restart sites (`integration_treekem_home_rename_restart_single_announce_
+  end_to_end` and `integration_real_home_provision_rename_restart_join_e2e`)
+  now capture the owner's stable PeerId before the shutdown and poll (20 ms,
+  5 s `#510`-tagged bound) until the joiner observes the old connection as
+  gone, removing the reconnect-vs-`connect_addr` overlap that caused the
+  simultaneous open instead of guessing its duration.
 - A2A binding fixtures no longer fail on a transient setup dial under
   full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
   ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s
