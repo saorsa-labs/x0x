@@ -164,8 +164,20 @@ pub(crate) fn ingest_verified_capability_advert(
     };
     if advert.protocol_version != ADVERT_PROTOCOL_VERSION
         || advert.agent_id != *pubsub_sender.as_bytes()
-        || !verify_advert_signature(&advert, sender_pubkey)
     {
+        return false;
+    }
+    // #674: a stale or replayed advert cannot change store state — insert's
+    // last-write-wins rule would reject it — so it must not cost the
+    // ML-DSA-65 verify. `advert.agent_id` is constrained to the
+    // transport-authenticated sender above, so the pre-check key cannot be
+    // forged to suppress a genuine newer advert: the store only holds
+    // verified entries and only a strictly newer timestamp passes.
+    if !store.would_accept_advert(&AgentId(advert.agent_id), advert.created_at_unix_ms) {
+        store.record_prefiltered_stale_advert();
+        return false;
+    }
+    if !verify_advert_signature(&advert, sender_pubkey) {
         return false;
     }
     store.insert(
@@ -201,8 +213,18 @@ pub(crate) fn ingest_verified_digest_extension(
     };
     if extension.protocol_version != crate::dm_capability::DIGEST_EXTENSION_PROTOCOL_VERSION
         || extension.agent_id != *pubsub_sender.as_bytes()
-        || !verify_digest_extension_signature(&extension, sender_pubkey)
     {
+        return false;
+    }
+    // #674: same freshness pre-check as the advert path — see
+    // [`ingest_verified_capability_advert`].
+    if !store
+        .would_accept_digest_extension(&AgentId(extension.agent_id), extension.created_at_unix_ms)
+    {
+        store.record_prefiltered_stale_advert();
+        return false;
+    }
+    if !verify_digest_extension_signature(&extension, sender_pubkey) {
         return false;
     }
     store.apply_digest_extension(
@@ -2248,5 +2270,182 @@ mod asymmetric_ingress_tests {
             observer.snapshot().unwrap_err(),
             "service observer poisoned"
         );
+    }
+}
+
+/// #674 freshness pre-check: an advert the store would reject as stale must
+/// not cost a signature verification. Each test pins one leg of the safety
+/// argument — stale skip, newer acceptance, forged-newer rejection.
+#[cfg(test)]
+mod caps_prefilter_tests {
+    use super::*;
+    use crate::identity::AgentKeypair;
+
+    /// Signed advert from `signing`, bound to `machine`, stamped
+    /// `created_at_unix_ms`.
+    fn advert_message(
+        signing: &SigningContext,
+        machine: MachineId,
+        created_at_unix_ms: u64,
+    ) -> PubSubMessage {
+        let mut advert = CapabilityAdvert {
+            protocol_version: ADVERT_PROTOCOL_VERSION,
+            agent_id: *signing.agent_id.as_bytes(),
+            machine_id: *machine.as_bytes(),
+            created_at_unix_ms,
+            capabilities: DmCapabilities::v1_gossip_ready(vec![1; 1184]),
+            signature: Vec::new(),
+        };
+        advert.signature = signing
+            .sign(&advert.signed_bytes().unwrap())
+            .expect("re-sign fixture advert");
+        PubSubMessage {
+            topic: DM_CAPABILITY_TOPIC.into(),
+            payload: postcard::to_stdvec(&advert).unwrap().into(),
+            sender: Some(signing.agent_id),
+            sender_public_key: Some(signing.public_key_bytes.clone()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        }
+    }
+
+    /// Signed digest extension from `signing`, stamped
+    /// `created_at_unix_ms`.
+    fn extension_message(
+        signing: &SigningContext,
+        machine: MachineId,
+        created_at_unix_ms: u64,
+    ) -> PubSubMessage {
+        let mut extension = crate::dm_capability::DigestSupportExtension {
+            protocol_version: crate::dm_capability::DIGEST_EXTENSION_PROTOCOL_VERSION,
+            agent_id: *signing.agent_id.as_bytes(),
+            machine_id: *machine.as_bytes(),
+            created_at_unix_ms,
+            digest_support: true,
+            signature: Vec::new(),
+        };
+        extension.signature = signing
+            .sign(&extension.signed_bytes().unwrap())
+            .expect("re-sign fixture extension");
+        PubSubMessage {
+            topic: crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.into(),
+            payload: postcard::to_stdvec(&extension).unwrap().into(),
+            sender: Some(signing.agent_id),
+            sender_public_key: Some(signing.public_key_bytes.clone()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        }
+    }
+
+    #[test]
+    fn stale_advert_replays_skip_the_signature_verify() {
+        // Why (#674): on a 27-peer mesh nearly every inbound advert is one
+        // the store already holds at the same or newer timestamp; each one
+        // previously paid a full ML-DSA-65 verify before insert's
+        // last-write-wins rule discarded it.
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let now = now_unix_ms();
+        let first = advert_message(&signing, MachineId([1; 32]), now);
+        assert!(ingest_verified_capability_advert(&store, local, &first));
+        assert_eq!(store.prefiltered_stale_adverts(), 0);
+
+        // Same-timestamp replay: rejected without verify (counter is the
+        // counting hook for the skipped verify) and the TTL-bearing record
+        // is untouched — machine binding still the first advert's.
+        let replay = advert_message(&signing, MachineId([2; 32]), now);
+        assert!(!ingest_verified_capability_advert(&store, local, &replay));
+        let older = advert_message(&signing, MachineId([2; 32]), now - 1);
+        assert!(!ingest_verified_capability_advert(&store, local, &older));
+        assert_eq!(store.prefiltered_stale_adverts(), 2);
+        assert_eq!(
+            store.lookup_binding(&signing.agent_id).unwrap().machine_id,
+            MachineId([1; 32]),
+            "a stale or replayed advert must not replace the stored record"
+        );
+    }
+
+    #[test]
+    fn newer_advert_still_verifies_and_replaces_the_record() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let now = now_unix_ms();
+        assert!(ingest_verified_capability_advert(
+            &store,
+            local,
+            &advert_message(&signing, MachineId([1; 32]), now)
+        ));
+        assert!(ingest_verified_capability_advert(
+            &store,
+            local,
+            &advert_message(&signing, MachineId([2; 32]), now + 5_000)
+        ));
+        assert_eq!(
+            store.prefiltered_stale_adverts(),
+            0,
+            "a genuinely newer advert must reach the verify, never the skip"
+        );
+        assert_eq!(
+            store.lookup_binding(&signing.agent_id).unwrap().machine_id,
+            MachineId([2; 32]),
+            "the newer advert must replace the stored record"
+        );
+    }
+
+    #[test]
+    fn forged_newer_advert_is_rejected_by_the_verify() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let now = now_unix_ms();
+        assert!(ingest_verified_capability_advert(
+            &store,
+            local,
+            &advert_message(&signing, MachineId([1; 32]), now)
+        ));
+        let mut forged = advert_message(&signing, MachineId([2; 32]), now + 5_000);
+        let mut advert = CapabilityAdvert::from_postcard(&forged.payload).unwrap();
+        advert.signature[0] ^= 1;
+        forged.payload = postcard::to_stdvec(&advert).unwrap().into();
+        assert!(!ingest_verified_capability_advert(&store, local, &forged));
+        assert_eq!(
+            store.prefiltered_stale_adverts(),
+            0,
+            "a forged newer timestamp must be rejected by the verify, not by the pre-check"
+        );
+        assert_eq!(
+            store.lookup_binding(&signing.agent_id).unwrap().machine_id,
+            MachineId([1; 32]),
+            "a forged advert must not replace the stored record"
+        );
+    }
+
+    #[test]
+    fn digest_extension_stale_replays_skip_but_newer_extensions_apply() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let now = now_unix_ms();
+        assert!(ingest_verified_digest_extension(
+            &store,
+            local,
+            &extension_message(&signing, MachineId([1; 32]), now)
+        ));
+        assert!(!ingest_verified_digest_extension(
+            &store,
+            local,
+            &extension_message(&signing, MachineId([1; 32]), now - 1)
+        ));
+        assert_eq!(store.prefiltered_stale_adverts(), 1);
+        assert!(ingest_verified_digest_extension(
+            &store,
+            local,
+            &extension_message(&signing, MachineId([1; 32]), now + 5_000)
+        ));
+        assert_eq!(store.prefiltered_stale_adverts(), 1);
     }
 }
