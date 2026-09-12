@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 ### Fixed
 
+- **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3
+  rules out "a marker in isolation" establishing a supported deployment,
+  but the supervised classification trusted `X0X_SUPERVISED=1` alone: a
+  launchd job verified by `x0x autostart --repair` whose `KeepAlive` was
+  later removed or made conditional still classified `SupervisedExit`,
+  exited 0 for the upgrade — and nothing restarted it. The daemon went
+  down and stayed down, silently. `resolve_restart_plan` now requires, at
+  every apply, that the **loaded** launchd job policy for this exact
+  instance (matched by program basename plus argument tail, so
+  multi-instance `--name` jobs cannot verify each other) holds an
+  unconditional keep-alive — read back via `launchctl print`, never the
+  on-disk plist alone. Each label is probed in the `gui/<uid>` domain
+  first with a fallback to `user/<uid>` (the two per-user launchd domains
+  are disjoint, so a gui-only probe would refuse a legitimately-loaded
+  marker job forever — round-2 review), and the decision core is
+  unit-tested against captured `launchctl print` output for every
+  fail-closed arm. Anything short of a confirmed guarantee refuses the
+  apply before replacement with a diagnostic that names what was found.
+  `INVOCATION_ID`/systemd signals are unchanged (no launchd to read); the
+  systemd-side readback remains open under §3. Also documents the
+  platform-validated manual recovery procedure for a failed supervised
+  upgrade (#616, ADR-0061 §6) — diagnose, restore `<target>.backup`,
+  reconcile `upgrade-handoff.json`, re-enter through the manager — with
+  exact launchd and systemd commands, cross-linked from the new refusal
+  and from the apply logs.
+
+- **Group task-list policy now gates the bootstrap prune (#654).** The
+  digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
+  acted directly on the wire delta's removal evidence, so on a
+  group-scoped list a holder the content policy would reject (a
+  non-member, or an unsigned serve with no envelope-verified writer)
+  could still DELETE tasks by serving empty-tag removal evidence — and
+  the pruned replica would forward that evidence fleet-wide. Deletion is
+  content: the prune now applies the same `is_authorized_content_writer`
+  check as `merge_delta` (open lists keep accepting any verified writer,
+  so deletion cold-sync is unchanged there). Also from the #652 review:
+  dropped the inert `#[serde(default)]` on `SnapshotBodyV2.known_removed`
+  (bincode is positional — a default could never engage; the v1/v2 split
+  is the magic prefix) and the stale `#[allow(dead_code)]` on
+  `delta_remove_task` (it has production call sites).
 - **Slow-consumer Close(1013) survives the writer's flush budget (#287,
   round 2).** The WS writer owned the socket sink; when its bounded
   Close(1013) flush (2 s) expired against a stalled reader, the writer task

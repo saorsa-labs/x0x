@@ -134,12 +134,22 @@ impl AutoApplyUpgrader {
         &self,
         binary_path: &Path,
     ) -> Result<restart::RestartPlan, UpgradeError> {
+        let signals = restart::SupervisionSignals::sample();
+        // ADR-0061 §3 (#615): at upgrade time — not only at
+        // `x0x autostart --repair` time — verify that the LOADED launchd
+        // policy behind the supervision marker still guarantees a restart
+        // after the supervised exit. `readback_launchd_policy` is a no-op
+        // unless the recognized signal is the launchd marker, so systemd
+        // and unsupervised applies shell out to nothing.
+        let launchd_readback =
+            restart::readback_launchd_policy(&signals, binary_path, &restart::current_argv());
         restart::resolve_restart_plan(
             self.stop_on_upgrade,
-            &restart::SupervisionSignals::sample(),
+            &signals,
             binary_path,
             self.restart_context.data_dir.as_deref(),
             self.restart_context.api_addr,
+            &launchd_readback,
         )
         .map_err(UpgradeError::from)
     }
