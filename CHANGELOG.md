@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.42.2] - 2026-09-12
+
 ### Fixed
 
 - **`x0x/caps/v1` CPU amplification (#656).** One targeted capability
@@ -131,7 +133,9 @@ All notable changes to this project will be documented in this file.
 - `tests/e2e_deploy.sh` uploads the binary as a gzip stream with ssh keepalives
   (`ServerAliveInterval=15`, `ServerAliveCountMax=4`), so a stalled upload to a
   far host fails fast instead of hanging the rollout.
-
+- The two home rename/restart e2e tests settle 300 ms between owner shutdown and
+  rebuild so the joiner's ant-quic finishes unwinding the old connection before the
+  rebuilt owner dials it (#510; underlying reconnect race filed as ant-quic#277).
 
 ## [v0.42.1] - 2026-09-11
 
