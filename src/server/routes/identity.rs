@@ -367,9 +367,7 @@ fn card_addresses(
     // pushed same-host /agents/connect past a 20 s client budget (#638).
     // Observed addresses stay untouched: they are empirical reports, and a
     // specifically bound listener cannot earn a report on another interface.
-    let specifically_bound = local_addr.port() != 0
-        && !local_addr.ip().is_unspecified()
-        && !local_addr.ip().is_multicast();
+    let specifically_bound = x0x::is_specific_interface_bind(local_addr);
     let mut addresses: Vec<String> = external_addrs
         .iter()
         .filter(|addr| include_local || x0x::is_publicly_advertisable(**addr))
