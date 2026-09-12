@@ -595,6 +595,9 @@ const FULL_EAGER_DEGREE_CEILING: usize = 6;
 // toward sg's stock 12. A runtime test cannot discriminate this in steady
 // state (any ceiling >= 6 promotes to 6), so the constant itself is the
 // contract; raising it past 6 (or using sg's `0` sentinel) fails to compile.
+// This does NOT track sg's floor: if a future saorsa-gossip raises
+// `MIN_EAGER_DEGREE`, revisit this value so x0x does not cap the backbone
+// below what sg intends.
 const _: () = assert!(
     FULL_EAGER_DEGREE_CEILING == 6,
     "FULL_EAGER_DEGREE_CEILING must equal sg's MIN_EAGER_DEGREE (6); see #674 design C1"
