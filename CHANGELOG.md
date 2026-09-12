@@ -95,6 +95,14 @@ All notable changes to this project will be documented in this file.
   then had no address left to dial. The #456 hermeticity concern is cache
   sharing, not persistence, so a per-test dir preserves isolation. The
   deterministic settle wait is unchanged.
+- The #510 settle barrier no longer panics when the transport fails to close
+  the stale connection within 5 s (#510, ant-quic#283 workaround). ant-quic's
+  shutdown does not close superseded lifecycle survivors, so `is_connected`
+  can remain true until the idle timeout. On expiry the barrier now calls
+  `joiner_net.disconnect(&old_owner_peer)` (reconnect-eligible, no tombstone)
+  to force the joiner's view clean and continues rather than panicking. The
+  strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
+  genuine never-reconnects regression still fails at the same place.
 
 ## [v0.42.2] - 2026-09-12
 ### Fixed
