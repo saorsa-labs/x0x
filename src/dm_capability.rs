@@ -23,6 +23,7 @@ use crate::dm::DmCapabilities;
 use crate::identity::{AgentId, MachineId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -251,12 +252,16 @@ impl DigestSupportExtension {
 
 /// In-memory cache of `AgentId → latest CapabilityAdvert`, with TTL
 /// eviction.
-///
 /// Senders consult this cache before each `send_direct` call to determine
 /// whether the recipient supports the gossip DM inbox path.
 pub struct CapabilityStore {
     inner: Mutex<CapabilityStoreInner>,
     ttl: Duration,
+    /// Adverts and digest extensions the service skipped without an
+    /// ML-DSA-65 verify because the store already held state at least as
+    /// new (#674). Diagnostics-only; see
+    /// [`Self::would_accept_advert`].
+    prefiltered_stale_adverts: AtomicU64,
 }
 
 #[derive(Default)]
@@ -310,6 +315,7 @@ impl CapabilityStore {
         Self {
             inner: Mutex::new(CapabilityStoreInner::default()),
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
+            prefiltered_stale_adverts: AtomicU64::new(0),
         }
     }
 
@@ -319,6 +325,7 @@ impl CapabilityStore {
         Self {
             inner: Mutex::new(CapabilityStoreInner::default()),
             ttl,
+            prefiltered_stale_adverts: AtomicU64::new(0),
         }
     }
 
@@ -359,6 +366,64 @@ impl CapabilityStore {
     pub fn lookup_at(&self, agent_id: &AgentId, now: Instant) -> Option<DmCapabilities> {
         self.lookup_binding_at(agent_id, now)
             .map(|binding| binding.capabilities)
+    }
+
+    /// Would [`Self::insert`] accept an advert with this signed timestamp?
+    ///
+    /// Mirrors `insert`'s last-write-wins rule exactly — including the
+    /// retained-expired-entry behaviour — but without the wall-clock TTL
+    /// check, so the caller can decide *before* paying an ML-DSA-65
+    /// verification whether the advert could change store state at all
+    /// (#674). At the 600 s advert cadence nearly every advert on the mesh
+    /// is one this store already holds at the same or newer timestamp.
+    ///
+    /// Skipping the verify for a `false` return is safe: the store only
+    /// ever holds *verified* entries, a replayed old advert can never
+    /// refresh the TTL (`insert` would reject it), and a genuinely newer
+    /// advert returns `true` and is verified as before. A poisoned lock
+    /// fails open — the verify path then decides, as it always did.
+    pub(crate) fn would_accept_advert(&self, agent_id: &AgentId, created_at_unix_ms: u64) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return true;
+        };
+        inner
+            .adverts
+            .get(agent_id.as_bytes())
+            .is_none_or(|existing| created_at_unix_ms > existing.created_at_unix_ms)
+    }
+
+    /// Would [`Self::apply_digest_extension`] accept an extension with this
+    /// signed timestamp? Same contract as [`Self::would_accept_advert`],
+    /// mirroring `apply_digest_extension`'s rule that only a *fresh* cached
+    /// extension blocks an equal-or-older one — an expired extension must
+    /// not prefilter a re-publish, because the real path would accept it.
+    pub(crate) fn would_accept_digest_extension(
+        &self,
+        agent_id: &AgentId,
+        created_at_unix_ms: u64,
+    ) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return true;
+        };
+        inner
+            .digest_exts
+            .get(agent_id.as_bytes())
+            .is_none_or(|existing| {
+                Instant::now() > existing.expires_at
+                    || created_at_unix_ms > existing.created_at_unix_ms
+            })
+    }
+
+    /// Count one advert-family frame the service dropped at the freshness
+    /// pre-check (#674) — diagnostics only.
+    pub(crate) fn record_prefiltered_stale_advert(&self) {
+        self.prefiltered_stale_adverts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adverts and digest extensions skipped by the freshness pre-check.
+    pub(crate) fn prefiltered_stale_adverts(&self) -> u64 {
+        self.prefiltered_stale_adverts.load(Ordering::Relaxed)
     }
 
     /// Insert / refresh a cache entry.

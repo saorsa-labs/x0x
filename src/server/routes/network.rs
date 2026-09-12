@@ -591,6 +591,10 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "outer_v1_receipts": state.agent.gossip_outer_v1_receipts(),
                 "gossip_publish_zero_fanout": snap.publish_zero_fanout,
                 "pubsub_stages": pubsub_stages,
+                "inbound_by_topic": state
+                    .agent
+                    .gossip_inbound_by_topic()
+                    .unwrap_or_default(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
                 "discovery_cache_entries": {
@@ -977,6 +981,10 @@ pub(in crate::server) async fn dm_diagnostics(
         "subscriber_count": subscriber_count,
         "subscriber_capacity": subscriber_capacity,
         "capability_store_entries": state.agent.capability_store().len(),
+        "caps_advert_prefiltered_stale": state
+            .agent
+            .capability_store()
+            .prefiltered_stale_adverts(),
         "per_peer_digest": digest,
     });
     if let Some(stages) = last_durable_send {

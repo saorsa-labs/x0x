@@ -53,6 +53,42 @@ All notable changes to this project will be documented in this file.
   `reconnect_phase2_dial_aborted_when_peer_connects_during_phase1`, which
   forces the interleaving deterministically (blackholed old port, wire-level
   proof Phase 1 is in flight, inbound re-dial, single-flight-tracker drain).
+- **Capability adverts went stale in on-demand mode (#664 regression).**
+  #664 correctly stopped the per-request re-broadcast of the fleet-wide
+  `x0x/caps/v1` advert, but the on-demand publisher's idle wake stayed at
+  3600 s — four times the consumer-side `ADVERT_CACHE_TTL_SECS` (900 s)
+  cache window. With `legacy_announce = false` (the production default)
+  there is no steady beat, so after the startup advert a node's advert was
+  refreshed only when some peer happened to send it a targeted request. A
+  peer nobody asked about dropped out of every consumer's cache one TTL
+  later and every strict ADR-0030 send to it refused with HTTP 409
+  `recipient ... has no current v2 durable-ACK capability advert`.
+  Observed on the 6-node testnet four hours after a rolling restart: NYC to
+  SFO durable DMs failed while the other four directions, which saw request
+  traffic, stayed healthy. The on-demand idle wake is now bounded by the
+  advert window and measured from the last successful steady publish, so a
+  request-triggered cycle inside the window cannot defer the next steady
+  publish by a whole extra window. Worst-case steady republish interval is
+  now `ADVERT_PUBLISH_INTERVAL_SECS` + one tenth of it (660 s) against the
+  900 s cache TTL, versus 3600 s before. The #664 storm reduction is
+  unchanged: request-triggered cycles still answer on the Critical
+  response topic and still emit at most one steady advert per window.
+  Cadence only — no caps topic is retired and no wire shape changes.
+- **Stale capability adverts no longer cost an ML-DSA-65 verify (#674 item 1).**
+  `ingest_verified_capability_advert` and `ingest_verified_digest_extension`
+  (`src/dm_capability_service.rs`) consulted the signature verifier before
+  the store's last-write-wins staleness rule, so on a ~27-peer mesh nearly
+  every advert — the caps family is 43.5 unique msgs/s at two verifies per
+  frame against a 600 s publish cadence — was verified in full and then
+  discarded by `CapabilityStore::insert`. A new
+  `CapabilityStore::would_accept_advert` /
+  `would_accept_digest_extension` pre-check skips the verify for adverts
+  that could not change store state anyway. Safe by construction: the store
+  only ever holds verified entries, a replayed old advert can never refresh
+  the TTL (insert would reject it), and a genuinely newer advert still
+  reaches the verify. Skips are counted as `caps_advert_prefiltered_stale`
+  on `GET /diagnostics/dm`.
+
 - **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3
   rules out "a marker in isolation" establishing a supported deployment,
   but the supervised classification trusted `X0X_SUPERVISED=1` alone: a
@@ -111,6 +147,40 @@ All notable changes to this project will be documented in this file.
   `run_ws_writer_exits_after_flush_budget_with_close_still_blocked` (bounded
   exit + handoff) and integration
   `ws_slow_close_frame_survives_flush_budget_expiry` (self-DM-triggered
+
+### Changed
+
+- **Full-participation eager degree ceiling lowered from 12 to 6 (#674
+  design C1) — no steady-state send-rate change expected.** sg promotes
+  eager peers to `MIN_EAGER_DEGREE.min(ceiling)` and `MIN_EAGER_DEGREE` is
+  already 6, so a ceiling of 12 and a ceiling of 6 produce the same
+  steady-state degree; the measured 242.4 eager sends/s at 4.27 MB/s on the
+  testnet anchor come from an effective fan-out of ~2.1 and are NOT reduced
+  by this change. What it bounds is the all-cooled publish-rescue path,
+  where sg grows the eager set toward the ceiling instead of swapping
+  members — with 12 that growth is the send amplification the #380/#656
+  storms ride on; with 6 the set swaps. `ensure_eager_ceiling` now passes 6
+  instead of sg's `0` sentinel (stock 12). Delivery robustness unchanged
+  (PlumTree's lazy IHAVE/IWANT half still repairs peers outside the eager
+  tree). Local topology parameter — no wire change.
+- saorsa-gossip pins bumped 0.5.77 → 0.5.78 (all eleven crates): PlumTree dedups
+  inbound EAGER by `msg_id` before the ML-DSA-65 verify (saorsa-labs/saorsa-gossip#56,
+  #674) — on a bootstrap ~28% of inbound EAGER frames were duplicates that were
+  verified and then discarded. New counter `eager_duplicate_dropped_pre_verify`
+  under `pubsub_stages` in `GET /diagnostics/gossip`; a wiring test pins the key.
+  The #501 legacy-bus meter premise moves to pubsub 0.5.78.
+
+### Added
+
+- **`inbound_by_topic` counters on `GET /diagnostics/gossip` (#674 item 4).**
+  Inbound PubSub frames and bytes are now attributed to a topic class
+  (`announce_blob`, `caps`, `dm_bus`, `presence`, `other`) and PlumTree kind
+  (`eager`, `ihave`, `iwant`, …), counted in `handle_incoming` off the
+  already-decoded header before any signature work — refused and
+  later-discarded frames still count. Previously inbound verify cost could
+  only be inferred from message-cache eviction rates. Keys are documented in
+  `docs/diagnostics.md`. The measurement gap this closes is what forced the
+  #674 design to proxy per-topic inbound rates from eviction counters.
 
 ### Tests
 

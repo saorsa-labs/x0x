@@ -164,8 +164,20 @@ pub(crate) fn ingest_verified_capability_advert(
     };
     if advert.protocol_version != ADVERT_PROTOCOL_VERSION
         || advert.agent_id != *pubsub_sender.as_bytes()
-        || !verify_advert_signature(&advert, sender_pubkey)
     {
+        return false;
+    }
+    // #674: a stale or replayed advert cannot change store state — insert's
+    // last-write-wins rule would reject it — so it must not cost the
+    // ML-DSA-65 verify. `advert.agent_id` is constrained to the
+    // transport-authenticated sender above, so the pre-check key cannot be
+    // forged to suppress a genuine newer advert: the store only holds
+    // verified entries and only a strictly newer timestamp passes.
+    if !store.would_accept_advert(&AgentId(advert.agent_id), advert.created_at_unix_ms) {
+        store.record_prefiltered_stale_advert();
+        return false;
+    }
+    if !verify_advert_signature(&advert, sender_pubkey) {
         return false;
     }
     store.insert(
@@ -201,8 +213,18 @@ pub(crate) fn ingest_verified_digest_extension(
     };
     if extension.protocol_version != crate::dm_capability::DIGEST_EXTENSION_PROTOCOL_VERSION
         || extension.agent_id != *pubsub_sender.as_bytes()
-        || !verify_digest_extension_signature(&extension, sender_pubkey)
     {
+        return false;
+    }
+    // #674: same freshness pre-check as the advert path — see
+    // [`ingest_verified_capability_advert`].
+    if !store
+        .would_accept_digest_extension(&AgentId(extension.agent_id), extension.created_at_unix_ms)
+    {
+        store.record_prefiltered_stale_advert();
+        return false;
+    }
+    if !verify_digest_extension_signature(&extension, sender_pubkey) {
         return false;
     }
     store.apply_digest_extension(
@@ -451,12 +473,15 @@ impl CapabilityAdvertService {
         let mut publisher_caps_rx = caps_rx;
         let publisher = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(FIRST_PUBLISH_DELAY_MS)).await;
-            // L3 retirement: in on-demand mode (periodic == false) there is no
-            // startup burst and no steady beat — the publisher wakes only for
-            // targeted/warm requests and capability upgrades, and answers
-            // requesters on the Critical response topic (#656: the steady
-            // topic carries at most ONE advert per advert window — see the
-            // warm fallback below — instead of one per request cycle).
+            // L3 retirement: in on-demand mode (periodic == false) there is
+            // no startup burst, and the publisher answers requesters on the
+            // Critical response topic (#656: the steady topic carries at
+            // most ONE advert per advert window — see the warm fallback
+            // below — instead of one per request cycle). It still keeps a
+            // freshness timer: the idle wake is bounded by the advert window
+            // so the steady advert is refreshed inside every consumer's
+            // `ADVERT_CACHE_TTL_SECS` cache window even with zero request
+            // traffic (#664 regression — see `next_delay` below).
             let mut burst_idx: usize = if periodic {
                 0
             } else {
@@ -632,9 +657,27 @@ impl CapabilityAdvertService {
                 } else if periodic {
                     publish_interval
                 } else {
-                    // On-demand mode: no steady beat. The select below still
-                    // wakes on requests and capability upgrades.
-                    Duration::from_secs(3600)
+                    // On-demand mode has no fleet-wide steady BEAT, but the
+                    // publisher must still wake in time to keep its own
+                    // steady advert inside every consumer's
+                    // `ADVERT_CACHE_TTL_SECS` window (#664 regression): with
+                    // an hour-long idle sleep the only thing that refreshed
+                    // the advert was inbound request traffic, so a peer
+                    // nobody happened to ask about went stale after one TTL
+                    // and strict senders got `AckSemanticsUnavailable`.
+                    //
+                    // Wake when the warm fallback next comes due — measured
+                    // from the last SUCCESSFUL steady publish, not from this
+                    // cycle — so a request-triggered cycle inside the window
+                    // cannot defer the steady publish by a whole extra
+                    // window. The floor keeps a persistently failing publish
+                    // (which leaves the fallback permanently due) from
+                    // spinning the loop; it costs at most one tenth of an
+                    // advert window of extra staleness.
+                    let remaining = last_steady_publish_at.map_or(publish_interval, |last| {
+                        publish_interval.saturating_sub(last.elapsed())
+                    });
+                    remaining.max(publish_interval / 10)
                 };
                 let publish_delay = tokio::time::sleep(next_delay);
                 tokio::pin!(publish_delay);
@@ -1747,6 +1790,170 @@ mod tests {
         service.abort();
     }
 
+    /// #664 regression: on-demand mode must keep its own steady advert
+    /// fresh on a TIMER, not on inbound request traffic.
+    ///
+    /// WHY this matters: a consumer drops a cached advert after
+    /// `ADVERT_CACHE_TTL_SECS` (900 s) and a strict ADR-0030 send then
+    /// refuses with `AckSemanticsUnavailable` ("recipient has no current v2
+    /// durable-ACK capability advert"). #664 removed the per-request steady
+    /// republish — correctly, it was a storm — but left the on-demand idle
+    /// wake at 3600 s, four times the consumer TTL. Freshness therefore
+    /// depended entirely on somebody targeting the node: on the 6-node
+    /// testnet the peers that saw request traffic stayed fresh while SFO,
+    /// which nobody asked about, went stale after one TTL and every
+    /// NYC -> SFO durable DM returned HTTP 409 for hours.
+    ///
+    /// The fixture is the consumer's half of that: agent A publishes in
+    /// on-demand mode with a shortened advert window, NOBODY sends A a
+    /// targeted request, and B ingests the mesh-wide topics into a store
+    /// whose TTL is shortened too. B's record of A must stay current — and
+    /// keep passing the exact production strict-send gate — across several
+    /// TTL windows. On origin/main B's record expires one TTL after A's
+    /// single startup advert and never returns, whatever the TTL is.
+    ///
+    /// TIMING (CI round 2, run 103516993318). A paused tokio clock cannot
+    /// drive this fixture: the store's `expires_at` is a
+    /// `std::time::Instant` and its acceptance gate compares
+    /// `now_unix_ms()` SystemTime values, neither of which
+    /// `tokio::time::advance` moves — virtual time would freeze the TTL
+    /// instead of exercising it. So the test stays on the real clock and
+    /// buys determinism with ratio instead of luck: worst-case republish is
+    /// `ADVERT_WINDOW + ADVERT_WINDOW / 10` = 330 ms against a 3 s TTL,
+    /// leaving 2.67 s of slack for publish -> gossip -> ingest on every
+    /// refresh. The first version allowed 260 ms and lost it on a 2-vCPU
+    /// runner.
+    #[tokio::test]
+    async fn on_demand_publisher_refreshes_steady_advert_without_any_requests() {
+        // The advert window must stay well inside the cache TTL, as in
+        // production (600 s window, 900 s TTL). Shortened here on both
+        // sides and then widened: the TTL is 9x the worst-case republish
+        // interval, so scheduler jitter on a loaded runner cannot reach the
+        // expiry boundary.
+        const ADVERT_WINDOW: Duration = Duration::from_millis(300);
+        const CACHE_TTL: Duration = Duration::from_secs(3);
+        // Slightly over three cache TTLs of observation, so the record must
+        // survive on republishes alone many times over.
+        const OBSERVE: Duration = Duration::from_millis(9_500);
+
+        let kp_a = AgentKeypair::generate().expect("keygen");
+        let signing_a = Arc::new(SigningContext::from_keypair(&kp_a));
+        let agent_a = kp_a.agent_id();
+        let machine_a = MachineId([0x4A; 32]);
+
+        // The pubsub signs as A, so loopback messages reach B's ingest path
+        // with a verified sender of A — the same authenticated boundary the
+        // real subscriber enforces.
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing_a))).expect("pubsub"),
+        );
+
+        // B: a second agent's view of A, with the shortened cache TTL.
+        let agent_b = AgentId([0x4B; 32]);
+        let store_b = Arc::new(CapabilityStore::with_ttl(CACHE_TTL));
+        let mut adverts_b = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let mut digests_b = pubsub
+            .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
+            .await;
+        // Counting ingested adverts separates the two ways this test can
+        // fail: zero republishes is the #664 regression itself, while
+        // republishes that arrive but land late would be ingest latency.
+        let ingested = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let advert_store = Arc::clone(&store_b);
+        let advert_counter = Arc::clone(&ingested);
+        let advert_ingest = tokio::spawn(async move {
+            while let Some(message) = adverts_b.recv().await {
+                if ingest_verified_capability_advert(&advert_store, agent_b, &message) {
+                    advert_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        let digest_store = Arc::clone(&store_b);
+        let digest_ingest = tokio::spawn(async move {
+            while let Some(message) = digests_b.recv().await {
+                ingest_verified_digest_extension(&digest_store, agent_b, &message);
+            }
+        });
+
+        // A publishes in on-demand mode — the production default
+        // (`legacy_announce == false`).
+        let store_a = Arc::new(CapabilityStore::new());
+        let (_caps_tx, caps_rx) =
+            tokio::sync::watch::channel(DmCapabilities::v2_durable_gossip_ready(vec![0xCA; 1184]));
+        let service = CapabilityAdvertService::spawn(
+            Arc::clone(&pubsub),
+            Arc::clone(&signing_a),
+            agent_a,
+            machine_a,
+            caps_rx,
+            Arc::clone(&store_a),
+            ADVERT_WINDOW,
+            false,
+        )
+        .await
+        .expect("spawn on-demand service");
+
+        // Wait for B's first sight of A (the initial publishable cycle).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while store_b.lookup_binding(&agent_a).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "B never ingested A's initial advert"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // No targeted request is ever sent to A. Poll continuously: a single
+        // observation of an expired record is the regression.
+        let started = std::time::Instant::now();
+        let until = started + OBSERVE;
+        let mut samples: u32 = 0;
+        while std::time::Instant::now() < until {
+            let binding = store_b.lookup_binding(&agent_a);
+            assert!(
+                crate::capability_binding_supports_durable_ack(binding.as_ref()),
+                "B's record of A went stale with no request traffic {} ms in \
+                 ({} sample(s), {} advert(s) ingested, {:?} cache TTL): a strict \
+                 send would refuse with AckSemanticsUnavailable",
+                started.elapsed().as_millis(),
+                samples,
+                ingested.load(std::sync::atomic::Ordering::Relaxed),
+                CACHE_TTL,
+            );
+            samples += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(samples > 0, "observation loop never sampled");
+
+        // The record survived on republishes, not on one long-lived entry:
+        // over `OBSERVE` the timer owes roughly `OBSERVE / ADVERT_WINDOW`
+        // adverts, and more than the three TTLs observed proves the cache
+        // was actually refilled rather than never expiring.
+        let republishes = ingested.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            republishes > 4,
+            "expected the on-demand timer to republish repeatedly over \
+             {OBSERVE:?}, saw {republishes}"
+        );
+
+        // The `caps/v2/digest` extension rides the same publish cycle and
+        // carries the same TTL, so a set bit this far past startup proves
+        // the extension was republished too — not just the base advert.
+        // Asserted once at the end rather than per sample: within a single
+        // cycle the two topics are ingested by independent tasks, so the
+        // bit can lag the base advert by a scheduling hop.
+        assert!(
+            store_b
+                .lookup_binding(&agent_a)
+                .is_some_and(|b| b.capabilities.digest_support),
+            "the caps/v2/digest extension must be refreshed on the same timer"
+        );
+
+        service.abort();
+        advert_ingest.abort();
+        digest_ingest.abort();
+    }
+
     // ------------------------------------------------------------------
     // CapabilityAdvertService::abort(): terminates both background loops
     // ------------------------------------------------------------------
@@ -2248,5 +2455,182 @@ mod asymmetric_ingress_tests {
             observer.snapshot().unwrap_err(),
             "service observer poisoned"
         );
+    }
+}
+
+/// #674 freshness pre-check: an advert the store would reject as stale must
+/// not cost a signature verification. Each test pins one leg of the safety
+/// argument — stale skip, newer acceptance, forged-newer rejection.
+#[cfg(test)]
+mod caps_prefilter_tests {
+    use super::*;
+    use crate::identity::AgentKeypair;
+
+    /// Signed advert from `signing`, bound to `machine`, stamped
+    /// `created_at_unix_ms`.
+    fn advert_message(
+        signing: &SigningContext,
+        machine: MachineId,
+        created_at_unix_ms: u64,
+    ) -> PubSubMessage {
+        let mut advert = CapabilityAdvert {
+            protocol_version: ADVERT_PROTOCOL_VERSION,
+            agent_id: *signing.agent_id.as_bytes(),
+            machine_id: *machine.as_bytes(),
+            created_at_unix_ms,
+            capabilities: DmCapabilities::v1_gossip_ready(vec![1; 1184]),
+            signature: Vec::new(),
+        };
+        advert.signature = signing
+            .sign(&advert.signed_bytes().unwrap())
+            .expect("re-sign fixture advert");
+        PubSubMessage {
+            topic: DM_CAPABILITY_TOPIC.into(),
+            payload: postcard::to_stdvec(&advert).unwrap().into(),
+            sender: Some(signing.agent_id),
+            sender_public_key: Some(signing.public_key_bytes.clone()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        }
+    }
+
+    /// Signed digest extension from `signing`, stamped
+    /// `created_at_unix_ms`.
+    fn extension_message(
+        signing: &SigningContext,
+        machine: MachineId,
+        created_at_unix_ms: u64,
+    ) -> PubSubMessage {
+        let mut extension = crate::dm_capability::DigestSupportExtension {
+            protocol_version: crate::dm_capability::DIGEST_EXTENSION_PROTOCOL_VERSION,
+            agent_id: *signing.agent_id.as_bytes(),
+            machine_id: *machine.as_bytes(),
+            created_at_unix_ms,
+            digest_support: true,
+            signature: Vec::new(),
+        };
+        extension.signature = signing
+            .sign(&extension.signed_bytes().unwrap())
+            .expect("re-sign fixture extension");
+        PubSubMessage {
+            topic: crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.into(),
+            payload: postcard::to_stdvec(&extension).unwrap().into(),
+            sender: Some(signing.agent_id),
+            sender_public_key: Some(signing.public_key_bytes.clone()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        }
+    }
+
+    #[test]
+    fn stale_advert_replays_skip_the_signature_verify() {
+        // Why (#674): on a 27-peer mesh nearly every inbound advert is one
+        // the store already holds at the same or newer timestamp; each one
+        // previously paid a full ML-DSA-65 verify before insert's
+        // last-write-wins rule discarded it.
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let now = now_unix_ms();
+        let first = advert_message(&signing, MachineId([1; 32]), now);
+        assert!(ingest_verified_capability_advert(&store, local, &first));
+        assert_eq!(store.prefiltered_stale_adverts(), 0);
+
+        // Same-timestamp replay: rejected without verify (counter is the
+        // counting hook for the skipped verify) and the TTL-bearing record
+        // is untouched — machine binding still the first advert's.
+        let replay = advert_message(&signing, MachineId([2; 32]), now);
+        assert!(!ingest_verified_capability_advert(&store, local, &replay));
+        let older = advert_message(&signing, MachineId([2; 32]), now - 1);
+        assert!(!ingest_verified_capability_advert(&store, local, &older));
+        assert_eq!(store.prefiltered_stale_adverts(), 2);
+        assert_eq!(
+            store.lookup_binding(&signing.agent_id).unwrap().machine_id,
+            MachineId([1; 32]),
+            "a stale or replayed advert must not replace the stored record"
+        );
+    }
+
+    #[test]
+    fn newer_advert_still_verifies_and_replaces_the_record() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let now = now_unix_ms();
+        assert!(ingest_verified_capability_advert(
+            &store,
+            local,
+            &advert_message(&signing, MachineId([1; 32]), now)
+        ));
+        assert!(ingest_verified_capability_advert(
+            &store,
+            local,
+            &advert_message(&signing, MachineId([2; 32]), now + 5_000)
+        ));
+        assert_eq!(
+            store.prefiltered_stale_adverts(),
+            0,
+            "a genuinely newer advert must reach the verify, never the skip"
+        );
+        assert_eq!(
+            store.lookup_binding(&signing.agent_id).unwrap().machine_id,
+            MachineId([2; 32]),
+            "the newer advert must replace the stored record"
+        );
+    }
+
+    #[test]
+    fn forged_newer_advert_is_rejected_by_the_verify() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let now = now_unix_ms();
+        assert!(ingest_verified_capability_advert(
+            &store,
+            local,
+            &advert_message(&signing, MachineId([1; 32]), now)
+        ));
+        let mut forged = advert_message(&signing, MachineId([2; 32]), now + 5_000);
+        let mut advert = CapabilityAdvert::from_postcard(&forged.payload).unwrap();
+        advert.signature[0] ^= 1;
+        forged.payload = postcard::to_stdvec(&advert).unwrap().into();
+        assert!(!ingest_verified_capability_advert(&store, local, &forged));
+        assert_eq!(
+            store.prefiltered_stale_adverts(),
+            0,
+            "a forged newer timestamp must be rejected by the verify, not by the pre-check"
+        );
+        assert_eq!(
+            store.lookup_binding(&signing.agent_id).unwrap().machine_id,
+            MachineId([1; 32]),
+            "a forged advert must not replace the stored record"
+        );
+    }
+
+    #[test]
+    fn digest_extension_stale_replays_skip_but_newer_extensions_apply() {
+        let signing = SigningContext::from_keypair(&AgentKeypair::generate().unwrap());
+        let local = AgentId([3; 32]);
+        let store = CapabilityStore::new();
+        let now = now_unix_ms();
+        assert!(ingest_verified_digest_extension(
+            &store,
+            local,
+            &extension_message(&signing, MachineId([1; 32]), now)
+        ));
+        assert!(!ingest_verified_digest_extension(
+            &store,
+            local,
+            &extension_message(&signing, MachineId([1; 32]), now - 1)
+        ));
+        assert_eq!(store.prefiltered_stale_adverts(), 1);
+        assert!(ingest_verified_digest_extension(
+            &store,
+            local,
+            &extension_message(&signing, MachineId([1; 32]), now + 5_000)
+        ));
+        assert_eq!(store.prefiltered_stale_adverts(), 1);
     }
 }
