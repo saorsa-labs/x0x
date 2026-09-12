@@ -27,6 +27,21 @@ All notable changes to this project will be documented in this file.
   exact launchd and systemd commands, cross-linked from the new refusal
   and from the apply logs.
 
+- **Redundant ML-DSA verify per inbound IWANT (#656).** The 0.42.0 egress
+  metering's `track_iwant` (`src/gossip/egress.rs`) performed a full
+  ML-DSA-65 signature verification on every inbound IWANT frame solely to
+  decide whether the `iwant_matched_eager_attempt_msgs`/`..._bytes`
+  diagnostic counters could track it — the same frame is verified again by
+  PlumTree in `handle_message`, which ignores unauthenticated IWANTs
+  before acting. At the profiled 106 IWANT/s that was ~4% of a core of
+  pure diagnostics overhead. Tracking now relies on PlumTree's own
+  verification: the cheap structural gates stay (exact decode, IWant
+  kind, v2 header, payload-hash binding, decodable id list), the keys are
+  documented as unverified frame fields, and the counter names are
+  unchanged. A forged IWANT cannot inflate the counters beyond the repair
+  sends its own (rejected) frame would have drawn.
+
+
 - **SIGTERM exit bound enforced (#371).** The 5 s bounded-shutdown watchdog
   never fired exactly when it was needed. It ran as a tokio task, and
   teardown can freeze the async runtime it supervises — measured on an
@@ -62,6 +77,7 @@ All notable changes to this project will be documented in this file.
   (`#[cfg(windows)]`) so it is no longer compile-only wherever Windows
   tests run.
 
+
 - Gossip announce/identity adverts now respect an explicit P2P bind address
   (#650). The #638/#649 card fix suppressed undialable interface hints for
   specifically bound listeners (ant-quic 0.27.50 honours `bind_address`
@@ -75,6 +91,7 @@ All notable changes to this project will be documented in this file.
   `is_specific_interface_bind`): specifically bound listeners advertise
   only the bound address; wildcard-bound listeners (production bootstraps
   bind `[::]`) and observed/external addresses are unchanged.
+
 - **Group task-list policy now gates the bootstrap prune (#654).** The
   digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
   acted directly on the wire delta's removal evidence, so on a
@@ -89,6 +106,7 @@ All notable changes to this project will be documented in this file.
   (bincode is positional — a default could never engage; the v1/v2 split
   is the magic prefix) and the stale `#[allow(dead_code)]` on
   `delta_remove_task` (it has production call sites).
+
 
 ### Tests
 
