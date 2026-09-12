@@ -10,7 +10,8 @@ All notable changes to this project will be documented in this file.
   cache-first branch let every node that had ever cached peer X's blob
   answer a request for X, so one miss drew a broadcast response from every
   cache holder (observed 46.7 msgs/s, 825 KB/s against a documented
-  answers only when this node owns the requested digest (its own current
+  steady state of ~0.045 fetches/s). The responder now answers only when
+  this node owns the requested digest (its own current
   `(user_id, agent_certificate)` pair); cached peer blobs are no longer
   served, and the shared anonymous digest (`(None, None)`, computed by
   every cert-less node since user keys are opt-in) is never served — it

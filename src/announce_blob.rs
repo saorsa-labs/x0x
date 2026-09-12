@@ -71,12 +71,6 @@ pub(crate) const BLOB_FETCH_TIMEOUT_SECS: u64 = 5;
 /// fetcher's 5 s deadline.
 const MIN_RESPONSE_INTERVAL_SECS: u64 = 1;
 
-/// The window map is deliberately unbounded: owner-only serving means a
-/// responder's keys grow only when its OWN pair rotates (each rotation
-/// adds one ~40-byte entry), never from peer traffic — an attacker cannot
-/// add keys. The prior 256-entry eviction cap was unreachable in practice
-/// and was dropped (#656 round 2).
-///
 /// The serving daemon's current `(user_id, agent_certificate)` pair, shared
 /// with the responder task so consent changes are picked up live.
 pub type SharedCertPair =
@@ -826,6 +820,10 @@ pub async fn spawn_blob_responder(
         .await;
 
     let handle = tokio::spawn(async move {
+        // Deliberately unbounded: owner-only serving means this map's keys grow
+        // only when our OWN pair rotates (one ~40-byte entry per rotation), never
+        // from peer traffic — an attacker cannot add keys. The prior 256-entry
+        // eviction cap was unreachable in practice and was dropped (#656 round 2).
         let mut last_response_by_digest: HashMap<[u8; 32], std::time::Instant> = HashMap::new();
         loop {
             // Drain whichever carrier delivers first; both decode the same
