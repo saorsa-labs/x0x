@@ -725,34 +725,6 @@ async fn ws_stalled_reader_fills_queue_and_closes_1013() {
         "slow-consumer close must be counted exactly once per session"
     );
 
-    // ── REST availability across the back-pressure close (#287): publish
-    // waves keep completing while the session fills, closes, and tears
-    // down. WS back-pressure on one stalled session must never degrade the
-    // daemon's HTTP plane — the historical #287 failure killed in-flight
-    // `POST /publish` connections mid-wave (hyper IncompleteMessage at the
-    // client). These two waves overlap the teardown grace period, the
-    // window where a regression would surface.
-    for _ in 0..2 {
-        let wave: Vec<_> = (0..64)
-            .map(|_| {
-                client
-                    .post(d.url("/publish"))
-                    .json(&json!({"topic": &topic, "payload": &payload}))
-                    .send()
-            })
-            .collect();
-        for resp in futures::future::join_all(wave).await {
-            let resp = resp.expect("publish after slow-consumer close (#287)");
-            assert_eq!(
-                resp.status(),
-                200,
-                "publish after slow-consumer close failed (#287): REST plane \
-                 degraded by WS back-pressure"
-            );
-            published += 1;
-        }
-    }
-
     // ── Resume draining: the kernel-buffered backlog flushes first, then the
     // writer's Close(1013) (it holds a 2s flush budget and cleanup grants a
     // bounded grace period before aborting it, so the close frame reaches the
@@ -780,9 +752,39 @@ async fn ws_stalled_reader_fills_queue_and_closes_1013() {
         "slow-consumer close must reach the client as WS 1013 Try Again Later"
     );
     eprintln!(
-        "stalled reader: published={published} dropped={} close_code={close_code:?}",
+        "stalled reader: dropped={} close_code={close_code:?}",
         dropped - base_dropped
     );
+
+    // ── REST availability across the back-pressure close (#287): publish
+    // waves keep completing while the session fills, closes, and tears
+    // down. WS back-pressure on one stalled session must never degrade the
+    // daemon's HTTP plane — the historical #287 failure killed in-flight
+    // `POST /publish` connections mid-wave (hyper IncompleteMessage at the
+    // client). These two waves run after the Close(1013) has been confirmed (the
+    // drain must not wait behind 128 publishes on a slow host, #287 r3), and
+    // still prove the HTTP plane survived the session teardown.
+    for _ in 0..2 {
+        let wave: Vec<_> = (0..64)
+            .map(|_| {
+                client
+                    .post(d.url("/publish"))
+                    .json(&json!({"topic": &topic, "payload": &payload}))
+                    .send()
+            })
+            .collect();
+        for resp in futures::future::join_all(wave).await {
+            let resp = resp.expect("publish after slow-consumer close (#287)");
+            assert_eq!(
+                resp.status(),
+                200,
+                "publish after slow-consumer close failed (#287): REST plane \
+                 degraded by WS back-pressure"
+            );
+            published += 1;
+        }
+    }
+    eprintln!("stalled reader: published={published} after confirmed close");
 
     // ── The session must be gone from /ws/sessions (resources reclaimed).
     let sessions_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
