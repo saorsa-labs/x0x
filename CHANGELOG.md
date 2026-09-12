@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+### Changed
+
+- ant-quic pin bumped 0.27.50 → 0.27.51: `disconnect()` no longer leaves a
+  stale connection observable to `open_bi()` (ant-quic#278/#279), one
+  `accept_bi` consumer per connection — the relay accept task that silently
+  dropped app streams is gone (ant-quic#280/#282), `shutdown()` closes
+  superseded lifecycle survivors before the drain (ant-quic#283/#285), and
+  the simultaneous-open tiebreaker liveness fixes (ant-quic#281). Closes the
+  #277 reliable-voice churn flake at the mechanism and lets the #684 settle
+  barrier workaround (#510) be retired in a follow-up.
 ### Docs
 
 - **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
