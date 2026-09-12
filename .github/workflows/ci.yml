@@ -101,7 +101,9 @@ jobs:
             ${{ runner.os }}-target-test-
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       - name: Inert shared wrapper argument controls
         run: python3 -B scripts/ci/test_nextest_isolated.py -v
@@ -180,7 +182,9 @@ jobs:
             ${{ runner.os }}-target-coverage-
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -318,7 +322,9 @@ jobs:
             ${{ runner.os }}-target-parity-
 
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       # parity_cli spawns `x0x <cli_name> --help` so the binary must
       # exist. Build only what's needed.

@@ -46,6 +46,16 @@ All notable changes to this project will be documented in this file.
   strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
   genuine never-reconnects regression still fails at the same place.
 
+### CI
+
+- Pin nextest to 0.9.144 in all nine CI jobs across `ci.yml` (test, coverage,
+  parity) and `integration.yml` (proptest, integration-core, integration-groups,
+  integration-voice-datagram, integration-net, integration-timing). The floating
+  `taiki-e/install-action@nextest` shorthand was resolving to the latest release
+  at job-start time, meaning any new nextest release could silently change CI
+  behaviour. Each step now uses `install-action@v2` with `tool: nextest@0.9.144`
+  for a reproducible, auditable install (#673).
+
 ## [v0.42.3] - 2026-09-12
 
 ### Fixed

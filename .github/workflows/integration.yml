@@ -52,7 +52,9 @@ jobs:
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
       - name: Run property tests
         # Scope compilation to ONLY the targets that host property tests
         # (--lib + the eight tests/proptest_*.rs binaries) instead of the
@@ -113,7 +115,9 @@ jobs:
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
       - name: Run daemon API integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test daemon_api_integration -- -- --ignored
       - name: Run named group D4 signed commit integration tests
@@ -144,7 +148,9 @@ jobs:
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
       - name: 'Check issue #321 custody routing (inert)'
         run: python3 scripts/ci/test_issue321_custody_routing.py
       - name: Run named group integration tests
@@ -336,7 +342,9 @@ jobs:
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
       # Pin the bytes before any runtime: build the suite without
       # executing it, so discovery below reuses binaries that already
       # exist rather than compiling inside the namespace.
@@ -417,7 +425,9 @@ jobs:
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
       - name: Run GUI smoke tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test gui_smoke --
       - name: Run WebSocket tests
@@ -454,7 +464,9 @@ jobs:
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
       - name: Build release binaries (shared across suites)
         run: cargo build --release --bin x0xd --bin x0x
       - name: Run peer-lifecycle daemon tests (de-flaked, ignored-only)
