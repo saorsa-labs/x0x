@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.42.2] - 2026-09-12
+
 ### Fixed
 - **Slow-consumer Close(1013) survives the writer's flush budget (#287,
   round 2).** The WS writer owned the socket sink; when its bounded
@@ -23,6 +25,60 @@ All notable changes to this project will be documented in this file.
   `run_ws_writer_exits_after_flush_budget_with_close_still_blocked` (bounded
   exit + handoff) and integration
   `ws_slow_close_frame_survives_flush_budget_expiry` (self-DM-triggered
+
+- **`x0x/caps/v1` CPU amplification (#656).** One targeted capability
+  request caused the responder's publisher to also re-broadcast its signed
+  advert on the fleet-wide steady topic (`respond_on_steady` in
+  `DmCapabilityService`), turning the documented 600 s advert cadence into
+  the request rate — 27 nodes × 1 response-cycle/s × 3 publishes ≈ the
+  observed 77 caps msgs/s. The steady advert now rides its own cadence
+  (startup burst, timer beat, or capability upgrade) plus one bounded
+  exception: a request-triggered cycle may still emit a steady copy, at
+  most ONE per 600 s advert window (warm fallback), so a fresh Critical
+  topic with no mesh peers yet keeps a working carrier. Net effect: a
+  targeted request costs two publishes, not three — the answer on the
+  Critical `caps/v1/response/targeted-v2` topic the requester listens
+  on, plus the `caps/v2/digest` extension, which intentionally still
+  publishes on every advert cycle: a targeted refresh is the only
+  reliable delivery path for the `digest_support` bit in on-demand mode
+  (the default), where a lone node's initial-cycle extension publishes
+  before it has gossip links — restricting it to the periodic beat breaks
+  digest discovery (verified against
+  `asymmetric_signed_capability_convergence_over_relay`). Publish-side
+  cadence only; no caps topic is retired and no wire shape changes.
+
+- **`announce/v3/blob` CPU amplification (#656).** The blob responder's
+  cache-first branch let every node that had ever cached peer X's blob
+  answer a request for X, so one miss drew a broadcast response from every
+  cache holder (observed 46.7 msgs/s, 825 KB/s against a documented
+  steady state of ~0.045 fetches/s). The responder now answers only when
+  this node owns the requested digest (its own current
+  `(user_id, agent_certificate)` pair); cached peer blobs are no longer
+  served, and the shared anonymous digest (`(None, None)`, computed by
+  every cert-less node since user keys are opt-in) is never served — it
+  has no unique owner, and production requesters already exclude it via
+  `fetch_warranted`. The responder's 1 s coalescing window is now tracked
+  per digest instead of one global instant, so a busy blob (or a pair
+  rotation's fresh digest) is not starved into the fetcher's 5 s
+  timeout-retry loop; the map only ever holds this node's own served
+  digests, so it needs no bound. Publish-side only; request/response wire
+  shapes unchanged, 0.41.x/0.42.0 peers unaffected.
+
+
+- **Redundant ML-DSA verify per inbound IWANT (#656).** The 0.42.0 egress
+  metering's `track_iwant` (`src/gossip/egress.rs`) performed a full
+  ML-DSA-65 signature verification on every inbound IWANT frame solely to
+  decide whether the `iwant_matched_eager_attempt_msgs`/`..._bytes`
+  diagnostic counters could track it — the same frame is verified again by
+  PlumTree in `handle_message`, which ignores unauthenticated IWANTs
+  before acting. At the profiled 106 IWANT/s that was ~4% of a core of
+  pure diagnostics overhead. Tracking now relies on PlumTree's own
+  verification: the cheap structural gates stay (exact decode, IWant
+  kind, v2 header, payload-hash binding, decodable id list), the keys are
+  documented as unverified frame fields, and the counter names are
+  unchanged. A forged IWANT cannot inflate the counters beyond the repair
+  sends its own (rejected) frame would have drawn.
+
 
 - **SIGTERM exit bound enforced (#371).** The 5 s bounded-shutdown watchdog
   never fired exactly when it was needed. It ran as a tokio task, and
@@ -59,6 +115,7 @@ All notable changes to this project will be documented in this file.
   (`#[cfg(windows)]`) so it is no longer compile-only wherever Windows
   tests run.
 
+
 - Gossip announce/identity adverts now respect an explicit P2P bind address
   (#650). The #638/#649 card fix suppressed undialable interface hints for
   specifically bound listeners (ant-quic 0.27.50 honours `bind_address`
@@ -72,6 +129,7 @@ All notable changes to this project will be documented in this file.
   `is_specific_interface_bind`): specifically bound listeners advertise
   only the bound address; wildcard-bound listeners (production bootstraps
   bind `[::]`) and observed/external addresses are unchanged.
+
 - **Group task-list policy now gates the bootstrap prune (#654).** The
   digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
   acted directly on the wire delta's removal evidence, so on a
@@ -87,12 +145,12 @@ All notable changes to this project will be documented in this file.
   is the magic prefix) and the stale `#[allow(dead_code)]` on
   `delta_remove_task` (it has production call sites).
 
+
 ### Tests
 
 - `tests/e2e_deploy.sh` uploads the binary as a gzip stream with ssh keepalives
   (`ServerAliveInterval=15`, `ServerAliveCountMax=4`), so a stalled upload to a
   far host fails fast instead of hanging the rollout.
-
 - **#287 root cause round 1 — fixture self-update contamination (the
   ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
   failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised
@@ -117,6 +175,10 @@ All notable changes to this project will be documented in this file.
   tears down. The contract itself (bounded 1024-frame queue, drop-vs-close
   feeder policies, 1013 close-frame delivery, REST-plane isolation) is
   documented in `docs/api-reference.md`.
+
+- The two home rename/restart e2e tests settle 300 ms between owner shutdown and
+  rebuild so the joiner's ant-quic finishes unwinding the old connection before the
+  rebuilt owner dials it (#510; underlying reconnect race filed as ant-quic#277).
 
 
 ## [v0.42.1] - 2026-09-11
