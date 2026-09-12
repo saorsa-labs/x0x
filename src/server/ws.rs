@@ -194,6 +194,25 @@ const WS_SLOW_CONSUMER_CLOSE_CODE: u16 = 1013;
 /// Reason string sent in the WS close frame for a slow-consumer close.
 const WS_SLOW_CONSUMER_CLOSE_REASON: &str = "slow consumer";
 
+/// Budget the WS writer gives its Close(1013) flush before exiting (#287).
+///
+/// This is only the FIRST stage of the close sequence: when it expires
+/// against a stalled socket the writer exits, but cleanup takes the sink
+/// back and keeps retrying the flush for
+/// [`WS_SLOW_CLOSE_GRACE`](self) — see `handle_ws_connection`. Overridable
+/// per-daemon via `[ws] slow_close_flush_ms` (regression-test knob).
+pub(super) const WS_SLOW_CLOSE_FLUSH_BUDGET: Duration = Duration::from_secs(2);
+/// Grace window the connection cleanup holds the WS sink open after the
+/// writer exits, still retrying the Close(1013) flush (#287).
+///
+/// A reader that stalls, trips the slow-consumer close, and then RESUMES
+/// draining inside this window must still receive the Close(1013) frame
+/// after its kernel-buffered backlog — dropping the sink earlier turns the
+/// documented close into an abrupt connection reset once the writer's own
+/// flush budget has expired (the client-visible defect this window exists
+/// to prevent).
+const WS_SLOW_CLOSE_GRACE: Duration = Duration::from_secs(3);
+
 /// GET /ws — upgrade to WebSocket (general purpose).
 pub(super) async fn ws_handler(
     ws: axum::extract::WebSocketUpgrade,
@@ -356,13 +375,15 @@ fn feed_critical(
         Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
-
 /// The WS writer loop: drains `outbound_rx` and serializes each frame to the
 /// socket via `ws_tx` (a [`futures::Sink`] over `Message`). Races BOTH frame
 /// arrival and each socket send against the slow-consumer token (the writer may
 /// be blocked in `send` flushing to a stalled socket when the queue fills
-/// behind it). On slow-close it attempts a WS Close(1013) with a 2s flush
-/// budget, then exits even if it cannot flush.
+/// behind it). On slow-close it attempts a WS Close(1013) within
+/// `close_flush_budget`, then returns even if it cannot flush — the CALLER
+/// owns the rest of the close sequence (it keeps the sink and retries the
+/// flush for its grace window; see `handle_ws_connection`), because this
+/// task returning drops nothing: the sink is borrowed, not owned.
 ///
 /// Generic over `Sink<Message>` (axum's split WS sender is a `SplitSink` that
 /// implements `Sink<Message>`) so the slow-close behavior is unit-testable with
@@ -371,6 +392,7 @@ async fn run_ws_writer<S, E>(
     outbound_rx: &mut mpsc::Receiver<WsOutbound>,
     ws_tx: &mut S,
     slow_close: &tokio_util::sync::CancellationToken,
+    close_flush_budget: Duration,
 ) where
     S: futures::Sink<axum::extract::ws::Message, Error = E> + Unpin,
 {
@@ -409,7 +431,7 @@ async fn run_ws_writer<S, E>(
     }
     if need_close {
         let _ = tokio::time::timeout(
-            Duration::from_secs(2),
+            close_flush_budget,
             ws_tx.send(slow_consumer_close_message()),
         )
         .await;
@@ -472,13 +494,27 @@ async fn handle_ws_connection(
     // each socket send against the slow-consumer token — the writer may be
     // blocked in `ws_tx.send()` flushing to a stalled socket when the queue
     // fills behind it, so the token must interrupt the send too, not just the
-    // recv. On slow-close it sends a WS Close(1013) with a short flush timeout,
-    // then exits even if the close frame cannot flush (the reader is stalled).
+    // recv. On slow-close it sends a WS Close(1013) within its flush budget
+    // (`[ws] slow_close_flush_ms`, default 2s), then exits even if the close
+    // frame cannot flush (the reader is stalled) — and RETURNS THE SINK so
+    // cleanup below can keep the socket open for the grace window and retry
+    // the flush (#287: dropping the sink here is what turned the documented
+    // close into an abrupt reset on hosts whose buffers outlast the budget).
     let writer_session_id = session_id.clone();
     let writer_slow_close = slow_close.clone();
-    let mut writer = tokio::spawn(async move {
-        run_ws_writer(&mut outbound_rx, &mut ws_tx, &writer_slow_close).await;
+    let writer_flush_budget = state.ws_slow_close_flush;
+    let mut writer: tokio::task::JoinHandle<
+        futures::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
+    > = tokio::spawn(async move {
+        run_ws_writer(
+            &mut outbound_rx,
+            &mut ws_tx,
+            &writer_slow_close,
+            writer_flush_budget,
+        )
+        .await;
         tracing::debug!(session_id = %writer_session_id, "WebSocket writer stopped");
+        ws_tx
     });
 
     // If direct mode, spawn a forwarder for direct messages
@@ -659,14 +695,50 @@ async fn handle_ws_connection(
         h.abort();
     }
     drop(outbound_tx);
-    // Give the writer a bounded grace period instead of aborting it outright:
-    // on a slow-consumer close it is inside its 2s Close(1013) flush budget,
-    // and an immediate abort tears the socket down before the documented
-    // close frame can ever reach the (possibly now-draining) client — the
-    // #149 stalled-reader harness observed a raw connection reset instead of
-    // the 1013. Any other writer exits promptly once the senders are gone.
-    let _ = tokio::time::timeout(Duration::from_secs(3), &mut writer).await;
-    writer.abort();
+
+    // Close sequence (#287, one documented contract):
+    //   slow_close fires → writer attempts Close(1013) within its flush
+    //   budget → writer exits and RETURNS the sink → cleanup holds the sink
+    //   open for the remainder of the grace window, retrying the flush →
+    //   a client that resumes draining inside the grace receives Close(1013)
+    //   → grace expires → sink drops, teardown proceeds.
+    // The old shape only awaited the writer's own budget: once that expired
+    // against a stalled socket the writer task ended, `ws_tx` dropped with
+    // it, and the client saw a connection reset instead of the documented
+    // close frame (the #149 grace comment described this exact failure but
+    // the grace was inert once the writer had already exited). Holding the
+    // sink does NOT unbound memory: the outbound queue and feeders are gone;
+    // only the OS socket persists for the bounded grace.
+    let grace_deadline = tokio::time::Instant::now() + WS_SLOW_CLOSE_GRACE;
+    match tokio::time::timeout_at(grace_deadline, &mut writer).await {
+        Ok(Ok(mut ws_tx_back)) => {
+            if slow_close.is_cancelled() {
+                // Slow-consumer close: the writer's flush budget may have
+                // expired with Close(1013) queued but unwritten. Keep
+                // retrying the flush of whatever the writer left queued
+                // until the grace deadline — draining the kernel backlog
+                // is exactly what lets the frame through.
+                let _ = tokio::time::timeout_at(
+                    grace_deadline,
+                    futures::SinkExt::flush(&mut ws_tx_back),
+                )
+                .await;
+            }
+            // Ordinary teardown (client Close / channel end / send error):
+            // nothing is pending; drop the sink immediately at scope end.
+        }
+        Ok(Err(e)) => {
+            // The writer task itself failed; its sink died with it. Nothing
+            // to hold open — teardown proceeds as before.
+            tracing::debug!(session_id = %session_id, "WebSocket writer task failed: {e}");
+        }
+        Err(_) => {
+            // Still inside its own flush budget at the grace deadline (e.g.
+            // a flush budget configured past the grace): bounded teardown
+            // wins, as before.
+            writer.abort();
+        }
+    }
 
     tracing::info!(session_id = %session_id, "WebSocket session closed");
 }
@@ -1546,6 +1618,10 @@ mod tests {
         /// When true, flushing a Text frame never completes (simulates a
         /// stalled socket write). Close frames still flush.
         block_text: bool,
+        /// When true, flushing a Close frame also never completes — the
+        /// socket is stalled past the writer's whole close budget (#287:
+        /// the case cleanup's grace-flush exists for).
+        block_close: bool,
     }
 
     impl futures::Sink<axum::extract::ws::Message> for TestSink {
@@ -1569,13 +1645,13 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<(), Self::Error>> {
             let this = self.get_mut();
-            let last_is_text = this
-                .sent
-                .last()
-                .map(|m| matches!(m, axum::extract::ws::Message::Text(_)))
-                .unwrap_or(false);
-            if this.block_text && last_is_text {
-                // Stalled: the Text frame cannot flush (client not reading).
+            let last = this.sent.last();
+            let last_is_text =
+                last.is_some_and(|m| matches!(m, axum::extract::ws::Message::Text(_)));
+            let last_is_close =
+                last.is_some_and(|m| matches!(m, axum::extract::ws::Message::Close(_)));
+            if (this.block_text && last_is_text) || (this.block_close && last_is_close) {
+                // Stalled: the frame cannot flush (client not reading).
                 std::task::Poll::Pending
             } else {
                 std::task::Poll::Ready(Ok(()))
@@ -1602,7 +1678,7 @@ mod tests {
         token.cancel();
         let exited = tokio::time::timeout(
             Duration::from_secs(2),
-            run_ws_writer(&mut rx, &mut sink, &token),
+            run_ws_writer(&mut rx, &mut sink, &token, WS_SLOW_CLOSE_FLUSH_BUDGET),
         )
         .await
         .is_ok();
@@ -1645,7 +1721,7 @@ mod tests {
             async {
                 tokio::time::timeout(
                     Duration::from_secs(3),
-                    run_ws_writer(&mut rx, &mut sink, &token),
+                    run_ws_writer(&mut rx, &mut sink, &token, WS_SLOW_CLOSE_FLUSH_BUDGET),
                 )
                 .await
             },
@@ -1669,6 +1745,46 @@ mod tests {
                 axum::extract::ws::Message::Close(Some(f)) if f.code == WS_SLOW_CONSUMER_CLOSE_CODE
             )),
             "writer must attempt a Close(1013) after abandoning the blocked send"
+        );
+    }
+
+    /// #287 round 2: the writer gives its Close(1013) flush exactly the
+    /// configured budget and then EXITS — bounded exit is the contract the
+    /// connection cleanup relies on (it takes the returned sink and keeps
+    /// retrying the flush for its own grace window). A writer that hung on
+    /// an unflushable close would block session teardown forever.
+    #[tokio::test]
+    async fn run_ws_writer_exits_after_flush_budget_with_close_still_blocked() {
+        let (_tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let mut sink = TestSink {
+            block_close: true,
+            ..Default::default()
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let budget = Duration::from_millis(120);
+        let started = std::time::Instant::now();
+        let exited = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_ws_writer(&mut rx, &mut sink, &token, budget),
+        )
+        .await
+        .is_ok();
+        assert!(
+            exited,
+            "writer must exit after its close-flush budget, never hang on an unflushable close"
+        );
+        assert!(
+            started.elapsed() >= budget,
+            "writer must honour the flush budget before exiting (waited {:?})",
+            started.elapsed()
+        );
+        assert!(
+            sink.sent.iter().any(|m| matches!(
+                m,
+                axum::extract::ws::Message::Close(Some(f)) if f.code == WS_SLOW_CONSUMER_CLOSE_CODE
+            )),
+            "writer must have queued the Close(1013) even though it could not flush"
         );
     }
 

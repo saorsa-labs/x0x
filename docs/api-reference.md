@@ -2012,16 +2012,22 @@ bound against a local client that stops reading. When that queue is full:
   detected within roughly one interval of saturation regardless of topic
   flow — it never needs a DM to arrive.
 
-The close is the client-visible contract, not a connection reset: the writer
-flushes the Close(1013) frame with a bounded budget, so a client that resumes
-draining receives it after its kernel-buffered backlog. Treat `1013` as
-"resubscribe and reconcile from history" (`?backfill=N` on `/ws/direct`, or
-`GET /history?scope=topic:…`) — frames dropped from a full queue are not
+when the close fires, the session writer first tries to flush the Close(1013)
+frame within its flush budget (`[ws] slow_close_flush_ms`, default 2 s). If
+that budget expires against a still-stalled socket, the writer exits and the
+daemon's connection cleanup takes over: it holds the socket open for a 3 s
+grace window and keeps retrying the flush. A client that resumes draining
+anywhere inside that grace — even after the writer's own budget has expired —
+still receives Close(1013) after its kernel-buffered backlog; only a client
+that stays stalled past the grace sees the connection torn down. Treat `1013`
+as "resubscribe and reconcile from history" (`?backfill=N` on `/ws/direct`,
+or `GET /history?scope=topic:…`) — frames dropped from a full queue are not
 re-sent. Back-pressure is confined to the offending session: the daemon's
 REST plane (including concurrent `POST /publish` traffic that is filling the
 stalled session's queue) must keep serving 200s throughout the stall, close,
-and teardown — this is pinned end-to-end by the ignored integration test
-`ws_stalled_reader_fills_queue_and_closes_1013` (#287).
+and teardown — this is pinned end-to-end by the ignored integration tests
+`ws_stalled_reader_fills_queue_and_closes_1013` and
+`ws_slow_close_frame_survives_flush_budget_expiry` (#287).
 
 #### Reconnect and replay
 

@@ -946,6 +946,7 @@ pub async fn serve_with_options(
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
+        ws_slow_close_flush: Duration::from_millis(config.ws.slow_close_flush_ms),
         api_address: actual_api_addr,
         data_dir: config.data_dir.clone(),
         start_time: Instant::now(),

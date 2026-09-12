@@ -477,6 +477,38 @@ pub struct DaemonConfig {
     /// `X0X_SUPERVISED=1`) and off for terminal-launched daemons.
     #[serde(default)]
     pub api_watchdog: super::ApiWatchdogConfig,
+
+    /// WebSocket session tuning (`[ws]` in TOML).
+    #[serde(default)]
+    pub ws: DaemonWsConfig,
+}
+
+/// WebSocket session tuning (`[ws]` in the daemon TOML).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonWsConfig {
+    /// Budget the WS writer gives its Close(1013) flush before exiting, in
+    /// milliseconds (#287). Default 2000. Cleanup then holds the sink open
+    /// for its own grace window and keeps retrying the flush, so this only
+    /// moves WHEN the writer gives up — the client-visible contract (a
+    /// reader that resumes draining still receives Close(1013)) is governed
+    /// by the cleanup grace, not by this budget. Primarily a knob for the
+    /// stalled-reader regression test, which shrinks it to exercise the
+    /// writer-exited-early path without a slow host; leave the default in
+    /// production.
+    #[serde(default = "default_slow_close_flush_ms")]
+    pub slow_close_flush_ms: u64,
+}
+
+fn default_slow_close_flush_ms() -> u64 {
+    u64::try_from(super::ws::WS_SLOW_CLOSE_FLUSH_BUDGET.as_millis()).unwrap_or(u64::MAX)
+}
+
+impl Default for DaemonWsConfig {
+    fn default() -> Self {
+        Self {
+            slow_close_flush_ms: default_slow_close_flush_ms(),
+        }
+    }
 }
 
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -741,6 +773,7 @@ impl Default for DaemonConfig {
             gossip: x0x::gossip::GossipConfig::default(),
             key_move: KeyMoveConfig::default(),
             groups: DaemonGroupsConfig::default(),
+            ws: DaemonWsConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             legacy_announce: false,
             identity_ttl_secs: default_identity_ttl(),
@@ -1028,6 +1061,9 @@ pub(super) struct AppState {
     pub(super) ws_topics: RwLock<HashMap<String, SharedTopicState>>,
     /// Per-WS-outbound-queue observability (drop / slow-consumer-close counters).
     pub(super) ws_outbound_stats: Arc<WsOutboundStats>,
+    /// Close(1013) flush budget for the per-session WS writer, from
+    /// `[ws] slow_close_flush_ms` (#287). See `DaemonWsConfig`.
+    pub(super) ws_slow_close_flush: Duration,
     pub(super) api_address: SocketAddr,
     /// Daemon data directory — where the upgrade handoff/intent file and
     /// `UPGRADE_FAILED` artifact live (#261).
