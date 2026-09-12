@@ -837,6 +837,55 @@ fn rank_local_interface_addrs(
     ranked.into_iter().map(|(_, addr)| addr).collect()
 }
 
+/// A bind address that names exactly one interface address — not a wildcard,
+/// port-0, or multicast pseudo-address. ant-quic >= 0.27.50 honours such a
+/// bind exactly (ant-quic #274), so a listener bound this way is unreachable
+/// on every other interface address: advertising those hints makes dialers
+/// burn the local probe ladder on dead addresses before the one live bind
+/// (#638 card fix, #650 announce fix).
+pub fn is_specific_interface_bind(bind: std::net::SocketAddr) -> bool {
+    bind.port() != 0 && !bind.ip().is_unspecified() && !bind.ip().is_multicast()
+}
+
+/// Interface hints for `port` that a listener bound to `bind` can actually
+/// serve (#650). When `bind` names one specific interface address, only
+/// hints on that address survive — plus the bind itself, because interface
+/// enumeration deliberately excludes loopback and a loopback-bound listener
+/// must stay discoverable in local testnets. Wildcard, port-0, and
+/// multicast pseudo-binds (and a `None` bind, where no endpoint knowledge
+/// exists) keep every hint: the listener really is reachable on all of
+/// them. Observed/external addresses are NOT passed through here — they
+/// are empirical reports, not guesses, and a specifically bound listener
+/// cannot earn a report on another interface.
+fn bind_dialable_interface_hints(
+    bind: Option<std::net::SocketAddr>,
+    port: u16,
+) -> Vec<std::net::SocketAddr> {
+    filter_bind_dialable_hints(bind, collect_local_interface_addrs(port))
+}
+
+/// Pure core of [`bind_dialable_interface_hints`]: keep only `hints` the
+/// listener bound to `bind` can serve, and supply the bind itself when it
+/// names a specific interface (interface enumeration excludes loopback).
+fn filter_bind_dialable_hints(
+    bind: Option<std::net::SocketAddr>,
+    hints: Vec<std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    match bind {
+        Some(bind) if is_specific_interface_bind(bind) => {
+            let mut dialable: Vec<_> = hints
+                .into_iter()
+                .filter(|hint| hint.ip() == bind.ip())
+                .collect();
+            if !dialable.contains(&bind) {
+                dialable.push(bind);
+            }
+            dialable
+        }
+        _ => hints,
+    }
+}
+
 fn is_cgnat_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
 }
@@ -2950,12 +2999,8 @@ impl HeartbeatContext {
         // bound port from the QUIC endpoint — NOT the first external address
         // port (which is NAT-mapped) and NOT the config bind port (which may
         // be 0 for OS-assigned ports).
-        let bind_port = self
-            .network
-            .bound_addr()
-            .await
-            .map(|a| a.port())
-            .unwrap_or(5483);
+        let bound_addr = self.network.bound_addr().await;
+        let bind_port = bound_addr.map(|a| a.port()).unwrap_or(5483);
         if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
             if sock.connect("[2001:4860:4860::8888]:80").is_ok() {
                 if let Ok(local) = sock.local_addr() {
@@ -2967,7 +3012,15 @@ impl HeartbeatContext {
                         if is_global {
                             let v6_addr =
                                 std::net::SocketAddr::new(std::net::IpAddr::V6(v6), bind_port);
-                            if !addresses.contains(&v6_addr) {
+                            // #650: the probe reports the default-route
+                            // source address — a guess, not an observation.
+                            // A listener bound to one specific interface
+                            // cannot serve it; keep it only when it IS the
+                            // bind.
+                            let bind_allows = bound_addr.is_none_or(|b| {
+                                !is_specific_interface_bind(b) || b.ip() == v6_addr.ip()
+                            });
+                            if bind_allows && !addresses.contains(&v6_addr) {
                                 addresses.push(v6_addr);
                             }
                         }
@@ -2976,7 +3029,7 @@ impl HeartbeatContext {
             }
         }
 
-        for addr in collect_local_interface_addrs(bind_port) {
+        for addr in bind_dialable_interface_hints(bound_addr, bind_port) {
             if !addresses.contains(&addr) {
                 addresses.push(addr);
             }
@@ -7537,11 +7590,12 @@ impl Agent {
         // bound port from the QUIC endpoint — NOT the first external address
         // port (which is NAT-mapped) and NOT the config bind port (which may
         // be 0 for OS-assigned ports).
-        let bind_port = if let Some(network) = self.network.as_ref() {
-            network.bound_addr().await.map(|a| a.port()).unwrap_or(5483)
+        let bound_addr = if let Some(network) = self.network.as_ref() {
+            network.bound_addr().await
         } else {
-            5483
+            None
         };
+        let bind_port = bound_addr.map(|a| a.port()).unwrap_or(5483);
 
         // IPv6 probe
         if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
@@ -7555,7 +7609,13 @@ impl Agent {
                         if is_global {
                             let v6_addr =
                                 std::net::SocketAddr::new(std::net::IpAddr::V6(v6), bind_port);
-                            if !addresses.contains(&v6_addr) {
+                            // #650: same rule as the heartbeat announce — the
+                            // probe is a guess, and a specifically bound
+                            // listener cannot serve a different interface.
+                            let bind_allows = bound_addr.is_none_or(|b| {
+                                !is_specific_interface_bind(b) || b.ip() == v6_addr.ip()
+                            });
+                            if bind_allows && !addresses.contains(&v6_addr) {
                                 addresses.push(v6_addr);
                             }
                         }
@@ -7564,7 +7624,7 @@ impl Agent {
             }
         }
 
-        for addr in collect_local_interface_addrs(bind_port) {
+        for addr in bind_dialable_interface_hints(bound_addr, bind_port) {
             if !addresses.contains(&addr) {
                 addresses.push(addr);
             }
@@ -9299,7 +9359,10 @@ impl Agent {
     fn announcement_addresses(&self) -> Vec<std::net::SocketAddr> {
         match self.network.as_ref().and_then(|n| n.local_addr()) {
             Some(addr) if addr.port() > 0 => filter_discovery_announcement_addrs(
-                collect_local_interface_addrs(addr.port()),
+                // #650: the config bind is authoritative (ant-quic honours
+                // it exactly), so interface hints must stay on the bound
+                // address when it names one specific interface.
+                bind_dialable_interface_hints(Some(addr), addr.port()),
                 self.network
                     .as_ref()
                     .is_some_and(|network| allow_local_discovery_addresses(network.config())),
@@ -22211,6 +22274,46 @@ mod tests {
         assert_eq!(entry.user_id, agent.user_id());
     }
 
+    /// #650 regression: a loopback-bound daemon's gossip advert must agree
+    /// with its agent card (#638/#649). ant-quic 0.27.50 honours the
+    /// explicit P2P bind, so every other interface address (LAN,
+    /// utun/CGNAT, the locally-probed global IPv6) is undialable — peers
+    /// that trust the advert rank those hints into the fast local-probe
+    /// ladder and burn its 3 s + 3 s per-address budget before ever
+    /// reaching the one live loopback endpoint. Interface enumeration
+    /// deliberately excludes loopback, so before the fix the bound address
+    /// itself only stayed in the advert via the `routable_addr()` fallback.
+    #[tokio::test]
+    async fn loopback_bound_announce_advertises_only_the_dialable_bind() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        agent.announce_identity(false, false).await.unwrap();
+        let bound = agent
+            .network
+            .as_ref()
+            .expect("network configured")
+            .bound_addr()
+            .await
+            .expect("endpoint bound");
+        let entry = agent
+            .discovered_agent(agent.agent_id())
+            .await
+            .unwrap()
+            .expect("agent should discover its own announcement");
+
+        assert_eq!(entry.addresses, vec![bound]);
+    }
+
     /// ADR-0035 metering: the census must (a) classify advertisers by
     /// bootstrap membership via ADDRESS overlap with the operator fleet,
     /// (b) skip TTL-stale entries — a dead relay advert would otherwise
@@ -23470,6 +23573,51 @@ fn local_interface_addrs_allow_empty_and_exclude_unusable_addresses() {
     ]
     .map(|ip| ip.parse().unwrap());
     assert!(rank_local_interface_addrs(excluded, 9000).is_empty());
+}
+
+/// #650: ant-quic 0.27.50 honours an explicit P2P bind exactly, so a
+/// loopback- or LAN-bound listener is unreachable on the host's other
+/// interface addresses. The gossip announce paths must not advertise them:
+/// dialers rank LAN/CGNAT hints into the fast local-probe ladder and burn
+/// its 3 s + 3 s per-address budget before ever reaching the one live bind
+/// — the exact #638 card defect, one layer down. Interface enumeration
+/// excludes loopback, so the bound address itself is supplied in its place;
+/// without it a loopback-bound daemon with no observed external address
+/// would vanish from local-testnet discovery entirely.
+#[test]
+fn bind_dialable_hints_keep_only_the_bound_interface_for_specific_binds() {
+    let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+    let hints = vec![sa("192.168.1.89:5483"), sa("100.112.232.91:5483")];
+    // Loopback bind: every LAN/CGNAT hint is a lie; the bound address is
+    // supplied because enumeration never lists loopback.
+    assert_eq!(
+        filter_bind_dialable_hints(Some(sa("127.0.0.1:5483")), hints.clone()),
+        vec![sa("127.0.0.1:5483")]
+    );
+    // LAN bind: the one surviving hint IS the bind — no duplicate.
+    assert_eq!(
+        filter_bind_dialable_hints(Some(sa("192.168.1.89:5483")), hints.clone()),
+        vec![sa("192.168.1.89:5483")]
+    );
+}
+
+#[test]
+fn bind_dialable_hints_keep_every_hint_without_a_specific_bind() {
+    // A wildcard listener really is reachable on every interface, port-0 and
+    // multicast pseudo-addresses are not usable listener identities, and a
+    // missing bind means no endpoint knowledge — in all four cases the
+    // historic hint set must survive untouched (production bootstrap nodes
+    // bind `[::]` and are unaffected by #650).
+    let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+    let hints = vec![sa("192.168.1.89:5483"), sa("100.112.232.91:5483")];
+    for bind in ["0.0.0.0:5483", "[::]:5483", "127.0.0.1:0", "224.0.0.1:5483"] {
+        assert_eq!(
+            filter_bind_dialable_hints(Some(sa(bind)), hints.clone()),
+            hints,
+            "bind {bind}"
+        );
+    }
+    assert_eq!(filter_bind_dialable_hints(None, hints.clone()), hints);
 }
 
 #[test]
