@@ -132,6 +132,17 @@ All notable changes to this project will be documented in this file.
   (`ServerAliveInterval=15`, `ServerAliveCountMax=4`), so a stalled upload to a
   far host fails fast instead of hanging the rollout.
 
+- A2A binding fixtures no longer fail on a transient setup dial under
+  full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
+  ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s
+  floor) can be starved or socket-errored by ambient suite load, after
+  which the dial ladder skips hole-punch by design (an address-only dial
+  cannot coordinate) and surfaces `AllStrategiesFailed` quoting
+  "address-only dial: hole-punch requires the target's PeerId" — the
+  reported release-gate flake. The setup dial is now retried once; a
+  persistent failure still fails the test loudly with the last error, so
+  no round-trip observation is skipped.
+
 
 ## [v0.42.1] - 2026-09-11
 
