@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Tests
 
+- `e2e_deploy.sh` binary upload to VPS nodes is now bounded (900 s per
+  attempt), retried up to 3 times, and verified by comparing the remote
+  `stat -c %s` byte count against the local binary before the node is
+  restarted; a new post-mesh-wait straggler pass re-uploads and restarts
+  any node whose running version does not yet match the target version
+  (#682). New `tests/e2e_deploy_upload_test.sh` exercises all three paths
+  (retry, size-mismatch, straggler) using a fake SSH hook
+  (`X0X_DEPLOY_SSH_CMD`).
+
 - The #510 settle barrier no longer panics when the transport fails to close
   the stale connection within 5 s (#510, ant-quic#283 workaround). ant-quic's
   shutdown does not close superseded lifecycle survivors, so `is_connected`

@@ -47,6 +47,10 @@ VERSION="$(grep '^version = ' "$PROJECT_DIR/Cargo.toml" | head -1 | cut -d '"' -
 # ServerAlive* turns a dead session into a failure instead of an indefinite hang
 # (two stalls on 2026-09-11 cost ~40 min of the v0.42.1 rollout).
 SSH="ssh -C -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes"
+# Allow offline testing: set X0X_DEPLOY_SSH_CMD to substitute a fake SSH.
+[ -n "${X0X_DEPLOY_SSH_CMD:-}" ] && SSH="$X0X_DEPLOY_SSH_CMD"
+# Per-node upload: up to 3 attempts, each capped at 900 s (#682).
+MAX_UPLOAD_ATTEMPTS=3
 
 # CLI overrides (--mesh-verify / --skip-mesh-verify)
 for arg in "$@"; do
@@ -104,6 +108,10 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[2/4] Deploy to 6 VPS bootstrap nodes${NC}"
 
+# Local binary size for upload verification.  stat flag differs on macOS (-f %z)
+# vs Linux (-c %s); fall back to the other if the first form fails.
+LOCAL_SIZE=$(stat -f %z "$BINARY" 2>/dev/null || stat -c %s "$BINARY" 2>/dev/null || echo "0")
+
 FAILED_NODES=()
 for node in "${NODE_NAMES[@]}"; do
     ip="${NODE_IPS[$node]}"
@@ -118,12 +126,28 @@ for node in "${NODE_NAMES[@]}"; do
 
     # Stream to a temp path and install atomically. These hosts accept SSH
     # command execution reliably, but SFTP/scp in-place replacement can fail.
-    echo -n "    Uploading binary... "
-    # gzip stream: ~60% fewer bytes on the wire than ssh -C alone for the release binary.
-    if gzip -1 -c "$BINARY" | $SSH root@"$ip" 'gunzip -c > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
-        echo -e "${GREEN}done${NC}"
-    else
-        echo -e "${RED}failed${NC}"
+    # gzip stream: ~60% fewer bytes on the wire than ssh -C alone.
+    # Retry up to MAX_UPLOAD_ATTEMPTS times; each attempt is capped at 900 s
+    # via timeout (#682: APAC uploads stalled indefinitely on 2026-09-11/12).
+    # After each stream, verify the remote byte count matches the local size —
+    # a silent stall or partial transfer is caught as a size mismatch.
+    uploaded=false
+    for _attempt in $(seq 1 "$MAX_UPLOAD_ATTEMPTS"); do
+        echo -n "    Uploading binary (attempt $_attempt/$MAX_UPLOAD_ATTEMPTS)... "
+        if gzip -1 -c "$BINARY" | timeout 900 $SSH root@"$ip" 'gunzip -c > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
+            REMOTE_SIZE=$($SSH root@"$ip" "stat -c %s /tmp/x0xd.codex" 2>/dev/null || echo "0")
+            if [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ]; then
+                echo -e "${GREEN}done${NC}"
+                uploaded=true
+                break
+            else
+                echo -e "${YELLOW}size mismatch (local=$LOCAL_SIZE remote=$REMOTE_SIZE)${NC}"
+            fi
+        else
+            echo -e "${YELLOW}failed${NC}"
+        fi
+    done
+    if [ "$uploaded" != "true" ]; then
         FAILED_NODES+=("$node")
         continue
     fi
@@ -254,6 +278,76 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[3/4] Waiting 30s for mesh formation...${NC}"
 sleep 30
+
+# ═════════════════════════════════════════════════════════════════════════
+# 3b. STRAGGLER RE-PUSH — nodes still on the old version after the main
+#     loop get one more bounded upload+restart cycle (#682).  Only nodes
+#     that completed the deploy loop without error are checked here; nodes
+#     in FAILED_NODES are already excluded from the per-node accounting in
+#     section 4 and are not retried again.
+# ═════════════════════════════════════════════════════════════════════════
+echo -e "\n${CYAN}[3b/4] Straggler version check${NC}"
+STRAGGLER_NODES=()
+for node in "${NODE_NAMES[@]}"; do
+    ip="${NODE_IPS[$node]}"
+    already_failed=false
+    for _fn in "${FAILED_NODES[@]+"${FAILED_NODES[@]}"}"; do
+        [ "$_fn" = "$node" ] && { already_failed=true; break; }
+    done
+    [ "$already_failed" = "true" ] && continue
+
+    TOKEN=$($SSH root@"$ip" "cat $RUNNER_AGENT_DATA_DIR/api-token 2>/dev/null" 2>/dev/null || echo "")
+    RUNNING_VER=$($SSH root@"$ip" \
+        "curl -sf -m 5 -H 'Authorization: Bearer $TOKEN' http://127.0.0.1:$X0X_API_PORT/health" \
+        2>/dev/null \
+        | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('version',''))" 2>/dev/null \
+        || echo "")
+    if [ "$RUNNING_VER" != "$VERSION" ]; then
+        STRAGGLER_NODES+=("$node")
+        echo -e "  ${YELLOW}straggler${NC}: $node running '${RUNNING_VER:-unknown}' expected '$VERSION'"
+    fi
+done
+
+if [ ${#STRAGGLER_NODES[@]} -gt 0 ]; then
+    echo -e "  Re-uploading ${#STRAGGLER_NODES[@]} straggler(s): ${STRAGGLER_NODES[*]}"
+    for node in "${STRAGGLER_NODES[@]}"; do
+        ip="${NODE_IPS[$node]}"
+        echo -e "\n  ${CYAN}$node${NC} ($ip) [straggler re-push]:"
+        uploaded=false
+        for _attempt in $(seq 1 "$MAX_UPLOAD_ATTEMPTS"); do
+            echo -n "    Uploading binary (attempt $_attempt/$MAX_UPLOAD_ATTEMPTS)... "
+            if gzip -1 -c "$BINARY" | timeout 900 $SSH root@"$ip" 'gunzip -c > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
+                REMOTE_SIZE=$($SSH root@"$ip" "stat -c %s /tmp/x0xd.codex" 2>/dev/null || echo "0")
+                if [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ]; then
+                    echo -e "${GREEN}done${NC}"
+                    uploaded=true
+                    break
+                else
+                    echo -e "${YELLOW}size mismatch (local=$LOCAL_SIZE remote=$REMOTE_SIZE)${NC}"
+                fi
+            else
+                echo -e "${YELLOW}failed${NC}"
+            fi
+        done
+        if [ "$uploaded" != "true" ]; then
+            echo -e "    ${RED}straggler re-upload failed${NC}"
+            FAILED_NODES+=("$node")
+            continue
+        fi
+        echo -n "    Restarting $X0X_SERVICE (straggler)... "
+        if $SSH root@"$ip" "
+            install -m 755 /tmp/x0xd.codex '$X0X_BINARY_PATH' && rm -f /tmp/x0xd.codex
+            systemctl restart '$X0X_SERVICE'
+        " 2>/dev/null; then
+            echo -e "${GREEN}done${NC}"
+        else
+            echo -e "${RED}failed${NC}"
+            FAILED_NODES+=("$node")
+        fi
+    done
+    echo "  Waiting 10s for re-pushed stragglers to start..."
+    sleep 10
+fi
 
 # ═════════════════════════════════════════════════════════════════════════
 # 4. VERIFY HEALTH, VERSION, MESH & COLLECT TOKENS
