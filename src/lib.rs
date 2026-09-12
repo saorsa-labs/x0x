@@ -21019,6 +21019,261 @@ mod tests {
         );
     }
 
+    /// #510 (refinement): a peer-cache-disabled node that loses its
+    /// connection must still reconnect via Phase 2 — falling back to
+    /// ant-quic's internal bootstrap cache (`successful_candidates`, fed by
+    /// `record_bootstrap_direct_connection` on every successful direct
+    /// connection) when x0x's own cache has no entry. x0x's cache entry is
+    /// dropped by the post-connect cleanup (the explicit disconnect here;
+    /// in the #510 CI signature the simultaneous-open teardown), and with
+    /// `with_peer_cache_disabled()` it is in-memory-only anyway — before the
+    /// fallback, Phase 2 aborted on the cache miss and the reconnect
+    /// silently did nothing, leaving the peer at is_connected=0 forever.
+    ///
+    /// Driven through the production `schedule_reconnect` seam with an
+    /// EMPTY machine cache, so Phase 1 has no candidates and Phase 2 is the
+    /// only possible dial path. Fails on the pre-fallback code by
+    /// construction: the cache-miss precondition is asserted, so the
+    /// reconnect's only address source is the transport's internal cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconnect_redials_from_transport_cache_when_peer_cache_misses() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+
+        let alice_network = alice.network().expect("alice network");
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let bob_id = bob.machine_id().0;
+
+        // The successful direct connect records bob in BOTH caches: x0x's
+        // (in-memory) and ant-quic's internal `successful_candidates`.
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects to bob");
+        assert_eq!(connected.0, bob.machine_id().0);
+        let connected_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
+        while tokio::time::Instant::now() < connected_deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "alice connected to bob before the drop"
+        );
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
+
+        // Lose the connection the way the #510 owner did: post-connect
+        // cleanup that drops BOTH the transport and the x0x cache entry
+        // (production drives this combination on the cross-plane rejection
+        // path, which removes the cache entry via this same `remove` API;
+        // a plain Transport-reason disconnect does not touch the cache, so
+        // the removal is explicit here). ant-quic's internal
+        // `successful_candidates` keeps the address — it is insert-only.
+        let bootstrap_cache = alice_network
+            .bootstrap_cache()
+            .expect("bootstrap cache configured");
+        bootstrap_cache.remove(&bob_peer).await;
+        alice_network
+            .disconnect(&bob_peer)
+            .await
+            .expect("disconnect bob");
+        let drop_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
+        while alice_network.is_connected(&bob_peer).await {
+            assert!(
+                tokio::time::Instant::now() < drop_deadline,
+                "alice should observe the disconnect promptly"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Cache-miss precondition (teeth): the reconnect below must have no
+        // ordinary cached-dial path — only ant-quic's internal cache may
+        // still know bob.
+        assert!(
+            bootstrap_cache.get_peer(&bob_peer).await.is_none(),
+            "precondition: bob must be absent from x0x's cache after the \
+             post-connect cleanup — only ant-quic's internal cache may still \
+             know him"
+        );
+
+        // The reconnect attempt: empty machine cache (Phase 1 has no
+        // candidates), fresh tracker, production seam.
+        let machine_cache =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let tracker: ReconnectTracker =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        schedule_reconnect(
+            std::sync::Arc::clone(alice_network),
+            std::sync::Arc::clone(&machine_cache),
+            alice.shutdown_token.clone(),
+            bob_id,
+            std::sync::Arc::clone(&tracker),
+        );
+
+        let reconnect_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(15) * test_time_multiplier();
+        while !alice_network.is_connected(&bob_peer).await {
+            assert!(
+                tokio::time::Instant::now() < reconnect_deadline,
+                "#510: a cache-disabled node must still reconnect after losing its \
+                 connection — Phase 2 must fall back to ant-quic's internal \
+                 bootstrap cache when x0x's own cache misses the peer"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// #677: the accept loop must survive a `None` accept and still admit
+    /// the NEXT inbound connection. ant-quic's `accept` returns `None`
+    /// without `register_connected_peer` when a re-keyed inbound
+    /// registration lands on the Rejected path (a simultaneous-open
+    /// tiebreaker loser) or errors; the loop used to `break` on any `None`,
+    /// leaving the daemon permanently deaf to inbound connections — the
+    /// rebuilt #510 owner's dial then sat unadmitted in the accept queue
+    /// while both sides timed out.
+    ///
+    /// Organically producing the re-keyed Rejected inbound requires winning
+    /// a probabilistic tiebreaker, so the test arms the one-shot
+    /// `ACCEPT_NONE_PROBE` seam: the loop's next iteration runs its REAL
+    /// `None` branch (no `accept()` call). carol's dial first forces the
+    /// loop past its parked `accept().await` so the probe is consumed
+    /// BEFORE bob's dial is offered; bob's subsequent inbound must still be
+    /// admitted. The discriminator is the x0x-side `PeerConnected` event —
+    /// the transport registers the QUIC connection either way, but only the
+    /// accept loop emits admission, so on the pre-fix code (loop dead) bob's
+    /// event never fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn accept_loop_survives_rejected_accept_and_admits_next_inbound() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let carol = Agent::builder()
+            .with_machine_key(dir.path().join("carol-machine.key"))
+            .with_agent_key_path(dir.path().join("carol-agent.key"))
+            .with_contact_store_path(dir.path().join("carol-contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("carol");
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+
+        let alice_network = alice.network().expect("alice network");
+        let alice_addr =
+            normalize_loopback_addr(alice_network.bound_addr().await.expect("alice bound"));
+        let carol_id = carol.machine_id().0;
+        let bob_id = bob.machine_id().0;
+        let mut events = alice_network.subscribe();
+
+        // Arm the probe for ALICE's loop only, then force the loop through
+        // one real accept so the probe is consumed before bob's inbound is
+        // offered. Node-targeting matters: a global flag would be consumed
+        // by whichever agent's accept loop iterates first (the mutual-dial
+        // reverse leg wakes the dialer's loop too), leaving alice's loop —
+        // the one under test — untouched.
+        *network::ACCEPT_NONE_PROBE.lock().expect("probe lock") = Some(alice.machine_id().0);
+        carol
+            .network()
+            .expect("carol network")
+            .connect_addr(alice_addr)
+            .await
+            .expect("carol dials alice");
+        let carol_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(10) * test_time_multiplier();
+        while network::ACCEPT_NONE_PROBE
+            .lock()
+            .expect("probe lock")
+            .is_some()
+        {
+            assert!(
+                tokio::time::Instant::now() < carol_deadline,
+                "#677: carol's inbound must be admitted so the None probe is consumed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Drain carol's admission event so the wait below observes only bob.
+        while let Ok(event) = events.try_recv() {
+            if let network::NetworkEvent::PeerConnected { peer_id, .. } = event {
+                assert_eq!(peer_id, carol_id, "first admitted inbound is carol");
+            }
+        }
+
+        // The assertion: after the loop took its None branch, the next
+        // inbound is still admitted (x0x-side PeerConnected for bob).
+        bob.network()
+            .expect("bob network")
+            .connect_addr(alice_addr)
+            .await
+            .expect("bob dials alice");
+        let bob_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(10) * test_time_multiplier();
+        loop {
+            let mut admitted = false;
+            while let Ok(event) = events.try_recv() {
+                if let network::NetworkEvent::PeerConnected { peer_id, .. } = event {
+                    if peer_id == bob_id {
+                        admitted = true;
+                    }
+                }
+            }
+            if admitted {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < bob_deadline,
+                "#677: the accept loop died on a None accept (rejected re-keyed \
+                 inbound) — bob's subsequent inbound was never admitted, which is \
+                 the permanent-deafness bug: no inbound connection is accepted \
+                 again until restart"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     /// The announcement auto-connect gate must refuse to dial a peer whose
     /// reconnect is suppressed. WHY: a revoked / policy-rejected / admin-
     /// disconnected / evicted peer can keep broadcasting identity announcements

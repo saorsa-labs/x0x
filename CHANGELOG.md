@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 ### Fixed
 
+- **Accept loop no longer exits permanently on a `None` accept (#677,
+  found during #510).** ant-quic's `accept()` returns `None` without
+  `register_connected_peer` when a re-keyed inbound registration lands on
+  the Rejected path (a simultaneous-open tiebreaker loser) or errors; the
+  x0x accept loop treated every `None` as shutdown and `break`ed — after
+  which the daemon never accepted another inbound connection until
+  restart. In the #510 CI signature this is why the rebuilt owner's dial
+  sat unadmitted while both sides drained the 20 s barrier. The loop now
+  `continue`s past a `None` and exits only when the endpoint is actually
+  shutting down (`Node::is_running`, the same token ant-quic's shutdown
+  drives; x0x's own shutdown aborts the task regardless). A rejected
+  accept consumed exactly one queued inbound, so continuing simply waits
+  for the next. Regression test drives the real `None` branch through a
+  one-shot test-only probe (organically producing a re-keyed Rejected
+  inbound requires winning a probabilistic tiebreaker) and asserts the
+  next inbound is still admitted.
+
+- **Reconnect Phase 2 falls back to ant-quic's internal bootstrap cache
+  when x0x's own cache misses (#510).** x0x's cache entries are dropped by
+  explicit disconnects and cache maintenance, while ant-quic's
+  `successful_candidates` map (fed by `record_bootstrap_direct_connection`
+  on every successful direct connection) survives them. A cache miss used
+  to abort `connect_cached_peer` with "not found in bootstrap cache", so
+  the reconnect silently did nothing — the rebuilt-owner #510 signature:
+  post-connect cleanup cleared the entry and `is_connected` stayed 0 for
+  the whole barrier. The miss now falls back to a peer-authenticated dial
+  with no address hints, letting the endpoint enrich the dial from its
+  internal cache (and peer directory); it fails cleanly when neither knows
+  the peer. Regression test: a cache-disabled node loses its connection →
+  reconnect still redials from the transport cache (fails on the
+  pre-fallback code by construction).
+
 - **Reconnect no longer dials the bootstrap cache into a peer that just
   reconnected inbound (#510).** Between a reconnect attempt's top-of-attempt
   `is_connected` check and its Phase 2 (`connect_cached_peer`) fallback,
@@ -90,6 +122,16 @@ All notable changes to this project will be documented in this file.
   5 s `#510`-tagged bound) until the joiner observes the old connection as
   gone, removing the reconnect-vs-`connect_addr` overlap that caused the
   simultaneous open instead of guessing its duration.
+- The hs_f2 restart owners no longer disable the peer cache (#510). Both
+  `build_owner_agent` closures now point `.with_peer_cache_dir` at the
+  test's own `owner_dir/peers` instead of `with_peer_cache_disabled()`: the
+  bootstrap cache legitimately keeps the joiner's address across the
+  restart (same dir for the initial and rebuilt owner), and a disabled —
+  in-memory-only — cache turned any post-connect cleanup that drops the
+  entry into a PERMANENT disconnect for the rebuilt owner, whose reconnect
+  then had no address left to dial. The #456 hermeticity concern is cache
+  sharing, not persistence, so a per-test dir preserves isolation. The
+  deterministic settle wait is unchanged.
 - A2A binding fixtures no longer fail on a transient setup dial under
   full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
   ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s

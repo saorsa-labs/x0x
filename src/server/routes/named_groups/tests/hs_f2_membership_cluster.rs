@@ -2456,7 +2456,18 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
             .with_agent_key_path(owner_dir.path().join("agent.key"))
             .with_agent_cert_path(owner_dir.path().join("agent.cert"))
             .with_user_key(UserKeypair::from_seed(&owner_seed)?)
-            .with_peer_cache_disabled()
+            // #510: the bootstrap cache legitimately keeps the joiner's
+            // address across the restart (same owner_dir, so the initial
+            // and rebuilt owner share it) — the rebuilt owner can redial
+            // the joiner from the previous session's cache.
+            // `with_peer_cache_disabled()` made the cache in-memory-only,
+            // so any post-connect cleanup that drops the entry (an
+            // explicit disconnect, or the simultaneous-open teardown)
+            // turned into a PERMANENT disconnect for the rebuilt owner,
+            // whose reconnect then had no address left to dial. Point the
+            // cache at the test's own dir instead of disabling it (the
+            // #456 hermeticity concern is sharing, not persistence).
+            .with_peer_cache_dir(owner_dir.path().join("peers"))
             .with_contact_store_path(owner_dir.path().join("contacts.json"))
             .with_network_config(loopback_cfg())
             .build()
@@ -3262,7 +3273,13 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
             .with_agent_key_path(owner_dir.path().join("agent.key"))
             .with_agent_cert_path(owner_dir.path().join("agent.cert"))
             .with_user_key(UserKeypair::from_seed(&owner_seed)?)
-            .with_peer_cache_disabled()
+            // #510: same as the TreeKEM variant — the bootstrap cache
+            // legitimately keeps the joiner's address across the restart
+            // (same owner_dir); a disabled (in-memory-only) cache turned
+            // any post-connect cleanup into a PERMANENT disconnect for the
+            // rebuilt owner, whose reconnect then had no address to dial.
+            // Point the cache at the test's own dir instead of disabling.
+            .with_peer_cache_dir(owner_dir.path().join("peers"))
             .with_contact_store_path(owner_dir.path().join("contacts.json"))
             .with_network_config(loopback_cfg())
             .build()

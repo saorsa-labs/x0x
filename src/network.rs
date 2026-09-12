@@ -1788,6 +1788,20 @@ pub struct NetworkNode {
     pubsub_send_capture: Arc<Mutex<Vec<bytes::Bytes>>>,
 }
 
+/// #677 test-only seam: when armed for a node id, THAT node's accept loop
+/// runs its real `None` branch on its next iteration instead of calling
+/// `accept()`. Organically producing the `None`-without-shutdown case
+/// requires a re-keyed inbound registration to land on the Rejected path —
+/// a simultaneous-open tiebreaker loser — which is probabilistic, so tests
+/// arm this one-shot probe and assert the loop still admits the NEXT
+/// inbound connection. Targeted by node id because a test process runs one
+/// accept loop per agent: a global flag would be consumed by whichever
+/// loop iterates first (e.g. a mutual-dial reverse leg waking the dialer's
+/// loop), leaving the node under test untouched.
+#[cfg(test)]
+pub(crate) static ACCEPT_NONE_PROBE: std::sync::Mutex<Option<[u8; 32]>> =
+    std::sync::Mutex::new(None);
+
 impl NetworkNode {
     /// Create a new network node with the given configuration.
     ///
@@ -2654,15 +2668,28 @@ impl NetworkNode {
             }
         }
 
-        let cache = self.bootstrap_cache.as_ref().ok_or_else(|| {
-            NetworkError::ConnectionFailed("bootstrap cache not configured".to_string())
-        })?;
-        let cached_peer = cache.get_peer(&peer_id).await.ok_or_else(|| {
-            NetworkError::ConnectionFailed(format!(
-                "peer {:?} not found in bootstrap cache",
-                peer_id
-            ))
-        })?;
+        // #510: x0x's cache can legitimately miss a peer the transport
+        // still knows. Entries here are dropped by explicit disconnects
+        // and cache maintenance, while ant-quic's internal
+        // `successful_candidates` map (fed by
+        // `record_bootstrap_direct_connection` on EVERY successful direct
+        // connection, and never cleared on teardown) survives them. A
+        // cache miss used to abort Phase 2 of `schedule_reconnect`
+        // outright — the rebuilt-owner #510 signature: the reconnect
+        // silently did nothing and is_connected stayed 0 for the whole
+        // barrier window. Fall back to a peer-authenticated dial with NO
+        // address hints: `connect_peer_with_addrs` lets the endpoint
+        // enrich the dial from its internal cache (and peer directory),
+        // and fails cleanly when neither knows the peer.
+        let cache = self.bootstrap_cache.as_ref();
+        let cached_peer = match cache {
+            Some(cache) => cache.get_peer(&peer_id).await,
+            None => None,
+        };
+        let Some(cached_peer) = cached_peer else {
+            let (selected_addr, _) = self.connect_peer_with_addrs(peer_id, Vec::new()).await?;
+            return Ok(selected_addr);
+        };
         // cached addresses observed as mapped-v6 wedge sends with
         // "No route to host" on hosts whose mapped-v6 egress is refused
         // (durable fix ant-quic#269).
@@ -2691,7 +2718,9 @@ impl NetworkNode {
             }
         }
 
-        cache.record_failure(&peer_id).await;
+        if let Some(cache) = cache {
+            cache.record_failure(&peer_id).await;
+        }
         Err(NetworkError::ConnectionFailed(format!(
             "peer {:?} not reachable via {} cached addresses",
             peer_id,
@@ -4443,7 +4472,26 @@ impl NetworkNode {
                     }
                 };
 
-                match node_ref.accept().await {
+                #[cfg(test)]
+                let forced_none = match ACCEPT_NONE_PROBE.lock() {
+                    Ok(mut probe)
+                        if probe
+                            .as_ref()
+                            .is_some_and(|armed| *armed == node_ref.peer_id().0) =>
+                    {
+                        *probe = None;
+                        true
+                    }
+                    _ => false,
+                };
+                #[cfg(not(test))]
+                let forced_none = false;
+                let accepted = if forced_none {
+                    None
+                } else {
+                    node_ref.accept().await
+                };
+                match accepted {
                     Some(peer_conn) => {
                         // Reject peers not in inbound allowlist (when configured)
                         if !inbound_allowlist.is_empty()
@@ -4546,8 +4594,27 @@ impl NetworkNode {
                         }
                     }
                     None => {
-                        debug!("Accept loop ended (node shutting down)");
-                        break;
+                        // #677: `None` is not only shutdown. ant-quic's
+                        // `accept` also yields `None` — without
+                        // `register_connected_peer` — when a re-keyed
+                        // inbound registration lands on the Rejected path
+                        // (a simultaneous-open tiebreaker loser,
+                        // `p2p_endpoint::accept`) or errors. Breaking here
+                        // left the daemon permanently deaf to inbound
+                        // connections after a single rejected accept; the
+                        // #510 rebuilt owner's dial then sat unadmitted in
+                        // the accept queue for the whole barrier. A rejected
+                        // accept consumed exactly one queued inbound, so
+                        // continuing simply waits for the next one; exit
+                        // only when the endpoint is really shutting down
+                        // (the token ant-quic's shutdown drives — and x0x's
+                        // own shutdown aborts this task anyway).
+                        if !node_ref.is_running() {
+                            debug!("Accept loop ended (node shutting down)");
+                            break;
+                        }
+                        debug!("#677: inbound accept returned None without shutdown; continuing");
+                        continue;
                     }
                 }
             }
