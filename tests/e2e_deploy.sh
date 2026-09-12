@@ -14,6 +14,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_DIR/target/x86_64-unknown-linux-gnu/release/x0xd"
+# shellcheck source=lib/deploy_upload.sh
+source "$SCRIPT_DIR/lib/deploy_upload.sh"
 RUNNER_SCRIPT="$SCRIPT_DIR/runners/x0x_test_runner.py"
 RUNNER_UNIT="$SCRIPT_DIR/runners/x0x-test-runner.service"
 
@@ -127,27 +129,9 @@ for node in "${NODE_NAMES[@]}"; do
     # Stream to a temp path and install atomically. These hosts accept SSH
     # command execution reliably, but SFTP/scp in-place replacement can fail.
     # gzip stream: ~60% fewer bytes on the wire than ssh -C alone.
-    # Retry up to MAX_UPLOAD_ATTEMPTS times; each attempt is capped at 900 s
-    # via timeout (#682: APAC uploads stalled indefinitely on 2026-09-11/12).
-    # After each stream, verify the remote byte count matches the local size —
-    # a silent stall or partial transfer is caught as a size mismatch.
-    uploaded=false
-    for _attempt in $(seq 1 "$MAX_UPLOAD_ATTEMPTS"); do
-        echo -n "    Uploading binary (attempt $_attempt/$MAX_UPLOAD_ATTEMPTS)... "
-        if gzip -1 -c "$BINARY" | timeout 900 $SSH root@"$ip" 'gunzip -c > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
-            REMOTE_SIZE=$($SSH root@"$ip" "stat -c %s /tmp/x0xd.codex" 2>/dev/null || echo "0")
-            if [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ]; then
-                echo -e "${GREEN}done${NC}"
-                uploaded=true
-                break
-            else
-                echo -e "${YELLOW}size mismatch (local=$LOCAL_SIZE remote=$REMOTE_SIZE)${NC}"
-            fi
-        else
-            echo -e "${YELLOW}failed${NC}"
-        fi
-    done
-    if [ "$uploaded" != "true" ]; then
+    # x0x_upload_binary retries up to MAX_UPLOAD_ATTEMPTS times (each capped
+    # at 900 s) and verifies the remote byte count before returning (#682).
+    if ! x0x_upload_binary "$ip"; then
         FAILED_NODES+=("$node")
         continue
     fi
@@ -287,64 +271,8 @@ sleep 30
 #     section 4 and are not retried again.
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[3b/4] Straggler version check${NC}"
-STRAGGLER_NODES=()
-for node in "${NODE_NAMES[@]}"; do
-    ip="${NODE_IPS[$node]}"
-    already_failed=false
-    for _fn in "${FAILED_NODES[@]+"${FAILED_NODES[@]}"}"; do
-        [ "$_fn" = "$node" ] && { already_failed=true; break; }
-    done
-    [ "$already_failed" = "true" ] && continue
-
-    TOKEN=$($SSH root@"$ip" "cat $RUNNER_AGENT_DATA_DIR/api-token 2>/dev/null" 2>/dev/null || echo "")
-    RUNNING_VER=$($SSH root@"$ip" \
-        "curl -sf -m 5 -H 'Authorization: Bearer $TOKEN' http://127.0.0.1:$X0X_API_PORT/health" \
-        2>/dev/null \
-        | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('version',''))" 2>/dev/null \
-        || echo "")
-    if [ "$RUNNING_VER" != "$VERSION" ]; then
-        STRAGGLER_NODES+=("$node")
-        echo -e "  ${YELLOW}straggler${NC}: $node running '${RUNNING_VER:-unknown}' expected '$VERSION'"
-    fi
-done
-
-if [ ${#STRAGGLER_NODES[@]} -gt 0 ]; then
-    echo -e "  Re-uploading ${#STRAGGLER_NODES[@]} straggler(s): ${STRAGGLER_NODES[*]}"
-    for node in "${STRAGGLER_NODES[@]}"; do
-        ip="${NODE_IPS[$node]}"
-        echo -e "\n  ${CYAN}$node${NC} ($ip) [straggler re-push]:"
-        uploaded=false
-        for _attempt in $(seq 1 "$MAX_UPLOAD_ATTEMPTS"); do
-            echo -n "    Uploading binary (attempt $_attempt/$MAX_UPLOAD_ATTEMPTS)... "
-            if gzip -1 -c "$BINARY" | timeout 900 $SSH root@"$ip" 'gunzip -c > /tmp/x0xd.codex && chmod 755 /tmp/x0xd.codex' 2>/dev/null; then
-                REMOTE_SIZE=$($SSH root@"$ip" "stat -c %s /tmp/x0xd.codex" 2>/dev/null || echo "0")
-                if [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ]; then
-                    echo -e "${GREEN}done${NC}"
-                    uploaded=true
-                    break
-                else
-                    echo -e "${YELLOW}size mismatch (local=$LOCAL_SIZE remote=$REMOTE_SIZE)${NC}"
-                fi
-            else
-                echo -e "${YELLOW}failed${NC}"
-            fi
-        done
-        if [ "$uploaded" != "true" ]; then
-            echo -e "    ${RED}straggler re-upload failed${NC}"
-            FAILED_NODES+=("$node")
-            continue
-        fi
-        echo -n "    Restarting $X0X_SERVICE (straggler)... "
-        if $SSH root@"$ip" "
-            install -m 755 /tmp/x0xd.codex '$X0X_BINARY_PATH' && rm -f /tmp/x0xd.codex
-            systemctl restart '$X0X_SERVICE'
-        " 2>/dev/null; then
-            echo -e "${GREEN}done${NC}"
-        else
-            echo -e "${RED}failed${NC}"
-            FAILED_NODES+=("$node")
-        fi
-    done
+x0x_scan_and_repush_stragglers
+if [ "${STRAGGLERS_REPUSHED:-0}" -gt 0 ]; then
     echo "  Waiting 10s for re-pushed stragglers to start..."
     sleep 10
 fi

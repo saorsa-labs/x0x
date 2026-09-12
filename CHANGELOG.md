@@ -11,9 +11,9 @@ All notable changes to this project will be documented in this file.
   `stat -c %s` byte count against the local binary before the node is
   restarted; a new post-mesh-wait straggler pass re-uploads and restarts
   any node whose running version does not yet match the target version
-  (#682). New `tests/e2e_deploy_upload_test.sh` exercises all three paths
-  (retry, size-mismatch, straggler) using a fake SSH hook
-  (`X0X_DEPLOY_SSH_CMD`).
+  (#682). Logic extracted into `tests/lib/deploy_upload.sh`
+  (sourced by both `e2e_deploy.sh` and `tests/e2e_deploy_upload_test.sh`),
+  which drives the library functions via `X0X_DEPLOY_SSH_CMD`.
 
 - The #510 settle barrier no longer panics when the transport fails to close
   the stale connection within 5 s (#510, ant-quic#283 workaround). ant-quic's
