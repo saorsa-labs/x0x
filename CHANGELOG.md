@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`x0x/caps/v1` CPU amplification (#656).** One targeted capability
+  request caused the responder's publisher to also re-broadcast its signed
+  advert on the fleet-wide steady topic (`respond_on_steady` in
+  `DmCapabilityService`), turning the documented 600 s advert cadence into
+  the request rate — 27 nodes × 1 response-cycle/s × 3 publishes ≈ the
+  observed 77 caps msgs/s. The steady advert now rides its own cadence
+  (startup burst, timer beat, or capability upgrade) plus one bounded
+  exception: a request-triggered cycle may still emit a steady copy, at
+  most ONE per 600 s advert window (warm fallback), so a fresh Critical
+  topic with no mesh peers yet keeps a working carrier. Net effect: a
+  targeted request costs two publishes, not three — the answer on the
+  Critical `caps/v1/response/targeted-v2` topic the requester listens
+  on, plus the `caps/v2/digest` extension, which intentionally still
+  publishes on every advert cycle: a targeted refresh is the only
+  reliable delivery path for the `digest_support` bit in on-demand mode
+  (the default), where a lone node's initial-cycle extension publishes
+  before it has gossip links — restricting it to the periodic beat breaks
+  digest discovery (verified against
+  `asymmetric_signed_capability_convergence_over_relay`). Publish-side
+  cadence only; no caps topic is retired and no wire shape changes.
+
 - **`announce/v3/blob` CPU amplification (#656).** The blob responder's
   cache-first branch let every node that had ever cached peer X's blob
   answer a request for X, so one miss drew a broadcast response from every
@@ -22,6 +43,7 @@ All notable changes to this project will be documented in this file.
   timeout-retry loop; the map only ever holds this node's own served
   digests, so it needs no bound. Publish-side only; request/response wire
   shapes unchanged, 0.41.x/0.42.0 peers unaffected.
+
 
 - **Redundant ML-DSA verify per inbound IWANT (#656).** The 0.42.0 egress
   metering's `track_iwant` (`src/gossip/egress.rs`) performed a full
