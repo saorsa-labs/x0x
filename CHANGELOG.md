@@ -17,7 +17,12 @@ All notable changes to this project will be documented in this file.
   instance (matched by program basename plus argument tail, so
   multi-instance `--name` jobs cannot verify each other) holds an
   unconditional keep-alive — read back via `launchctl print`, never the
-  on-disk plist alone. Anything short of a confirmed guarantee refuses the
+  on-disk plist alone. Each label is probed in the `gui/<uid>` domain
+  first with a fallback to `user/<uid>` (the two per-user launchd domains
+  are disjoint, so a gui-only probe would refuse a legitimately-loaded
+  marker job forever — round-2 review), and the decision core is
+  unit-tested against captured `launchctl print` output for every
+  fail-closed arm. Anything short of a confirmed guarantee refuses the
   apply before replacement with a diagnostic that names what was found.
   `INVOCATION_ID`/systemd signals are unchanged (no launchd to read); the
   systemd-side readback remains open under §3. Also documents the

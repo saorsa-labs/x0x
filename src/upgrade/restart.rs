@@ -344,14 +344,76 @@ fn readback_launchd_policy_macos(_executable: &Path, _argv: &[String]) -> Launch
 
 #[cfg(target_os = "macos")]
 fn readback_launchd_policy_macos(executable: &Path, argv: &[String]) -> LaunchdPolicyReadback {
-    use LaunchdPolicyReadback::NotGuaranteed;
-
     let Some(plist_dir) = dirs::home_dir().map(|h| h.join("Library/LaunchAgents")) else {
-        return NotGuaranteed {
+        return LaunchdPolicyReadback::NotGuaranteed {
             detail: "cannot locate ~/Library/LaunchAgents".to_string(),
         };
     };
-    let entries = match std::fs::read_dir(&plist_dir) {
+    readback_launchd_policy_in(
+        &plist_dir,
+        // SAFETY: getuid cannot fail.
+        unsafe { libc::getuid() },
+        executable,
+        argv,
+        &plist_as_json,
+        &mut run_launchctl_print,
+    )
+}
+
+/// Real launchctl probe for [`readback_launchd_policy_in`]: run
+/// `launchctl print <target>`. `Ok(None)` when the domain does not hold the
+/// job (launchctl exits nonzero for an unknown service target); `Err` when
+/// launchctl itself could not be run.
+#[cfg(target_os = "macos")]
+fn run_launchctl_print(target: &str) -> Result<Option<String>, String> {
+    match std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(target)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+        }
+        Ok(_) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Plist-reader callback for [`readback_launchd_policy_in`]: the plist file
+/// as JSON, or `None` when it cannot be read or parsed.
+type PlistReader<'a> = &'a dyn Fn(&Path) -> Option<serde_json::Value>;
+
+/// launchctl probe callback for [`readback_launchd_policy_in`]: given a full
+/// launchd service target (e.g. `gui/501/com.example.x0xd`), `Ok(Some(stdout))`
+/// when that domain holds the job, `Ok(None)` when it does not, `Err` when
+/// launchctl could not be run. `FnMut` so tests can record probe order.
+type LaunchctlPrint<'a> = &'a mut dyn FnMut(&str) -> Result<Option<String>, String>;
+
+/// The decision core of [`readback_launchd_policy`]: discover candidate
+/// labels from a LaunchAgents directory, probe each label's LOADED policy,
+/// and verdict on the job running this exact instance.
+///
+/// Each label is probed in the `gui/<uid>` domain first and falls back to
+/// `user/<uid>`: the two per-user domains are disjoint (a job bootstrapped
+/// into `user/<uid>` answers "Could not find service" from the gui probe),
+/// so probing gui alone would refuse a legitimately-loaded marker job
+/// forever (round-2 review of #615).
+///
+/// Split from the plutil/launchctl drivers — and free of any platform API —
+/// so the refuse-vs-proceed decision table is unit-testable on any platform
+/// with captured probe output; every path that cannot confirm an
+/// unconditional keep-alive on this instance's job fails closed.
+fn readback_launchd_policy_in(
+    plist_dir: &Path,
+    uid: u32,
+    executable: &Path,
+    argv: &[String],
+    read_plist: PlistReader<'_>,
+    launchctl_print: LaunchctlPrint<'_>,
+) -> LaunchdPolicyReadback {
+    use LaunchdPolicyReadback::NotGuaranteed;
+
+    let entries = match std::fs::read_dir(plist_dir) {
         Ok(entries) => entries,
         Err(e) => {
             return NotGuaranteed {
@@ -360,13 +422,7 @@ fn readback_launchd_policy_macos(executable: &Path, argv: &[String]) -> LaunchdP
         }
     };
 
-    let executable_basename = executable
-        .to_string_lossy()
-        .rsplit('/')
-        .next()
-        .unwrap_or(&executable.to_string_lossy())
-        .to_string();
-    let uid = unsafe { libc::getuid() };
+    let executable_basename = path_basename(&executable.to_string_lossy()).to_string();
 
     // First refusal-worthy observation, kept for the diagnostic when no
     // candidate verifies. A definitive answer (verified, or the loaded job
@@ -377,7 +433,7 @@ fn readback_launchd_policy_macos(executable: &Path, argv: &[String]) -> LaunchdP
         if path.extension().and_then(|e| e.to_str()) != Some("plist") {
             continue;
         }
-        let Some(job_plist) = plist_as_json(&path) else {
+        let Some(job_plist) = read_plist(&path) else {
             refusal.get_or_insert_with(|| format!("unreadable plist {}", path.display()));
             continue;
         };
@@ -394,30 +450,36 @@ fn readback_launchd_policy_macos(executable: &Path, argv: &[String]) -> LaunchdP
             refusal.get_or_insert_with(|| format!("plist {} has no Label", path.display()));
             continue;
         };
-        let output = match std::process::Command::new("launchctl")
-            .arg("print")
-            .arg(format!("gui/{uid}/{label}"))
-            .output()
-        {
-            Ok(output) => output,
-            Err(e) => {
-                refusal.get_or_insert_with(|| {
-                    format!("could not run launchctl print for job {label}: {e}")
-                });
-                continue;
-            }
+        // Probe gui first; fall back to the user domain when gui does not
+        // hold the job (the domains are disjoint — see the function docs).
+        let gui_probe = launchctl_print(&format!("gui/{uid}/{label}"));
+        let loaded_stdout = match &gui_probe {
+            Ok(Some(stdout)) => Some(std::borrow::Cow::Borrowed(stdout.as_str())),
+            _ => match launchctl_print(&format!("user/{uid}/{label}")) {
+                Ok(Some(stdout)) => Some(std::borrow::Cow::Owned(stdout)),
+                Ok(None) => {
+                    refusal.get_or_insert_with(|| {
+                        format!(
+                            "job {label} ({}) is not loaded in either the gui or the user \
+                             launchd domain",
+                            path.display()
+                        )
+                    });
+                    continue;
+                }
+                Err(user_err) => {
+                    let why = match &gui_probe {
+                        Err(gui_err) => format!("{gui_err}; {user_err}"),
+                        _ => user_err,
+                    };
+                    refusal.get_or_insert_with(|| {
+                        format!("could not run launchctl print for job {label}: {why}")
+                    });
+                    continue;
+                }
+            },
         };
-        if !output.status.success() {
-            refusal.get_or_insert_with(|| {
-                format!(
-                    "job {label} ({}) is not loaded in the gui domain",
-                    path.display()
-                )
-            });
-            continue;
-        }
-        let Some(loaded) = parse_launchd_loaded_job(&String::from_utf8_lossy(&output.stdout))
-        else {
+        let Some(loaded) = loaded_stdout.as_deref().and_then(parse_launchd_loaded_job) else {
             refusal
                 .get_or_insert_with(|| format!("could not parse the loaded policy of job {label}"));
             continue;
@@ -1900,6 +1962,228 @@ mod tests {
         )
         .expect("systemd signals do not require a launchd readback");
         assert_eq!(plan.mode, RestartMode::SupervisedExit);
+    }
+
+    // ------------------------------------------------------------------------
+    // Round-2 (#615 review): the readback DECISION core — the code that
+    // decides refuse-vs-proceed on real Macs — driven with captured
+    // `launchctl print` output, so every fail-closed arm is pinned without
+    // touching real launchd or the developer's ~/Library/LaunchAgents.
+    // ------------------------------------------------------------------------
+
+    /// Write a LaunchAgents-style candidate plist as plain JSON (the reader
+    /// is injected in these tests, so no plutil is involved).
+    fn write_candidate_plist(dir: &Path, label: &str, program: &str, args: &[&str]) {
+        let mut argv = vec![program.to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        let plist = serde_json::json!({
+            "Label": label,
+            "ProgramArguments": argv,
+        });
+        std::fs::write(
+            dir.join(format!("{label}.plist")),
+            serde_json::to_string(&plist).expect("serialize fixture plist"),
+        )
+        .expect("write fixture plist");
+    }
+
+    /// The injected plist reader for the decision tests.
+    fn read_json_plist(path: &Path) -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+
+    const TEST_LABEL: &str = "com.example.x0xd";
+    const TEST_EXE: &str = "/usr/local/bin/x0xd";
+
+    #[test]
+    fn readback_decision_verifies_a_loaded_keepalive_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let dump = launchd_print_dump(&[TEST_EXE], true);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(Some(dump.clone())),
+        );
+        assert_eq!(
+            verdict,
+            LaunchdPolicyReadback::Verified {
+                label: TEST_LABEL.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn readback_decision_refuses_a_conditional_keepalive_job() {
+        // The #615 scenario itself: the plist still names this executable,
+        // the job is loaded, but the LOADED policy no longer guarantees a
+        // respawn after exit 0 — refuse rather than exit into a dead service.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let dump = launchd_print_dump(&[TEST_EXE], false);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(Some(dump.clone())),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("does not hold an unconditional KeepAlive"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readback_decision_falls_back_to_the_user_domain() {
+        // Round-2 review: `gui/<uid>` and `user/<uid>` are DISJOINT — a
+        // marker job bootstrapped into `user/<uid>` answers "Could not find
+        // service" from the gui probe. Probing gui alone refused such a job
+        // forever. The gui miss must fall back to `user/<uid>`, and gui must
+        // be probed FIRST (it is the domain `x0x autostart` loads into).
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let dump = launchd_print_dump(&[TEST_EXE], true);
+        let mut probed = Vec::new();
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |target| {
+                probed.push(target.to_string());
+                if target == "user/501/com.example.x0xd" {
+                    Ok(Some(dump.clone()))
+                } else {
+                    Ok(None)
+                }
+            },
+        );
+        assert_eq!(
+            verdict,
+            LaunchdPolicyReadback::Verified {
+                label: TEST_LABEL.to_string()
+            }
+        );
+        assert_eq!(
+            probed,
+            vec![
+                "gui/501/com.example.x0xd".to_string(),
+                "user/501/com.example.x0xd".to_string()
+            ],
+            "gui must be probed first, user only as fallback"
+        );
+    }
+
+    #[test]
+    fn readback_decision_refuses_a_job_not_loaded_in_either_domain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(None),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("not loaded in either the gui or the user launchd domain"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readback_decision_fails_closed_on_unparseable_loaded_policy() {
+        // launchctl "succeeds" but the dump is not a job dump (format drift,
+        // partial output): parsing to nothing must refuse, never guess.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &[]);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(Some("launchctl: unexpected format drift".to_string())),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("could not parse the loaded policy"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readback_decision_refuses_when_only_a_sibling_instance_matches() {
+        // A loaded, healthy job for a DIFFERENT instance (--name bob) must
+        // not verify this instance, and the refusal must say why — the
+        // operator is told which job was inspected, not a bare "no job".
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_candidate_plist(dir.path(), TEST_LABEL, TEST_EXE, &["--name", "bob"]);
+        let dump = launchd_print_dump(&[TEST_EXE, "--name", "bob"], true);
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[
+                TEST_EXE.to_string(),
+                "--name".to_string(),
+                "alice".to_string(),
+            ],
+            &read_json_plist,
+            &mut |_target| Ok(Some(dump.clone())),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("runs different arguments"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readback_decision_refuses_when_no_plist_names_this_executable() {
+        // Marker set, but nothing in LaunchAgents even references this
+        // executable: an env-var-only marker with no supervisor is exactly
+        // the false positive §3 rules out — refuse with the honest reason.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let verdict = readback_launchd_policy_in(
+            dir.path(),
+            501,
+            Path::new(TEST_EXE),
+            &[TEST_EXE.to_string()],
+            &read_json_plist,
+            &mut |_target| Ok(None),
+        );
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(detail.contains("no launchd job"), "detail: {detail}");
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
     }
 
     #[test]
