@@ -4,9 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [v0.42.2] - 2026-09-12
-
 ### Fixed
+
 - **Slow-consumer Close(1013) survives the writer's flush budget (#287,
   round 2).** The WS writer owned the socket sink; when its bounded
   Close(1013) flush (2 s) expired against a stalled reader, the writer task
@@ -25,6 +24,38 @@ All notable changes to this project will be documented in this file.
   `run_ws_writer_exits_after_flush_budget_with_close_still_blocked` (bounded
   exit + handoff) and integration
   `ws_slow_close_frame_survives_flush_budget_expiry` (self-DM-triggered
+
+
+### Tests
+
+- **#287 root cause round 1 — fixture self-update contamination (the
+  ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
+  failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised
+  on mDNS on the production gossip plane, joined a live mesh peer, received a
+  newer signed release manifest via the gossip update listener (gated there
+  on `[update] enabled` only — `--skip-update-check` did not suppress the
+  gossip listener in v0.34.3; current code computes
+  `effective_self_update_enabled`, which does), and replaced its own binary
+  mid-test — the process vanished under in-flight `POST /publish` requests,
+  which reqwest surfaces as `hyper::Error(IncompleteMessage)`. Reproduced
+  directly: a v0.34.3 daemon joined to the production plane sidelines its
+  binary and dies within seconds of a stall run, while the same binary
+  hermetic (mDNS off, private plane) fills the queue, counts drops, and
+  serves every publish. The hermeticity work (#337/#417/#609) removed the
+  contamination. Separately — and only visible once that noise was gone, on
+  hosts whose socket buffers outlast the writer's flush budget — the
+  close-frame delivery itself was broken; that product fix is the `### Fixed`
+  entry above. The test now (1) disables `[update]` for its daemon so it is
+  immune to the round-1 failure mode even if hermeticity regresses, and (2)
+  asserts REST availability through the close window — publish waves must
+  keep returning 200 while the stalled session fills, closes with 1013, and
+  tears down. The contract itself (bounded 1024-frame queue, drop-vs-close
+  feeder policies, 1013 close-frame delivery, REST-plane isolation) is
+  documented in `docs/api-reference.md`.
+
+## [v0.42.2] - 2026-09-12
+
+### Fixed
 
 - **`x0x/caps/v1` CPU amplification (#656).** One targeted capability
   request caused the responder's publisher to also re-broadcast its signed
@@ -151,35 +182,9 @@ All notable changes to this project will be documented in this file.
 - `tests/e2e_deploy.sh` uploads the binary as a gzip stream with ssh keepalives
   (`ServerAliveInterval=15`, `ServerAliveCountMax=4`), so a stalled upload to a
   far host fails fast instead of hanging the rollout.
-- **#287 root cause round 1 — fixture self-update contamination (the
-  ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
-  failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised
-  on mDNS on the production gossip plane, joined a live mesh peer, received a
-  newer signed release manifest via the gossip update listener (gated there
-  on `[update] enabled` only — `--skip-update-check` did not suppress the
-  gossip listener in v0.34.3; current code computes
-  `effective_self_update_enabled`, which does), and replaced its own binary
-  mid-test — the process vanished under in-flight `POST /publish` requests,
-  which reqwest surfaces as `hyper::Error(IncompleteMessage)`. Reproduced
-  directly: a v0.34.3 daemon joined to the production plane sidelines its
-  binary and dies within seconds of a stall run, while the same binary
-  hermetic (mDNS off, private plane) fills the queue, counts drops, and
-  serves every publish. The hermeticity work (#337/#417/#609) removed the
-  contamination. Separately — and only visible once that noise was gone, on
-  hosts whose socket buffers outlast the writer's flush budget — the
-  close-frame delivery itself was broken; that product fix is the `### Fixed`
-  entry above. The test now (1) disables `[update]` for its daemon so it is
-  immune to the round-1 failure mode even if hermeticity regresses, and (2)
-  asserts REST availability through the close window — publish waves must
-  keep returning 200 while the stalled session fills, closes with 1013, and
-  tears down. The contract itself (bounded 1024-frame queue, drop-vs-close
-  feeder policies, 1013 close-frame delivery, REST-plane isolation) is
-  documented in `docs/api-reference.md`.
-
 - The two home rename/restart e2e tests settle 300 ms between owner shutdown and
   rebuild so the joiner's ant-quic finishes unwinding the old connection before the
   rebuilt owner dials it (#510; underlying reconnect race filed as ant-quic#277).
-
 
 ## [v0.42.1] - 2026-09-11
 
