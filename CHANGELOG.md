@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+## [v0.42.2] - 2026-09-12
 ### Fixed
 
 - **Launchd loaded-policy readback at upgrade time (#615).** ADR-0061 §3
@@ -30,10 +31,6 @@ All notable changes to this project will be documented in this file.
   reconcile `upgrade-handoff.json`, re-enter through the manager — with
   exact launchd and systemd commands, cross-linked from the new refusal
   and from the apply logs.
-
-## [v0.42.2] - 2026-09-12
-### Fixed
-
 - **Group task-list policy now gates the bootstrap prune (#654).** The
   digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
   acted directly on the wire delta's removal evidence, so on a
