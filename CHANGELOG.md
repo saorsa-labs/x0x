@@ -22,8 +22,8 @@ All notable changes to this project will be documented in this file.
   doc could read "Could not find service" for a job verified in the other
   domain; intent files written before the field existed still parse.
   ADR-0061 §3 remains **NOT MET**: the versioned-template half and the
-  systemd-side readback are open (dated status note added to the ADR;
-  tracked separately).
+  systemd-side readback are open (tracked in #690; the ADR itself is
+  immutable after acceptance, so its acceptance-time status table stands).
 
 **BREAKING — upgrade restart-contract API:** two methods became `async` and
 three public types gained fields.

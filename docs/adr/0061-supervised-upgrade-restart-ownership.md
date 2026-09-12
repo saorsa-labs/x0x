@@ -250,24 +250,6 @@ Those tests and the classification table remain useful controls but do not
 satisfy the platform observations above. None of these new observations has
 been executed for this Proposed ADR.
 
-### Implementation status updates after acceptance
-
-The table above records acceptance-time state (PR #612) and is left
-unchanged. Later changes are recorded here so a reader can trust neither a
-stale gap nor an unearned "met".
-
-- **2026-09-12 (#668, follow-ups tracked in #671): §3 remains NOT MET.** The
-  macOS half of the loaded-policy readback is now live in the upgrade path
-  (`upgrade::restart::readback_launchd_policy` behind the `X0X_SUPERVISED=1`
-  marker): an apply is refused unless the **loaded** launchd job running this
-  exact instance holds an unconditional `KeepAlive`, probed in both per-user
-  domains. That closes the acceptance-era residual failure of a marker job
-  whose `KeepAlive` was altered after `x0x autostart --repair`. §3 is still
-  not met: the **versioned-template** half (launchd and systemd) and the
-  **systemd-side loaded-policy readback** (`systemctl show -p Restart
-  -p ExecStart` before an in-place replace on Linux) remain open, and §3's
-  "supported launchd jobs must actually restart after 0" is still unobserved.
-
 ## Notes for AI-assisted work
 
 AI tools drafted this ADR; David Irvine accepted it on 2026-09-09 after human
