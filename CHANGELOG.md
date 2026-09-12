@@ -6,18 +6,18 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - **Full-participation eager degree ceiling lowered from 12 to 6 (#674
-  item 3).** `ensure_eager_ceiling` passed sg's `0` sentinel (stock
-  `MAX_EAGER_DEGREE = 12`) for Full nodes; it now passes 6 — sg's
-  documented promotion floor (`MIN_EAGER_DEGREE`) — so a bootstrap's eager
-  fan-out per topic is bounded by the degree needed for coverage, not by
-  its peer count (measured anchor: up to 12 of ~27 peers, feeding 242.4
-  eager sends/s at 4.27 MB/s, the send path that owns the non-verify half
-  of daemon CPU). Robustness is preserved by PlumTree's lazy half: peers
-  outside the eager tree still receive IHAVE digests and repair via IWANT.
-  On sg 0.5.77 steady-state promotion is already MIN-bounded at 6, so the
-  change caps eager excursions (the all-cooled publish-rescue path can
-  reach the ceiling; degree maintenance demotes above it) rather than
-  shifting the steady state. Local topology parameter — no wire change.
+  design C1) — no steady-state send-rate change expected.** sg promotes
+  eager peers to `MIN_EAGER_DEGREE.min(ceiling)` and `MIN_EAGER_DEGREE` is
+  already 6, so a ceiling of 12 and a ceiling of 6 produce the same
+  steady-state degree; the measured 242.4 eager sends/s at 4.27 MB/s on the
+  testnet anchor come from an effective fan-out of ~2.1 and are NOT reduced
+  by this change. What it bounds is the all-cooled publish-rescue path,
+  where sg grows the eager set toward the ceiling instead of swapping
+  members — with 12 that growth is the send amplification the #380/#656
+  storms ride on; with 6 the set swaps. `ensure_eager_ceiling` now passes 6
+  instead of sg's `0` sentinel (stock 12). Delivery robustness unchanged
+  (PlumTree's lazy IHAVE/IWANT half still repairs peers outside the eager
+  tree). Local topology parameter — no wire change.
 
 ### Fixed
 

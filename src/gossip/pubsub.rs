@@ -578,16 +578,17 @@ impl std::fmt::Debug for PubSubManager {
     }
 }
 
-/// Eager degree ceiling for Full-participation nodes (#674 item 3).
+/// Eager degree ceiling for Full-participation nodes (#674 design C1).
 ///
-/// Was `0` — sg's sentinel for its stock `MAX_EAGER_DEGREE = 12`. 6 is sg's
-/// documented promotion floor (`MIN_EAGER_DEGREE`), so a Full node's eager
-/// fan-out is bounded by the degree needed for coverage, not by its peer
-/// count: measured on the testnet anchor, a bootstrap eager-pushed to up to
-/// 12 peers per topic out of ~27 while carrying 242.4 eager sends/s at
-/// 4.27 MB/s — the send path that owns the non-verify half of daemon CPU.
-/// Delivery robustness is preserved by PlumTree's lazy half: peers outside
-/// the eager tree still receive IHAVE digests and can repair via IWANT.
+/// Was `0` — sg's sentinel for its stock `MAX_EAGER_DEGREE = 12`. sg promotes
+/// eager peers up to `MIN_EAGER_DEGREE.min(ceiling)` and `MIN_EAGER_DEGREE` is
+/// 6, so in steady state a ceiling of 12 and a ceiling of 6 yield the SAME
+/// eager degree: this constant changes no steady-state send rate. What it
+/// bounds is the all-cooled publish rescue path, where sg grows the eager set
+/// toward the ceiling instead of swapping members — with 12 that growth is the
+/// send amplification the #380/#656 storms ride on; with 6 the set swaps.
+/// Delivery robustness is unchanged: PlumTree's lazy half (IHAVE/IWANT)
+/// still repairs peers outside the eager tree.
 const FULL_EAGER_DEGREE_CEILING: usize = 6;
 
 impl PubSubManager {
@@ -2894,14 +2895,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_participation_eager_fanout_is_capped_at_six() {
-        // Why (#674 item 3): a Full node's fan-out is bounded by the eager
-        // degree needed for coverage, not by its peer count — sg's stock
-        // ceiling of 12 let a bootstrap eager-push to up to 12 peers per
-        // topic out of ~27, feeding the 242 sends/s · 4.27 MB/s relay send
-        // path. With 12 candidate peers, every publish must attempt
-        // exactly 6 EAGER sends (sg's promotion floor), before and after a
-        // membership refresh — never more, whatever the peer count.
+    async fn full_participation_eager_fanout_meets_sg_floor_with_twelve_candidates() {
+        // Why (#674 design C1): with 12 candidate peers a Full node must eager-
+        // push to exactly sg's promotion floor (6) per publish, before and after
+        // a membership refresh. This pins the steady-state degree (a floor); it
+        // cannot discriminate the ceiling because sg promotes to
+        // MIN_EAGER_DEGREE.min(ceiling) and any ceiling >= 6 gives the same
+        // result — the ceiling's own value is pinned by
+        // `full_eager_degree_ceiling_equals_sg_promotion_floor` below.
         let manager = slice1_manager(2, true).await;
         *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
             peers: (1..=12).rev().map(|id| PeerId::new([id; 32])).collect(),
@@ -2924,7 +2925,7 @@ mod tests {
             assert_eq!(
                 sends.len(),
                 6,
-                "Full eager fan-out must equal the 6-peer ceiling with 12 candidates"
+                "Full eager fan-out must equal sg's 6-peer promotion floor with 12 candidates"
             );
             recorded_eager(&manager);
             assert!(tokio::time::timeout(Duration::from_secs(2), sub.recv())
@@ -2932,6 +2933,17 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+    }
+
+    /// Pins the ceiling's value (#674 design C1): it must equal sg's promotion
+    /// floor so the all-cooled rescue path swaps eager members instead of
+    /// growing toward sg's stock 12. A behavioural test cannot discriminate
+    /// this in steady state (any ceiling >= 6 promotes to 6), so the constant
+    /// itself is the contract; raising it past 6 restores the rescue growth.
+    #[test]
+    fn full_eager_degree_ceiling_equals_sg_promotion_floor() {
+        assert_eq!(FULL_EAGER_DEGREE_CEILING, 6);
+        assert!(FULL_EAGER_DEGREE_CEILING > 0, "0 is sg's sentinel for the stock ceiling of 12");
     }
 
     #[tokio::test]
