@@ -71,12 +71,12 @@ pub(crate) const BLOB_FETCH_TIMEOUT_SECS: u64 = 5;
 /// fetcher's 5 s deadline.
 const MIN_RESPONSE_INTERVAL_SECS: u64 = 1;
 
-/// Bound for the per-digest coalescing window. Matches the cache cap
-/// (`BLOB_CACHE_MAX_ENTRIES`): at fleet scale each node owns one blob, so a
-/// window entry per served digest is the natural unit. The stalest entry is
-/// evicted on overflow.
-const RESPONSE_WINDOW_MAX_DIGESTS: usize = 256;
-
+/// The window map is deliberately unbounded: owner-only serving means a
+/// responder's keys grow only when its OWN pair rotates (each rotation
+/// adds one ~40-byte entry), never from peer traffic — an attacker cannot
+/// add keys. The prior 256-entry eviction cap was unreachable in practice
+/// and was dropped (#656 round 2).
+///
 /// The serving daemon's current `(user_id, agent_certificate)` pair, shared
 /// with the responder task so consent changes are picked up live.
 pub type SharedCertPair =
@@ -351,18 +351,21 @@ impl AnnounceBlobCache {
     /// digest. The response is the bincode of the served agent's
     /// `(user_id, agent_certificate)` pair.
     ///
-    /// OWNER-ONLY (#656): a cached peer blob is deliberately NOT served.
-    /// Every node that ever cached peer X's blob would otherwise become a
-    /// responder for X, so one request draws a broadcast response from
-    /// every cache holder — a mesh of N caches is a mesh of N amplifiers.
-    /// The owner is always a valid responder, and fetchers verify the
-    /// served bytes against the requested digest anyway.
+    /// The ANONYMOUS digest is never served either: user keys are opt-in,
+    /// so every cert-less node computes the same
+    /// [`crate::announce_v3::anonymous_cert_digest`], and "exactly one
+    /// owner" is impossible for a digest shared by the whole fleet. The
+    /// requesting side already excludes it via [`fetch_warranted`], so no
+    /// legitimate requester is affected.
     pub async fn serve_request(
         &self,
         digest: &[u8; 32],
         current_user_id: &Option<identity::UserId>,
         current_agent_certificate: &Option<identity::AgentCertificate>,
     ) -> Option<Vec<u8>> {
+        if !fetch_warranted(digest) {
+            return None;
+        }
         if crate::announce_v3::cert_digest(current_user_id, current_agent_certificate) == *digest {
             return bincode::serialize(&(current_user_id, current_agent_certificate)).ok();
         }
@@ -890,20 +893,6 @@ pub async fn spawn_blob_responder(
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if !last_response_by_digest.contains_key(&request.digest)
-                && last_response_by_digest.len() >= RESPONSE_WINDOW_MAX_DIGESTS
-            {
-                // Bound the window map: evict the stalest tracked digest.
-                // Entries older than the window are already inert, so this
-                // only trims bookkeeping.
-                if let Some((stalest, _)) = last_response_by_digest
-                    .iter()
-                    .min_by_key(|(_, last)| *last)
-                    .map(|(digest, last)| (*digest, *last))
-                {
-                    last_response_by_digest.remove(&stalest);
-                }
-            }
             last_response_by_digest.insert(request.digest, now);
             // Wrap the pair bytes in the typed response envelope so the
             // fetcher's decode_blob_response round-trips (a bare pair tuple
@@ -1323,6 +1312,21 @@ mod tests {
         );
     }
 
+    /// serve_request (#656 round 2): the anonymous digest must not be
+    /// served even by a node whose own pair IS `(None, None)` — user keys
+    /// are opt-in, so every cert-less node shares that digest and a
+    /// request for it would draw a response from each of them. Production
+    /// requesters never ask for it (`fetch_warranted` gates the fetch).
+    #[tokio::test]
+    async fn serve_request_never_serves_the_shared_anonymous_digest() {
+        let cache = AnnounceBlobCache::new(None);
+        let anon = crate::announce_v3::anonymous_cert_digest();
+        assert!(
+            cache.serve_request(&anon, &None, &None).await.is_none(),
+            "the anonymous digest is shared by every cert-less node — it has no unique owner"
+        );
+    }
+
     // ── Hermetic protocol tests (issue #417: no prod dialing — local
     //    pubsub delivery only, mirroring the caps-service test harness) ──
 
@@ -1581,6 +1585,105 @@ mod tests {
             assert_eq!(count(&digest_a), 1, "no late responses for A's blob");
         }
 
+        /// #656 round 2 — the discriminating test for the PER-DIGEST
+        /// window. Owner-only serving leaves one responder with one
+        /// digest, so the only way a single responder serves two digests
+        /// inside one window is a live pair rotation (`own_pair` is read
+        /// per request, so a consent change swaps the served digest).
+        /// Under the old single global instant, answering the OLD digest
+        /// burned the responder's whole 1 s window and silently starved
+        /// the NEW digest; per-digest tracking answers both. Fails on the
+        /// pre-fix global-window code with owner-only serving kept.
+        #[tokio::test]
+        async fn pair_rotation_is_not_starved_by_the_coalescing_window() {
+            let (cert_old, user_old, _) = issued_cert();
+            let (cert_new, user_new, _) = issued_cert();
+            let user_old = Some(user_old.user_id());
+            let user_new = Some(user_new.user_id());
+            let digest_old = crate::announce_v3::cert_digest(&user_old, &Some(cert_old.clone()));
+            let digest_new = crate::announce_v3::cert_digest(&user_new, &Some(cert_new.clone()));
+
+            let pubsub = make_pubsub().await;
+            let mut counter_sub = pubsub.subscribe(ANNOUNCE_BLOB_TOPIC.to_string()).await;
+            let counts = Arc::new(std::sync::Mutex::new(HashMap::<[u8; 32], usize>::new()));
+            let counter_counts = Arc::clone(&counts);
+            tokio::spawn(async move {
+                while let Some(message) = counter_sub.recv().await {
+                    let Some(payload) = message.payload.strip_prefix(ANNOUNCE_BLOB_RESPONSE_DOMAIN)
+                    else {
+                        continue;
+                    };
+                    let Some(response) = decode_blob_response(payload) else {
+                        continue;
+                    };
+                    let digest: [u8; 32] = blake3::hash(&response.announcement_bytes).into();
+                    *counter_counts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(digest)
+                        .or_insert(0) += 1;
+                }
+            });
+
+            let own_pair = shared_cert_pair(user_old, Some(cert_old));
+            spawn_blob_responder(
+                Arc::clone(&pubsub),
+                Arc::new(AnnounceBlobCache::new(None)),
+                Arc::clone(&own_pair),
+            )
+            .await
+            .expect("responder spawns");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let requester = crate::identity::AgentKeypair::generate()
+                .expect("requester keypair")
+                .agent_id();
+            pubsub
+                .publish(
+                    ANNOUNCE_BLOB_TOPIC.to_string(),
+                    Bytes::from(encode_blob_request(&digest_old, &requester)),
+                )
+                .await
+                .expect("publish request for the old pair");
+            let count = |digest: &[u8; 32]| {
+                counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(digest)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while count(&digest_old) < 1 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(count(&digest_old), 1, "the old pair is served once");
+
+            // Rotate the live pair (a consent change) and immediately —
+            // well inside the old 1 s window — request the new digest.
+            own_pair
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&(user_new, Some(cert_new)));
+            pubsub
+                .publish(
+                    ANNOUNCE_BLOB_TOPIC.to_string(),
+                    Bytes::from(encode_blob_request(&digest_new, &requester)),
+                )
+                .await
+                .expect("publish request for the rotated pair");
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while count(&digest_new) < 1 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(
+                count(&digest_new),
+                1,
+                "a fresh digest must not be starved by a recent serve of an unrelated digest"
+            );
+        }
+
         /// Forged responder: serves tampered pair bytes whose digest DOES
         /// match the tampered bytes (attacker controls both). The verify
         /// gate must reject — the cache stays empty and the failure meters.
@@ -1659,13 +1762,19 @@ mod tests {
             assert!(fetch_warranted(&real), "a real digest must fetch");
         }
 
-        /// Protocol safety net: even if a caller ignores the skip rule, an
-        /// anonymous fetch round-trips `(None, None)` harmlessly — there is
-        /// nothing sensitive to leak and nothing to forge.
+        /// Protocol safety net, inverted for owner-only serving (#656
+        /// round 2): even if a caller ignores the fetch-warranted skip
+        /// rule and asks for the anonymous digest, the responder stays
+        /// SILENT — that digest is shared by every cert-less node, so it
+        /// has no unique owner to answer. The stray request is harmless:
+        /// nothing is served, nothing leaks, and the fetcher's own
+        /// 5 s deadline ends it (metered as a failed fetch).
         #[tokio::test]
-        async fn anonymous_pair_round_trip_is_harmless() {
+        async fn anonymous_digest_never_draws_a_response() {
             let pubsub = make_pubsub().await;
             let serving_cache = Arc::new(AnnounceBlobCache::new(None));
+            // The responder's own pair IS the anonymous pair — exactly the
+            // node that used to answer.
             let own_pair = shared_cert_pair(None, None);
             spawn_blob_responder(Arc::clone(&pubsub), serving_cache, own_pair)
                 .await
@@ -1682,10 +1791,13 @@ mod tests {
                 .ensure_blob(&pubsub, &anon_digest, 0, &agent_id, &machine_id)
                 .await;
 
-            let filled = wait_for_blob(&fetching_cache, &anon_digest, 8)
-                .await
-                .expect("anonymous fetch round-trips");
-            assert!(filled.user_id.is_none() && filled.agent_certificate.is_none());
+            // Quiet window well past a local round-trip: no response may
+            // arrive, and therefore no cache entry.
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            assert!(
+                fetching_cache.get(&anon_digest).await.is_none(),
+                "the anonymous digest must never be served"
+            );
         }
     }
 }
