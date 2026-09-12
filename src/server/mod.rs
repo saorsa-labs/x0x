@@ -370,8 +370,9 @@ pub async fn serve_with_options(
     // load/generation, or any other subsystem initialises — and independent
     // of `[history] enabled` (the previous implicit guard was SQLite's
     // EXCLUSIVE lock on history.db, which covered only that file and
-    // surfaced as a history subsystem error). Held for the lifetime of the
-    // returned ServerHandle; process exit releases it even on crash.
+    // surfaced as a history subsystem error). Held until the spawned
+    // supervisor below has finished draining; process exit releases it even
+    // on crash (#645 — the guard must outlive the ServerHandle's Drop).
     let instance_lock =
         instance_lock::InstanceLock::acquire(&config.data_dir).map_err(anyhow::Error::new)?;
     // Startup banner
@@ -447,6 +448,23 @@ pub async fn serve_with_options(
             Some(dir)
         }
         (None, None) => None,
+    };
+
+    // #645: a CONFIGURED identity_dir shared across two different data dirs
+    // still let two daemons load the same machine/agent keys and both sign
+    // as one agent — the #601 hazard, one directory up. The identity dir
+    // now carries its own instance lock, skipped when it is the same
+    // directory as the data dir (that case is already guarded, and flock'ing
+    // the same lockfile from two open file descriptions in one process
+    // would self-contend). Derived identity dirs (`--name` instances, the
+    // `~/.x0x` default) stay unguarded: they resolve through X0X_HOME,
+    // which the #456 test harness shares across every test process —
+    // locking it would make parallel hermetic servers refuse each other.
+    let identity_lock = match config.identity_dir.as_ref() {
+        Some(id_dir) if !same_directory(id_dir, &config.data_dir) => Some(
+            instance_lock::InstanceLock::acquire_identity(id_dir).map_err(anyhow::Error::new)?,
+        ),
+        _ => None,
     };
 
     // Create agent
@@ -2083,6 +2101,14 @@ pub async fn serve_with_options(
     let supervisor_cancel = cancel.clone();
 
     let task = tokio::spawn(async move {
+        // #645: the single-instance guards live HERE, in the supervisor
+        // task — not in the ServerHandle. Dropping the handle cancels this
+        // task, but the locks are only released once it has finished
+        // draining, so an embedded caller that drops and immediately
+        // re-serves the same data/identity dirs is refused rather than
+        // overlapping two servers on them.
+        let _instance_lock = instance_lock;
+        let _identity_lock = identity_lock;
         let mut server_shutdown_rx = state.shutdown_notify.subscribe();
         let mut server = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -2234,8 +2260,17 @@ pub async fn serve_with_options(
         local_addr: actual_api_addr,
         cancel,
         task: Some(task),
-        _instance_lock: instance_lock,
     })
+}
+
+/// Whether two directory paths refer to the same directory, tolerating
+/// alias spellings (e.g. macOS `/var` vs `/private/var`). Falls back to
+/// literal comparison when canonicalisation fails (both paths exist by the
+/// time this is consulted, so the fallback only covers exotic races).
+fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canonical =
+        |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canonical(a) == canonical(b)
 }
 
 pub async fn list_instances() -> Result<()> {
