@@ -30,7 +30,7 @@ dial answered mid-handshake cannot produce an `Admitted` verdict.
 ### B — Per-frame gate drops suppressed-peer frames
 
 Gossip frames received from a reconnect-suppressed peer are discarded at the receive pump
-(`src/network.rs:4335`) before they reach the gossip layer. This closes the accept-to-close
+(`src/network.rs:4344`) before they reach the gossip layer. This closes the accept-to-close
 window in which a `PolicyRejection`-tombstoned peer might slip one frame through after the
 transport connection is observed but before the QUIC close is delivered.
 
@@ -46,12 +46,16 @@ cache write, and no tombstone mutation.
 
 ### D — Inbound accept gate (admit-window race)
 
-The inbound accept loop re-checks the tombstone after `accept()` yields
-(`src/network.rs:3326`). A `PolicyRejection` tombstone present at accept time closes the
-connection without emitting `PeerConnected`, using a plain transport close that must not
-refresh the tombstone.
+The inbound accept loop re-checks the tombstone after `accept()` yields. The primary gate
+comment is at `src/network.rs:4530`; the three suppression checks follow at roughly
+`src/network.rs:4544`, `src/network.rs:4562`, and `src/network.rs:4572`. The atomic
+check-and-emit helper that holds the suppression-map lock across the `PeerConnected` emit is
+`try_admit_inbound_peer` (`src/network.rs:5667`). A `PolicyRejection` tombstone present at
+accept time closes the connection without emitting `PeerConnected`, using a plain transport
+close that must not refresh the tombstone.
 
-**Unit test:** `network::tests::inbound_admit_emits_no_peer_connected_when_policy_rejection_tombstone_is_live`  
+**Unit test:** `network::tests::inbound_admit_emits_no_peer_connected_when_policy_rejection_tombstone_is_live`
+(anchor comment `src/network.rs:5842`)  
 **Integration test:** `tests/gossip_plane_isolation.rs`
 
 ### E — PlaneRefuse (CLOSED: subsumed by A + `disconnect_with_reason` ordering contract)
@@ -65,7 +69,7 @@ separate code anchor or test beyond what already exists.
 
 The implementation proof:
 
-1. `plane_handle_hello` (`src/network.rs:3483`) detects the plane mismatch and calls
+1. `plane_handle_hello` (`src/network.rs:3492`) detects the plane mismatch and calls
    `disconnect_with_reason(&peer, PolicyRejection)`.
 2. `disconnect_with_reason` (`src/network.rs:3128`) calls `self.suppress_reconnect(peer_id.0,
    reason)` at `src/network.rs:3133` **before** `node.disconnect()` — the tombstone is live
@@ -88,7 +92,7 @@ tested. **Tracked in [#632](https://github.com/saorsa-labs/x0x/issues/632).**
 ### F — Refused dial/accept must not refresh tombstone
 
 A refused outbound dial or inbound accept uses a plain transport close (calling
-`close_suppressed_inbound` at `src/network.rs:5647`, never `disconnect_with_reason`) so that
+`close_suppressed_inbound` at `src/network.rs:5637`, never `disconnect_with_reason`) so that
 an existing `PolicyRejection` tombstone's `set_at` timestamp is preserved. Refreshing it would
 silently extend the suppression window in a way that could mask test-observable timing.
 
@@ -103,8 +107,8 @@ tombstone timestamp is unchanged.
 | Invariant | Status | Primary anchor | Regression test |
 |-----------|--------|----------------|-----------------|
 | A | Implemented | `src/network.rs:3192` | `gossip_plane_isolation` |
-| B | Implemented | `src/network.rs:4335` | `gossip_plane_isolation` |
+| B | Implemented | `src/network.rs:4344` | `gossip_plane_isolation` |
 | C | Implemented | `src/network.rs:3250` | `gossip_plane_isolation` |
-| D | Implemented | `src/network.rs:3326` | unit + `gossip_plane_isolation` |
-| **E** | **Subsumed** — see above | A + `src/network.rs:3128,3133,3483` | `gossip_plane_isolation` |
-| F | Implemented | `src/network.rs:5647` | unit D companion |
+| D | Implemented | `src/network.rs:4530`, `5667`, `5842` | unit + `gossip_plane_isolation` |
+| **E** | **Subsumed** — see above | A + `src/network.rs:3128,3133,3492` | `gossip_plane_isolation` |
+| F | Implemented | `src/network.rs:5637` | unit D companion |

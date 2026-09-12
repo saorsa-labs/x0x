@@ -13,7 +13,7 @@ All notable changes to this project will be documented in this file.
   `peer_admission` returns `Suppressed` before the QUIC close, with no window in which a
   plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
   already covers the full observable chain. Added an `invariant E` anchor comment to
-  `plane_handle_hello` (`src/network.rs:3483`). Closes #632.
+  `plane_handle_hello` (`src/network.rs:3492`). Closes #632.
 
 ### Tests
 
