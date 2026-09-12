@@ -31,6 +31,9 @@ All notable changes to this project will be documented in this file.
   exact launchd and systemd commands, cross-linked from the new refusal
   and from the apply logs.
 
+## [v0.42.2] - 2026-09-12
+### Fixed
+
 - **Group task-list policy now gates the bootstrap prune (#654).** The
   digest-verified full-serve adopt gate (`TaskList::prune_to_served_set`)
   acted directly on the wire delta's removal evidence, so on a
@@ -63,59 +66,6 @@ All notable changes to this project will be documented in this file.
   `run_ws_writer_exits_after_flush_budget_with_close_still_blocked` (bounded
   exit + handoff) and integration
   `ws_slow_close_frame_survives_flush_budget_expiry` (self-DM-triggered
-
-### Tests
-
-- A2A binding fixtures no longer fail on a transient setup dial under
-  full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
-  ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s
-  floor) can be starved or socket-errored by ambient suite load, after
-  which the dial ladder skips hole-punch by design (an address-only dial
-  cannot coordinate) and surfaces `AllStrategiesFailed` quoting
-  "address-only dial: hole-punch requires the target's PeerId" — the
-  reported release-gate flake. The setup dial is now retried once; a
-  persistent failure still fails the test loudly with the last error, so
-  no round-trip observation is skipped.
-
-- The two #316 loopback tests no longer flake under full parallel load
-  (#316). `direct_send_with_require_ack_round_trips_to_live_peer` asked
-  the post-send liveness probe for a 3 s budget — the daemon honours the
-  caller-supplied budget exactly, and the recorded ~18 s failures were
-  the probe starving under ambient suite load after the durable send
-  itself completed; the fixture now requests 10 s (the bundled GUI client
-  already ships 5 s) while the assertion stays strict (ok + finite RTT).
-  The setup dial of `suppressed_peer_inbound_redial_is_rejected` — the
-  0.16 s fast-fail was the same transient setup-dial class — gets the
-  same bounded retry. Observation windows, assertions, and the nextest
-  serial-group scheduling are unchanged.
-- **#287 root cause round 1 — fixture self-update contamination (the
-  ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
-  failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised
-  on mDNS on the production gossip plane, joined a live mesh peer, received a
-  newer signed release manifest via the gossip update listener (gated there
-  on `[update] enabled` only — `--skip-update-check` did not suppress the
-  gossip listener in v0.34.3; current code computes
-  `effective_self_update_enabled`, which does), and replaced its own binary
-  mid-test — the process vanished under in-flight `POST /publish` requests,
-  which reqwest surfaces as `hyper::Error(IncompleteMessage)`. Reproduced
-  directly: a v0.34.3 daemon joined to the production plane sidelines its
-  binary and dies within seconds of a stall run, while the same binary
-  hermetic (mDNS off, private plane) fills the queue, counts drops, and
-  serves every publish. The hermeticity work (#337/#417/#609) removed the
-  contamination. Separately — and only visible once that noise was gone, on
-  hosts whose socket buffers outlast the writer's flush budget — the
-  close-frame delivery itself was broken; that product fix is the `### Fixed`
-  entry above. The test now (1) disables `[update]` for its daemon so it is
-  immune to the round-1 failure mode even if hermeticity regresses, and (2)
-  asserts REST availability through the close window — publish waves must
-  keep returning 200 while the stalled session fills, closes with 1013, and
-  tears down. The contract itself (bounded 1024-frame queue, drop-vs-close
-  feeder policies, 1013 close-frame delivery, REST-plane isolation) is
-  documented in `docs/api-reference.md`.
-
-## [v0.42.2] - 2026-09-12
-### Fixed
-
 - **Stale capability adverts no longer cost an ML-DSA-65 verify (#674 item 1).**
   `ingest_verified_capability_advert` and `ingest_verified_digest_extension`
   (`src/dm_capability_service.rs`) consulted the signature verifier before
@@ -307,6 +257,52 @@ All notable changes to this project will be documented in this file.
 
 ### Tests
 
+- The two #316 loopback tests no longer flake under full parallel load
+  (#316). `direct_send_with_require_ack_round_trips_to_live_peer` asked
+  the post-send liveness probe for a 3 s budget — the daemon honours the
+  caller-supplied budget exactly, and the recorded ~18 s failures were
+  the probe starving under ambient suite load after the durable send
+  itself completed; the fixture now requests 10 s (the bundled GUI client
+  already ships 5 s) while the assertion stays strict (ok + finite RTT).
+  The setup dial of `suppressed_peer_inbound_redial_is_rejected` — the
+  0.16 s fast-fail was the same transient setup-dial class — gets the
+  same bounded retry. Observation windows, assertions, and the nextest
+  serial-group scheduling are unchanged.
+- A2A binding fixtures no longer fail on a transient setup dial under
+  full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
+  ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s
+  floor) can be starved or socket-errored by ambient suite load, after
+  which the dial ladder skips hole-punch by design (an address-only dial
+  cannot coordinate) and surfaces `AllStrategiesFailed` quoting
+  "address-only dial: hole-punch requires the target's PeerId" — the
+  reported release-gate flake. The setup dial is now retried once; a
+  persistent failure still fails the test loudly with the last error, so
+  no round-trip observation is skipped.
+
+- **#287 root cause round 1 — fixture self-update contamination (the
+  ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
+  failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised
+  on mDNS on the production gossip plane, joined a live mesh peer, received a
+  newer signed release manifest via the gossip update listener (gated there
+  on `[update] enabled` only — `--skip-update-check` did not suppress the
+  gossip listener in v0.34.3; current code computes
+  `effective_self_update_enabled`, which does), and replaced its own binary
+  mid-test — the process vanished under in-flight `POST /publish` requests,
+  which reqwest surfaces as `hyper::Error(IncompleteMessage)`. Reproduced
+  directly: a v0.34.3 daemon joined to the production plane sidelines its
+  binary and dies within seconds of a stall run, while the same binary
+  hermetic (mDNS off, private plane) fills the queue, counts drops, and
+  serves every publish. The hermeticity work (#337/#417/#609) removed the
+  contamination. Separately — and only visible once that noise was gone, on
+  hosts whose socket buffers outlast the writer's flush budget — the
+  close-frame delivery itself was broken; that product fix is the `### Fixed`
+  entry above. The test now (1) disables `[update]` for its daemon so it is
+  immune to the round-1 failure mode even if hermeticity regresses, and (2)
+  asserts REST availability through the close window — publish waves must
+  keep returning 200 while the stalled session fills, closes with 1013, and
+  tears down. The contract itself (bounded 1024-frame queue, drop-vs-close
+  feeder policies, 1013 close-frame delivery, REST-plane isolation) is
+  documented in `docs/api-reference.md`.
 - `tests/e2e_deploy.sh` uploads the binary as a gzip stream with ssh keepalives
   (`ServerAliveInterval=15`, `ServerAliveCountMax=4`), so a stalled upload to a
   far host fails fast instead of hanging the rollout.
