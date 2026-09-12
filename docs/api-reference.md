@@ -1999,9 +1999,29 @@ Server → client (complete outbound frame set):
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
 
-**Delivery semantics.** Topic/control/error frames are best-effort and may be
-dropped for a full per-session queue; DM/keepalive pressure closes the socket
-with close code `1013` instead of emitting another event.
+**Delivery semantics and back-pressure contract (issues #122 / #147 / #149 / #287).**
+Each WebSocket session has one bounded outbound queue (1024 frames) between
+the daemon's feeders and the socket writer; it is the daemon's only memory
+bound against a local client that stops reading. When that queue is full:
+
+- **topic / control / error frames are dropped** (best-effort — topic data is
+  re-obtainable via gossip and history), counted in `ws_outbound_dropped`;
+- **direct-message and keepalive frames close the session** with close code
+  `1013` ("Try Again Later"), counted in `ws_slow_consumer_closes`. A 30 s
+  keepalive pinger feeds this path unconditionally, so a stalled reader is
+  detected within roughly one interval of saturation regardless of topic
+  flow — it never needs a DM to arrive.
+
+The close is the client-visible contract, not a connection reset: the writer
+flushes the Close(1013) frame with a bounded budget, so a client that resumes
+draining receives it after its kernel-buffered backlog. Treat `1013` as
+"resubscribe and reconcile from history" (`?backfill=N` on `/ws/direct`, or
+`GET /history?scope=topic:…`) — frames dropped from a full queue are not
+re-sent. Back-pressure is confined to the offending session: the daemon's
+REST plane (including concurrent `POST /publish` traffic that is filling the
+stalled session's queue) must keep serving 200s throughout the stall, close,
+and teardown — this is pinned end-to-end by the ignored integration test
+`ws_stalled_reader_fills_queue_and_closes_1013` (#287).
 
 #### Reconnect and replay
 

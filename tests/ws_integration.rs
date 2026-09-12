@@ -626,14 +626,29 @@ async fn ws_outbound_counters(client: &reqwest::Client, d: &DaemonFixture) -> (u
 ///    contract (this caught a real bug: session cleanup used to abort the
 ///    writer mid-flush, so the 1013 never reached the wire and clients only
 ///    ever saw a raw connection reset);
-/// 4. the session is removed from `/ws/sessions` (resources reclaimed).
+/// 4. the session is removed from `/ws/sessions` (resources reclaimed);
+/// 5. REST publishing keeps completing with 200 THROUGH the fill and the
+///    slow-consumer close (#287): WS back-pressure on one stalled session
+///    must never degrade the daemon's HTTP plane — the historical failure
+///    was in-flight `POST /publish` connections dying mid-wave
+///    (`hyper::Error(IncompleteMessage)`) while the reader stalled.
 ///
 /// ~60-90s wall clock (dominated by the 30s keepalive cadence), hence the
 /// `--ignored` integration tier.
 #[tokio::test]
 #[ignore]
 async fn ws_stalled_reader_fills_queue_and_closes_1013() {
-    let d = daemon().await;
+    // #287 root-cause pin: the historical failure was NOT the back-pressure
+    // machinery — it was this test's daemon (pre-#417 fixture: mDNS on, prod
+    // gossip plane) joining the real mesh, hearing a newer signed release
+    // manifest from a production peer, and SELF-UPDATING mid-run: the
+    // process was replaced under the test, so in-flight `POST /publish`
+    // connections died with hyper `IncompleteMessage`. Hermeticity
+    // (#337/#417/#609) removes the mesh coupling; disabling the updater for
+    // this daemon makes the test immune by construction even if hermeticity
+    // ever regresses — the daemon under a back-pressure soak must never be
+    // the thing that replaces itself.
+    let d = DaemonFixture::start_with_config("ws-test", "[update]\nenabled = false\n").await;
     let client = client_with_auth(&d);
     let topic = format!("stall-test-{}", rand::random::<u32>());
 
@@ -709,6 +724,34 @@ async fn ws_stalled_reader_fills_queue_and_closes_1013() {
         base_closes + 1,
         "slow-consumer close must be counted exactly once per session"
     );
+
+    // ── REST availability across the back-pressure close (#287): publish
+    // waves keep completing while the session fills, closes, and tears
+    // down. WS back-pressure on one stalled session must never degrade the
+    // daemon's HTTP plane — the historical #287 failure killed in-flight
+    // `POST /publish` connections mid-wave (hyper IncompleteMessage at the
+    // client). These two waves overlap the teardown grace period, the
+    // window where a regression would surface.
+    for _ in 0..2 {
+        let wave: Vec<_> = (0..64)
+            .map(|_| {
+                client
+                    .post(d.url("/publish"))
+                    .json(&json!({"topic": &topic, "payload": &payload}))
+                    .send()
+            })
+            .collect();
+        for resp in futures::future::join_all(wave).await {
+            let resp = resp.expect("publish after slow-consumer close (#287)");
+            assert_eq!(
+                resp.status(),
+                200,
+                "publish after slow-consumer close failed (#287): REST plane \
+                 degraded by WS back-pressure"
+            );
+            published += 1;
+        }
+    }
 
     // ── Resume draining: the kernel-buffered backlog flushes first, then the
     // writer's Close(1013) (it holds a 2s flush budget and cleanup grants a

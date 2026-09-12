@@ -75,6 +75,28 @@ All notable changes to this project will be documented in this file.
   (`ServerAliveInterval=15`, `ServerAliveCountMax=4`), so a stalled upload to a
   far host fails fast instead of hanging the rollout.
 
+- **#287 root-caused: the WS back-pressure contract was never broken; the
+  historical failure was the test's own daemon self-updating mid-run.**
+  `ws_stalled_reader_fills_queue_and_closes_1013` failed on v0.34.3-era
+  `main` because the pre-#417 fixture daemon advertised on mDNS on the
+  production gossip plane, joined a live mesh peer, received a newer signed
+  release manifest via the gossip update listener (gated on
+  `[update] enabled`, NOT on `--skip-update-check`), and replaced its own
+  binary mid-test — the process vanished under in-flight `POST /publish`
+  requests, which reqwest surfaces as `hyper::Error(IncompleteMessage)`.
+  Reproduced directly: a v0.34.3 daemon joined to the production plane
+  sidelines its binary and dies within seconds of a stall run, while the
+  same binary hermetic (mDNS off, private plane) fills the queue, counts
+  drops, and serves every publish. The hermeticity work (#337/#417/#609)
+  removed the contamination, which is why the test passes on current main
+  (locally and in CI). The test now (1) disables `[update]` for its daemon
+  so it is immune to its own root cause even if hermeticity regresses, and
+  (2) asserts REST availability through the close window — publish waves
+  must keep returning 200 while the stalled session fills, closes with
+  1013, and tears down. The contract itself (bounded 1024-frame queue,
+  drop-vs-close feeder policies, 1013 close-frame delivery, REST-plane
+  isolation) is documented in `docs/api-reference.md`.
+
 
 ## [v0.42.1] - 2026-09-11
 
