@@ -36,10 +36,13 @@ All notable changes to this project will be documented in this file.
 
 ### CI
 
-- Pin nextest to 0.9.144 in all three CI jobs (test, coverage, parity). nextest
-  0.9.126 has an output-drain race that can misattribute a slow test as failed
-  (#673). The `taiki-e/install-action@nextest` shorthand no longer floats to
-  latest; each step now uses `install-action@v2` with `tool: nextest@0.9.144`.
+- Pin nextest to 0.9.144 in all nine CI jobs across `ci.yml` (test, coverage,
+  parity) and `integration.yml` (proptest, integration-core, integration-groups,
+  integration-voice-datagram, integration-net, integration-timing). The floating
+  `taiki-e/install-action@nextest` shorthand was resolving to the latest release
+  at job-start time, meaning any new nextest release could silently change CI
+  behaviour. Each step now uses `install-action@v2` with `tool: nextest@0.9.144`
+  for a reproducible, auditable install (#673).
 
 ## [v0.42.3] - 2026-09-12
 
