@@ -3480,6 +3480,15 @@ impl NetworkNode {
     /// Phase 0/1 redials) and disconnected with a
     /// [`DisconnectReason::PolicyRejection`] tombstone so no reconnect
     /// path re-dials it.
+    ///
+    /// Issue #292 invariant E (PlaneRefuse): this is the plane-refusal path.
+    /// [`Self::disconnect_with_reason`] calls [`Self::suppress_reconnect`]
+    /// *before* the QUIC close, so `peer_admission` returns `Suppressed`
+    /// immediately — the `PlanePending → Admitted` transition is permanently
+    /// blocked with no window between mismatch detection and suppression.
+    /// Invariant E is therefore subsumed by invariant A plus the ordering
+    /// contract of `disconnect_with_reason`; see
+    /// `docs/design/292-plane-gate-churn-model.md` for the full proof.
     async fn plane_handle_hello(&self, peer: AntPeerId, their_plane: &str) {
         let Some(our_plane) = &self.config.network_id else {
             return;

@@ -22,7 +22,33 @@ All notable changes to this project will be documented in this file.
   doc could read "Could not find service" for a job verified in the other
   domain; intent files written before the field existed still parse.
   ADR-0061 §3 remains **NOT MET**: the versioned-template half and the
-  systemd-side readback are open (dated status note added to the ADR).
+  systemd-side readback are open (dated status note added to the ADR;
+  tracked separately).
+
+**BREAKING — upgrade restart-contract API:** two methods became `async` and
+three public types gained fields.
+- `AutoApplyUpgrader::resolve_restart_plan(&self, binary_path)` and
+  `AutoApplyUpgrader::restart_current_binary(&self, target_version)` are now
+  `async` (the launchd readback runs on the blocking pool); callers must
+  `.await` them.
+- `LaunchdPolicyReadback::Verified` gained `domain: &'static str` (`"gui"` or
+  `"user"`): constructions and exhaustive matches must supply/handle it.
+- `RestartPlan` and `UpgradeHandoff` gained
+  `launchd_verified: Option<LaunchdVerifiedJob>`; struct-literal callers must
+  populate it. `UpgradeHandoff` keeps `#[serde(default)]` on the field, so
+  intent files written before this change still parse.
+
+### Docs
+
+- **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
+  `docs/design/292-plane-gate-churn-model.md` documenting all six invariants (A–F) with code
+  anchors and test references. Invariant E is proved subsumed by invariant A
+  (`src/network.rs:3192`) plus the ordering contract of `disconnect_with_reason`
+  (`src/network.rs:3133`): `suppress_reconnect` is called before `node.disconnect()`, so
+  `peer_admission` returns `Suppressed` before the QUIC close, with no window in which a
+  plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
+  already covers the full observable chain. Added an `invariant E` anchor comment to
+  `plane_handle_hello` (`src/network.rs:3492`). Closes #632.
 
 ### Tests
 
@@ -54,6 +80,16 @@ All notable changes to this project will be documented in this file.
   to force the joiner's view clean and continues rather than panicking. The
   strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
   genuine never-reconnects regression still fails at the same place.
+
+### CI
+
+- Pin nextest to 0.9.144 in all nine CI jobs across `ci.yml` (test, coverage,
+  parity) and `integration.yml` (proptest, integration-core, integration-groups,
+  integration-voice-datagram, integration-net, integration-timing). The floating
+  `taiki-e/install-action@nextest` shorthand was resolving to the latest release
+  at job-start time, meaning any new nextest release could silently change CI
+  behaviour. Each step now uses `install-action@v2` with `tool: nextest@0.9.144`
+  for a reproducible, auditable install (#673).
 
 ## [v0.42.3] - 2026-09-12
 
