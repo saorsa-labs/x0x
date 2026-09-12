@@ -87,6 +87,28 @@ All notable changes to this project will be documented in this file.
 
 ### Tests
 
+- A2A binding fixtures no longer fail on a transient setup dial under
+  full-suite load (#311). `setup_pair`'s warm-up dial is address-only;
+  ant-quic's adaptive direct-stage budget (4×initial_rtt + 750 ms, 1 s
+  floor) can be starved or socket-errored by ambient suite load, after
+  which the dial ladder skips hole-punch by design (an address-only dial
+  cannot coordinate) and surfaces `AllStrategiesFailed` quoting
+  "address-only dial: hole-punch requires the target's PeerId" — the
+  reported release-gate flake. The setup dial is now retried once; a
+  persistent failure still fails the test loudly with the last error, so
+  no round-trip observation is skipped.
+
+- The two #316 loopback tests no longer flake under full parallel load
+  (#316). `direct_send_with_require_ack_round_trips_to_live_peer` asked
+  the post-send liveness probe for a 3 s budget — the daemon honours the
+  caller-supplied budget exactly, and the recorded ~18 s failures were
+  the probe starving under ambient suite load after the durable send
+  itself completed; the fixture now requests 10 s (the bundled GUI client
+  already ships 5 s) while the assertion stays strict (ok + finite RTT).
+  The setup dial of `suppressed_peer_inbound_redial_is_rejected` — the
+  0.16 s fast-fail was the same transient setup-dial class — gets the
+  same bounded retry. Observation windows, assertions, and the nextest
+  serial-group scheduling are unchanged.
 - **#287 root cause round 1 — fixture self-update contamination (the
   ORIGINAL v0.34.3-era failure).** `ws_stalled_reader_fills_queue_and_closes_1013`
   failed on v0.34.3-era `main` because the pre-#417 fixture daemon advertised

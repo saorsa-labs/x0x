@@ -115,7 +115,33 @@ async fn setup_pair(
     let alice_peer = ant_quic::PeerId(alice.machine_id().0);
     let bob_peer = ant_quic::PeerId(bob.machine_id().0);
 
-    let connected = alice_network.connect_addr(bob_addr).await?;
+    // Issue #311: this dial is fixture warm-up, not the behaviour under
+    // test — every assertion below exercises the binding round-trip over
+    // the DM path, which establishes connectivity itself. ant-quic gives a
+    // fresh node's direct stage an adaptive budget of 4×initial_rtt + 750 ms
+    // (1 s floor, ≈2.1 s here); under full-suite ambient load the loopback
+    // PQC handshake can transiently exceed that budget or error at the
+    // socket. The ladder then skips hole-punch — an address-only dial
+    // cannot coordinate by design — and has no relay configured, so the
+    // surfaced `AllStrategiesFailed` string quotes "address-only dial:
+    // hole-punch requires the target's PeerId": the #311 signature. Retry
+    // the SETUP dial a bounded number of times so scheduler noise cannot
+    // fail the binding assertions; a persistent dial failure still fails
+    // the test loudly with the last error (no silent skips — a14828f).
+    let mut last_dial_error = None;
+    let connected = loop {
+        match alice_network.connect_addr(bob_addr).await {
+            Ok(peer) => break peer,
+            Err(error) => {
+                eprintln!("a2a setup dial attempt failed, retrying: {error}");
+                if last_dial_error.is_some() {
+                    return Err(Box::new(error));
+                }
+                last_dial_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    };
     assert_eq!(connected.0, bob.machine_id().0);
 
     // The binding is bidirectional (requests alice→bob, responses bob→alice),
