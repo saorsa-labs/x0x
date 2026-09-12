@@ -1999,9 +1999,35 @@ Server → client (complete outbound frame set):
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
 
-**Delivery semantics.** Topic/control/error frames are best-effort and may be
-dropped for a full per-session queue; DM/keepalive pressure closes the socket
-with close code `1013` instead of emitting another event.
+**Delivery semantics and back-pressure contract (issues #122 / #147 / #149 / #287).**
+Each WebSocket session has one bounded outbound queue (1024 frames) between
+the daemon's feeders and the socket writer; it is the daemon's only memory
+bound against a local client that stops reading. When that queue is full:
+
+- **topic / control / error frames are dropped** (best-effort — topic data is
+  re-obtainable via gossip and history), counted in `ws_outbound_dropped`;
+- **direct-message and keepalive frames close the session** with close code
+  `1013` ("Try Again Later"), counted in `ws_slow_consumer_closes`. A 30 s
+  keepalive pinger feeds this path unconditionally, so a stalled reader is
+  detected within roughly one interval of saturation regardless of topic
+  flow — it never needs a DM to arrive.
+
+when the close fires, the session writer first tries to flush the Close(1013)
+frame within its flush budget (`[ws] slow_close_flush_ms`, default 2 s). If
+that budget expires against a still-stalled socket, the writer exits and the
+daemon's connection cleanup takes over: it holds the socket open for a 3 s
+grace window and keeps retrying the flush. A client that resumes draining
+anywhere inside that grace — even after the writer's own budget has expired —
+still receives Close(1013) after its kernel-buffered backlog; only a client
+that stays stalled past the grace sees the connection torn down. Treat `1013`
+as "resubscribe and reconcile from history" (`?backfill=N` on `/ws/direct`,
+or `GET /history?scope=topic:…`) — frames dropped from a full queue are not
+re-sent. Back-pressure is confined to the offending session: the daemon's
+REST plane (including concurrent `POST /publish` traffic that is filling the
+stalled session's queue) must keep serving 200s throughout the stall, close,
+and teardown — this is pinned end-to-end by the ignored integration tests
+`ws_stalled_reader_fills_queue_and_closes_1013` and
+`ws_slow_close_frame_survives_flush_budget_expiry` (#287).
 
 #### Reconnect and replay
 
