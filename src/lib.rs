@@ -21020,10 +21020,27 @@ mod tests {
         let bob_peer = ant_quic::PeerId(bob.machine_id().0);
         let bob_id = bob.machine_id().0;
 
-        let connected = alice_network
-            .connect_addr(bob_addr)
-            .await
-            .expect("alice connects bob");
+        // Issue #316: this dial is the SETUP leg (the observation is the
+        // rejection of bob's later redial). Under full-suite ambient load a
+        // first setup attempt can fail fast at the socket or blow ant-quic's
+        // ~1–2.1 s adaptive direct budget — the original flake fast-failed
+        // here in 0.16 s. Retry the setup dial a bounded number of times so
+        // scheduler noise cannot fail the scenario; a persistent failure
+        // still panics loudly with the last error.
+        let mut last_dial_error = None;
+        let connected = loop {
+            match alice_network.connect_addr(bob_addr).await {
+                Ok(peer) => break peer,
+                Err(error) => {
+                    eprintln!("suppressed-redial setup dial failed, retrying: {error}");
+                    if last_dial_error.is_some() {
+                        panic!("alice could not dial bob for setup: {error}");
+                    }
+                    last_dial_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        };
         assert_eq!(connected.0, bob.machine_id().0);
         let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < reg {
