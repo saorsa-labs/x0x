@@ -35,6 +35,18 @@ The identity listener applies trust evaluation to every incoming announcement. B
 4. `needs_coordination()` or direct failed → for each reachable coordinator peer: connect to coordinator, then use `network.connect_peer_via(peer_id, coordinator)` for peer-ID hole-punching (QUIC extension frames, PUNCH_ME_NOW) → `Coordinated(addr)` on success
 5. All attempts failed → `Unreachable`
 
+Direct-dial ladder budget (#638/#649/#650): a direct attempt first walks the
+fast local-probe ladder — every advertised same-/24, private, or CGNAT IPv4
+hint, each costing a 3 s peer-authenticated dial plus a 3 s verified
+raw-address fallback (loopback is excluded from the fast probes) — then one
+8 s peer-authenticated dial over the full advertised address list, which is
+also where loopback-only adverts (a specifically bound loopback listener)
+are reached. Every undialable hint in an advert therefore burns up to 6 s of
+ladder budget before the live address is tried, which is why announces and
+agent cards alike filter interface hints down to an explicitly bound
+address: ant-quic honours `bind_address` exactly, so a hint on any other
+interface is a lie every dialer pays for.
+
 The coordination path uses explicit peer-ID-based NAT traversal via `connect_peer_via` (which calls `connect_to_peer(peer_id, Some(coordinator))`), not raw `connect_addr`. This triggers QUIC extension-frame hole-punching through the coordinator peer (typically a bootstrap node). MASQUE relay fallback is planned but not yet wired in ant-quic.
 
 Successful connections enrich the bootstrap cache via `add_from_connection()`.
