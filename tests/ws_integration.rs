@@ -626,14 +626,29 @@ async fn ws_outbound_counters(client: &reqwest::Client, d: &DaemonFixture) -> (u
 ///    contract (this caught a real bug: session cleanup used to abort the
 ///    writer mid-flush, so the 1013 never reached the wire and clients only
 ///    ever saw a raw connection reset);
-/// 4. the session is removed from `/ws/sessions` (resources reclaimed).
+/// 4. the session is removed from `/ws/sessions` (resources reclaimed);
+/// 5. REST publishing keeps completing with 200 THROUGH the fill and the
+///    slow-consumer close (#287): WS back-pressure on one stalled session
+///    must never degrade the daemon's HTTP plane — the historical failure
+///    was in-flight `POST /publish` connections dying mid-wave
+///    (`hyper::Error(IncompleteMessage)`) while the reader stalled.
 ///
 /// ~60-90s wall clock (dominated by the 30s keepalive cadence), hence the
 /// `--ignored` integration tier.
 #[tokio::test]
 #[ignore]
 async fn ws_stalled_reader_fills_queue_and_closes_1013() {
-    let d = daemon().await;
+    // #287 root-cause pin: the historical failure was NOT the back-pressure
+    // machinery — it was this test's daemon (pre-#417 fixture: mDNS on, prod
+    // gossip plane) joining the real mesh, hearing a newer signed release
+    // manifest from a production peer, and SELF-UPDATING mid-run: the
+    // process was replaced under the test, so in-flight `POST /publish`
+    // connections died with hyper `IncompleteMessage`. Hermeticity
+    // (#337/#417/#609) removes the mesh coupling; disabling the updater for
+    // this daemon makes the test immune by construction even if hermeticity
+    // ever regresses — the daemon under a back-pressure soak must never be
+    // the thing that replaces itself.
+    let d = DaemonFixture::start_with_config("ws-test", "[update]\nenabled = false\n").await;
     let client = client_with_auth(&d);
     let topic = format!("stall-test-{}", rand::random::<u32>());
 
@@ -737,9 +752,39 @@ async fn ws_stalled_reader_fills_queue_and_closes_1013() {
         "slow-consumer close must reach the client as WS 1013 Try Again Later"
     );
     eprintln!(
-        "stalled reader: published={published} dropped={} close_code={close_code:?}",
+        "stalled reader: dropped={} close_code={close_code:?}",
         dropped - base_dropped
     );
+
+    // ── REST availability across the back-pressure close (#287): publish
+    // waves keep completing while the session fills, closes, and tears
+    // down. WS back-pressure on one stalled session must never degrade the
+    // daemon's HTTP plane — the historical #287 failure killed in-flight
+    // `POST /publish` connections mid-wave (hyper IncompleteMessage at the
+    // client). These two waves run after the Close(1013) has been confirmed (the
+    // drain must not wait behind 128 publishes on a slow host, #287 r3), and
+    // still prove the HTTP plane survived the session teardown.
+    for _ in 0..2 {
+        let wave: Vec<_> = (0..64)
+            .map(|_| {
+                client
+                    .post(d.url("/publish"))
+                    .json(&json!({"topic": &topic, "payload": &payload}))
+                    .send()
+            })
+            .collect();
+        for resp in futures::future::join_all(wave).await {
+            let resp = resp.expect("publish after slow-consumer close (#287)");
+            assert_eq!(
+                resp.status(),
+                200,
+                "publish after slow-consumer close failed (#287): REST plane \
+                 degraded by WS back-pressure"
+            );
+            published += 1;
+        }
+    }
+    eprintln!("stalled reader: published={published} after confirmed close");
 
     // ── The session must be gone from /ws/sessions (resources reclaimed).
     let sessions_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -763,6 +808,178 @@ async fn ws_stalled_reader_fills_queue_and_closes_1013() {
         assert!(
             tokio::time::Instant::now() < sessions_deadline,
             "stalled session {session_id} still registered after slow-consumer close"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #287 round 2 — Close(1013) must survive the writer's flush-budget expiry
+// ---------------------------------------------------------------------------
+
+/// A stalled reader that resumes draining AFTER the writer's Close(1013)
+/// flush budget has expired but INSIDE the cleanup grace window must still
+/// receive Close(1013) — never an abrupt connection reset.
+///
+/// WHY: the writer's close flush gets a bounded budget
+/// (`[ws] slow_close_flush_ms`, default 2 s). On hosts whose kernel socket
+/// buffers outlast that budget (slow CI runners; this exact test failed the
+/// PR #667 CI head with "Connection reset without closing handshake") the
+/// writer used to exit and DROP the sink, tearing the TCP connection before
+/// the client had drained enough to see the close frame — the documented
+/// client-visible contract (#149) silently became a reset. Cleanup now
+/// takes the sink back from the exited writer and keeps retrying the flush
+/// for its grace window (3 s), so the contract holds for any reader that
+/// resumes inside the grace.
+///
+/// Deterministic without a slow host: the daemon runs with a 200 ms flush
+/// budget, the slow-consumer close is triggered by a SELF-DM (DM frames are
+/// critical-feeder frames — a full queue closes the session immediately, no
+/// 30 s keepalive wait), and the client stays stalled 600 ms past the close
+/// (flush budget long expired) before draining inside the grace.
+#[tokio::test]
+#[ignore]
+async fn ws_slow_close_frame_survives_flush_budget_expiry() {
+    let d = DaemonFixture::start_with_config(
+        "ws-test",
+        "[update]\nenabled = false\n[ws]\nslow_close_flush_ms = 200\n",
+    )
+    .await;
+    let client = client_with_auth(&d);
+    let topic = format!("stall-budget-{}", rand::random::<u32>());
+
+    // /ws/direct so the session receives direct messages: the self-DM below
+    // feeds the critical path (full queue → slow-consumer close).
+    let mut ws = ws_connect(&d, "/ws/direct").await;
+    let connected = ws_recv_text(&mut ws, 5).await.expect("connected frame");
+    let frame: Value = serde_json::from_str(&connected).expect("parse connected");
+    let session_id = frame["session_id"]
+        .as_str()
+        .expect("session_id in connected frame")
+        .to_string();
+    ws_subscribe_topic(&mut ws, &topic).await;
+
+    let agent: Value = client
+        .get(d.url("/agent"))
+        .send()
+        .await
+        .expect("GET /agent")
+        .json()
+        .await
+        .expect("parse /agent");
+    let agent_id = agent["agent_id"].as_str().expect("agent_id").to_string();
+
+    let (base_dropped, base_closes) = ws_outbound_counters(&client, &d).await;
+    let payload = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [b'x'; 16 * 1024],
+    );
+
+    // ── STALL and fill the queue, same rationale as the stalled-reader test:
+    // the client never polls `ws`, kernel buffers fill, the writer blocks,
+    // and the bounded queue observes Full (drops counted).
+    let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut dropped = base_dropped;
+    while dropped <= base_dropped {
+        assert!(
+            tokio::time::Instant::now() < fill_deadline,
+            "outbound queue never filled: ws_outbound_dropped still {dropped} \
+             (baseline {base_dropped})"
+        );
+        let wave: Vec<_> = (0..64)
+            .map(|_| {
+                client
+                    .post(d.url("/publish"))
+                    .json(&json!({"topic": &topic, "payload": &payload}))
+                    .send()
+            })
+            .collect();
+        for resp in futures::future::join_all(wave).await {
+            let resp = resp.expect("publish during fill");
+            assert_eq!(resp.status(), 200, "publish during fill failed");
+        }
+        (dropped, _) = ws_outbound_counters(&client, &d).await;
+    }
+
+    // ── Trigger the slow-consumer close NOW via the critical feeder: a
+    // self-DM hits the Full queue and closes the session immediately.
+    let resp = client
+        .post(d.url("/direct/send"))
+        .json(&json!({"agent_id": &agent_id, "payload": "eHg="}))
+        .send()
+        .await
+        .expect("POST /direct/send");
+    assert_eq!(resp.status(), 200, "self-DM close trigger failed");
+
+    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut closes = base_closes;
+    while closes <= base_closes {
+        assert!(
+            tokio::time::Instant::now() < close_deadline,
+            "self-DM on a full queue did not close the session within 10s \
+             (ws_slow_consumer_closes still {closes}, baseline {base_closes})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (_, closes) = ws_outbound_counters(&client, &d).await;
+    }
+
+    // ── Stay stalled PAST the tiny flush budget (200 ms): the writer has
+    // exited and handed the sink back; only cleanup's grace window (3 s)
+    // keeps the socket open with the close-frame flush retrying.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // ── Resume draining INSIDE the grace: kernel-buffered backlog first,
+    // then the Close(1013). On the pre-fix code the sink was dropped when
+    // the writer exited, so this drain hit a reset/EOF instead.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut close_code: Option<u16> = None;
+    while tokio::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Close(close_frame)))) => {
+                close_code = close_frame.as_ref().map(|f| u16::from(f.code));
+                break;
+            }
+            Ok(Some(Ok(_))) => continue, // buffered backlog frames
+            Ok(Some(Err(e))) => panic!(
+                "reader that resumes inside the grace must receive \
+                 Close(1013), not a socket error: {e}"
+            ),
+            Ok(None) => {
+                panic!("reader that resumes inside the grace must receive Close(1013), not EOF")
+            }
+            Err(_) => break, // stream open and quiet — deadline loop decides
+        }
+    }
+    assert_eq!(
+        close_code,
+        Some(1013),
+        "Close(1013) must still be deliverable after the writer's flush \
+         budget expired, for a client that resumes draining inside the \
+         cleanup grace"
+    );
+
+    // ── The session must be reclaimed.
+    let sessions_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let v: Value = client
+            .get(d.url("/ws/sessions"))
+            .send()
+            .await
+            .expect("GET /ws/sessions")
+            .json()
+            .await
+            .expect("parse /ws/sessions");
+        let still_present = v["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .any(|s| s["session_id"].as_str() == Some(session_id.as_str()));
+        if !still_present {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < sessions_deadline,
+            "session {session_id} still registered after grace-window close"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

@@ -32195,6 +32195,7 @@ pub(in crate::server) mod tests {
             ws_sessions: RwLock::new(HashMap::new()),
             ws_topics: RwLock::new(HashMap::new()),
             ws_outbound_stats: Arc::new(WsOutboundStats::default()),
+            ws_slow_close_flush: Duration::from_millis(2000),
             api_address: "127.0.0.1:0".parse().expect("valid test API address"),
             data_dir: data_dir.to_path_buf(),
             start_time: Instant::now(),
