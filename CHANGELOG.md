@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Capability adverts went stale in on-demand mode (#664 regression).**
+  #664 correctly stopped the per-request re-broadcast of the fleet-wide
+  `x0x/caps/v1` advert, but the on-demand publisher's idle wake stayed at
+  3600 s — four times the consumer-side `ADVERT_CACHE_TTL_SECS` (900 s)
+  cache window. With `legacy_announce = false` (the production default)
+  there is no steady beat, so after the startup advert a node's advert was
+  refreshed only when some peer happened to send it a targeted request. A
+  peer nobody asked about dropped out of every consumer's cache one TTL
+  later and every strict ADR-0030 send to it refused with HTTP 409
+  `recipient ... has no current v2 durable-ACK capability advert`.
+  Observed on the 6-node testnet four hours after a rolling restart: NYC to
+  SFO durable DMs failed while the other four directions, which saw request
+  traffic, stayed healthy. The on-demand idle wake is now bounded by the
+  advert window and measured from the last successful steady publish, so a
+  request-triggered cycle inside the window cannot defer the next steady
+  publish by a whole extra window. Worst-case steady republish interval is
+  now `ADVERT_PUBLISH_INTERVAL_SECS` + one tenth of it (660 s) against the
+  900 s cache TTL, versus 3600 s before. The #664 storm reduction is
+  unchanged: request-triggered cycles still answer on the Critical
+  response topic and still emit at most one steady advert per window.
+  Cadence only — no caps topic is retired and no wire shape changes.
+
 ## [v0.42.2] - 2026-09-12
 
 ### Fixed
