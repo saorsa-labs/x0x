@@ -143,6 +143,18 @@ All notable changes to this project will be documented in this file.
   persistent failure still fails the test loudly with the last error, so
   no round-trip observation is skipped.
 
+- The two #316 loopback tests no longer flake under full parallel load
+  (#316). `direct_send_with_require_ack_round_trips_to_live_peer` asked
+  the post-send liveness probe for a 3 s budget — the daemon honours the
+  caller-supplied budget exactly, and the recorded ~18 s failures were
+  the probe starving under ambient suite load after the durable send
+  itself completed; the fixture now requests 10 s (the bundled GUI client
+  already ships 5 s) while the assertion stays strict (ok + finite RTT).
+  The setup dial of `suppressed_peer_inbound_redial_is_rejected` — the
+  0.16 s fast-fail was the same transient setup-dial class — gets the
+  same bounded retry. Observation windows, assertions, and the nextest
+  serial-group scheduling are unchanged.
+
 
 ## [v0.42.1] - 2026-09-11
 
