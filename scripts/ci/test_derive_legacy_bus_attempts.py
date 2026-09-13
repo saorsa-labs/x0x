@@ -10,7 +10,7 @@ import unittest
 spec = importlib.util.spec_from_file_location("derive501", Path(__file__).with_name("derive-legacy-bus-attempts.py"))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="0.5.78"\nchecksum="' + module.PUBSUB_SHA + '"\n').encode()
+LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="0.5.79"\nchecksum="' + module.PUBSUB_SHA + '"\n').encode()
 
 
 def fixture():

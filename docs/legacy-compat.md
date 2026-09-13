@@ -105,3 +105,18 @@ No timeout padding, weakened predicate or library-fixture substitution.
 deploy, and live-daemon work follow modern-release owners (ADR-014 receipt,
 RejectV1 product, CI) and remain out of scope for this disabled facility.
 No product G4 activation from this doc.
+
+## 2026-09-13 — meter producer premise moved to saorsa-gossip-pubsub 0.5.79
+
+The #501 legacy-bus meter refuses to measure against an unpinned producer, so
+the exact published version and crates.io checksum are pinned in
+`src/legacy_bus_interop_tests.rs`, `scripts/ci/derive-legacy-bus-attempts.py`
+and its test fixture. saorsa-gossip 0.5.79 adds `ValidationAction::LazyForward`
+(saorsa-gossip#59) for the x0x #674 C2/C3 relay fan-out work, so the premise
+moves from 0.5.78 to **0.5.79**, checksum `2070b36d7e26e8fdebd3a0d84f7aae8f30bebb607e2fdcf3e916faf43da336dc`.
+Note for #674 baselines: 0.5.79 also changes what `relay_msgs` counts (an
+`if !eager_peers.is_empty()` guard on the relay meter), so relay counter
+baselines taken on 0.5.78 are not directly comparable, and the IWANT serve
+path still does not record publish origin — read `outbound_by_kind["eager"]`
+alongside `relay_bytes` when accounting relay egress.
+
