@@ -93,7 +93,13 @@ survive the attempt and are all you need:
 - `<target>.backup` — the exact bytes that were serving before the swap,
   written beside the installed binary (`<target>`).
 - `<data_dir>/upgrade-handoff.json` — the intent record: from/to versions,
-  `target_path`, `backup_path`, argv, cwd, old pid, API address. It is a
+  `target_path`, `backup_path`, argv, cwd, old pid, API address. On the
+  supervised path it also carries `launchd_verified` — the launchd label and
+  the per-user session domain (`gui` or `user`) whose **loaded** policy the
+  apply-time readback verified; it is `null`/absent on every other path
+  (unsupervised, systemd, pre-upgrade intent files). The two launchd domains
+  are disjoint, so `domain` tells you which `launchctl print` probe below
+  will actually answer for this job — probe that one first. It is a
   *diagnosis record*, not state the daemon needs to boot.
 
 `<data_dir>` is the instance's data directory —
@@ -255,8 +261,11 @@ The handoff transaction (`upgrade::restart`):
 
 1. The old daemon writes `data_dir/upgrade-handoff.json` (from/to versions,
    target/backup paths, argv, cwd, env whitelist, old pid, API address,
-   timestamp) — captured before any exit, and also on the supervised path so a
-   crash loop is diagnosable.
+   timestamp, and — when the supervision signal was the launchd marker and
+   the apply-time readback verified its loaded policy — `launchd_verified`
+   with the job's label and the matched `gui`/`user` domain) — captured
+   before any exit, and also on the supervised path so a crash loop is
+   diagnosable.
 2. It spawns a detached helper in a new session — the same `x0xd` binary,
    preferring the known-good backup bytes — as `x0xd --upgrade-handoff <file>`.
 3. It triggers the graceful-shutdown hook with a **5s bound** (never waits

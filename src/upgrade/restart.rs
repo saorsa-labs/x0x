@@ -275,6 +275,12 @@ pub enum LaunchdPolicyReadback {
     Verified {
         /// The launchd label that was verified.
         label: String,
+        /// The per-user launchd session domain whose loaded state answered
+        /// the probe: `gui` or `user`. The two domains are disjoint, so a
+        /// job verified in one is invisible to the other — surfacing which
+        /// one matched keeps an operator's `launchctl print` follow-up from
+        /// answering "Could not find service" (#671).
+        domain: &'static str,
     },
     /// Readback ran and could not confirm a guaranteed respawn. The apply
     /// is refused: exiting into an unconfirmed policy is exactly the
@@ -291,6 +297,19 @@ pub enum LaunchdPolicyReadback {
         /// Why readback does not apply.
         detail: String,
     },
+}
+
+/// The launchd job whose loaded policy guaranteed the supervised restart
+/// (ADR-0061 §3, #671): the label plus the per-user session domain that held
+/// it. Carried into [`RestartPlan`] and the `upgrade-handoff.json` intent
+/// record so an operator's follow-up `launchctl print` targets the domain
+/// that actually answered, not the one `x0x autostart` usually loads into.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaunchdVerifiedJob {
+    /// launchd label of the verified job.
+    pub label: String,
+    /// Per-user session domain that held the job: `gui` or `user`.
+    pub domain: String,
 }
 
 /// The running process's argv as lossy strings. Shared by the restart
@@ -329,6 +348,43 @@ pub fn readback_launchd_policy(
         "Reading back the loaded launchd policy behind X0X_SUPERVISED=1 (ADR-0061 §3)"
     );
     readback_launchd_policy_macos(executable, argv)
+}
+
+/// [`readback_launchd_policy`] run off the async runtime (#671).
+///
+/// The readback shells out to `plutil` and `launchctl print` synchronously
+/// (`[`readback_launchd_policy_macos`]`), and the upgrade path awaits it from
+/// async code. Run inline, a slow `launchctl` would stall the runtime worker
+/// for the whole subprocess exchange; [`tokio::task::spawn_blocking`] moves
+/// the entire readback — plist discovery plus both domain probes — onto the
+/// blocking pool, so the runtime keeps serving while launchd answers.
+///
+/// Fails closed: a join failure (the readback task panicked or was torn down
+/// with the runtime) maps to `NotGuaranteed`, so the apply is refused rather
+/// than green-lit by a policy that was never read.
+pub async fn readback_launchd_policy_offloaded(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+) -> LaunchdPolicyReadback {
+    let signals = signals.clone();
+    let executable = executable.to_path_buf();
+    let argv = argv.to_vec();
+    spawn_readback_offloaded(move || readback_launchd_policy(&signals, &executable, &argv)).await
+}
+
+/// spawn_blocking core of [`readback_launchd_policy_offloaded`], split so the
+/// offload itself is testable with a stand-in readback closure instead of the
+/// real plutil/launchctl subprocesses.
+async fn spawn_readback_offloaded(
+    readback: impl FnOnce() -> LaunchdPolicyReadback + Send + 'static,
+) -> LaunchdPolicyReadback {
+    match tokio::task::spawn_blocking(readback).await {
+        Ok(verdict) => verdict,
+        Err(join_err) => LaunchdPolicyReadback::NotGuaranteed {
+            detail: format!("launchd policy readback task failed: {join_err}"),
+        },
+    }
 }
 
 /// launchd does not exist on this platform, so the marker cannot be
@@ -457,9 +513,9 @@ fn readback_launchd_policy_in(
         // hold the job (the domains are disjoint — see the function docs).
         let gui_probe = launchctl_print(&format!("gui/{uid}/{label}"));
         let loaded_stdout = match &gui_probe {
-            Ok(Some(stdout)) => Some(std::borrow::Cow::Borrowed(stdout.as_str())),
+            Ok(Some(stdout)) => Some((std::borrow::Cow::Borrowed(stdout.as_str()), "gui")),
             _ => match launchctl_print(&format!("user/{uid}/{label}")) {
-                Ok(Some(stdout)) => Some(std::borrow::Cow::Owned(stdout)),
+                Ok(Some(stdout)) => Some((std::borrow::Cow::Owned(stdout), "user")),
                 Ok(None) => {
                     refusal.get_or_insert_with(|| {
                         format!(
@@ -482,7 +538,12 @@ fn readback_launchd_policy_in(
                 }
             },
         };
-        let Some(loaded) = loaded_stdout.as_deref().and_then(parse_launchd_loaded_job) else {
+        let Some((stdout, domain)) = loaded_stdout else {
+            refusal
+                .get_or_insert_with(|| format!("could not parse the loaded policy of job {label}"));
+            continue;
+        };
+        let Some(loaded) = parse_launchd_loaded_job(&stdout) else {
             refusal
                 .get_or_insert_with(|| format!("could not parse the loaded policy of job {label}"));
             continue;
@@ -496,6 +557,7 @@ fn readback_launchd_policy_in(
         if loaded.keepalive_unconditional {
             return LaunchdPolicyReadback::Verified {
                 label: label.to_string(),
+                domain,
             };
         }
         return NotGuaranteed {
@@ -641,6 +703,11 @@ pub struct RestartPlan {
     pub data_root: PathBuf,
     /// Pre-upgrade API address the replacement must serve `/health` on.
     pub api_addr: SocketAddr,
+    /// The launchd job whose loaded policy guaranteed the restart, when the
+    /// recognized signal is the `X0X_SUPERVISED=1` marker and the readback
+    /// verified it (ADR-0061 §3, #671). Carried into the intent record so
+    /// diagnostics name the domain that actually answered.
+    pub launchd_verified: Option<LaunchdVerifiedJob>,
 }
 
 impl RestartPlan {
@@ -687,6 +754,13 @@ pub fn resolve_restart_plan(
     // by §3 stranded jobs whose `KeepAlive` was altered after `--repair`.
     // INVOCATION_ID / `systemd`-parent signals are not gated: they name a
     // systemd unit, and the systemd-side readback is out of #615's scope.
+    let launchd_verified = match launchd_readback {
+        LaunchdPolicyReadback::Verified { label, domain } => Some(LaunchdVerifiedJob {
+            label: label.clone(),
+            domain: domain.to_string(),
+        }),
+        _ => None,
+    };
     if mode == RestartMode::SupervisedExit && !signals.invocation_id && signals.x0x_supervised {
         if let LaunchdPolicyReadback::NotGuaranteed { detail } = launchd_readback {
             return Err(RestartOwnershipError::SupervisedPolicyNotGuaranteed {
@@ -746,6 +820,7 @@ pub fn resolve_restart_plan(
         cwd,
         data_root,
         api_addr: api_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+        launchd_verified,
     })
 }
 
@@ -785,6 +860,14 @@ pub struct UpgradeHandoff {
     /// Mode the old process classified (also written on the supervised-exit
     /// intent file so crash loops are diagnosable).
     pub mode: RestartMode,
+    /// The launchd job whose loaded policy guaranteed the supervised
+    /// restart, with the session domain (`gui`/`user`) that held it — #671:
+    /// the domains are disjoint, so the intent record must name the one that
+    /// actually answered or an operator's `launchctl print` follow-up misses.
+    /// `None` on every non-launchd-marker path. `#[serde(default)]` keeps
+    /// intent files written before the field existed parseable.
+    #[serde(default)]
+    pub launchd_verified: Option<LaunchdVerifiedJob>,
 }
 
 impl UpgradeHandoff {
@@ -817,6 +900,7 @@ impl UpgradeHandoff {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             mode: plan.mode,
+            launchd_verified: plan.launchd_verified.clone(),
         }
     }
 
@@ -1711,6 +1795,7 @@ mod tests {
             None,
             &LaunchdPolicyReadback::Verified {
                 label: "com.example.x0xd".to_string(),
+                domain: "gui",
             },
         )
         .expect("supervised + stop_on_upgrade=true is a supported contract");
@@ -1936,6 +2021,7 @@ mod tests {
             None,
             &LaunchdPolicyReadback::Verified {
                 label: "com.example.x0xd".to_string(),
+                domain: "gui",
             },
         )
         .expect("a verified launchd policy is a supported contract");
@@ -2014,7 +2100,8 @@ mod tests {
         assert_eq!(
             verdict,
             LaunchdPolicyReadback::Verified {
-                label: TEST_LABEL.to_string()
+                label: TEST_LABEL.to_string(),
+                domain: "gui",
             }
         );
     }
@@ -2075,7 +2162,8 @@ mod tests {
         assert_eq!(
             verdict,
             LaunchdPolicyReadback::Verified {
-                label: TEST_LABEL.to_string()
+                label: TEST_LABEL.to_string(),
+                domain: "user",
             }
         );
         assert_eq!(
@@ -2086,6 +2174,109 @@ mod tests {
             ],
             "gui must be probed first, user only as fallback"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readback_offload_runs_the_subprocess_work_off_the_runtime_thread() {
+        // #671: the plutil/launchctl subprocesses behind the launchd
+        // readback are blocking, and the upgrade path awaits them from async
+        // code. If they ever run inline on the runtime worker again, a slow
+        // `launchctl` stalls the whole runtime mid-upgrade — exactly what
+        // spawn_blocking exists to prevent. Thread identity is the directly
+        // observable property: on a current_thread runtime the polling thread
+        // IS the only runtime worker, so the closure must never see it.
+        let runtime_thread = std::thread::current().id();
+        let verdict = spawn_readback_offloaded(move || {
+            assert_ne!(
+                std::thread::current().id(),
+                runtime_thread,
+                "the launchd readback must not run on the async runtime thread"
+            );
+            LaunchdPolicyReadback::Verified {
+                label: TEST_LABEL.to_string(),
+                domain: "gui",
+            }
+        })
+        .await;
+        assert_eq!(
+            verdict,
+            LaunchdPolicyReadback::Verified {
+                label: TEST_LABEL.to_string(),
+                domain: "gui",
+            },
+            "the offloaded verdict must be passed through unchanged"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readback_offload_fails_closed_when_the_readback_task_panics() {
+        // A panicking readback must refuse the apply, not crash the upgrade
+        // path or — worse — verify by accident: the JoinError arm maps to
+        // NotGuaranteed, the same fail-closed verdict as every other
+        // unread-policy outcome.
+        let verdict =
+            spawn_readback_offloaded(|| panic!("launchctl hung in an unexpected way")).await;
+        match verdict {
+            LaunchdPolicyReadback::NotGuaranteed { detail } => {
+                assert!(
+                    detail.contains("launchd policy readback task failed"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supervised_intent_json_records_the_verified_launchd_domain() {
+        // #671: `gui/<uid>` and `user/<uid>` are disjoint, so the intent
+        // record must name the domain that actually answered. Without it, an
+        // operator following the recovery doc probes the gui domain first
+        // and reads "Could not find service" for a job verified in `user`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = resolve_restart_plan(
+            true,
+            &launchd_marker_signals(),
+            &installed_binary(dir.path()),
+            Some(dir.path()),
+            None,
+            &LaunchdPolicyReadback::Verified {
+                label: TEST_LABEL.to_string(),
+                domain: "user",
+            },
+        )
+        .expect("a verified launchd policy is a supported contract");
+        assert_eq!(
+            plan.launchd_verified,
+            Some(LaunchdVerifiedJob {
+                label: TEST_LABEL.to_string(),
+                domain: "user".to_string(),
+            }),
+            "the plan must carry which domain matched, not just the label"
+        );
+
+        let handoff = UpgradeHandoff::from_plan(&plan, "9.9.9");
+        assert_eq!(handoff.launchd_verified, plan.launchd_verified);
+        let path = dir.path().join(HANDOFF_FILE_NAME);
+        handoff.write(&path).expect("write intent record");
+        let raw = std::fs::read_to_string(&path).expect("read intent record");
+        assert!(
+            raw.contains("\"launchd_verified\"") && raw.contains("\"domain\": \"user\""),
+            "the intent JSON must name the matched domain: {raw}"
+        );
+        let read_back = UpgradeHandoff::read(&path).expect("intent record parses");
+        assert_eq!(read_back.launchd_verified, plan.launchd_verified);
+
+        // Intent files written before the field existed must still parse.
+        let mut old_shape =
+            serde_json::from_str::<serde_json::Value>(&raw).expect("intent record is JSON");
+        old_shape
+            .as_object_mut()
+            .expect("intent record is an object")
+            .remove("launchd_verified");
+        let legacy: UpgradeHandoff = serde_json::from_value(old_shape)
+            .expect("a pre-#671 intent file must remain parseable");
+        assert_eq!(legacy.launchd_verified, None);
     }
 
     #[test]
@@ -2314,6 +2505,7 @@ mod tests {
             api_addr: "127.0.0.1:12700".parse().unwrap(),
             started_at: 1_700_000_000,
             mode: RestartMode::TransactionalHandoff,
+            launchd_verified: None,
         };
         handoff.write(&path).unwrap();
         let read_back = UpgradeHandoff::read(&path).unwrap();
@@ -2362,6 +2554,7 @@ mod tests {
             api_addr: "127.0.0.1:12700".parse().unwrap(),
             started_at: 0,
             mode: RestartMode::TransactionalHandoff,
+            launchd_verified: None,
         };
         assert_eq!(
             resolve_health_addr(&handoff, dir.path()),
@@ -2400,6 +2593,7 @@ mod tests {
             api_addr: "127.0.0.1:0".parse().unwrap(),
             started_at: 0,
             mode: RestartMode::TransactionalHandoff,
+            launchd_verified: None,
         }
     }
 

@@ -3,6 +3,41 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+### Changed
+
+- **The launchd loaded-policy readback now runs off the async runtime, and
+  the intent record names the matched launchd domain (#671, follow-ups to
+  #668).** The `plutil`/`launchctl print` subprocesses behind the
+  `X0X_SUPERVISED=1` upgrade-time readback used to run inline on the runtime
+  worker (`apply_upgrade_from_manifest` and the post-manual-apply restart are
+  async), so a slow `launchctl` could stall the daemon mid-upgrade. The
+  readback now runs via `tokio::task::spawn_blocking`
+  (`readback_launchd_policy_offloaded`); a join failure fails closed to
+  `NotGuaranteed` — the apply is refused, never green-lit by an unread
+  policy. `LaunchdPolicyReadback::Verified` and the
+  `upgrade-handoff.json` intent record now carry which per-user launchd
+  domain (`gui`/`user`) actually answered — the domains are disjoint, so
+  without this an operator's `launchctl print` follow-up from the recovery
+  doc could read "Could not find service" for a job verified in the other
+  domain; intent files written before the field existed still parse.
+  ADR-0061 §3 remains **NOT MET**: the versioned-template half and the
+  systemd-side readback are open (tracked in #690; the ADR itself is
+  immutable after acceptance, so its acceptance-time status table stands).
+
+**BREAKING — upgrade restart-contract API:** two methods became `async` and
+three public types gained fields.
+- `AutoApplyUpgrader::resolve_restart_plan(&self, binary_path)` and
+  `AutoApplyUpgrader::restart_current_binary(&self, target_version)` are now
+  `async` (the launchd readback runs on the blocking pool); callers must
+  `.await` them.
+- `LaunchdPolicyReadback::Verified` gained `domain: &'static str` (`"gui"` or
+  `"user"`): constructions and exhaustive matches must supply/handle it.
+- `RestartPlan` and `UpgradeHandoff` gained
+  `launchd_verified: Option<LaunchdVerifiedJob>`; struct-literal callers must
+  populate it. `UpgradeHandoff` keeps `#[serde(default)]` on the field, so
+  intent files written before this change still parse.
+
 ### Docs
 
 - **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added

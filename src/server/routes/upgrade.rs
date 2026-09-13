@@ -912,7 +912,7 @@ fn schedule_restart_after_response(
         // Same planner as every other apply path (#261): unsupervised daemons
         // get the transactional handoff here too — never a bare exit(0).
         let upgrader = deferred_restart_upgrader(stop_on_upgrade, restart_context);
-        if let Err(e) = upgrader.restart_current_binary(&target_version) {
+        if let Err(e) = upgrader.restart_current_binary(&target_version).await {
             tracing::error!(error = %e, "failed to restart after manual upgrade apply");
         }
     });
