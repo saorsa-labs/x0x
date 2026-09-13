@@ -3,6 +3,33 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Added
+
+- **#674 C2/C3 — lazy relay fan-out for unconsumed topics + per-topic eager
+  budget** (refs #674, #656; requires saorsa-gossip 0.5.79's
+  `ValidationAction::LazyForward`, sg#59/PR#60). A Full relay now forwards
+  traffic on topics with **zero local subscribers** lazily: the eager
+  re-publish is withheld and the msg-ids are announced via IHAVE (to the
+  lazy set and every withheld eager peer), staying cached and
+  IWANT-serveable — delivery is preserved at one IHAVE instead of an EAGER
+  per withheld peer (~99% of bootstrap send-path load is relayed traffic
+  this converts; ADR-0034 relay role unchanged, only the forwarding mode).
+  Topics WITH subscribers keep eager forwarding inside a per-topic token
+  bucket (`gossip.relay_fanout_budget_msgs_per_sec`, default 50 msgs/s,
+  0 disables the gate); beyond budget they degrade to the same lazy mode
+  and recover as the bucket refills. Storm-control validators (announce
+  topics) are composed in as the base layer and always win — `Drop`/
+  `DeliverOnly` are never widened. New `relay_fanout` block on
+  `GET /diagnostics/gossip` (`topics`, `forward_msgs`, `lazy_msgs`,
+  `withheld_eager_peers`, per-topic lazy counts, budget); byte accounting
+  reads `pubsub_stages.outbound_by_kind` (`eager` + `ihave`) alongside
+  `participation.relay_bytes`, which understates relay egress once
+  LazyForward is live (IWANT serves record no publish origin), and whose
+  msgs counter changed meaning at sg 0.5.78→0.5.79 — pre-0.5.79 baselines
+  are not comparable. The legacy-bus interop oracle now measures bus
+  dissemination (eager + IHAVE for the default arm; any-kind egress for the
+  optout arm — strictly stronger than the old eager-only check).
+
 ### Changed
 
 - ant-quic pin bumped 0.27.50 → 0.27.51: `disconnect()` no longer leaves a
