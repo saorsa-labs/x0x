@@ -236,11 +236,13 @@ async fn start_daemon(dir: &Path) -> Daemon {
     config.identity_dir = Some(dir.join("identity"));
 
     // A restart on the same data directory can briefly race the previous
-    // instance releasing its SQLite history database: `shutdown_and_wait`
-    // returns when the supervisor is done, and since #661 the history
-    // reaper is awaited inside the drain, so the remaining window is only a
-    // retention pass already inside its `spawn_blocking` (uncancellable by
-    // design — see HistoryService::shutdown). Retry rather than sleep a
+    // instance releasing its SQLite history database: since #661 the drain
+    // awaits the history reaper, the API watchdog holds the agent only
+    // weakly, and the supervisor drops its AppState before the instance
+    // locks — the pinned contract is that `shutdown_and_wait` leaves the
+    // lock free AND history.db openable first-try. The remaining window is
+    // a retention pass already inside its `spawn_blocking` (uncancellable
+    // by design — see HistoryService::shutdown). Retry rather than sleep a
     // fixed amount, so the common (first-start) case stays instant.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let handle = loop {

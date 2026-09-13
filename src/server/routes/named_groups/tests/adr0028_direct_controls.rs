@@ -35,6 +35,7 @@
 
 use super::*;
 use crate::groups::GroupInfo;
+#[cfg(unix)]
 use std::path::PathBuf;
 use x0x::identity::AgentKeypair;
 
@@ -386,6 +387,7 @@ async fn approve_status(state: &Arc<AppState>, group_key: &str, request_id: &str
 /// Parent directory of the durable predecessor outbox sidecar — the directory
 /// the production atomic-write helper creates its temp file in. Making this
 /// read-only forces `save_predecessor_relay_outbox` to return `Err` for real.
+#[cfg(unix)]
 fn outbox_parent(state: &AppState) -> PathBuf {
     state
         .predecessor_relay_outbox_path
@@ -403,6 +405,7 @@ fn outbox_parent(state: &AppState) -> PathBuf {
 struct SaveFailureGuard {
     parent: PathBuf,
 }
+#[cfg(unix)]
 impl SaveFailureGuard {
     async fn arm(state: &AppState) -> Self {
         use std::os::unix::fs::PermissionsExt;
@@ -411,6 +414,7 @@ impl SaveFailureGuard {
         SaveFailureGuard { parent }
     }
 }
+#[cfg(unix)]
 impl Drop for SaveFailureGuard {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;

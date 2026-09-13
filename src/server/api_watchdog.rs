@@ -348,6 +348,15 @@ pub(crate) fn spawn_api_watchdog(
     agent: Arc<Agent>,
     shutdown: watch::Receiver<bool>,
 ) -> std::thread::JoinHandle<()> {
+    // #661 item 2 (r2): hold only a WEAK reference. This thread outlives the
+    // drain by up to one probe interval (it sleeps, then notices the
+    // shutdown watch), and a strong Arc<Agent> here kept the Agent — and
+    // with it the exclusive `history.db` handle inside `history_handle` —
+    // open after `instance.lock` had already been released, so a restart
+    // racing the watchdog's sleep window failed its `history.db` open. The
+    // trip path upgrades lazily; an upgrade failure means the server was
+    // torn down, which is the one situation the watchdog must NOT act on.
+    let agent: std::sync::Weak<Agent> = std::sync::Arc::downgrade(&agent);
     // Deliberately an ordinary tokio task on the normal executor: its whole
     // value is that it stops being polled exactly when everything else does.
     let heartbeat = Arc::new(RuntimeHeartbeat::new());
@@ -416,6 +425,17 @@ pub(crate) fn spawn_api_watchdog(
                     if *shutdown.borrow() {
                         return;
                     }
+                    // Lazy upgrade: a dead Agent means the server was torn
+                    // down (drain finished while this thread was still in
+                    // its sleep window) — nothing to diagnose, nothing to
+                    // abort.
+                    let Some(agent) = agent.upgrade() else {
+                        tracing::debug!(
+                            target: "x0x::api_watchdog",
+                            "agent already dropped before trip — shutdown won the race"
+                        );
+                        return;
+                    };
                     trip(
                         &agent,
                         api_addr,

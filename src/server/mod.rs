@@ -2253,6 +2253,22 @@ pub async fn serve_with_options(
         // Clean up port file on shutdown (kept after task teardown so the
         // existing ordering — port advertisement removed last — is preserved).
         let _ = tokio::fs::remove_file(&port_file).await;
+
+        // #661 r2: drop the captured AppState NOW, as the last statement,
+        // instead of leaving it to generator teardown. `state` holds the
+        // Agent, whose `history_handle` (and the DM-inbox clones) keep an
+        // `Arc<Store>` — the exclusive SQLite connection — open. As a task
+        // *capture*, `state` would otherwise drop only when the runtime
+        // tears the completed generator down, AFTER this body's locals —
+        // including the instance locks above — have already released. A
+        // restart that wins the lock in that gap would then fail its
+        // `history.db` open. With the drain having joined/aborted every
+        // server and agent task above, this is typically the last
+        // `Arc<AppState>`, so the Agent (and its exclusive handles) is
+        // destroyed here, deterministically BEFORE the locks drop. If some
+        // leaked holder outlives the drain, this degrades to the previous
+        // behaviour rather than anything worse.
+        std::mem::drop(state);
         tracing::info!("Shutdown complete");
         server_result
     });

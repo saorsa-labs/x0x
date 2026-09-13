@@ -6,14 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **The history reaper is awaited at shutdown, so its SQLite handle is
-  released inside the drain (#661 item 2).** `HistoryService::shutdown`
-  used to `abort()` the reaper task fire-and-forget; the aborted future
-  holds an `Arc<Store>` — the open `history.db` connection — until the
-  runtime happens to reap it, which can land after the server supervisor
-  has finished and released `instance.lock`. A restart then had to retry
-  past that overlap. The abort is now awaited, so the connection release
-  happens deterministically before the drain that precedes lock release.
+- **The exclusive history handle no longer outlives the instance lock at
+  shutdown (#661 item 2).** Three holders kept the exclusive `history.db`
+  connection (`PRAGMA locking_mode = EXCLUSIVE`) open past
+  `instance.lock` release, so a same-data-dir restart had to retry its
+  database open: (1) `HistoryService::shutdown` aborted the reaper task
+  fire-and-forget — the aborted future holds an `Arc<Store>` until the
+  runtime reaps it; the abort is now awaited, parking the release inside
+  the drain. (2) The API-unserved watchdog thread holds an `Arc<Agent>`
+  for up to one probe interval after shutdown (it sleeps, then notices
+  the shutdown watch), and the Agent's `history_handle` keeps the store
+  open; the watchdog now holds only a `Weak<Agent>` and upgrades lazily
+  at trip time — an upgrade failure means teardown, the one situation it
+  must not act on. (3) The supervisor's captured `AppState` (owner of the
+  Agent) dropped only at generator teardown, after the body-local
+  instance locks; it is now dropped explicitly as the supervisor's last
+  statement, so the exclusive handle closes before the locks release.
+  Pinned by
+  `shutdown_releases_the_exclusive_history_handle_with_the_instance_lock`:
+  after `shutdown_and_wait`, the lock is acquirable and `history.db`
+  opens on the FIRST try — this failed before the watchdog fix.
   Residual (accepted, documented in the code): a retention pass already
   inside its `spawn_blocking` runs to completion holding the connection —
   blocking code cannot be cancelled — bounded by one pass and covered by
