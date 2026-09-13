@@ -1507,28 +1507,55 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
                 }
             }
         }
-        let eager =
-            |rows: &std::collections::BTreeMap<String, serde_json::Value>| -> Result<u64, String> {
-                match rows.get(&bus) {
-                    None => Ok(0), // Only after the source-universe and continuity premises.
-                    Some(row) => row["eager"]["bytes"]
-                        .as_u64()
-                        .ok_or("invalid bus eager bytes".into()),
+        // #674 C2/C3 oracle: eager re-publish is no longer the only bus
+        // forwarding mechanism — a relay whose verdict went lazy withholds
+        // the eager send and announces via IHAVE instead (peers pull by
+        // IWANT; those serve bytes land in `eager` too, so a pull-heavy
+        // run adds to the eager side). Measure ACTIVE DISSEMINATION
+        // (eager + ihave), not the wire kind:
+        //   D5 (bus inbox, forwarding expected) must move bus egress —
+        //       eager re-publish pre-budget-exhaustion, IHAVE announce
+        //       under a #674 lazy verdict, or both. Zero of both is a
+        //       real forwarding regression (broken fan-out, refused
+        //       admission, or a dropped subscription) and still fails.
+        //   O5 (optout) must contribute NO bus egress of ANY kind — a
+        //       strictly stronger claim than the previous eager-only
+        //       check: no eager, no IHAVE announce, no IWANT, no
+        //       anti-entropy on a topic this arm opted out of.
+        let bus_bytes = |rows: &std::collections::BTreeMap<String, serde_json::Value>,
+                         kinds: &[&str]|
+         -> Result<u64, String> {
+            match rows.get(&bus) {
+                None => Ok(0), // Only after the source-universe and continuity premises.
+                Some(row) => {
+                    let mut total = 0u64;
+                    for kind in kinds {
+                        total = total
+                            .checked_add(row[*kind]["bytes"].as_u64().ok_or("invalid bus counter")?)
+                            .ok_or("bus counter overflow")?;
+                    }
+                    Ok(total)
                 }
-            };
-        let delta = eager(&b)?
-            .checked_sub(eager(&a)?)
-            .ok_or("bus counter decreased")?;
+            }
+        };
+        let delta = |a: &std::collections::BTreeMap<String, serde_json::Value>,
+                     b: &std::collections::BTreeMap<String, serde_json::Value>,
+                     kinds: &[&str]|
+         -> Result<u64, String> {
+            bus_bytes(b, kinds)?
+                .checked_sub(bus_bytes(a, kinds)?)
+                .ok_or("bus counter decreased".into())
+        };
         if arm == "D5" {
             if !b.contains_key(&bus) {
                 return Err("D5 positive bus row/attempt not observed".into());
             }
             // Cached endpoint peer_scores are diagnostic only.
-            if delta == 0 {
-                return Err("FAIL: D5 recorded no bus eager attempts".into());
+            if delta(&a, &b, &["eager", "ihave"])? == 0 {
+                return Err("FAIL: D5 recorded no bus dissemination (eager or IHAVE)".into());
             }
-        } else if delta != 0 {
-            return Err("FAIL: O5 recorded bus eager attempts".into());
+        } else if delta(&a, &b, &["eager", "ihave", "iwant", "anti_entropy"])? != 0 {
+            return Err("FAIL: O5 recorded bus egress of any kind".into());
         }
     }
     Ok(())
@@ -1542,7 +1569,6 @@ fn emit_measurement(raw: &serde_json::Value) {
         serde_json::to_string(raw).expect("raw evidence serialization")
     );
 }
-
 struct MeasurementPreparation {
     binary_sha256: String,
     build_lock_sha256: String,
@@ -1575,7 +1601,7 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     let clock = std::time::Instant::now();
     let mut raw = json!({"schema":2,"selector":"legacy_bus_interop_tests::paired_controlled_load_bus_eager_attempts_default_vs_optout",
         "phase":"setup","outcome":"UNRUN","pid":std::process::id(),
-        "claim":"controlled bus eager send attempts; not forwarding, wire occupancy or field reduction",
+        "claim":"controlled bus dissemination (eager re-publish or #674 lazy IHAVE announce); optout contributes no bus egress of any kind; not wire occupancy or field reduction",
         "universe":topic_universe(agents),"samples":{},"load":{},
         "generator_diagnostics":{"schema":1,"role":"G5","cuts":{},"load_returns":[],"load_interpretation":null},
         "identities":agents.iter().map(|a|json!({"agent":hex::encode(a.agent_id().0),"machine":hex::encode(a.machine_id().0)})).collect::<Vec<_>>(),
