@@ -18,10 +18,12 @@ All notable changes to this project will be documented in this file.
   minimum safe pin** for this test. Gate: 60/60 on each of
   `integration_treekem_home_rename_restart_single_announce_end_to_end`,
   `integration_real_home_provision_rename_restart_join_e2e` and
-  `connection_churn_falls_back_to_reliable`, against a negative control
-  (same code, ant-quic pinned back to `=0.27.50`) that fails 1 of 20. That
-  supports "no evidence of a residual failure rate of ~5% or worse on macOS",
-  not "the race is gone" — see the PR for the full matrix and its limits.
+  `connection_churn_falls_back_to_reliable`. A negative control (same code,
+  ant-quic pinned back to `=0.27.50`) fires the restored assertion, which is
+  what makes the green gate falsifiable; it is not a before/after comparison
+  and no rate reduction is claimed. 0 of 60 supports "no evidence of a
+  residual failure rate of ~5% or worse on macOS", not "the race is gone" —
+  see the PR for the full matrix and its limits.
 
 ## [v0.44.0] - 2026-09-13
 
