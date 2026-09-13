@@ -3,7 +3,6 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
-
 ### Changed
 
 - ant-quic pin bumped 0.27.50 → 0.27.51: `disconnect()` no longer leaves a
@@ -14,17 +13,37 @@ All notable changes to this project will be documented in this file.
   the simultaneous-open tiebreaker liveness fixes (ant-quic#281). Closes the
   #277 reliable-voice churn flake at the mechanism and lets the #684 settle
   barrier workaround (#510) be retired in a follow-up.
-### Docs
+- **The launchd loaded-policy readback now runs off the async runtime, and
+  the intent record names the matched launchd domain (#671, follow-ups to
+  #668).** The `plutil`/`launchctl print` subprocesses behind the
+  `X0X_SUPERVISED=1` upgrade-time readback used to run inline on the runtime
+  worker (`apply_upgrade_from_manifest` and the post-manual-apply restart are
+  async), so a slow `launchctl` could stall the daemon mid-upgrade. The
+  readback now runs via `tokio::task::spawn_blocking`
+  (`readback_launchd_policy_offloaded`); a join failure fails closed to
+  `NotGuaranteed` — the apply is refused, never green-lit by an unread
+  policy. `LaunchdPolicyReadback::Verified` and the
+  `upgrade-handoff.json` intent record now carry which per-user launchd
+  domain (`gui`/`user`) actually answered — the domains are disjoint, so
+  without this an operator's `launchctl print` follow-up from the recovery
+  doc could read "Could not find service" for a job verified in the other
+  domain; intent files written before the field existed still parse.
+  ADR-0061 §3 remains **NOT MET**: the versioned-template half and the
+  systemd-side readback are open (tracked in #690; the ADR itself is
+  immutable after acceptance, so its acceptance-time status table stands).
 
-- **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
-  `docs/design/292-plane-gate-churn-model.md` documenting all six invariants (A–F) with code
-  anchors and test references. Invariant E is proved subsumed by invariant A
-  (`src/network.rs:3192`) plus the ordering contract of `disconnect_with_reason`
-  (`src/network.rs:3133`): `suppress_reconnect` is called before `node.disconnect()`, so
-  `peer_admission` returns `Suppressed` before the QUIC close, with no window in which a
-  plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
-  already covers the full observable chain. Added an `invariant E` anchor comment to
-  `plane_handle_hello` (`src/network.rs:3492`). Closes #632.
+**BREAKING — upgrade restart-contract API:** two methods became `async` and
+three public types gained fields.
+- `AutoApplyUpgrader::resolve_restart_plan(&self, binary_path)` and
+  `AutoApplyUpgrader::restart_current_binary(&self, target_version)` are now
+  `async` (the launchd readback runs on the blocking pool); callers must
+  `.await` them.
+- `LaunchdPolicyReadback::Verified` gained `domain: &'static str` (`"gui"` or
+  `"user"`): constructions and exhaustive matches must supply/handle it.
+- `RestartPlan` and `UpgradeHandoff` gained
+  `launchd_verified: Option<LaunchdVerifiedJob>`; struct-literal callers must
+  populate it. `UpgradeHandoff` keeps `#[serde(default)]` on the field, so
+  intent files written before this change still parse.
 
 ### Tests
 
@@ -56,6 +75,18 @@ All notable changes to this project will be documented in this file.
   to force the joiner's view clean and continues rather than panicking. The
   strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
   genuine never-reconnects regression still fails at the same place.
+
+### Docs
+
+- **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
+  `docs/design/292-plane-gate-churn-model.md` documenting all six invariants (A–F) with code
+  anchors and test references. Invariant E is proved subsumed by invariant A
+  (`src/network.rs:3192`) plus the ordering contract of `disconnect_with_reason`
+  (`src/network.rs:3133`): `suppress_reconnect` is called before `node.disconnect()`, so
+  `peer_admission` returns `Suppressed` before the QUIC close, with no window in which a
+  plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
+  already covers the full observable chain. Added an `invariant E` anchor comment to
+  `plane_handle_hello` (`src/network.rs:3492`). Closes #632.
 
 ### CI
 

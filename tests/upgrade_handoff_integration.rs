@@ -148,6 +148,7 @@ fn write_handoff(
         api_addr: format!("127.0.0.1:{port}").parse().unwrap(),
         started_at: 1_724_000_000,
         mode: RestartMode::TransactionalHandoff,
+        launchd_verified: None,
     };
     let path = data_dir.join(restart::HANDOFF_FILE_NAME);
     handoff.write(&path).unwrap();
@@ -335,6 +336,7 @@ fn fixture_role_old_side() {
         api_addr: format!("127.0.0.1:{}", spec.port).parse().unwrap(),
         started_at: 1_724_000_000,
         mode: RestartMode::TransactionalHandoff,
+        launchd_verified: None,
     };
     let handoff_path = spec.data_dir.join(restart::HANDOFF_FILE_NAME);
     let result = restart::begin_transactional_handoff(handoff, &handoff_path, None);
@@ -713,6 +715,7 @@ fn handoff_start_failure_keeps_old_process_alive_and_loud() {
         api_addr: "127.0.0.1:0".parse().unwrap(),
         started_at: 1_724_000_000,
         mode: RestartMode::TransactionalHandoff,
+        launchd_verified: None,
     };
     let handoff_path = data.path().join(restart::HANDOFF_FILE_NAME);
     let result = restart::begin_transactional_handoff(handoff, &handoff_path, None);
