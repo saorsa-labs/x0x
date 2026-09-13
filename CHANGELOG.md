@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Tests
+
+- **The #684 settle-barrier workaround is retired (closes #692).** Both
+  restart barriers in `hs_f2_membership_cluster.rs` (lines 2610 and 3420) go
+  back to the plain `#510` assertion; the `joiner_net.disconnect()` call and
+  its `DIAG ... action=disconnect_stale_owner reason=ant-quic#283` line are
+  gone. The workaround existed because ant-quic's `shutdown()` left superseded
+  lifecycle survivors open, so `is_connected` could stay true until the idle
+  timeout (ant-quic#283); 0.27.51 closed that and 0.27.52 closed the residual
+  accept-worker path (ant-quic#286/#288), so the barrier can assert again
+  instead of masking. Gate: 60/60 on each of
+  `integration_treekem_home_rename_restart_single_announce_end_to_end`,
+  `integration_real_home_provision_rename_restart_join_e2e` and
+  `connection_churn_falls_back_to_reliable`, against a negative control
+  (same code, ant-quic pinned back to `=0.27.50`) that fails 1 of 20. That
+  supports "no evidence of a residual failure rate of ~5% or worse on macOS",
+  not "the race is gone" — see the PR for the full matrix and its limits.
+
 ## [v0.44.0] - 2026-09-13
 
 ### Changed
