@@ -4134,6 +4134,20 @@ impl Agent {
             .map(|rt| rt.pubsub().inbound_by_topic_snapshot())
     }
 
+    /// #674 C2/C3 relay fan-out snapshot (`topics` / `forward_msgs` /
+    /// `lazy_msgs` / `withheld_eager_peers` + per-topic lazy counts).
+    ///
+    /// Returns `None` when the agent has no gossip runtime. Exposed through
+    /// `GET /diagnostics/gossip` as `relay_fanout`, beside
+    /// `pubsub_stages` / `inbound_by_topic`, so the lazy-vs-eager relay
+    /// split is directly observable on live bootstraps.
+    #[must_use]
+    pub fn gossip_relay_fanout(&self) -> Option<serde_json::Value> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().relay_fanout_diagnostics())
+    }
+
     /// Snapshot of ant-quic → gossip receive-pump diagnostics.
     ///
     /// Returns `None` when this agent was built without a network node.

@@ -60,6 +60,17 @@ pub struct GossipConfig {
     #[serde(default = "default_leaf_egress_hard")]
     pub leaf_egress_hard_bytes_per_sec: u64,
 
+    /// #674 C3: per-topic budget for *eager* re-forwarding of relayed
+    /// messages on topics this node subscribes to. Within budget, verdicts
+    /// stay `ForwardAndDeliver` (today's behaviour); beyond it the topic
+    /// degrades to `LazyForward` — eager re-publish withheld, msg-ids
+    /// announced via IHAVE, peers pull by IWANT — and recovers as the
+    /// bucket refills. Topics with **zero local subscribers** are always
+    /// `LazyForward` (#674 C2) regardless of this budget. 0 disables the
+    /// C3 gate (consumed topics never go lazy); it does not disable C2.
+    #[serde(default = "default_relay_fanout_budget_msgs_per_sec")]
+    pub relay_fanout_budget_msgs_per_sec: u64,
+
     /// Operator opt-in to Full (pass-through relay) participation.
     ///
     /// TOML: `gossip.relay = true`. The `--relay` CLI flag sets the same
@@ -102,6 +113,12 @@ const fn default_leaf_egress_soft() -> u64 {
 const fn default_leaf_egress_hard() -> u64 {
     131_072
 }
+pub(crate) const fn default_relay_fanout_budget() -> u64 {
+    default_relay_fanout_budget_msgs_per_sec()
+}
+const fn default_relay_fanout_budget_msgs_per_sec() -> u64 {
+    50
+}
 
 impl Default for GossipConfig {
     fn default() -> Self {
@@ -114,6 +131,7 @@ impl Default for GossipConfig {
             leaf_max_eager_degree: default_leaf_max_eager_degree(),
             leaf_egress_soft_bytes_per_sec: default_leaf_egress_soft(),
             leaf_egress_hard_bytes_per_sec: default_leaf_egress_hard(),
+            relay_fanout_budget_msgs_per_sec: default_relay_fanout_budget_msgs_per_sec(),
             relay: false,
             participation: ParticipationMode::Leaf,
             participation_reason: String::new(),
@@ -283,6 +301,23 @@ mod tests {
         assert!(cfg.deprecation_warnings().is_empty());
         assert!(!cfg.relay);
         assert_eq!(cfg.resolved_participation(), ParticipationMode::Leaf);
+    }
+
+    #[test]
+    fn relay_fanout_budget_parses_partial_toml_and_defaults_to_50() {
+        // Why (#674 C3): the budget is the operator's only lever on eager
+        // re-forwarding of consumed topics; a partial TOML section must
+        // keep the 50 msg/s default (above the busiest measured fleet
+        // topic, ~19/s) and 0 must round-trip as "gate disabled" — not be
+        // silently normalized away.
+        let cfg: GossipConfig = toml::from_str("dispatch_workers = 2").expect("partial TOML");
+        assert_eq!(cfg.relay_fanout_budget_msgs_per_sec, 50);
+        let cfg: GossipConfig =
+            toml::from_str("relay_fanout_budget_msgs_per_sec = 0").expect("explicit zero");
+        assert_eq!(cfg.relay_fanout_budget_msgs_per_sec, 0);
+        let cfg: GossipConfig =
+            toml::from_str("relay_fanout_budget_msgs_per_sec = 7").expect("explicit value");
+        assert_eq!(cfg.relay_fanout_budget_msgs_per_sec, 7);
     }
 
     #[test]

@@ -595,6 +595,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                     .agent
                     .gossip_inbound_by_topic()
                     .unwrap_or_default(),
+                "relay_fanout": state.agent.gossip_relay_fanout().unwrap_or_default(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
                 "discovery_cache_entries": {

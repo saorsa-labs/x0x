@@ -227,7 +227,8 @@ impl BroadcastGuard {
     }
 }
 
-/// Register announce-topic validators on the PlumTree instance.
+/// Register announce-topic validators as the BASE (content) layer of the
+/// #674 relay fan-out composite.
 ///
 /// Called once at `PubSubManager` construction. Identity announces (legacy /
 /// `X0A2` / `X0A3`) and machine announces each get a classifier keyed on the
@@ -235,8 +236,18 @@ impl BroadcastGuard {
 /// same payload formats, but shard ids are per-entity and unbounded — the
 /// global broadcast topics are where the measured storm lives, so those are
 /// the enforcement points.
-pub fn register_announce_validators<T>(plumtree: &saorsa_gossip_pubsub::PlumtreePubSub<T>)
-where
+///
+/// The validators are registered on the [`RelayFanout`] handle, NOT directly
+/// on sg: sg's `set_topic_validator` replaces any prior validator for a
+/// topic, so a direct registration here would be clobbered by the composite
+/// (or vice versa). The composite consults this base layer live on every
+/// admitted message and never widens a `Drop`/`DeliverOnly` verdict, so
+/// storm-control semantics are unchanged; only the fan-out of a verdict
+/// storm control lets through can become lazy (#674 C2/C3).
+pub(crate) fn register_announce_validators<T>(
+    plumtree: &saorsa_gossip_pubsub::PlumtreePubSub<T>,
+    fanout: &std::sync::Arc<crate::gossip::relay_fanout::RelayFanout>,
+) where
     T: saorsa_gossip_transport::GossipTransport + Send + Sync + 'static,
 {
     use saorsa_gossip_pubsub::ValidationAction;
@@ -269,10 +280,9 @@ where
             to_action(classify_announce(facts, &mut rate, now_unix()))
         })
     };
-    plumtree.set_topic_validator(
-        TopicId::from_entity(crate::IDENTITY_ANNOUNCE_TOPIC.as_bytes()),
-        identity_validator,
-    );
+    let identity_topic = TopicId::from_entity(crate::IDENTITY_ANNOUNCE_TOPIC.as_bytes());
+    fanout.register_base(identity_topic, identity_validator);
+    fanout.ensure_registered(plumtree, identity_topic);
 
     let machine_rate = std::sync::Arc::new(std::sync::Mutex::new(AuthorRate::default()));
     let machine_validator: saorsa_gossip_pubsub::TopicValidator = {
@@ -285,10 +295,9 @@ where
             to_action(classify_announce(facts, &mut rate, now_unix()))
         })
     };
-    plumtree.set_topic_validator(
-        TopicId::from_entity(crate::MACHINE_ANNOUNCE_TOPIC.as_bytes()),
-        machine_validator,
-    );
+    let machine_topic = TopicId::from_entity(crate::MACHINE_ANNOUNCE_TOPIC.as_bytes());
+    fanout.register_base(machine_topic, machine_validator);
+    fanout.ensure_registered(plumtree, machine_topic);
 
     // Broadcast topics with no per-format timestamp semantics get the
     // generic guard: inner-payload replay dedupe + per-author rate limit.
@@ -312,7 +321,9 @@ where
                 to_action(guard.classify(author, inner_hash, now_unix()))
             })
         };
-        plumtree.set_topic_validator(TopicId::from_entity(topic.as_bytes()), validator);
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        fanout.register_base(topic_id, validator);
+        fanout.ensure_registered(plumtree, topic_id);
     }
 }
 
