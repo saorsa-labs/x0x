@@ -31434,10 +31434,19 @@ pub(in crate::server) mod tests {
     use axum::response::Response;
     use tokio::sync::{broadcast, mpsc, watch};
 
+    // #661: these three control families are unix-permission-shaped — their
+    // whole fixture fabric arms read-only/unsearchable dirs via
+    // PermissionsExt — so the modules do not compile for `cargo test --lib`
+    // on Windows. direct_controls is mostly cross-platform: only its seven
+    // save-failure controls (and their SaveFailureGuard) arm permissions and
+    // are gated at test level inside the module.
     mod adr0028_direct_controls;
     mod adr0028_restart_disposition;
+    #[cfg(unix)]
     mod adr0028_roster_replay_controls;
+    #[cfg(unix)]
     mod adr0028_row6_recovery_controls;
+    #[cfg(unix)]
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
     mod cache_hardening_followup;

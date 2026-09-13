@@ -621,8 +621,17 @@ mod tests {
         let mut stall = tokio::net::TcpStream::connect(handle.local_addr())
             .await
             .expect("connect to the api listener");
+        // #661 item 3: `Expect: 100-continue` makes the server's liveness on
+        // this request an OBSERVABLE protocol fact instead of a 200 ms guess:
+        // hyper sends the `100 Continue` interim response only once the
+        // handler starts reading the body, so reading it proves the request
+        // is in flight and the graceful-shutdown drain must wait for it.
+        // (The old fixed sleep could fire before the head was even accepted,
+        // letting the drain finish first and the refusal assert flake.)
         let head = format!(
-            "POST /publish HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nContent-Length: 65536\r\n\r\n",
+            "POST /publish HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\n\
+             content-type: application/json\r\nExpect: 100-continue\r\n\
+             Content-Length: 65536\r\n\r\n",
             handle.local_addr(),
         );
         stall
@@ -630,8 +639,19 @@ mod tests {
             .await
             .expect("send stalled request head");
         stall.flush().await.expect("flush stalled request head");
-        // Let the server accept the connection and start awaiting the body.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut interim = [0u8; 128];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            use tokio::io::AsyncReadExt;
+            stall.read(&mut interim).await
+        })
+        .await
+        .expect("server must answer the 100-continue probe within 10s")
+        .expect("read the 100-continue interim response");
+        let preamble = String::from_utf8_lossy(&interim[..read]);
+        assert!(
+            preamble.starts_with("HTTP/1.1 100"),
+            "expected the 100-continue interim response, got: {preamble}"
+        );
 
         // The overlap window: dropping the handle requests shutdown, and a
         // re-serve on the same data dir must be REFUSED while the first

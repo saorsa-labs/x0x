@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+### Fixed
+
+- **The history reaper is awaited at shutdown, so its SQLite handle is
+  released inside the drain (#661 item 2).** `HistoryService::shutdown`
+  used to `abort()` the reaper task fire-and-forget; the aborted future
+  holds an `Arc<Store>` — the open `history.db` connection — until the
+  runtime happens to reap it, which can land after the server supervisor
+  has finished and released `instance.lock`. A restart then had to retry
+  past that overlap. The abort is now awaited, so the connection release
+  happens deterministically before the drain that precedes lock release.
+  Residual (accepted, documented in the code): a retention pass already
+  inside its `spawn_blocking` runs to completion holding the connection —
+  blocking code cannot be cancelled — bounded by one pass and covered by
+  the restart-side retry in `tests/f2_public_group_bootstrap_wiring.rs`.
+
 ### Docs
 
 - **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
@@ -46,6 +62,17 @@ All notable changes to this project will be documented in this file.
   strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
   genuine never-reconnects regression still fails at the same place.
 
+- **The drain-held-lock test is no longer timing-shaped (#661 item 3).**
+  `reserve_during_drain_is_refused_until_the_supervisor_finishes`
+  (src/server/instance_lock.rs) used to sleep 200 ms hoping the server had
+  accepted a stalled request before asserting the re-serve refusal — under
+  load the sleep could fire first, letting the drain finish and the
+  assertion flake. The stall now sends `Expect: 100-continue` and reads the
+  server's `100 Continue` interim response, the protocol-level proof the
+  handler is in flight on the body, so the refusal assertion runs only once
+  the drain is deterministically pinned open. No sleep was widened.
+
+
 ### CI
 
 - Pin nextest to 0.9.144 in all nine CI jobs across `ci.yml` (test, coverage,
@@ -55,6 +82,19 @@ All notable changes to this project will be documented in this file.
   at job-start time, meaning any new nextest release could silently change CI
   behaviour. Each step now uses `install-action@v2` with `tool: nextest@0.9.144`
   for a reproducible, auditable install (#673).
+- Add a Windows lib-test job (#661 item 1, the unfinished half of #645
+  bullet 4): `cargo test --lib` did not compile on Windows because the
+  ADR-0028 control test modules unconditionally import
+  `std::os::unix::fs::PermissionsExt`. The three control families whose
+  whole fixture fabric is unix-permission-shaped (roster replay, row-6
+  recovery, sidecar recovery) are now `#[cfg(unix)]` at module level;
+  inside `adr0028_direct_controls` only the seven save-failure controls
+  (plus their `SaveFailureGuard`) arm permissions, so those are gated at
+  test level and the rest of the module — and the disposition module —
+  stay cross-platform. The new `Test Suite (Windows)` job compiles the
+  full lib test suite on `windows-latest`, and the instance-lock family
+  runs there — so the Windows share-mode contention path is finally
+  executed in CI, not just linked by the Build matrix.
 
 ## [v0.42.3] - 2026-09-12
 

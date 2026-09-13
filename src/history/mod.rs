@@ -183,8 +183,22 @@ impl HistoryService {
 
     /// Stop the reaper and drain the writer (bounded grace, then abandon
     /// with count — ADR-0023 §5 shutdown semantics).
+    ///
+    /// The reaper task owns an `Arc<Store>` for its whole life, so an
+    /// aborted-but-unawaited reaper keeps the SQLite connection open until
+    /// the runtime happens to drop the cancelled task — potentially after
+    /// the server supervisor has finished and released `instance.lock`
+    /// (#661 item 2). Awaiting the abort parks that release deterministically
+    /// *inside* `shutdown`, before the drain that precedes lock release.
+    /// Residual, accepted: a `retain` already inside its `spawn_blocking`
+    /// runs to completion holding the connection — blocking code cannot be
+    /// cancelled — which is bounded by one retention pass and covered by the
+    /// restart-side retry in `tests/f2_public_group_bootstrap_wiring.rs`.
     pub async fn shutdown(mut self) {
         self.reaper.abort();
+        // Awaits the cancelled task's reaping: returns promptly with a
+        // cancelled JoinError once the runtime drops the aborted future.
+        let _ = self.reaper.await;
         if let Some(writer) = self.writer.take() {
             // Writer drain is blocking (joins an OS thread).
             let _ = tokio::task::spawn_blocking(move || writer.shutdown()).await;

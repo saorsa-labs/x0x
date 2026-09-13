@@ -237,9 +237,11 @@ async fn start_daemon(dir: &Path) -> Daemon {
 
     // A restart on the same data directory can briefly race the previous
     // instance releasing its SQLite history database: `shutdown_and_wait`
-    // returns when the supervisor is done, but the background tasks holding
-    // the connection are dropped just after. Retry rather than sleep a fixed
-    // amount, so the common (first-start) case stays instant.
+    // returns when the supervisor is done, and since #661 the history
+    // reaper is awaited inside the drain, so the remaining window is only a
+    // retention pass already inside its `spawn_blocking` (uncancellable by
+    // design — see HistoryService::shutdown). Retry rather than sleep a
+    // fixed amount, so the common (first-start) case stays instant.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let handle = loop {
         let options = ServeOptions {

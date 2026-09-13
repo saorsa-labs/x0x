@@ -146,6 +146,54 @@ jobs:
           name: test-results
           path: target/nextest/
 
+
+  test-windows:
+    name: Test Suite (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-target-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-test-
+
+      # #661 / #645 bullet 4: the Windows contention path used to be
+      # compile-only in CI (the Build matrix links it; nothing ran it).
+      # `cargo test --lib` did not even compile on Windows until the
+      # unix-only adr0028 control modules were cfg-gated. Compile the whole
+      # lib test suite, then run the instance-lock family so the Windows
+      # share-mode guard finally executes in CI.
+      - name: Compile the lib test suite
+        run: cargo test --lib --no-run
+
+      - name: Run the instance-lock suite
+        run: cargo test --lib instance_lock
+
   coverage:
     name: Coverage Gate
     runs-on: ubuntu-latest

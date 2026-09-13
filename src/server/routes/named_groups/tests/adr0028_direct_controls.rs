@@ -35,7 +35,6 @@
 
 use super::*;
 use crate::groups::GroupInfo;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use x0x::identity::AgentKeypair;
 
@@ -398,11 +397,15 @@ fn outbox_parent(state: &AppState) -> PathBuf {
 /// RAII guard: makes outbox saves fail (read-only parent, mode 0o500 — still
 /// readable so `load_predecessor_relay_outbox` works) and restores write
 /// permission on drop so the tempdir cleans up. Real I/O failure, not a mock.
+// Unix-only (#661): arms/restores unix file permissions, which do not exist
+// on Windows.
+#[cfg(unix)]
 struct SaveFailureGuard {
     parent: PathBuf,
 }
 impl SaveFailureGuard {
     async fn arm(state: &AppState) -> Self {
+        use std::os::unix::fs::PermissionsExt;
         let parent = outbox_parent(state);
         let _ = tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).await;
         SaveFailureGuard { parent }
@@ -410,6 +413,7 @@ impl SaveFailureGuard {
 }
 impl Drop for SaveFailureGuard {
     fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&self.parent, std::fs::Permissions::from_mode(0o700));
     }
 }
@@ -682,6 +686,7 @@ async fn b3_expired_obligation_survives_save_but_is_dropped_on_restart() {
 // exhausted obligations in-memory, then attempts `save_predecessor_relay_outbox`
 // with no rollback on Err. Memory ends up pruned while disk still holds the
 // pre-prune state — memory != disk.
+#[cfg(unix)]
 #[tokio::test]
 async fn b4_no_due_save_failure_must_roll_back_live_memory() {
     let (state, _dir) = d_state().await;
@@ -746,6 +751,7 @@ async fn b4_no_due_save_failure_must_roll_back_live_memory() {
 // the snapshotted (due) groups. The daemon-wide prune that follows removes
 // completed obligations from EVERY group, so an unrelated group's completed
 // obligation is pruned but never restored on save failure.
+#[cfg(unix)]
 #[tokio::test]
 async fn b4_due_save_failure_must_restore_unrelated_group_prune() {
     let (state, _dir) = d_state().await;
@@ -828,6 +834,7 @@ async fn b4_due_save_failure_must_restore_unrelated_group_prune() {
 // obligation whose envelope hashes to a pre-existing tombstone's digest
 // completes, the just-added tombstone shares the digest, and the save failure
 // rolls back the wrong row.
+#[cfg(unix)]
 #[tokio::test]
 async fn b4_due_save_failure_tombstone_rollback_must_remove_just_added_not_pre_existing() {
     let (state, _dir) = d_state().await;
@@ -1174,6 +1181,7 @@ async fn b6_tampered_journal_entry_is_dropped_on_load() {
 // completion. The production path saves first and returns before counting on
 // Err, so a failed recovery write leaves the prior journal intact and counts
 // nothing. GREEN at 277505c.
+#[cfg(unix)]
 #[tokio::test]
 async fn b6_recovery_write_failure_leaves_journal_intact_and_counts_nothing() {
     let (state, _dir) = d_state().await;
@@ -1363,6 +1371,7 @@ async fn b7_relay_transaction_excludes_cross_group_dirty_write() {
 // The paired control: when no concurrent save captures A's mutation, A's
 // failed save correctly leaves no durable trace. This isolates that the leak
 // above is caused by B's intervening capture, not by the save itself.
+#[cfg(unix)]
 #[tokio::test]
 async fn b7_isolated_failed_save_leaves_no_durable_trace() {
     let (state, _dir) = d_state().await;
@@ -1540,6 +1549,7 @@ async fn b8_final_expiry_check_linearizes_with_journal_installation() {
 // fails after the B8 target refresh, the roster is rolled back but the
 // refreshed relay targets remain live in memory (and were never persisted).
 // The approval returns 500 yet the obligation's target set reflects it.
+#[cfg(unix)]
 #[tokio::test]
 async fn b8_outbox_refresh_save_failure_leaves_refreshed_targets_in_memory() {
     let (state, _dir) = d_state().await;
@@ -1604,6 +1614,7 @@ async fn b8_outbox_refresh_save_failure_leaves_refreshed_targets_in_memory() {
 // The durable outbox now carries refreshed targets for an approval the endpoint
 // reported as aborted — durable state derives from a transition that did not
 // happen.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn b8_roster_save_failure_after_outbox_success_leaves_durable_outbox_for_aborted_approval() {
     use tokio::sync::Notify;
@@ -1647,7 +1658,11 @@ async fn b8_roster_save_failure_after_outbox_success_leaves_durable_outbox_for_a
         *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
             .lock()
             .expect("hook lock") = None;
-        let _ = tokio::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500)).await;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                tokio::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500)).await;
+        }
         release_c.notify_one();
     });
 
@@ -1669,11 +1684,14 @@ async fn b8_roster_save_failure_after_outbox_success_leaves_durable_outbox_for_a
         return;
     };
     // Restore writability + clear the hook regardless of outcome.
-    let _ = tokio::fs::set_permissions(
-        state.named_groups_path.parent().expect("parent"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .await;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(
+            state.named_groups_path.parent().expect("parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .await;
+    }
     {
         let mut hook = NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
             .lock()
