@@ -10,9 +10,10 @@ All notable changes to this project will be documented in this file.
   `accept_bi` consumer per connection — the relay accept task that silently
   dropped app streams is gone (ant-quic#280/#282), `shutdown()` closes
   superseded lifecycle survivors before the drain (ant-quic#283/#285), and
-  the simultaneous-open tiebreaker liveness fixes (ant-quic#281). Closes the
-  #277 reliable-voice churn flake at the mechanism and lets the #684 settle
-  barrier workaround (#510) be retired in a follow-up.
+  the simultaneous-open tiebreaker liveness fixes (ant-quic#281). This fixes
+  the mechanism behind the #277 reliable-voice churn flake and behind the
+  #510 restart flake (refs #277, #510); retiring the #684 settle-barrier
+  workaround and the flake-list allowances is tracked in #692.
 - **The launchd loaded-policy readback now runs off the async runtime, and
   the intent record names the matched launchd domain (#671, follow-ups to
   #668).** The `plutil`/`launchctl print` subprocesses behind the
