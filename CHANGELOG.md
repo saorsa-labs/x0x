@@ -1458,8 +1458,6 @@ Home Suite hardening release. Summarises the notable user-facing changes since v
   for manually port-forwarded hosts). A NATed default daemon now announces
   false for both.
 
-## [Unreleased]
-
 ## [v0.39.6] - 2026-08-24
 
 ### Changed
