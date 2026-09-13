@@ -600,8 +600,12 @@ pub struct PubSubManager {
     passthrough_refresh_runs: AtomicU64,
     /// Name → actual PlumTree topic id (DM inboxes are not `from_entity(name)`).
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
-    /// Live subscribed transport ids for the Leaf C0 refuse gate.
+    /// Live subscribed transport ids for the Leaf C0 refuse gate AND the
+    /// #674 C2 zero-subscriber test (shared handle).
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// #674 C2/C3 relay fan-out policy: composite per-topic validators
+    /// (storm-control base + lazy-for-unconsumed + budgeted eager).
+    relay_fanout: Arc<super::relay_fanout::RelayFanout>,
     /// Whether the DM inbox opted out of the compatibility bus.  This is
     /// installed by `AgentBuilder` before network listeners can run so a
     /// trusted connect event cannot undo the opt-out with an ACK pre-warm.
@@ -811,7 +815,17 @@ impl PubSubManager {
         };
         let plumtree = Arc::new(plumtree_inner);
         register_x0x_topic_priorities(plumtree.admission().registry());
-        crate::storm_control::register_announce_validators(plumtree.as_ref());
+        // #674 C2/C3: the relay fan-out policy owns every per-topic
+        // validator registration from here on. Storm control registers its
+        // content classifiers as the base layer through the same handle,
+        // so the composite (which never widens Drop/DeliverOnly) clobbers
+        // nothing — sg's `set_topic_validator` replaces any prior
+        // validator for a topic, so two independent callers cannot both
+        // hold the slot.
+        let subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>> =
+            Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let relay_fanout = super::relay_fanout::RelayFanout::new(Arc::clone(&subscribed_topic_ids));
+        crate::storm_control::register_announce_validators(plumtree.as_ref(), &relay_fanout);
 
         Ok(Self {
             network,
@@ -832,7 +846,8 @@ impl PubSubManager {
             participation_reason: "default_leaf".to_string(),
             passthrough_refresh_runs: AtomicU64::new(0),
             topic_id_by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            subscribed_topic_ids: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            subscribed_topic_ids,
+            relay_fanout,
             skip_legacy_dm_bus: AtomicBool::new(false),
             unsubscribed_refused_frames: AtomicU64::new(0),
             unsubscribed_refused_bytes: AtomicU64::new(0),
@@ -854,6 +869,10 @@ impl PubSubManager {
         if let Some(warning) = self.egress_config.normalize_egress_budget() {
             tracing::warn!("{warning}");
         }
+        // #674 C3: the eager-forward budget rides the same pre-traffic
+        // config pass as the observe-only egress thresholds.
+        self.relay_fanout
+            .set_budget(config.relay_fanout_budget_msgs_per_sec);
         self.ensure_eager_ceiling().await;
     }
 
@@ -954,6 +973,38 @@ impl PubSubManager {
                     "semantics": "subset of eager counters matching v2 in-flight IWANT peer/topic/message IDs (unverified frame fields; PlumTree verifies the IWANT itself, #656); includes coincident same-message forwards, not confirmed delivery; anti_entropy stays separate"
                 }
             }
+        })
+    }
+
+    /// #674 C2/C3 relay fan-out snapshot for `GET /diagnostics/gossip`,
+    /// beside `pubsub_stages` / `inbound_by_topic`.
+    ///
+    /// `lazy_msgs` and `withheld_eager_peers` mirror sg's meters
+    /// (`stage_stats().validator.lazy_forward` global + per topic,
+    /// `lazy_ihave_withheld_peers`); `forward_msgs` is x0x-side because sg
+    /// meters only non-default validator verdicts. Byte accounting notes:
+    /// the IWANT serve path never records publish origin, so
+    /// `participation.relay_bytes` systematically understates relay egress
+    /// once `LazyForward` is live — read `pubsub_stages.outbound_by_kind`
+    /// `eager` (serves) + `ihave` (announces) alongside it. And
+    /// `participation.relay_msgs` changed meaning at sg 0.5.78→0.5.79 (the
+    /// relay origin meter now counts only fan-outs that attempt ≥1 peer),
+    /// so pre-0.5.79 baselines are not comparable.
+    pub fn relay_fanout_diagnostics(&self) -> serde_json::Value {
+        let stages = self.plumtree.stage_stats();
+        let lazy_by_topic: std::collections::BTreeMap<&str, u64> = stages
+            .validator
+            .by_topic
+            .iter()
+            .map(|(topic, meter)| (topic.as_str(), meter.lazy_forward))
+            .collect();
+        serde_json::json!({
+            "topics": self.relay_fanout.registered_topics(),
+            "forward_msgs": self.relay_fanout.forward_msgs(),
+            "lazy_msgs": stages.validator.lazy_forward,
+            "withheld_eager_peers": stages.lazy_ihave_withheld_peers,
+            "lazy_msgs_by_topic": lazy_by_topic,
+            "budget_msgs_per_sec": self.egress_config.relay_fanout_budget_msgs_per_sec,
         })
     }
 
@@ -1174,6 +1225,12 @@ impl PubSubManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(topic_id);
+        // #674 C2/C3: every subscribed topic carries the composite
+        // validator (C3 budget applies to consumed topics; the verdict
+        // reads the live subscriber set above, so this is once per topic,
+        // not per subscription).
+        self.relay_fanout
+            .ensure_registered(&self.plumtree, topic_id);
         // ADR-0034 / #397 (Leaf C0): a Leaf node REFUSES inbound frames —
         // including anti-entropy — for unsubscribed topics, so a topic that
         // was unsubscribed for a while has no passively-repaired state to
@@ -1536,6 +1593,16 @@ impl PubSubManager {
         if self.refuse_leaf_unsubscribed_passthrough(header.as_ref(), &data) {
             return;
         }
+        // #674 C2/C3: first sight of a topic id on the inbound path
+        // installs the relay fan-out composite validator. On a Full relay
+        // this is the ONLY way an unconsumed topic (never passed through
+        // subscribe/unsubscribe) gets the lazy-forward verdict — sg creates
+        // topic state from inbound frames directly. One read-locked set
+        // lookup per frame; the write path runs once per topic.
+        if let Some(header) = &header {
+            self.relay_fanout
+                .ensure_registered(&self.plumtree, header.topic);
+        }
         let _repair_scope = if header
             .as_ref()
             .is_some_and(|header| header.kind == MessageKind::IWant)
@@ -1723,6 +1790,9 @@ impl PubSubManager {
 
     /// Initialize PlumTree peers for a topic from currently connected peers.
     async fn initialize_topic_peers(&self, topic: TopicId) {
+        // #674 C2/C3: the pre-subscribe warm path also creates the topic,
+        // so the composite must exist before any inbound frame can admit.
+        self.relay_fanout.ensure_registered(&self.plumtree, topic);
         self.ensure_eager_ceiling().await;
         // Issue #206: plane-gated peer view (see refresh_topic_peers).
         let peers: Vec<PeerId> = self.transport.connected_peer_ids().await;
@@ -4621,6 +4691,186 @@ mod tests {
         assert_eq!(
             snap.unsubscribed_refused_frames, 0,
             "Full must keep today's unsubscribed pass-through"
+        );
+    }
+
+    /// Wire-kind aggregate from sg stage stats (`outbound_by_kind`).
+    fn kind_meter(manager: &PubSubManager, kind: &str) -> (u64, u64) {
+        manager
+            .stage_stats()
+            .outbound_by_kind
+            .get(kind)
+            .map(|meter| (meter.msgs, meter.bytes))
+            .unwrap_or((0, 0))
+    }
+
+    /// Drain every recorded send from a manager's test recorder.
+    fn drain_sends(manager: &PubSubManager) -> Vec<(PeerId, Bytes)> {
+        std::mem::take(
+            &mut manager
+                .transport
+                .recorder
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .sends,
+        )
+    }
+
+    /// WHY (#674 C2/C3 — the acceptance seam): a Full relay carrying a
+    /// topic it has NO local subscriber for must forward lazily — zero
+    /// EAGER re-publish, IHAVE announce instead — while the subscriber at
+    /// the far end still receives every payload (IHAVE → IWANT → serve).
+    /// Both meter assertions fail on main by construction: main
+    /// eager-republishes all N (eager delta > 0) and its only topic peer
+    /// is eager, so the lazy set is empty and no IHAVE is flushed.
+    ///
+    /// Line topology publisher → relay → subscriber, hermetic: the wire is
+    /// the test recorder, frames are ferried between `handle_incoming`
+    /// calls exactly as the transport would deliver them.
+    #[tokio::test]
+    async fn relay_fanout_wiring_lazy_relay_preserves_delivery() {
+        use std::collections::HashSet as StdHashSet;
+
+        const N: u64 = 8;
+        const TOPIC: &str = "x0x.relay.fanout.wiring.test";
+        let topic_id = TopicId::from_entity(TOPIC.as_bytes());
+
+        let publisher = PubSubManager::new(test_node().await, None).expect("publisher manager");
+        let relay = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "operator_relay",
+        )
+        .expect("relay manager");
+        let subscriber = PubSubManager::new(test_node().await, None).expect("subscriber manager");
+
+        let pub_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(publisher.transport.as_ref());
+        let relay_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(relay.transport.as_ref());
+        let sub_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(subscriber.transport.as_ref());
+
+        *publisher.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![relay_peer],
+            sends: Vec::new(),
+        });
+        *relay.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![sub_peer],
+            sends: Vec::new(),
+        });
+        *subscriber.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+
+        let _pub_sub = publisher.subscribe(TOPIC.to_string()).await;
+        let mut sub = subscriber.subscribe(TOPIC.to_string()).await;
+        publisher
+            .set_topic_peers_for_test(topic_id, vec![relay_peer])
+            .await;
+        // The relay never subscribes: its only eager member is the
+        // subscriber, exactly the peer a lazy verdict must announce to.
+        relay
+            .set_topic_peers_for_test(topic_id, vec![sub_peer])
+            .await;
+
+        let (eager_msgs_0, eager_bytes_0) = kind_meter(&relay, "eager");
+        let (ihave_msgs_0, ihave_bytes_0) = kind_meter(&relay, "ihave");
+        let stats_0 = relay.stage_stats();
+        let lazy_0 = stats_0.validator.lazy_forward;
+        let withheld_0 = stats_0.lazy_ihave_withheld_peers;
+
+        // Publish N messages; ferry each recorded EAGER frame to the relay.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut ferried = 0_u64;
+        for i in 0..N {
+            publisher
+                .publish(TOPIC.to_string(), Bytes::from(format!("wiring-{i}")))
+                .await
+                .expect("wiring publish");
+            // Wait for the publish's EAGER to reach the recorder (sg
+            // records the claim synchronously, the send task may lag).
+            loop {
+                let sends = drain_sends(&publisher);
+                for (_peer, bytes) in sends {
+                    relay.handle_incoming(pub_peer, bytes).await;
+                    ferried += 1;
+                }
+                if ferried > i {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "publisher frame {i} never reached the recorder"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // Let the relay's IHAVE flush (100 ms interval) announce the ids.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let relay_frames = drain_sends(&relay);
+
+        // --- Checkpoint: the C2 mechanism, before any pull happens. ---
+        let (eager_msgs_1, eager_bytes_1) = kind_meter(&relay, "eager");
+        let (ihave_msgs_1, ihave_bytes_1) = kind_meter(&relay, "ihave");
+        assert_eq!(
+            (eager_msgs_1 - eager_msgs_0, eager_bytes_1 - eager_bytes_0),
+            (0, 0),
+            "relay must not eager-re-publish an unconsumed topic (main: N republishes)"
+        );
+        assert!(
+            ihave_msgs_1 > ihave_msgs_0 && ihave_bytes_1 > ihave_bytes_0,
+            "relay must announce the withheld ids via IHAVE (main: eager-only, no IHAVE)"
+        );
+        let stats_1 = relay.stage_stats();
+        assert_eq!(stats_1.validator.lazy_forward - lazy_0, N);
+        assert_eq!(
+            stats_1.lazy_ihave_withheld_peers - withheld_0,
+            N,
+            "the subscriber peer was withheld once per message"
+        );
+
+        // --- The delivery guarantee: IHAVE → IWANT → serve → subscriber. ---
+        for (_peer, bytes) in relay_frames {
+            subscriber.handle_incoming(relay_peer, bytes).await;
+        }
+        let mut received: StdHashSet<String> = StdHashSet::new();
+        let pull_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while received.len() < N as usize && tokio::time::Instant::now() < pull_deadline {
+            for (_peer, bytes) in drain_sends(&subscriber) {
+                relay.handle_incoming(sub_peer, bytes).await;
+            }
+            for (_peer, bytes) in drain_sends(&relay) {
+                subscriber.handle_incoming(relay_peer, bytes).await;
+            }
+            while let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(20), sub.recv()).await
+            {
+                received.insert(String::from_utf8_lossy(&message.payload).into_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let expected: StdHashSet<String> = (0..N).map(|i| format!("wiring-{i}")).collect();
+        assert_eq!(
+            received, expected,
+            "lazy relay must deliver every payload to the far-end subscriber"
+        );
+
+        // Attribution (sg 0.5.79 fact): the IWANT serve path records NO
+        // publish origin and lands in `eager` — eager bytes AFTER the pull
+        // are serves, not re-publishes. The pre-pull checkpoint above is
+        // what proves zero re-publishing; this proves every message was
+        // served on demand at least once.
+        let (eager_msgs_2, _) = kind_meter(&relay, "eager");
+        assert!(
+            eager_msgs_2 - eager_msgs_1 >= N,
+            "each of the N messages must have been served on IWANT at least once"
         );
     }
 

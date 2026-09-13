@@ -7,6 +7,7 @@ pub mod config;
 mod egress;
 pub mod participation;
 pub mod pubsub;
+pub(crate) mod relay_fanout;
 pub mod runtime;
 pub(crate) mod wire;
 
