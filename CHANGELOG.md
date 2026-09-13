@@ -3,9 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
-
 ### Changed
 
+- ant-quic pin bumped 0.27.50 → 0.27.51: `disconnect()` no longer leaves a
+  stale connection observable to `open_bi()` (ant-quic#278/#279), one
+  `accept_bi` consumer per connection — the relay accept task that silently
+  dropped app streams is gone (ant-quic#280/#282), `shutdown()` closes
+  superseded lifecycle survivors before the drain (ant-quic#283/#285), and
+  the simultaneous-open tiebreaker liveness fixes (ant-quic#281). This fixes
+  the mechanism behind the #277 reliable-voice churn flake and behind the
+  #510 restart flake (refs #277, #510); retiring the #684 settle-barrier
+  workaround and the flake-list allowances is tracked in #692.
 - **The launchd loaded-policy readback now runs off the async runtime, and
   the intent record names the matched launchd domain (#671, follow-ups to
   #668).** The `plutil`/`launchctl print` subprocesses behind the
@@ -38,18 +46,6 @@ three public types gained fields.
   populate it. `UpgradeHandoff` keeps `#[serde(default)]` on the field, so
   intent files written before this change still parse.
 
-### Docs
-
-- **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
-  `docs/design/292-plane-gate-churn-model.md` documenting all six invariants (A–F) with code
-  anchors and test references. Invariant E is proved subsumed by invariant A
-  (`src/network.rs:3192`) plus the ordering contract of `disconnect_with_reason`
-  (`src/network.rs:3133`): `suppress_reconnect` is called before `node.disconnect()`, so
-  `peer_admission` returns `Suppressed` before the QUIC close, with no window in which a
-  plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
-  already covers the full observable chain. Added an `invariant E` anchor comment to
-  `plane_handle_hello` (`src/network.rs:3492`). Closes #632.
-
 ### Tests
 
 - `e2e_deploy.sh` binary upload to VPS nodes is now bounded (900 s per
@@ -80,6 +76,18 @@ three public types gained fields.
   to force the joiner's view clean and continues rather than panicking. The
   strict `gossip_plane_peers` assertions after the barrier are unchanged, so a
   genuine never-reconnects regression still fails at the same place.
+
+### Docs
+
+- **Plane-gate churn model: invariant E (PlaneRefuse) closed as subsumed (#632, #292).** Added
+  `docs/design/292-plane-gate-churn-model.md` documenting all six invariants (A–F) with code
+  anchors and test references. Invariant E is proved subsumed by invariant A
+  (`src/network.rs:3192`) plus the ordering contract of `disconnect_with_reason`
+  (`src/network.rs:3133`): `suppress_reconnect` is called before `node.disconnect()`, so
+  `peer_admission` returns `Suppressed` before the QUIC close, with no window in which a
+  plane-refused peer can transition to `Admitted`. `cross_plane_pair_does_not_exchange_gossip`
+  already covers the full observable chain. Added an `invariant E` anchor comment to
+  `plane_handle_hello` (`src/network.rs:3492`). Closes #632.
 
 ### CI
 
