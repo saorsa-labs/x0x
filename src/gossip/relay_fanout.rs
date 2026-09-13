@@ -153,6 +153,14 @@ impl RelayFanout {
         *write_unpoisoned(&self.budget) = msgs_per_sec.min(MAX_BUDGET_MSGS_PER_SEC);
     }
 
+    /// The effective (clamped) budget for diagnostics — differs from the
+    /// raw config value only when an operator set a value above
+    /// [`MAX_BUDGET_MSGS_PER_SEC`]; reporting the enforced number keeps
+    /// `relay_fanout.budget_msgs_per_sec` honest (Greptile P2, PR #695).
+    pub(crate) fn effective_budget(&self) -> u64 {
+        *read_unpoisoned(&self.budget)
+    }
+
     /// Register (or replace) a content-based base validator for a topic.
     /// Called at construction for the storm-control topics; the verdict
     /// takes effect on the next inbound message with no sg re-registration.
@@ -344,6 +352,20 @@ mod tests {
                 ValidationAction::ForwardAndDeliver
             );
         }
+    }
+
+    #[test]
+    fn effective_budget_reports_the_enforced_clamp() {
+        // Why (Greptile P2, PR #695): diagnostics must report what is
+        // enforced, not what was configured — an operator setting 1M msg/s
+        // sees the 100k clamp in `relay_fanout.budget_msgs_per_sec`
+        // instead of a number nothing on the wire honours.
+        let fanout = RelayFanout::new(subscriber_set());
+        assert_eq!(fanout.effective_budget(), 50, "construction default");
+        fanout.set_budget(1_000_000);
+        assert_eq!(fanout.effective_budget(), MAX_BUDGET_MSGS_PER_SEC);
+        fanout.set_budget(0);
+        assert_eq!(fanout.effective_budget(), 0);
     }
 
     #[test]

@@ -1004,7 +1004,7 @@ impl PubSubManager {
             "lazy_msgs": stages.validator.lazy_forward,
             "withheld_eager_peers": stages.lazy_ihave_withheld_peers,
             "lazy_msgs_by_topic": lazy_by_topic,
-            "budget_msgs_per_sec": self.egress_config.relay_fanout_budget_msgs_per_sec,
+            "budget_msgs_per_sec": self.relay_fanout.effective_budget(),
         })
     }
 
