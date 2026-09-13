@@ -20,7 +20,7 @@ KINDS = ("eager", "ihave", "iwant", "anti_entropy")
 BUS = "a746d680e31732d1"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-PUBSUB_SHA = "a4003d64b7d2edbea274e14a30d5997aa8fd316a5b1cc9634310982f0287a863"
+PUBSUB_SHA = "2070b36d7e26e8fdebd3a0d84f7aae8f30bebb607e2fdcf3e916faf43da336dc"
 
 
 class Inconclusive(ValueError):
@@ -188,7 +188,7 @@ def derive(record, lock_bytes):
     require(hashlib.sha256(lock_bytes).hexdigest() == record["build_lock_sha256"], "BUILD_LOCK_MISMATCH")
     require(HEX64.fullmatch(record["binary_sha256"]) is not None, "BINARY_HASH_MISSING")
     packages = [p for p in tomllib.loads(lock_bytes.decode())["package"] if p["name"] == "saorsa-gossip-pubsub"]
-    require(len(packages) == 1 and packages[0]["version"] == "0.5.78" and packages[0]["checksum"] == PUBSUB_SHA, "PRODUCER_PIN_MISMATCH")
+    require(len(packages) == 1 and packages[0]["version"] == "0.5.79" and packages[0]["checksum"] == PUBSUB_SHA, "PRODUCER_PIN_MISMATCH")
     require(0 < len(record["universe"]) <= 64, "UNIVERSE_BOUND")
     full, allowed = set(), set()
     for topic in record["universe"]:
