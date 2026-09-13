@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [v0.43.0] - 2026-09-13
+
 ### Changed
 
 - ant-quic pin bumped 0.27.50 → 0.27.51: `disconnect()` no longer leaves a
