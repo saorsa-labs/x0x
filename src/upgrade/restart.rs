@@ -644,7 +644,7 @@ pub struct SystemdVerifiedUnit {
     /// runs must target the same one.
     pub user_manager: bool,
     /// The confirmed `Restart=` value (one of
-    /// [`RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART`]).
+    /// `RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART`).
     pub restart: String,
     /// present and parseable.
     pub template_version: Option<u32>,
@@ -1505,7 +1505,7 @@ fn monotonic_now_us() -> Option<u64> {
 
 /// Driver half of the systemd readback (Linux): read this process's cgroup
 /// and `INVOCATION_ID`, then verify the loaded policy through
-/// [`readback_systemd_policy_in`]. Returns
+/// `readback_systemd_policy_in`. Returns
 /// [`SystemdPolicyReadback::NotApplicable`] unless a systemd signal
 /// classified this instance, so non-systemd applies shell out to nothing.
 #[cfg(target_os = "linux")]

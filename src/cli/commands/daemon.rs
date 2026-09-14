@@ -955,23 +955,23 @@ mod tests {
 
     #[test]
     fn systemd_exec_arg_escapes_specifier_dollar_and_backslash() {
-        // Plain argument: no quoting, no escaping.
+        // Plain arguments receive only the always-present outer quotes.
         assert_eq!(escape_systemd_exec_arg("--name"), "\"--name\"");
         assert_eq!(
             escape_systemd_exec_arg("/opt/x0x/x0xd"),
             "\"/opt/x0x/x0xd\""
         );
-        // Whitespace triggers quoting.
+        // Whitespace remains one argument inside the outer quotes.
         assert_eq!(escape_systemd_exec_arg("a b"), "\"a b\"");
         // % → %% (specifier escape, man systemd.service SPECIFIERS).
-        assert_eq!(escape_systemd_exec_arg("100%"), "100%%");
+        assert_eq!(escape_systemd_exec_arg("100%"), "\"100%%\"");
         // $ → $$ (variable substitution escape, man systemd.service
         // COMMAND LINES).
-        assert_eq!(escape_systemd_exec_arg("$FOO"), "$$FOO");
-        assert_eq!(escape_systemd_exec_arg("${FOO}"), "$${FOO}");
+        assert_eq!(escape_systemd_exec_arg("$FOO"), "\"$$FOO\"");
+        assert_eq!(escape_systemd_exec_arg("${FOO}"), "\"$${FOO}\"");
         // \ → \\ (escape character itself) — unconditionally, not just
         // inside quotes.
-        assert_eq!(escape_systemd_exec_arg("C:\\path"), "C:\\\\path");
+        assert_eq!(escape_systemd_exec_arg("C:\\path"), "\"C:\\\\path\"");
         assert_eq!(escape_systemd_exec_arg("\"quoted\""), "\"\\\"quoted\\\"\"");
         // Empty argument renders as quoted empty string (systemd cannot
         // express a bare empty token otherwise).
