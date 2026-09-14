@@ -3083,10 +3083,9 @@ mod tests {
 
     #[test]
     fn non_marker_signals_do_not_gate_on_a_launchd_readback() {
-        // INVOCATION_ID (systemd) is not a launchd marker: the readback is
-        // Unavailable on this platform, and the contract still resolves —
-        // the marker-in-isolation gap is a launchd-specific fix (#615); the
-        // systemd-side readback is deliberately out of its scope.
+        // INVOCATION_ID (systemd) is not a launchd marker: the launchd
+        // readback is unavailable on this platform, while the independently
+        // verified systemd policy still supports the supervised exit.
         let dir = tempfile::tempdir().expect("tempdir");
         let signals = SupervisionSignals {
             invocation_id: true,
@@ -3101,10 +3100,24 @@ mod tests {
             &LaunchdPolicyReadback::Unavailable {
                 detail: "no launchd on a systemd unit".to_string(),
             },
-            &SystemdPolicyReadback::NotApplicable,
+            &SystemdPolicyReadback::Verified(Box::new(SystemdVerifiedUnit {
+                unit: "x0xd.service".to_string(),
+                user_manager: false,
+                restart: "always".to_string(),
+                template_version: Some(1),
+            })),
         )
-        .expect("systemd signals do not require a launchd readback");
+        .expect("verified systemd policy does not require a launchd readback");
         assert_eq!(plan.mode, RestartMode::SupervisedExit);
+        assert_eq!(
+            plan.systemd_verified,
+            Some(SystemdVerifiedUnit {
+                unit: "x0xd.service".to_string(),
+                user_manager: false,
+                restart: "always".to_string(),
+                template_version: Some(1),
+            })
+        );
     }
 
     // ------------------------------------------------------------------------
