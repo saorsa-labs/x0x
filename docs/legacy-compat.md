@@ -196,11 +196,20 @@ cannot do:
   stillness, because 500 ms is thin on exactly the starved runners this
   targets, where one scheduling gap of that length would read as a drained
   pipeline — over `(recv_pump.pubsub.produced_total,
-  recv_pump.pubsub.dequeued_total, stages.message_kinds.eager, bus outbound
-  eager.msgs, bus outbound ihave.msgs)` on *both* measured arms, capped at
-  20 s and wrapped in a 30 s labelled deadline so a wedged arm is still
-  caught and still attributed to this label. Measured cost on a passing
-  run: ~2 s.
+  recv_pump.pubsub.dequeued_total, stages.message_kinds.eager, plus that
+  arm's bus outbound msgs)` on *both* measured arms, capped at 20 s and
+  wrapped in a 30 s labelled deadline so a wedged arm is still caught and
+  still attributed to this label. Measured cost on a passing run: ~1.5-1.8 s.
+- The bus kinds it watches are **per arm, and are the arm's own oracle
+  kinds**: D5 `eager + ihave` (#674 active dissemination), O5 `eager +
+  ihave + iwant + anti_entropy` (no bus egress of any kind). Both arms read
+  them from `D5_BUS_ORACLE_KINDS` / `O5_BUS_ORACLE_KINDS`, the same consts
+  `validate_measurement` sums, so the reset condition covers exactly the
+  verdict it protects by construction rather than by two lists agreeing —
+  and `load.quiescence.bus_kinds_watched` records which kinds were in force
+  for the run. A barrier watching a narrower quantity than the oracle
+  judges on is what produced the 189-vs-200 gap; these consts are what stop
+  it recurring if either oracle's kinds change.
 - On **timeout** it does not fail, retry or widen anything — it stops
   waiting, records `"quiescent": false` with the elapsed `waited_ms`, and
   the t1 cut is taken exactly as before. A `false` there means the arms

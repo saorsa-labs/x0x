@@ -1432,30 +1432,59 @@ fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
         "recv_pump":recv_pump})
 }
 
-/// #613: the cumulative quantities the t1 cut depends on. The last two are
-/// load-bearing and were missing from the first version of this barrier: the
-/// oracle reads **bus egress** (`sample_rows` over
+/// The bus wire kinds each arm's oracle judges on. Shared by
+/// `validate_measurement` and by the drain barrier so the barrier's reset
+/// condition covers **exactly** the verdict it protects — no more and no
+/// less — by construction rather than by two lists agreeing. A barrier
+/// watching a narrower quantity than the oracle judges on is what produced
+/// the 189-vs-200 gap; these consts are what stop that recurring if either
+/// oracle's kinds change.
+///
+/// D5 is judged on active dissemination (#674: eager re-publish, or the
+/// IHAVE announce a `LazyForward` verdict withholds it for). O5 is judged on
+/// the strictly stronger claim of no bus egress of ANY kind.
+const D5_BUS_ORACLE_KINDS: [&str; 2] = ["eager", "ihave"];
+const O5_BUS_ORACLE_KINDS: [&str; 4] = ["eager", "ihave", "iwant", "anti_entropy"];
+
+/// #613: the cumulative quantities the t1 cut depends on. The bus-egress
+/// terms are load-bearing and were missing from the first version of this
+/// barrier: the oracle reads **bus egress** (`sample_rows` over
 /// `egress.outbound_by_topic_named`), and that lags ingress. In the drain
 /// probe that motivated the barrier, D5 had already produced and decoded 201
 /// at the old cut instant — ingress essentially complete — while its bus
 /// eager egress read 189. Stabilising on ingress alone would therefore
 /// report quiescent while the measured quantity was still draining.
 ///
-/// Including egress cannot mask anything on the O5 arm: the value the O5
-/// oracle requires is 0, which is stable on the first poll, so the term
-/// tightens that arm rather than loosening it.
-fn drain_counts(agent: &Agent, bus: &str) -> (u64, u64, u64, u64, u64) {
+/// `kinds` is that arm's entry from the consts above, read from the same
+/// `stage_stats().outbound_by_topic` row under the same topic key the oracle
+/// projects, so there is no parallel counter that could drift. Including
+/// egress cannot mask anything on the O5 arm: the value that arm's oracle
+/// requires is 0, stable on the first poll, so the terms tighten it.
+fn drain_counts(agent: &Agent, bus: &str, kinds: &[&str]) -> (u64, u64, u64, Vec<u64>) {
     let pump = agent
         .recv_pump_diagnostics()
         .expect("actual recv pump getter");
     let stages = pubsub(agent).stage_stats();
     let bus_row = stages.outbound_by_topic.get(bus);
+    let bus_msgs = kinds
+        .iter()
+        .map(|kind| {
+            bus_row.map_or(0, |row| match *kind {
+                "eager" => row.eager.msgs,
+                "ihave" => row.ihave.msgs,
+                "iwant" => row.iwant.msgs,
+                "anti_entropy" => row.anti_entropy.msgs,
+                // Fail loud: silently reading 0 for a mistyped kind would
+                // leave the barrier blind to exactly what it must watch.
+                other => panic!("unknown bus wire kind {other}"),
+            })
+        })
+        .collect();
     (
         pump.pubsub.produced_total,
         pump.pubsub.dequeued_total,
         stages.message_kinds.eager,
-        bus_row.map_or(0, |row| row.eager.msgs),
-        bus_row.map_or(0, |row| row.ihave.msgs),
+        bus_msgs,
     )
 }
 
@@ -1488,7 +1517,12 @@ async fn await_drain_quiescence(d5: &Agent, o5: &Agent) -> serde_json::Value {
     // Measured cost at 4 is ~2 s against a 20 s cap.
     const STABLE_POLLS: u32 = 4;
     let bus = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
-    let sample = || (drain_counts(d5, &bus), drain_counts(o5, &bus));
+    let sample = || {
+        (
+            drain_counts(d5, &bus, &D5_BUS_ORACLE_KINDS),
+            drain_counts(o5, &bus, &O5_BUS_ORACLE_KINDS),
+        )
+    };
     let started = tokio::time::Instant::now();
     let mut previous = sample();
     let mut stable = 0u32;
@@ -1507,7 +1541,8 @@ async fn await_drain_quiescence(d5: &Agent, o5: &Agent) -> serde_json::Value {
         "poll_ms": POLL.as_millis() as u64,
         "budget_ms": BUDGET.as_millis() as u64,
         "stable_polls_required": STABLE_POLLS,
-        "counts": "per measured arm: (recv_pump.pubsub.produced_total, recv_pump.pubsub.dequeued_total, stages.message_kinds.eager, bus outbound eager.msgs, bus outbound ihave.msgs)",
+        "counts": "per measured arm: (recv_pump.pubsub.produced_total, recv_pump.pubsub.dequeued_total, stages.message_kinds.eager, bus outbound msgs for that arm's oracle kinds)",
+        "bus_kinds_watched": {"D5": D5_BUS_ORACLE_KINDS, "O5": O5_BUS_ORACLE_KINDS},
         "timeout_behaviour": "records quiescent=false and cuts as before; never retries, fails or widens the oracle",
     })
 }
@@ -1700,13 +1735,13 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
                 ));
             }
             // Cached endpoint peer_scores are diagnostic only.
-            if delta(&a, &b, &["eager", "ihave"])? == 0 {
+            if delta(&a, &b, &D5_BUS_ORACLE_KINDS)? == 0 {
                 return Err(format!(
                     "FAIL: D5 recorded no bus dissemination (eager or IHAVE){}",
                     facts()
                 ));
             }
-        } else if delta(&a, &b, &["eager", "ihave", "iwant", "anti_entropy"])? != 0 {
+        } else if delta(&a, &b, &O5_BUS_ORACLE_KINDS)? != 0 {
             return Err(format!(
                 "FAIL: O5 recorded bus egress of any kind{}",
                 facts()
