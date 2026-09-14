@@ -152,6 +152,81 @@ jobs:
           name: test-results
           path: target/nextest/
 
+  linux-systemd-policy:
+    name: Linux systemd policy acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Resolve acceptance dependency graph
+        run: cargo generate-lockfile
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-linux690-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Cache acceptance target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-linux690-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'examples/linux690_systemd_probe.rs') }}
+
+      - name: Build only the systemd acceptance probe
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo build --locked --example linux690_systemd_probe
+
+      - name: Exercise inert runner controls
+        run: python3 -B scripts/ci/test_linux690_systemd_acceptance.py -v
+
+      - name: Prepare Linux acceptance custody
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/linux690-systemd-acceptance"
+          mkdir -m 700 "${artifact}"
+          git rev-parse HEAD >"${artifact}/source-head.txt"
+          git rev-parse 'HEAD^{tree}' >"${artifact}/source-tree.txt"
+          sha256sum Cargo.lock >"${artifact}/cargo-lock-sha256.txt"
+          sha256sum target/debug/examples/linux690_systemd_probe >"${artifact}/probe-pre-run-sha256.txt"
+
+      - name: Exercise loaded systemd policy and clean-exit respawn
+        id: systemd_acceptance
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/linux690-systemd-acceptance"
+          set +e
+          sudo scripts/ci/linux690-systemd-acceptance.sh \
+            --probe "${GITHUB_WORKSPACE}/target/debug/examples/linux690_systemd_probe" \
+            --manager system \
+            --artifact-root "${artifact}"
+          acceptance_status=$?
+          set -e
+          if ! sudo test -d "${artifact}"; then
+            sudo mkdir -m 700 -p "${artifact}"
+          fi
+          sudo chown -R "$(id -u):$(id -g)" "${artifact}"
+          sha256sum target/debug/examples/linux690_systemd_probe >"${artifact}/probe-post-run-sha256.txt"
+          printf 'ACCEPTANCE_EXIT=%s\n' "${acceptance_status}" >"${artifact}/workflow-exit.txt"
+          exit "${acceptance_status}"
+
+      - name: Upload Linux systemd acceptance custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux690-systemd-acceptance
+          path: ${{ runner.temp }}/linux690-systemd-acceptance/
+          if-no-files-found: error
+
 
   test-windows:
     name: Test Suite (Windows)

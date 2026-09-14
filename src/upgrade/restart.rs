@@ -1132,7 +1132,7 @@ fn same_executable_canonical(loaded: &str, ours: &Path) -> bool {
             std::fs::canonicalize(ours)
         ),
         (Ok(a), Ok(b)) if a == b
-    );
+    )
 }
 /// Parse a systemd timespan (`systemctl show` renders `StartLimitIntervalUSec`
 /// as e.g. `10s`, `1min 30s`, `500ms`, `0`, or `infinity`) into microseconds.
@@ -3861,6 +3861,41 @@ mod tests {
     }
 
     const SYSTEM_CGROUP: &str = "0::/system.slice/x0xd.service";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_executable_identity_uses_canonical_paths() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let executable = dir.path().join("x0xd");
+        let alias = dir.path().join("x0xd-alias");
+        let other = dir.path().join("other-x0xd");
+        std::fs::write(&executable, b"fixture executable")?;
+        std::fs::write(&other, b"different fixture executable")?;
+        symlink(&executable, &alias)?;
+
+        assert!(same_executable_canonical(
+            alias
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 alias"))?,
+            &executable,
+        ));
+        assert!(!same_executable_canonical(
+            other
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 other path"))?,
+            &executable,
+        ));
+        assert!(!same_executable_canonical(
+            dir.path()
+                .join("missing")
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 missing path"))?,
+            &executable,
+        ));
+        Ok(())
+    }
 
     #[test]
     fn systemd_readback_verifies_healthy_unit_both_restart_values() {
