@@ -28,6 +28,27 @@ All notable changes to this project will be documented in this file.
   `docs/legacy-compat.md` for the measurements and for what this does **not**
   establish about the CI occurrences of #613.
 
+### Tests
+
+- **The #684 settle-barrier workaround is retired (closes #692).** Both
+  restart barriers in `hs_f2_membership_cluster.rs` (lines 2610 and 3420) go
+  back to the plain `#510` assertion; the `joiner_net.disconnect()` call and
+  its `DIAG ... action=disconnect_stale_owner reason=ant-quic#283` line are
+  gone. The workaround existed because ant-quic's `shutdown()` could leave the
+  joiner's `is_connected(old_owner)` true until the idle timeout. **The
+  responsible upstream fix is ant-quic#286/#288 in 0.27.52, not ant-quic#283
+  in 0.27.51**: with the workaround removed the defect still reproduces on
+  `=0.27.51` (1 failure in 60, same assertion, same line), so **0.27.52 is the
+  minimum safe pin** for this test. Gate: 60/60 on each of
+  `integration_treekem_home_rename_restart_single_announce_end_to_end`,
+  `integration_real_home_provision_rename_restart_join_e2e` and
+  `connection_churn_falls_back_to_reliable`. A negative control (same code,
+  ant-quic pinned back to `=0.27.50`) fires the restored assertion, which is
+  what makes the green gate falsifiable; it is not a before/after comparison
+  and no rate reduction is claimed. 0 of 60 supports "no evidence of a
+  residual failure rate of ~5% or worse on macOS", not "the race is gone" —
+  see the PR for the full matrix and its limits.
+
 ## [v0.44.0] - 2026-09-13
 
 ### Changed
@@ -1481,8 +1502,6 @@ Home Suite hardening release. Summarises the notable user-facing changes since v
   (`--relay`/`--relay-opt-in` flag or `X0X_RELAY_OPT_IN=1` — the escape hatch
   for manually port-forwarded hosts). A NATed default daemon now announces
   false for both.
-
-## [Unreleased]
 
 ## [v0.39.6] - 2026-08-24
 
