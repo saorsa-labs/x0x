@@ -170,6 +170,30 @@ cutting, and records `load.quiescence` — including whether quiescence was
 actually reached. This is a premise repair, not a tolerance: the oracle's
 requirement is unchanged, the instant it reads is now a valid one.
 
+**The cut moved — read this before distrusting the meter.** If you are
+debugging a #613-class failure on a record that has `load.quiescence`, the
+t1 sample is no longer taken at the last publish. What the barrier can and
+cannot do:
+
+- It is **bounded**: two consecutive unchanged 250 ms polls of
+  `(recv_pump.pubsub.produced_total, dequeued_total,
+  stages.message_kinds.eager)` on *both* measured arms, capped at 20 s, and
+  wrapped in a 30 s labelled deadline so a wedged arm is still caught and
+  still attributed to this label. Measured cost on a passing run: ~2.1 s.
+- On **timeout** it does not fail, retry or widen anything — it stops
+  waiting, records `"quiescent": false` with the elapsed `waited_ms`, and
+  the t1 cut is taken exactly as before. A `false` there means the arms
+  were still moving after 20 s, which is itself evidence and is why the
+  flag is recorded rather than asserted.
+- It **cannot manufacture counts**. A barrier only gives already-sent work
+  time to be processed. If frames were genuinely dropped, refused or never
+  forwarded, waiting produces no additional counts, the oracle still reads
+  zero dissemination, and the test still fails — now with the
+  `ingress[...]` attribution above. That is the property that separates
+  this from a loosened threshold: a tolerance says "a gap of N is
+  acceptable", whereas this says "measure after the system has finished,
+  not mid-flight", which is what the meter always claimed to measure.
+
 Not established by this change: whether the CI occurrences of #613 are that
 drain artefact. They did not reproduce locally (3/3 PASS on x0x v0.44.0 /
 saorsa-gossip-pubsub 0.5.80, D5 receiving 197-212 of 200 bus publications),
