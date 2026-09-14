@@ -92,13 +92,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-git-
 
+      # Cargo.lock is intentionally ignored in this application repo. Resolve it
+      # before caching so the target key identifies the dependency graph actually
+      # compiled by the locked test command below.
+      - name: Resolve test dependency graph
+        run: cargo generate-lockfile
+
       - name: Cache target directory
         uses: actions/cache@v5
         with:
           path: target
-          key: ${{ runner.os }}-target-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-target-test-
+          # Do not restore a different graph: stale test artifacts can consume the
+          # hosted runner disk when changed dependencies must be compiled again.
+          key: ${{ runner.os }}-rust-1.95.0-target-test-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
