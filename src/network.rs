@@ -719,7 +719,7 @@ pub struct RecvPumpStreamSnapshot {
     pub dropped_full: u64,
     /// Recoverable control frames (IHAVE/IWANT/AntiEntropy) proactively shed
     /// while the queue was near-full, to preserve data (EAGER) delivery
-    /// (ADR 0010). Distinct from `dropped_full`: an intentional, recoverable
+    /// (ADR 0013). Distinct from `dropped_full`: an intentional, recoverable
     /// shed, not a hard data loss.
     pub shed_priority: u64,
     /// Frames dropped because the receive queue was closed.
@@ -1362,14 +1362,14 @@ fn channel_pressure_exceeds_warn_threshold(available: usize, max: usize) -> bool
 /// small channels integer rounding makes it slightly stricter). Above this the
 /// recv pump proactively sheds recoverable control frames (IHAVE/IWANT/AntiEntropy)
 /// before they consume the last slots, preserving data (EAGER) delivery
-/// (ADR 0010). Refines ADR 0009's flat PubSub try_send/drop policy into a
+/// (ADR 0013). Refines ADR 0009's flat PubSub try_send/drop policy into a
 /// priority-aware shed; the kind-peek is gated on this threshold so the
 /// steady-state hot path pays no decode cost.
 fn channel_pressure_exceeds_shed_threshold(available: usize, max: usize) -> bool {
     available.saturating_mul(10) < max
 }
 
-/// ADR 0010: PubSub frame kinds that are safe to shed under near-overload
+/// ADR 0013: PubSub frame kinds that are safe to shed under near-overload
 /// because they are recoverable by PlumTree's lazy-push recovery. EAGER (data)
 /// and tree-maintenance frames (Prune/Graft) are never shed here.
 fn is_pubsub_shed_eligible(kind: saorsa_gossip_types::MessageKind) -> bool {
@@ -1552,7 +1552,7 @@ async fn forward_gossip_payload(
     // class behind one full channel. Direct/relayed DM never reach this
     // function (they have a lossless spill forwarder in `spawn_receiver`).
     if stream_type == GossipStreamType::PubSub {
-        // ADR 0010: under near-overload (>90% full, available < max/10), proactively shed
+        // ADR 0013: under near-overload (>90% full, available < max/10), proactively shed
         // recoverable control frames (IHAVE/IWANT/AntiEntropy) so the last
         // slots stay available for data (EAGER). The kind-peek is gated on the
         // shed threshold, so the steady-state path keeps ADR 0009's flat
@@ -6944,7 +6944,7 @@ mod pressure_tests {
 
     #[tokio::test]
     async fn recv_pump_pubsub_sheds_control_under_near_full_but_preserves_eager() {
-        // ADR 0010: when the PubSub channel is near-full (>90%, available < max/10), recoverable
+        // ADR 0013: when the PubSub channel is near-full (>90%, available < max/10), recoverable
         // control frames (IHAVE/IWANT/AntiEntropy) are shed so the last slots
         // stay available for data (EAGER). EAGER is never silently shed — when
         // the channel is truly full it hard-drops (dropped_full) as ADR 0009
