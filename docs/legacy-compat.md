@@ -120,6 +120,27 @@ baselines taken on 0.5.78 are not directly comparable, and the IWANT serve
 path still does not record publish origin — read `outbound_by_kind["eager"]`
 alongside `relay_bytes` when accounting relay egress.
 
+## 2026-09-14 — meter producer premise moved to saorsa-gossip-pubsub 0.5.81
+
+saorsa-gossip 0.5.81 is the first release carrying the #58 dedupe read-probe
+(saorsa-gossip PR #67 merged at 17:35Z on 2026-09-13; the v0.5.80 tag was cut
+at 15:52Z, so 0.5.80 does **not** contain it). It also carries bounded
+per-topic peer state (saorsa-gossip#41), the background-task shutdown
+lifecycle (#42), the rate-limited recovery bypass during active suppression
+(#29), and the WAN send-timeout tunables (PR #72 — production constants:
+`PER_PEER_REPUBLISH_TIMEOUT` 2500->4000 ms, `PEER_TIMEOUT_WINDOW` 30->60 s,
+`PEER_TIMEOUT_THRESHOLD` 5->8). The #501 meter premise therefore moves from
+0.5.80 to **0.5.81**, checksum
+`9b97359a1c57af33c5fe8c7ef5458b382db3ca47b86e68575fb352835999d887`.
+
+Note on ordering, recorded because it cost a CI outage: 0.5.81 was published
+*before* this pin bump landed. The x0x pin is a caret range and `Cargo.lock`
+is gitignored, so every fresh CI resolve immediately picked up 0.5.81 and the
+meter refused to run against an unpinned producer — turning every open PR red
+until this merged. Prepare the pin bump PR first, then publish, then merge it
+immediately.
+
+
 ## 2026-09-13 (b) — meter producer premise moved to saorsa-gossip-pubsub 0.5.80
 
 saorsa-gossip 0.5.80 carries two cooling fixes root-caused from x0x#611
