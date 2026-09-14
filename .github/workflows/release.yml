@@ -31,18 +31,18 @@ jobs:
       - name: Test release metadata validation
         run: python3 .github/scripts/test_release_metadata.py
 
-      - name: Validate release metadata (tag)
-        if: startsWith(github.ref, 'refs/tags/v')
+      # Single gate for both tag pushes and workflow_dispatch: the validator
+      # refuses any run whose actual ref is not a valid release tag
+      # (refs/tags/vX.Y.Z) matching Cargo.toml/SKILL.md/agent.json. A branch
+      # dispatch or malformed tag therefore fails here, in the first job —
+      # before build-release, sign-release, create-release, or any publish
+      # job can start.
+      - name: Validate release metadata
         run: |
           python3 .github/scripts/validate_release_metadata.py \
             --mode release_tag \
-            --tag "${GITHUB_REF_NAME}"
-
-      - name: Validate release metadata (manual dispatch)
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode push_main
+            --tag "${GITHUB_REF_NAME}" \
+            --ref "${GITHUB_REF}"
 
   # ============================================================
   # Gate: never ship on red (or unknown) CI (#128 / WS1.7)
@@ -50,6 +50,9 @@ jobs:
   require-green-ci:
     name: Require green CI on tagged commit
     runs-on: ubuntu-latest
+    # Serialize behind metadata validation: an invalid dispatch ref must be
+    # refused before this job burns up to 45 minutes of CI polling.
+    needs: validate-release-metadata
     permissions:
       actions: read
       checks: read
@@ -384,7 +387,8 @@ jobs:
           done
           # Strip 'v' prefix from tag for version string
           VERSION="${GITHUB_REF_NAME#v}"
-          # Validate that VERSION is a valid semver string (prevents broken manifests from workflow_dispatch)
+          # Validate that VERSION is a valid semver string (defense in depth:
+          # the metadata-validation job already refused non-tag refs)
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             echo "ERROR: '$VERSION' is not a valid semver version (expected tag like v1.2.3)"
             exit 1
@@ -498,17 +502,13 @@ jobs:
           cp SAORSA_PUBLIC_KEY.asc release-files/
           cp .well-known/agent.json release-files/
           # The PUBLISHED asset must be inspected against the tag, not just
-          # against the source tree (#514): on a tag push, pass the tag so a
-          # staged card that drifted from the tagged release blocks the
-          # GitHub Release step. Manual dispatches have no tag ref.
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            python3 .github/scripts/validate_release_metadata.py \
-              --mode release_tag --tag "${GITHUB_REF_NAME}" \
-              --agent-card release-files/agent.json
-          else
-            python3 .github/scripts/validate_release_metadata.py \
-              --mode push_main --agent-card release-files/agent.json
-          fi
+          # against the source tree (#514): pass the tag so a staged card
+          # that drifted from the tagged release blocks the GitHub Release
+          # step. --ref re-asserts that this run targets a valid release tag
+          # before anything is published.
+          python3 .github/scripts/validate_release_metadata.py \
+            --mode release_tag --tag "${GITHUB_REF_NAME}" --ref "${GITHUB_REF}" \
+            --agent-card release-files/agent.json
           ls -la release-files/
 
       - name: Create GitHub Release

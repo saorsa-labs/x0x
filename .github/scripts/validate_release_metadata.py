@@ -12,6 +12,13 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_POLICY_PATH = REPO_ROOT / ".github" / "release-metadata-policy.json"
 SEMVER_PATTERN = re.compile(r"(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])")
+# A release may only run on a tag ref whose name is a full semver tag
+# (optional prerelease/build suffix). Release jobs derive VERSION from
+# GITHUB_REF_NAME and assume semver, so anything else must be refused
+# before any build, signing, or publish side effect starts.
+RELEASE_TAG_REF_PATTERN = re.compile(
+    r"^refs/tags/v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
 
 
 class ValidationState:
@@ -70,6 +77,11 @@ def parse_args():
         help="Release tag to compare against metadata in release_tag mode",
     )
     parser.add_argument(
+        "--ref",
+        help="Full git ref the release runs on (e.g. refs/tags/v1.2.3); "
+        "release_tag mode refuses refs that are not a valid release tag",
+    )
+    parser.add_argument(
         "--policy",
         default=str(DEFAULT_POLICY_PATH),
         help="Path to the JSON policy file",
@@ -101,6 +113,26 @@ def normalize_tag(tag_name):
     if not tag_name:
         return None
     return tag_name[1:] if tag_name.startswith("v") else tag_name
+
+def validate_release_ref(full_ref, tag_name):
+    """Return None when full_ref is a valid release tag ref naming tag_name.
+
+    Branch dispatches (refs/heads/*) and malformed tags cannot produce a
+    release: every downstream job assumes a semver tag. The workflow passes
+    the actual GITHUB_REF here so invalid runs are refused in its first job,
+    before expensive side effects start.
+    """
+    if not RELEASE_TAG_REF_PATTERN.match(full_ref or ""):
+        return (
+            "Release must target a valid release tag ref refs/tags/vX.Y.Z "
+            f"(got {full_ref or 'none'}). Dispatch the Release workflow from "
+            "an existing tag whose version matches Cargo.toml, SKILL.md, and "
+            ".well-known/agent.json"
+        )
+    if tag_name != full_ref[len("refs/tags/"):]:
+        return f"--tag {tag_name!r} does not name the release ref {full_ref!r}"
+    return None
+
 
 
 def relative_path(path):
@@ -471,11 +503,23 @@ def main():
         raise SystemExit(
             f"--tag is only valid in release_tag mode (got mode {args.mode!r})"
         )
+    if args.ref and args.mode != "release_tag":
+        # Same lesson as --tag above: a silently ignored --ref would make
+        # the release-ref gate look like a pass — refuse it loudly instead.
+        raise SystemExit(
+            f"--ref is only valid in release_tag mode (got mode {args.mode!r})"
+        )
 
     tag_version = None
     if args.mode == "release_tag":
         if not args.tag:
             raise SystemExit("--tag is required in release_tag mode")
+        if args.ref:
+            ref_error = validate_release_ref(args.ref, args.tag)
+            if ref_error:
+                # The run itself is invalid: exit with one clear message
+                # before any rule can produce tag-derived noise.
+                raise SystemExit(ref_error)
         tag_version = normalize_tag(args.tag)
         print(f"Release tag version: {tag_version}")
 

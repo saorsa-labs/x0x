@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 VALIDATOR = Path('.github/scripts/validate_release_metadata.py')
+WORKFLOW = Path('.github/workflows/release.yml')
 CARD = Path('.well-known/agent.json')
 
 
@@ -19,7 +21,7 @@ class ReleaseCardTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for name in [VALIDATOR, CARD, Path('Cargo.toml'), Path('SKILL.md'),
+        for name in [VALIDATOR, WORKFLOW, CARD, Path('Cargo.toml'), Path('SKILL.md'),
                      Path('scripts/bump-version.sh')]:
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -32,12 +34,17 @@ class ReleaseCardTests(unittest.TestCase):
         spec.loader.exec_module(self.validator)
         self.version = self.validator.extract_cargo_version('Cargo.toml')
 
-    def validate(self, tag=None, card=None):
+    def run_validator(self, tag, ref=None, card=None):
         command = ['python3', str(self.root / VALIDATOR), '--mode', 'release_tag',
-                   '--tag', 'v' + (tag or self.version)]
+                   '--tag', tag]
+        if ref:
+            command += ['--ref', ref]
         if card:
             command += ['--agent-card', str(card)]
         return subprocess.run(command, cwd=self.root, capture_output=True, text=True)
+
+    def validate(self, tag=None, card=None):
+        return self.run_validator('v' + (tag or self.version), card=card)
 
     def test_current_source_and_staged_asset_match_tag(self):
         staged = self.root / 'release-files/agent.json'
@@ -150,6 +157,129 @@ class ReleaseCardTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual({path: (self.root / path).read_bytes() for path in paths},
                                  before)
+
+    def test_valid_tag_ref_passes(self):
+        result = self.run_validator('v' + self.version,
+                                    ref=f'refs/tags/v{self.version}')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_branch_dispatch_is_refused_before_other_checks(self):
+        # WHY: dispatching Release on a branch used to validate in push_main
+        # mode and only die after the platform builds, when VERSION derivation
+        # hit a non-semver GITHUB_REF_NAME. The ref gate must refuse first,
+        # with one clear message and no tag-derived noise.
+        for ref_name, ref in [('main', 'refs/heads/main'),
+                              ('codex/release-dispatch-guard',
+                               'refs/heads/codex/release-dispatch-guard')]:
+            with self.subTest(ref=ref):
+                result = self.run_validator(ref_name, ref=ref)
+                self.assertEqual(result.returncode, 1,
+                                 result.stdout + result.stderr)
+                self.assertIn(
+                    'Release must target a valid release tag ref refs/tags/vX.Y.Z',
+                    result.stderr)
+                self.assertNotIn('Running version_sync', result.stdout)
+                self.assertNotIn('does not match release tag', result.stdout)
+
+    def test_malformed_tag_refs_are_refused(self):
+        cases = [
+            ('v1.2', 'refs/tags/v1.2'),
+            ('v1.2.3.4', 'refs/tags/v1.2.3.4'),
+            ('v1.2.3+', 'refs/tags/v1.2.3+'),
+            ('1.2.3', 'refs/tags/1.2.3'),
+            ('main', 'refs/tags/main'),
+        ]
+        for tag, ref in cases:
+            with self.subTest(ref=ref):
+                result = self.run_validator(tag, ref=ref)
+                self.assertEqual(result.returncode, 1,
+                                 result.stdout + result.stderr)
+                self.assertIn('Release must target a valid release tag ref',
+                              result.stderr)
+
+    def test_tag_ref_disagreement_is_refused(self):
+        # A --tag that does not name the validated ref would let a caller
+        # vouch for metadata the run is not actually building from.
+        result = self.run_validator('v' + self.version, ref='refs/tags/v0.42.0')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("does not name the release ref 'refs/tags/v0.42.0'",
+                      result.stderr)
+
+    def test_valid_ref_shape_but_mismatched_metadata_fails(self):
+        # Prerelease-shaped tags are valid refs; they must still fail on the
+        # metadata-mismatch rules rather than the ref-form gate.
+        result = self.run_validator('v999.0.0-rc.1', ref='refs/tags/v999.0.0-rc.1')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('does not match release tag v999.0.0-rc.1', result.stdout)
+        self.assertNotIn('Release must target', result.stderr)
+
+    def test_ref_argument_is_rejected_outside_release_tag_mode(self):
+        # Mirror of the --tag guard: a silently ignored --ref would make the
+        # release-ref gate look like a pass — misuse must fail loudly.
+        result = subprocess.run(
+            ['python3', str(self.root / VALIDATOR), '--mode', 'push_main',
+             '--ref', 'refs/heads/main'],
+            cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('--ref is only valid in release_tag mode', result.stderr)
+
+    def run_release_validate_step(self, ref, ref_name):
+        # Execute the exact shell command the Release workflow's first job
+        # runs, extracted from the real workflow file, under a simulated ref.
+        run_block = self.validator.extract_step_run_block(
+            str(WORKFLOW), 'Validate release metadata')
+        env = dict(os.environ, GITHUB_REF=ref, GITHUB_REF_NAME=ref_name)
+        return subprocess.run(['bash', '-c', run_block], cwd=self.root,
+                              capture_output=True, text=True, env=env)
+
+    def test_workflow_validate_step_accepts_matching_tag(self):
+        result = self.run_release_validate_step(
+            f'refs/tags/v{self.version}', f'v{self.version}')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_workflow_validate_step_refuses_branch_dispatch(self):
+        result = self.run_release_validate_step('refs/heads/main', 'main')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Release must target a valid release tag ref refs/tags/vX.Y.Z',
+                      result.stderr)
+
+    def test_every_side_effect_job_is_gated_on_metadata_validation(self):
+        # Rejection must land before any build/publish side effect: every
+        # downstream job has to hang (directly or transitively) off the
+        # first validation job, and no call site may fall back to push_main.
+        text = (ROOT / WORKFLOW).read_text()
+        self.assertNotIn(
+            '--mode push_main', text,
+            'release.yml must not validate any release run in push_main mode')
+        self.assertGreaterEqual(
+            text.count('--ref "${GITHUB_REF}"'), 2,
+            'both validator call sites must pass the actual full ref')
+        needs = {}
+        current = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if line.startswith('  ') and not line.startswith('   ') \
+                    and stripped.endswith(':'):
+                current = stripped[:-1]
+                needs[current] = ''
+            elif current and stripped.startswith('needs:'):
+                needs[current] = stripped[len('needs:'):].strip()
+        expected = {
+            'require-green-ci': ['validate-release-metadata'],
+            'build-release': ['validate-release-metadata', 'require-green-ci'],
+            'sign-release': ['build-release'],
+            'create-release': ['build-release', 'sign-release'],
+            'publish-clawhub': ['create-release'],
+            'publish-crates': ['create-release'],
+        }
+        for job, dependencies in expected.items():
+            with self.subTest(job=job):
+                self.assertIn(job, needs, f'{job} is missing from release.yml')
+                for dependency in dependencies:
+                    self.assertIn(
+                        dependency, needs[job],
+                        f'{job} must need {dependency} so an invalid ref '
+                        'cannot reach it')
 
 
 if __name__ == '__main__':
