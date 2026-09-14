@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.45.0] - 2026-09-14
+
+### Changed
+
+- **saorsa-gossip 0.5.80 -> 0.5.81 (#708).** This is the release that actually
+  delivers the #58 dedupe read-probe to production: saorsa-gossip PR #67 merged
+  at 17:35Z on 2026-09-13 while the v0.5.80 tag was cut at 15:52Z, so 0.5.80
+  never contained it, and the x0x#656 CPU analysis was conducted for several
+  hours on the assumption that it was live. Also brings bounded per-topic peer
+  state (saorsa-gossip#41 — previously unbounded, with prod topic count growing
+  linearly at ~6.6/hour and no plateau observed over five hours), the
+  background-task shutdown lifecycle (#42), the rate-limited recovery bypass
+  during active peer suppression (#29), and the WAN send-timeout tunables
+  (PR #72): `PER_PEER_REPUBLISH_TIMEOUT` 2500 -> 4000 ms, `PEER_TIMEOUT_WINDOW`
+  30 -> 60 s, `PEER_TIMEOUT_THRESHOLD` 5 -> 8. Those three are **production**
+  constants, unlike the test-only fallbacks folded into saorsa-gossip PR #71.
+  The #501 meter provenance premise moved with the pin, in all four sites.
+
+
 ### Fixed
 
 - **The #501 legacy-bus meter now reads the measured arms' ingress, and cuts
