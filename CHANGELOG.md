@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
   neither changes what the oracle requires. (1) `raw_sample` began at
   saorsa-gossip's decode, so frames x0x's own receive pump discarded
   (`recv_pump.pubsub.dropped_full`) or shed near overload (`shed_priority`,
-  ADR 0010) were invisible — "never arrived" and "arrived and was dropped
+  ADR 0013) were invisible — "never arrived" and "arrived and was dropped
   here" produced an identical failure line and had to be hand-classified on
   every occurrence. The sample now carries `recv_pump` (per stream and per
   peer) and the D5 failure reasons carry an `ingress[...]` summary keyed on
@@ -20,8 +20,11 @@ All notable changes to this project will be documented in this file.
   had processed it — so it measured how much the arm had processed by the
   time the fixture looked. Measured on a quiet host: D5's bus eager egress
   read 189 at that instant and 200 three seconds later. `measure` now waits
-  for ingress to stop advancing on both measured arms (two unchanged 250 ms
-  polls, 20 s bound, typically ~2 s) and records `load.quiescence`. See
+  for both measured arms to stop advancing — ingress **and** the bus egress
+  the oracle actually reads, which lags it — before cutting (four unchanged
+  250 ms polls, 20 s bound, typically ~2 s), and records `load.quiescence`.
+  `load.elapsed_ns` stays the generator's load phase and excludes the
+  barrier, so `load_achieved_per_second` is unaffected. See
   `docs/legacy-compat.md` for the measurements and for what this does **not**
   establish about the CI occurrences of #613.
 

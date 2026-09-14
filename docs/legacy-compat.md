@@ -142,7 +142,7 @@ arm's egress, participation and `stage_stats()`. Every one of those starts
 after x0x's own receive pump has handed the frame to the gossip dispatcher.
 That pump drops PubSub frames when its bounded forward channel is full
 (`recv_pump.pubsub.dropped_full`) and proactively sheds recoverable control
-frames near overload (`shed_priority`, ADR 0010) — both silent to every
+frames near overload (`shed_priority`, ADR 0013) — both silent to every
 counter the record carried. So "the generator's frames never reached this
 host" and "they reached it and x0x discarded them" produced an identical
 failure line, and each occurrence had to be hand-classified. The sample now
@@ -164,22 +164,43 @@ processed the frame, so the old cut measured "how much had this arm processed
 by the time I looked". Measured: D5's bus eager egress was 189 at the old cut
 instant and 200 three seconds later — 5.5% of the load still in flight on an
 idle host. Under runner starvation that fraction has no bound and `delta == 0`
-is its limit. `measure` now waits for ingress to stop advancing on both
-measured arms (two consecutive unchanged 250 ms polls, 20 s bound) before
-cutting, and records `load.quiescence` — including whether quiescence was
-actually reached. This is a premise repair, not a tolerance: the oracle's
-requirement is unchanged, the instant it reads is now a valid one.
+is its limit. `measure` now waits for both measured arms to stop advancing —
+ingress **and** the bus egress the oracle actually reads — before cutting,
+and records `load.quiescence` including whether quiescence was actually
+reached. This is a premise repair, not a tolerance: the oracle's requirement
+is unchanged, the instant it reads is now a valid one.
+
+The egress term is load-bearing, and its absence was the blocking finding on
+the first version of this barrier. The oracle reads `sample_rows` over
+`egress.outbound_by_topic_named`, and that lags ingress: in the table above,
+D5 had already produced and decoded 201 at the old cut instant — ingress
+essentially complete — while its bus eager egress read 189. A barrier
+stabilising on ingress alone would have reported quiescent while the very
+quantity the oracle measures was still draining, i.e. it would have repaired
+the wrong half. Including egress cannot mask anything on the O5 arm either:
+the value that arm's oracle requires is 0, stable on the first poll, so the
+term tightens O5 rather than loosening it.
+
+`load.elapsed_ns` deliberately excludes the barrier. It is the generator's
+load phase and feeds `load_achieved_per_second` in the CI derivation;
+billing the drain to it would understate the achieved rate by roughly the
+barrier's duration and report a load the fixture did sustain as one it did
+not. The barrier's own cost lives in `load.quiescence.waited_ms`.
 
 **The cut moved — read this before distrusting the meter.** If you are
 debugging a #613-class failure on a record that has `load.quiescence`, the
 t1 sample is no longer taken at the last publish. What the barrier can and
 cannot do:
 
-- It is **bounded**: two consecutive unchanged 250 ms polls of
-  `(recv_pump.pubsub.produced_total, dequeued_total,
-  stages.message_kinds.eager)` on *both* measured arms, capped at 20 s, and
-  wrapped in a 30 s labelled deadline so a wedged arm is still caught and
-  still attributed to this label. Measured cost on a passing run: ~2.1 s.
+- It is **bounded**: four consecutive unchanged 250 ms polls — 1 s of
+  stillness, because 500 ms is thin on exactly the starved runners this
+  targets, where one scheduling gap of that length would read as a drained
+  pipeline — over `(recv_pump.pubsub.produced_total,
+  recv_pump.pubsub.dequeued_total, stages.message_kinds.eager, bus outbound
+  eager.msgs, bus outbound ihave.msgs)` on *both* measured arms, capped at
+  20 s and wrapped in a 30 s labelled deadline so a wedged arm is still
+  caught and still attributed to this label. Measured cost on a passing
+  run: ~2 s.
 - On **timeout** it does not fail, retry or widen anything — it stops
   waiting, records `"quiescent": false` with the elapsed `waited_ms`, and
   the t1 cut is taken exactly as before. A `false` there means the arms

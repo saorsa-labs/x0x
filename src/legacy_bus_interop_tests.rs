@@ -1419,7 +1419,7 @@ fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
     let stages = pubsub(agent).stage_stats();
     // #613: the ingress side of this arm. `stages` starts at sg's decode, so
     // a frame x0x's own receive pump discarded (bounded forward channel full,
-    // or ADR 0010 near-overload shed) is invisible to every counter this
+    // or ADR 0013 near-overload shed) is invisible to every counter this
     // record previously carried — leaving "arrived and was dropped here" and
     // "never arrived" indistinguishable. `recv_pump.pubsub.produced_total`
     // counts frames read off the wire BEFORE that queue, so the pair
@@ -1432,18 +1432,30 @@ fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
         "recv_pump":recv_pump})
 }
 
-/// #613: the three cumulative ingress quantities the t1 cut depends on —
-/// frames the receive pump read off the wire, frames the gossip dispatcher
-/// took off the bounded queue, and frames saorsa-gossip decoded as EAGER.
-fn ingress_counts(agent: &Agent) -> (u64, u64, u64) {
+/// #613: the cumulative quantities the t1 cut depends on. The last two are
+/// load-bearing and were missing from the first version of this barrier: the
+/// oracle reads **bus egress** (`sample_rows` over
+/// `egress.outbound_by_topic_named`), and that lags ingress. In the drain
+/// probe that motivated the barrier, D5 had already produced and decoded 201
+/// at the old cut instant — ingress essentially complete — while its bus
+/// eager egress read 189. Stabilising on ingress alone would therefore
+/// report quiescent while the measured quantity was still draining.
+///
+/// Including egress cannot mask anything on the O5 arm: the value the O5
+/// oracle requires is 0, which is stable on the first poll, so the term
+/// tightens that arm rather than loosening it.
+fn drain_counts(agent: &Agent, bus: &str) -> (u64, u64, u64, u64, u64) {
     let pump = agent
         .recv_pump_diagnostics()
         .expect("actual recv pump getter");
-    let kinds = pubsub(agent).stage_stats().message_kinds;
+    let stages = pubsub(agent).stage_stats();
+    let bus_row = stages.outbound_by_topic.get(bus);
     (
         pump.pubsub.produced_total,
         pump.pubsub.dequeued_total,
-        kinds.eager,
+        stages.message_kinds.eager,
+        bus_row.map_or(0, |row| row.eager.msgs),
+        bus_row.map_or(0, |row| row.ihave.msgs),
     )
 }
 
@@ -1458,26 +1470,33 @@ fn ingress_counts(agent: &Agent) -> (u64, u64, u64) {
 /// 5.5% of the load was still in flight. Under runner starvation that
 /// fraction has no bound, and "delta == 0" is its limit.
 ///
-/// So wait for ingress to stop advancing on BOTH measured arms before
-/// cutting. This is a quiescence barrier, not a tolerance: it does not
-/// weaken what the oracle requires, it makes the instant the oracle reads
-/// a valid one. It is bounded, it stops early in the normal case
-/// (~`POLL` on an idle pipeline), and whether it actually reached
+/// So wait for BOTH measured arms to stop moving — ingress AND the bus
+/// egress the oracle actually reads — before cutting. This is a quiescence
+/// barrier, not a tolerance: it does not weaken what the oracle requires, it
+/// makes the instant the oracle reads a valid one. A bounded barrier cannot
+/// manufacture counts: frames that were genuinely dropped, refused or never
+/// forwarded produce nothing extra no matter how long it waits, so a real
+/// forwarding failure still fails — now with attribution. It is bounded, it
+/// stops early in the normal case, and whether it actually reached
 /// quiescence is recorded in the evidence rather than assumed.
-async fn await_ingress_quiescence(d5: &Agent, o5: &Agent) -> serde_json::Value {
+async fn await_drain_quiescence(d5: &Agent, o5: &Agent) -> serde_json::Value {
     const POLL: Duration = Duration::from_millis(250);
     const BUDGET: Duration = Duration::from_secs(20);
-    // Two consecutive unchanged observations, so a single poll landing inside
-    // a scheduling gap cannot be read as a drained pipeline.
-    const STABLE_POLLS: u32 = 2;
+    // Four consecutive unchanged observations (1 s of stillness). Two was
+    // 500 ms, which is thin on exactly the starved runners this targets: one
+    // scheduling gap of that length would read as a drained pipeline.
+    // Measured cost at 4 is ~2 s against a 20 s cap.
+    const STABLE_POLLS: u32 = 4;
+    let bus = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
+    let sample = || (drain_counts(d5, &bus), drain_counts(o5, &bus));
     let started = tokio::time::Instant::now();
-    let mut previous = (ingress_counts(d5), ingress_counts(o5));
+    let mut previous = sample();
     let mut stable = 0u32;
     let mut polls = 0u64;
     while stable < STABLE_POLLS && started.elapsed() < BUDGET {
         tokio::time::sleep(POLL).await;
         polls += 1;
-        let current = (ingress_counts(d5), ingress_counts(o5));
+        let current = sample();
         stable = if current == previous { stable + 1 } else { 0 };
         previous = current;
     }
@@ -1488,7 +1507,8 @@ async fn await_ingress_quiescence(d5: &Agent, o5: &Agent) -> serde_json::Value {
         "poll_ms": POLL.as_millis() as u64,
         "budget_ms": BUDGET.as_millis() as u64,
         "stable_polls_required": STABLE_POLLS,
-        "counts": "(recv_pump.pubsub.produced_total, dequeued_total, stages.message_kinds.eager) per measured arm",
+        "counts": "per measured arm: (recv_pump.pubsub.produced_total, recv_pump.pubsub.dequeued_total, stages.message_kinds.eager, bus outbound eager.msgs, bus outbound ihave.msgs)",
+        "timeout_behaviour": "records quiescent=false and cuts as before; never retries, fails or widens the oracle",
     })
 }
 
@@ -1658,19 +1678,21 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
                 .checked_sub(bus_bytes(a, kinds)?)
                 .ok_or("bus counter decreased".into())
         };
+        // #613: neither verdict on this arm is self-explaining. A D5 zero is
+        // identical for "never received the load", "x0x's own receive pump
+        // discarded it" and "received it and refused to forward"; and an O5
+        // result — including a PASS — is only trustworthy if the barrier
+        // actually settled, since nothing having drained also produces zero
+        // bus egress. Carry the facts that separate those, so an occurrence
+        // is triaged from the failure line rather than by hand.
+        let facts = || {
+            format!(
+                " [{} quiescence={}]",
+                ingress_facts(after, generator_machine_hex),
+                raw["load"]["quiescence"]["quiescent"]
+            )
+        };
         if arm == "D5" {
-            // #613: a zero-dissemination observation is not self-explaining —
-            // it is identical for "D5 never received the load", "x0x's own
-            // receive pump discarded it" and "D5 received it and refused to
-            // forward". Carry the facts that separate those into the reason
-            // so an occurrence is triaged from the failure line, not by hand.
-            let facts = || {
-                format!(
-                    " [{} quiescence={}]",
-                    ingress_facts(after, generator_machine_hex),
-                    raw["load"]["quiescence"]["quiescent"]
-                )
-            };
             if !b.contains_key(&bus) {
                 return Err(format!(
                     "D5 positive bus row/attempt not observed{}",
@@ -1685,7 +1707,10 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
                 ));
             }
         } else if delta(&a, &b, &["eager", "ihave", "iwant", "anti_entropy"])? != 0 {
-            return Err("FAIL: O5 recorded bus egress of any kind".into());
+            return Err(format!(
+                "FAIL: O5 recorded bus egress of any kind{}",
+                facts()
+            ));
         }
     }
     Ok(())
@@ -1825,17 +1850,34 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
             }
         }
     }).await;
-    // #613: cut only once the pipeline the generator filled has drained on
-    // both measured arms; see `await_ingress_quiescence`.
+    // The generator's own phase ends HERE. `elapsed_ns` is the measured load
+    // phase and feeds `load_achieved_per_second` in the CI derivation, so the
+    // drain barrier below must not be billed to it — that would understate the
+    // achieved rate and report a load the fixture did sustain as one it did
+    // not. The barrier's own cost is recorded inside `load.quiescence`.
+    let load_elapsed = started.elapsed();
+    // #613: cut only once the quantity the oracle reads has stopped moving on
+    // both measured arms; see `await_drain_quiescence`.
     let quiescence = bounded(
-        "post-load ingress quiescence",
+        "post-load drain quiescence",
         Duration::from_secs(30),
-        await_ingress_quiescence(&agents[1], &agents[2]),
+        await_drain_quiescence(&agents[1], &agents[2]),
     )
     .await;
     raw["samples"]["D5"]["t1"] = raw_sample(&agents[1], clock);
     raw["samples"]["O5"]["t1"] = raw_sample(&agents[2], clock);
-    raw["load"] = json!({"quiescence":quiescence,"sent":sent,"payload_bytes":4096,"period_ms":50,"elapsed_ns":started.elapsed().as_nanos() as u64,"fanouts":fanouts,"witness_observed_during_load":observed.len(),"witness_attribution":"none"});
+    // #613: retain the ingress attribution for BOTH arms whatever the verdict.
+    // The O5 arm passes by observing zero bus egress, and "nothing drained"
+    // produces that too — so an O5 PASS is exactly the result whose
+    // trustworthiness rests on the barrier having settled, and it never
+    // reaches a failure reason where the facts could otherwise be attached.
+    let generator_machine_hex = hex::encode(agents[0].machine_id().0);
+    raw["ingress_attribution"] = json!({
+        "D5": ingress_facts(&raw["samples"]["D5"]["t1"], &generator_machine_hex),
+        "O5": ingress_facts(&raw["samples"]["O5"]["t1"], &generator_machine_hex),
+        "quiescent": quiescence["quiescent"].clone(),
+    });
+    raw["load"] = json!({"quiescence":quiescence,"sent":sent,"payload_bytes":4096,"period_ms":50,"elapsed_ns":load_elapsed.as_nanos() as u64,"elapsed_excludes":"post-load drain barrier (see load.quiescence.waited_ms)","fanouts":fanouts,"witness_observed_during_load":observed.len(),"witness_attribution":"none"});
     raw["generator_diagnostics"]["cuts"]["t1"] = generator_cut(&agents[0], clock);
     attach_generator_load(&mut raw, &load_returns);
     raw["topology"]["observations"]["t1"] = bounded(
