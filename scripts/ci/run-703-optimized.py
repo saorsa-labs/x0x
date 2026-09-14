@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""#703 optimized 100k diagnostic runner (ephemeral Linux CI only).
+
+Runs the exact ignored test
+  gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages
+at source commit f76521858f4a549f4f5540e0a6e1d2ea033f162a in --release
+mode, once, inside a fresh loopback-only network namespace, with the
+original 100_000 message count and all original assertions unchanged.
+
+Phases:
+  outer  (default)  : verify tree, generate+hash lock, build, select the
+                      exact libtest binary, then re-exec into the netns.
+  inner  (--inner)  : already inside the netns as the original runner
+                      UID/GID; run the single bounded 900s execution and
+                      verify the proof.
+  self-test         : deterministic offline checks of artifact selection,
+                      proof verification, and exit-code mapping. No cargo,
+                      no namespaces, safe on any host.
+
+HOME is never overridden, redirected, or deleted anywhere in this script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BASE_COMMIT = "f76521858f4a549f4f5540e0a6e1d2ea033f162a"
+BASE_TREE = "c9ec44d0d04e840eb5cfd35fb3c7094870bfae2c"
+SOURCE_PATH = "src/gossip/pubsub.rs"
+SOURCE_SHA256 = "5ad301d726732027cc2ca9026db58d0dbca27ad70a1327b16b7a5f7d512f6c42"
+SELECTOR = "gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages"
+EXPECTED_MESSAGES = 100_000
+
+# 900 s outer bound, then TERM, then KILL after a grace period.
+OUTER_TIMEOUT_SECONDS = 900
+TERM_GRACE_SECONDS = 10
+
+INNER_FLAG_ENV = "X0X_703_INNER"
+INNER_RESULT_NAME = "inner-result.json"
+REPORT_NAME = "run-report.json"
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=False, **kw)
+
+
+def git_output(repo: Path, *args: str) -> str:
+    return run(["git", "-C", str(repo), *args], capture_output=True, text=True).stdout.strip()
+
+
+def validate_changed_paths(changed: set[str]) -> None:
+    allowed = {".github/workflows/build.yml", "scripts/ci/run-703-optimized.py"}
+    unexpected = sorted(changed - allowed)
+    if unexpected:
+        raise ValueError(f"source changes outside diagnostic workflow: {unexpected}")
+    missing = sorted(allowed - changed)
+    if missing:
+        raise ValueError(f"diagnostic workflow files missing from HEAD delta: {missing}")
+
+
+def select_test_binary(build_json_text: str) -> tuple[str, list[str]]:
+    """Return (executable, notes) for the unique compiler-artifact whose
+    target kind contains 'lib' and whose executable is non-null.
+
+    Checks the native exit BEFORE this is called (caller contract).
+    """
+    matches: list[str] = []
+    for line in build_json_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("reason") != "compiler-artifact":
+            continue
+        target = msg.get("target", {})
+        kinds = target.get("kind", [])
+        exe = msg.get("executable")
+        if "lib" in kinds and exe:
+            matches.append(exe)
+    if not matches:
+        raise SystemExit("FAIL: no compiler-artifact with lib kind and non-null executable")
+    if len(matches) != 1:
+        raise SystemExit(f"FAIL: ambiguous lib test binaries: {matches}")
+    return matches[0], [f"selected {matches[0]}"]
+
+
+def verify_proof(proof: dict) -> tuple[bool, list[str]]:
+    """Verify the proof against the unchanged f765 assertions.
+
+    Returns (ok, notes). decode_to_delivery_drops == 0 is an additional
+    acceptance requirement layered over the unchanged f765 test assertions.
+    """
+    notes: list[str] = []
+
+    def need(cond: bool, label: str) -> bool:
+        notes.append(("PASS: " if cond else "FAIL: ") + label)
+        return cond
+
+    ok = True
+    ok &= need(proof.get("messages") == EXPECTED_MESSAGES,
+               f"proof messages == {EXPECTED_MESSAGES}")
+    ok &= need(proof.get("publish_total") == EXPECTED_MESSAGES,
+               f"proof publish_total == {EXPECTED_MESSAGES} (assertion)")
+    ok &= need(proof.get("fast_received") == EXPECTED_MESSAGES,
+               f"proof fast_received == {EXPECTED_MESSAGES} (assertion)")
+    drops = proof.get("slow_subscriber_dropped")
+    ok &= need(isinstance(drops, int) and drops >= 1,
+               f"proof slow_subscriber_dropped >= 1 (assertion), got {drops!r}")
+    closed = proof.get("subscriber_channel_closed")
+    ok &= need(isinstance(closed, int) and closed >= 1,
+               f"proof subscriber_channel_closed >= 1 (assertion), got {closed!r}")
+
+    ok &= need(proof.get("decode_to_delivery_drops") == 0,
+               "proof decode_to_delivery_drops == 0 (acceptance requirement), "
+               f"got {proof.get('decode_to_delivery_drops')!r}")
+    return bool(ok), notes
+
+
+def parse_libtest_summary(log_text: str) -> tuple[int, int]:
+    """Return (passed, failed) from the libtest summary line."""
+    passed = failed = -1
+    for line in log_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("test result:") and "passed" in stripped:
+            for part in stripped.split(";"):
+                part = part.strip()
+                for key, store in (("passed", "passed"), ("failed", "failed")):
+                    if part.endswith(key):
+                        try:
+                            value = int(part[: -len(key)].strip().rsplit(" ", 1)[-1])
+                        except (ValueError, IndexError):
+                            continue
+                        if store == "passed":
+                            passed = value
+                        else:
+                            failed = value
+    return passed, failed
+
+
+def namespace_state(parent: str, *, command=run, current: str | None = None) -> dict:
+    """Return checked network-namespace state or fail closed."""
+    current_ns = current if current is not None else os.readlink("/proc/self/ns/net")
+    if current_ns == parent:
+        raise RuntimeError("network namespace did not change")
+
+    def ip_json(*args: str) -> list[dict]:
+        proc = command(["/usr/sbin/ip", *args], capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ip {' '.join(args)} exited {proc.returncode}")
+        try:
+            value = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"ip {' '.join(args)} returned invalid JSON") from exc
+        if not isinstance(value, list):
+            raise RuntimeError(f"ip {' '.join(args)} returned non-list JSON")
+        return value
+
+    links = ip_json("-j", "link")
+    if [row.get("ifname") for row in links] != ["lo"]:
+        raise RuntimeError(f"foreign interfaces: {links}")
+    routes = {
+        family: ip_json(family, "-j", "route", "show", "table", "all")
+        for family in ("-4", "-6")
+    }
+    foreign = [row for rows in routes.values() for row in rows
+               if row.get("dev") != "lo" or row.get("dst") == "default" or "gateway" in row]
+    if foreign:
+        raise RuntimeError(f"foreign route: {foreign}")
+    return {"namespace": current_ns, "links": links, "routes": routes}
+
+
+def privilege_state(expected_uid: int, expected_gid: int,
+                    status_text: str | None = None) -> dict:
+    if os.getuid() != expected_uid or os.getgid() != expected_gid or os.geteuid() == 0:
+        raise RuntimeError("runtime uid/gid do not match the original unprivileged owner")
+    if os.getgroups():
+        raise RuntimeError("runtime supplementary groups are not empty")
+    text = status_text if status_text is not None else Path("/proc/self/status").read_text()
+    status = dict(line.split(":", 1) for line in text.splitlines() if ":" in line)
+    cap_keys = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+    for key in cap_keys:
+        try:
+            nonzero = int(status[key].strip(), 16)
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError(f"missing or malformed {key}") from exc
+        if nonzero:
+            raise RuntimeError(f"{key} is not empty")
+    if status.get("NoNewPrivs", "").strip() != "1":
+        raise RuntimeError("NoNewPrivs is not set")
+    return {"uid": os.getuid(), "gid": os.getgid(),
+            "groups": os.getgroups(),
+            "capabilities": {key: status[key].strip() for key in cap_keys},
+            "no_new_privs": 1}
+
+
+def outer_phase(repo: Path, artifact_dir: Path) -> int:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    head = git_output(repo, "rev-parse", "HEAD")
+    tree = git_output(repo, "rev-parse", "HEAD^{tree}")
+    branch = git_output(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    ancestor = run(["git", "-C", str(repo), "merge-base", "--is-ancestor",
+                    BASE_COMMIT, "HEAD"]).returncode
+    if ancestor != 0:
+        raise SystemExit(f"FAIL: required base {BASE_COMMIT} is not an ancestor of HEAD {head}")
+    changed_output = git_output(repo, "diff", "--name-only", f"{BASE_COMMIT}..HEAD")
+    changed = {line for line in changed_output.splitlines() if line}
+    try:
+        validate_changed_paths(changed)
+    except ValueError as exc:
+        raise SystemExit(f"FAIL: {exc}") from exc
+    dirty = git_output(repo, "status", "--porcelain")
+    if dirty:
+        raise SystemExit(f"FAIL: checkout is not clean: {dirty.splitlines()}")
+    base_tree = git_output(repo, "rev-parse", f"{BASE_COMMIT}^{{tree}}")
+    if base_tree != BASE_TREE:
+        raise SystemExit(f"FAIL: base tree {base_tree} != required tree {BASE_TREE}")
+    source = repo / SOURCE_PATH
+    source_sha = sha256_file(source)
+    base_source = run(["git", "-C", str(repo), "show", f"{BASE_COMMIT}:{SOURCE_PATH}"],
+                      capture_output=True)
+    if base_source.returncode != 0:
+        raise SystemExit(f"FAIL: cannot read {SOURCE_PATH} from required base")
+    base_source_sha = hashlib.sha256(base_source.stdout).hexdigest()
+    if source_sha != SOURCE_SHA256 or base_source_sha != SOURCE_SHA256:
+        raise SystemExit(
+            f"FAIL: {SOURCE_PATH} custody differs (worktree={source_sha}, base={base_source_sha})")
+    print(f"base/source verified: HEAD={head} tree={tree} branch={branch} changes={sorted(changed)}")
+    print(f"source blob {SOURCE_PATH} sha256={source_sha}")
+
+    # Fresh lock: the prior run retained no lock custody.
+    lock = repo / "Cargo.lock"
+    if run(["cargo", "generate-lockfile"], cwd=repo).returncode != 0:
+        raise SystemExit("FAIL: cargo generate-lockfile")
+    lock_sha = sha256_file(lock)
+    print(f"Cargo.lock sha256={lock_sha}")
+
+    env = dict(os.environ)
+    env["CARGO_BUILD_JOBS"] = "4"
+    proc = run(
+        ["cargo", "test", "--locked", "--release", "--all-features", "--lib",
+         SELECTOR, "--no-run", "--message-format=json"],
+        cwd=repo, env=env, capture_output=True, text=True,
+    )
+    build_json = artifact_dir / "build-messages.json"
+    build_json.write_text(proc.stdout)
+    (artifact_dir / "build-stderr.log").write_text(proc.stderr)
+    print(f"build native exit: {proc.returncode}")
+    if proc.returncode != 0:
+        raise SystemExit(f"FAIL: cargo build exited {proc.returncode}")
+    postbuild_lock_sha = sha256_file(lock)
+    if postbuild_lock_sha != lock_sha:
+        raise SystemExit(
+            f"FAIL: Cargo.lock changed during locked build ({lock_sha} -> {postbuild_lock_sha})")
+    # Native exit checked BEFORE parsing/selecting.
+    test_binary, notes = select_test_binary(proc.stdout)
+    for n in notes:
+        print(n)
+
+    listing = run([test_binary, "--list", "--exact", SELECTOR],
+                  capture_output=True, text=True)
+    if listing.returncode != 0:
+        raise SystemExit(f"FAIL: --list exited {listing.returncode}")
+    listed = [l for l in listing.stdout.splitlines() if l.strip() and ": test" in l]
+    if len(listed) != 1:
+        raise SystemExit(f"FAIL: --list --exact returned {len(listed)} tests, expected 1")
+    print(f"--list --exact matched exactly 1 test")
+
+    binary_sha = sha256_file(Path(test_binary))
+    print(f"test binary sha256={binary_sha}")
+
+    # Record outer netns inode so the inner phase can prove separation.
+    outer_netns = os.readlink("/proc/self/ns/net")
+    (artifact_dir / "outer-netns.txt").write_text(outer_netns)
+
+    inner_result_path = artifact_dir / INNER_RESULT_NAME
+    uid, gid = os.getuid(), os.getgid()
+    # Preserve the inherited HOME through sudo without assigning or replacing it.
+    # The root launcher raises loopback before dropping to the original uid/gid.
+    inner_env = dict(os.environ)
+    inner_env["X0X_703_ARTIFACT_DIR"] = str(artifact_dir)
+    inner_env[INNER_FLAG_ENV] = "1"
+    inner_env["X0X_703_RUNNER_UID"] = str(uid)
+    inner_env["X0X_703_RUNNER_GID"] = str(gid)
+    preserve = (f"HOME,PATH,X0X_703_ARTIFACT_DIR,{INNER_FLAG_ENV},"
+                "X0X_703_RUNNER_UID,X0X_703_RUNNER_GID")
+    inner_cmd = [
+        "sudo", f"--preserve-env={preserve}", "--",
+        "unshare", "--net", "--",
+        sys.executable, str(Path(__file__).resolve()), "--netns-launch",
+        "--runner-uid", str(uid), "--runner-gid", str(gid),
+        "--test-binary", test_binary, "--artifact-dir", str(artifact_dir),
+    ]
+    rc = run(inner_cmd, cwd=repo, env=inner_env).returncode
+
+    if not inner_result_path.exists():
+        raise SystemExit(f"FAIL: inner phase produced no {INNER_RESULT_NAME} (sudo exit {rc})")
+    inner = json.loads(inner_result_path.read_text())
+
+    report = {
+        "head": head,
+        "tree": tree,
+        "branch": branch,
+        f"{SOURCE_PATH}_sha256": source_sha,
+        "cargo_lock_sha256": lock_sha,
+        "test_binary_sha256": binary_sha,
+        "inner": inner,
+    }
+    (artifact_dir / REPORT_NAME).write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))
+    return 0 if rc == 0 and inner.get("ok") is True else 1
+
+
+def netns_launch(test_binary: str, artifact_dir: Path, uid: int, gid: int) -> int:
+    """Raise loopback as root, then replace this process with the unprivileged inner."""
+    if os.geteuid() != 0:
+        raise SystemExit("FAIL: netns launcher must run as root")
+    ip = shutil.which("ip")
+    if ip is None:
+        raise SystemExit("FAIL: iproute2 unavailable before privilege drop")
+    raised = run([ip, "link", "set", "lo", "up"])
+    if raised.returncode != 0:
+        raise SystemExit(f"FAIL: raising loopback exited {raised.returncode}")
+    command = [
+        "/usr/bin/setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups",
+        "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs",
+        sys.executable, str(Path(__file__).resolve()), "--inner",
+        "--test-binary", test_binary, "--artifact-dir", str(artifact_dir),
+    ]
+    os.execvp(command[0], command)
+    return 1
+
+
+def inner_phase(test_binary: str, artifact_dir: Path) -> int:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    checks: list[tuple[bool, str]] = []
+
+    expected_uid = int(os.environ.get("X0X_703_RUNNER_UID", "-1"))
+    expected_gid = int(os.environ.get("X0X_703_RUNNER_GID", "-1"))
+    outer_netns = (artifact_dir / "outer-netns.txt").read_text().strip()
+    try:
+        net_state = namespace_state(outer_netns)
+        priv_state = privilege_state(expected_uid, expected_gid)
+        checks.extend([
+            (True, f"network namespace admitted: {net_state['namespace']}"),
+            (True, f"uid/gid/groups/capabilities admitted: {priv_state}"),
+        ])
+    except RuntimeError as exc:
+        checks.append((False, str(exc)))
+
+    failed_checks = [msg for ok, msg in checks if not ok]
+    for ok, msg in checks:
+        print(("PASS: " if ok else "FAIL: ") + msg)
+    if failed_checks:
+        print("namespace isolation verification failed; refusing to run test")
+        return 2
+
+    test_log = artifact_dir / "test.log"
+    proof_path = artifact_dir / "proof.json"
+    env = dict(os.environ)
+    env["X0X_SLOW_CONSUMER_PROOF"] = str(proof_path)
+    for var in ("X0X_SLOW_SUBSCRIBER_MESSAGES",):
+        env.pop(var, None)
+
+    cmd = [test_binary, "--exact", SELECTOR, "--ignored", "--nocapture",
+           "--test-threads=1"]
+    print(f"executing: {' '.join(cmd)}")
+    started = time.monotonic()
+    timed_out = False
+    with test_log.open("wb") as log_fh:
+        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env)
+        try:
+            proc.communicate(timeout=OUTER_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            print(f"outer bound {OUTER_TIMEOUT_SECONDS}s reached; sending TERM")
+            proc.terminate()
+            try:
+                proc.wait(timeout=TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                print("TERM grace expired; sending KILL")
+                proc.kill()
+                proc.wait()
+    elapsed = round(time.monotonic() - started, 4)
+    native_exit = proc.returncode
+    print(f"native exit={native_exit} elapsed={elapsed}s timed_out={timed_out}")
+
+    log_text = test_log.read_text(errors="replace")
+    passed, failed = parse_libtest_summary(log_text)
+    proof_notes: list[str] = []
+    proof_sha = None
+    ok = (not timed_out) and native_exit == 0 and passed == 1 and failed == 0
+    if proof_path.exists():
+        proof_sha = sha256_file(proof_path)
+        proof_ok, proof_notes = verify_proof(json.loads(proof_path.read_text()))
+        ok = ok and proof_ok
+    else:
+        proof_notes.append("FAIL: no proof.json produced")
+        ok = False
+
+    for n in proof_notes:
+        print(n)
+
+    result = {
+        "ok": ok,
+        "timed_out": timed_out,
+        "native_exit": native_exit,
+        "elapsed_seconds": elapsed,
+        "tests_passed": passed,
+        "tests_failed": failed,
+        "proof_sha256": proof_sha,
+        "isolation_checks": [{"ok": o, "msg": m} for o, m in checks],
+        "namespace_state": net_state if "net_state" in locals() else None,
+        "privilege_state": priv_state if "priv_state" in locals() else None,
+        "proof_notes": proof_notes,
+        "test_binary": test_binary,
+    }
+    (artifact_dir / INNER_RESULT_NAME).write_text(json.dumps(result, indent=2) + "\n")
+    return 0 if ok else 1
+
+
+def self_test() -> int:
+    failures = 0
+
+    # Exact source-custody delta rejects missing and additional files.
+    expected_delta = {".github/workflows/build.yml", "scripts/ci/run-703-optimized.py"}
+    validate_changed_paths(expected_delta)
+    for label, paths in (("missing runner", {".github/workflows/build.yml"}),
+                         ("extra source", expected_delta | {"src/lib.rs"})):
+        try:
+            validate_changed_paths(paths)
+            print(f"FAIL self-test: custody should reject {label}")
+            failures += 1
+        except ValueError:
+            print(f"PASS self-test: custody rejects {label}")
+
+    # Namespace parsing fails closed on command errors and foreign routes.
+    class StubResult:
+        def __init__(self, code: int, value: object):
+            self.returncode = code
+            self.stdout = json.dumps(value)
+    def good_ip(cmd: list[str], **_kw):
+        if cmd[1:3] == ["-j", "link"]:
+            return StubResult(0, [{"ifname": "lo"}])
+        return StubResult(0, [{"dst": "127.0.0.0/8", "dev": "lo"}])
+    state = namespace_state("net:[1]", command=good_ip, current="net:[2]")
+    failures += state["namespace"] != "net:[2]"
+    def failed_ip(_cmd: list[str], **_kw):
+        return StubResult(7, [])
+    try:
+        namespace_state("net:[1]", command=failed_ip, current="net:[2]")
+        failures += 1
+        print("FAIL self-test: failed ip command accepted")
+    except RuntimeError:
+        print("PASS self-test: failed ip command rejected")
+    def foreign_route(cmd: list[str], **_kw):
+        if cmd[1:3] == ["-j", "link"]:
+            return StubResult(0, [{"ifname": "lo"}])
+        return StubResult(0, [{"dst": "default", "dev": "eth0", "gateway": "192.0.2.1"}])
+    try:
+        namespace_state("net:[1]", command=foreign_route, current="net:[2]")
+        failures += 1
+        print("FAIL self-test: foreign route accepted")
+    except RuntimeError:
+        print("PASS self-test: foreign route rejected")
+    try:
+        privilege_state(os.getuid() + 1, os.getgid())
+        failures += 1
+        print("FAIL self-test: wrong uid accepted")
+    except RuntimeError:
+        print("PASS self-test: wrong uid rejected")
+
+    # Artifact selection.
+    good = "\n".join([
+        json.dumps({"reason": "compiler-artifact", "target": {"kind": ["lib"]},
+                    "executable": "/x/deps/x0x-abc"}),
+        json.dumps({"reason": "compiler-artifact", "target": {"kind": ["bin"]},
+                    "executable": "/x/x0x"}),
+        json.dumps({"reason": "compiler-artifact", "target": {"kind": ["lib"]},
+                    "executable": None}),
+        "not json",
+    ])
+    exe, _ = select_test_binary(good)
+    failures += exe != "/x/deps/x0x-abc"
+    for label, payload in (
+        ("no lib artifact", json.dumps({"reason": "compiler-artifact",
+                                        "target": {"kind": ["bin"]}, "executable": "/x"})),
+        ("ambiguous", "\n".join([
+            json.dumps({"reason": "compiler-artifact", "target": {"kind": ["lib"]},
+                        "executable": "/a"}),
+            json.dumps({"reason": "compiler-artifact", "target": {"kind": ["lib"]},
+                        "executable": "/b"}),
+        ])),
+    ):
+        try:
+            select_test_binary(payload)
+            print(f"FAIL self-test: selection should have failed: {label}")
+            failures += 1
+        except SystemExit:
+            print(f"PASS self-test: selection rejects {label}")
+
+    # Proof verification.
+    base = {"messages": 100000, "publish_total": 100000, "fast_received": 100000,
+            "slow_subscriber_dropped": 1, "subscriber_channel_closed": 1,
+            "decode_to_delivery_drops": 0}
+    ok, _ = verify_proof(dict(base))
+    failures += not ok
+    for label, patch in (
+        ("publish_total short", {"publish_total": 99999}),
+        ("fast_received short", {"fast_received": 0}),
+        ("zero drops", {"slow_subscriber_dropped": 0}),
+        ("zero closed", {"subscriber_channel_closed": 0}),
+    ):
+        bad = dict(base)
+        bad.update(patch)
+        ok, _ = verify_proof(bad)
+        if ok:
+            print(f"FAIL self-test: proof should have failed: {label}")
+            failures += 1
+        else:
+            print(f"PASS self-test: proof rejects {label}")
+    # The additional acceptance criterion is fail-closed.
+    supp = dict(base, decode_to_delivery_drops=5)
+    ok, _ = verify_proof(supp)
+    if ok:
+        print("FAIL self-test: nonzero decode_to_delivery_drops must fail acceptance")
+        failures += 1
+    else:
+        print("PASS self-test: nonzero decode_to_delivery_drops fails acceptance")
+
+    # libtest summary parsing.
+    log = "running 1 test\ntest gossip::pubsub::tests::x ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.00s\n"
+    p, f = parse_libtest_summary(log)
+    failures += (p, f) != (1, 0)
+    p, f = parse_libtest_summary("test result: FAILED. 0 passed; 1 failed;")
+    failures += (p, f) != (0, 1)
+
+    print("self-test failures:", failures)
+    return 1 if failures else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--inner", action="store_true")
+    ap.add_argument("--netns-launch", action="store_true")
+    ap.add_argument("--runner-uid", type=int)
+    ap.add_argument("--runner-gid", type=int)
+    ap.add_argument("--test-binary")
+    ap.add_argument("--artifact-dir")
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--repo", default=os.getcwd())
+    args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
+    if args.netns_launch:
+        if (not args.test_binary or not args.artifact_dir
+                or args.runner_uid is None or args.runner_gid is None):
+            raise SystemExit("netns launcher requires binary, artifact dir, uid, and gid")
+        return netns_launch(args.test_binary, Path(args.artifact_dir),
+                            args.runner_uid, args.runner_gid)
+    if os.environ.get(INNER_FLAG_ENV) == "1" or args.inner:
+        if not args.test_binary or not args.artifact_dir:
+            raise SystemExit("inner phase requires --test-binary and --artifact-dir")
+        return inner_phase(args.test_binary, Path(args.artifact_dir))
+    if not args.artifact_dir:
+        raise SystemExit("outer phase requires --artifact-dir")
+    return outer_phase(Path(args.repo).resolve(), Path(args.artifact_dir))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
