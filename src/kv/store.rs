@@ -1655,6 +1655,21 @@ impl KvStore {
         content_type: String,
         peer_id: PeerId,
     ) -> Result<()> {
+        if !self.preflight_put_content(&key, &value, &content_type)? {
+            return Ok(());
+        }
+        let seq = self.reserve_sequences(1)?;
+        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)
+    }
+
+    /// Validate deterministic content constraints before reserving a local
+    /// sequence. Returns `false` only for an AppendOnly idempotent re-put.
+    pub(crate) fn preflight_put_content(
+        &self,
+        key: &str,
+        value: &[u8],
+        content_type: &str,
+    ) -> Result<bool> {
         if value.len() > crate::kv::entry::MAX_INLINE_SIZE {
             return Err(KvError::ValueTooLarge {
                 size: value.len(),
@@ -1662,15 +1677,14 @@ impl KvStore {
             });
         }
         if matches!(self.policy, AccessPolicy::AppendOnly) {
-            if let Some(existing) = self.get(&key) {
+            if let Some(existing) = self.get(key) {
                 if existing.value == value && existing.content_type == content_type {
-                    return Ok(());
+                    return Ok(false);
                 }
-                return Err(KvError::ImmutableKey(key));
+                return Err(KvError::ImmutableKey(key.to_string()));
             }
         }
-        let seq = self.reserve_sequences(1)?;
-        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)
+        Ok(true)
     }
 
     pub(crate) fn put_with_reserved_sequence(

@@ -48,9 +48,15 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from e2e_tunnel import start_ssh_tunnel, stop_ssh_tunnel
+from result_framing import RESULT_PREFIX_V2, ResultReassembler
 
 DISCOVER_TOPIC = "x0x.test.discover.v1"
 LEGACY_RESULTS_TOPIC = "x0x.test.results.v1"
+COMMAND_HTTP_TIMEOUT_SECS = 15.0
+COMMAND_RETRY_BACKOFF_SECS = sum(min(8, 2 * attempt) for attempt in range(1, 5))
+COMMAND_DISPATCH_BUDGET_SECS = (
+    (5 * COMMAND_HTTP_TIMEOUT_SECS) + COMMAND_RETRY_BACKOFF_SECS + 1.0
+)
 PREFIX_CMD = b"x0xtest|cmd|"
 PREFIX_RES = b"x0xtest|res|"
 
@@ -250,14 +256,31 @@ class ResultRouter:
         self._waiters: Dict[str, CommandWaiter] = {}
         self._discover_q: "queue.Queue[Runner]" = queue.Queue()
         self._stop = threading.Event()
+        self._chunks = ResultReassembler()
 
-    def register(self, w: CommandWaiter) -> None:
+    def register_pending(
+        self, w: CommandWaiter, sender: str, dispatch_deadline: float,
+    ) -> None:
         with self._lock:
             self._waiters[w.request_id] = w
+            if not self._chunks.register_pending(
+                w.request_id, [sender], dispatch_deadline,
+            ):
+                self._waiters.pop(w.request_id, None)
+                raise ValueError("result request metadata exceeds framing bounds")
 
     def deregister(self, rid: str) -> None:
         with self._lock:
             self._waiters.pop(rid, None)
+            self._chunks.deregister(rid)
+
+    def arm(self, rid: str, deadline: float) -> bool:
+        return self._chunks.arm(rid, deadline)
+
+    def deliver_chunk(self, sender: str, wire: bytes) -> None:
+        envelope = self._chunks.accept(sender, wire)
+        if envelope is not None:
+            self.deliver(envelope)
 
     def stop(self) -> None:
         self._stop.set()
@@ -355,6 +378,12 @@ def _route_event(
             payload = base64.b64decode(payload_b64)
         except Exception:
             return
+        sender = msg.get("sender")
+        if not isinstance(sender, str):
+            return
+        if payload.startswith(RESULT_PREFIX_V2):
+            router.deliver_chunk(sender, payload)
+            return
         if not payload.startswith(PREFIX_RES):
             return
         try:
@@ -427,19 +456,27 @@ class FleetHarness:
         if self.runners[target].agent_id == self.anchor_aid:
             return self._invoke_local(action, params, request_id)
         waiter = CommandWaiter(request_id=request_id)
-        self.router.register(waiter)
+        self.router.register_pending(
+            waiter,
+            self.runners[target].agent_id,
+            time.monotonic() + COMMAND_DISPATCH_BUDGET_SECS,
+        )
         try:
             envelope = {
                 "command_id": request_id,
                 "target_node": target,
                 "action": action,
                 "anchor_aid": self.anchor_aid,
+                "result_chunks_v2": True,
                 "params": params,
             }
             wire = PREFIX_CMD + base64.b64encode(
                 json.dumps(envelope).encode("utf-8")
             )
             self._send_command(target, wire)
+            response_deadline = time.monotonic() + self.cmd_timeout_secs
+            if not self.router.arm(request_id, response_deadline):
+                raise RuntimeError("result request expired before response wait")
             try:
                 response = waiter.queue.get(timeout=self.cmd_timeout_secs)
             except queue.Empty:

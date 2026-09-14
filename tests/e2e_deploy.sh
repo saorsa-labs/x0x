@@ -17,7 +17,9 @@ BINARY="$PROJECT_DIR/target/x86_64-unknown-linux-gnu/release/x0xd"
 # shellcheck source=lib/deploy_upload.sh
 source "$SCRIPT_DIR/lib/deploy_upload.sh"
 RUNNER_SCRIPT="$SCRIPT_DIR/runners/x0x_test_runner.py"
+RUNNER_HELPER="$SCRIPT_DIR/result_framing.py"
 RUNNER_UNIT="$SCRIPT_DIR/runners/x0x-test-runner.service"
+RUNNER_INSTALLER="$SCRIPT_DIR/runners/install_runner_bundle.sh"
 
 # Network selector — sets X0X_NETWORK, X0X_API_PORT, X0X_SERVICE,
 # X0X_TOKEN_FILE, X0X_TOKEN_VAR_PREFIX. Banner + 5 s hold for prod.
@@ -209,11 +211,11 @@ LRCONF
         echo -e "${YELLOW}log-cap setup failed (continuing)${NC}"
     fi
 
-    # Mesh test runner — single Python script + systemd unit + env file.
+    # Mesh test runner — Python entrypoint + framing helper + unit + env file.
     # The runner subscribes to the test-control gossip topic so the Mac
     # harness can drive matrix tests through one SSH tunnel instead of
     # one SSH per assertion.
-    if [ "$DEPLOY_RUNNER" = "1" ] && [ -f "$RUNNER_SCRIPT" ] && [ -f "$RUNNER_UNIT" ]; then
+    if [ "$DEPLOY_RUNNER" = "1" ] && [ -f "$RUNNER_SCRIPT" ] && [ -f "$RUNNER_HELPER" ] && [ -f "$RUNNER_INSTALLER" ] && [ -f "$RUNNER_UNIT" ]; then
         echo -n "    Installing mesh test runner... "
         # Per-network unit + env file so prod and testnet runners coexist.
         # The Python script at /usr/local/bin/x0x-test-runner.py is shared;
@@ -222,13 +224,18 @@ LRCONF
         REMOTE_UNIT_PATH="/etc/systemd/system/$RUNNER_UNIT_NAME"
         if cat "$RUNNER_SCRIPT" \
             | $SSH root@"$ip" 'cat > /tmp/x0x-test-runner.py.codex && chmod 755 /tmp/x0x-test-runner.py.codex' 2>/dev/null \
-           && sed "s|EnvironmentFile=.*|EnvironmentFile=$RUNNER_ENV_FILE|" "$RUNNER_UNIT" \
+           && cat "$RUNNER_HELPER" \
+            | $SSH root@"$ip" 'cat > /tmp/x0x-result-framing.py.codex && chmod 644 /tmp/x0x-result-framing.py.codex' 2>/dev/null \
+           && cat "$RUNNER_INSTALLER" \
+            | $SSH root@"$ip" 'cat > /tmp/x0x-install-runner-bundle.sh.codex && chmod 755 /tmp/x0x-install-runner-bundle.sh.codex' 2>/dev/null \
+           && sed -e "s|EnvironmentFile=.*|EnvironmentFile=$RUNNER_ENV_FILE|" \
+                  -e "s|ExecStart=.*|ExecStart=/usr/local/bin/x0x-test-runner-$X0X_NETWORK.py|" "$RUNNER_UNIT" \
             | $SSH root@"$ip" "cat > /tmp/$RUNNER_UNIT_NAME.codex" 2>/dev/null \
            && $SSH root@"$ip" "
                 set -e
-                install -m 755 /tmp/x0x-test-runner.py.codex /usr/local/bin/x0x-test-runner.py
+                /tmp/x0x-install-runner-bundle.sh.codex /tmp/x0x-test-runner.py.codex /tmp/x0x-result-framing.py.codex / $X0X_NETWORK
                 install -m 644 /tmp/$RUNNER_UNIT_NAME.codex $REMOTE_UNIT_PATH
-                rm -f /tmp/x0x-test-runner.py.codex /tmp/$RUNNER_UNIT_NAME.codex
+                rm -f /tmp/x0x-test-runner.py.codex /tmp/x0x-result-framing.py.codex /tmp/x0x-install-runner-bundle.sh.codex /tmp/$RUNNER_UNIT_NAME.codex
                 cat > $RUNNER_ENV_FILE <<EOF
 NODE_NAME=$node
 X0X_API_BASE=http://127.0.0.1:$X0X_API_PORT

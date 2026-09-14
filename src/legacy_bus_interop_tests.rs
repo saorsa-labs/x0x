@@ -8,7 +8,7 @@
 use crate::dm::{self, DmPath, DmSendConfig, DurableSendStages, EnvelopeBuilder, DM_PROTOCOL_V1};
 use crate::dm_inbox::{DmInboxConfig, DmInboxService, DmTypedPayload, DM_BUS_TOPIC};
 use crate::dm_send::{self, DmSendContext};
-use crate::gossip::{PubSubManager, SigningContext};
+use crate::gossip::{PubSubManager, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
 use crate::trust::TrustDecision;
 use crate::{network, Agent};
@@ -95,7 +95,11 @@ async fn build(dir: &Path, name: &str, skip: bool) -> Agent {
         .expect("real Agent construction; no setup-success skip")
 }
 
-async fn prepare(agents: &[Agent], keys: &[Arc<AgentKemKeypair>]) -> Vec<Inbox> {
+async fn prepare(
+    agents: &[Agent],
+    keys: &[Arc<AgentKemKeypair>],
+    observe_inbox: Option<usize>,
+) -> (Vec<Inbox>, Option<Subscription>) {
     let mut receivers = Vec::new();
     for (agent, key) in agents.iter().zip(keys) {
         // Contacts and their machine records contain the peers' actual keys;
@@ -119,6 +123,20 @@ async fn prepare(agents: &[Agent], keys: &[Arc<AgentKemKeypair>]) -> Vec<Inbox> 
             .expect("real typed inbox before publication");
         receivers.push(rx);
     }
+    // Install the diagnostic observer before peers connect. Its second local
+    // subscription therefore cannot repair or reshape the live target mesh;
+    // the ordinary join/readiness/refresh sequence below remains authoritative.
+    let outer_observer = if let Some(index) = observe_inbox {
+        let agent = &agents[index];
+        let topic = DmInboxService::inbox_topic_name(&agent.agent_id());
+        Some(
+            pubsub(agent)
+                .subscribe_topic_id(topic, dm::dm_inbox_topic(&agent.agent_id()))
+                .await,
+        )
+    } else {
+        None
+    };
     for agent in agents {
         agent.join_network().await.expect("join actual runtime");
     }
@@ -163,7 +181,7 @@ async fn prepare(agents: &[Agent], keys: &[Arc<AgentKemKeypair>]) -> Vec<Inbox> 
     for agent in agents {
         pubsub(agent).refresh_topic_peers().await;
     }
-    receivers
+    (receivers, outer_observer)
 }
 
 fn marked(label: &str) -> Vec<u8> {
@@ -370,7 +388,13 @@ async fn run(case: Case) {
             agents.push(build(dir.path(), name, *skip).await);
         }
         let keys: Vec<_> = agents.iter().map(|_| Arc::new(AgentKemKeypair::generate().expect("real KEM"))).collect();
-        let mut receivers = bounded("fixture services and peer setup", Duration::from_secs(90), prepare(&agents, &keys)).await;
+        let observe_inbox = matches!(case, Case::BusPair).then_some(2);
+        let (mut receivers, mut outer_observer) = bounded(
+            "fixture services and peer setup",
+            Duration::from_secs(90),
+            prepare(&agents, &keys, observe_inbox),
+        )
+        .await;
         for (agent, (_, skip)) in agents.iter().zip(roles) {
             assert_eq!(pubsub(agent).is_topic_subscribed(DM_BUS_TOPIC).await, !*skip);
             assert!(pubsub(agent).is_topic_subscribed(&DmInboxService::inbox_topic_name(&agent.agent_id())).await);
@@ -392,14 +416,113 @@ async fn run(case: Case) {
                 absent(&mut receivers[2], id_o).await;
                 assert!(!pubsub(o).is_topic_subscribed(DM_BUS_TOPIC).await);
                 eprintln!("ISSUE501 checkpoint=optout_bus_negative result=bounded_nonobservation window_ms=300 fanout={fanout_o} request={}", hex::encode(id_o));
+                let target_name = DmInboxService::inbox_topic_name(&o.agent_id());
+                let target_id = dm::dm_inbox_topic(&o.agent_id());
+                let outer_observer = outer_observer
+                    .as_mut()
+                    .expect("bus-pair targeted outer observer");
+
+                // A fresh, valid envelope on a different, consistently named
+                // transport topic must not credit the targeted observation.
+                let wrong_id = dm_send::fresh_request_id();
+                let wrong_payload = marked("wrong-topic-negative");
+                let wrong_wire = envelope(l, o, &keys[2], wrong_id, wrong_payload);
+                let wrong_topic = format!("x0x/dm/v1/diagnostic-wrong/{}", hex::encode(wrong_id));
+                let wrong_topic_id = saorsa_gossip_types::TopicId::from_entity(wrong_topic.as_bytes());
+                let wrong_fanout = bounded(
+                    "wrong-topic diagnostic publish",
+                    DELIVERY,
+                    pubsub(l).publish_topic_id_with_fanout_for_test(
+                        wrong_topic,
+                        wrong_topic_id,
+                        Bytes::from(wrong_wire),
+                    ),
+                )
+                .await
+                .expect("signed wrong-topic diagnostic publish");
+                eprintln!(
+                    "ISSUE501 checkpoint=wrong_topic_publish result=accepted fanout={wrong_fanout} request={}",
+                    hex::encode(wrong_id)
+                );
+                assert!(
+                    wrong_fanout > 0,
+                    "wrong-topic negative requires a real sender fan-out attempt"
+                );
+                let (outer_negative, typed_negative) = tokio::join!(
+                    tokio::time::timeout(NEGATIVE_WINDOW, outer_observer.recv()),
+                    tokio::time::timeout(NEGATIVE_WINDOW, receivers[2].recv()),
+                );
+                match outer_negative {
+                    Err(_) => {}
+                    Ok(None) => panic!("targeted outer observer closed"),
+                    Ok(Some(message)) => panic!(
+                        "wrong topic reached targeted outer observer: {:?}",
+                        message.topic
+                    ),
+                }
+                match typed_negative {
+                    Err(_) => {}
+                    Ok(None) => panic!("typed receiver closed"),
+                    Ok(Some(actual)) => panic!(
+                        "wrong topic reached typed receiver: {:?}, expected no {:?}",
+                        actual.request_id, wrong_id
+                    ),
+                }
+                eprintln!(
+                    "ISSUE501 checkpoint=wrong_topic_negative result=bounded_nonobservation outer=false typed=false fanout={wrong_fanout} request={}",
+                    hex::encode(wrong_id)
+                );
+
                 // No rebuild/re-encryption: move precisely the same inner wire
                 // to the domain-separated targeted ID, in a fresh signed V2 carrier.
-                bounded("exact O ciphertext targeted publish", DELIVERY,
-                    pubsub(l).publish_topic_id(DmInboxService::inbox_topic_name(&o.agent_id()), dm::dm_inbox_topic(&o.agent_id()), Bytes::from(wire_o)))
-                    .await.expect("signed targeted publish");
-                delivered(&mut receivers[2], l, id_o, &payload_o).await;
+                let targeted_fanout = bounded(
+                    "exact O ciphertext targeted publish",
+                    DELIVERY,
+                    pubsub(l).publish_topic_id_with_fanout_for_test(
+                        target_name.clone(),
+                        target_id,
+                        Bytes::from(wire_o.clone()),
+                    ),
+                )
+                .await
+                .expect("signed targeted publish");
+                eprintln!(
+                    "ISSUE501 checkpoint=targeted_publish result=accepted fanout={targeted_fanout} request={}",
+                    hex::encode(id_o)
+                );
+                assert!(
+                    targeted_fanout > 0,
+                    "targeted sender recorded no fan-out attempt"
+                );
+                bounded("targeted outer and typed observations", DELIVERY, async {
+                    tokio::join!(
+                        async {
+                            let outer = outer_observer
+                                .recv()
+                                .await
+                                .expect("targeted outer observer must remain open");
+                            assert_eq!(outer.topic, target_name);
+                            assert_eq!(outer.payload, Bytes::from(wire_o));
+                            eprintln!(
+                                "ISSUE501 checkpoint=targeted_outer result=observed request={}",
+                                hex::encode(id_o)
+                            );
+                        },
+                        async {
+                            delivered(&mut receivers[2], l, id_o, &payload_o).await;
+                            eprintln!(
+                                "ISSUE501 checkpoint=targeted_typed result=observed request={}",
+                                hex::encode(id_o)
+                            );
+                        },
+                    );
+                })
+                .await;
                 assert!(!pubsub(o).is_topic_subscribed(DM_BUS_TOPIC).await);
-                eprintln!("ISSUE501 checkpoint=exact_ciphertext_viability result=observed request={}", hex::encode(id_o));
+                eprintln!(
+                    "ISSUE501 checkpoint=exact_ciphertext_viability result=observed outer=true typed=true fanout={targeted_fanout} request={}",
+                    hex::encode(id_o)
+                );
             }
             Case::Fallback => {
                 let (o, l) = (&agents[0], &agents[1]);

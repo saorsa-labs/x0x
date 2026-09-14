@@ -1245,10 +1245,10 @@ impl PubSubManager {
         self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
 
-        let mut plumtree_rx = self.plumtree.subscribe(topic_id);
-        // Plumtree registers subscribers on a spawned task; yield once so
-        // immediate local publishes in the same task see this subscriber.
-        tokio::task::yield_now().await;
+        // The synchronous crate API registers on a detached task. Await the
+        // ready variant so returning this subscription is also the barrier
+        // after which an immediate first publish cannot miss its receiver.
+        let mut plumtree_rx = self.plumtree.subscribe_ready(topic_id).await;
         let (tx, rx) = mpsc::channel(10_000);
         let contacts = self.contacts.get().cloned();
         let revocation_set = self.revocation_set.get().cloned();
@@ -1455,6 +1455,20 @@ impl PubSubManager {
         self.publish_topic_id_with_envelope(topic, topic_id, payload)
             .await
             .map(|_| ())
+    }
+
+    /// Retain the explicit-topic publish fan-out for targeted-delivery tests.
+    #[cfg(test)]
+    pub(crate) async fn publish_topic_id_with_fanout_for_test(
+        &self,
+        topic: String,
+        topic_id: TopicId,
+        payload: Bytes,
+    ) -> NetworkResult<u32> {
+        let outcome = self
+            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .await?;
+        Ok(outcome.fan_out)
     }
 
     /// Publish to a topic with an explicit transport `TopicId`, returning the
@@ -4377,6 +4391,49 @@ mod tests {
         let manager = PubSubManager::new(node, None).expect("manager");
         let sub = manager.subscribe("test-topic".to_string()).await;
         assert_eq!(sub.topic(), "test-topic");
+    }
+
+    #[tokio::test]
+    async fn normal_subscription_is_ready_for_immediate_publish() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let topic = "ready-normal-topic";
+        let payload = Bytes::from_static(b"first-normal-message");
+
+        let mut sub = manager.subscribe(topic.to_string()).await;
+        manager
+            .publish(topic.to_string(), payload.clone())
+            .await
+            .expect("immediate publish");
+
+        let received = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("subscription must be registered when subscribe returns")
+            .expect("subscription remains open");
+        assert_eq!(received.topic, topic);
+        assert_eq!(received.payload, payload);
+    }
+
+    #[tokio::test]
+    async fn explicit_dm_topic_subscription_is_ready_for_immediate_publish() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let topic = "x0x/dm/v1/inbox/readiness-control";
+        let topic_id = TopicId::new([0x61; 32]);
+        let payload = Bytes::from_static(b"first-explicit-dm-message");
+
+        let mut sub = manager
+            .subscribe_topic_id(topic.to_string(), topic_id)
+            .await;
+        manager
+            .publish_topic_id(topic.to_string(), topic_id, payload.clone())
+            .await
+            .expect("immediate explicit-topic publish");
+
+        let received = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("explicit subscription must be registered on return")
+            .expect("subscription remains open");
+        assert_eq!(received.topic, topic);
+        assert_eq!(received.payload, payload);
     }
 
     /// WHY (issue #238 round-5 review): dropping a `Subscription` must end

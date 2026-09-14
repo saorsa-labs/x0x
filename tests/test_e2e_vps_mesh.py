@@ -101,6 +101,40 @@ class E2eVpsMeshTests(unittest.TestCase):
         decoded = json.loads(base64.b64decode(wire[len(self.mesh.PREFIX_CMD):]))
         self.assertEqual(command, decoded)
 
+    def test_matrix_pending_requests_survive_dispatch_longer_than_120_seconds(self):
+        bus = self.mesh.ResultsBus()
+        runners = {
+            name: self.mesh.RunnerInfo(name, char * 64, f"machine-{name}")
+            for name, char in zip(("a", "b", "c", "d"), "abcd")
+        }
+        clock = [1_000.0]
+
+        def now():
+            return clock[0]
+
+        def delayed_send(_client, _target, cmd, _log, **_kwargs):
+            clock[0] += 15.0
+            rid = cmd["params"]["request_id"]
+            src = cmd["target_node"]
+            recipient = cmd["params"]["recipient_aid"]
+            dst = next(name for name, info in runners.items()
+                       if info.agent_id == recipient)
+            bus.sends.put(self.mesh.SendResult(rid, src, "ok", None, {}))
+            bus.received.put(self.mesh.ReceivedDm(rid, dst, None, {}, 0))
+            return {"ok": True}
+
+        bus.chunks.clock = now
+        with mock.patch.object(self.mesh.time, "monotonic", side_effect=now), \
+             mock.patch.object(self.mesh, "send_command_dm", side_effect=delayed_send), \
+             mock.patch.object(self.mesh.time, "sleep", return_value=None):
+            outcome = self.mesh.run_all_pairs_matrix(
+                FakeClient(), bus, runners, runners["a"].agent_id, 30,
+                logging.getLogger("delayed-matrix"),
+            )
+        self.assertGreater(clock[0] - 1_000.0, 120.0)
+        self.assertEqual(12, outcome.send_ok)
+        self.assertEqual(12, outcome.received)
+
     def run_main_with_nodes(
         self,
         requested: list[str],

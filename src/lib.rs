@@ -17045,12 +17045,22 @@ impl KvStoreHandle {
         writer: &identity::AgentId,
         key: &str,
         value: &[u8],
-    ) -> error::Result<()> {
+        content_type: &str,
+    ) -> error::Result<bool> {
         store
             .authorize_put(writer, key, value)
             .map_err(|e| match e {
                 kv::KvError::Unauthorized(msg) => error::IdentityError::Unauthorized(msg),
                 other => error::IdentityError::Unauthorized(other.to_string()),
+            })?;
+        store
+            .preflight_put_content(key, value, content_type)
+            .map_err(|e| match e {
+                kv::KvError::Unauthorized(msg) => error::IdentityError::Unauthorized(msg),
+                kv::KvError::ImmutableKey(key) => error::IdentityError::ImmutableKey(key),
+                other => error::IdentityError::Storage(std::io::Error::other(format!(
+                    "kv put failed: {other}",
+                ))),
             })
     }
 
@@ -17120,13 +17130,10 @@ impl KvStoreHandle {
         })?;
         let delta = {
             let mut store = self.sync.write().await;
-            Self::check_local_put(&store, &self.agent_id, &key, &value)?;
+            let would_mutate =
+                Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
             let version_before = store.current_version();
-            if matches!(store.policy(), kv::AccessPolicy::AppendOnly)
-                && store
-                    .get(&key)
-                    .is_some_and(|entry| entry.value == value && entry.content_type == content_type)
-            {
+            if !would_mutate {
                 return Ok(kv::KvStoreDelta::new(version_before));
             }
             let first_seq = store.reserve_sequences(2).map_err(|e| {
@@ -19702,6 +19709,101 @@ mod tests {
         assert!(store.get("still-overflow").is_none());
         drop(store);
         handle.cancel_sync();
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_puts_do_not_consume_final_sequences() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        let oversized = agent
+            .create_kv_store("oversized", "oversized-sequence-topic")
+            .await
+            .expect("signed store");
+        oversized
+            .sync
+            .read()
+            .await
+            .restore_seq_counter(u64::MAX - 2);
+        let version_before = oversized.sync.read().await.current_version();
+        let error = oversized
+            .put_with_delta(
+                "too-large".to_string(),
+                vec![0; kv::entry::MAX_INLINE_SIZE + 1],
+                "application/octet-stream".to_string(),
+            )
+            .await
+            .expect_err("oversized put rejected before reservation");
+        assert!(error.to_string().contains("value too large"), "{error}");
+        {
+            let store = oversized.sync.read().await;
+            assert_eq!(store.seq_counter_value(), u64::MAX - 2);
+            assert_eq!(store.current_version(), version_before);
+            assert!(store.get("too-large").is_none());
+        }
+        oversized
+            .put("valid".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect("last two sequences remain available after rejection");
+        assert_eq!(oversized.sync.read().await.seq_counter_value(), u64::MAX);
+
+        let append_only = agent
+            .create_kv_store_with_policy(
+                "append-only",
+                "append-only-sequence-topic",
+                kv::AccessPolicy::AppendOnly,
+            )
+            .await
+            .expect("append-only store");
+        append_only
+            .put(
+                "existing".to_string(),
+                b"original".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("initial append");
+        append_only
+            .sync
+            .read()
+            .await
+            .restore_seq_counter(u64::MAX - 2);
+        let version_before = append_only.sync.read().await.current_version();
+        let error = append_only
+            .put_with_delta(
+                "existing".to_string(),
+                b"rewrite".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect_err("append-only rewrite rejected before reservation");
+        assert!(matches!(error, error::IdentityError::ImmutableKey(_)));
+        {
+            let store = append_only.sync.read().await;
+            assert_eq!(store.seq_counter_value(), u64::MAX - 2);
+            assert_eq!(store.current_version(), version_before);
+            assert_eq!(
+                store.get("existing").map(|entry| entry.value.as_slice()),
+                Some(b"original".as_slice())
+            );
+        }
+        append_only
+            .put("valid".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect("last two sequences remain available after rewrite rejection");
+        assert_eq!(append_only.sync.read().await.seq_counter_value(), u64::MAX);
+
+        oversized.cancel_sync();
+        append_only.cancel_sync();
         agent.shutdown().await;
     }
 

@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from e2e_tunnel import start_ssh_tunnel, stop_ssh_tunnel
+from result_framing import RESULT_PREFIX_V2, ResultReassembler
 
 DISCOVER_TOPIC = "x0x.test.discover.v1"
 LEGACY_CONTROL_TOPIC = "x0x.test.control.v1"
@@ -71,6 +72,7 @@ PREFIX_RES = b"x0xtest|res|"
 # `COMMAND_DM_ACK_MS` remains the optional post-send liveness probe knob; it is
 # separate from `COMMAND_RAW_QUIC_ACK_MS`, which ACKs the message bytes.
 COMMAND_DM_ACK_MS: Optional[int] = None
+COMMAND_HTTP_TIMEOUT_SECS = 15.0
 
 
 def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
@@ -269,6 +271,7 @@ class ResultsBus:
     discover: queue.Queue = field(default_factory=queue.Queue)
     sends: queue.Queue = field(default_factory=queue.Queue)
     received: queue.Queue = field(default_factory=queue.Queue)
+    chunks: ResultReassembler = field(default_factory=ResultReassembler)
 
 
 def drain_queue(q: queue.Queue) -> int:
@@ -360,6 +363,14 @@ def _route_sse_event(
         try:
             payload = base64.b64decode(payload_b64)
         except Exception:
+            return
+        sender = msg.get("sender")
+        if not isinstance(sender, str):
+            return
+        if payload.startswith(RESULT_PREFIX_V2):
+            body = bus.chunks.accept(sender, payload)
+            if body is not None:
+                _enqueue_result_envelope(body, bus, source=label)
             return
         if not payload.startswith(PREFIX_RES):
             return
@@ -628,6 +639,8 @@ def run_all_pairs_matrix(
     expected_send_rids = set()
     expected_recv_pairs: Dict[Tuple[str, str], bool] = {}
     dm_dispatch_failures: List[str] = []
+    dispatch_budget = len(pairs) * (COMMAND_HTTP_TIMEOUT_SECS + 0.05)
+    pending_deadline = time.monotonic() + dispatch_budget
 
     for src, dst, request_id, digest in pairs:
         recipient_aid = runners[dst].agent_id
@@ -637,6 +650,7 @@ def run_all_pairs_matrix(
             "target_node": src,
             "action": "send_dm",
             "anchor_aid": anchor_aid,
+            "result_chunks_v2": True,
             "params": {
                 "recipient_aid": recipient_aid,
                 "payload_b64": base64.b64encode(
@@ -650,6 +664,13 @@ def run_all_pairs_matrix(
                 "stop_fallback_on_raw_error": True,
             },
         }
+        registered = bus.chunks.register_pending(
+            request_id,
+            [runner_aid, recipient_aid],
+            pending_deadline,
+        )
+        if not registered:
+            raise ValueError("matrix result request metadata exceeds framing bounds")
         resp = send_command_dm(
             client,
             runner_aid,
@@ -674,6 +695,10 @@ def run_all_pairs_matrix(
         )
 
     log.info("waiting %ds for results to settle", settle_secs)
+    monotonic_deadline = time.monotonic() + settle_secs
+    for _, _, request_id, _ in pairs:
+        if not bus.chunks.arm(request_id, monotonic_deadline):
+            raise RuntimeError("matrix result request expired before settle window")
     deadline = time.time() + settle_secs
     out = MatrixOutcome()
     seen_sends: Dict[str, SendResult] = {}
