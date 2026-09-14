@@ -210,6 +210,115 @@ pub async fn instances() -> Result<()> {
     Ok(())
 }
 
+/// Template identity stamped into every `x0x autostart`-generated service
+/// definition (ADR-0061 §3, #690): the plist key `X0XTemplateVersion` on
+/// macOS and the unit `Environment=X0X_TEMPLATE_VERSION=` on systemd. A
+/// version alone is NOT a support claim — it identifies the template
+/// generation a deployment was created from so upgrade-time drift detection
+/// (the loaded-policy readbacks) can tell a known template from a drifted
+/// one. Bump when the template's semantics change and teach repair about
+/// the migration.
+pub(crate) const AUTOSTART_TEMPLATE_VERSION: u32 = 1;
+
+/// Escape one argument for a plist `<string>` element: the five XML
+/// predefined entities, so an install path or `--name` carrying `&`, `<`,
+/// `>`, `'` or `"` renders as data, never as markup.
+#[cfg(any(test, target_os = "macos"))]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\'' => out.push_str("&apos;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn validate_autostart_value(value: &str) -> Result<()> {
+    if value.chars().any(|c| c.is_control() && !matches!(c, '\t')) {
+        anyhow::bail!("autostart arguments and paths must not contain control characters");
+    }
+    Ok(())
+}
+
+/// Render one argument for a systemd `ExecStart=` line per `man
+/// systemd.service` COMMAND LINES: every argument is wrapped in double
+/// quotes, with `"` and `\\` backslash-escaped inside; a literal `%` is
+/// doubled (`%%`) because `%` introduces a specifier. Always quoting also
+/// preserves apostrophes and a standalone semicolon as argument data.
+#[cfg(any(test, target_os = "linux"))]
+fn escape_systemd_exec_arg(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    // Quote every argument. Besides preserving whitespace this keeps single
+    // quotes and a standalone `;` as data rather than systemd command-line
+    // syntax.
+    out.push('"');
+    for c in arg.chars() {
+        match c {
+            // % introduces a specifier (man systemd.service, SPECIFIERS);
+            // a literal % is written %%.
+            '%' => out.push_str("%%"),
+            // $ introduces environment variable substitution ("${FOO}"
+            // / "$FOO" — man systemd.service, COMMAND LINES); a literal $
+            // is written $$.
+            '$' => out.push_str("$$"),
+            // \\ is the escape character itself (man systemd.service,
+            // COMMAND LINES): a literal backslash is written \\\\,
+            // unconditionally — inside AND outside quotes — because an
+            // unescaped backslash would consume the next character.
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn render_systemd_unit(executable: &str, args: &[String]) -> Result<String> {
+    validate_autostart_value(executable)?;
+    for arg in args {
+        validate_autostart_value(arg)?;
+    }
+    let exec_start = std::iter::once(escape_systemd_exec_arg(executable))
+        .chain(args.iter().map(|arg| escape_systemd_exec_arg(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "[Unit]\nDescription=x0x Agent Daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={exec_start}\nEnvironment={env_key}={template_version}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        env_key = crate::upgrade::restart::SYSTEMD_TEMPLATE_ENV_KEY,
+        template_version = AUTOSTART_TEMPLATE_VERSION,
+    ))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn render_launchd_plist(executable: &str, args: &[String], log_path: &Path) -> Result<String> {
+    validate_autostart_value(executable)?;
+    for arg in args {
+        validate_autostart_value(arg)?;
+    }
+    let log_path = log_path.to_string_lossy();
+    validate_autostart_value(&log_path)?;
+    let prog_args = std::iter::once(executable)
+        .chain(args.iter().map(String::as_str))
+        .map(|arg| format!("        <string>{}</string>\n", xml_escape(arg)))
+        .collect::<String>();
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>com.saorsalabs.x0xd</string>\n    <key>ProgramArguments</key>\n    <array>\n{prog_args}    </array>\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>{supervised_key}</key>\n        <string>1</string>\n    </dict>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>{template_key}</key>\n    <integer>{template_version}</integer>\n    <key>StandardOutPath</key>\n    <string>{log}</string>\n    <key>StandardErrorPath</key>\n    <string>{log}</string>\n</dict>\n</plist>\n",
+        supervised_key = crate::upgrade::restart::SUPERVISED_ENV_VAR,
+        template_key = crate::upgrade::restart::LAUNCHD_TEMPLATE_VERSION_KEY,
+        template_version = AUTOSTART_TEMPLATE_VERSION,
+        log = xml_escape(&log_path),
+    ))
+}
+
 /// `x0x autostart` — configure daemon to start on boot.
 pub async fn autostart(name: Option<&str>) -> Result<()> {
     let x0xd_path = find_x0xd()?;
@@ -222,28 +331,17 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
             args.push("--name".to_string());
             args.push(n.to_string());
         }
-        let args_str = args.join(" ");
+        // #690: correctly escaped ExecStart — every argument rendered
+        // through the systemd command-line escaper so a name with spaces or
+        // quotes stays ONE argument — plus the template version stamp in
+        // the unit Environment where the loaded-policy readback observes it.
         let unit_dir = dirs::config_dir()
             .context("cannot determine config directory")?
             .join("systemd/user");
         std::fs::create_dir_all(&unit_dir)?;
 
         let unit_path = unit_dir.join("x0xd.service");
-        let unit = format!(
-            "[Unit]\n\
-             Description=x0x Agent Daemon\n\
-             After=network-online.target\n\
-             Wants=network-online.target\n\
-             \n\
-             [Service]\n\
-             Type=simple\n\
-             ExecStart={x0xd} {args_str}\n\
-             Restart=always\n\
-             RestartSec=5\n\
-             \n\
-             [Install]\n\
-             WantedBy=default.target\n"
-        );
+        let unit = render_systemd_unit(&x0xd, &args)?;
         std::fs::write(&unit_path, unit)?;
 
         let status = std::process::Command::new("systemctl")
@@ -276,11 +374,11 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
         std::fs::create_dir_all(&plist_dir)?;
 
         let plist_path = plist_dir.join("com.saorsalabs.x0xd.plist");
-        let mut prog_args = format!("        <string>{x0xd}</string>\n");
+        // #690: XML-escape every rendered argument and stamp the template
+        // version so upgrade-time drift detection identifies the generation.
+        let mut args = Vec::new();
         if let Some(n) = name {
-            prog_args.push_str(&format!(
-                "        <string>--name</string>\n        <string>{n}</string>\n"
-            ));
+            args.extend(["--name".to_string(), n.to_string()]);
         }
 
         let data_dir = if let Some(n) = name {
@@ -295,42 +393,8 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
         std::fs::create_dir_all(&data_dir)?;
         let log_path = data_dir.join("x0xd.log");
 
-        let plist = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-             <plist version=\"1.0\">\n\
-             <dict>\n\
-                 <key>Label</key>\n\
-                 <string>com.saorsalabs.x0xd</string>\n\
-                 <key>ProgramArguments</key>\n\
-                 <array>\n\
-             {prog_args}\
-                 </array>\n\
-                 <key>EnvironmentVariables</key>\n\
-                 <dict>\n\
-                     <key>{}</key>\n\
-                     <string>1</string>\n\
-                 </dict>\n\
-                 <key>RunAtLoad</key>\n\
-                 <true/>\n\
-                 <key>KeepAlive</key>\n\
-                 <true/>\n\
-                 <key>StandardOutPath</key>\n\
-                 <string>{}</string>\n\
-                 <key>StandardErrorPath</key>\n\
-                 <string>{}</string>\n\
-             </dict>\n\
-             </plist>\n",
-            // launchd ancestry alone is NOT classified as supervision
-            // (`is_supervised`, src/upgrade/restart.rs) — without this var a
-            // KeepAlive agent takes the transactional-handoff path on
-            // self-update and launchd relaunches a second daemon on the same
-            // data dir (#493). With it, self-update exits and lets launchd
-            // restart the new binary.
-            crate::upgrade::restart::SUPERVISED_ENV_VAR,
-            log_path.display(),
-            log_path.display()
-        );
+        // The pure renderer used by tests is the only template path.
+        let plist = render_launchd_plist(&x0xd, &args, &log_path)?;
         std::fs::write(&plist_path, plist)?;
 
         // Unload any existing agent first (ignore errors if not loaded).
@@ -370,7 +434,7 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
 /// running custom one, and never rewrites arbitrary service policy.
 // Only the macOS `--repair` driver calls these; on other platforms they exist
 // for the unit tests, which is where the decision table is pinned.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RepairVerdict {
     /// The job already declares the supervision marker — no change needed.
@@ -389,7 +453,7 @@ pub(crate) enum RepairVerdict {
 /// Basename of a launchd `ProgramArguments[0]`, ignoring any path.
 // Only the macOS `--repair` driver calls these; on other platforms they exist
 // for the unit tests, which is where the decision table is pinned.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(test, target_os = "macos"))]
 fn program_basename(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
@@ -401,7 +465,7 @@ fn program_basename(program: &str) -> &str {
 /// the verdict.
 // Only the macOS `--repair` driver calls these; on other platforms they exist
 // for the unit tests, which is where the decision table is pinned.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
     let program = plist
         .get("ProgramArguments")
@@ -877,5 +941,109 @@ mod tests {
             "autostart_remove should not fail: {:?}",
             result
         );
+    }
+    // ===================================================================
+    // #690: versioned template rendering and argument escaping
+    // ===================================================================
+
+    #[test]
+    fn xml_escape_renders_all_five_entities() {
+        assert_eq!(xml_escape("&<>\"'"), "&amp;&lt;&gt;&quot;&apos;");
+        assert_eq!(xml_escape("/plain/path"), "/plain/path");
+        assert_eq!(xml_escape("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn systemd_exec_arg_escapes_specifier_dollar_and_backslash() {
+        // Plain argument: no quoting, no escaping.
+        assert_eq!(escape_systemd_exec_arg("--name"), "\"--name\"");
+        assert_eq!(
+            escape_systemd_exec_arg("/opt/x0x/x0xd"),
+            "\"/opt/x0x/x0xd\""
+        );
+        // Whitespace triggers quoting.
+        assert_eq!(escape_systemd_exec_arg("a b"), "\"a b\"");
+        // % → %% (specifier escape, man systemd.service SPECIFIERS).
+        assert_eq!(escape_systemd_exec_arg("100%"), "100%%");
+        // $ → $$ (variable substitution escape, man systemd.service
+        // COMMAND LINES).
+        assert_eq!(escape_systemd_exec_arg("$FOO"), "$$FOO");
+        assert_eq!(escape_systemd_exec_arg("${FOO}"), "$${FOO}");
+        // \ → \\ (escape character itself) — unconditionally, not just
+        // inside quotes.
+        assert_eq!(escape_systemd_exec_arg("C:\\path"), "C:\\\\path");
+        assert_eq!(escape_systemd_exec_arg("\"quoted\""), "\"\\\"quoted\\\"\"");
+        // Empty argument renders as quoted empty string (systemd cannot
+        // express a bare empty token otherwise).
+        assert_eq!(escape_systemd_exec_arg(""), "\"\"");
+        assert_eq!(escape_systemd_exec_arg("'alice'"), "\"'alice'\"");
+        assert_eq!(escape_systemd_exec_arg(";"), "\";\"");
+    }
+
+    /// The plist template with a name containing XML-special characters
+    /// must render as parseable XML with the value intact as data.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plist_renders_escaped_and_versioned() {
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let log = dir.path().join("logs & output/x0xd.log");
+        let args = vec!["--name".to_string(), "a & <b> \"c\" 'd'".to_string()];
+        let rendered = render_launchd_plist("/Applications/x0x & tools/x0xd", &args, &log)
+            .expect("render production plist");
+        let path = dir.path().join("fixture.plist");
+        std::fs::write(&path, rendered).expect("write fixture plist");
+        let parsed = read_plist_as_json(&path)
+            .expect("run plutil")
+            .expect("actual generated plist parses");
+        assert_eq!(
+            parsed["ProgramArguments"],
+            serde_json::json!([
+                "/Applications/x0x & tools/x0xd",
+                "--name",
+                "a & <b> \"c\" 'd'"
+            ])
+        );
+        assert_eq!(parsed["EnvironmentVariables"]["X0X_SUPERVISED"], "1");
+        assert_eq!(parsed["X0XTemplateVersion"], AUTOSTART_TEMPLATE_VERSION);
+        assert_eq!(parsed["StandardOutPath"], log.to_string_lossy().as_ref());
+        assert_eq!(parsed["StandardErrorPath"], log.to_string_lossy().as_ref());
+    }
+
+    /// The systemd template's ExecStart and Environment lines are
+    /// well-formed for the escaping contract (verified on any platform —
+    /// the template text is the same).
+    #[test]
+    fn systemd_template_renders_escaped_and_versioned() {
+        let name = "a b&c%d$e\\f";
+        let args = ["--name".to_string(), name.to_string()];
+        let unit =
+            render_systemd_unit("/opt/x0x tools/x0xd", &args).expect("render production unit");
+        let exec = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+            .expect("actual ExecStart line");
+        assert_eq!(
+            exec,
+            "\"/opt/x0x tools/x0xd\" \"--name\" \"a b&c%%d$$e\\\\f\""
+        );
+        assert!(unit.lines().any(|line| {
+            line == format!(
+                "Environment={}={AUTOSTART_TEMPLATE_VERSION}",
+                crate::upgrade::restart::SYSTEMD_TEMPLATE_ENV_KEY
+            )
+        }));
+        assert!(unit.lines().any(|line| line == "Type=simple"));
+        assert!(unit.lines().any(|line| line == "Restart=always"));
+    }
+
+    #[test]
+    fn autostart_templates_reject_raw_controls() {
+        assert!(render_systemd_unit("/opt/x0xd", &["--name\nforged".to_string()]).is_err());
+        assert!(render_launchd_plist(
+            "/opt/x0xd",
+            &["--name\rforged".to_string()],
+            Path::new("/tmp/x0xd.log")
+        )
+        .is_err());
     }
 }

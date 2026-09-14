@@ -437,14 +437,14 @@ fn run_launchctl_print(target: &str) -> Result<Option<String>, String> {
 
 /// Plist-reader callback for [`readback_launchd_policy_in`]: the plist file
 /// as JSON, or `None` when it cannot be read or parsed.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(test, target_os = "macos"))]
 type PlistReader<'a> = &'a dyn Fn(&Path) -> Option<serde_json::Value>;
 
 /// launchctl probe callback for [`readback_launchd_policy_in`]: given a full
 /// launchd service target (e.g. `gui/501/com.example.x0xd`), `Ok(Some(stdout))`
 /// when that domain holds the job, `Ok(None)` when it does not, `Err` when
 /// launchctl could not be run. `FnMut` so tests can record probe order.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(test, target_os = "macos"))]
 type LaunchctlPrint<'a> = &'a mut dyn FnMut(&str) -> Result<Option<String>, String>;
 
 /// The decision core of [`readback_launchd_policy`]: discover candidate
@@ -461,7 +461,7 @@ type LaunchctlPrint<'a> = &'a mut dyn FnMut(&str) -> Result<Option<String>, Stri
 /// so the refuse-vs-proceed decision table is unit-testable on any platform
 /// with captured probe output; every path that cannot confirm an
 /// unconditional keep-alive on this instance's job fails closed.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(test, target_os = "macos"))]
 fn readback_launchd_policy_in(
     plist_dir: &Path,
     uid: u32,
@@ -590,6 +590,985 @@ fn plist_as_json(path: &Path) -> Option<serde_json::Value> {
     }
     serde_json::from_slice(&out.stdout).ok()
 }
+// ---------------------------------------------------------------------------
+// systemd loaded-policy readback (ADR-0061 §3, #690)
+// ---------------------------------------------------------------------------
+
+/// `Environment=` key the versioned systemd template stamps into generated
+/// units (see `x0x autostart`): it makes the template generation the job
+/// was created from observable in the LOADED policy (`systemctl show -p
+/// Environment`), so upgrade-time drift detection does not have to trust a
+/// file on disk.
+pub const SYSTEMD_TEMPLATE_ENV_KEY: &str = "X0X_TEMPLATE_VERSION";
+
+/// The launchd plist key carrying the same template-version identity.
+pub const LAUNCHD_TEMPLATE_VERSION_KEY: &str = "X0XTemplateVersion";
+
+/// Upper bound for every `systemctl` subprocess the readback runs
+/// (`systemctl show` on one unit; bounded so a wedged dbus/manager cannot
+/// hang an upgrade decision — the refusal side of the bound is fail-closed).
+#[cfg(target_os = "linux")]
+const SYSTEMCTL_SHOW_BOUND: Duration = Duration::from_secs(5);
+
+/// Output cap for the bounded `systemctl show` collection: far above any
+/// realistic property payload, small enough that a runaway `show` (e.g. a
+/// unit with a pathological Environment) cannot balloon memory.
+#[cfg(target_os = "linux")]
+const SYSTEMCTL_OUTPUT_CAP: usize = 256 * 1024;
+
+/// `Restart=` values that guarantee a respawn after the supervised exit
+/// status (exit 0), per `man systemd.service` (table 2): `always`
+/// restarts on every exit including clean ones; `on-success` restarts on
+/// exit 0/success specifically. Every other value (`no`, `on-failure`,
+/// `on-abnormal`, `on-watchdog`, `on-abort`) leaves a clean exit
+/// un-restarted and may NOT back a `SupervisedExit` plan — the daemon
+/// would exit 0 for the upgrade and stay down.
+#[cfg(any(test, target_os = "linux"))]
+const RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART: &[&str] = &["always", "on-success"];
+
+/// The systemd unit whose loaded policy guaranteed the restart (ADR-0061
+/// §3, #690): the unit name, which manager holds it, the confirmed
+/// `Restart=` value, and the template version stamped in the unit's loaded
+/// environment when the deployment was created from a versioned template
+/// (`None` = pre-template legacy unit — recorded for drift visibility, not a
+/// refusal; the readback's accept/reject rests on policy and instance
+/// binding, not on the version marker).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SystemdVerifiedUnit {
+    /// Unit name as systemd knows it (instance suffix included, e.g.
+    /// `x0xd.service` or `x0xd@foo.service`).
+    pub unit: String,
+    /// `true` when the unit lives in the user's manager (`systemctl
+    /// --user`), `false` for the system manager. The two managers hold
+    /// disjoint unit sets, so the follow-up `systemctl` commands an operator
+    /// runs must target the same one.
+    pub user_manager: bool,
+    /// The confirmed `Restart=` value (one of
+    /// [`RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART`]).
+    pub restart: String,
+    /// present and parseable.
+    pub template_version: Option<u32>,
+}
+
+/// Outcome of the systemd loaded-policy readback — the systemd-side twin of
+/// [`LaunchdPolicyReadback`] (#615), closing ADR-0061 §3's Linux half
+/// (#690).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemdPolicyReadback {
+    /// No systemd signal classified this instance (or the readback is not
+    /// applicable on this platform) — nothing to gate.
+    NotApplicable,
+    /// The loaded unit policy for THIS exact running instance was read back
+    /// and guarantees a respawn after the supervised exit status.
+    Verified(Box<SystemdVerifiedUnit>),
+    /// Every path that cannot confirm the guarantee. Fail-closed: choosing
+    /// `SupervisedExit` on any of these is the silent-service-disappearance
+    /// failure §3 exists to prevent.
+    NotGuaranteed { detail: String },
+}
+
+/// Whether the recognized supervision signal names a systemd unit (either
+/// `INVOCATION_ID` or a `systemd` parent) — those are the signals whose
+/// `SupervisedExit` plan the systemd readback must gate.
+fn systemd_signal_name(signals: &SupervisionSignals) -> Option<&'static str> {
+    if signals.invocation_id {
+        Some("INVOCATION_ID")
+    } else if signals
+        .parent_comm
+        .as_deref()
+        .is_some_and(|c| c.trim() == "systemd")
+    {
+        Some("parent process `systemd`")
+    } else {
+        None
+    }
+}
+
+/// Extract `(unit, user_manager)` from a `/proc/<pid>/cgroup` read.
+///
+/// The cgroup path is systemd's own name for the unit holding the process
+/// (`man systemd.cgroup`): system units live under `/system.slice/…`, user
+/// units under `/user.slice/user-<uid>.slice/user@<uid>.service/…` — the
+/// `user@` component is what distinguishes the user manager. The unit is
+/// the LAST `.service` path component; anything else (a bare slice/scope
+/// tail, an empty path) cannot name this daemon's service and fails closed.
+#[cfg(any(test, target_os = "linux"))]
+fn unit_from_cgroup(cgroup: &str) -> Option<(String, bool)> {
+    // Lines are `<hierarchy-id>:<controllers>:<path>` (cgroup v1) or
+    // `0::<path>` (unified v2); the last non-empty line is the most
+    // specific. Split on ':' taking everything after the second colon.
+    let path = cgroup
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|line| {
+            let mut parts = line.splitn(3, ':');
+            let _hierarchy = parts.next()?;
+            let _controllers = parts.next()?;
+            parts.next()
+        })?
+        .trim();
+    let user_manager = path.contains("/user@");
+    let unit = path.rsplit('/').find(|c| c.ends_with(".service"))?;
+    Some((unit.to_string(), user_manager))
+}
+
+/// One `key=value` line from `systemctl show` output, if present.
+#[cfg(any(test, target_os = "linux"))]
+fn show_property<'a>(show: &'a str, key: &str) -> Option<&'a str> {
+    show.lines()
+        .map(|l| l.trim())
+        .find(|l| l.starts_with(key) && l[key.len()..].starts_with('='))
+        .map(|l| &l[key.len() + 1..])
+}
+
+/// Tokenize one raw systemd command-line (the `argv[]=` rendering of
+/// `systemctl show -p ExecStart`) into its argument list, preserving
+/// argument boundaries per `man systemd.service` (COMMAND LINES): tokens
+/// are whitespace-separated; double quotes keep whitespace inside a token;
+/// backslash escapes the next character.
+///
+/// Conservative by contract: returns `None` for anything it cannot decode
+/// with certainty (unterminated quote, trailing backslash, quoting in the
+/// middle of a token). Raw `%` (specifier) and `$` (variable) sequences are
+/// also refused — the shown ExecStart is the RAW configured line, and
+/// comparing it against the running process's EXPANDED argv would require
+/// reimplementing specifier/variable expansion; refusing is the fail-closed
+/// side of that trade.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_systemd_argv_tokens(raw: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut quoted_token = false;
+    let mut chars = raw.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped) => current.push(escaped),
+                None => return None, // trailing backslash
+            },
+            '"' => {
+                if in_quotes || current.is_empty() {
+                    in_quotes = !in_quotes;
+                    quoted_token = true;
+                } else {
+                    // `"a"b` — quoting glued onto a token this parser
+                    // cannot reproduce faithfully.
+                    return None;
+                }
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() || quoted_token {
+                    tokens.push(std::mem::take(&mut current));
+                    quoted_token = false;
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if in_quotes {
+        return None; // unterminated quote
+    }
+    if !current.is_empty() || quoted_token {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    for token in &tokens {
+        if token.contains('%') || token.contains('$') {
+            return None;
+        }
+    }
+    Some(tokens)
+}
+
+/// `ExecStart={ path=/x/y ; argv[]=a b ; … }` → `(path, argv_tokens)`.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_exec_start(value: &str) -> Option<(String, Vec<String>)> {
+    let path = value
+        .split("path=")
+        .nth(1)?
+        .split(" ; ")
+        .next()?
+        .trim()
+        .to_string();
+    let argv_raw = value.split("argv[]=").nth(1)?.split(" ; ").next()?.trim();
+    let tokens = parse_systemd_argv_tokens(argv_raw)?;
+    Some((path, tokens))
+}
+
+/// The decision core of [`readback_systemd_policy`]: resolve the unit from
+/// the cgroup read, query the correct manager's LOADED policy, and verify —
+/// for THIS exact running instance — the PID binding (`MainPID`), the
+/// invocation binding (`InvocationID`), the executable/argv binding
+/// (`ExecStart`, compared by canonical absolute path through
+/// `same_executable` and by exact argv boundaries), and a `Restart=`
+/// policy that respawns after exit 0.
+///
+/// `same_executable` decides whether a loaded `ExecStart` path IS this
+/// executable — the production implementation canonicalizes both paths
+/// (never basename equality: different directories may contain `x0xd`);
+/// tests inject fixture logic. Split from the systemctl driver so the
+/// refuse-vs-proceed decision table is unit-testable on any platform with
+/// captured show output; every path that cannot confirm the guarantee
+/// fails closed.
+#[cfg(any(test, target_os = "linux"))]
+type SystemctlShow<'a> = dyn FnMut(bool, &str) -> Result<Option<String>, String> + 'a;
+
+#[cfg(any(test, target_os = "linux"))]
+type SameExecutable<'a> = dyn Fn(&str, &Path) -> bool + 'a;
+
+#[cfg(any(test, target_os = "linux"))]
+struct SystemdReadbackInput<'a> {
+    cgroup: &'a str,
+    pid: u32,
+    invocation_id: Option<&'a str>,
+    executable: &'a Path,
+    argv: &'a [String],
+    monotonic_now_us: Option<u64>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn readback_systemd_policy_in(
+    input: SystemdReadbackInput<'_>,
+    show: &mut SystemctlShow<'_>,
+    same_executable: &SameExecutable<'_>,
+) -> SystemdPolicyReadback {
+    let SystemdReadbackInput {
+        cgroup,
+        pid,
+        invocation_id,
+        executable,
+        argv,
+        monotonic_now_us,
+    } = input;
+    let refuse = |detail: String| SystemdPolicyReadback::NotGuaranteed { detail };
+    let Some((unit, user_manager)) = unit_from_cgroup(cgroup) else {
+        return refuse(format!(
+            "the process cgroup ({}) does not name a service unit for this instance",
+            cgroup.trim()
+        ));
+    };
+    let show_output = match show(user_manager, &unit) {
+        Ok(Some(out)) => out,
+        Ok(None) => {
+            return refuse(format!(
+                "systemctl show reported no loaded unit `{unit}` ({} manager)",
+                if user_manager { "user" } else { "system" }
+            ))
+        }
+        Err(e) => return refuse(format!("`systemctl show {unit}` failed: {e}")),
+    };
+
+    // PID binding: the unit's MainPID must be THIS process. A child of the
+    // real service (or a unit that is not running) fails here — exactly the
+    // "not merely INVOCATION_ID presence" requirement.
+    let main_pid = show_property(&show_output, "MainPID")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if main_pid != pid {
+        return refuse(format!(
+            "unit `{unit}` reports MainPID {main_pid}, not this process ({pid}); \
+             INVOCATION_ID presence alone does not bind the unit to this instance"
+        ));
+    }
+
+    // Invocation binding: when systemd gave us an invocation id, the loaded
+    // unit's must match it.
+    if let Some(invocation) = invocation_id {
+        match show_property(&show_output, "InvocationID") {
+            Some(loaded) if loaded.trim() == invocation => {}
+            other => {
+                return refuse(format!(
+                    "unit `{unit}` reports InvocationID {} but this process runs under {}",
+                    other.unwrap_or("<absent>"),
+                    invocation
+                ))
+            }
+        }
+    }
+
+    // Executable/argv binding: canonical-absolute-path identity for the
+    // executable (never basename equality) and exact argv boundaries —
+    // unparseable or ambiguous ExecStart quoting fails closed.
+    let exec = show_property(&show_output, "ExecStart").and_then(parse_exec_start);
+    let exec_ok = exec.is_some_and(|(loaded_path, tokens)| {
+        if !same_executable(&loaded_path, executable) {
+            return false;
+        }
+        // argv[0] in the loaded line: either the path itself or an
+        // `argv[0]=` override, which must still be this executable.
+        let first = tokens.first().map(String::as_str).unwrap_or_default();
+        if first != loaded_path && !same_executable(first, executable) {
+            return false;
+        }
+        tokens.len() == argv.len()
+            && tokens
+                .iter()
+                .zip(argv.iter())
+                .skip(1)
+                .all(|(loaded, ours)| loaded == ours)
+    });
+    if !exec_ok {
+        return refuse(format!(
+            "unit `{unit}` does not run this executable/argv (ExecStart {})",
+            show_property(&show_output, "ExecStart").unwrap_or("<absent>")
+        ));
+    }
+
+    // Restart policy: only the clean-exit-covering values may back a
+    // SupervisedExit (see RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART).
+    let restart = show_property(&show_output, "Restart").unwrap_or("").trim();
+    if !RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART.contains(&restart) {
+        return refuse(format!(
+            "unit `{unit}` has Restart={restart:?}, which does not guarantee a respawn \
+             after exit {}; `always` or `on-success` is required (man systemd.service)",
+            supervised_exit_code()
+        ));
+    }
+
+    /// What one `RestartPreventExitStatus=` entry says about the clean exit
+    /// status (exit 0). Entries are numeric statuses, `low-high` ranges, or
+    /// signal names (man systemd.service); a signal never covers a clean exit,
+    /// and anything this parser cannot decode is [`PreventCoverage::Unparseable`]
+    /// so the caller fails closed.
+    enum PreventCoverage {
+        CoversCleanExit,
+        CleanExitNotCovered,
+        Unparseable,
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn prevent_token_covers_clean_exit(token: &str) -> PreventCoverage {
+        let token = token.trim();
+        if token.is_empty() {
+            return PreventCoverage::Unparseable;
+        }
+        if let Ok(status) = token.parse::<i64>() {
+            return if status == 0 {
+                PreventCoverage::CoversCleanExit
+            } else {
+                PreventCoverage::CleanExitNotCovered
+            };
+        }
+        if let Some((low, high)) = token.split_once('-') {
+            if let (Ok(low), Ok(high)) = (low.trim().parse::<i64>(), high.trim().parse::<i64>()) {
+                return if low <= 0 && 0 <= high {
+                    PreventCoverage::CoversCleanExit
+                } else {
+                    PreventCoverage::CleanExitNotCovered
+                };
+            }
+        }
+        // Signal names (SIGTERM, SIGKILL, …) name terminations, not clean
+        // exits; systemd renders them with the SIG prefix.
+        if token.to_ascii_uppercase().starts_with("SIG") {
+            return PreventCoverage::CleanExitNotCovered;
+        }
+        PreventCoverage::Unparseable
+    }
+
+    // RestartPreventExitStatus (man systemd.service): a matching exit
+    // status prevents the restart REGARDLESS of Restart= — a unit with
+    // Restart=always and `0` (or a range covering 0) listed here still
+    // leaves the daemon down after exit 0. Fail closed when the property
+    match show_property(&show_output, "RestartPreventExitStatus") {
+        None => {
+            return refuse(
+                "RestartPreventExitStatus was not reported for the unit; whether exit 0 \
+                 is restart-prevented cannot be proven"
+                    .to_string(),
+            )
+        }
+        Some(v) if v.trim().is_empty() => {}
+        Some(v) => {
+            for token in v.split_whitespace() {
+                match prevent_token_covers_clean_exit(token) {
+                    PreventCoverage::CoversCleanExit => {
+                        return refuse(format!(
+                            "RestartPreventExitStatus lists `{token}`, which covers the \
+                             clean exit status and prevents the restart regardless of \
+                             Restart={restart}"
+                        ))
+                    }
+                    PreventCoverage::Unparseable => {
+                        return refuse(format!(
+                            "RestartPreventExitStatus entry `{token}` cannot be parsed; \
+                             coverage of the clean exit status cannot be proven"
+                        ))
+                    }
+                    PreventCoverage::CleanExitNotCovered => {}
+                }
+            }
+        }
+    }
+
+    // RemainAfterExit=yes / Type=oneshot: a clean exit leaves the unit
+    // `active (exited)` and systemd does not respawn it (man systemd.service,
+    // Restart= and Type= semantics) — not a restart guarantee. Both
+    // properties are always emitted by `systemctl show`; absence is
+    // unprovable and fails closed.
+    let remain_after_exit = show_property(&show_output, "RemainAfterExit")
+        .unwrap_or("")
+        .trim();
+    let unit_type = show_property(&show_output, "Type").unwrap_or("").trim();
+    if remain_after_exit.is_empty() || unit_type.is_empty() {
+        return refuse(
+            "RemainAfterExit/Type were not reported for the unit; the clean-exit restart \
+             semantics cannot be proven"
+                .to_string(),
+        );
+    }
+    if remain_after_exit.eq_ignore_ascii_case("yes") {
+        return refuse(
+            "RemainAfterExit=yes leaves the unit active(exited) after a clean exit — \
+             systemd does not respawn it"
+                .to_string(),
+        );
+    }
+    if unit_type.eq_ignore_ascii_case("oneshot") {
+        return refuse(
+            "Type=oneshot units are not restarted on clean exit — the supervised exit \
+             would leave the service down"
+                .to_string(),
+        );
+    }
+
+    // Start-rate limiting (man systemd.service, StartLimitIntervalSec=/
+    // StartLimitBurst=): restarts are subject to a rate limit — a unit at
+    // the limit does NOT respawn even with Restart=always. Bound the claim
+    // to ONE clean-exit restart: either limiting is disabled (interval 0 or
+    // burst 0), or the CURRENT activation has outlived the loaded interval,
+    // so every earlier start attempt has slid out of the window and this
+    // activation's own start has too — the next start is the only one the
+    // window could count. Anything ambiguous (property absent, unparseable,
+    // no monotonic clock, or a window that may still hold prior attempts)
+    // fails closed before mutation. Host limits are never weakened and no
+    // competing restart owner is introduced: an exhausted unit is an
+    // operator problem, not one the upgrade path papers over.
+    let Some(interval_us) =
+        show_property(&show_output, "StartLimitIntervalUSec").and_then(parse_systemd_timespan_us)
+    else {
+        return refuse(
+            "StartLimitIntervalUSec is absent or unparseable; the start-rate window \
+             cannot be proven"
+                .to_string(),
+        );
+    };
+    let Some(burst) =
+        show_property(&show_output, "StartLimitBurst").and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return refuse(
+            "StartLimitBurst is absent or unparseable; the start-rate limit cannot be \
+             proven"
+                .to_string(),
+        );
+    };
+    if interval_us != 0 && burst != 0 {
+        let Some(active_enter_us) = show_property(&show_output, "ActiveEnterTimestampMonotonic")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        else {
+            return refuse(
+                "ActiveEnterTimestampMonotonic is absent or unparseable; whether the \
+                 start-rate window has aged out cannot be proven"
+                    .to_string(),
+            );
+        };
+        match monotonic_now_us {
+            Some(now_us) if now_us > active_enter_us && now_us - active_enter_us > interval_us => {
+                // Stable old service: the window has aged out completely.
+            }
+            Some(_) => {
+                return refuse(
+                    "the unit's current activation has not outlived StartLimitIntervalUSec; \
+                     a restart now could hit the start-rate limit and leave the service \
+                     down (man systemd.service)"
+                        .to_string(),
+                )
+            }
+            None => {
+                return refuse(
+                    "the monotonic clock is unavailable; whether the start-rate window \
+                     has aged out cannot be proven"
+                        .to_string(),
+                )
+            }
+        }
+    }
+
+    // Template identity for drift detection — recorded, never required (a
+    // pre-template unit is legacy, not unsupported; the policy+binding
+    // checks above are what establish support). Unparseable versions stay
+    // `None` rather than guessing.
+    let template_version = show_property(&show_output, "Environment").and_then(|env| {
+        env.split(&[',', ' '][..])
+            .find_map(|tok| {
+                tok.strip_prefix(SYSTEMD_TEMPLATE_ENV_KEY)?
+                    .strip_prefix('=')
+            })
+            .and_then(|v| v.trim().parse::<u32>().ok())
+    });
+
+    SystemdPolicyReadback::Verified(Box::new(SystemdVerifiedUnit {
+        unit,
+        user_manager,
+        restart: restart.to_string(),
+        template_version,
+    }))
+}
+
+/// Executable identity for the readback: canonical absolute paths on both
+/// sides (a directory difference is a DIFFERENT binary, never a match);
+/// anything that cannot be canonicalized is unproven and fails closed.
+/// (Device/inode comparison would be equally acceptable evidence; canonical
+/// paths are what `std` provides portably here.)
+#[cfg(target_os = "linux")]
+fn same_executable_canonical(loaded: &str, ours: &Path) -> bool {
+    matches!(
+        (
+            std::fs::canonicalize(std::path::Path::new(loaded)),
+            std::fs::canonicalize(ours)
+        ),
+        (Ok(a), Ok(b)) if a == b
+    );
+}
+/// Parse a systemd timespan (`systemctl show` renders `StartLimitIntervalUSec`
+/// as e.g. `10s`, `1min 30s`, `500ms`, `0`, or `infinity`) into microseconds.
+/// `infinity` is not a finite window this readback can reason about and fails
+/// closed (`None`), as does any token that does not parse.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_systemd_timespan_us(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None; // empty is unparseable, not zero — fail closed
+    }
+    // "0" (no unit) is how systemctl renders a disabled limit.
+    if trimmed == "0" {
+        return Some(0);
+    }
+    let mut total_us: u64 = 0;
+    for token in trimmed.split_whitespace() {
+        if token.eq_ignore_ascii_case("infinity") {
+            return None;
+        }
+        let end = token
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(token.len());
+        let (digits, unit) = token.split_at(end);
+        if digits.is_empty() {
+            return None; // no numeric part
+        }
+        let value: u64 = digits.parse().ok()?;
+        // Integer microseconds only: sub-second units (usec/ms) below 1 µs
+        // cannot be represented and fail closed rather than truncating.
+        let multiplier_us = match unit.to_ascii_lowercase().as_str() {
+            "s" => 1_000_000u64.checked_mul(1)?,
+            "us" | "\u{b5}s" | "usec" => 1,
+            "ms" | "msec" => 1_000,
+            "m" | "min" => 60_000_000,
+            "h" => 3_600_000_000,
+            "d" => 86_400_000_000,
+            "w" => 604_800_000_000,
+            _ => return None,
+        };
+        total_us = total_us.checked_add(value.checked_mul(multiplier_us)?)?;
+    }
+    Some(total_us)
+}
+
+/// Collect a spawned child's stdout under a hard wall-clock bound and byte
+/// cap using `poll(2)` on a genuinely non-blocking descriptor — NOT a
+/// blocking `read` behind a stop flag (a flag cannot wake a parked read,
+/// and a silent DESCENDANT inheriting the write end keeps the pipe open
+/// forever after the direct child exits).
+///
+/// Mechanics: the piped stdout is duplicated into a raw fd set
+/// `O_NONBLOCK`, then `poll(POLLIN, deadline-remaining)` drives every
+/// read. Three exits, all bounded: (1) poll/read reports EOF or a child
+/// error — pipe drained, done; (2) the wall deadline passes — the child is
+/// killed and reaped, the loop makes one final drain pass with a short
+/// grace so buffered-but-unread final properties are still collected, then
+/// returns; (3) the byte cap is exceeded — fail closed, never accept
+/// truncated property data. Every post-spawn error path kills and reaps
+/// the child so no `systemctl` is ever left running. I/O read errors are
+/// returned as errors, never silently treated as EOF.
+///
+/// # Safety
+/// The `unsafe` blocks call `libc::fcntl`/`libc::poll`/`libc::read`/`libc::close`
+/// on a raw fd this function owns for its lifetime (duplicated from the
+/// child's piped stdout, closed before returning on every path); the
+/// descriptor is not shared with any other thread, so no aliasing is
+/// possible (same pattern as the existing `unsafe` blocks in this module:
+/// `getppid`, `isatty`, `_exit`).
+#[cfg(unix)]
+#[cfg(any(test, target_os = "linux"))]
+fn collect_child_output_bounded(
+    child: std::process::Child,
+    bound: Duration,
+    cap: usize,
+) -> Result<Option<String>, String> {
+    collect_child_output_bounded_inner(child, bound, cap, false)
+}
+
+#[cfg(unix)]
+#[cfg(any(test, target_os = "linux"))]
+fn collect_child_output_bounded_inner(
+    mut child: std::process::Child,
+    bound: Duration,
+    cap: usize,
+    fail_after_dup_for_test: bool,
+) -> Result<Option<String>, String> {
+    use std::os::unix::io::AsRawFd;
+
+    // Cleanup guard: every fallible SETUP step below (stdout take, fd
+    // duplicate, flag reads) that fails must kill and reap the child before
+    // returning — no spawned process is ever leaked past a setup error
+    // (Sol292 review). The closure captures nothing; it borrows the child.
+    let fail_setup = |child: &mut std::process::Child, what: &str| -> String {
+        let _ = child.kill();
+        let _ = child.wait();
+        what.to_string()
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| fail_setup(&mut child, "child stdout was not piped"))?;
+    let raw_fd = stdout.as_raw_fd();
+
+    // SAFETY: fcntl(F_DUPFD) on a live fd we own; the duplicate is a fresh
+    // descriptor number with no other holders.
+    let dup_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD, 0) };
+    if dup_fd < 0 {
+        return Err(fail_setup(&mut child, "cannot duplicate child stdout fd"));
+    }
+    if fail_after_dup_for_test {
+        // SAFETY: close the private duplicate before exercising the common
+        // post-spawn cleanup path.
+        unsafe { libc::close(dup_fd) };
+        return Err(fail_setup(&mut child, "injected collector setup failure"));
+    }
+    // SAFETY: fcntl(F_GETFL)/fcntl(F_SETFL) toggling O_NONBLOCK on our
+    // private duplicate.
+    let flags = unsafe { libc::fcntl(dup_fd, libc::F_GETFL, 0) };
+    if flags < 0 {
+        // SAFETY: close on the error path.
+        unsafe { libc::close(dup_fd) };
+        return Err(fail_setup(&mut child, "cannot read child stdout fd flags"));
+    }
+    if unsafe { libc::fcntl(dup_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        // SAFETY: close on the error path.
+        unsafe { libc::close(dup_fd) };
+        return Err(fail_setup(
+            &mut child,
+            "cannot set child stdout non-blocking",
+        ));
+    }
+
+    let deadline = Instant::now() + bound;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut read_error: Option<String> = None;
+    let mut over_cap = false;
+    let mut timed_out = false;
+
+    let kill_and_reap = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        child.wait().ok()
+    };
+
+    // Main bounded loop: poll + read until EOF, error, over-cap, or the
+    // wall deadline. Each iteration's poll timeout is the deadline
+    // remainder, so a silent pipe still returns at the wall bound.
+    let final_status;
+    'collect: loop {
+        let now = Instant::now();
+        if now >= deadline {
+            timed_out = true;
+            let reaped_status = kill_and_reap(&mut child);
+            // One bounded grace drain: the kill closed the direct child's
+            // descriptors; anything the pipe already buffered is readable
+            // as EOF-or-data within this grace. A silent DESCENDANT still
+            // holding the write end keeps POLLIN off (no EOF), so the
+            // grace deadline — not the descendant — ends the wait.
+            let grace = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < grace {
+                match poll_read_once(dup_fd, &mut buf, cap, grace) {
+                    PollRead::Data { cap_exceeded: true } => {
+                        over_cap = true;
+                        break;
+                    }
+                    PollRead::Data {
+                        cap_exceeded: false,
+                    } => continue,
+                    PollRead::Eof | PollRead::Timeout => break,
+                    PollRead::Error(e) => {
+                        read_error = Some(e);
+                        break;
+                    }
+                }
+            }
+            final_status = reaped_status;
+            break;
+        }
+        match poll_read_once(dup_fd, &mut buf, cap, deadline) {
+            PollRead::Data { cap_exceeded } => {
+                if cap_exceeded {
+                    over_cap = true;
+                    final_status = kill_and_reap(&mut child);
+                    break;
+                }
+            }
+            PollRead::Eof => {
+                // EOF only proves every stdout writer closed. The child may
+                // remain alive indefinitely, so wait via try_wait under the
+                // same wall deadline rather than calling blocking wait().
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            final_status = Some(status);
+                            break 'collect;
+                        }
+                        Ok(None) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Ok(None) => {
+                            timed_out = true;
+                            final_status = kill_and_reap(&mut child);
+                            break 'collect;
+                        }
+                        Err(error) => {
+                            read_error = Some(format!("checking child status failed: {error}"));
+                            final_status = kill_and_reap(&mut child);
+                            break 'collect;
+                        }
+                    }
+                }
+            }
+            PollRead::Error(e) => {
+                read_error = Some(e);
+                final_status = kill_and_reap(&mut child);
+                break;
+            }
+            PollRead::Timeout => {
+                // No data within the remaining wall bound; loop re-checks
+                // the deadline and takes the kill path above.
+            }
+        }
+    }
+    // SAFETY: close our private duplicate on every exit path.
+    unsafe { libc::close(dup_fd) };
+
+    if let Some(e) = read_error {
+        return Err(format!("reading child output failed: {e}"));
+    }
+    if over_cap || buf.len() > cap {
+        return Err(format!(
+            "child output exceeded the {} byte cap; the property payload is \
+             incomplete and cannot be verified",
+            cap
+        ));
+    }
+    if timed_out {
+        // Grace draining is cleanup only. Expiry means the property stream
+        // was never proven complete, even if the direct child exited zero.
+        return Ok(None);
+    }
+    let status = final_status.ok_or("child was not reaped")?;
+    if status.success() {
+        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+#[cfg(any(test, target_os = "linux"))]
+enum PollRead {
+    Data { cap_exceeded: bool },
+    Eof,
+    Error(String),
+    Timeout,
+}
+
+/// One `poll(POLLIN, until)` + non-blocking `read` cycle on `fd`.
+/// Appends to `buf` up to `cap` (never beyond).
+///
+/// # Safety
+/// Called only with the private duplicate fd owned by
+/// [`collect_child_output_bounded`]; no aliasing, no other threads.
+#[cfg(unix)]
+#[cfg(any(test, target_os = "linux"))]
+fn poll_read_once(fd: i32, buf: &mut Vec<u8>, cap: usize, until: Instant) -> PollRead {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let remaining = until.saturating_duration_since(Instant::now());
+    let timeout_ms: i32 = remaining.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: poll(2) on a private fd; the pfd is stack-local.
+    let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if ready < 0 {
+        let errno = std::io::Error::last_os_error();
+        if errno.kind() == std::io::ErrorKind::Interrupted {
+            return PollRead::Timeout;
+        }
+        return PollRead::Error(errno.to_string());
+    }
+    if ready == 0 {
+        return PollRead::Timeout;
+    }
+    if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return PollRead::Error("poll reported POLLERR/POLLNVAL".to_string());
+    }
+    if pfd.revents & libc::POLLHUP != 0 && pfd.revents & libc::POLLIN == 0 {
+        return PollRead::Eof;
+    }
+    let mut chunk = [0u8; 8192];
+    // SAFETY: read(2) into a stack buffer we own; the fd is non-blocking.
+    let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+    if n < 0 {
+        let errno = std::io::Error::last_os_error();
+        if errno.kind() == std::io::ErrorKind::WouldBlock
+            || errno.kind() == std::io::ErrorKind::Interrupted
+        {
+            return PollRead::Data {
+                cap_exceeded: false,
+            }; // spurious wakeup; poll again
+        }
+        return PollRead::Error(errno.to_string());
+    }
+    if n == 0 {
+        return PollRead::Eof;
+    }
+    let n = n as usize;
+    let room = cap.saturating_sub(buf.len());
+    buf.extend_from_slice(&chunk[..n.min(room)]);
+    PollRead::Data {
+        cap_exceeded: n > room,
+    }
+}
+/// Run `systemctl [--user] show <unit>` with every property the decision
+/// core verifies, under a hard wall-clock bound and output cap: on expiry
+/// the child is killed and the caller fails closed. Off the async runtime
+/// by construction (the driver is called from
+/// [`readback_systemd_policy_offloaded`]'s blocking task), so the poll loop
+/// cannot stall a runtime worker. Output is capped well above any realistic
+/// property payload and error messages never include the `Environment=`
+/// line (it may carry deployment secrets — only the parsed template
+/// version ever leaves the readback).
+#[cfg(target_os = "linux")]
+fn run_systemctl_show(user_manager: bool, unit: &str) -> Result<Option<String>, String> {
+    let mut cmd = std::process::Command::new("systemctl");
+    if user_manager {
+        cmd.arg("--user");
+    }
+    cmd.arg("show")
+        .arg(unit)
+        .args([
+            "--property",
+            "MainPID,InvocationID,Restart,RestartPreventExitStatus,RemainAfterExit,Type,StartLimitIntervalUSec,StartLimitBurst,ActiveEnterTimestampMonotonic,ExecStart,Environment",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot run systemctl: {e}"))?;
+    collect_child_output_bounded(child, SYSTEMCTL_SHOW_BOUND, SYSTEMCTL_OUTPUT_CAP)
+}
+
+/// Linux `CLOCK_MONOTONIC` microseconds, matching systemd's
+/// `ActiveEnterTimestampMonotonic`. `/proc/uptime` includes suspend time on
+/// Linux and would make a resumed host appear older than this clock.
+/// Errors and conversion overflow fail closed.
+#[cfg(target_os = "linux")]
+fn monotonic_now_us() -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is a valid writable timespec and CLOCK_MONOTONIC takes
+    // no borrowed resources.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(value.tv_sec).ok()?;
+    let nanos = u64::try_from(value.tv_nsec).ok()?;
+    if nanos >= 1_000_000_000 {
+        return None;
+    }
+    seconds.checked_mul(1_000_000)?.checked_add(nanos / 1_000)
+}
+
+/// Driver half of the systemd readback (Linux): read this process's cgroup
+/// and `INVOCATION_ID`, then verify the loaded policy through
+/// [`readback_systemd_policy_in`]. Returns
+/// [`SystemdPolicyReadback::NotApplicable`] unless a systemd signal
+/// classified this instance, so non-systemd applies shell out to nothing.
+#[cfg(target_os = "linux")]
+pub fn readback_systemd_policy(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+) -> SystemdPolicyReadback {
+    if systemd_signal_name(signals).is_none() {
+        return SystemdPolicyReadback::NotApplicable;
+    }
+    let cgroup = match std::fs::read_to_string("/proc/self/cgroup") {
+        Ok(c) => c,
+        Err(e) => {
+            return SystemdPolicyReadback::NotGuaranteed {
+                detail: format!("cannot read /proc/self/cgroup: {e}"),
+            }
+        }
+    };
+    let invocation = std::env::var("INVOCATION_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
+    readback_systemd_policy_in(
+        SystemdReadbackInput {
+            cgroup: &cgroup,
+            pid: std::process::id(),
+            invocation_id: invocation.as_deref(),
+            executable,
+            argv,
+            monotonic_now_us: monotonic_now_us(),
+        },
+        &mut run_systemctl_show,
+        &same_executable_canonical,
+    )
+}
+
+/// Non-Linux: there is no systemd to read back.
+#[cfg(not(target_os = "linux"))]
+pub fn readback_systemd_policy(
+    _signals: &SupervisionSignals,
+    _executable: &Path,
+    _argv: &[String],
+) -> SystemdPolicyReadback {
+    SystemdPolicyReadback::NotApplicable
+}
+
+/// [`readback_systemd_policy`] on the blocking pool (the twin of
+/// [`readback_launchd_policy_offloaded`]): the bounded `systemctl`
+/// subprocesses must not stall the runtime worker mid-upgrade (#671 rule).
+pub async fn readback_systemd_policy_offloaded(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+) -> SystemdPolicyReadback {
+    let signals = signals.clone();
+    let executable = executable.to_path_buf();
+    let argv = argv.to_vec();
+    tokio::task::spawn_blocking(move || readback_systemd_policy(&signals, &executable, &argv))
+        .await
+        .unwrap_or_else(|e| SystemdPolicyReadback::NotGuaranteed {
+            detail: format!("systemd readback task failed: {e}"),
+        })
+}
 
 /// The instance's restart contract could not be resolved, so no bytes may be
 /// replaced (ADR-0061 §1: failure "leaves the current process and installed
@@ -643,6 +1622,33 @@ pub enum RestartOwnershipError {
          in docs/upgrade-system.md. No binaries were replaced."
     )]
     SupervisedPolicyNotGuaranteed {
+        /// The recognized signal that made this instance managed.
+        signal: String,
+        /// Exit status the supervisor would have to restart on.
+        exit_code: i32,
+        /// Why the loaded policy could not be confirmed.
+        detail: String,
+    },
+
+    /// A systemd signal fired (INVOCATION_ID / systemd parent), but the
+    /// loaded unit policy for this exact instance does not guarantee a
+    /// respawn after the supervised exit status (ADR-0061 §3, #690).
+    /// Refused before replacement: exiting into an unconfirmed policy is
+    /// the silent-service-disappearance failure — the daemon exits 0 for
+    /// the upgrade and nothing restarts it.
+    #[error(
+        "refusing self-update: this instance reports {signal} but the loaded systemd unit \
+         policy does not guarantee a restart after exit {exit_code} ({detail}). A supervised \
+         exit without a guaranteed respawn leaves the service down with the new bytes on \
+         disk. Inspect the unit with `systemctl show <unit> -p Restart -p RestartPreventExitStatus -p MainPID` \
+         (add `--user` for user-manager units), set `Restart=always` (or `on-success`) with no \
+         exit-0 entry in `RestartPreventExitStatus`, no `RemainAfterExit=yes`, not `Type=oneshot`, \
+         and a start-rate window that has aged out, then `daemon-reload` and restart the unit — \
+         and retry; if the daemon is already down after a supervised upgrade, follow the \"Manual \
+         recovery after a failed supervised upgrade\" procedure in docs/upgrade-system.md. No \
+         binaries were replaced."
+    )]
+    SupervisedSystemdPolicyNotGuaranteed {
         /// The recognized signal that made this instance managed.
         signal: String,
         /// Exit status the supervisor would have to restart on.
@@ -708,6 +1714,12 @@ pub struct RestartPlan {
     /// verified it (ADR-0061 §3, #671). Carried into the intent record so
     /// diagnostics name the domain that actually answered.
     pub launchd_verified: Option<LaunchdVerifiedJob>,
+    /// The systemd unit whose loaded policy guaranteed the restart
+    /// (ADR-0061 §3, #690), with the manager scope, confirmed `Restart=`
+    /// value and stamped template version. `None` on every non-systemd
+    /// path. Carried into the intent record the same way
+    /// `launchd_verified` is (#671).
+    pub systemd_verified: Option<SystemdVerifiedUnit>,
 }
 
 impl RestartPlan {
@@ -744,6 +1756,7 @@ pub fn resolve_restart_plan(
     data_root_hint: Option<&Path>,
     api_addr: Option<SocketAddr>,
     launchd_readback: &LaunchdPolicyReadback,
+    systemd_readback: &SystemdPolicyReadback,
 ) -> Result<RestartPlan, RestartOwnershipError> {
     let mode = plan_restart_mode(stop_on_upgrade, signals)?;
 
@@ -761,6 +1774,33 @@ pub fn resolve_restart_plan(
         }),
         _ => None,
     };
+    // ADR-0061 §3 (#690): the systemd signals name a unit, and the unit's
+    // LOADED policy must guarantee a respawn after the supervised exit —
+    // MainPID/InvocationID/ExecStart binding plus Restart=/prevent-status/
+    // rate-limit semantics verified by the readback. Refused before any
+    // mutation on every NotGuaranteed path.
+    let systemd_verified = match systemd_readback {
+        SystemdPolicyReadback::Verified(unit) => Some((**unit).clone()),
+        _ => None,
+    };
+    if mode == RestartMode::SupervisedExit {
+        if let Some(signal) = systemd_signal_name(signals) {
+            if !matches!(systemd_readback, SystemdPolicyReadback::Verified(_)) {
+                let detail = match systemd_readback {
+                SystemdPolicyReadback::NotGuaranteed { detail } => detail.clone(),
+                _ => "the systemd readback did not run for a systemd-signalled                       instance"
+                    .to_string(),
+            };
+                return Err(
+                    RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
+                        signal: signal.to_string(),
+                        exit_code: supervised_exit_code(),
+                        detail,
+                    },
+                );
+            }
+        }
+    }
     if mode == RestartMode::SupervisedExit && !signals.invocation_id && signals.x0x_supervised {
         if let LaunchdPolicyReadback::NotGuaranteed { detail } = launchd_readback {
             return Err(RestartOwnershipError::SupervisedPolicyNotGuaranteed {
@@ -821,6 +1861,7 @@ pub fn resolve_restart_plan(
         data_root,
         api_addr: api_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
         launchd_verified,
+        systemd_verified,
     })
 }
 
@@ -868,6 +1909,12 @@ pub struct UpgradeHandoff {
     /// intent files written before the field existed parseable.
     #[serde(default)]
     pub launchd_verified: Option<LaunchdVerifiedJob>,
+    /// The systemd unit whose loaded policy guaranteed the supervised
+    /// restart (#690) — unit, manager scope, `Restart=`, template version.
+    /// `None` on every non-systemd path. `#[serde(default)]` keeps intent
+    /// files written before the field existed parseable.
+    #[serde(default)]
+    pub systemd_verified: Option<SystemdVerifiedUnit>,
 }
 
 impl UpgradeHandoff {
@@ -901,6 +1948,7 @@ impl UpgradeHandoff {
                 .unwrap_or(0),
             mode: plan.mode,
             launchd_verified: plan.launchd_verified.clone(),
+            systemd_verified: plan.systemd_verified.clone(),
         }
     }
 
@@ -1762,6 +2810,7 @@ mod tests {
             Some(&data_root),
             Some(addr),
             &readback_na(),
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect("an unsupervised terminal run resolves");
 
@@ -1797,6 +2846,7 @@ mod tests {
                 label: "com.example.x0xd".to_string(),
                 domain: "gui",
             },
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect("supervised + stop_on_upgrade=true is a supported contract");
 
@@ -1826,6 +2876,7 @@ mod tests {
             Some(dir.path()),
             None,
             &readback_na(),
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect_err("supervised + stop_on_upgrade=false must not resolve");
         assert!(matches!(
@@ -1982,6 +3033,7 @@ mod tests {
                 detail: "loaded job com.example.x0xd does not hold an unconditional KeepAlive"
                     .to_string(),
             },
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect_err("an unverifiable launchd policy must refuse the apply");
 
@@ -2023,6 +3075,7 @@ mod tests {
                 label: "com.example.x0xd".to_string(),
                 domain: "gui",
             },
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect("a verified launchd policy is a supported contract");
         assert_eq!(plan.mode, RestartMode::SupervisedExit);
@@ -2048,6 +3101,7 @@ mod tests {
             &LaunchdPolicyReadback::Unavailable {
                 detail: "no launchd on a systemd unit".to_string(),
             },
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect("systemd signals do not require a launchd readback");
         assert_eq!(plan.mode, RestartMode::SupervisedExit);
@@ -2244,6 +3298,7 @@ mod tests {
                 label: TEST_LABEL.to_string(),
                 domain: "user",
             },
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect("a verified launchd policy is a supported contract");
         assert_eq!(
@@ -2395,6 +3450,7 @@ mod tests {
             Some(dir.path()),
             None,
             &readback_na(),
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect_err("a missing install directory is an unresolved contract");
         assert!(
@@ -2409,6 +3465,7 @@ mod tests {
             Some(&dir.path().join("no-such-data-root")),
             None,
             &readback_na(),
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect_err("a missing data root is an unresolved contract");
         assert!(
@@ -2430,6 +3487,7 @@ mod tests {
             Some(dir.path()),
             None,
             &readback_na(),
+            &SystemdPolicyReadback::NotApplicable,
         )
         .expect("resolves");
         plan.argv = vec![
@@ -2506,6 +3564,7 @@ mod tests {
             started_at: 1_700_000_000,
             mode: RestartMode::TransactionalHandoff,
             launchd_verified: None,
+            systemd_verified: None,
         };
         handoff.write(&path).unwrap();
         let read_back = UpgradeHandoff::read(&path).unwrap();
@@ -2555,6 +3614,7 @@ mod tests {
             started_at: 0,
             mode: RestartMode::TransactionalHandoff,
             launchd_verified: None,
+            systemd_verified: None,
         };
         assert_eq!(
             resolve_health_addr(&handoff, dir.path()),
@@ -2594,6 +3654,7 @@ mod tests {
             started_at: 0,
             mode: RestartMode::TransactionalHandoff,
             launchd_verified: None,
+            systemd_verified: None,
         }
     }
 
@@ -2742,5 +3803,1157 @@ mod tests {
         restore_backup(&backup, &target).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"old good bytes");
         assert!(!backup.exists(), "restore moves (not copies) the backup");
+    }
+    // ===================================================================
+    // #690: systemd loaded-policy readback decision table
+    // ===================================================================
+
+    /// A realistic full `systemctl show` output — exact property set and
+    /// rendering observed on the real systemd 255 VPS fixture (NYC,
+    /// 2026-09-14, omp-reports/recovery-20260914/690-real-systemd-show.txt):
+    /// ExecStart carries ` ; `-separated fields with `[n/a]` timestamps;
+    /// ActiveEnterTimestampMonotonic is plain integer microseconds.
+    fn healthy_show(pid: u32, invocation: &str, exec: &str, restart: &str) -> String {
+        format!(
+            "Type=simple\n\
+             Restart={restart}\n\
+             RemainAfterExit=no\n\
+             RestartPreventExitStatus=\n\
+             MainPID={pid}\n\
+             ExecStart={{ path={exec} ; argv[]={exec} --name testnet ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\n\
+             ActiveEnterTimestampMonotonic=1000000\n\
+             StartLimitIntervalUSec=10s\n\
+             StartLimitBurst=5\n\
+             InvocationID={invocation}\n\
+             Environment=X0X_TEMPLATE_VERSION=1\n"
+        )
+    }
+
+    fn real_fixture_argv(exec: &str) -> Vec<String> {
+        vec![
+            exec.to_string(),
+            "--name".to_string(),
+            "testnet".to_string(),
+        ]
+    }
+
+    fn run_readback(
+        cgroup: &str,
+        pid: u32,
+        invocation: Option<&str>,
+        argv: &[String],
+        show_output: Result<Option<String>, String>,
+        monotonic_now: Option<u64>,
+    ) -> SystemdPolicyReadback {
+        let exec = Path::new("/opt/x0x/x0xd");
+        readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup,
+                pid,
+                invocation_id: invocation,
+                executable: exec,
+                argv,
+                monotonic_now_us: monotonic_now,
+            },
+            &mut |_user, _unit| show_output.clone(),
+            &|loaded, ours| loaded == "/opt/x0x/x0xd" && ours == Path::new("/opt/x0x/x0xd"),
+        )
+    }
+
+    const SYSTEM_CGROUP: &str = "0::/system.slice/x0xd.service";
+
+    #[test]
+    fn systemd_readback_verifies_healthy_unit_both_restart_values() {
+        for restart in ["always", "on-success"] {
+            let out = healthy_show(
+                4242,
+                "0851a8fdc1cf4ab38316f9e4e2e1eaa0",
+                "/opt/x0x/x0xd",
+                restart,
+            );
+            let verdict = run_readback(
+                SYSTEM_CGROUP,
+                4242,
+                Some("0851a8fdc1cf4ab38316f9e4e2e1eaa0"),
+                &real_fixture_argv("/opt/x0x/x0xd"),
+                Ok(Some(out)),
+                // 100 s monotonic > 10 s interval past activation: stable.
+                Some(101_000_000),
+            );
+            match verdict {
+                SystemdPolicyReadback::Verified(unit) => {
+                    assert_eq!(unit.unit, "x0xd.service");
+                    assert!(!unit.user_manager, "system.slice is the system manager");
+                    assert_eq!(unit.restart, restart);
+                    assert_eq!(unit.template_version, Some(1));
+                }
+                other => panic!("expected Verified for Restart={restart}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn systemd_readback_resolves_user_manager_from_cgroup() {
+        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always");
+        let verdict = run_readback(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x0xd.service",
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        match verdict {
+            SystemdPolicyReadback::Verified(unit) => {
+                assert!(unit.user_manager, "user@ cgroup is the user manager");
+                assert_eq!(unit.unit, "x0xd.service");
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn systemd_readback_rejects_wrong_pid_and_invocation() {
+        let out = healthy_show(9999, "inv-1", "/opt/x0x/x0xd", "always");
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        assert!(
+            matches!(verdict, SystemdPolicyReadback::NotGuaranteed { ref detail } if detail.contains("MainPID 9999"))
+        );
+
+        let out = healthy_show(4242, "inv-OTHER", "/opt/x0x/x0xd", "always");
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        assert!(
+            matches!(verdict, SystemdPolicyReadback::NotGuaranteed { ref detail } if detail.contains("InvocationID"))
+        );
+    }
+
+    #[test]
+    fn systemd_readback_rejects_wrong_executable_by_canonical_identity() {
+        // Different directory, same basename: basename equality would
+        // accept; canonical identity must not.
+        let out = healthy_show(4242, "inv-1", "/other/dir/x0xd", "always");
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/other/dir/x0xd"),
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        assert!(
+            matches!(verdict, SystemdPolicyReadback::NotGuaranteed { ref detail } if detail.contains("does not run this executable"))
+        );
+
+        // Argv boundary: a different argument list must not pass.
+        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always");
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &[
+                "/opt/x0x/x0xd".to_string(),
+                "--name".to_string(),
+                "a b".to_string(),
+            ],
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        assert!(matches!(
+            verdict,
+            SystemdPolicyReadback::NotGuaranteed { .. }
+        ));
+    }
+
+    #[test]
+    fn systemd_readback_rejects_clean_exit_unsafe_policies() {
+        for restart in ["on-failure", "no", "on-abnormal", "on-watchdog", ""] {
+            let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", restart);
+            let verdict = run_readback(
+                SYSTEM_CGROUP,
+                4242,
+                Some("inv-1"),
+                &real_fixture_argv("/opt/x0x/x0xd"),
+                Ok(Some(out)),
+                Some(101_000_000),
+            );
+            assert!(
+                matches!(verdict, SystemdPolicyReadback::NotGuaranteed { ref detail } if detail.contains("Restart=")),
+                "Restart={restart:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_readback_rejects_restart_prevent_exit_status_covering_zero() {
+        for prevent in ["0", "0-3", "0 5", "SIGTERM 0", "garbage"] {
+            let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always").replace(
+                "RestartPreventExitStatus=\n",
+                &format!("RestartPreventExitStatus={prevent}\n"),
+            );
+            let verdict = run_readback(
+                SYSTEM_CGROUP,
+                4242,
+                Some("inv-1"),
+                &real_fixture_argv("/opt/x0x/x0xd"),
+                Ok(Some(out)),
+                Some(101_000_000),
+            );
+            assert!(
+                matches!(verdict, SystemdPolicyReadback::NotGuaranteed { .. }),
+                "RestartPreventExitStatus={prevent:?} must refuse"
+            );
+        }
+        // A non-zero, non-zero-covering, parseable list passes; SIGTERM does
+        // not cover a clean exit.
+        let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always").replace(
+            "RestartPreventExitStatus=\n",
+            "RestartPreventExitStatus=5 SIGTERM\n",
+        );
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        assert!(matches!(verdict, SystemdPolicyReadback::Verified(_)));
+    }
+
+    #[test]
+    fn systemd_readback_rejects_missing_restart_prevent_property() {
+        let out: String = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
+            .lines()
+            .filter(|l| !l.starts_with("RestartPreventExitStatus="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(out)),
+            Some(101_000_000),
+        );
+        assert!(
+            matches!(verdict, SystemdPolicyReadback::NotGuaranteed { ref detail } if detail.contains("RestartPreventExitStatus")),
+            "absent property must fail closed"
+        );
+    }
+
+    #[test]
+    fn systemd_readback_rejects_remain_after_exit_and_oneshot() {
+        for (prop, value) in [("RemainAfterExit", "yes"), ("Type", "oneshot")] {
+            let out = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
+                .replace(&format!("{prop}=no\n"), &format!("{prop}={value}\n"))
+                .replace(&format!("{prop}=simple\n"), &format!("{prop}={value}\n"));
+            let verdict = run_readback(
+                SYSTEM_CGROUP,
+                4242,
+                Some("inv-1"),
+                &real_fixture_argv("/opt/x0x/x0xd"),
+                Ok(Some(out)),
+                Some(101_000_000),
+            );
+            assert!(
+                matches!(verdict, SystemdPolicyReadback::NotGuaranteed { .. }),
+                "{prop}={value} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_readback_start_rate_limit_table() {
+        let mk = |interval: &str, burst: &str, active: &str| {
+            healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
+                .replace(
+                    "StartLimitIntervalUSec=10s\n",
+                    &format!("StartLimitIntervalUSec={interval}\n"),
+                )
+                .replace("StartLimitBurst=5\n", &format!("StartLimitBurst={burst}\n"))
+                .replace(
+                    "ActiveEnterTimestampMonotonic=1000000\n",
+                    &format!("ActiveEnterTimestampMonotonic={active}\n"),
+                )
+        };
+        // Disabled (interval 0): passes without any clock.
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(mk("0", "5", "1000000"))),
+            None,
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::Verified(_)),
+            "interval 0 disables"
+        );
+        // Disabled (burst 0): passes without any clock.
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(mk("10s", "0", "1000000"))),
+            None,
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::Verified(_)),
+            "burst 0 disables"
+        );
+        // Stable old service: activation 20 s ago > 10 s interval.
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(mk("10s", "5", "1000000"))),
+            Some(21_000_000),
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::Verified(_)),
+            "aged-out window"
+        );
+        // Fresh activation (2 s ago < 10 s): refuse — the window may still
+        // count prior attempts.
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(mk("10s", "5", "1000000"))),
+            Some(3_000_000),
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("start-rate")),
+            "fresh activation refuses"
+        );
+        // Ambiguous: no monotonic clock with a live limit.
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(mk("10s", "5", "1000000"))),
+            None,
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("monotonic clock")),
+            "no clock refuses"
+        );
+        // Unparseable interval.
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(mk("infinity", "5", "1000000"))),
+            Some(21_000_000),
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("StartLimitIntervalUSec")),
+            "infinity refuses"
+        );
+        // Absent interval property.
+        let out: String = healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always")
+            .lines()
+            .filter(|l| !l.starts_with("StartLimitIntervalUSec="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &real_fixture_argv("/opt/x0x/x0xd"),
+            Ok(Some(out)),
+            Some(21_000_000),
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("StartLimitIntervalUSec")),
+            "absent interval refuses"
+        );
+    }
+
+    #[test]
+    fn systemd_readback_rejects_command_failure_and_absent_unit() {
+        let argv = real_fixture_argv("/opt/x0x/x0xd");
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &argv,
+            Err("spawn failed".into()),
+            Some(101_000_000),
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("failed"))
+        );
+        let v = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some("inv-1"),
+            &argv,
+            Ok(None),
+            Some(101_000_000),
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("no loaded unit"))
+        );
+        let v = run_readback(
+            "0::/system.slice/foo.scope",
+            4242,
+            Some("inv-1"),
+            &argv,
+            Ok(Some(healthy_show(4242, "inv-1", "/opt/x0x/x0xd", "always"))),
+            Some(101_000_000),
+        );
+        assert!(
+            matches!(v, SystemdPolicyReadback::NotGuaranteed { detail: ref d } if d.contains("does not name a service unit"))
+        );
+    }
+
+    #[test]
+    fn resolve_restart_plan_gates_systemd_signals_on_readback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("x0xd");
+        std::fs::write(&bin, b"stub").expect("stub binary");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).expect("data root");
+        let mk = |systemd: SystemdPolicyReadback| {
+            let signals = SupervisionSignals {
+                invocation_id: true,
+                ..Default::default()
+            };
+            resolve_restart_plan(
+                true,
+                &signals,
+                &bin,
+                Some(&data),
+                Some(SocketAddr::from(([127, 0, 0, 1], 9))),
+                &LaunchdPolicyReadback::Unavailable {
+                    detail: "test".to_string(),
+                },
+                &systemd,
+            )
+        };
+        // Verified → SupervisedExit plan carrying the verified unit.
+        let plan = mk(SystemdPolicyReadback::Verified(Box::new(
+            SystemdVerifiedUnit {
+                unit: "x0xd.service".into(),
+                user_manager: false,
+                restart: "always".into(),
+                template_version: Some(1),
+            },
+        )))
+        .expect("verified readback admits SupervisedExit");
+        assert_eq!(plan.mode, RestartMode::SupervisedExit);
+        let unit = plan.systemd_verified.expect("plan carries the unit");
+        assert_eq!(unit.unit, "x0xd.service");
+        assert_eq!(unit.restart, "always");
+        // NotGuaranteed → refusal naming the systemd policy.
+        let err = mk(SystemdPolicyReadback::NotGuaranteed {
+            detail: "unit `x0xd.service` has Restart=\"no\"".into(),
+        })
+        .expect_err("not-guaranteed readback refuses");
+        assert!(matches!(
+            err,
+            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed { .. }
+        ));
+        // NotApplicable while the signal IS systemd → refusal.
+        let err = mk(SystemdPolicyReadback::NotApplicable).expect_err("missing readback refuses");
+        assert!(matches!(
+            err,
+            RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed { .. }
+        ));
+        // Non-systemd instance: NotApplicable is fine (handoff path).
+        let signals = SupervisionSignals::default();
+        let plan = resolve_restart_plan(
+            true,
+            &signals,
+            &bin,
+            Some(&data),
+            None,
+            &LaunchdPolicyReadback::Unavailable {
+                detail: "test".to_string(),
+            },
+            &SystemdPolicyReadback::NotApplicable,
+        )
+        .expect("unsupervised instance unaffected");
+        assert_eq!(plan.mode, RestartMode::TransactionalHandoff);
+        assert!(plan.systemd_verified.is_none());
+    }
+
+    #[test]
+    fn handoff_roundtrips_systemd_verified_unit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("x0xd");
+        std::fs::write(&bin, b"stub").expect("stub binary");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).expect("data root");
+        let plan = resolve_restart_plan(
+            true,
+            &SupervisionSignals {
+                invocation_id: true,
+                ..Default::default()
+            },
+            &bin,
+            Some(&data),
+            None,
+            &LaunchdPolicyReadback::Unavailable {
+                detail: "test".to_string(),
+            },
+            &SystemdPolicyReadback::Verified(Box::new(SystemdVerifiedUnit {
+                unit: "x0xd.service".into(),
+                user_manager: true,
+                restart: "on-success".into(),
+                template_version: None,
+            })),
+        )
+        .expect("plan resolves");
+        let handoff = UpgradeHandoff::from_plan(&plan, "9.9.9");
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join(HANDOFF_FILE_NAME);
+        handoff.write(&path).expect("write");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("\"systemd_verified\"") && raw.contains("\"user_manager\": true"));
+        let back = UpgradeHandoff::read(&path).expect("parse");
+        assert_eq!(back.systemd_verified, plan.systemd_verified);
+    }
+
+    #[test]
+    fn systemd_timespan_parser_table() {
+        assert_eq!(parse_systemd_timespan_us("0"), Some(0));
+        assert_eq!(parse_systemd_timespan_us("10s"), Some(10_000_000));
+        assert_eq!(parse_systemd_timespan_us("1min 30s"), Some(90_000_000));
+        assert_eq!(parse_systemd_timespan_us("500ms"), Some(500_000));
+        assert_eq!(parse_systemd_timespan_us(""), None, "empty is unparseable");
+        assert_eq!(parse_systemd_timespan_us("infinity"), None);
+        assert_eq!(parse_systemd_timespan_us("garbage"), None);
+        assert_eq!(
+            parse_systemd_timespan_us("1.5s"),
+            None,
+            "fractional digits fail closed"
+        );
+        assert_eq!(
+            parse_systemd_timespan_us("18446744073709551615w"),
+            None,
+            "overflow fails closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_collector_kills_a_hung_child() {
+        use std::process::Command;
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        let result = collect_child_output_bounded(child, Duration::from_secs(1), 1024);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bound is enforced"
+        );
+        assert!(
+            matches!(result, Ok(None)),
+            "killed child is not success: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_process_reaped(pid: u32) {
+        // SAFETY: signal 0 performs existence/permission checking only.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(result, -1, "child {pid} still exists after collector error");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "child {pid} was not reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    struct FixtureProcessGuard(libc::pid_t);
+
+    #[cfg(unix)]
+    impl Drop for FixtureProcessGuard {
+        fn drop(&mut self) {
+            // SAFETY: the fixture records the PID of the process it forked;
+            // the guard exists solely to terminate that owned process.
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fixture_pid(
+        child: &mut std::process::Child,
+        path: &std::path::Path,
+    ) -> FixtureProcessGuard {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if let Ok(pid) = contents.parse::<libc::pid_t>() {
+                    if pid > 0 {
+                        return FixtureProcessGuard(pid);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("fixture did not report readiness before its setup deadline");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_collector_reaps_child_when_stdout_is_missing() {
+        use std::process::Command;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        drop(child.stdout.take());
+        let result = collect_child_output_bounded(child, Duration::from_secs(1), 1024);
+        assert!(matches!(result, Err(ref error) if error.contains("not piped")));
+        assert_process_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_collector_reaps_child_on_setup_failure_after_dup() {
+        use std::process::Command;
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let result = collect_child_output_bounded_inner(child, Duration::from_secs(1), 1024, true);
+        assert!(matches!(result, Err(ref error) if error.contains("injected")));
+        assert_process_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_collector_returns_output_and_fails_closed_on_cap() {
+        use std::process::Command;
+        let child = Command::new("echo")
+            .arg("MainPID=1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn echo");
+        let result = collect_child_output_bounded(child, Duration::from_secs(5), 4096);
+        assert!(
+            matches!(result, Ok(Some(ref s)) if s.contains("MainPID=1")),
+            "{result:?}"
+        );
+        let child = Command::new("head")
+            .arg("-c")
+            .arg("4096")
+            .arg("/dev/zero")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn exact-cap head");
+        let result = collect_child_output_bounded(child, Duration::from_secs(5), 4096);
+        assert!(
+            matches!(result, Ok(Some(ref bytes)) if bytes.len() == 4096),
+            "exactly-at-cap output remains complete: {result:?}"
+        );
+        let child = Command::new("head")
+            .arg("-c")
+            .arg("8192")
+            .arg("/dev/zero")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn head");
+        let result = collect_child_output_bounded(child, Duration::from_secs(5), 4096);
+        assert!(
+            matches!(result, Err(ref e) if e.contains("cap")),
+            "over-cap must fail closed: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_collector_reaps_child_that_closes_stdout_then_sleeps() {
+        use std::process::Command;
+        let child = Command::new("python3")
+            .args(["-c", "import os,time; os.close(1); time.sleep(30)"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn close-stdout child");
+        let pid = child.id();
+        let started = Instant::now();
+        let result = collect_child_output_bounded(child, Duration::from_millis(250), 1024);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            matches!(result, Ok(None)),
+            "sleeping child is killed: {result:?}"
+        );
+        assert_process_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_collector_returns_when_descendant_holds_pipe() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let pid_path = dir.path().join("descendant.pid");
+        // The direct child exits immediately after recording the descendant
+        // PID; the forked descendant alone retains the pipe's write end.
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import os,time,pathlib\npid=os.fork()\nif pid==0:\n time.sleep(30)\n os._exit(0)\npathlib.Path(os.environ['DESC_PID_FILE']).write_text(str(pid))\nos._exit(0)",
+            ])
+            .env("DESC_PID_FILE", &pid_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        let descendant = wait_for_fixture_pid(&mut child, &pid_path);
+        let started = Instant::now();
+        let result = collect_child_output_bounded(child, Duration::from_millis(250), 65536);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "silent descendant must not hang the collector past the bound"
+        );
+        assert!(
+            matches!(result, Ok(None)),
+            "expired collection fails closed: {result:?}"
+        );
+        drop(descendant);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_collector_rejects_overflow_arriving_during_grace() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let ready_path = dir.path().join("overflow-ready.pid");
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import os,time,pathlib\npid=os.fork()\nif pid==0:\n os.write(1,b'x'*2048)\n pathlib.Path(os.environ['READY_FILE']).write_text(str(os.getpid()))\n os._exit(0)\ntime.sleep(30)",
+            ])
+            .env("READY_FILE", &ready_path)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn buffered overflow fixture");
+        let writer = wait_for_fixture_pid(&mut child, &ready_path);
+        let result = collect_child_output_bounded(child, Duration::ZERO, 1024);
+        assert!(
+            matches!(result, Err(ref error) if error.contains("cap")),
+            "{result:?}"
+        );
+        drop(writer);
+    }
+
+    #[cfg(target_os = "macos")]
+    const LAUNCHD_FIXTURE_ENV: &str = "X0X_690_LAUNCHD_FIXTURE_DIR";
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_fixture_file(path: &Path) -> String {
+        // launchd's default service throttle is commonly ten seconds. Keep a
+        // platform-fixture-only margin so a real clean-exit respawn is not
+        // raced by the assertion deadline.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Ok(value) = std::fs::read_to_string(path) {
+                if !value.trim().is_empty() {
+                    return value;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("launchd fixture did not produce {}", path.display());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn xml_fixture_value(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_fixture_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let temp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        if let Err(error) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(temp);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    struct BoundedCommandOutput {
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn launchctl_output_bounded(args: &[&str]) -> Result<BoundedCommandOutput, String> {
+        let stdout_file = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("create launchctl stdout capture: {error}"))?;
+        let stderr_file = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("create launchctl stderr capture: {error}"))?;
+        let mut child = std::process::Command::new("launchctl")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout_file.reopen().map_err(
+                |error| format!("open launchctl stdout capture: {error}"),
+            )?))
+            .stderr(std::process::Stdio::from(stderr_file.reopen().map_err(
+                |error| format!("open launchctl stderr capture: {error}"),
+            )?))
+            .spawn()
+            .map_err(|error| format!("spawn launchctl: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("launchctl {} timed out", args.join(" ")));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("poll launchctl {}: {error}", args.join(" ")));
+                }
+            }
+        };
+        let stdout = std::fs::read_to_string(stdout_file.path())
+            .map_err(|error| format!("read launchctl stdout capture: {error}"))?;
+        let stderr = std::fs::read_to_string(stderr_file.path())
+            .map_err(|error| format!("read launchctl stderr capture: {error}"))?;
+        Ok(BoundedCommandOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    struct LaunchdFixtureGuard {
+        target: String,
+        dir: PathBuf,
+        active: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl LaunchdFixtureGuard {
+        fn run_recorded(&self, label: &str, args: &[&str]) -> Result<BoundedCommandOutput, String> {
+            let result = launchctl_output_bounded(args);
+            let record = match &result {
+                Ok(output) => serde_json::json!({
+                    "args": args,
+                    "status": output.status.code(),
+                    "success": output.status.success(),
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                }),
+                Err(error) => serde_json::json!({"args": args, "error": error}),
+            };
+            write_fixture_atomic(
+                &self.dir.join(format!("launchctl-{label}.json")),
+                &serde_json::to_vec_pretty(&record)
+                    .map_err(|error| format!("serialize launchctl evidence: {error}"))?,
+            )
+            .map_err(|error| format!("preserve launchctl {label} evidence: {error}"))?;
+            result
+        }
+
+        fn cleanup(&mut self) -> Result<(), String> {
+            let _ = write_fixture_atomic(&self.dir.join("stop"), b"stop");
+            let bootout = self.run_recorded("bootout", &["bootout", &self.target])?;
+            let print = self.run_recorded("cleanup-print", &["print", &self.target])?;
+            if print.status.success() {
+                return Err(format!(
+                    "fixture remained loaded after bootout (bootout status {}; print stdout {:?}; stderr {:?})",
+                    bootout.status, print.stdout, print.stderr
+                ));
+            }
+            if !print.stdout.contains("Could not find service")
+                && !print.stderr.contains("Could not find service")
+            {
+                return Err(format!(
+                    "launchctl did not prove fixture absence (status {}; stdout {:?}; stderr {:?})",
+                    print.status, print.stdout, print.stderr
+                ));
+            }
+            write_fixture_atomic(&self.dir.join("cleanup-proved"), b"missing-target")
+                .map_err(|error| format!("preserve cleanup proof: {error}"))?;
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for LaunchdFixtureGuard {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = self.cleanup();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bootstrap_launchd_fixture(keepalive: bool) -> (PathBuf, LaunchdFixtureGuard, String) {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock after epoch")
+            .as_nanos();
+        let unique = format!(
+            "com.saorsalabs.x0x.test.{}.{}.{}",
+            std::process::id(),
+            nonce,
+            if keepalive { "positive" } else { "negative" }
+        );
+        let dir = std::env::temp_dir().join(format!("x0x-690-launchd-{unique}"));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("create retained launchd artifact directory");
+        eprintln!("X0X690 launchd artifacts={}", dir.display());
+        let executable = std::env::current_exe().expect("current test executable");
+        // libtest's exact selector omits the library crate prefix (`x0x::`).
+        let fixture_test = "upgrade::restart::tests::platform_launchd_fixture_role".to_string();
+        let arguments = [
+            executable.to_string_lossy().into_owned(),
+            fixture_test,
+            "--exact".to_string(),
+            "--ignored".to_string(),
+            "--nocapture".to_string(),
+        ];
+        let mut argument_xml = String::new();
+        for argument in &arguments {
+            writeln!(
+                argument_xml,
+                "        <string>{}</string>",
+                xml_fixture_value(argument)
+            )
+            .expect("render argument");
+        }
+        let keepalive_xml = if keepalive {
+            "    <key>KeepAlive</key>\n    <true/>\n"
+        } else {
+            ""
+        };
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict>\n\
+             <key>Label</key><string>{}</string>\n\
+             <key>ProgramArguments</key><array>\n{}    </array>\n\
+             <key>EnvironmentVariables</key><dict>\n\
+             <key>{}</key><string>{}</string>\n\
+             </dict>\n{}\
+             <key>RunAtLoad</key><true/>\n\
+             <key>StandardOutPath</key><string>{}</string>\n\
+             <key>StandardErrorPath</key><string>{}</string>\n\
+             </dict></plist>\n",
+            xml_fixture_value(&unique),
+            argument_xml,
+            LAUNCHD_FIXTURE_ENV,
+            xml_fixture_value(&dir.to_string_lossy()),
+            keepalive_xml,
+            xml_fixture_value(&dir.join("stdout.log").to_string_lossy()),
+            xml_fixture_value(&dir.join("stderr.log").to_string_lossy()),
+        );
+        let plist_path = dir.join(format!("{unique}.plist"));
+        write_fixture_atomic(&plist_path, plist.as_bytes()).expect("write isolated fixture plist");
+        let uid = unsafe { libc::getuid() };
+        let domain = format!("gui/{uid}");
+        let target = format!("{domain}/{unique}");
+        let plist_arg = plist_path.to_string_lossy();
+        // Install cleanup ownership before bootstrap: launchctl can register
+        // the job and still return late/nonzero, and that partial state must
+        // never escape a failing fixture setup.
+        let guard = LaunchdFixtureGuard {
+            target,
+            dir: dir.clone(),
+            active: true,
+        };
+        let bootstrap = guard
+            .run_recorded("bootstrap", &["bootstrap", &domain, &plist_arg])
+            .expect("run bounded launchctl bootstrap");
+        assert!(
+            bootstrap.status.success(),
+            "the current user GUI launchd domain is unavailable; this platform gate is unsupported: {}",
+            bootstrap.stderr
+        );
+        (dir, guard, unique)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "loads a uniquely labelled temporary launchd fixture"]
+    fn platform_launchd_fixture_role() {
+        let Some(dir) = std::env::var_os(LAUNCHD_FIXTURE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let slot = [1_u8, 2]
+            .into_iter()
+            .find(|slot| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(dir.join(format!("invocation-{slot}.claim")))
+                    .is_ok()
+            })
+            .expect("at most two fixture invocations");
+        write_fixture_atomic(
+            &dir.join(format!("invocation-{slot}.pid")),
+            std::process::id().to_string().as_bytes(),
+        )
+        .expect("publish invocation pid");
+        if slot == 1 {
+            let executable = std::env::current_exe().expect("fixture executable");
+            let argv = current_argv();
+            let uid = unsafe { libc::getuid() };
+            let verdict = readback_launchd_policy_in(
+                &dir,
+                uid,
+                &executable,
+                &argv,
+                &plist_as_json,
+                &mut run_launchctl_print,
+            );
+            let verdict = match verdict {
+                LaunchdPolicyReadback::Verified { label, domain } => serde_json::json!({
+                    "status": "verified",
+                    "label": label,
+                    "domain": domain,
+                }),
+                LaunchdPolicyReadback::NotGuaranteed { detail } => serde_json::json!({
+                    "status": "not_guaranteed",
+                    "detail": detail,
+                }),
+                LaunchdPolicyReadback::Unavailable { detail } => serde_json::json!({
+                    "status": "unavailable",
+                    "detail": detail,
+                }),
+            };
+            write_fixture_atomic(
+                &dir.join("verdict.json"),
+                &serde_json::to_vec(&verdict).expect("serialize loaded-policy verdict"),
+            )
+            .expect("write loaded-policy verdict");
+            let _ = wait_for_fixture_file(&dir.join("release-first"));
+            write_fixture_atomic(&dir.join("clean-exit-intent"), b"0")
+                .expect("record controlled clean exit");
+        } else {
+            let _ = wait_for_fixture_file(&dir.join("stop"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "loads isolated launchd jobs and proves real loaded policy/respawn"]
+    fn platform_launchd_loaded_policy_and_clean_exit_restart() {
+        let (positive_dir, mut positive_guard, positive_label) = bootstrap_launchd_fixture(true);
+        let first_pid = wait_for_fixture_file(&positive_dir.join("invocation-1.pid"));
+        let verdict: serde_json::Value =
+            serde_json::from_str(&wait_for_fixture_file(&positive_dir.join("verdict.json")))
+                .expect("typed positive verdict");
+        assert_eq!(verdict["status"], "verified");
+        assert_eq!(verdict["label"], positive_label);
+        assert_eq!(verdict["domain"], "gui");
+        write_fixture_atomic(&positive_dir.join("release-first"), b"release")
+            .expect("release first clean exit");
+        let second_pid = wait_for_fixture_file(&positive_dir.join("invocation-2.pid"));
+        assert_eq!(
+            wait_for_fixture_file(&positive_dir.join("clean-exit-intent")).trim(),
+            "0"
+        );
+        assert_ne!(
+            first_pid.trim(),
+            second_pid.trim(),
+            "exit zero must produce a new launchd-owned process"
+        );
+        let loaded = positive_guard
+            .run_recorded("loaded-positive", &["print", &positive_guard.target])
+            .expect("capture loaded positive job");
+        assert!(
+            loaded.status.success() && loaded.stdout.contains("last exit code = 0"),
+            "launchd did not report the controlled clean exit (stdout {:?}; stderr {:?})",
+            loaded.stdout,
+            loaded.stderr
+        );
+        write_fixture_atomic(
+            &positive_dir.join("launchctl-print.txt"),
+            loaded.stdout.as_bytes(),
+        )
+        .expect("preserve loaded launchd evidence");
+        positive_guard.cleanup().expect("clean positive fixture");
+
+        let (negative_dir, mut negative_guard, _) = bootstrap_launchd_fixture(false);
+        let _ = wait_for_fixture_file(&negative_dir.join("invocation-1.pid"));
+        let verdict: serde_json::Value =
+            serde_json::from_str(&wait_for_fixture_file(&negative_dir.join("verdict.json")))
+                .expect("typed negative verdict");
+        assert_eq!(verdict["status"], "not_guaranteed");
+        assert!(
+            verdict["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("KeepAlive")),
+            "loaded job without KeepAlive must fail closed: {verdict}"
+        );
+        negative_guard.cleanup().expect("clean negative fixture");
     }
 }

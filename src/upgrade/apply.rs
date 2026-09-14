@@ -148,6 +148,15 @@ impl AutoApplyUpgrader {
             &restart::current_argv(),
         )
         .await;
+        // #690: the systemd-side twin — no-op (NotApplicable) unless a
+        // systemd signal classified this instance, so macOS and unsupervised
+        // applies shell out to nothing.
+        let systemd_readback = restart::readback_systemd_policy_offloaded(
+            &signals,
+            binary_path,
+            &restart::current_argv(),
+        )
+        .await;
         restart::resolve_restart_plan(
             self.stop_on_upgrade,
             &signals,
@@ -155,6 +164,7 @@ impl AutoApplyUpgrader {
             self.restart_context.data_dir.as_deref(),
             self.restart_context.api_addr,
             &launchd_readback,
+            &systemd_readback,
         )
         .map_err(UpgradeError::from)
     }
@@ -207,6 +217,7 @@ impl AutoApplyUpgrader {
             mode = ?restart_plan.mode,
             supervision = restart_plan.supervision_signal.as_deref().unwrap_or("none"),
             launchd = ?restart_plan.launchd_verified,
+            systemd = ?restart_plan.systemd_verified,
             stop_on_upgrade = self.stop_on_upgrade,
             data_root = %restart_plan.data_root.display(),
             spawns_helper = restart_plan.spawns_helper(),
