@@ -12,12 +12,20 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_POLICY_PATH = REPO_ROOT / ".github" / "release-metadata-policy.json"
 SEMVER_PATTERN = re.compile(r"(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])")
-# A release may only run on a tag ref whose name is a full semver tag
-# (optional prerelease/build suffix). Release jobs derive VERSION from
-# GITHUB_REF_NAME and assume semver, so anything else must be refused
-# before any build, signing, or publish side effect starts.
+# A release may only run on a tag ref whose name is a full SemVer 2.0.0
+# version with the mandatory `v` prefix (optional prerelease/build suffix).
+# Strict per semver.org: no leading zeros in the numeric core or in numeric
+# prerelease identifiers (build identifiers MAY have leading zeros), no empty
+# dot-separated identifiers, ASCII digits only (Python `\d` would also accept
+# Unicode digits), and full-string matching so a trailing newline cannot slip
+# past a bare `$` anchor. Release jobs derive VERSION from GITHUB_REF_NAME and
+# assume semver, so anything else must be refused before any build, signing,
+# or publish side effect starts.
 RELEASE_TAG_REF_PATTERN = re.compile(
-    r"^refs/tags/v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+    r"refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
 
 
@@ -122,7 +130,7 @@ def validate_release_ref(full_ref, tag_name):
     the actual GITHUB_REF here so invalid runs are refused in its first job,
     before expensive side effects start.
     """
-    if not RELEASE_TAG_REF_PATTERN.match(full_ref or ""):
+    if not RELEASE_TAG_REF_PATTERN.fullmatch(full_ref or ""):
         return (
             "Release must target a valid release tag ref refs/tags/vX.Y.Z "
             f"(got {full_ref or 'none'}). Dispatch the Release workflow from "
