@@ -33,6 +33,10 @@ Usage::
 
 Exit code is 0 when every directed pair delivers a DM round-trip within
 the settle window.
+
+Default mode is strict: every node requested with ``--nodes`` must be
+discovered before the matrix starts. Use ``--allow-skips`` only for partial
+subset resilience drills; those results are not fleet-release acceptance.
 """
 from __future__ import annotations
 
@@ -894,6 +898,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="expected node labels (default: %(default)s)",
     )
     parser.add_argument(
+        "--allow-skips",
+        action="store_true",
+        help="permit missing runners and validate a clearly labelled partial subset",
+    )
+    parser.add_argument(
         "--network",
         choices=["test", "prod"],
         default="test",
@@ -1040,9 +1049,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             log=log,
             no_pubsub_after_discover=args.no_pubsub_after_discover,
         )
+        missing = sorted(set(args.nodes) - set(runners))
+        if missing and not args.allow_skips:
+            log.error(
+                "missing expected runners in strict mode: %s "
+                "(use --allow-skips only for subset resilience)",
+                missing,
+            )
+            return 4
         if len(runners) < 2:
             log.error("need at least 2 runners; found %s", list(runners.keys()))
             return 4
+        if args.allow_skips:
+            log.warning(
+                "PARTIAL SUBSET MODE: testing %d/%d requested runners; "
+                "result is unsuitable for fleet-release acceptance",
+                len(runners),
+                len(args.nodes),
+            )
         if args.post_discover_settle_secs > 0:
             log.info(
                 "post-discover settle: waiting %ds for runner direct-event streams",

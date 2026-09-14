@@ -10,6 +10,7 @@ import logging
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def load_mesh():
@@ -34,6 +35,20 @@ class FakeClient:
     def direct_send(self, target_aid: str, payload: bytes, **_kwargs):
         self.direct_sent.append((target_aid, payload))
         return {"ok": True, "via": "direct"}
+
+
+class MainFakeClient:
+    def __init__(self, _base_url: str, _token: str) -> None:
+        pass
+
+    def health(self):
+        return {"ok": True, "version": "test", "peers": 6}
+
+    def agent(self):
+        return {"agent_id": "a" * 64}
+
+    def subscribe(self, _topic: str):
+        return {"subscription_id": "test"}
 
 
 class E2eVpsMeshTests(unittest.TestCase):
@@ -77,6 +92,96 @@ class E2eVpsMeshTests(unittest.TestCase):
         self.assertTrue(wire.startswith(self.mesh.PREFIX_CMD))
         decoded = json.loads(base64.b64decode(wire[len(self.mesh.PREFIX_CMD):]))
         self.assertEqual(command, decoded)
+
+    def run_main_with_nodes(
+        self,
+        requested: list[str],
+        discovered: list[str],
+        *,
+        allow_skips: bool = False,
+    ):
+        runners = {
+            node: self.mesh.RunnerInfo(node, node * 64, node * 64)
+            for node in discovered
+        }
+        outcome = self.mesh.MatrixOutcome(sent=len(runners) * (len(runners) - 1))
+        argv = [
+            "--no-tunnel",
+            "--api-base",
+            "http://unused.invalid",
+            "--api-token",
+            "test",
+            "--nodes",
+            *requested,
+            "--post-discover-settle-secs",
+            "0",
+        ]
+        if allow_skips:
+            argv.append("--allow-skips")
+        with (
+            mock.patch.object(self.mesh, "X0xClient", MainFakeClient),
+            mock.patch.object(self.mesh, "discover_runners", return_value=runners),
+            mock.patch.object(self.mesh, "run_all_pairs_matrix", return_value=outcome) as matrix,
+            mock.patch.object(self.mesh, "print_summary") as summary,
+            mock.patch.object(self.mesh, "consume_sse"),
+            mock.patch.object(self.mesh.time, "sleep"),
+        ):
+            with self.assertLogs("e2e_vps_mesh", level=logging.INFO) as logs:
+                rc = self.mesh.main(argv)
+        return rc, matrix, summary, "\n".join(logs.output)
+
+    def test_main_full_six_runs_thirty_directed_pairs(self) -> None:
+        nodes = list(self.mesh.NODES_DEFAULT)
+
+        rc, matrix, summary, logs = self.run_main_with_nodes(nodes, nodes)
+
+        self.assertEqual(0, rc, logs)
+        matrix.assert_called_once()
+        summary.assert_called_once_with(mock.ANY, 30, mock.ANY)
+
+    def test_main_missing_runner_fails_before_matrix(self) -> None:
+        nodes = list(self.mesh.NODES_DEFAULT)
+
+        rc, matrix, summary, logs = self.run_main_with_nodes(nodes, nodes[:-1])
+
+        self.assertNotEqual(0, rc)
+        matrix.assert_not_called()
+        summary.assert_not_called()
+        self.assertIn(nodes[-1], logs)
+        self.assertIn("strict mode", logs)
+
+    def test_main_fewer_than_two_fails_before_matrix(self) -> None:
+        rc, matrix, summary, logs = self.run_main_with_nodes(["nyc"], ["nyc"])
+
+        self.assertNotEqual(0, rc)
+        matrix.assert_not_called()
+        summary.assert_not_called()
+        self.assertIn("need at least 2 runners", logs)
+
+    def test_main_allow_skips_runs_clearly_labelled_partial_subset(self) -> None:
+        nodes = list(self.mesh.NODES_DEFAULT)
+
+        rc, matrix, summary, logs = self.run_main_with_nodes(
+            nodes,
+            nodes[:3],
+            allow_skips=True,
+        )
+
+        self.assertEqual(0, rc, logs)
+        matrix.assert_called_once()
+        summary.assert_called_once_with(mock.ANY, 6, mock.ANY)
+        self.assertIn("PARTIAL SUBSET MODE", logs)
+        self.assertIn("unsuitable for fleet-release acceptance", logs)
+
+    def test_main_deliberate_complete_two_node_inventory_is_strict_success(self) -> None:
+        nodes = ["nyc", "sfo"]
+
+        rc, matrix, summary, logs = self.run_main_with_nodes(nodes, nodes)
+
+        self.assertEqual(0, rc, logs)
+        matrix.assert_called_once()
+        summary.assert_called_once_with(mock.ANY, 2, mock.ANY)
+        self.assertNotIn("PARTIAL SUBSET MODE", logs)
 
 
 if __name__ == "__main__":
