@@ -846,7 +846,7 @@ def observer_phase(artifact_dir: Path, test_binary: str, target_pid: int,
     forced_kill = False
     with perf_log.open("wb") as log:
         observer = subprocess.Popen(
-            [perf, "record", "-F", "99", "--call-graph", "dwarf", "--inherit",
+            [perf, "record", "--no-buildid", "-F", "99", "--call-graph", "dwarf", "--inherit",
              "-o", str(perf_data), "-p", str(target_pid)],
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         )
