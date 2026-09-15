@@ -8,11 +8,11 @@ cargo test profile (no --release), once, inside a fresh loopback-only
 network namespace, with the original 100_000 message count and all
 original assertions unchanged.
 
-The only manifest delta vs the base tree is
-  [profile.test.package.fips204] opt-level = 3
+The only manifest delta vs the base tree is package-specific opt-level 3
+for fips204 and its concrete saorsa-pqc and ant-quic signing adapters,
 which this script verifies exactly (no arbitrary Cargo.toml edits), and it
-retains the full verbose rustc invocations so the profile proof — fips204
-compiled with -C opt-level=3, the x0x test binary left at the default
+retains the full verbose rustc invocations so the profile proof — all three
+signing-path crates compiled with -C opt-level=3, x0x left at the default
 debug opt-level — can be verified from the artifacts.
 
 Phases:
@@ -51,16 +51,21 @@ SOURCE_SHA256 = "5ad301d726732027cc2ca9026db58d0dbca27ad70a1327b16b7a5f7d512f6c4
 SELECTOR = "gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages"
 EXPECTED_MESSAGES = 100_000
 
-PROFILE_LABEL = "default-test-profile"
+PROFILE_LABEL = "adapter-optimized-default-test-profile"
 
-# The ONLY permitted Cargo.toml change vs base: the fips204 test-profile
-# override block, added lines exactly as prescribed (no removals).
+# The ONLY permitted Cargo.toml change vs base: three package-specific
+# signing-path overrides, added exactly as prescribed (no removals).
 EXPECTED_CARGO_ADDITIONS = [
-    "# #703: the unchanged-assertions 100k test times out (902s) in the default",
-    "# test profile; the only CPU samples were fips204 ML-DSA signing. Optimize",
-    "# only the fips204 package within the test profile — the whole dev/test",
-    "# profile and all release profiles stay untouched.",
+    "# #703: preserve the default x0x test target while optimizing the concrete",
+    "# ML-DSA adapter path exercised by the unchanged 100k signing test. The",
+    "# workspace-wide dev/test profiles and every release profile stay untouched.",
     "[profile.test.package.fips204]",
+    "opt-level = 3",
+    "",
+    "[profile.test.package.saorsa-pqc]",
+    "opt-level = 3",
+    "",
+    "[profile.test.package.ant-quic]",
     "opt-level = 3",
     "",
 ]
@@ -123,7 +128,7 @@ def validate_cargo_delta(diff_text: str) -> None:
     if added != EXPECTED_CARGO_ADDITIONS:
         raise ValueError(
             "Cargo.toml delta is not the exact prescribed "
-            f"[profile.test.package.fips204] block; added={added!r}")
+            f"three package-specific signing-path blocks; added={added!r}")
 
 
 def extract_rustc_invocations(build_stderr_text: str) -> list[str]:
@@ -142,7 +147,7 @@ def extract_rustc_invocations(build_stderr_text: str) -> list[str]:
 def extract_profile_evidence(build_stderr_text: str) -> dict:
     """Verify and record the default-test-profile proof from rustc args.
 
-    Fails closed unless exactly one fips204 rustc invocation carries
+    Fails closed unless fips204, saorsa-pqc, and ant-quic invocations carry
     -C opt-level=3, and the single x0x `--test` invocation stays at the
     default debug opt-level (no -C opt-level, or opt-level=0).
     """
@@ -154,7 +159,11 @@ def extract_profile_evidence(build_stderr_text: str) -> dict:
                 return tokens[i + 1]
         return None
 
-    fips = [c for c in invocations if crate_name(c) == "fips204"]
+    optimized_crates = ("fips204", "saorsa_pqc", "ant_quic")
+    optimized = {
+        name: [c for c in invocations if crate_name(c) == name]
+        for name in optimized_crates
+    }
     test_bins = [c for c in invocations
                  if crate_name(c) == "x0x" and "--test" in shlex.split(c)]
 
@@ -170,12 +179,13 @@ def extract_profile_evidence(build_stderr_text: str) -> dict:
         return None
 
     failures: list[str] = []
-    if len(fips) == 0:
-        failures.append("no fips204 rustc invocation captured")
-    fips_ok = sum(1 for c in fips if opt_level(c) == "3")
-    if len(fips) != fips_ok:
-        failures.append(f"fips204 not compiled with -C opt-level=3 in every "
-                        f"captured invocation (levels={[opt_level(c) for c in fips]})")
+    for name, commands in optimized.items():
+        if not commands:
+            failures.append(f"no {name} rustc invocation captured")
+        elif any(opt_level(command) != "3" for command in commands):
+            failures.append(
+                f"{name} not compiled with -C opt-level=3 in every captured "
+                f"invocation (levels={[opt_level(c) for c in commands]})")
     if len(test_bins) != 1:
         failures.append(f"expected exactly one x0x --test invocation, got {len(test_bins)}")
     else:
@@ -186,9 +196,13 @@ def extract_profile_evidence(build_stderr_text: str) -> dict:
         raise SystemExit("FAIL: default-test-profile evidence: " + "; ".join(failures))
     return {
         "profile": PROFILE_LABEL,
-        "fips204_opt_level": opt_level(fips[0]),
+        "optimized_crate_opt_levels": {
+            name: opt_level(commands[0]) for name, commands in optimized.items()
+        },
         "x0x_test_opt_level": opt_level(test_bins[0]) if test_bins else None,
-        "fips204_invocation": fips[0],
+        "optimized_crate_invocations": {
+            name: commands for name, commands in optimized.items()
+        },
         "x0x_test_invocation": test_bins[0] if test_bins else None,
         "rustc_invocation_count": len(invocations),
     }
@@ -370,7 +384,7 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
             f"FAIL: {SOURCE_PATH} custody differs (worktree={source_sha}, base={base_source_sha})")
     print(f"base/source verified: HEAD={head} tree={tree} branch={branch} changes={sorted(changed)}")
     print(f"source blob {SOURCE_PATH} sha256={source_sha}")
-    print(f"Cargo.toml delta verified: exact [profile.test.package.fips204] opt-level=3 block")
+    print("Cargo.toml delta verified: exact fips204/saorsa-pqc/ant-quic opt-level=3 blocks")
 
     # Fresh lock: the prior run retained no lock custody.
     lock = repo / "Cargo.lock"
@@ -404,8 +418,10 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
             f"FAIL: Cargo.lock changed during locked build ({lock_sha} -> {postbuild_lock_sha})")
     # Profile proof: fail closed before selecting/running anything.
     profile_evidence = extract_profile_evidence(proc.stderr)
-    print(f"profile evidence: fips204 opt-level={profile_evidence['fips204_opt_level']} "
-          f"x0x-test opt-level={profile_evidence['x0x_test_opt_level']}")
+    print(
+        "profile evidence: optimized="
+        f"{profile_evidence['optimized_crate_opt_levels']} "
+        f"x0x-test opt-level={profile_evidence['x0x_test_opt_level']}")
     # Native exit checked BEFORE parsing/selecting.
     test_binary, notes = select_test_binary(proc.stdout)
     for n in notes:
@@ -618,24 +634,31 @@ def self_test() -> int:
             print(f"PASS self-test: cargo delta rejects {label}")
 
     # Profile evidence from retained rustc invocations.
-    fips_cmd = ("rustc --crate-name fips204 --crate-type lib --edition 2021 "
-                "-C opt-level=3 -C embed-bitcode=no src/lib.rs")
+    optimized_cmds = [
+        f"rustc --crate-name {name} --crate-type lib --edition 2021 "
+        "-C opt-level=3 -C embed-bitcode=no src/lib.rs"
+        for name in ("fips204", "saorsa_pqc", "ant_quic")
+    ]
     test_cmd = ("rustc --crate-name x0x --crate-type lib --test --edition 2021 "
                 "-C opt-level=0 src/lib.rs")
-    stderr_good = (f"     Running `{fips_cmd}`\n     Running `{test_cmd}`\n")
+    stderr_good = "".join(f"     Running `{cmd}`\n" for cmd in optimized_cmds)
+    stderr_good += f"     Running `{test_cmd}`\n"
     ev = extract_profile_evidence(stderr_good)
-    failures += ev["fips204_opt_level"] != "3"
+    failures += any(level != "3" for level in ev["optimized_crate_opt_levels"].values())
     failures += ev["x0x_test_opt_level"] != "0"
     absolute_commands = stderr_good.replace(
         "`rustc ", "`'/opt/rust toolchain/bin/rustc' ")
     ev = extract_profile_evidence(absolute_commands)
-    failures += ev["fips204_opt_level"] != "3"
+    failures += any(level != "3" for level in ev["optimized_crate_opt_levels"].values())
     for label, text in (
-        ("fips not optimized", f"     Running `{fips_cmd.replace('opt-level=3', 'opt-level=0')}`\n"
-                               f"     Running `{test_cmd}`\n"),
-        ("test binary optimized", f"     Running `{fips_cmd}`\n"
-                                  f"     Running `{test_cmd.replace('opt-level=0', 'opt-level=3')}`\n"),
-        ("no fips invocation", f"     Running `{test_cmd}`\n"),
+        ("adapter not optimized", stderr_good.replace(
+            "--crate-name ant_quic --crate-type lib --edition 2021 -C opt-level=3",
+            "--crate-name ant_quic --crate-type lib --edition 2021 -C opt-level=0")),
+        ("test binary optimized", stderr_good.replace(
+            "--crate-name x0x --crate-type lib --test --edition 2021 -C opt-level=0",
+            "--crate-name x0x --crate-type lib --test --edition 2021 -C opt-level=3")),
+        ("no fips invocation", "\n".join(
+            line for line in stderr_good.splitlines() if "--crate-name fips204 " not in line)),
         ("crate-name prefix collision", stderr_good.replace(
             "--crate-name fips204 ", "--crate-name fips204_other ")),
     ):
@@ -647,8 +670,7 @@ def self_test() -> int:
             print(f"PASS self-test: profile evidence rejects {label}")
     # Default (omitted) opt-level on the test binary is acceptable.
     ev = extract_profile_evidence(
-        f"     Running `{fips_cmd}`\n"
-        f"     Running `{test_cmd.replace('-C opt-level=0 ', '')}`\n")
+        stderr_good.replace("-C opt-level=0 src/lib.rs", "src/lib.rs"))
     failures += ev["x0x_test_opt_level"] is not None
 
     # Namespace parsing fails closed on command errors and foreign routes.

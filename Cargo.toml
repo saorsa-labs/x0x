@@ -193,11 +193,16 @@ members = [
     "tests/harness",
 ]
 
-# #703: the unchanged-assertions 100k test times out (902s) in the default
-# test profile; the only CPU samples were fips204 ML-DSA signing. Optimize
-# only the fips204 package within the test profile — the whole dev/test
-# profile and all release profiles stay untouched.
+# #703: preserve the default x0x test target while optimizing the concrete
+# ML-DSA adapter path exercised by the unchanged 100k signing test. The
+# workspace-wide dev/test profiles and every release profile stay untouched.
 [profile.test.package.fips204]
+opt-level = 3
+
+[profile.test.package.saorsa-pqc]
+opt-level = 3
+
+[profile.test.package.ant-quic]
 opt-level = 3
 
 [profile.release-profiling]

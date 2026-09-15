@@ -5,8 +5,8 @@ name: 703 Default Test Profile 100k Diagnostic
 # no uploads other than the test proof/logs. This replaces the default
 # build.yml ONLY on this dedicated branch; default branch is untouched.
 # Unlike the earlier release-mode diagnostic, this runs the exact test
-# under the DEFAULT cargo test profile (no --release); the only profile
-# delta vs base is [profile.test.package.fips204] opt-level=3.
+# under the DEFAULT cargo test profile (no --release); only fips204 and its
+# concrete saorsa-pqc/ant-quic signing adapters receive package opt-level=3.
 
 on:
   workflow_dispatch:
@@ -18,8 +18,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  run-703-default-test-profile-100k:
-    name: Exact 100k test, default test profile, loopback netns
+  run-703-adapter-optimized-test-profile-100k:
+    name: Exact 100k test, adapter-optimized default profile, loopback netns
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -36,7 +36,7 @@ jobs:
         with:
           toolchain: 1.95.0
 
-      - name: Verify tree and run exact 100k test in default test profile in loopback netns
+      - name: Verify tree and run exact 100k test with optimized signing adapters
         run: |
           python3 scripts/ci/run-703-optimized.py \
             --repo "$GITHUB_WORKSPACE" \
