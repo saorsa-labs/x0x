@@ -1,12 +1,13 @@
-name: 703 Default Test Profile 100k Diagnostic
+name: 703 Caller-and-Adapter Optimized Test Profile 100k Diagnostic
 
 # Diagnostic-only workflow on the #703 test-signing-profile branch.
 # Manual dispatch only — no push/PR triggers, no release/build matrix,
 # no uploads other than the test proof/logs. This replaces the default
 # build.yml ONLY on this dedicated branch; default branch is untouched.
-# Unlike the earlier release-mode diagnostic, this runs the exact test
-# under the DEFAULT cargo test profile (no --release); only fips204 and its
-# concrete saorsa-pqc/ant-quic signing adapters receive package opt-level=3.
+# Unlike the earlier release-mode diagnostic, this keeps the plain cargo
+# test command (no --release) while fips204, its concrete saorsa-pqc and
+# ant-quic signing adapters, AND the x0x test target itself (authorized
+# upper control) receive package opt-level=3 via [profile.test.package.*].
 
 on:
   workflow_dispatch:
@@ -18,8 +19,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  run-703-adapter-optimized-test-profile-100k:
-    name: Exact 100k test, adapter-optimized default profile, loopback netns
+  run-703-caller-and-adapter-optimized-test-profile-100k:
+    name: Exact 100k test, caller-and-adapter optimized test profile, loopback netns
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -36,7 +37,7 @@ jobs:
         with:
           toolchain: 1.95.0
 
-      - name: Verify tree and run exact 100k test with optimized signing adapters
+      - name: Verify tree and run exact 100k test with caller-and-adapter optimized profile
         run: |
           python3 scripts/ci/run-703-optimized.py \
             --repo "$GITHUB_WORKSPACE" \
@@ -46,7 +47,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: 703-default-test-profile-proof
+          name: 703-caller-and-adapter-optimized-test-profile-proof
           path: |
             ${{ runner.temp }}/703-artifacts/run-report.json
             ${{ runner.temp }}/703-artifacts/inner-result.json

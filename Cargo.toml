@@ -193,9 +193,10 @@ members = [
     "tests/harness",
 ]
 
-# #703: preserve the default x0x test target while optimizing the concrete
-# ML-DSA adapter path exercised by the unchanged 100k signing test. The
-# workspace-wide dev/test profiles and every release profile stay untouched.
+# #703: caller-and-adapter optimized test profile (experiment). Optimize the
+# concrete ML-DSA adapter path (fips204, saorsa-pqc, ant-quic) plus the x0x
+# test target itself; the workspace-wide dev/test profiles and every release
+# profile stay untouched.
 [profile.test.package.fips204]
 opt-level = 3
 
@@ -203,6 +204,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.test.package.ant-quic]
+opt-level = 3
+
+[profile.test.package.x0x]
 opt-level = 3
 
 [profile.release-profiling]
