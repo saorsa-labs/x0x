@@ -84,6 +84,27 @@ EXPECTED_CARGO_ADDITIONS = [
 # then KILL after a grace period. No automatic retry or extension.
 OUTER_TIMEOUT_SECONDS = 600
 TERM_GRACE_SECONDS = 10
+# Hosted run 34920522172 produced a 501,261,776-byte DWARF recording. The
+# generic 10-second process grace killed perf before it could finalize that
+# file, so recorder shutdown gets a separate bound without extending the
+# unchanged 600-second test deadline.
+PERF_FINALIZE_GRACE_SECONDS = 120
+PERF_REPORT_TIMEOUT_SECONDS = 30
+BOOKKEEPING_GRACE_SECONDS = 30
+# The privileged launcher does not finish until the bounded test, its TERM
+# grace, perf finalization, both sequential reports, and final bookkeeping do.
+INNER_COMPLETION_TIMEOUT_SECONDS = (
+    OUTER_TIMEOUT_SECONDS
+    + TERM_GRACE_SECONDS
+    + PERF_FINALIZE_GRACE_SECONDS
+    + 2 * PERF_REPORT_TIMEOUT_SECONDS
+    + BOOKKEEPING_GRACE_SECONDS
+)
+# If the outer phase is interrupted, SIGTERM makes the observer helper unwind
+# through its finally block. Keep that helper alive long enough to finalize perf.
+OBSERVER_HELPER_CLEANUP_GRACE_SECONDS = (
+    PERF_FINALIZE_GRACE_SECONDS + BOOKKEEPING_GRACE_SECONDS
+)
 
 INNER_FLAG_ENV = "X0X_703_INNER"
 INNER_RESULT_NAME = "inner-result.json"
@@ -165,21 +186,38 @@ def profiling_status(test_exit: int, perf_exit: int, timed_out: bool,
 
 
 def stop_owned_group(proc: subprocess.Popen, first_signal: signal.Signals,
-                     grace: int = TERM_GRACE_SECONDS) -> None:
+                     grace: int = TERM_GRACE_SECONDS,
+                     kill_group=os.killpg) -> bool:
     if proc.poll() is not None:
-        return
+        return False
     try:
-        os.killpg(proc.pid, first_signal)
+        kill_group(proc.pid, first_signal)
     except ProcessLookupError:
         pass
     try:
         proc.wait(timeout=grace)
+        return False
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            kill_group(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         proc.wait()
+        return True
+
+
+def finalize_perf_observer(proc: subprocess.Popen,
+                           grace: int = PERF_FINALIZE_GRACE_SECONDS,
+                           kill_group=os.killpg) -> bool:
+    """Interrupt owned perf and wait for data finalization before forced kill."""
+    return stop_owned_group(proc, signal.SIGINT, grace, kill_group)
+
+
+def remaining_test_seconds(released_monotonic: float,
+                           now: float | None = None) -> float:
+    """Return the unspent part of the unchanged test execution deadline."""
+    current = time.monotonic() if now is None else now
+    return max(0.0, OUTER_TIMEOUT_SECONDS - (current - released_monotonic))
 
 
 def install_cleanup_signals() -> None:
@@ -688,12 +726,16 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
             time.sleep(0.02)
         else:
             raise SystemExit("FAIL: stopped wrapper did not exec exact test binary")
-        rc = launcher.wait(timeout=OUTER_TIMEOUT_SECONDS + TERM_GRACE_SECONDS + 30)
-        observer_helper.wait(timeout=TERM_GRACE_SECONDS + 30)
+        rc = launcher.wait(timeout=INNER_COMPLETION_TIMEOUT_SECONDS)
+        observer_helper.wait(timeout=OBSERVER_HELPER_CLEANUP_GRACE_SECONDS)
     finally:
         stop_owned_group(launcher, signal.SIGTERM, TERM_GRACE_SECONDS + 5)
         if observer_helper is not None:
-            stop_owned_group(observer_helper, signal.SIGTERM, TERM_GRACE_SECONDS + 5)
+            stop_owned_group(
+                observer_helper,
+                signal.SIGTERM,
+                OBSERVER_HELPER_CLEANUP_GRACE_SECONDS,
+            )
         if target_pidfd is not None:
             os.close(target_pidfd)
 
@@ -801,6 +843,7 @@ def observer_phase(artifact_dir: Path, test_binary: str, target_pid: int,
         raise SystemExit("FAIL: perf unavailable to observer helper")
     perf_data = artifact_dir / PERF_DATA_NAME
     perf_log = artifact_dir / "perf-observer.log"
+    forced_kill = False
     with perf_log.open("wb") as log:
         observer = subprocess.Popen(
             [perf, "record", "-F", "99", "--call-graph", "dwarf", "--inherit",
@@ -828,14 +871,15 @@ def observer_phase(artifact_dir: Path, test_binary: str, target_pid: int,
             if not attached:
                 return 2
             wait_json(artifact_dir / "test-done.json", OUTER_TIMEOUT_SECONDS + 60)
-            stop_owned_group(observer, signal.SIGINT)
+            forced_kill = finalize_perf_observer(observer)
             return observer.returncode
         finally:
-            stop_owned_group(observer, signal.SIGINT)
+            forced_kill = finalize_perf_observer(observer) or forced_kill
             if perf_data.exists():
                 os.chown(perf_data, target["uid"], -1)
             atomic_json(artifact_dir / "observer-result.json", {
                 "native_exit": observer.returncode,
+                "forced_kill": forced_kill,
                 "target_pid": target_pid,
                 "target_start": target_start,
             })
@@ -913,7 +957,7 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
                 raise RuntimeError("test-started identity mismatch")
             started = float(started_record["released_monotonic"])
             try:
-                proc.communicate(timeout=OUTER_TIMEOUT_SECONDS)
+                proc.communicate(timeout=remaining_test_seconds(started))
             except subprocess.TimeoutExpired:
                 timed_out = True
                 print(f"outer bound {OUTER_TIMEOUT_SECONDS}s reached; sending TERM")
@@ -927,7 +971,9 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
         "timed_out": timed_out,
         "elapsed_seconds": elapsed,
     })
-    observer_result = wait_json(artifact_dir / "observer-result.json", 30)
+    observer_result = wait_json(
+        artifact_dir / "observer-result.json", OBSERVER_HELPER_CLEANUP_GRACE_SECONDS
+    )
     perf_exit = int(observer_result["native_exit"])
     reports = {}
     for mode, args in (
@@ -937,7 +983,7 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
         try:
             report = run(
             ["perf", "report", "--stdio", *args, "--percent-limit", "0.5", "-i", str(perf_data)],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=PERF_REPORT_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
             reports[mode] = {"native_exit": None, "has_samples": False, "timed_out": True}
@@ -953,6 +999,7 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
         }
     perf_bytes = perf_data.stat().st_size if perf_data.exists() else 0
     status = profiling_status(native_exit, perf_exit, timed_out, perf_bytes, reports)
+    status["perf_forced_kill"] = bool(observer_result.get("forced_kill", False))
     print(f"native exit={native_exit} elapsed={elapsed}s timed_out={timed_out}")
 
     log_text = test_log.read_text(errors="replace")
@@ -1003,6 +1050,33 @@ def self_test() -> int:
             self.stdout = stdout
             self.stderr = stderr
 
+    class FakeOwnedProcess:
+        def __init__(self, finalize_seconds: int):
+            self.pid = 4242
+            self.returncode = None
+            self.finalize_seconds = finalize_seconds
+            self.waits: list[int | None] = []
+            self.signals: list[signal.Signals] = []
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.waits.append(timeout)
+            if self.returncode is not None:
+                return self.returncode
+            if timeout is not None and timeout < self.finalize_seconds:
+                raise subprocess.TimeoutExpired("perf", timeout)
+            self.returncode = 0
+            return self.returncode
+
+        def kill_group(self, pid, signum):
+            if pid != self.pid:
+                raise AssertionError("foreign PID signalled")
+            self.signals.append(signum)
+            if signum == signal.SIGKILL:
+                self.returncode = -int(signal.SIGKILL)
+
     with __import__("tempfile").TemporaryDirectory() as raw:
         tmp = Path(raw)
         missing = perf_precheck(tmp, perf=None, command=lambda *_a, **_k: PerfResult(1))
@@ -1024,10 +1098,33 @@ def self_test() -> int:
         "children": {"native_exit": 0, "has_samples": True},
     }
     failures += profiling_status(0, 0, False, 100, failed_report)["capture_ok"]
+    empty_reports = {
+        "self": {"native_exit": 0, "has_samples": False},
+        "children": {"native_exit": 0, "has_samples": False},
+    }
+    failures += profiling_status(0, 0, False, 100, empty_reports)["capture_ok"]
     failures += profiling_status(0, 0, False, 0, good_reports)["capture_ok"]
     failures += not report_has_samples("  91.23% command symbol\n")
     failures += report_has_samples("   0.00% command symbol\n")
     failures += report_has_samples("# no samples\n")
+
+    # The production perf-finalization path must wait beyond the former generic
+    # 10-second grace. The negative control proves that old path force-kills the
+    # same 30-second finalizer, while the new path sends SIGINT and exits zero.
+    old = FakeOwnedProcess(finalize_seconds=30)
+    old_forced = stop_owned_group(
+        old, signal.SIGINT, TERM_GRACE_SECONDS, old.kill_group
+    )
+    failures += not old_forced
+    failures += old.signals != [signal.SIGINT, signal.SIGKILL]
+    failures += old.returncode != -int(signal.SIGKILL)
+    print("PASS self-test: old 10-second perf finalization path requires SIGKILL")
+    repaired = FakeOwnedProcess(finalize_seconds=30)
+    repaired_forced = finalize_perf_observer(repaired, kill_group=repaired.kill_group)
+    failures += repaired_forced
+    failures += repaired.signals != [signal.SIGINT]
+    failures += repaired.returncode != 0
+    print("PASS self-test: repaired perf finalization waits after SIGINT without SIGKILL")
 
     # Exact source-custody delta rejects missing and additional files.
     expected_delta = {"Cargo.toml", ".github/workflows/build.yml",
