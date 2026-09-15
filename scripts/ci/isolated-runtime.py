@@ -13,12 +13,12 @@ import tempfile
 
 # Preserve toolchain/instrumentation, not proxy credentials or host agent sockets.
 ENV_KEYS = (
-    'PATH', 'CARGO_HOME', 'RUSTUP_HOME', 'RUSTUP_TOOLCHAIN', 'CARGO_TARGET_DIR',
+    'HOME', 'PATH', 'CARGO_HOME', 'RUSTUP_HOME', 'RUSTUP_TOOLCHAIN', 'CARGO_TARGET_DIR',
     'CARGO_TERM_COLOR', 'RUST_BACKTRACE', 'RUSTFLAGS', 'RUSTDOCFLAGS',
     'CARGO_ENCODED_RUSTFLAGS', 'CARGO_ENCODED_RUSTDOCFLAGS', 'RUSTC', 'RUSTDOC',
     'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'LLVM_PROFILE_FILE',
     'CARGO_INCREMENTAL', 'CARGO_LLVM_COV', 'CARGO_LLVM_COV_TARGET_DIR', 'CARGO_LLVM_COV_BUILD_DIR',
-    'LLVM_COV', 'LLVM_PROFDATA',
+    'LLVM_COV', 'LLVM_PROFDATA', 'X0X_SLOW_CONSUMER_PROOF',
 )
 
 
@@ -75,7 +75,7 @@ def setup(config_file):
     subprocess.run(['/usr/bin/mount', '--make-rprivate', '/'], check=True)
     subprocess.run(['/usr/bin/mount', '-t', 'tmpfs', '-o', 'mode=1777,nosuid,nodev',
                     'tmpfs', '/tmp'], check=True)
-    for name in ('/tmp/x0x-nextest-home', '/tmp/x0x-runtime-home', '/tmp/x0x-runtime-tmp'):
+    for name in ('/tmp/x0x-runtime-data', '/tmp/x0x-runtime-tmp'):
         Path(name).mkdir(mode=0o700)
         os.chown(name, config['uid'], config['gid'])
     subprocess.run(['/usr/sbin/ip', 'link', 'set', 'lo', 'up'], check=True)
@@ -142,7 +142,7 @@ def caller(config_file):
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda number, _frame: interrupted.append(number))
     child = subprocess.Popen([
-        '/usr/bin/sudo', '-n', '/usr/bin/python3', str(Path(__file__).resolve()),
+        '/usr/bin/sudo', '-n', '--preserve-env=HOME', '/usr/bin/python3', str(Path(__file__).resolve()),
         '--supervise', str(config_file)], stdin=subprocess.PIPE, close_fds=True)
     try:
         while child.poll() is None:
@@ -171,12 +171,12 @@ def main():
     for tool in ('/usr/bin/sudo', '/usr/bin/unshare', '/usr/bin/setpriv', '/usr/sbin/ip', '/usr/bin/mount'):
         if not Path(tool).is_file():
             raise RuntimeError(f'missing namespace prerequisite: {tool}')
-    # Resolve once before changing HOME/PATH; no shell evaluation of test arguments.
+    # Resolve once before filtering the environment; never evaluate test arguments in a shell.
     command[0] = shutil.which(command[0]) or command[0]
     env = {key: os.environ[key] for key in ENV_KEYS if key in os.environ}
     env.setdefault('CARGO_HOME', str(Path.home() / '.cargo'))
     env.setdefault('RUSTUP_HOME', str(Path.home() / '.rustup'))
-    env.update(HOME='/tmp/x0x-runtime-home', X0X_HOME='/tmp/x0x-runtime-home',
+    env.update(X0X_HOME='/tmp/x0x-runtime-data',
                TMPDIR='/tmp/x0x-runtime-tmp', CARGO_NET_OFFLINE='true', RUST_MIN_STACK='16777216')
     evidence = Path(tempfile.mkdtemp(prefix='x0x-isolation-', dir=os.environ['RUNNER_TEMP'])).resolve()
     if evidence.is_relative_to('/tmp'):

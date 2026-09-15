@@ -193,6 +193,23 @@ members = [
     "tests/harness",
 ]
 
+# #703: the 100k signing-path test spends most CPU time in Keccak. Optimize
+# only its concrete crypto path and test target; dev and release stay unchanged.
+[profile.test.package.keccak]
+opt-level = 3
+
+[profile.test.package.fips204]
+opt-level = 3
+
+[profile.test.package.saorsa-pqc]
+opt-level = 3
+
+[profile.test.package.ant-quic]
+opt-level = 3
+
+[profile.test.package.x0x]
+opt-level = 3
+
 [profile.release-profiling]
 inherits = "release"
 debug = "line-tables-only"

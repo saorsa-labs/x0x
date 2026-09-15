@@ -152,6 +152,85 @@ jobs:
           name: test-results
           path: target/nextest/
 
+  signing-path-100k:
+    name: Signing path 100k acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-issue703-cargo-${{ hashFiles('Cargo.toml') }}
+
+      - name: Resolve acceptance dependency graph
+        run: cargo generate-lockfile
+
+      - name: Cache acceptance target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-issue703-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144
+
+      - name: Exercise proof and isolation wrapper controls
+        run: |
+          python3 -B scripts/ci/validate-703-signing-proof.py --self-test
+          python3 -B scripts/ci/test_nextest_isolated.py -v
+
+      - name: Prepare acceptance artifact
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          mkdir -m 700 "${artifact}"
+          test ! -e "${artifact}/proof.json"
+
+      - name: Run exact ignored 100k signing-path test
+        id: signing_test
+        shell: bash
+        env:
+          X0X_ISOLATION_ROLE: issue703-signing-acceptance
+          X0X_RUNTIME_TIMEOUT_SECONDS: 660
+          X0X_SLOW_CONSUMER_PROOF: ${{ runner.temp }}/issue703-signing-test/proof.json
+        run: |
+          set +e
+          bash scripts/ci/nextest-isolated.sh --all-features --lib -- \
+            --run-ignored ignored-only --no-tests=fail \
+            -E 'test(=gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages)'
+          status=$?
+          set -e
+          printf '{"native_exit":%d}\n' "${status}" \
+            >"${RUNNER_TEMP}/issue703-signing-test/native-exit.json"
+          if [[ ${status} -ne 0 ]]; then
+            exit "${status}"
+          fi
+          python3 -B scripts/ci/validate-703-signing-proof.py \
+            "${RUNNER_TEMP}/issue703-signing-test/proof.json"
+
+      - name: Upload signing-path acceptance custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue703-signing-path-100k
+          path: |
+            ${{ runner.temp }}/issue703-signing-test/
+            ${{ runner.temp }}/x0x-metadata-*/
+            ${{ runner.temp }}/x0x-isolation-*/
+          if-no-files-found: error
+
   linux-systemd-policy:
     name: Linux systemd policy acceptance
     runs-on: ubuntu-latest
