@@ -41,6 +41,7 @@ import json
 import os
 import re
 import signal
+import ctypes
 import shutil
 import shlex
 import subprocess
@@ -88,6 +89,8 @@ INNER_FLAG_ENV = "X0X_703_INNER"
 INNER_RESULT_NAME = "inner-result.json"
 REPORT_NAME = "run-report.json"
 PERF_DATA_NAME = "perf.data"
+TARGET_RECORD_NAME = "target-record.json"
+OBSERVER_READY_NAME = "observer-ready.json"
 
 
 def perf_precheck(artifact_dir: Path, *, perf: str | None = None, command=None) -> dict:
@@ -108,7 +111,9 @@ def perf_precheck(artifact_dir: Path, *, perf: str | None = None, command=None) 
     probe = artifact_dir / "perf-precheck.data"
     try:
         capture = command(
-            [executable, "record", "-q", "-o", str(probe), "--", "/bin/true"],
+            ["sudo", "--preserve-env=HOME,PATH", "--", sys.executable,
+             str(Path(__file__).resolve()), "--perf-precheck-helper", "--precheck-output",
+             str(probe), "--perf-executable", executable],
             capture_output=True, text=True, timeout=10,
         )
     except subprocess.TimeoutExpired:
@@ -129,7 +134,7 @@ def perf_precheck(artifact_dir: Path, *, perf: str | None = None, command=None) 
         and evidence["capture_bytes"] > 0
     )
     if not evidence["ok"]:
-        evidence["reason"] = "unprivileged perf capture unavailable"
+        evidence["reason"] = "bounded privileged perf capture unavailable"
     return evidence
 
 
@@ -177,12 +182,82 @@ def stop_owned_group(proc: subprocess.Popen, first_signal: signal.Signals,
         proc.wait()
 
 
+def install_cleanup_signals() -> None:
+    terminating = False
+    def terminate(signum, _frame):
+        nonlocal terminating
+        if terminating:
+            return
+        terminating = True
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(value, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def proc_identity(pid: int) -> dict:
+    root = Path(f"/proc/{pid}")
+    stat = (root / "stat").read_text()
+    tail = stat[stat.rfind(")") + 2:].split()
+    status_text = (root / "status").read_text()
+    status = dict(line.split(":", 1) for line in status_text.splitlines() if ":" in line)
+    return {
+        "pid": pid,
+        "start_time": int(tail[19]),
+        "exe": os.readlink(root / "exe"),
+        "argv": (root / "cmdline").read_bytes().split(b"\0")[:-1],
+        "netns": os.readlink(root / "ns/net"),
+        "uid": int(status["Uid"].split()[0]),
+        "gid": int(status["Gid"].split()[0]),
+        "groups": [int(value) for value in status.get("Groups", "").split()],
+        "caps": {key: status.get(key, "").strip() for key in
+                 ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")},
+        "no_new_privs": status.get("NoNewPrivs", "").strip(),
+    }
+
+
+def policy_matches(identity: dict, uid: int, gid: int, netns: str) -> bool:
+    return (
+        identity["uid"] == uid and identity["gid"] == gid
+        and identity["groups"] == [] and identity["netns"] == netns
+        and identity["no_new_privs"] == "1"
+        and all(value and int(value, 16) == 0 for value in identity["caps"].values())
+    )
+
+
+def wait_json(path: Path, timeout_seconds: int) -> dict:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            return json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.05)
+    raise TimeoutError(f"timed out waiting for {path.name}")
+
+
+def wait_stopped(pid: int, timeout_seconds: int = 10) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WUNTRACED | os.WNOHANG)
+        if waited == pid:
+            if os.WIFSTOPPED(status):
+                return
+            raise RuntimeError("test wrapper exited before stopping")
+        time.sleep(0.02)
+    raise TimeoutError("timed out waiting for stopped test wrapper")
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -493,7 +568,7 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
         json.dumps(perf_evidence, indent=2) + "\n"
     )
     if not perf_evidence["ok"]:
-        raise SystemExit("FAIL: unprivileged perf precheck failed before build")
+        raise SystemExit("FAIL: bounded privileged perf precheck failed before build")
 
     # Fresh lock: the prior run retained no lock custody.
     lock = repo / "Cargo.lock"
@@ -568,7 +643,59 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
         "--runner-uid", str(uid), "--runner-gid", str(gid),
         "--test-binary", test_binary, "--artifact-dir", str(artifact_dir),
     ]
-    rc = run(inner_cmd, cwd=repo, env=inner_env).returncode
+    install_cleanup_signals()
+    launcher = subprocess.Popen(inner_cmd, cwd=repo, env=inner_env, start_new_session=True)
+    observer_helper = None
+    target_pidfd = None
+    try:
+        target = wait_json(artifact_dir / TARGET_RECORD_NAME, 30)
+        live = proc_identity(int(target["pid"]))
+        expected_wrapper_argv = target["wrapper_argv"]
+        live_argv = [part.decode(errors="replace") for part in live["argv"]]
+        if (live["start_time"] != target["start_time"]
+                or live["exe"] != target["wrapper_exe"]
+                or live_argv != expected_wrapper_argv
+                or not policy_matches(live, uid, gid, target["netns"])):
+            raise SystemExit("FAIL: stopped wrapper identity mismatch")
+        target_pidfd = os.pidfd_open(int(target["pid"]))
+        if proc_identity(int(target["pid"]))["start_time"] != target["start_time"]:
+            raise SystemExit("FAIL: target identity changed while opening pidfd")
+        observer_cmd = [
+            "sudo", f"--preserve-env=HOME,PATH", "--", sys.executable,
+            str(Path(__file__).resolve()), "--observer", "--artifact-dir",
+            str(artifact_dir), "--test-binary", test_binary,
+            "--target-pid", str(target["pid"]), "--target-start", str(target["start_time"]),
+        ]
+        observer_helper = subprocess.Popen(observer_cmd, cwd=repo, start_new_session=True)
+        ready = wait_json(artifact_dir / OBSERVER_READY_NAME, 30)
+        if not ready.get("attached"):
+            raise SystemExit(f"FAIL: perf observer did not attach: {ready}")
+        atomic_json(artifact_dir / "test-release.json", {"target_start": target["start_time"]})
+        signal.pidfd_send_signal(target_pidfd, signal.SIGCONT)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            current = proc_identity(int(target["pid"]))
+            if current["exe"] == str(Path(test_binary).resolve()):
+                expected_argv = [part.encode() for part in [
+                    test_binary, "--exact", SELECTOR, "--ignored", "--nocapture",
+                    "--test-threads=1",
+                ]]
+                if current["argv"] != expected_argv or not policy_matches(
+                    current, uid, gid, target["netns"]
+                ):
+                    raise SystemExit("FAIL: test argv differs after wrapper exec")
+                break
+            time.sleep(0.02)
+        else:
+            raise SystemExit("FAIL: stopped wrapper did not exec exact test binary")
+        rc = launcher.wait(timeout=OUTER_TIMEOUT_SECONDS + TERM_GRACE_SECONDS + 30)
+        observer_helper.wait(timeout=TERM_GRACE_SECONDS + 30)
+    finally:
+        stop_owned_group(launcher, signal.SIGTERM, TERM_GRACE_SECONDS + 5)
+        if observer_helper is not None:
+            stop_owned_group(observer_helper, signal.SIGTERM, TERM_GRACE_SECONDS + 5)
+        if target_pidfd is not None:
+            os.close(target_pidfd)
 
     if not inner_result_path.exists():
         raise SystemExit(f"FAIL: inner phase produced no {INNER_RESULT_NAME} (sudo exit {rc})")
@@ -612,6 +739,108 @@ def netns_launch(test_binary: str, artifact_dir: Path, uid: int, gid: int) -> in
     return 1
 
 
+def stopped_exec(started_path: Path, command: list[str]) -> int:
+    os.kill(os.getpid(), signal.SIGSTOP)
+    identity = proc_identity(os.getpid())
+    atomic_json(started_path, {
+        "pid": os.getpid(),
+        "start_time": identity["start_time"],
+        "released_monotonic": time.monotonic(),
+    })
+    os.execv(command[0], command)
+    return 1
+
+
+def perf_precheck_helper(perf: str, output: Path) -> int:
+    if os.geteuid() != 0:
+        raise SystemExit("FAIL: perf precheck helper must be root")
+    parent_pid = os.getppid()
+    install_cleanup_signals()
+    if ctypes.CDLL(None).prctl(1, int(signal.SIGTERM), 0, 0, 0) != 0:
+        raise SystemExit("FAIL: cannot install precheck parent-death signal")
+    if os.getppid() != parent_pid:
+        raise SystemExit("FAIL: precheck parent exited during setup")
+    child = subprocess.Popen(
+        [perf, "record", "-q", "-o", str(output), "--", "/bin/true"],
+        start_new_session=True,
+    )
+    try:
+        return child.wait(timeout=5)
+    finally:
+        stop_owned_group(child, signal.SIGTERM)
+
+
+def observer_phase(artifact_dir: Path, test_binary: str, target_pid: int,
+                   target_start: int) -> int:
+    if os.geteuid() != 0:
+        raise SystemExit("FAIL: observer helper must be root")
+    parent_pid = os.getppid()
+    install_cleanup_signals()
+    if ctypes.CDLL(None).prctl(1, int(signal.SIGTERM), 0, 0, 0) != 0:
+        raise SystemExit("FAIL: cannot install observer parent-death signal")
+    if os.getppid() != parent_pid:
+        raise SystemExit("FAIL: observer parent exited during setup")
+    target = proc_identity(target_pid)
+    record = json.loads((artifact_dir / TARGET_RECORD_NAME).read_text())
+    expected_binary = str(Path(test_binary).resolve())
+    live_argv = [part.decode(errors="replace") for part in target["argv"]]
+    if (record.get("pid") != target_pid
+            or record.get("start_time") != target_start
+            or target["start_time"] != target_start
+            or target["exe"] != record.get("wrapper_exe")
+            or live_argv != record.get("wrapper_argv")
+            or not policy_matches(
+                target, record.get("uid"), record.get("gid"), record.get("netns")
+            )
+            or target["netns"] == record.get("outer_netns")
+            or record.get("expected_test_binary") != expected_binary
+            or record.get("expected_test_sha256") != sha256_file(Path(expected_binary))):
+        raise SystemExit("FAIL: observer target custody record mismatch")
+    perf = shutil.which("perf")
+    if perf is None:
+        raise SystemExit("FAIL: perf unavailable to observer helper")
+    perf_data = artifact_dir / PERF_DATA_NAME
+    perf_log = artifact_dir / "perf-observer.log"
+    with perf_log.open("wb") as log:
+        observer = subprocess.Popen(
+            [perf, "record", "-F", "99", "--call-graph", "dwarf", "--inherit",
+             "-o", str(perf_data), "-p", str(target_pid)],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            attached = False
+            while time.monotonic() < deadline and observer.poll() is None:
+                fd_root = Path(f"/proc/{observer.pid}/fd")
+                try:
+                    attached = any("perf_event" in os.readlink(fd) for fd in fd_root.iterdir())
+                except (FileNotFoundError, PermissionError):
+                    attached = False
+                if attached:
+                    break
+                time.sleep(0.05)
+            atomic_json(artifact_dir / OBSERVER_READY_NAME, {
+                "attached": attached,
+                "observer_pid": observer.pid,
+                "target_pid": target_pid,
+                "target_start": target_start,
+            })
+            if not attached:
+                return 2
+            wait_json(artifact_dir / "test-done.json", OUTER_TIMEOUT_SECONDS + 60)
+            stop_owned_group(observer, signal.SIGINT)
+            return observer.returncode
+        finally:
+            stop_owned_group(observer, signal.SIGINT)
+            if perf_data.exists():
+                os.chown(perf_data, target["uid"], -1)
+            atomic_json(artifact_dir / "observer-result.json", {
+                "native_exit": observer.returncode,
+                "target_pid": target_pid,
+                "target_start": target_start,
+            })
+
+
 def inner_phase(test_binary: str, artifact_dir: Path) -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     checks: list[tuple[bool, str]] = []
@@ -643,28 +872,46 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
     for var in ("X0X_SLOW_SUBSCRIBER_MESSAGES",):
         env.pop(var, None)
 
-    perf = shutil.which("perf")
-    if perf is None:
-        raise SystemExit("FAIL: perf disappeared after successful outer precheck")
     cmd = [test_binary, "--exact", SELECTOR, "--ignored", "--nocapture",
            "--test-threads=1"]
     print(f"executing ({PROFILE_LABEL}): {' '.join(cmd)}")
     started = time.monotonic()
     timed_out = False
-    perf_log = artifact_dir / "perf-observer.log"
     perf_data = artifact_dir / PERF_DATA_NAME
-    with test_log.open("wb") as log_fh, perf_log.open("wb") as perf_fh:
+    with test_log.open("wb") as log_fh:
+        started_path = artifact_dir / "test-started.json"
+        install_cleanup_signals()
         proc = subprocess.Popen(
-            cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True
+            [sys.executable, str(Path(__file__).resolve()), "--stopped-exec",
+             str(started_path), "--", *cmd],
+            stdout=log_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True,
         )
-        observer = None
-        elapsed = None
         try:
-            observer = subprocess.Popen(
-                [perf, "record", "-F", "99", "--call-graph", "dwarf", "-o",
-                 str(perf_data), "-p", str(proc.pid)],
-                stdout=perf_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True,
-            )
+            wait_stopped(proc.pid)
+            wrapper = proc_identity(proc.pid)
+            atomic_json(artifact_dir / TARGET_RECORD_NAME, {
+            "pid": proc.pid,
+            "start_time": wrapper["start_time"],
+            "wrapper_exe": wrapper["exe"],
+            "wrapper_argv": [part.decode(errors="replace") for part in wrapper["argv"]],
+            "netns": wrapper["netns"],
+            "outer_netns": outer_netns,
+            "uid": wrapper["uid"],
+            "gid": wrapper["gid"],
+            "groups": wrapper["groups"],
+            "caps": wrapper["caps"],
+            "no_new_privs": wrapper["no_new_privs"],
+            "expected_test_binary": str(Path(test_binary).resolve()),
+            "expected_test_sha256": sha256_file(Path(test_binary)),
+            })
+            release = wait_json(artifact_dir / "test-release.json", 30)
+            if release.get("target_start") != wrapper["start_time"]:
+                raise RuntimeError("test release identity mismatch")
+            started_record = wait_json(started_path, 30)
+            if (started_record.get("pid") != proc.pid
+                    or started_record.get("start_time") != wrapper["start_time"]):
+                raise RuntimeError("test-started identity mismatch")
+            started = float(started_record["released_monotonic"])
             try:
                 proc.communicate(timeout=OUTER_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
@@ -674,14 +921,14 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
             elapsed = round(time.monotonic() - started, 4)
         finally:
             stop_owned_group(proc, signal.SIGTERM)
-            if elapsed is None:
-                elapsed = round(time.monotonic() - started, 4)
-            if observer is not None:
-                stop_owned_group(observer, signal.SIGINT)
     native_exit = proc.returncode
-    if observer is None:
-        raise RuntimeError("perf observer did not start")
-    perf_exit = observer.returncode
+    atomic_json(artifact_dir / "test-done.json", {
+        "test_native_exit": native_exit,
+        "timed_out": timed_out,
+        "elapsed_seconds": elapsed,
+    })
+    observer_result = wait_json(artifact_dir / "observer-result.json", 30)
+    perf_exit = int(observer_result["native_exit"])
     reports = {}
     for mode, args in (
         ("self", ["--no-children"]),
@@ -689,7 +936,7 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
     ):
         try:
             report = run(
-                [perf, "report", "--stdio", *args, "--percent-limit", "0.5", "-i", str(perf_data)],
+            ["perf", "report", "--stdio", *args, "--percent-limit", "0.5", "-i", str(perf_data)],
                 capture_output=True, text=True, timeout=30,
             )
         except subprocess.TimeoutExpired:
@@ -965,9 +1212,21 @@ def self_test() -> int:
 
 
 def main() -> int:
+    if "--stopped-exec" in sys.argv:
+        marker = sys.argv.index("--stopped-exec")
+        remainder = sys.argv[marker + 1:]
+        if len(remainder) < 3 or remainder[1] != "--":
+            raise SystemExit("stopped exec requires a started path and command")
+        return stopped_exec(Path(remainder[0]), remainder[2:])
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--inner", action="store_true")
     ap.add_argument("--netns-launch", action="store_true")
+    ap.add_argument("--observer", action="store_true")
+    ap.add_argument("--perf-precheck-helper", action="store_true")
+    ap.add_argument("--precheck-output")
+    ap.add_argument("--perf-executable")
+    ap.add_argument("--target-pid", type=int)
+    ap.add_argument("--target-start", type=int)
     ap.add_argument("--runner-uid", type=int)
     ap.add_argument("--runner-gid", type=int)
     ap.add_argument("--test-binary")
@@ -978,6 +1237,17 @@ def main() -> int:
 
     if args.self_test:
         return self_test()
+    if args.perf_precheck_helper:
+        if not args.precheck_output or not args.perf_executable:
+            raise SystemExit("perf precheck helper requires output and executable")
+        return perf_precheck_helper(args.perf_executable, Path(args.precheck_output))
+    if args.observer:
+        if (not args.artifact_dir or not args.test_binary
+                or args.target_pid is None or args.target_start is None):
+            raise SystemExit("observer requires artifact, binary, PID, and start time")
+        return observer_phase(
+            Path(args.artifact_dir), args.test_binary, args.target_pid, args.target_start
+        )
     if args.netns_launch:
         if (not args.test_binary or not args.artifact_dir
                 or args.runner_uid is None or args.runner_gid is None):
