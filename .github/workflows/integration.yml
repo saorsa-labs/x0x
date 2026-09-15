@@ -85,8 +85,8 @@ jobs:
   #    wall-clock limit on every PR, despite all tests passing. It is now
   #    four jobs: three run in parallel on every PR (core + groups + net),
   #    and the de-flaked timing suites run only on the weekly schedule
-  #    (mirroring the soak job's gating). Each PR job retains its 20-min
-  #    ceiling and all existing suites. Their root integration targets include
+  #    (mirroring the soak job's gating). Each PR job retains all existing
+  #    suites. Their root integration targets include
   #    tests/harness/src/{daemon,cluster}.rs, which prefer CARGO_BIN_EXE_x0xd:
   #    Cargo supplies the debug/all-features binary for nextest. Separate
   #    release prebuilds were unused and exhausted core's cold-cache budget
@@ -99,7 +99,9 @@ jobs:
   integration-core:
     name: Integration (core)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Cold all-feature compilation consumed the former 20-minute job budget
+    # before the final selector ran; inner runtime bounds remain unchanged.
+    timeout-minutes: 30
     env:
       X0X_RUNTIME_TIMEOUT_SECONDS: 1200
     steps:
@@ -132,7 +134,9 @@ jobs:
   integration-groups:
     name: Integration (groups)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Preserve headroom for cold compilation and artifact finalization while
+    # retaining each test harness's existing runtime deadline.
+    timeout-minutes: 30
     env:
       X0X_RUNTIME_TIMEOUT_SECONDS: 1200
     steps:
