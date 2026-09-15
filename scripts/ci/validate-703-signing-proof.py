@@ -13,6 +13,8 @@ def validate(proof: object) -> None:
         "messages": 100_000,
         "publish_total": 100_000,
         "fast_received": 100_000,
+        # Fast receiver plus the unread slow subscriber's 10k buffer.
+        "delivered_to_subscriber": 110_000,
         "decode_to_delivery_drops": 0,
     }
     for key, expected in exact.items():
@@ -39,6 +41,15 @@ def self_test() -> None:
         ("messages", 99_999),
         ("publish_total", 99_999),
         ("fast_received", 99_999),
+        ("delivered_to_subscriber", None),
+        ("delivered_to_subscriber", True),
+        ("delivered_to_subscriber", 110_000.0),
+        ("delivered_to_subscriber", "110000"),
+        ("delivered_to_subscriber", 100_000),
+        ("delivered_to_subscriber", 120_000),
+        ("delivered_to_subscriber", 109_999),
+        ("delivered_to_subscriber", 110_001),
+        ("delivered_to_subscriber", 99_999),
         ("decode_to_delivery_drops", 1),
         ("decode_to_delivery_drops", False),
         ("messages", 100_000.0),
@@ -52,6 +63,22 @@ def self_test() -> None:
         except ValueError:
             continue
         raise AssertionError(f"invalid {key} proof was accepted")
+    for missing in (
+        "messages",
+        "publish_total",
+        "fast_received",
+        "delivered_to_subscriber",
+        "slow_subscriber_dropped",
+        "subscriber_channel_closed",
+        "decode_to_delivery_drops",
+    ):
+        candidate = dict(good)
+        del candidate[missing]
+        try:
+            validate(candidate)
+        except ValueError:
+            continue
+        raise AssertionError(f"proof missing {missing} was accepted")
 
 
 def main() -> int:
