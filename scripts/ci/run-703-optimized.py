@@ -89,7 +89,10 @@ TERM_GRACE_SECONDS = 10
 # file, so recorder shutdown gets a separate bound without extending the
 # unchanged 600-second test deadline.
 PERF_FINALIZE_GRACE_SECONDS = 120
-PERF_REPORT_TIMEOUT_SECONDS = 30
+PERF_REPORT_TIMEOUT_SECONDS = 180
+# Worst case: TERM communicate, KILL communicate, then the final bounded wait
+# after closing the owned pipe.
+PERF_REPORT_CLEANUP_GRACE_SECONDS = 3 * TERM_GRACE_SECONDS
 BOOKKEEPING_GRACE_SECONDS = 30
 # The privileged launcher does not finish until the bounded test, its TERM
 # grace, perf finalization, both sequential reports, and final bookkeeping do.
@@ -97,7 +100,7 @@ INNER_COMPLETION_TIMEOUT_SECONDS = (
     OUTER_TIMEOUT_SECONDS
     + TERM_GRACE_SECONDS
     + PERF_FINALIZE_GRACE_SECONDS
-    + 2 * PERF_REPORT_TIMEOUT_SECONDS
+    + 2 * (PERF_REPORT_TIMEOUT_SECONDS + PERF_REPORT_CLEANUP_GRACE_SECONDS)
     + BOOKKEEPING_GRACE_SECONDS
 )
 # If the outer phase is interrupted, SIGTERM makes the observer helper unwind
@@ -112,6 +115,81 @@ REPORT_NAME = "run-report.json"
 PERF_DATA_NAME = "perf.data"
 TARGET_RECORD_NAME = "target-record.json"
 OBSERVER_READY_NAME = "observer-ready.json"
+TEST_BINARY_ARTIFACT_NAME = "test-binary"
+
+
+def output_bytes(value) -> bytes:
+    if value is None:
+        return b""
+    return value if isinstance(value, bytes) else value.encode(errors="replace")
+
+
+def run_perf_report(perf_data: Path, output_path: Path, mode_args: list[str],
+                    timeout: float = PERF_REPORT_TIMEOUT_SECONDS,
+                    cleanup_grace: float = TERM_GRACE_SECONDS,
+                    popen=subprocess.Popen) -> dict:
+    """Run one owned perf report and retain output, including on timeout."""
+    argv = [
+        "perf", "report", "--stdio", *mode_args, "--max-stack", "32",
+        "--no-inline", "--percent-limit", "0.5", "-i", str(perf_data),
+    ]
+    proc = popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    timed_out = False
+    forced_kill = False
+    cleanup_error = None
+    partial = b""
+    try:
+        final, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        timed_out = True
+        partial = output_bytes(error.output)
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            final, _ = proc.communicate(timeout=cleanup_grace)
+        except subprocess.TimeoutExpired as error:
+            forced_kill = True
+            later = output_bytes(error.output)
+            if len(later) > len(partial):
+                partial = later
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                final, _ = proc.communicate(timeout=cleanup_grace)
+            except subprocess.TimeoutExpired as error:
+                later = output_bytes(error.output)
+                if len(later) > len(partial):
+                    partial = later
+                cleanup_error = "report process did not reap after SIGKILL"
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                try:
+                    proc.wait(timeout=cleanup_grace)
+                except subprocess.TimeoutExpired:
+                    cleanup_error += "; bounded final wait expired"
+                final = b""
+    final_bytes = output_bytes(final)
+    retained = final_bytes if len(final_bytes) >= len(partial) else partial + final_bytes
+    output_path.write_bytes(retained)
+    text = retained.decode(errors="replace")
+    return {
+        "argv": argv,
+        "native_exit": proc.returncode,
+        "has_samples": report_has_samples(text),
+        "timed_out": timed_out,
+        "forced_kill": forced_kill,
+        "output_bytes": len(retained),
+        "cleanup_error": cleanup_error,
+    }
 
 
 def perf_precheck(artifact_dir: Path, *, perf: str | None = None, command=None) -> dict:
@@ -170,7 +248,10 @@ def report_has_samples(text: str) -> bool:
 def profiling_status(test_exit: int, perf_exit: int, timed_out: bool,
                      data_bytes: int, reports: dict) -> dict:
     reports_ok = set(reports) == {"self", "children"} and all(
-        row.get("native_exit") == 0 and row.get("has_samples") is True
+        row.get("native_exit") == 0
+        and row.get("has_samples") is True
+        and not row.get("timed_out", False)
+        and row.get("cleanup_error") is None
         for row in reports.values()
     )
     capture_ok = data_bytes > 0 and perf_exit == 0 and reports_ok
@@ -658,6 +739,19 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
 
     binary_sha = sha256_file(Path(test_binary))
     print(f"test binary sha256={binary_sha}")
+    retained_binary = artifact_dir / TEST_BINARY_ARTIFACT_NAME
+    shutil.copy2(test_binary, retained_binary)
+    retained_sha = sha256_file(retained_binary)
+    if retained_sha != binary_sha:
+        raise SystemExit(
+            f"FAIL: retained test binary hash differs ({binary_sha} -> {retained_sha})"
+        )
+    atomic_json(artifact_dir / "test-binary-custody.json", {
+        "original_path": str(Path(test_binary).resolve()),
+        "retained_path": str(retained_binary.resolve()),
+        "sha256": binary_sha,
+        "bytes": retained_binary.stat().st_size,
+    })
 
     # Record outer netns inode so the inner phase can prove separation.
     outer_netns = os.readlink("/proc/self/ns/net")
@@ -980,23 +1074,11 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
         ("self", ["--no-children"]),
         ("children", ["--children"]),
     ):
-        try:
-            report = run(
-            ["perf", "report", "--stdio", *args, "--percent-limit", "0.5", "-i", str(perf_data)],
-                capture_output=True, text=True, timeout=PERF_REPORT_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            reports[mode] = {"native_exit": None, "has_samples": False, "timed_out": True}
-            (artifact_dir / f"perf-report-{mode}.txt").write_text("report timed out\n")
-            continue
-        (artifact_dir / f"perf-report-{mode}.txt").write_text(
-            report.stdout + report.stderr
+        reports[mode] = run_perf_report(
+            perf_data,
+            artifact_dir / f"perf-report-{mode}.txt",
+            args,
         )
-        reports[mode] = {
-            "native_exit": report.returncode,
-            "has_samples": report_has_samples(report.stdout),
-            "timed_out": False,
-        }
     perf_bytes = perf_data.stat().st_size if perf_data.exists() else 0
     status = profiling_status(native_exit, perf_exit, timed_out, perf_bytes, reports)
     status["perf_forced_kill"] = bool(observer_result.get("forced_kill", False))
@@ -1085,6 +1167,68 @@ def self_test() -> int:
             tmp, perf="perf", command=lambda cmd, **_k: PerfResult(0) if "version" in cmd else PerfResult(13)
         )
         failures += denied.get("ok", True)
+
+        seen_report_argv = []
+
+        def report_process(code: str):
+            def launch(argv, **kwargs):
+                seen_report_argv.append(argv)
+                return subprocess.Popen([sys.executable, "-c", code], **kwargs)
+            return launch
+
+        successful = run_perf_report(
+            tmp / "perf.data",
+            tmp / "report-success.txt",
+            ["--no-children"],
+            timeout=1,
+            popen=report_process("print(' 91.00% command symbol', flush=True)"),
+        )
+        failures += successful["native_exit"] != 0 or not successful["has_samples"]
+        failures += successful["timed_out"]
+        failures += not all(
+            token in seen_report_argv[-1]
+            for token in ("--max-stack", "32", "--no-inline", "--percent-limit", "0.5")
+        )
+
+        failed = run_perf_report(
+            tmp / "perf.data",
+            tmp / "report-failed.txt",
+            ["--children"],
+            timeout=1,
+            popen=report_process("import sys; print('report failed'); sys.exit(7)"),
+        )
+        failures += failed["native_exit"] != 7 or failed["timed_out"]
+
+        timed = run_perf_report(
+            tmp / "perf.data",
+            tmp / "report-timeout.txt",
+            ["--children"],
+            timeout=0.05,
+            cleanup_grace=0.05,
+            popen=report_process(
+                "import time; print('partial report evidence', flush=True); time.sleep(10)"
+            ),
+        )
+        failures += not timed["timed_out"] or timed["native_exit"] is None
+        failures += b"partial report evidence" not in (tmp / "report-timeout.txt").read_bytes()
+
+        forced = run_perf_report(
+            tmp / "perf.data",
+            tmp / "report-forced-kill.txt",
+            ["--children"],
+            timeout=0.05,
+            cleanup_grace=0.05,
+            popen=report_process(
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('forced partial evidence', flush=True); time.sleep(10)"
+            ),
+        )
+        failures += not forced["timed_out"] or not forced["forced_kill"]
+        failures += forced["native_exit"] != -int(signal.SIGKILL)
+        failures += forced["cleanup_error"] is not None
+        failures += b"forced partial evidence" not in (
+            tmp / "report-forced-kill.txt"
+        ).read_bytes()
     good_reports = {
         "self": {"native_exit": 0, "has_samples": True},
         "children": {"native_exit": 0, "has_samples": True},
@@ -1098,6 +1242,22 @@ def self_test() -> int:
         "children": {"native_exit": 0, "has_samples": True},
     }
     failures += profiling_status(0, 0, False, 100, failed_report)["capture_ok"]
+    timed_out_report = {
+        "self": {"native_exit": 0, "has_samples": True, "timed_out": True},
+        "children": {"native_exit": 0, "has_samples": True},
+    }
+    failures += profiling_status(0, 0, False, 100, timed_out_report)["capture_ok"]
+    cleanup_failed_report = {
+        "self": {
+            "native_exit": 0,
+            "has_samples": True,
+            "cleanup_error": "bounded final wait expired",
+        },
+        "children": {"native_exit": 0, "has_samples": True},
+    }
+    failures += profiling_status(
+        0, 0, False, 100, cleanup_failed_report
+    )["capture_ok"]
     empty_reports = {
         "self": {"native_exit": 0, "has_samples": False},
         "children": {"native_exit": 0, "has_samples": False},

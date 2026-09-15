@@ -2,7 +2,8 @@ name: 703 Caller-and-Adapter Optimized Test Profile 100k Diagnostic
 
 # Diagnostic-only workflow on the #703 test-signing-profile branch.
 # Manual dispatch only — no push/PR triggers, no release/build matrix,
-# no uploads other than the test proof/logs. This replaces the default
+# uploads only the test proof/logs and the exact profiled ELF needed to
+# resolve the retained perf capture. This replaces the default
 # build.yml ONLY on this dedicated branch; default branch is untouched.
 # Unlike the earlier release-mode diagnostic, this keeps the plain cargo
 # test command (no --release) while fips204, its concrete saorsa-pqc and
@@ -65,4 +66,6 @@ jobs:
             ${{ runner.temp }}/703-artifacts/perf-report-self.txt
             ${{ runner.temp }}/703-artifacts/perf-report-children.txt
             ${{ runner.temp }}/703-artifacts/perf-observer.log
+            ${{ runner.temp }}/703-artifacts/test-binary
+            ${{ runner.temp }}/703-artifacts/test-binary-custody.json
           if-no-files-found: warn
