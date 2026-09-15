@@ -37,6 +37,11 @@ jobs:
         with:
           toolchain: 1.95.0
 
+      - name: Install Linux perf tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes linux-tools-common linux-tools-generic
+
       - name: Verify tree and run exact 100k test with caller-and-adapter optimized profile
         run: |
           python3 scripts/ci/run-703-optimized.py \
@@ -55,4 +60,9 @@ jobs:
             ${{ runner.temp }}/703-artifacts/test.log
             ${{ runner.temp }}/703-artifacts/build-messages.json
             ${{ runner.temp }}/703-artifacts/build-stderr.log
+            ${{ runner.temp }}/703-artifacts/perf-precheck.json
+            ${{ runner.temp }}/703-artifacts/perf.data
+            ${{ runner.temp }}/703-artifacts/perf-report-self.txt
+            ${{ runner.temp }}/703-artifacts/perf-report-children.txt
+            ${{ runner.temp }}/703-artifacts/perf-observer.log
           if-no-files-found: warn

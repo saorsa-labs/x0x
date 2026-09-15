@@ -39,6 +39,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import signal
 import shutil
 import shlex
 import subprocess
@@ -85,6 +87,94 @@ TERM_GRACE_SECONDS = 10
 INNER_FLAG_ENV = "X0X_703_INNER"
 INNER_RESULT_NAME = "inner-result.json"
 REPORT_NAME = "run-report.json"
+PERF_DATA_NAME = "perf.data"
+
+
+def perf_precheck(artifact_dir: Path, *, perf: str | None = None, command=None) -> dict:
+    """Prove unprivileged sampling works before paying the build cost."""
+    command = run if command is None else command
+    executable = perf if perf is not None else shutil.which("perf")
+    evidence = {"executable": executable, "ok": False}
+    if executable is None:
+        evidence["reason"] = "perf executable unavailable"
+        return evidence
+    try:
+        version = command(
+            [executable, "version"], capture_output=True, text=True, timeout=10
+        )
+    except subprocess.TimeoutExpired:
+        evidence["reason"] = "perf version precheck timed out"
+        return evidence
+    probe = artifact_dir / "perf-precheck.data"
+    try:
+        capture = command(
+            [executable, "record", "-q", "-o", str(probe), "--", "/bin/true"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        evidence["reason"] = "perf capture precheck timed out"
+        return evidence
+    evidence.update({
+        "version_exit": version.returncode,
+        "version_stdout": version.stdout,
+        "version_stderr": version.stderr,
+        "capture_exit": capture.returncode,
+        "capture_stdout": capture.stdout,
+        "capture_stderr": capture.stderr,
+        "capture_bytes": probe.stat().st_size if probe.exists() else 0,
+    })
+    evidence["ok"] = (
+        version.returncode == 0
+        and capture.returncode == 0
+        and evidence["capture_bytes"] > 0
+    )
+    if not evidence["ok"]:
+        evidence["reason"] = "unprivileged perf capture unavailable"
+    return evidence
+
+
+def report_has_samples(text: str) -> bool:
+    for line in text.splitlines():
+        match = re.match(r"^\s*(\d+(?:\.\d+)?)%", line)
+        if match is not None and float(match.group(1)) > 0:
+            return True
+    return False
+
+
+def profiling_status(test_exit: int, perf_exit: int, timed_out: bool,
+                     data_bytes: int, reports: dict) -> dict:
+    reports_ok = set(reports) == {"self", "children"} and all(
+        row.get("native_exit") == 0 and row.get("has_samples") is True
+        for row in reports.values()
+    )
+    capture_ok = data_bytes > 0 and perf_exit == 0 and reports_ok
+    return {
+        "capture_ok": capture_ok,
+        "test_ok": test_exit == 0 and not timed_out,
+        "timed_out": timed_out,
+        "test_native_exit": test_exit,
+        "perf_capture_exit": perf_exit,
+        "data_bytes": data_bytes,
+        "reports_ok": reports_ok,
+    }
+
+
+def stop_owned_group(proc: subprocess.Popen, first_signal: signal.Signals,
+                     grace: int = TERM_GRACE_SECONDS) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, first_signal)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
 
 
 def sha256_file(path: Path) -> str:
@@ -398,6 +488,13 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
     print(f"source blob {SOURCE_PATH} sha256={source_sha}")
     print("Cargo.toml delta verified: exact fips204/saorsa-pqc/ant-quic/x0x opt-level=3 blocks")
 
+    perf_evidence = perf_precheck(artifact_dir)
+    (artifact_dir / "perf-precheck.json").write_text(
+        json.dumps(perf_evidence, indent=2) + "\n"
+    )
+    if not perf_evidence["ok"]:
+        raise SystemExit("FAIL: unprivileged perf precheck failed before build")
+
     # Fresh lock: the prior run retained no lock custody.
     lock = repo / "Cargo.lock"
     if run(["cargo", "generate-lockfile"], cwd=repo).returncode != 0:
@@ -486,6 +583,7 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
         "cargo_lock_sha256": lock_sha,
         "cargo_profile_delta": EXPECTED_CARGO_ADDITIONS,
         "profile_evidence": profile_evidence,
+        "perf_precheck": perf_evidence,
         "test_binary_sha256": binary_sha,
         "inner": inner,
     }
@@ -545,34 +643,76 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
     for var in ("X0X_SLOW_SUBSCRIBER_MESSAGES",):
         env.pop(var, None)
 
+    perf = shutil.which("perf")
+    if perf is None:
+        raise SystemExit("FAIL: perf disappeared after successful outer precheck")
     cmd = [test_binary, "--exact", SELECTOR, "--ignored", "--nocapture",
            "--test-threads=1"]
     print(f"executing ({PROFILE_LABEL}): {' '.join(cmd)}")
     started = time.monotonic()
     timed_out = False
-    with test_log.open("wb") as log_fh:
-        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env)
+    perf_log = artifact_dir / "perf-observer.log"
+    perf_data = artifact_dir / PERF_DATA_NAME
+    with test_log.open("wb") as log_fh, perf_log.open("wb") as perf_fh:
+        proc = subprocess.Popen(
+            cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True
+        )
+        observer = None
+        elapsed = None
         try:
-            proc.communicate(timeout=OUTER_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            print(f"outer bound {OUTER_TIMEOUT_SECONDS}s reached; sending TERM")
-            proc.terminate()
+            observer = subprocess.Popen(
+                [perf, "record", "-F", "99", "--call-graph", "dwarf", "-o",
+                 str(perf_data), "-p", str(proc.pid)],
+                stdout=perf_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True,
+            )
             try:
-                proc.wait(timeout=TERM_GRACE_SECONDS)
+                proc.communicate(timeout=OUTER_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
-                print("TERM grace expired; sending KILL")
-                proc.kill()
-                proc.wait()
-    elapsed = round(time.monotonic() - started, 4)
+                timed_out = True
+                print(f"outer bound {OUTER_TIMEOUT_SECONDS}s reached; sending TERM")
+                stop_owned_group(proc, signal.SIGTERM)
+            elapsed = round(time.monotonic() - started, 4)
+        finally:
+            stop_owned_group(proc, signal.SIGTERM)
+            if elapsed is None:
+                elapsed = round(time.monotonic() - started, 4)
+            if observer is not None:
+                stop_owned_group(observer, signal.SIGINT)
     native_exit = proc.returncode
+    if observer is None:
+        raise RuntimeError("perf observer did not start")
+    perf_exit = observer.returncode
+    reports = {}
+    for mode, args in (
+        ("self", ["--no-children"]),
+        ("children", ["--children"]),
+    ):
+        try:
+            report = run(
+                [perf, "report", "--stdio", *args, "--percent-limit", "0.5", "-i", str(perf_data)],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            reports[mode] = {"native_exit": None, "has_samples": False, "timed_out": True}
+            (artifact_dir / f"perf-report-{mode}.txt").write_text("report timed out\n")
+            continue
+        (artifact_dir / f"perf-report-{mode}.txt").write_text(
+            report.stdout + report.stderr
+        )
+        reports[mode] = {
+            "native_exit": report.returncode,
+            "has_samples": report_has_samples(report.stdout),
+            "timed_out": False,
+        }
+    perf_bytes = perf_data.stat().st_size if perf_data.exists() else 0
+    status = profiling_status(native_exit, perf_exit, timed_out, perf_bytes, reports)
     print(f"native exit={native_exit} elapsed={elapsed}s timed_out={timed_out}")
 
     log_text = test_log.read_text(errors="replace")
     passed, failed = parse_libtest_summary(log_text)
     proof_notes: list[str] = []
     proof_sha = None
-    ok = (not timed_out) and native_exit == 0 and passed == 1 and failed == 0
+    ok = status["capture_ok"] and status["test_ok"] and passed == 1 and failed == 0
     if proof_path.exists():
         proof_sha = sha256_file(proof_path)
         proof_ok, proof_notes = verify_proof(json.loads(proof_path.read_text()))
@@ -589,6 +729,9 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
         "ok": ok,
         "timed_out": timed_out,
         "native_exit": native_exit,
+        "profiling_status": status,
+        "perf_capture_bytes": perf_bytes,
+        "perf_reports": reports,
         "elapsed_seconds": elapsed,
         "outer_timeout_seconds": OUTER_TIMEOUT_SECONDS,
         "tests_passed": passed,
@@ -606,6 +749,38 @@ def inner_phase(test_binary: str, artifact_dir: Path) -> int:
 
 def self_test() -> int:
     failures = 0
+
+    class PerfResult:
+        def __init__(self, code: int, stdout: str = "", stderr: str = ""):
+            self.returncode = code
+            self.stdout = stdout
+            self.stderr = stderr
+
+    with __import__("tempfile").TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        missing = perf_precheck(tmp, perf=None, command=lambda *_a, **_k: PerfResult(1))
+        failures += missing.get("ok", True)
+        denied = perf_precheck(
+            tmp, perf="perf", command=lambda cmd, **_k: PerfResult(0) if "version" in cmd else PerfResult(13)
+        )
+        failures += denied.get("ok", True)
+    good_reports = {
+        "self": {"native_exit": 0, "has_samples": True},
+        "children": {"native_exit": 0, "has_samples": True},
+    }
+    failures += not profiling_status(0, 0, False, 100, good_reports)["capture_ok"]
+    failures += profiling_status(7, 0, False, 100, good_reports)["test_ok"]
+    failures += profiling_status(-15, 0, True, 100, good_reports)["test_ok"]
+    failures += profiling_status(0, 9, False, 100, good_reports)["capture_ok"]
+    failed_report = {
+        "self": {"native_exit": 1, "has_samples": False},
+        "children": {"native_exit": 0, "has_samples": True},
+    }
+    failures += profiling_status(0, 0, False, 100, failed_report)["capture_ok"]
+    failures += profiling_status(0, 0, False, 0, good_reports)["capture_ok"]
+    failures += not report_has_samples("  91.23% command symbol\n")
+    failures += report_has_samples("   0.00% command symbol\n")
+    failures += report_has_samples("# no samples\n")
 
     # Exact source-custody delta rejects missing and additional files.
     expected_delta = {"Cargo.toml", ".github/workflows/build.yml",
