@@ -1,134 +1,57 @@
-name: Build
+name: 703 Default Test Profile 100k Diagnostic
+
+# Diagnostic-only workflow on the #703 test-signing-profile branch.
+# Manual dispatch only — no push/PR triggers, no release/build matrix,
+# no uploads other than the test proof/logs. This replaces the default
+# build.yml ONLY on this dedicated branch; default branch is untouched.
+# Unlike the earlier release-mode diagnostic, this runs the exact test
+# under the DEFAULT cargo test profile (no --release); the only profile
+# delta vs base is [profile.test.package.fips204] opt-level=3.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  validate-release-metadata:
-    name: Validate release metadata
+  run-703-default-test-profile-100k:
+    name: Exact 100k test, default test profile, loopback netns
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Test release metadata validation
-        run: python3 .github/scripts/test_release_metadata.py
+      # No cargo cache restore: fresh HOME/caches on the ephemeral runner,
+      # matching the plan's fresh-cache requirement.
 
-      - name: Validate release metadata (pull request)
-        if: github.event_name == 'pull_request'
-        run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode pull_request \
-            --base-sha "${{ github.event.pull_request.base.sha }}"
-
-      - name: Validate release metadata (push or dispatch)
-        if: github.event_name != 'pull_request'
-        run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode push_main
-
-  build-matrix:
-    name: Build ${{ matrix.platform }}
-    needs: validate-release-metadata
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux x86_64 GNU
-          - platform: linux-x64-gnu
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cross: false
-
-          # Linux x86_64 musl (static linking)
-          - platform: linux-x64-musl
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cross: true
-
-          # Linux ARM64
-          - platform: linux-arm64-gnu
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            cross: true
-
-          # macOS x86_64 (cross-compiled on Apple Silicon)
-          - platform: macos-x64
-            os: macos-14
-            target: x86_64-apple-darwin
-            cross: false
-
-          # macOS ARM64 (Apple Silicon)
-          - platform: macos-arm64
-            os: macos-14
-            target: aarch64-apple-darwin
-            cross: false
-
-          # Windows x86_64
-          - platform: windows-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust stable
+      - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          toolchain: 1.95.0
 
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-registry-
+      - name: Verify tree and run exact 100k test in default test profile in loopback netns
+        run: |
+          python3 scripts/ci/run-703-optimized.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --artifact-dir "$RUNNER_TEMP/703-artifacts"
 
-      - name: Cache cargo index
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-git-
-
-      - name: Cache target directory
-        uses: actions/cache@v5
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-target-
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Upload artifacts
+      - name: Upload proof and logs
+        if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: x0x-${{ matrix.platform }}
+          name: 703-default-test-profile-proof
           path: |
-            target/${{ matrix.target }}/release/x0x*
-            !target/${{ matrix.target }}/release/*.d
-            !target/${{ matrix.target }}/release/*.pdb
-          if-no-files-found: error
+            ${{ runner.temp }}/703-artifacts/run-report.json
+            ${{ runner.temp }}/703-artifacts/inner-result.json
+            ${{ runner.temp }}/703-artifacts/proof.json
+            ${{ runner.temp }}/703-artifacts/test.log
+            ${{ runner.temp }}/703-artifacts/build-messages.json
+            ${{ runner.temp }}/703-artifacts/build-stderr.log
+          if-no-files-found: warn
