@@ -194,9 +194,12 @@ members = [
 ]
 
 # #703: caller-and-adapter optimized test profile (experiment). Optimize the
-# concrete ML-DSA adapter path (fips204, saorsa-pqc, ant-quic) plus the x0x
-# test target itself; the workspace-wide dev/test profiles and every release
-# profile stay untouched.
+# sampled Keccak primitive, concrete ML-DSA adapter path (fips204, saorsa-pqc,
+# ant-quic), and x0x test target itself; workspace-wide dev/test profiles and
+# every release profile stay untouched.
+[profile.test.package.keccak]
+opt-level = 3
+
 [profile.test.package.fips204]
 opt-level = 3
 

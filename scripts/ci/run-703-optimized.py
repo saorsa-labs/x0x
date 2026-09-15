@@ -10,11 +10,11 @@ network namespace, with the original 100_000 message count and all
 original assertions unchanged.
 
 The only manifest delta vs the base tree is package-specific opt-level 3
-for fips204, its concrete saorsa-pqc and ant-quic signing adapters, and
-the x0x test target itself (authorized upper control), which this script
+for the sampled keccak primitive, fips204, its concrete saorsa-pqc and
+ant-quic signing adapters, and the x0x test target itself (authorized upper control), which this script
 verifies exactly (no arbitrary Cargo.toml edits), and it retains the full
-verbose rustc invocations so the profile proof — all three signing-path
-crates plus the single x0x `--test` invocation compiled with
+verbose rustc invocations so the profile proof — keccak, all three signing-path
+crates, plus the single x0x `--test` invocation compiled with
 -C opt-level=3 — can be verified from the artifacts.
 
 Phases:
@@ -58,14 +58,17 @@ EXPECTED_MESSAGES = 100_000
 
 PROFILE_LABEL = "caller-and-adapter-optimized-test-profile"
 
-# The ONLY permitted Cargo.toml change vs base: four package-specific
-# overrides (three signing-path adapters plus the x0x test target as
+# The ONLY permitted Cargo.toml change vs base: five package-specific
+# overrides (the sampled primitive, three signing-path adapters, and the x0x test target as
 # authorized upper control), added exactly as prescribed (no removals).
 EXPECTED_CARGO_ADDITIONS = [
     "# #703: caller-and-adapter optimized test profile (experiment). Optimize the",
-    "# concrete ML-DSA adapter path (fips204, saorsa-pqc, ant-quic) plus the x0x",
-    "# test target itself; the workspace-wide dev/test profiles and every release",
-    "# profile stay untouched.",
+    "# sampled Keccak primitive, concrete ML-DSA adapter path (fips204, saorsa-pqc,",
+    "# ant-quic), and x0x test target itself; workspace-wide dev/test profiles and",
+    "# every release profile stay untouched.",
+    "[profile.test.package.keccak]",
+    "opt-level = 3",
+    "",
     "[profile.test.package.fips204]",
     "opt-level = 3",
     "",
@@ -419,7 +422,7 @@ def validate_cargo_delta(diff_text: str) -> None:
     if added != EXPECTED_CARGO_ADDITIONS:
         raise ValueError(
             "Cargo.toml delta is not the exact prescribed "
-            "four package-specific blocks (three adapters + x0x upper control); "
+            "five package-specific blocks (keccak + three adapters + x0x upper control); "
             f"added={added!r}")
 
 
@@ -439,7 +442,7 @@ def extract_rustc_invocations(build_stderr_text: str) -> list[str]:
 def extract_profile_evidence(build_stderr_text: str) -> dict:
     """Verify and record the caller-and-adapter optimized test-profile proof.
 
-    Fails closed unless fips204, saorsa-pqc, and ant-quic invocations carry
+    Fails closed unless keccak, fips204, saorsa-pqc, and ant-quic invocations carry
     -C opt-level=3, and the single x0x `--test` invocation is also compiled
     at -C opt-level=3 (authorized upper control via
     [profile.test.package.x0x]).
@@ -452,7 +455,7 @@ def extract_profile_evidence(build_stderr_text: str) -> dict:
                 return tokens[i + 1]
         return None
 
-    optimized_crates = ("fips204", "saorsa_pqc", "ant_quic")
+    optimized_crates = ("keccak", "fips204", "saorsa_pqc", "ant_quic")
     optimized = {
         name: [c for c in invocations if crate_name(c) == name]
         for name in optimized_crates
@@ -680,7 +683,7 @@ def outer_phase(repo: Path, artifact_dir: Path) -> int:
             f"FAIL: {SOURCE_PATH} custody differs (worktree={source_sha}, base={base_source_sha})")
     print(f"base/source verified: HEAD={head} tree={tree} branch={branch} changes={sorted(changed)}")
     print(f"source blob {SOURCE_PATH} sha256={source_sha}")
-    print("Cargo.toml delta verified: exact fips204/saorsa-pqc/ant-quic/x0x opt-level=3 blocks")
+    print("Cargo.toml delta verified: exact keccak/fips204/saorsa-pqc/ant-quic/x0x opt-level=3 blocks")
 
     perf_evidence = perf_precheck(artifact_dir)
     (artifact_dir / "perf-precheck.json").write_text(
@@ -1326,7 +1329,7 @@ def self_test() -> int:
     optimized_cmds = [
         f"rustc --crate-name {name} --crate-type lib --edition 2021 "
         "-C opt-level=3 -C embed-bitcode=no src/lib.rs"
-        for name in ("fips204", "saorsa_pqc", "ant_quic")
+        for name in ("keccak", "fips204", "saorsa_pqc", "ant_quic")
     ]
     test_cmd = ("rustc --crate-name x0x --crate-type lib --test --edition 2021 "
                 "-C opt-level=3 src/lib.rs")
@@ -1353,6 +1356,11 @@ def self_test() -> int:
             line for line in stderr_good.splitlines() if "--crate-name x0x " not in line) + "\n"),
         ("no fips invocation", "\n".join(
             line for line in stderr_good.splitlines() if "--crate-name fips204 " not in line)),
+        ("no keccak invocation", "\n".join(
+            line for line in stderr_good.splitlines() if "--crate-name keccak " not in line)),
+        ("keccak not optimized", stderr_good.replace(
+            "--crate-name keccak --crate-type lib --edition 2021 -C opt-level=3",
+            "--crate-name keccak --crate-type lib --edition 2021 -C opt-level=0")),
         ("crate-name prefix collision", stderr_good.replace(
             "--crate-name fips204 ", "--crate-name fips204_other ")),
     ):
