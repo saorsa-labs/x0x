@@ -169,7 +169,7 @@ Census base: current tree, tip `252c3fb`. "Gated" means the path consults
 | 22 | Ratchet / persist lifecycle epoch re-check | **does not exist** (`lifecycle_epoch`/`epoch_token`/`LifecycleEpoch`: 0 hits in `src/`) | **No** | **Introduce** (§4) |
 | 23 | File transfer | `files.rs` — no `named_groups` reference at all | **No** | **Out of scope** — the DM-plane protocol of ADR 0055 is not group-state bound; recorded so the enumeration is complete, not to be gated |
 | 24 | Inbound metadata / state-commit apply | `named_groups.rs:8922` | **No, deliberately** | **Keep ungated** — the anchored clearing commit must be able to arrive (`named_groups.rs:19904`) |
-| 25 | WebSocket fan-out — ADR-0040 `Mention` events for validated group messages and delegation grants on the group topic channel, plus ADR-0023 stored-history backfill on `Subscribe` | `ws.rs:217` (`ws_handler`), event shape `:116`–`:123`, backfill `:145`–`:163` and `:527`; `grep -c quarantin src/server/ws.rs` → **0** | **No** | **Annotate** (§3e) — the live mirror of rows 13 and 16, and it must not be refused for the same forensic reason |
+| 25 | WebSocket fan-out — ADR-0040 `Mention` events for validated group messages and delegation grants on the group topic channel, plus ADR-0023 stored-history backfill on `Subscribe` | `ws.rs:217` (`ws_handler`), event shape `:116`–`:123`, backfill `:145`–`:163` and `:527`; `grep -c quarantin src/server/ws.rs` → **0** | **No** | **Annotate** (§3d) — the live mirror of rows 13 and 16, and it must not be refused for the same forensic reason |
 | 26 | History diagnostics | `history.rs:488` | **No** | **Annotate** (§3a) |
 
 **Counts.** 26 enumerated paths: **12 gated** today (1–12), **13 ungated**
@@ -195,7 +195,7 @@ not a group-scoped send, and is therefore **not** part of this row; it is
 covered by row 1 only when a client routes through `POST /groups/:id/send`.
 
 **The count that matters.** For **ordinary (non-owner-axis) groups the gated
-count is 0 of 24**, because `named_groups.rs:3733` prevents the marker from
+count is 0 of 26**, because `named_groups.rs:3733` prevents the marker from
 ever being set. Gates 1–12 are unreachable for that population. This is the
 single largest finding of the census and is what Decision §2 repairs.
 
