@@ -2593,6 +2593,7 @@ fn generator_returns_preserve_order_override_and_unavailable() {
             Some(FanoutCounts {
                 attempted: 2,
                 succeeded: 1,
+                ..Default::default()
             }),
         ),
         (0, None),
@@ -2619,7 +2620,8 @@ fn generator_load_interpretation_rejects_incoherent_or_partial_records() {
             7,
             Some(FanoutCounts {
                 attempted: 2,
-                succeeded: 1
+                succeeded: 1,
+                ..Default::default()
             })
         );
         200
@@ -2718,7 +2720,8 @@ fn generator_ancillary_attachment_is_bounded_and_ignores_cut_totals() {
             u32::MAX,
             Some(FanoutCounts {
                 attempted: usize::MAX,
-                succeeded: usize::MAX
+                succeeded: usize::MAX,
+                ..Default::default()
             })
         );
         200
@@ -2738,7 +2741,8 @@ fn generator_ancillary_attachment_is_bounded_and_ignores_cut_totals() {
             2,
             Some(FanoutCounts {
                 attempted: 2,
-                succeeded: 0
+                succeeded: 0,
+                ..Default::default()
             })
         );
         200

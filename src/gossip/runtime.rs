@@ -942,7 +942,7 @@ impl GossipRuntime {
             config.resolved_participation(),
             config.resolved_participation_reason().to_string(),
         )?;
-        pubsub.configure_egress(&config).await;
+        pubsub.configure_egress(&config).await?;
         let pubsub = Arc::new(pubsub);
         let dispatch_workers = config.dispatch_workers;
 

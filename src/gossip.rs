@@ -11,7 +11,7 @@ pub(crate) mod relay_fanout;
 pub mod runtime;
 pub(crate) mod wire;
 
-pub use config::GossipConfig;
+pub use config::{GossipConfig, LeafBytePolicy};
 pub use participation::{
     classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, resolve_participation,
     ParticipationInputs, ParticipationMode, ParticipationSelection, ParticipationSnapshot,
