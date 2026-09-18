@@ -270,9 +270,17 @@ when `resolved_participation() == Leaf`. Full ignores them.
 leaf_max_eager_degree = 2
 
 # Rolling 60s epidemic (subscribed-topic) outbound. 0 = disabled.
-# Slice 1: both thresholds observe-only. Later: metered fail-soft shed (§4.3).
+# Both thresholds are a meter. Shedding is a separate opt-in (§4.3).
 leaf_egress_soft_bytes_per_sec = 65536
 leaf_egress_hard_bytes_per_sec = 131072
+
+# Token-bucket capacity. Must hold one maximum frame; too small and the WHOLE
+# budget group (degree, soft, hard, burst) normalizes to defaults + a warning.
+leaf_egress_burst_bytes = 4194304
+
+# Slice 2: "observe_only" (default) | "shed_normal". Leaf-only; a Full/relay
+# node ignores it with a warning and keeps starting.
+byte_policy = "observe_only"
 ```
 
 Prefer Full/bootstrap peers at the front of the truncated list. The helper
@@ -285,7 +293,42 @@ membership change with a compat trade-off; keep it on its own PR.
 
 ### 4.3 Fail-soft behaviour
 
-**Slice 1 is fan-out-first; both byte thresholds are observe-only.** Count
+**Slice 2 status (x0x consumer side): `byte_policy` shipped, default
+`observe_only`.** The threshold and the authority to act on it are now two
+separate settings. A non-zero `leaf_egress_hard_bytes_per_sec` turns the
+budget on as a *meter* only; `byte_policy = "shed_normal"` is what authorizes
+saorsa-gossip to deny a send, and it is honoured only on a resolved **Leaf**.
+Full/relay nodes are handed no budget at all, so they cannot shed whatever
+their TOML says — a pass-through forwarder must not black-hole the plane it
+exists to serve. A `shed_normal` request on a Full node is ignored with a
+warning rather than fatal, because participation is resolved at runtime
+(dual listen, seed address, managed binary) and a node that becomes Full on
+its own must keep starting.
+
+Under `shed_normal`, saorsa-gossip never sheds Critical-class topics (DM
+inbox, control plane), locally originated publishes, own-inbox delivery or
+targeted sends. `leaf_egress.shed_suppressed` in `GET /diagnostics/gossip`
+counts sends the budget *would* have denied but policy protected — under the
+default that is the only signal an observe-only budget is being exceeded at
+all. It is a lower bound, not a shed-count forecast (it does not model the
+recovery waiter/intent refusals or the relay soft bucket).
+
+**Known cost of turning the meter on by default.** saorsa-gossip takes its
+egress-limiter lock and records per-topic / per-purpose counters on every
+serialized send, including under `observe_only`. No send is deferred or
+reordered (sg keys those branches on `enforcing()`, not `enabled()`), but the
+accounting is new per-send work on a fleet already CPU-bound on ML-DSA
+verification (#656). It has not been profiled. Treat any post-upgrade fleet
+CPU delta as a candidate cause, and record daemon uptime with every baseline —
+cumulative counters are integrals, and a self-update restarts the clock.
+
+**Still held:** the sustained-cap claim and #504 acceptance. Nothing here has
+been re-measured in the field; `shed_normal` has no field acceptance and
+should not be enabled on the fleet until an external tester re-captures §5.
+A #501 capture taken under `shed_normal` is not comparable to any earlier
+baseline.
+
+Slice 1 was fan-out-first with both byte thresholds observe-only. Count
 `egress_budget_soft_exceeded` / `egress_budget_hard_exceeded` and rate-limit
 warnings with topic hex, name, priority, origin, and bytes/s. No byte shedding
 is authorized by this slice.
@@ -663,7 +706,7 @@ with comparable peers/workload and recovery evidence, distinct from C0.
 
 | slice | what | depends on |
 |---|---|---|
-| 2 | Fail-soft byte shedding, including explicit Critical/Normal forwarding policy if needed | named capture + per-topic/origin/priority meters + delivery/recovery gates |
+| 2 | Fail-soft byte shedding, including explicit Critical/Normal forwarding policy if needed. **x0x consumer side implemented** (`byte_policy`, default `observe_only`, Leaf-only); field acceptance still held | named capture + per-topic/origin/priority meters + delivery/recovery gates |
 | 3 | Consume-only / no-forward for global announce on Leaf | sg API or a carefully metered x0x fork; evidence that announce (not the bus) is the top row |
 | 4 | #501 `skip_legacy_dm_bus` default-on-Leaf decision | #501 PR + the same capture |
 | 5 | ~~Honest HyParView mapping **or** delete dead knobs~~ **DONE**: `active_view_size` / `passive_view_size` / `arwl` / `prwl` deleted; parsed-and-warned only, so deployed TOML keeps loading | independent cleanup; does not close #504 |

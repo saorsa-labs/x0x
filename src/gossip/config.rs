@@ -3,6 +3,37 @@
 use super::participation::ParticipationMode;
 use serde::{Deserialize, Serialize};
 
+/// What an exhausted Leaf egress budget is allowed to *do*.
+///
+/// TOML: `[gossip] byte_policy`. Shedding is opt-in because dropping gossip
+/// is a behaviour change that must be attributable to a deliberate operator
+/// decision, never to the side effect of setting a non-zero byte rate
+/// (#504 slice 2). A non-zero `leaf_egress_hard_bytes_per_sec` is a meter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeafBytePolicy {
+    /// Account and meter every send, but deny none. The default.
+    #[default]
+    ObserveOnly,
+    /// Shed *forwarded* Normal/Bulk traffic once a Leaf budget is exhausted.
+    ///
+    /// saorsa-gossip never sheds Critical-class topics (DM inbox, control
+    /// plane), locally originated publishes, own-inbox delivery or targeted
+    /// sends, whatever this is set to.
+    ShedNormal,
+}
+
+impl LeafBytePolicy {
+    /// The TOML / diagnostics spelling of this policy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObserveOnly => "observe_only",
+            Self::ShedNormal => "shed_normal",
+        }
+    }
+}
+
 /// Configuration for the gossip overlay network.
 ///
 /// These parameters control x0x's Leaf egress budget, participation mode and
@@ -56,9 +87,21 @@ pub struct GossipConfig {
     #[serde(default = "default_leaf_egress_soft")]
     pub leaf_egress_soft_bytes_per_sec: u64,
 
-    /// Observe-only hard threshold; slice 1 never sheds bytes.
+    /// Sustained hard threshold. A non-zero value turns the budget on as a
+    /// **meter**; it never by itself sheds bytes. See [`Self::byte_policy`].
     #[serde(default = "default_leaf_egress_hard")]
     pub leaf_egress_hard_bytes_per_sec: u64,
+
+    /// Leaf serialized-byte bucket capacity. Must hold one maximum frame,
+    /// otherwise saorsa-gossip refuses the budget outright.
+    #[serde(default = "default_leaf_egress_burst")]
+    pub leaf_egress_burst_bytes: u64,
+
+    /// #504 slice 2: what an exhausted budget is allowed to *do*.
+    ///
+    /// Opt-in, and only on a Leaf — see [`LeafBytePolicy`].
+    #[serde(default)]
+    pub byte_policy: LeafBytePolicy,
 
     /// #674 C3: per-topic budget for *eager* re-forwarding of relayed
     /// messages on topics this node subscribes to. Within budget, verdicts
@@ -113,6 +156,9 @@ const fn default_leaf_egress_soft() -> u64 {
 const fn default_leaf_egress_hard() -> u64 {
     131_072
 }
+const fn default_leaf_egress_burst() -> u64 {
+    4 * 1024 * 1024
+}
 pub(crate) const fn default_relay_fanout_budget() -> u64 {
     default_relay_fanout_budget_msgs_per_sec()
 }
@@ -131,6 +177,8 @@ impl Default for GossipConfig {
             leaf_max_eager_degree: default_leaf_max_eager_degree(),
             leaf_egress_soft_bytes_per_sec: default_leaf_egress_soft(),
             leaf_egress_hard_bytes_per_sec: default_leaf_egress_hard(),
+            leaf_egress_burst_bytes: default_leaf_egress_burst(),
+            byte_policy: LeafBytePolicy::ObserveOnly,
             relay_fanout_budget_msgs_per_sec: default_relay_fanout_budget_msgs_per_sec(),
             relay: false,
             participation: ParticipationMode::Leaf,
@@ -177,6 +225,19 @@ impl GossipConfig {
         {
             return Err("leaf egress hard threshold must be >= soft (or 0 to disable)".into());
         }
+        // #504 slice 2: saorsa-gossip refuses a budget whose burst cannot hold
+        // one maximum frame, and a refused budget means *no* accounting at
+        // all. Normalizing here (rather than failing startup) keeps the same
+        // promise the other budget typos make: a bad byte knob must never
+        // restart-loop a live daemon.
+        if self.leaf_egress_hard_bytes_per_sec != 0
+            && self.leaf_egress_burst_bytes < super::pubsub::MAX_LEAF_GOSSIP_FRAME_BYTES as u64
+        {
+            return Err(format!(
+                "leaf_egress_burst_bytes must be at least {} bytes (one maximum frame)",
+                super::pubsub::MAX_LEAF_GOSSIP_FRAME_BYTES
+            ));
+        }
         Ok(())
     }
 
@@ -186,6 +247,7 @@ impl GossipConfig {
         self.leaf_max_eager_degree = default_leaf_max_eager_degree();
         self.leaf_egress_soft_bytes_per_sec = default_leaf_egress_soft();
         self.leaf_egress_hard_bytes_per_sec = default_leaf_egress_hard();
+        self.leaf_egress_burst_bytes = default_leaf_egress_burst();
         Some(format!("{error}; using default Leaf egress budget"))
     }
 
@@ -233,6 +295,53 @@ impl GossipConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WHY: #504 slice 2 must not change what an existing operator's TOML
+    /// does. Every deployed `[gossip]` section predates `byte_policy`, so
+    /// omitting it has to mean "observe only" — if this ever defaulted to
+    /// `shed_normal`, every node in the fleet would start dropping forwarded
+    /// gossip on an upgrade nobody opted into.
+    #[test]
+    fn omitted_byte_policy_means_observe_only() {
+        let parsed: GossipConfig = toml::from_str("leaf_max_eager_degree = 2").unwrap();
+        assert_eq!(parsed.byte_policy, LeafBytePolicy::ObserveOnly);
+        assert_eq!(GossipConfig::default().byte_policy, parsed.byte_policy);
+        assert_eq!(parsed.byte_policy.as_str(), "observe_only");
+
+        let opted_in: GossipConfig = toml::from_str("byte_policy = \"shed_normal\"").unwrap();
+        assert_eq!(opted_in.byte_policy, LeafBytePolicy::ShedNormal);
+        assert_eq!(opted_in.byte_policy.as_str(), "shed_normal");
+        // Opting into shedding must not disturb the metered thresholds.
+        assert_eq!(
+            opted_in.leaf_egress_hard_bytes_per_sec,
+            default_leaf_egress_hard()
+        );
+    }
+
+    /// WHY: saorsa-gossip refuses a budget whose burst cannot hold one
+    /// maximum frame, and a refused budget means *no* accounting at all. An
+    /// operator who mistypes the burst must get metering back with a warning,
+    /// not a daemon that silently stopped measuring — and not a restart loop,
+    /// which is the trap the deprecated view-size keys already sprang once.
+    #[test]
+    fn undersized_burst_normalizes_rather_than_disabling_accounting() {
+        let mut config = GossipConfig {
+            leaf_egress_burst_bytes: 1_024,
+            ..Default::default()
+        };
+        assert!(config.validate_egress_budget().is_err());
+        assert!(config.normalize_egress_budget().is_some());
+        assert_eq!(config.leaf_egress_burst_bytes, default_leaf_egress_burst());
+        assert!(config.validate().is_ok());
+
+        // A disabled budget has no frame to size a burst against.
+        let disabled = GossipConfig {
+            leaf_egress_hard_bytes_per_sec: 0,
+            leaf_egress_burst_bytes: 1,
+            ..Default::default()
+        };
+        assert!(disabled.validate_egress_budget().is_ok());
+    }
 
     #[test]
     fn slice1_budget_defaults_escape_and_invalid_fallback() {

@@ -9,6 +9,7 @@
 //! - **V3** (Signed KV pairing): same fields as V2, with signed topic length
 //! - **V2** (signed): `[0x02 | agent_id | pubkey | signature | topic | payload]`
 
+use super::config::LeafBytePolicy;
 use super::egress::{EgressMeter, PubSubTransport};
 use super::participation::{
     classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, ParticipationMode,
@@ -20,7 +21,7 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
-use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub, SignaturePolicy};
+use saorsa_gossip_pubsub::{BytePolicy, LeafEgressConfig, PlumtreePubSub, PubSub, SignaturePolicy};
 use saorsa_gossip_transport::GossipTransport;
 use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
@@ -36,6 +37,51 @@ use tokio::sync::{mpsc, RwLock};
 /// Matches the X0X-0073 cooling floor so a send storm produces one warn
 /// per group per cooldown, not one warn per message.
 pub(crate) const ZERO_FANOUT_WARN_WINDOW: Duration = Duration::from_secs(30);
+
+/// ant-quic accepts a 4 MiB application stream; x0x prepends one type byte.
+pub(crate) const MAX_LEAF_GOSSIP_FRAME_BYTES: usize = 4 * 1024 * 1024 - 1;
+
+/// Map a validated x0x `[gossip]` section onto saorsa-gossip's Leaf egress
+/// contract, or `None` for "no byte accounting at all".
+///
+/// Two independent gates, both of which must be deliberate:
+///
+/// * **Accounting** is off unless this is a Leaf with a non-zero hard rate.
+///   Full/relay nodes are pass-through forwarders; budgeting their egress
+///   would starve the plane they exist to serve, so sg is handed `None`.
+/// * **Shedding** is off unless the operator wrote `byte_policy =
+///   "shed_normal"`. A non-zero hard rate must never start dropping gossip by
+///   itself — that would make a behaviour change an accident of configuration
+///   rather than a decision (#504 slice 2).
+///
+/// A `shed_normal` request on a Full/relay node is therefore ignored, not
+/// honoured and not fatal: participation is resolved at runtime (dual listen,
+/// seed address, managed binary), so a node that becomes Full for reasons the
+/// operator never wrote must keep starting. The caller warns.
+fn leaf_egress_config(config: &GossipConfig) -> Option<LeafEgressConfig> {
+    (config.resolved_participation() == ParticipationMode::Leaf
+        && config.leaf_egress_hard_bytes_per_sec != 0)
+        .then_some(LeafEgressConfig {
+            soft_bytes_per_second: config.leaf_egress_soft_bytes_per_sec,
+            hard_bytes_per_second: config.leaf_egress_hard_bytes_per_sec,
+            burst_bytes: config.leaf_egress_burst_bytes,
+            max_serialized_frame_bytes: MAX_LEAF_GOSSIP_FRAME_BYTES,
+            policy: match config.byte_policy {
+                LeafBytePolicy::ObserveOnly => BytePolicy::ObserveOnly,
+                LeafBytePolicy::ShedNormal => BytePolicy::ShedNormal,
+            },
+        })
+}
+
+/// The policy x0x will report: what sg actually accepted, never what the
+/// operator asked for. `None` (no accounting) sheds nothing, so it reports
+/// `observe_only` just as an accepted ObserveOnly budget does.
+fn effective_byte_policy(accepted: Option<LeafEgressConfig>) -> LeafBytePolicy {
+    match accepted.map(|config| config.policy) {
+        Some(BytePolicy::ShedNormal) => LeafBytePolicy::ShedNormal,
+        Some(BytePolicy::ObserveOnly) | None => LeafBytePolicy::ObserveOnly,
+    }
+}
 
 /// Drop-detection counters for the pub/sub pipeline.
 ///
@@ -575,6 +621,9 @@ pub struct PubSubManager {
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
     transport: Arc<PubSubTransport>,
     egress_config: GossipConfig,
+    /// #504 slice 2: the policy saorsa-gossip accepted, which is what
+    /// diagnostics report. Not the policy the operator requested.
+    effective_byte_policy: LeafBytePolicy,
     egress_meter: Mutex<EgressMeter>,
     eager_ceiling_initialized: tokio::sync::OnceCell<()>,
     /// Local topic subscription ref-counts (for stats and cleanup).
@@ -669,6 +718,7 @@ mod observed_fanout_controls {
             let counts = FanoutCounts {
                 attempted: 2,
                 succeeded,
+                ..Default::default()
             };
             let outcome = PublishFanoutOutcome {
                 fan_out: 7,
@@ -872,6 +922,7 @@ impl PubSubManager {
             plumtree,
             transport,
             egress_config: GossipConfig::default(),
+            effective_byte_policy: LeafBytePolicy::ObserveOnly,
             egress_meter: Mutex::new(EgressMeter::default()),
             eager_ceiling_initialized: tokio::sync::OnceCell::new(),
             topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
@@ -902,18 +953,41 @@ impl PubSubManager {
         })
     }
 
-    /// Apply the validated, observe-only budget before starting the runtime.
-    pub(crate) async fn configure_egress(&mut self, config: &GossipConfig) {
+    /// Apply the validated Leaf byte budget before starting the runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::NodeCreation`] if saorsa-gossip refuses the
+    /// budget this node just normalized. That is an x0x/sg contract
+    /// disagreement, not operator error, so it must fail loudly rather than
+    /// leave the daemon running with silently absent accounting.
+    pub(crate) async fn configure_egress(&mut self, config: &GossipConfig) -> NetworkResult<()> {
         self.egress_config = config.clone();
         self.egress_config.participation = self.participation;
         if let Some(warning) = self.egress_config.normalize_egress_budget() {
             tracing::warn!("{warning}");
         }
         // #674 C3: the eager-forward budget rides the same pre-traffic
-        // config pass as the observe-only egress thresholds.
+        // config pass as the Leaf egress thresholds.
         self.relay_fanout
             .set_budget(config.relay_fanout_budget_msgs_per_sec);
+        let accepted = leaf_egress_config(&self.egress_config);
+        if !self.plumtree.configure_leaf_egress(accepted) {
+            return Err(NetworkError::NodeCreation(
+                "saorsa-gossip rejected the normalized Leaf egress budget".to_string(),
+            ));
+        }
+        self.effective_byte_policy = effective_byte_policy(accepted);
+        if self.egress_config.byte_policy != self.effective_byte_policy {
+            tracing::warn!(
+                "[gossip] byte_policy = \"{}\" ignored: shedding needs a Leaf node with a \
+                 non-zero leaf_egress_hard_bytes_per_sec; effective policy is \"{}\"",
+                self.egress_config.byte_policy.as_str(),
+                self.effective_byte_policy.as_str()
+            );
+        }
         self.ensure_eager_ceiling().await;
+        Ok(())
     }
 
     /// Configure before any topic creation or inbound handling, including
@@ -995,9 +1069,14 @@ impl PubSubManager {
                 "leaf_max_eager_degree": self.egress_config.leaf_max_eager_degree,
                 "leaf_egress_soft_bytes_per_sec": self.egress_config.leaf_egress_soft_bytes_per_sec,
                 "leaf_egress_hard_bytes_per_sec": self.egress_config.leaf_egress_hard_bytes_per_sec,
+                "leaf_egress_burst_bytes": self.egress_config.leaf_egress_burst_bytes,
+                "max_serialized_frame_bytes": MAX_LEAF_GOSSIP_FRAME_BYTES,
                 "applies_to_leaf": !self.participation.forwards_passthrough(),
                 "sustained_cap_status": "experimental: published sg ceiling API; sustained-cap and field acceptance pending",
-                "byte_policy": "observe_only",
+                "byte_policy": self.effective_byte_policy.as_str(),
+                "byte_policy_requested": self.egress_config.byte_policy.as_str(),
+                "byte_policy_semantics": "effective policy accepted by saorsa-gossip; observe_only also covers 'no accounting configured' (Full/relay, or a zero hard rate) because neither sheds",
+                "leaf_egress": self.plumtree.leaf_egress_snapshot(),
                 "window_secs": 60,
                 "sample_age_secs": meter.sampled_at.map(|at| at.elapsed().as_secs_f64()),
                 "subscribed_outbound_bytes_per_sec_60s": meter.rate,
@@ -2885,12 +2964,124 @@ mod tests {
                 leaf_egress_hard_bytes_per_sec: 2,
                 ..Default::default()
             })
-            .await;
+            .await
+            .expect("sg accepts the slice-1 budget");
         *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
             peers: (1..=8).rev().map(|id| PeerId::new([id; 32])).collect(),
             sends: Vec::new(),
         });
         manager
+    }
+
+    /// WHY: the default `[gossip]` section is what every deployed daemon
+    /// runs. It must reach saorsa-gossip as an accounting-only budget, so the
+    /// upgrade buys measurement and changes not one send decision. A regression
+    /// here silently turns metering into shedding fleet-wide.
+    #[test]
+    fn default_config_reaches_sg_as_observe_only() {
+        let config = GossipConfig::default();
+        let accepted = leaf_egress_config(&config).expect("default Leaf budget is metered");
+        assert_eq!(accepted.policy, BytePolicy::ObserveOnly);
+        assert_eq!(
+            accepted.hard_bytes_per_second,
+            config.leaf_egress_hard_bytes_per_sec
+        );
+        assert_eq!(
+            accepted.soft_bytes_per_second,
+            config.leaf_egress_soft_bytes_per_sec
+        );
+        assert_eq!(accepted.burst_bytes, config.leaf_egress_burst_bytes);
+        assert_eq!(
+            accepted.max_serialized_frame_bytes,
+            MAX_LEAF_GOSSIP_FRAME_BYTES
+        );
+        assert_eq!(
+            effective_byte_policy(Some(accepted)),
+            LeafBytePolicy::ObserveOnly
+        );
+    }
+
+    /// WHY: a Full/relay node exists to forward other people's traffic. If a
+    /// byte budget could shed there, one operator's copied config would make a
+    /// bootstrap node quietly black-hole the plane it is supposed to serve.
+    /// Participation is resolved at runtime, so this is ignored (sg is handed
+    /// no budget at all) rather than fatal — a node that becomes Full on its
+    /// own must keep starting.
+    #[test]
+    fn shed_normal_is_refused_on_a_relay_and_without_a_budget() {
+        let relay = GossipConfig {
+            relay: true,
+            byte_policy: LeafBytePolicy::ShedNormal,
+            ..Default::default()
+        };
+        assert!(leaf_egress_config(&relay).is_none());
+        assert_eq!(effective_byte_policy(None), LeafBytePolicy::ObserveOnly);
+
+        let resolved_full = GossipConfig {
+            participation: ParticipationMode::Full,
+            byte_policy: LeafBytePolicy::ShedNormal,
+            ..Default::default()
+        };
+        assert!(leaf_egress_config(&resolved_full).is_none());
+
+        // No hard rate means no accounting, so there is nothing to shed from.
+        let unmetered = GossipConfig {
+            leaf_egress_hard_bytes_per_sec: 0,
+            byte_policy: LeafBytePolicy::ShedNormal,
+            ..Default::default()
+        };
+        assert!(leaf_egress_config(&unmetered).is_none());
+
+        // The one combination that does shed: an opted-in Leaf with a budget.
+        let leaf = GossipConfig {
+            byte_policy: LeafBytePolicy::ShedNormal,
+            ..Default::default()
+        };
+        let accepted = leaf_egress_config(&leaf).expect("opted-in Leaf sheds");
+        assert_eq!(accepted.policy, BytePolicy::ShedNormal);
+        assert_eq!(
+            effective_byte_policy(Some(accepted)),
+            LeafBytePolicy::ShedNormal
+        );
+    }
+
+    /// WHY: an operator reads `byte_policy` to answer "is this node dropping
+    /// gossip?". Echoing what was *requested* would answer that question
+    /// wrongly on exactly the nodes where the request was ignored, which are
+    /// the nodes someone is debugging. The requested value stays visible
+    /// beside it so the ignore is diagnosable.
+    #[tokio::test]
+    async fn diagnostics_report_the_effective_policy_not_the_requested_one() {
+        let mut manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "byte_policy_test",
+        )
+        .expect("manager");
+        manager
+            .configure_egress(&GossipConfig {
+                relay: true,
+                byte_policy: LeafBytePolicy::ShedNormal,
+                ..Default::default()
+            })
+            .await
+            .expect("an ignored policy is not a startup failure");
+        let budget = manager.egress_diagnostics()["egress_budget"].clone();
+        assert_eq!(budget["byte_policy"], "observe_only");
+        assert_eq!(budget["byte_policy_requested"], "shed_normal");
+        assert!(budget["leaf_egress"].is_object(), "sg snapshot is reported");
+
+        let mut leaf = PubSubManager::new(test_node().await, None).expect("manager");
+        leaf.configure_egress(&GossipConfig::default())
+            .await
+            .expect("default budget");
+        assert_eq!(
+            leaf.egress_diagnostics()["egress_budget"]["byte_policy"],
+            "observe_only",
+            "a default Leaf meters without shedding"
+        );
     }
 
     fn recorded_eager(

@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`[gossip] byte_policy` — opt-in Leaf egress shedding (#504 slice 2).**
+  `"observe_only"` (default) | `"shed_normal"`. The byte thresholds and the
+  authority to act on them are now two separate settings: a non-zero
+  `leaf_egress_hard_bytes_per_sec` turns the budget on as a *meter* and never
+  by itself drops gossip. Only `"shed_normal"` on a resolved **Leaf** with a
+  non-zero hard rate reaches saorsa-gossip as `BytePolicy::ShedNormal`;
+  Full/relay nodes are handed no budget at all, so a pass-through forwarder
+  cannot black-hole the plane it serves whatever its TOML says. A
+  `"shed_normal"` request that cannot be honoured is ignored with a warning,
+  not fatal — participation is resolved at runtime, so a node that becomes
+  Full on its own must keep starting. Even under `shed_normal`, sg never
+  sheds Critical-class topics (DM inbox, control plane), locally originated
+  publishes, own-inbox delivery or targeted sends. **The default config is
+  behaviour-identical to the previous release.** New companion key
+  `leaf_egress_burst_bytes` (default 4 MiB) sizes the token bucket; a burst
+  too small to hold one maximum frame is rejected by
+  `normalize_egress_budget`, which — as it already did for the other budget
+  typos — restores the **whole** budget group (`leaf_max_eager_degree`, soft,
+  hard and burst) to defaults and warns, rather than failing startup. It is
+  not a burst-only reset. This matches the existing "a budget typo must never
+  restart-loop a daemon" convention.
+- **Known cost of the default upgrade.** Turning the meter on by default means
+  saorsa-gossip takes its egress-limiter lock and records per-topic /
+  per-purpose counters on every serialized send, including under
+  `observe_only`. Sends are not deferred or reordered (sg keys those branches
+  on `enforcing()`, not `enabled()`), but the accounting itself is new
+  per-send work on a fleet already CPU-bound on ML-DSA verification (#656).
+  It has not been profiled: treat any post-upgrade fleet CPU delta as a
+  candidate cause, and record daemon uptime with every baseline.
+- **`GET /diagnostics/gossip` (`x0x diagnostics gossip`) reports the
+  effective policy.** `egress_budget.byte_policy` is what saorsa-gossip
+  accepted, never what was requested — `observe_only` also covers "no budget
+  configured", because that sheds nothing either. `byte_policy_requested`
+  sits beside it so an ignored setting is diagnosable. New
+  `egress_budget.leaf_egress` carries sg's `LeafEgressSnapshot` (demanded /
+  charged / sent bytes, `send_failures`, `data_deferred`, `recovery_waited`,
+  `budget_timeouts`, `queue_overflow`, `invariant_violations`,
+  `pending_recovery_intents`, per-topic/purpose rows and `shed_suppressed`).
+  `shed_suppressed` is the headroom enabling shedding would buy, and under
+  the default policy the only signal the budget is being exceeded at all; it
+  is a lower bound, not a shed-count forecast. Also adds
+  `egress_budget.leaf_egress_burst_bytes` and `max_serialized_frame_bytes`.
+
 ### CI
 
 - **Coverage Gate no longer loses the ratchet on a red test pass (#607).** The
