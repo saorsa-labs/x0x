@@ -21,9 +21,20 @@ All notable changes to this project will be documented in this file.
   publishes, own-inbox delivery or targeted sends. **The default config is
   behaviour-identical to the previous release.** New companion key
   `leaf_egress_burst_bytes` (default 4 MiB) sizes the token bucket; a burst
-  too small to hold one maximum frame normalizes back to the default with a
-  warning rather than failing startup, matching the existing "a budget typo
-  must never restart-loop a daemon" convention.
+  too small to hold one maximum frame is rejected by
+  `normalize_egress_budget`, which — as it already did for the other budget
+  typos — restores the **whole** budget group (`leaf_max_eager_degree`, soft,
+  hard and burst) to defaults and warns, rather than failing startup. It is
+  not a burst-only reset. This matches the existing "a budget typo must never
+  restart-loop a daemon" convention.
+- **Known cost of the default upgrade.** Turning the meter on by default means
+  saorsa-gossip takes its egress-limiter lock and records per-topic /
+  per-purpose counters on every serialized send, including under
+  `observe_only`. Sends are not deferred or reordered (sg keys those branches
+  on `enforcing()`, not `enabled()`), but the accounting itself is new
+  per-send work on a fleet already CPU-bound on ML-DSA verification (#656).
+  It has not been profiled: treat any post-upgrade fleet CPU delta as a
+  candidate cause, and record daemon uptime with every baseline.
 - **`GET /diagnostics/gossip` (`x0x diagnostics gossip`) reports the
   effective policy.** `egress_budget.byte_policy` is what saorsa-gossip
   accepted, never what was requested — `observe_only` also covers "no budget

@@ -274,8 +274,8 @@ leaf_max_eager_degree = 2
 leaf_egress_soft_bytes_per_sec = 65536
 leaf_egress_hard_bytes_per_sec = 131072
 
-# Token-bucket capacity. Must hold one maximum frame or the budget is refused
-# (normalized back to this default with a warning).
+# Token-bucket capacity. Must hold one maximum frame; too small and the WHOLE
+# budget group (degree, soft, hard, burst) normalizes to defaults + a warning.
 leaf_egress_burst_bytes = 4194304
 
 # Slice 2: "observe_only" (default) | "shed_normal". Leaf-only; a Full/relay
@@ -313,9 +313,20 @@ default that is the only signal an observe-only budget is being exceeded at
 all. It is a lower bound, not a shed-count forecast (it does not model the
 recovery waiter/intent refusals or the relay soft bucket).
 
+**Known cost of turning the meter on by default.** saorsa-gossip takes its
+egress-limiter lock and records per-topic / per-purpose counters on every
+serialized send, including under `observe_only`. No send is deferred or
+reordered (sg keys those branches on `enforcing()`, not `enabled()`), but the
+accounting is new per-send work on a fleet already CPU-bound on ML-DSA
+verification (#656). It has not been profiled. Treat any post-upgrade fleet
+CPU delta as a candidate cause, and record daemon uptime with every baseline —
+cumulative counters are integrals, and a self-update restarts the clock.
+
 **Still held:** the sustained-cap claim and #504 acceptance. Nothing here has
 been re-measured in the field; `shed_normal` has no field acceptance and
 should not be enabled on the fleet until an external tester re-captures §5.
+A #501 capture taken under `shed_normal` is not comparable to any earlier
+baseline.
 
 Slice 1 was fan-out-first with both byte thresholds observe-only. Count
 `egress_budget_soft_exceeded` / `egress_budget_hard_exceeded` and rate-limit
