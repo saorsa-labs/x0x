@@ -37,11 +37,12 @@ question and deliberately left two residuals open, naming them as its own
 
 A source census on the current tree (tip `252c3fb`, v0.45.0 lineage) produced
 the coverage map in Decision §1. It corrects the packet/issue premise in one
-direction: **KV is already partially gated** (five sites across
-`src/server/routes/stores.rs` and `src/groups/kv_context.rs`), which ADR 0064
-listed as undecided. It confirms the premise in the other: **no lifecycle epoch
-token exists anywhere** — `lifecycle_epoch`, `epoch_token` and `LifecycleEpoch`
-have zero hits across `src/`.
+direction: **KV is already partially gated** — six sites across
+`src/server/routes/stores.rs` (`:807`, `:1191`, `:2054`) and
+`src/groups/kv_context.rs` (`:122`, `:364`, `:376`), which are map rows 7–12 —
+a surface ADR 0064 listed as undecided. It confirms the premise in the other:
+**no lifecycle epoch token exists anywhere** — `lifecycle_epoch`, `epoch_token`
+and `LifecycleEpoch` have zero hits across `src/`.
 
 > **Evidence-provenance note (fail loud).** The design/evidence packet
 > `.planning/472-remaining-adr-packet.md` referenced by #732 **could not be
@@ -168,11 +169,30 @@ Census base: current tree, tip `252c3fb`. "Gated" means the path consults
 | 22 | Ratchet / persist lifecycle epoch re-check | **does not exist** (`lifecycle_epoch`/`epoch_token`/`LifecycleEpoch`: 0 hits in `src/`) | **No** | **Introduce** (§4) |
 | 23 | File transfer | `files.rs` — no `named_groups` reference at all | **No** | **Out of scope** — the DM-plane protocol of ADR 0055 is not group-state bound; recorded so the enumeration is complete, not to be gated |
 | 24 | Inbound metadata / state-commit apply | `named_groups.rs:8922` | **No, deliberately** | **Keep ungated** — the anchored clearing commit must be able to arrive (`named_groups.rs:19904`) |
+| 25 | WebSocket fan-out — ADR-0040 `Mention` events for validated group messages and delegation grants on the group topic channel, plus ADR-0023 stored-history backfill on `Subscribe` | `ws.rs:217` (`ws_handler`), event shape `:116`–`:123`, backfill `:145`–`:163` and `:527`; `grep -c quarantin src/server/ws.rs` → **0** | **No** | **Annotate** (§3e) — the live mirror of rows 13 and 16, and it must not be refused for the same forensic reason |
+| 26 | History diagnostics | `history.rs:488` | **No** | **Annotate** (§3a) |
 
-**Counts.** 24 enumerated paths: **12 gated** today (1–12), **11 ungated**
-(13–23), **1 deliberately ungated** (24). Of the 11 ungated, this ADR gates
-**8** (14, 15, 17, 18, 19, 20-mutations, 21, 22), **annotates 3** (13, 16,
-20-reads), and rules **1** out of scope (23).
+**Counts.** 26 enumerated paths: **12 gated** today (1–12), **13 ungated**
+(13–23, 25, 26), **1 deliberately ungated** (24).
+
+Dispositions for the 13 ungated, one class each (no row is counted twice):
+
+| Disposition | Rows | Count |
+|---|---|---|
+| **Refuse** (409 `fork_quarantined`) | 14, 15, 17, 18, 19, 21 | 6 |
+| **Split** — mutations refuse, reads annotate | 20 | 1 |
+| **Annotate** only | 13, 16, 25, 26 | 4 |
+| **Introduce** a new mechanism | 22 | 1 |
+| **Out of scope** | 23 | 1 |
+
+*Exhaustiveness caveat (scope, not oversight).* Row 25 was missed by the first
+draft of this map and found in cross-model review. A map that calls itself
+normative must be defended by a test, not by a reading — hence the
+exhaustiveness fixture in Validation, which is the only durable guarantee that
+a route added later cannot silently join the ungated set. Row 25's WS
+`Publish { topic, payload }` verb (`ws.rs:152`) is a raw gossip-topic publish,
+not a group-scoped send, and is therefore **not** part of this row; it is
+covered by row 1 only when a client routes through `POST /groups/:id/send`.
 
 **The count that matters.** For **ordinary (non-owner-axis) groups the gated
 count is 0 of 24**, because `named_groups.rs:3733` prevents the marker from
@@ -191,11 +211,24 @@ the group's policy has no owner axis.
   `evaluate_fork_evidence_candidate` and the ADR-0059 dedup installs a marker.
   No new trigger, no new evidence class, no relaxation of authentication.
 - **Clear is manual and only manual.** A `no_anchor` marker is **never**
-  cleared by any commit, of any revision, on any ancestry — the owner-anchored
-  clear arms of `named_groups.rs:3536` and `:9554` must test `no_anchor` and
-  decline. The only exit is the shipped
-  `POST /groups/:id/quarantine/clear` (`named_groups.rs:12510`), counted by
-  `fork_quarantine_manual_clears`.
+  cleared by any commit, of any revision, on any ancestry. The only exit is the
+  shipped `POST /groups/:id/quarantine/clear` (`named_groups.rs:12510`),
+  counted by `fork_quarantine_manual_clears`.
+
+  **Enumerated clear sites and their treatment under `no_anchor` (normative —
+  the first draft of this ADR named the wrong arm and is corrected here):**
+
+  | Site | What it is | Treatment |
+  |---|---|---|
+  | `named_groups.rs:4142` (`try_adopt_member_added_across_gap`) | Owner-anchored clear via the owner-signed head attestation CAS on adoption; already fenced by `owner_certified_user_id().is_some()` at `:4136` and by strict revision at `:4140` | Must test `no_anchor` and **decline**. The existing owner-axis fence already excludes ordinary groups, so this is belt-and-braces — but the fence is a *policy* test and `no_anchor` is the *marker's own* claim, and §2 makes the marker's claim authoritative. |
+  | `named_groups.rs:9554` (`apply_named_group_metadata_event_inner`) | Owner-anchored clear via a mandate-carrying `MemberAdded` that verifies; strict revision at `:9556`; counts `fork_quarantine_owner_anchored_clears` | Must test `no_anchor` and **decline**. This arm has **no** owner-axis policy fence of its own — it relies on the marker only ever existing for owner-axis groups, an assumption §2 invalidates. **This is the load-bearing change**: without the `no_anchor` test here, extending the marker to ordinary groups would hand them an automatic clear and silently contradict the manual-only rule. |
+  | `src/groups/mod.rs:1001` (`clear_fork_quarantine_on_explicit_owner_seal`) | Explicit owner-key seal route, both arms including eviction | Must test `no_anchor` and **decline** — an ordinary group has no owner key, so the route is unreachable for it in practice; the test documents the invariant rather than changing behaviour. |
+  | `named_groups.rs:3536`–`:3541` (`rollback_live_fork_evidence`) | **NOT a clear.** This is the retry-rollback arm: it undoes a non-durable install on an exact identity match (revision + state hash + committer, `:3525`–`:3529`) when the mutation that installed it is retried. | **Left exactly as-is — must NOT test `no_anchor`.** Gating it would strand a marker whose evidence was retracted on a benign retry, creating an unclearable quarantine from a transient persist failure. An undo of an install is not a clear, and the manual-only rule in §2 governs clears. |
+
+  The distinction matters because the two categories look identical at the
+  call site (`info.fork_quarantine = None`) and differ only in provenance:
+  a *clear* asserts the fork was resolved; a *rollback* asserts the install
+  never durably happened. Only the former is constrained by §2.
 - **`invite_lineage` fence.** The evidence path is currently reached only for
   invite-derived groups (`named_groups.rs:3765`). Ordinary groups formed
   without an invite still record nothing. Widening that fence is **not**
@@ -236,7 +269,20 @@ quarantined group's snapshot at the same predicate that already tests
 `withdrawn` — this is the one ungated path that *exports* contested state to
 other nodes, and is the highest-severity item in the census after §2.
 
-**§3d — Typed refusal is uniform.** Every new refusal reuses
+**§3d — WebSocket fan-out (path 25).** The WS plane is the live mirror of the
+annotated read paths: `ws_handler` (`ws.rs:217`) emits ADR-0040 `Mention`
+events for validated group messages and delegation grants on the group topic
+channel (`:116`–`:123`) and replays ADR-0023 stored history on `Subscribe`
+backfill (`:145`–`:163`, `:527`), with zero quarantine consults. It is
+**annotated, never refused**, for the same reason as §3a: an operator watching
+a live incident must not lose the stream at the moment it matters. The
+`fork_quarantined` flag rides the `Mention` envelope and the backfill frames,
+so a subscribed client can distinguish contested traffic without a second
+round trip. Note that a `Mention` for a *delegation grant* may be annotated as
+contested while §3b independently refuses the grant itself — the annotation
+describes what was observed, not what was authorized.
+
+**§3e — Typed refusal is uniform.** Every new refusal reuses
 `reject_fork_quarantined` (`named_groups.rs:19910`) or its exact contract — 409,
 body `fork_quarantined`, one `fork_quarantine_refusals` increment
 (`diagnostics.rs:150`) — so that a single diagnostic counts the whole
@@ -286,6 +332,8 @@ Representation is Open Question 4.
 | Delegated send-as from a contested roster | Honoured (`delegations.rs:448`) | Fails closed (§3b) |
 | Quarantined group's snapshot published to the fleet | Published (`public_group_bootstrap_outbox.rs:394`) | Suppressed (§3c) |
 | Operator investigating a live fork | History serves, unlabelled | History serves, labelled `fork_quarantined` (§3a) |
+| WS client watching a quarantined group | Mentions and backfill stream unlabelled (`ws.rs:217`) | Stream continues, every frame labelled (§3d) |
+| Marker retracted by a benign persist retry | Rolled back (`named_groups.rs:3541`) | Unchanged — rollback is not a clear (§2 table) |
 | Operator/attacker purges evidence mid-incident | Permitted | Refused (§3a) |
 | Marker installed mid-operation on a bound KV store | Cached snapshot still authorizes | Token mismatch aborts before persist (§4) |
 | Anchored clearing commit arrives at a quarantined node | Applies (apply path ungated) | Unchanged — deliberately still applies (path 24) |
@@ -296,7 +344,7 @@ Representation is Open Question 4.
 
 ### Positive
 
-- The data plane is enumerated rather than asserted: 24 paths, each with a
+- The data plane is enumerated rather than asserted: 26 paths, each with a
   `file:line` anchor and a disposition, re-checkable by any reviewer.
 - The largest silent gap — ordinary groups being completely uncontained
   despite ADR 0064's text claiming otherwise — is named and closed.
@@ -309,7 +357,8 @@ Representation is Open Question 4.
 - A new availability failure mode for ordinary groups with **no automatic
   exit**: a benign network split that produces authenticated conflicting
   commits now strands the group until an operator calls the manual clear.
-- Blast radius of a false positive grows from 6 route surfaces to 20.
+- Blast radius of a false positive grows from the 6 shipped route surfaces
+  (rows 1–6) to 19 refusing or split surfaces once §3 lands.
 - §4 adds a re-check to hot paths (KV delta apply, send, encrypt); the cost is
   a compare under a lock already taken, but it is on every operation.
 - History annotation is an additive response-shape change across seven
@@ -348,11 +397,27 @@ Representation is Open Question 4.
    #470 full-equality participant, and a new bootstrap-strip obligation for
    information already derivable.
 5. **Rollout posture for the new ordinary-group refusals — warn-only first
-   release, or fail-closed immediately?** *Recommendation:* one release
-   warn-only (annotate + count `fork_quarantine_refusals`, do not refuse) for
-   the ordinary-group population only, mirroring ADR 0064 §1b's grace
-   precedent, then fail closed. Owner-axis behaviour is unchanged throughout.
-   Flagged because it trades containment for availability during the window.
+   release, or fail-closed immediately?** *Recommendation (revised after
+   cross-model review — a blanket warn-only window was unsafe as first
+   drafted):* **split by reversibility, not by population.**
+   - **Fail closed immediately**, with no warn-only window, for every path
+     whose act is irreversible or outlives the window: history purge (row 14 —
+     destroys the forensic record ADR 0064 §4 exists to preserve), delegation
+     minting and honouring (rows 15, 17, 18 — authority granted during the
+     window survives the window), registry seeding (row 19), and signed-public
+     bootstrap publication (row 21 — exports contested state to other nodes,
+     which cannot be recalled).
+   - **Warn-only for one release** (annotate + count
+     `fork_quarantine_refusals`, do not refuse) for task mutations (row 20),
+     which are CRDT-recoverable, and for the purely additive annotations
+     (rows 13, 16, 25, 26), which refuse nothing in either posture.
+
+   The original blanket recommendation traded containment for availability
+   uniformly; the defect is that "warn-only" is only a *deferral* for a
+   reversible act, but a *permanent grant* for an irreversible one. Owner-axis
+   behaviour is unchanged throughout. Still an open question because the split
+   itself — and whether row 20 deserves even one release of grace — is David's
+   call, not the drafter's.
 
 ## Validation
 
@@ -363,17 +428,33 @@ Representation is Open Question 4.
   across `src/` → 0). The packet-absence note above is part of the record.
 - **Implementation (future PRs, each with its own gates):**
   - An **exhaustiveness test** over the §1 table: a fixture that installs a
-    marker and asserts the disposition of every one of the 24 paths, so a new
-    data-plane route added later fails the test until it is classified.
+    marker and asserts the disposition of every one of the 26 paths, so a new
+    data-plane route added later fails the test until it is classified. This
+    fixture is not optional garnish: row 25 was missed by the first draft of
+    the map and caught only in cross-model review, which is direct evidence
+    that a hand-maintained enumeration degrades.
   - Ordinary-group fixtures: authenticated evidence installs a `no_anchor`
     marker; a valid higher-revision commit on **any** ancestry does **not**
     clear it; the manual endpoint does.
+  - **Clear-arm discrimination fixtures (§2 table), one per site:** a
+    `no_anchor` marker survives an owner-anchored adoption clear
+    (`named_groups.rs:4142`), survives a mandate-carrying `MemberAdded`
+    (`:9554` — the arm with no independent owner-axis fence, so this is the
+    fixture that would have caught the bug), and survives an explicit owner
+    seal (`src/groups/mod.rs:1001`); **and, in the opposite direction**, a
+    `no_anchor` marker installed by a mutation that is then retried IS rolled
+    back by `rollback_live_fork_evidence` (`:3536`–`:3541`) on exact identity
+    match — asserting that the rollback arm was NOT gated, since gating it
+    would strand the group on a transient persist failure.
   - Negative control inherited from ADR 0064: the contested branch's own valid
     commits never clear an owner-axis marker.
   - §3b fail-closed fixtures for `authorize`, `authorize_send_as` and registry
     indexing, each asserting the group is contested rather than merely absent.
   - §3c fixture: a quarantined group's signed-public snapshot is absent from
     the outbox, and reappears after a clear.
+  - §3d fixture: a WS subscriber receives `Mention` events and ADR-0023
+    backfill frames for a quarantined group — the stream is **not** cut — and
+    every frame carries `fork_quarantined: true`.
   - §4 race fixture: install a marker between a KV authorization bind and its
     delta apply; assert the apply aborts with state byte-identical.
   - Mixed-version serde fixtures both directions for `no_anchor`.
