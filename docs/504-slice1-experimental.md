@@ -14,14 +14,25 @@ not the accepted #504 fix.
 leaf_max_eager_degree = 2
 leaf_egress_soft_bytes_per_sec = 65536
 leaf_egress_hard_bytes_per_sec = 131072
+leaf_egress_burst_bytes = 4194304
+byte_policy = "observe_only"
 ```
 
 Degree accepts 0–12. Zero restores stock sg selection, not zero peers.
 Full keeps the entire eligible plane regardless of these Leaf settings.
-Invalid degree or enabled hard < soft restores the three budget defaults,
-with a startup / `x0xd --check` warning; other config settings are preserved.
-Either byte threshold can be disabled independently with zero. Byte limits
-are observe-only: no shedding or priority changes.
+Invalid degree, enabled hard < soft, or a burst too small to hold one maximum
+frame restores the budget defaults, with a startup / `x0xd --check` warning;
+other config settings are preserved. Either byte threshold can be disabled
+independently with zero.
+
+**Slice 2 (`byte_policy`).** The thresholds stay a meter by default. Setting
+`byte_policy = "shed_normal"` on a **Leaf** with a non-zero hard rate is what
+authorizes saorsa-gossip to deny a send; anything else — the default, a
+Full/relay node, or a zero hard rate — sheds nothing. A `shed_normal` request
+that cannot be honoured is ignored with a warning, never fatal. sg never
+sheds Critical-class topics, local-origin publishes, own-inbox delivery or
+targeted sends under any policy. Field acceptance for `shed_normal` is still
+held; do not enable it on the fleet.
 
 All four x0x writers share the same policy: deduplicate and sort full PeerIds,
 prefer the smallest eligible coordinator, then relay, then pinned bootstrap
@@ -38,7 +49,8 @@ DM inbox IDs, rather than rehashing the display name.
 - `outbound_by_topic_named`: `{name, names, topic_id_hex8, outbound}` rows.
   Multiple aliases remain visible; unmapped / unsubscribed rows use
   `unknown-hex`. The existing raw sg meters and participation split remain.
-- `egress_budget`: configured limits, observe-only policy, experimental
+- `egress_budget`: configured limits (now including `leaf_egress_burst_bytes`
+  and `max_serialized_frame_bytes`), experimental
   status, last sample age, rolling 60-second subscribed outbound byte rate,
   and soft/hard exceed counts. Sampling runs with the runtime's nominal 1s
   peer-refresh tick, independently of API reads. Counts are exceeded samples,
@@ -47,6 +59,18 @@ DM inbox IDs, rather than rehashing the display name.
   resolution and attributes interval deltas by subscription at sampling time.
   These are sg send-attempt bytes, all kinds including repair, not confirmed
   QUIC bytes. sg's bounded per-topic meter can omit overflow topics.
+- `egress_budget.byte_policy`: the **effective** policy saorsa-gossip
+  accepted, `observe_only` or `shed_normal`. `observe_only` also covers "no
+  budget configured at all" (a Full/relay node, or a zero hard rate), because
+  neither sheds. `byte_policy_requested` shows what the TOML asked for, so an
+  ignored `shed_normal` is diagnosable rather than invisible.
+- `egress_budget.leaf_egress`: sg's `LeafEgressSnapshot` — `demanded_bytes`,
+  `charged_bytes`, `sent_bytes`, `send_failures`, `data_deferred`,
+  `recovery_waited`, `budget_timeouts`, `queue_overflow`,
+  `invariant_violations`, `pending_recovery_intents`, per-topic/purpose rows,
+  and `shed_suppressed`. The last is the headroom enabling shedding would buy
+  and, under the default policy, the only signal the budget is being exceeded
+  at all; it is a lower bound, not a shed-count forecast.
 - `egress_budget.repair`: EAGER transport attempts matching authenticated v2
   in-flight IWANT `(peer, topic, message ID)` requests. This separately shows
   cached recovery even though sg includes it in EAGER totals. It is a subset,
