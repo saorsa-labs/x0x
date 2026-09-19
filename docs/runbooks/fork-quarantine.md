@@ -75,9 +75,34 @@ group-keyed data until an owner-anchored path (§4) advances the chain past
 the evidenced revision. It is containment, not a verdict: ADR-0064
 deliberately has NO automated eviction, and the membership-event ingest path
 is NOT gated (the owner-anchored clearing commit must still be able to
-arrive). History, delegations, tasks, the bootstrap outbox and the WS plane
+arrive). History, tasks, the bootstrap outbox and the WS plane
 are not yet gated or annotated: ADR-0066 §1 enumerates all 26 data-plane paths
-with a disposition each, and slices 3–6 land them.
+with a disposition each, and slices 4–6 land them.
+
+**Delegations (ADR-0066 §3b, slice 3) are gated now.** Delegation is an
+authority transfer, and a quarantined group's roster is the thing under
+dispute, so minting new authority from it — or honouring authority derived
+from it — fails closed:
+
+| Surface | Behaviour while quarantined |
+|---|---|
+| `POST /groups/:id/delegate` (row 15) | **409 `fork_quarantined`.** Nothing is minted: no envelope is signed, no carrier row reaches history, nothing is published to the group bus. |
+| `GET /groups/:id/delegations` (row 16) | **Still serves**, with `fork_quarantined: true` and a `fork_quarantine` object (same shape as the refusal's) added to the response. Reading who holds authority during a fork is exactly what an operator needs. |
+| Delegated task-execute (`POST /task-lists/:id/tasks/:tid` citing `delegation`, row 17) | **409 `fork_quarantined`** before the claim/complete mutation. Task mutations *not* citing a delegation are row 20 and are not gated until slice 5. |
+| Send-as authorization (row 18) | Fails closed. A peer's gossiped send-as message for a quarantined group is dropped at ingest, as it already is for any unauthorized attribution. |
+| Delegation index / global id registry (row 19) | A contested group's grants are not indexed and do not seed the registry — including at daemon start, where `rebuild_global_delegation_registry` skips the group entirely. An unregistered grant cannot authorize. |
+
+Rows 17–19 have no HTTP response of their own on the gossip-ingest path, so
+there the refusal is recorded (one `fork_quarantine_refusals` increment, the
+same counter as the REST rows) and the §5 sentence is logged at WARN, rather
+than the message being dropped silently. Carrier history rows are still
+committed and retained — refusing to *honour* a delegation never blanks the
+forensic record.
+
+Existing delegations stop being honoured for the group, so **a quarantine on a
+group that delegates work is an availability event for that work.** The exit is
+the same clear as everything else (§4/§5); after it, the next use re-derives
+the index from durable history and service resumes with no re-issuance.
 
 Group membership reads, `/groups/:id/state`, and the diagnostics surfaces
 keep working while quarantined.

@@ -110,7 +110,12 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
 - **Delegation & mentions (ADR-0040):** `POST /groups/:id/delegate`,
   `GET /groups/:id/delegations`; `mentions` and `delegation_digest` fields on
   `POST /groups/:id/send` and on the signed `GroupPublicMessage` wire object;
-  the WS `mention` event.
+  the WS `mention` event. **Availability note (ADR-0066 §3b):** while a group
+  is fork-quarantined, delegation minting refuses with 409 `fork_quarantined`
+  and existing delegations are not honoured — including send-as attribution
+  arriving over gossip and delegated task-execute — until
+  `POST /groups/:id/quarantine/clear`. `GET /groups/:id/delegations` keeps
+  serving, annotated. See `docs/runbooks/fork-quarantine.md` §1.
 - **Device sync (ADR-0041):** `GET /sync/devices`, `POST /sync/devices/enroll`,
   `DELETE /sync/devices/:machine_id`; owner-to-owner SyncV1 streams.
 - **Placement & key-move (ADR-0043):** `GET /owner/placement`,
@@ -1119,8 +1124,8 @@ helper API.
 | POST | `/groups/:id/state/withdraw` | `x0x group delete <group_id>` | **Phase D.3**: any admin permanently deletes the group with a signed terminal withdrawal |
 | POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker — on a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set |
 | POST | `/groups/:id/send` | `x0x group send <group_id> <body> [--kind chat\|announcement] [--thread-root <id>] [--reply-to <id>] [--mentions <hex>...] [--delegation-digest <hex>]` | **Phase E**: publish a signed message to a SignedPublic group. `--mentions` (repeatable) routes structured ADR-0040 mentions daemon-side; `--delegation-digest` authorizes send-as attribution |
-| POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit) |
-| GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history |
+| POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit). **ADR-0066 §3b**: 409 `fork_quarantined` while the group is fork-quarantined — refused before anything is signed, committed or published |
+| GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history. **ADR-0066 §3b**: keeps serving while fork-quarantined, with `fork_quarantined: true` and a `fork_quarantine` object added to the response |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |

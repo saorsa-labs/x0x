@@ -59,10 +59,21 @@ struct CoverageRow {
     /// Source file the ADR anchors the row to, relative to the crate root.
     anchor: &'static str,
     disposition: Disposition,
-    /// The implementation slice that closes the row: `Some(n)` while it is
-    /// still open, `None` once shipped. Slice 2 (this one) ships no new
-    /// refusal — it makes rows 1–12 REACHABLE for ordinary groups.
+    /// The implementation slice that owns this row's behaviour change,
+    /// or `None` for a row that needs none (already gated, deliberately
+    /// ungated, or out of scope).
     closed_by_slice: Option<u8>,
+    /// Is that change IN THE TREE?
+    ///
+    /// WHY this is a separate field from `closed_by_slice` rather than
+    /// clearing the slice number on landing: the slice that owns a row is
+    /// a fact about the ADR and stays true forever, while "has it landed"
+    /// is a fact about the tree and changes once. Keeping both means a
+    /// reviewer of a later slice can still see which slice was supposed
+    /// to close a row that regressed, and the OPEN_ROWS equality below
+    /// turns "somebody shipped a row without saying so" — or reverted one
+    /// — into a failing test rather than a quiet drift.
+    closed: bool,
 }
 
 /// The §1 table, transcribed. Deliberately verbatim: a divergence between
@@ -75,6 +86,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 2,
@@ -82,6 +94,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 3,
@@ -89,6 +102,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 4,
@@ -96,6 +110,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 5,
@@ -103,6 +118,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 6,
@@ -110,6 +126,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 7,
@@ -117,6 +134,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 8,
@@ -124,6 +142,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 9,
@@ -131,6 +150,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 10,
@@ -138,6 +158,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 11,
@@ -145,6 +166,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 12,
@@ -152,6 +174,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 13,
@@ -159,6 +182,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
+        closed: false,
     },
     CoverageRow {
         row: 14,
@@ -166,6 +190,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(4),
+        closed: false,
     },
     CoverageRow {
         row: 15,
@@ -173,6 +198,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        closed: true,
     },
     CoverageRow {
         row: 16,
@@ -180,6 +206,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(3),
+        closed: true,
     },
     CoverageRow {
         row: 17,
@@ -187,6 +214,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        closed: true,
     },
     CoverageRow {
         row: 18,
@@ -194,6 +222,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        closed: true,
     },
     CoverageRow {
         row: 19,
@@ -201,6 +230,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        closed: true,
     },
     CoverageRow {
         row: 20,
@@ -208,6 +238,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/tasks.rs",
         disposition: Disposition::Split,
         closed_by_slice: Some(5),
+        closed: false,
     },
     CoverageRow {
         row: 21,
@@ -215,6 +246,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/public_group_bootstrap_outbox.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(5),
+        closed: false,
     },
     CoverageRow {
         row: 22,
@@ -222,6 +254,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Introduce,
         closed_by_slice: Some(7),
+        closed: false,
     },
     CoverageRow {
         row: 23,
@@ -229,6 +262,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/files.rs",
         disposition: Disposition::OutOfScope,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 24,
@@ -236,6 +270,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::KeepUngated,
         closed_by_slice: None,
+        closed: true,
     },
     CoverageRow {
         row: 25,
@@ -243,6 +278,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/ws.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(6),
+        closed: false,
     },
     CoverageRow {
         row: 26,
@@ -250,6 +286,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
+        closed: false,
     },
 ];
 
@@ -535,16 +572,22 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     for row in COVERAGE_MAP.iter() {
         let _ = read_anchor(row.anchor);
     }
-    // Slice 2 ships no new refusal. Every row still open names the slice
-    // that closes it, so "not done yet" is never indistinguishable from
-    // "forgotten".
+    // Every row still open names the slice that closes it, so "not done
+    // yet" is never indistinguishable from "forgotten".
     for row in COVERAGE_MAP.iter() {
         match row.disposition {
-            Disposition::Gated | Disposition::KeepUngated | Disposition::OutOfScope => assert!(
-                row.closed_by_slice.is_none(),
-                "row {} needs no further slice",
-                row.row
-            ),
+            Disposition::Gated | Disposition::KeepUngated | Disposition::OutOfScope => {
+                assert!(
+                    row.closed_by_slice.is_none(),
+                    "row {} needs no further slice",
+                    row.row
+                );
+                assert!(
+                    row.closed,
+                    "row {} needs no behaviour change, so it is closed by definition",
+                    row.row
+                );
+            }
             _ => assert!(
                 row.closed_by_slice.is_some(),
                 "row {} changes behaviour, so it must name the slice that closes it",
@@ -552,7 +595,53 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
             ),
         }
     }
+
+    // The EXACT open set. Asserted as an equality rather than a count so
+    // that closing a row and reopening another cannot cancel out, and so
+    // that a slice which lands its code without updating this map fails
+    // here instead of leaving the map quietly describing a tree that no
+    // longer exists. Slice 3 closed 15–19; what remains is slice 4
+    // (13, 14, 26), slice 5 (20, 21), slice 6 (25) and slice 7 (22).
+    let open: Vec<u8> = COVERAGE_MAP
+        .iter()
+        .filter(|row| !row.closed)
+        .map(|row| row.row)
+        .collect();
+    assert_eq!(
+        open,
+        OPEN_ROWS,
+        "the §1 rows still awaiting their slice — update this list in the slice that closes one"
+    );
+
+    // A row that claims to be CLOSED and whose disposition is a refusal,
+    // a split or an annotation must actually consult the marker in its
+    // anchor file. This is the clause that catches a landed gate being
+    // deleted or refactored out from under the map — the same guarantee
+    // the `Gated` rows above get, extended to every row a slice has
+    // shipped. Rows that need no behaviour change (out-of-scope,
+    // deliberately ungated) are excluded: for them, consulting the marker
+    // would be the defect.
+    for row in COVERAGE_MAP.iter().filter(|row| {
+        row.closed
+            && matches!(
+                row.disposition,
+                Disposition::Refuse | Disposition::Split | Disposition::Annotate
+            )
+    }) {
+        let source = read_anchor(row.anchor);
+        assert!(
+            source.contains("fork_quarantine") || source.contains("is_fork_quarantined"),
+            "§1 row {} ({}) is marked closed by slice {:?}, but {} consults no marker",
+            row.row,
+            row.path,
+            row.closed_by_slice,
+            row.anchor
+        );
+    }
 }
+
+/// The §1 rows whose behaviour change has not landed yet, in row order.
+const OPEN_ROWS: &[u8] = &[13, 14, 20, 21, 22, 25, 26];
 
 /// WHY (ADR-0066 Validation, the fixture's whole reason for existing):
 /// every route on the censused surface must be explicitly classified. Row

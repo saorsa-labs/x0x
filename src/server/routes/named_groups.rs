@@ -19998,19 +19998,76 @@ fn reject_unverified_owner_certified_restore(
 /// so this helper is the single place the message is built — no route
 /// can refuse without explaining itself and no two routes can drift in
 /// wording (§3e).
-fn reject_fork_quarantined(
+pub(in crate::server) fn reject_fork_quarantined(
     state: &AppState,
     group_id: &str,
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     let marker = info.fork_quarantine.as_ref()?;
+    Some(reject_fork_quarantined_marker(state, group_id, marker))
+}
+
+/// ADR-0066 §3e (slice 3): the same single refusal, for a caller that
+/// already holds the marker rather than the whole [`GroupInfo`].
+///
+/// WHY a second entry point and not a second builder: the delegation
+/// paths (§3b rows 15–19) take the roster lock once, clone the marker out
+/// and then release it — they never hold a `&GroupInfo` across the
+/// refusal. Routing them through this function keeps §3e's promise that
+/// one helper owns the status, the body and the single
+/// `fork_quarantine_refusals` increment, so no route can refuse without
+/// explaining itself and none can double-count.
+pub(in crate::server) fn reject_fork_quarantined_marker(
+    state: &AppState,
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+) -> (StatusCode, Json<serde_json::Value>) {
     state
         .groups_diagnostics
         .record_fork_quarantine_refusal(group_id);
-    Some((
+    (
         StatusCode::CONFLICT,
         Json(fork_quarantine_refusal_body(group_id, marker)),
-    ))
+    )
+}
+
+/// ADR-0066 §3b/§3e (slice 3): the refusal where there is no HTTP
+/// response to carry it — a gossip-ingest honour path or an internal
+/// authority predicate whose only channel is `Err(String)`.
+///
+/// It is the SAME refusal: the same §5 sentence and the same single
+/// `fork_quarantine_refusals` increment. Only the envelope differs,
+/// because a delegation honoured over gossip has no status code to
+/// return. Callers must surface the returned reason (log it, or hand it
+/// back as the predicate's error) rather than dropping silently — a
+/// delegation that stops working with no recorded reason is exactly the
+/// unexplained outage R5 forbids.
+pub(in crate::server) fn fork_quarantine_refusal_reason(
+    state: &AppState,
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+) -> String {
+    state
+        .groups_diagnostics
+        .record_fork_quarantine_refusal(group_id);
+    fork_quarantine_refusal_message(group_id, marker)
+}
+
+/// ADR-0066 §3a/§3b: the marker as it appears on a path that ANNOTATES
+/// rather than refuses (row 16 today; rows 13, 25, 26 in later slices).
+///
+/// Deliberately the same object the refusal body carries under
+/// `fork_quarantine`, so a client parses one shape whether the operation
+/// was served-with-a-warning or refused outright.
+pub(in crate::server) fn fork_quarantine_annotation(
+    marker: &x0x::groups::ForkQuarantine,
+) -> serde_json::Value {
+    serde_json::json!({
+        "revision": marker.revision,
+        "observed_at_ms": marker.observed_at_ms,
+        "no_anchor": marker.no_anchor,
+        "clear_with": FORK_QUARANTINE_CLEAR_ROUTE,
+    })
 }
 
 /// ADR-0066 §5: the refusal body, built from the marker alone.
@@ -20032,12 +20089,7 @@ fn fork_quarantine_refusal_body(
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
             "fork_quarantine".to_string(),
-            serde_json::json!({
-                "revision": marker.revision,
-                "observed_at_ms": marker.observed_at_ms,
-                "no_anchor": marker.no_anchor,
-                "clear_with": FORK_QUARANTINE_CLEAR_ROUTE,
-            }),
+            fork_quarantine_annotation(marker),
         );
     }
     body
@@ -20064,7 +20116,10 @@ const FORK_QUARANTINE_CLEAR_ROUTE: &str = "POST /groups/:id/quarantine/clear";
 /// - `no_anchor` marker: nothing clears it automatically, and the manual
 ///   route has no owner axis to attest with, so the operator override
 ///   (`--force` plus a reason) is the only exit (path (b)).
-fn fork_quarantine_refusal_message(group_id: &str, marker: &x0x::groups::ForkQuarantine) -> String {
+pub(in crate::server) fn fork_quarantine_refusal_message(
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+) -> String {
     let revision = marker.revision;
     if marker.no_anchor {
         format!(
@@ -31621,6 +31676,7 @@ pub(in crate::server) mod tests {
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
     mod adr0066_coverage_map;
+    mod adr0066_delegations;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod hs_f2_membership_cluster;

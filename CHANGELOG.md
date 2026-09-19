@@ -6,6 +6,38 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Delegations on a fork-quarantined group now REFUSE until the marker is
+  cleared (ADR-0066 §3b, slice 3; #732) — an availability change, deliberate.**
+  Delegation is an authority transfer, and a quarantined group's roster is
+  precisely what is in dispute, so minting authority from it or honouring
+  authority derived from it fails closed. `POST /groups/:id/delegate` returns
+  the 409 `fork_quarantined` body (§5) **before** anything irreversible
+  happens: no envelope is signed, no carrier row reaches durable history, the
+  effectiveness index is untouched and nothing is published to the group bus.
+  Already-issued delegations stop being honoured for that group: delegated
+  task-execute (a `POST /task-lists/:id/tasks/:tid` citing `delegation`)
+  refuses with the same body before the claim/complete mutation; send-as
+  authorization fails closed, so a peer's gossiped send-as message for the
+  group is dropped at ingest; and the delegation index and global delegation-id
+  registry refuse to be seeded from the group, including at daemon start where
+  `rebuild_global_delegation_registry` skips it entirely — an unregistered
+  grant cannot authorize. The **non-REST** paths (gossip ingest, boot rebuild)
+  have no response to carry the message, so they record the same single
+  `fork_quarantine_refusals` increment and log the §5 sentence rather than
+  dropping silently. Carrier history rows are still committed and retained
+  (R3: ingest is tag-and-retain) — refusing to honour a delegation never blanks
+  the forensic record. `GET /groups/:id/delegations` **keeps serving**, now
+  annotated with `fork_quarantined: true` and a `fork_quarantine` object in the
+  same shape the refusal carries: an operator auditing who holds authority
+  during a fork must not lose the list at the moment it matters. Refusals are
+  effective from the FIRST request after the marker installs (R5 — no
+  warn-only window, no grace); the only exit is
+  `POST /groups/:id/quarantine/clear` (CLI: `x0x groups quarantine clear <ID>`,
+  with `--force --reason "…"` for an ordinary `no_anchor` group), after which
+  the index re-derives from durable history and service resumes with no
+  re-issuance. Groups with no marker, and delegations for any other group, are
+  byte-for-byte unaffected. Runbook: `docs/runbooks/fork-quarantine.md` §1.
+
 - **Ordinary (non-owner-axis) groups now receive the fork-quarantine marker
   (ADR-0066 §2, slice 2; #732) — a NEW availability failure mode with no
   automatic exit.** ADR-0064 set the marker only for owner-axis groups, so for
