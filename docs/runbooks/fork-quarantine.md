@@ -22,6 +22,40 @@ HTTP 409 `fork_quarantined`:
 - TreeKEM encrypt/decrypt
 - the `secure/encrypt`, `secure/decrypt`, `secure/reseal` family
 
+### The refusal body (ADR-0066 §5)
+
+**Match on `reason`, not on `error`.** ADR-0066 §5 moved the stable machine
+code out of the human field so the human field can explain itself:
+
+```json
+{
+  "ok": false,
+  "reason": "fork_quarantined",
+  "error": "group is fork-quarantined on this node: authenticated fork evidence at revision 7 means the roster is contested, so this operation is refused here. It clears when an owner-anchored commit advances past revision 7, or immediately with the manual clear POST /groups/:id/quarantine/clear (CLI: `x0x groups quarantine clear <GROUP_ID>`, which needs `--force --reason \"<why>\"` unless this install holds the group's owner user key).",
+  "fork_quarantine": {
+    "revision": 7,
+    "observed_at_ms": 1700000000123,
+    "no_anchor": false,
+    "clear_with": "POST /groups/:id/quarantine/clear"
+  }
+}
+```
+
+- `reason` — the stable machine code. This is the field clients match.
+- `error` — prose, and NOT a matchable contract: its wording may change, and
+  it branches on `no_anchor` so the remedy it names is the one that can
+  actually succeed for that group (a `no_anchor` marker never auto-clears, and
+  its clear requires `--force` with a reason because there is no owner axis to
+  attest with — §4.3).
+- `fork_quarantine.clear_with` — the remedy, machine-readable, so a GUI or a
+  script can offer it without parsing the sentence.
+
+**One-time compatibility break.** Before ADR-0066 §5 the body was
+`{"ok": false, "error": "fork_quarantined"}`. A client matching the literal
+`error == "fork_quarantined"` stops matching and must move to `reason`. HTTP
+409 and `ok: false` are unchanged. The `x0x` CLI prints the sentence, the
+remedy and the code (`… (HTTP 409, reason: fork_quarantined)`).
+
 The refusal means: this node has applied and retained authenticated
 fork evidence (a conflicting state-commit whose signature verifies and whose
 committer was an active admin in the retained predecessor roster — the same
