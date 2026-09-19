@@ -516,8 +516,7 @@ pub(in crate::server) async fn update_task(
                 &state,
                 &scoped.group_id,
                 marker,
-            )
-            .into_response();
+            );
         }
         let committed =
             crate::server::delegations::committed_delegations(&state, &scoped.group_id).await;

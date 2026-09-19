@@ -463,9 +463,9 @@ pub(in crate::server) fn authorize(
     // what the marker does there, which is the property that keeps a
     // future caller from joining the ungated set by omission.
     if let Some(marker) = quarantine {
-        return Err(crate::server::routes::named_groups::fork_quarantine_refusal_message(
-            group_id, marker,
-        ));
+        return Err(
+            crate::server::routes::named_groups::fork_quarantine_refusal_message(group_id, marker),
+        );
     }
     let d = &sd.delegation;
     if d.group_id != group_id {
@@ -1139,7 +1139,10 @@ pub(in crate::server) async fn list_group_delegations(
     // when there is no marker.
     if let Some(marker) = &quarantine {
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("fork_quarantined".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "fork_quarantined".to_string(),
+                serde_json::Value::Bool(true),
+            );
             obj.insert(
                 "fork_quarantine".to_string(),
                 crate::server::routes::named_groups::fork_quarantine_annotation(marker),

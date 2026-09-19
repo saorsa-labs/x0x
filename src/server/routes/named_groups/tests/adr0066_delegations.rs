@@ -45,6 +45,15 @@ async fn delegation_state() -> Result<(Arc<AppState>, tempfile::TempDir)> {
             .with_agent_cert_path(data_dir.join("agent.cert"))
             .with_peer_cache_disabled()
             .with_contact_store_path(data_dir.join("contacts.json"))
+            // Durable ADR-0023 history is not optional here: it is the
+            // source of truth a delegation's effectiveness rests on, and
+            // "nothing was written" is only an assertion if there is a
+            // store that COULD have been written to.
+            .with_history(x0x::history::HistoryConfig {
+                enabled: true,
+                db_path: Some(data_dir.join("history.db")),
+                ..x0x::history::HistoryConfig::default()
+            })
             .build()
             .await?,
     );
@@ -99,7 +108,7 @@ fn marker(info: &x0x::groups::GroupInfo, no_anchor: bool) -> x0x::groups::ForkQu
     x0x::groups::ForkQuarantine {
         revision: 7,
         state_hash: info.state_hash.clone(),
-        committed_by: hex::encode(info.creator_agent_id().as_bytes()),
+        committed_by: "9e".repeat(32),
         observed_at_ms: 1_726_000_000_000,
         snapshot: x0x::groups::ForkSnapshot {
             terminal_commit: info.terminal_commit_header(),
@@ -188,7 +197,11 @@ fn assert_adr0066_refusal(body: &serde_json::Value, no_anchor: bool, case: &str)
          'actionable' bar: {error:?}"
     );
     let fq = &body["fork_quarantine"];
-    assert_eq!(fq["revision"].as_u64(), Some(7), "({case}) which divergence");
+    assert_eq!(
+        fq["revision"].as_u64(),
+        Some(7),
+        "({case}) which divergence"
+    );
     assert_eq!(
         fq["observed_at_ms"].as_u64(),
         Some(1_726_000_000_000),
@@ -670,7 +683,9 @@ async fn adr0066_slice3_does_not_touch_other_groups_or_ungrouped_delegations() -
 
     // The marker is scoped to the group that carries it.
     assert!(
-        fork_quarantine_marker(&state, &quarantined_id).await.is_some(),
+        fork_quarantine_marker(&state, &quarantined_id)
+            .await
+            .is_some(),
         "the contested group has a marker"
     );
     assert!(
@@ -678,7 +693,9 @@ async fn adr0066_slice3_does_not_touch_other_groups_or_ungrouped_delegations() -
         "its neighbour does not"
     );
     assert!(
-        fork_quarantine_marker(&state, &"9f".repeat(16)).await.is_none(),
+        fork_quarantine_marker(&state, &"9f".repeat(16))
+            .await
+            .is_none(),
         "and a group this node never joined has none either"
     );
 

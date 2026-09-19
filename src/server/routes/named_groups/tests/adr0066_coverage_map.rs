@@ -608,8 +608,7 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
         .map(|row| row.row)
         .collect();
     assert_eq!(
-        open,
-        OPEN_ROWS,
+        open, OPEN_ROWS,
         "the §1 rows still awaiting their slice — update this list in the slice that closes one"
     );
 
