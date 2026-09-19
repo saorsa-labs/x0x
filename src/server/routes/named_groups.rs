@@ -31621,6 +31621,7 @@ pub(in crate::server) mod tests {
     #[cfg(unix)]
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
+    mod adr0066_coverage_map;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod hs_f2_membership_cluster;

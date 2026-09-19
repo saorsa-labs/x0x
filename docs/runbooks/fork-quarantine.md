@@ -1,4 +1,4 @@
-# Fork quarantine runbook (ADR-0064)
+# Fork quarantine runbook (ADR-0064, ADR-0066)
 
 Operator procedures for the persistent fork-quarantine marker and the owner
 mandate grace machinery. Everything here is LOCAL, per-node state: a marker
@@ -10,8 +10,19 @@ context: [docs/trust-and-connectivity.md](../trust-and-connectivity.md)
 [ADR errata](../adr/README.md) (maintainer decisions of 2026-09-10/11),
 issues #468/#469/#472.
 
-Scope: **owner-axis groups** (Home-suite / `OwnerCertified` admission).
-Ordinary (non-owner-axis) groups are NOT gated — see §5.
+Scope: **every group.** ADR-0064 gated owner-axis groups (Home-suite /
+`OwnerCertified` admission) only. ADR-0066 §2 extends the marker to ordinary
+(non-owner-axis) groups, where it carries `no_anchor: true` and **only the
+manual clear lifts it** — see §5.
+
+> **Upgrade expectation (ADR-0066 Migration).** Expect `fork_quarantine_set`
+> to RISE on the upgrade wave, for groups that were already silently forked.
+> Nothing is quarantined retroactively — there is no startup scan — but the
+> first authenticated conflicting commit after the upgrade installs a marker
+> on an ordinary group that previously degraded silently, and that group's
+> data plane begins refusing at once, with no grace period (R5). Set alerting
+> thresholds on `fork_quarantine_set` and `fork_quarantine_refusals` before
+> rolling out, and read §5 first: for these groups a human is the only exit.
 
 ## 1) What the 409 `fork_quarantined` refusal means
 
@@ -64,8 +75,9 @@ group-keyed data until an owner-anchored path (§4) advances the chain past
 the evidenced revision. It is containment, not a verdict: ADR-0064
 deliberately has NO automated eviction, and the membership-event ingest path
 is NOT gated (the owner-anchored clearing commit must still be able to
-arrive). History/delegations/kv routes are not yet gated either (route
-coverage is deferred — #472 residual list).
+arrive). History, delegations, tasks, the bootstrap outbox and the WS plane
+are not yet gated or annotated: ADR-0066 §1 enumerates all 26 data-plane paths
+with a disposition each, and slices 3–6 land them.
 
 Group membership reads, `/groups/:id/state`, and the diagnostics surfaces
 keep working while quarantined.
@@ -100,7 +112,12 @@ The group record carries `fork_quarantine` (null when not quarantined):
     removed by the very commit the fork chains from, or a plain member);
   - `null`/absent — pre-slice-4 record shape (the claimed parent was not
     retained, so only the legacy revision−1 signer check ran).
-- `no_anchor` — reserved flag; always `false` today (see §5).
+- `no_anchor` — `true` when the group's policy has NO owner axis, i.e. there
+  is no anchor any commit could carry: nothing clears the marker
+  automatically and the manual clear (§4.3, force path) is the only exit
+  (§5). `false` on owner-axis groups, and on every marker persisted before
+  ADR-0066 (the field is `#[serde(default)]`, so an old record decodes as
+  the owner-axis marker it was).
 
 No shared secrets or TreeKEM material appear in the snapshot — it is
 header-only by construction.
@@ -140,8 +157,14 @@ survives restarts; counters are process-lifetime.
 
 ## 4) Clearing the marker — owner-anchored paths only
 
-A marker clears ONLY through an owner-anchored path, and every automatic
-path additionally requires the clearing commit to be one this node APPLIES
+**A `no_anchor` marker (ordinary group) has NO automatic path at all.** Skip
+to §4.3 — none of the anchored arms below can clear it; each one tests
+`no_anchor` and declines, by design (ADR-0066 §2). Note that the *retry
+rollback* of a non-durable install is not a clear and is deliberately not
+gated, so a transient persist failure never leaves a marker stranded.
+
+For an owner-axis marker, it clears ONLY through an owner-anchored path, and
+every automatic path additionally requires the clearing commit to be one this node APPLIES
 at a revision STRICTLY GREATER than the evidenced revision (ADR-0064 §3 as
 clarified in the 2026-09-11 errata). The contested branch's own commits —
 same-revision siblings, lower revisions, however well-formed — NEVER clear;
@@ -202,28 +225,54 @@ divergence is live. Force-clear is for: the evidenced fork is understood
 and abandoned, the owner is permanently unavailable, or containment is
 blocking an agreed recovery the automatic paths cannot express.
 
-## 5) Ordinary (non-owner-axis) groups — `quarantine_no_anchor`
+## 5) Ordinary (non-owner-axis) groups — `no_anchor: true`, manual clear only
 
-Ordinary groups are NOT gated (#472 decision 2, 2026-09-10): indefinite
-quarantine with no recovery path would brick ordinary groups in the wild,
-which is worse than the ADR-0016 equal-revision fork risk it prevents.
-Their behaviour is byte-for-byte unchanged:
+**Changed by ADR-0066 §2 (supersedes #472 decision 2 of 2026-09-10).**
+Ordinary groups ARE now contained. An ordinary group has no owner key by
+construction, so there is no anchor to wait for: the marker it receives
+carries `no_anchor: true`, and **only a human clears it**.
 
-- they never receive a marker — no 409 `fork_quarantined`, no
-  `fork_quarantine` field set;
-- authenticated fork evidence is still recorded (ADR-0059
-  `invite_lineage`) and visible through the diagnostics counters, so the
-  divergence is observable, not silent;
-- the marker type's `no_anchor` flag — the would-be "can never auto-clear"
-  case for groups with no owner axis — is reserved and always `false`.
+- **Trigger:** unchanged in how evidence is authenticated. Only a
+  conflicting commit whose signature verifies AND whose committer was an
+  active admin in the retained predecessor roster installs a marker. An
+  unauthenticated or forged conflict still records nothing (this is the
+  security boundary: a marker that any stranger could install would be a
+  remote denial of service with no automatic recovery). What DID widen is
+  which groups reach the evidence path — ADR-0066 R2 covers ordinary groups
+  formed without an invite too, so "ordinary group" is one population.
+- **Refusals:** the same rows as owner-axis groups — `POST /groups/:id/send`,
+  TreeKEM encrypt/decrypt, and the `secure/encrypt|decrypt|reseal` family —
+  effective on the FIRST request after the marker installs. No warn-only
+  window, no request budget (R5).
+- **No automatic clear, ever.** No commit, of any revision, on any ancestry
+  clears a `no_anchor` marker. All three owner-anchored clear arms test the
+  flag and decline.
+- **The exit** is the manual clear with the operator override, because there
+  is no owner axis to attest with:
 
-What an operator should do: treat rising fork-evidence counters on an
-ordinary group as an investigation signal. Establish the canonical chain
-out-of-band with the group's admins (compare `GET /groups/:id/state`
+  ```bash
+  x0x groups quarantine clear <GROUP_ID> --force --reason "<what you verified and why>"
+  ```
+
+  Without `--force` the endpoint answers 409 `force_required` — that is
+  correct, not a bug: there is nothing to mint an attestation with.
+
+**What an operator should do before clearing.** Establish the canonical
+chain out of band with the group's admins (compare `GET /groups/:id/state`
 heads across members), have an active admin of the AGREED chain advance it
-(revision strictly greater), and re-seat members still holding the
-disowned sibling (fresh invite/re-add). Gating for ordinary groups waits
-for an ADR that defines their anchor (#472 tracker).
+(revision strictly greater), re-seat members still holding the disowned
+sibling (fresh invite/re-add), and only then force-clear — naming this
+runbook and what you verified in `--reason`, which is logged and counted.
+Clearing while the divergence is still live re-quarantines on the next
+authenticated conflicting commit (every clear re-arms the evidence gate).
+
+**The accepted cost (ADR-0066 Consequences).** A benign network split that
+produces authenticated conflicting commits now strands an ordinary group
+until an operator intervenes. This was chosen over a founder-key anchor (R1:
+a compromised founder key would become an unreviewable eviction oracle) and
+over a quorum anchor (a two-member group's quorum is the attacker). The
+mitigation is the §1 refusal message, which names the condition, the cause
+and this exact remedy — not a delay.
 
 ## 6) Mixed-fleet notes
 
@@ -283,7 +332,9 @@ durable fix is a mandate-producing authority.
 | 409 `fork_quarantined` on send/encrypt | local marker set; authenticated fork evidence held | read `fork_quarantine` snapshot + classification (§2); let the owner anchor advance (§4.1–4.2); manual clear only per §4.3 |
 | `classification: "owner_anchored_conflict"` | the owner anchored a successor this node cannot apply | this node likely holds the disowned chain — coordinate with the owner before any force-clear |
 | `fork_quarantine_owner_anchored_refusals` rising, marker persists | contested branch publishing owner-anchored successors | divergence still live; do not force-clear |
-| fork-evidence counters rising on an ORDINARY group | divergence observed, not gated (§5) | out-of-band canonical-chain agreement + re-seat stragglers |
+| 409 `fork_quarantined` with `"no_anchor": true` | ordinary group contained; NO automatic clear exists (§5) | agree the canonical chain out of band, re-seat stragglers, then `x0x groups quarantine clear <ID> --force --reason "…"` |
+| `force_required` from the clear endpoint | the group has no owner axis to attest with (§5) | re-run the clear with `--force` and a reason — this is the documented path, not a fault |
+| `fork_quarantine_set` rising across a fleet right after an upgrade | groups already silently forked are being contained for the first time | expected (ADR-0066 Migration); triage per §5, do not mass force-clear |
 | 409 `owner_mandate_missing` (retryable) | post-grace absent mandate from a recorded-capable authority | upgrade/repair the authority (owner user key); retry the send |
 | `mandate_capability` row `state: "refusing"` | that agent's grace window elapsed | same as above, per-agent |
 | marker vanished after an old binary ran | downgrade dropped containment (§6) | re-upgrade; the node re-quarantines on the next authenticated conflict (gate re-arms on every clear/set) |

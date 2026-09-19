@@ -5844,3 +5844,74 @@ async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> R
     );
     Ok(())
 }
+
+/// WHY (ADR-0066 §2 clear-arm table, site 1 — `try_adopt_member_added_
+/// across_gap`): the tier-1 adoption clear is already fenced by the
+/// group's owner axis, so an ordinary group cannot reach it. §2 still
+/// requires the `no_anchor` test here, and the reason is precise: the
+/// existing fence tests the POLICY, while `no_anchor` is the MARKER's own
+/// claim, and §2 makes the marker's claim authoritative. A record whose
+/// policy says "owner axis" while its marker says "no anchor" — a policy
+/// change, a restored record, a future population — must not find a clear
+/// through this route when §2 says nothing clears such a marker.
+///
+/// The positive and strictly-greater arms are
+/// `adr0064_adoption_clear_requires_strictly_greater_revision`; this
+/// fixture varies only `no_anchor`, with the revision fence deliberately
+/// SATISFIED so the flag is the only thing that can decide.
+#[tokio::test]
+async fn adr0066_adoption_clear_declines_a_no_anchor_marker() -> Result<()> {
+    let stage = r3_stage(0x9C).await?;
+    let terminal = match &stage.member_added {
+        NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            ..
+        } => commit.revision,
+        _ => panic!("staged MemberAdded carries its terminal commit"),
+    };
+    assert!(terminal >= 1, "the staged terminal advances the chain");
+    {
+        let terminal_header = {
+            let groups = stage.joiner_state.named_groups.read().await;
+            groups
+                .get(&stage.group_id)
+                .expect("stub")
+                .terminal_commit_header()
+        };
+        let mut groups = stage.joiner_state.named_groups.write().await;
+        groups
+            .get_mut(&stage.group_id)
+            .expect("stub")
+            .fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: terminal - 1,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: stage.authority_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+    }
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(
+        result.accepted,
+        "the quarantined stub still adopts — ingest stays open (ADR-0066 row 24)"
+    );
+    let groups = stage.joiner_state.named_groups.read().await;
+    let info = groups.get(&stage.group_id).expect("group");
+    assert!(
+        info.has_active_member(&stage.joiner_hex),
+        "the joiner is seated regardless of the marker"
+    );
+    assert!(
+        info.fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.no_anchor),
+        "ADR-0066 §2: an attestation-anchored adoption past the evidenced revision still \
+         DECLINES a `no_anchor` marker — the marker's own claim outranks the policy fence"
+    );
+    Ok(())
+}

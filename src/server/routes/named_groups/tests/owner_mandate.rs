@@ -2828,3 +2828,95 @@ async fn owner_anchored_apply_path_clears_quarantine() -> Result<()> {
     drop(dir2);
     Ok(())
 }
+
+/// WHY (ADR-0066 §2 clear-arm table, site 2 — "**This is the load-bearing
+/// change**"): the mandate-carrying `MemberAdded` clear arm
+/// (`apply_named_group_metadata_event_inner`) has NO owner-axis fence of
+/// its own. It relied on an assumption ADR-0066 §2 invalidates — that the
+/// marker only ever exists on owner-axis groups — so extending the marker
+/// to ordinary groups without testing `no_anchor` here would hand those
+/// groups an AUTOMATIC clear and silently contradict the manual-only rule.
+/// The ADR's first draft named the wrong arm; this is the fixture that
+/// would have caught it.
+///
+/// The fixture is deliberately built on an OWNER-AXIS receiver carrying a
+/// `no_anchor` marker, which is the hostile case: the policy fence the
+/// other two arms have would not help here, so only the marker's own claim
+/// can decide. `owner_anchored_apply_path_clears_quarantine` is the
+/// positive control for the identical shape with `no_anchor: false`.
+#[tokio::test]
+async fn adr0066_mandate_carrying_member_added_declines_a_no_anchor_marker() -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "e1-invite-secret",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+
+    // Same seating as the positive control — the marker sits STRICTLY
+    // BELOW the terminal revision, so the strictly-greater fence is
+    // satisfied and `no_anchor` is the only thing that can refuse.
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("receiver group");
+        let terminal_header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: terminal.revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: actor_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+    }
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    let result = apply_event(&state, event).await;
+    assert!(
+        result.accepted,
+        "the anchored MemberAdded still APPLIES — inbound apply is never gated (ADR-0066 row 24), \
+         otherwise the clearing commit could never arrive"
+    );
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert!(
+            live.has_active_member(&joiner_hex),
+            "the roster change lands regardless of the marker"
+        );
+        assert!(
+            live.fork_quarantine
+                .as_ref()
+                .is_some_and(|marker| marker.no_anchor),
+            "ADR-0066 §2: a `no_anchor` marker is NEVER cleared by a commit — only the manual \
+             clear lifts it"
+        );
+    }
+    let row = diag_row(state.as_ref(), &group_id).await;
+    assert_eq!(
+        row.counters.fork_quarantine_owner_anchored_clears, 0,
+        "a declined clear must not be counted as one — the counter is what an operator reads to \
+         decide whether containment lifted"
+    );
+    drop(dir);
+    Ok(())
+}

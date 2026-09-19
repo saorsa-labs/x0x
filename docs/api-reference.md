@@ -2167,6 +2167,17 @@ and the clearing path; it branches on `no_anchor`, because a `no_anchor` marker
 never auto-clears and its manual clear requires `force` plus a reason.
 `fork_quarantine.clear_with` is the same remedy, machine-readable.
 
+**`no_anchor` (ADR-0066 §2).** `true` means the group's policy has no owner
+axis, so **no commit on any ancestry will ever clear the marker** — the only
+exit is `POST /groups/:id/quarantine/clear` with `force: true` and a non-empty
+`reason` (without `force` that endpoint answers 409 `force_required`, because
+there is no owner axis to attest with). Before ADR-0066 these ordinary groups
+never received a marker at all and no route refused for them; they now refuse
+the same rows as owner-axis groups, from the first request after the marker
+installs. Operators should expect `fork_quarantine_set` to rise after
+upgrading — see the
+[fork quarantine runbook](runbooks/fork-quarantine.md) §5.
+
 **One-time compatibility break (ADR-0066 §5).** This body previously was
 `{ "ok": false, "error": "fork_quarantined" }`. A client matching the literal
 `error == "fork_quarantined"` must move to `reason`. HTTP 409 and `ok: false`

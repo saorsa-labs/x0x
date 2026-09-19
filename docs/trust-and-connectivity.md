@@ -278,12 +278,12 @@ automated eviction (ADR-0064 Decision 2). The marker is strictly local
 containment state: stripped from outbound signed-public bootstrap snapshots
 and rejected inbound, exactly like `invite_lineage` — a member that never
 received the authenticated evidence is not contained (per-node scope,
-ADR-0064 Decision 3). **Non-owner-axis groups are out of scope for this
-slice**: they never receive a marker and their behaviour is byte-for-byte
-unchanged; their quarantine/recovery semantics (indefinite
-`quarantine_no_anchor` quarantine and the manual operator runbook) are
-deferred to the ADR follow-up (#472); the operator procedure that DID land
-— ordinary groups ungated, evidence and diagnostics only — is documented in
+ADR-0064 Decision 3). **Ordinary (non-owner-axis) groups are contained too
+since ADR-0066 §2**: authenticated conflicting evidence installs a marker with
+`no_anchor: true`, the same data-plane rows refuse, and — because such a group
+has no owner key to anchor anything — **no commit ever clears it**. All three
+owner-anchored clear arms test `no_anchor` and decline; the only exit is the
+manual clear with `force` plus a reason. The operator procedure is
 [docs/runbooks/fork-quarantine.md](runbooks/fork-quarantine.md) §5.
 Mixed-fleet note: the marker is a
 serde-default JSON field, so v0.41.4 binaries ignore it (and silently drop
@@ -387,8 +387,9 @@ Remote-owner attestation submission is OUT of scope for this endpoint:
 an attestation minted on another node cannot be supplied in the body. A
 keyless node asking without force gets a typed 409
 (`owner_key_unavailable`); a group with no owner axis gets
-`force_required`. A group with no marker (including every non-owner-axis
-group, which never sets one) answers 409. Every successful clear
+`force_required` — which is the NORMAL path for an ordinary group under
+ADR-0066 §2, since the force arm is the only exit a `no_anchor` marker has. A
+group with no marker answers 409. Every successful clear
 increments `fork_quarantine_manual_clears` and logs at info with the
 reason (the audit trail; the logged reason is capped at 256 chars) and
 returns the updated `fork_quarantine: null` view. The owner-key path is

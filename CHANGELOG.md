@@ -6,6 +6,41 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Ordinary (non-owner-axis) groups now receive the fork-quarantine marker
+  (ADR-0066 §2, slice 2; #732) — a NEW availability failure mode with no
+  automatic exit.** ADR-0064 set the marker only for owner-axis groups, so for
+  ordinary groups — the majority population — the gated count was **0 of the 26
+  enumerated data-plane paths**: every route served both branches of an
+  authenticated fork, indefinitely, while ADR-0064's own text claimed
+  `quarantine_no_anchor` semantics for exactly that case. Authenticated
+  conflicting evidence on an ordinary group now installs a marker with
+  `no_anchor: true`, which makes rows 1–12 reachable for that population:
+  `POST /groups/:id/send`, TreeKEM encrypt/decrypt, the
+  `secure/encrypt|decrypt|reseal` family and the group KV/store gates refuse
+  with the 409 `fork_quarantined` body below, from the FIRST request after the
+  marker installs (R5 — no warn-only window). **A `no_anchor` marker is never
+  cleared by any commit, on any ancestry**: all three owner-anchored clear arms
+  (attestation-verified adoption, the mandate-carrying `MemberAdded`, and the
+  explicit owner seal) now share one predicate and decline it, so the only exit
+  is `POST /groups/:id/quarantine/clear` with `force: true` and a reason (CLI:
+  `x0x groups quarantine clear <ID> --force --reason "…"`). The retry-rollback
+  of a non-durable install is deliberately NOT gated on the flag — an undo of
+  an install is not a clear, and gating it would turn a transient persist
+  failure into an unclearable quarantine. ADR-0066 R2 also widens the evidence
+  path to ordinary groups formed without an invite, so "ordinary group" is one
+  population rather than two; for those the marker itself is the durable
+  evidence record. **Evidence authentication is unchanged** — only a
+  conflicting commit whose signature verifies and whose committer was an active
+  admin in the retained predecessor roster installs a marker, so an
+  unauthenticated or forged conflict still quarantines nothing.
+  **Operators: expect `fork_quarantine_set` to rise on the upgrade wave** for
+  groups that were already silently forked. Nothing is quarantined
+  retroactively (there is no startup scan), but the first authenticated
+  conflicting commit after the upgrade contains the group at once. Mixed-fleet
+  safe: `no_anchor` is `#[serde(default)]`, so a marker persisted before this
+  release decodes as the owner-axis marker it was. Docs:
+  `docs/runbooks/fork-quarantine.md` §5, `docs/api-reference.md`.
+
 - **BREAKING (one-time, for literal matchers): the 409 `fork_quarantined`
   refusal now explains itself (ADR-0066 §5, slice 1; #732).** The stable
   machine code moved from `error` to a new `reason` field, and `error` became a
