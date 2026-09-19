@@ -247,6 +247,31 @@ carries `no_anchor: true`, and **only a human clears it**.
 - **No automatic clear, ever.** No commit, of any revision, on any ancestry
   clears a `no_anchor` marker. All three owner-anchored clear arms test the
   flag and decline.
+- **Said plainly: a CURRENT admin's own signed conflicting commit permanently
+  quarantines the group on every node that receives it, until a human runs the
+  manual `--force --reason` clear on each of those nodes.** The trigger asks
+  only that the committer was an Active Admin in the retained predecessor
+  roster — not whether that admin was malicious, confused, or merely
+  partitioned. An admin committing from a stale head (a laptop that was
+  offline; two admins sealing concurrently) therefore contains the group for
+  everyone who receives that commit, with no automatic recovery, and — because
+  the marker is per-node and never gossiped — no fleet-wide clear either: the
+  remedy is per-node too. This is accepted design, not an oversight: R1
+  rejected a founder-key anchor (a compromised founder key would be an
+  unreviewable eviction oracle) and R5 rejected every grace window, on the
+  condition that the refusal explains itself. Plan for it — an ordinary group
+  with several admins committing concurrently is the population most likely to
+  need this procedure.
+- **A recovery-time conflict on a lineage-less ordinary group records
+  nothing.** The journal-recovery evidence path
+  (`record_recovery_fork_evidence`) stays fenced to groups carrying an
+  `invite_lineage` record, because that record is where recovery-time evidence
+  is stored; ADR-0066 slice 2 widened the LIVE apply path only. So a conflict
+  discovered while replaying the persist journal for an ordinary group formed
+  without an invite installs no marker and fires no counter — the group is
+  contained on the next authenticated conflicting commit that arrives through
+  the live path instead. Treat a restart that logged a journal conflict on such
+  a group as NOT yet quarantined.
 - **The exit** is the manual clear with the operator override, because there
   is no owner axis to attest with:
 

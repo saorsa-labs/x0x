@@ -279,9 +279,9 @@ enum RouteClass {
     /// A group-scoped path the §1 map does NOT name, recorded as a gap in
     /// the map rather than quietly folded into a neighbouring row.
     ///
-    /// Both current entries are READ paths, so the gap is in the
+    /// The one current entry is a READ path, so the gap is in the
     /// annotate class (§3a/§3d), never the refuse class — no authority
-    /// escapes through them. They are reported on the slice-2 PR for the
+    /// escapes through it. It is reported on the slice-2 PR for the
     /// slice that owns annotations (slice 4/6) or a superseding ADR to
     /// absorb. The set is asserted EXACTLY, so a new unmapped route fails
     /// this fixture instead of joining a growing list.
