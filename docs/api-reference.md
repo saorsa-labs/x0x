@@ -2136,6 +2136,12 @@ must stay machine-separable (two distinct 409 CONFLICT conditions, say). **Where
 a `reason` is present, match on `reason`; `error` is prose and its wording is
 not a contract.**
 
+The `x0x` CLI renders a reason-bearing error as
+`<message> (HTTP <code>, reason: <reason>)`, and one with no `reason` as
+`<message> (HTTP <code>)`. The reason-bearing responses today are the 409
+`fork_quarantined` below and the 409 `recipient_not_active` on group key
+sealing.
+
 ### 409 `fork_quarantined` (ADR-0064 / ADR-0066 §5)
 
 While this node holds a fork-quarantine marker for a group, the

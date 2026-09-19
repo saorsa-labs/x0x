@@ -24,11 +24,20 @@ All notable changes to this project will be documented in this file.
   a `no_anchor` marker only clears with `force` plus a reason).
   `reject_fork_quarantined` remains the single refusal helper (§3e) and the
   diagnostics contract is unchanged (one `fork_quarantine_refusals` increment
-  per refusal). The `x0x` CLI now prints any `reason` alongside the message
-  (`… (HTTP 409, reason: fork_quarantined)`); errors without a `reason` render
-  exactly as before. Docs: `docs/api-reference.md` (Error handling),
+  per refusal). Docs: `docs/api-reference.md` (Error handling),
   `docs/runbooks/fork-quarantine.md` §1, `docs/trust-and-connectivity.md`,
   `SKILL.md`.
+- **The `x0x` CLI now prints a response's `reason` alongside the message**, as
+  `<message> (HTTP <code>, reason: <reason>)`. Errors with no `reason` render
+  byte-identically to before, so this affects exactly the reason-bearing
+  responses — which today means the new 409 `fork_quarantined` above **and the
+  pre-existing 409 `recipient_not_active`** (ADR-0028 active-recipient group key
+  sealing), whose CLI output gains `, reason: recipient_not_active`. The change
+  is in the shared `error_from_body` path rather than per-command, so any future
+  `api_error_with_reason` response inherits it: a human reads the sentence, a
+  script matching CLI output keeps the stable code. Anything parsing the CLI's
+  error line positionally should match on the `reason:` key, not on trailing
+  text.
 
 ### CI
 
