@@ -5221,11 +5221,10 @@ async fn adr0064_owner_axis_twin_conflict_quarantines_gates_and_owner_seal_clear
     .await;
     let body: serde_json::Value = json.0;
     assert_eq!(status, StatusCode::CONFLICT, "gated while quarantined");
-    assert_eq!(
-        body["error"].as_str(),
-        Some("fork_quarantined"),
-        "typed quarantine error: {body}"
-    );
+    // ADR-0066 §5 (slice 1): the machine code moved from `error` to
+    // `reason`, and `error` now carries the mandatory informational
+    // sentence. The whole contract is asserted in one shared place.
+    super::fork_quarantine::assert_fork_quarantine_refusal_body(&body);
     let row = diagnostics_row(state.as_ref(), &group_id).await;
     assert_eq!(row.counters.fork_quarantine_refusals, 1);
 
@@ -5333,12 +5332,10 @@ async fn adr0064_restart_preserves_marker_and_gate_still_refuses() -> Result<()>
         StatusCode::CONFLICT,
         "the gate still refuses after the restart"
     );
-    assert_eq!(
-        json.0["error"].as_str(),
-        Some("fork_quarantined"),
-        "typed fork-quarantine error after reload: {}",
-        json.0
-    );
+    // ADR-0066 §5: the refusal keeps explaining itself across a restart —
+    // the message is rebuilt from the RELOADED marker, so a persisted
+    // marker whose fields survived must still produce the full body.
+    super::fork_quarantine::assert_fork_quarantine_refusal_body(&json.0);
     Ok(())
 }
 

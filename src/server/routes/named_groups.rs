@@ -19907,17 +19907,102 @@ fn reject_unverified_owner_certified_restore(
 /// local owner-certified seal; non-owner-axis groups never receive a
 /// marker in this slice. Each refusal bumps the
 /// `fork_quarantine_refusals` diagnostic.
+///
+/// ADR-0066 §5 (slice 1): the machine code moved from `error` to
+/// `reason`, and `error` now carries the informational sentence R5 made
+/// mandatory when it removed the warn-only window. A bare code is a
+/// permanent, unexplained refusal for a marker that never auto-clears,
+/// so this helper is the single place the message is built — no route
+/// can refuse without explaining itself and no two routes can drift in
+/// wording (§3e).
 fn reject_fork_quarantined(
     state: &AppState,
     group_id: &str,
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    info.is_fork_quarantined().then(|| {
-        state
-            .groups_diagnostics
-            .record_fork_quarantine_refusal(group_id);
-        api_error(StatusCode::CONFLICT, "fork_quarantined")
-    })
+    let marker = info.fork_quarantine.as_ref()?;
+    state
+        .groups_diagnostics
+        .record_fork_quarantine_refusal(group_id);
+    Some((
+        StatusCode::CONFLICT,
+        Json(fork_quarantine_refusal_body(group_id, marker)),
+    ))
+}
+
+/// ADR-0066 §5: the refusal body, built from the marker alone.
+///
+/// Split out from [`reject_fork_quarantined`] (which additionally owns
+/// the diagnostics increment and needs an `AppState`) so the payload
+/// contract is testable without a daemon fixture: the §5 acceptance bar
+/// is a property of the body, and a test that has to stand a node up to
+/// check it is a test nobody runs.
+fn fork_quarantine_refusal_body(
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+) -> serde_json::Value {
+    let (_, Json(mut body)) = api_error_with_reason(
+        StatusCode::CONFLICT,
+        fork_quarantine_refusal_message(group_id, marker),
+        FORK_QUARANTINED_REASON,
+    );
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "fork_quarantine".to_string(),
+            serde_json::json!({
+                "revision": marker.revision,
+                "observed_at_ms": marker.observed_at_ms,
+                "no_anchor": marker.no_anchor,
+                "clear_with": FORK_QUARANTINE_CLEAR_ROUTE,
+            }),
+        );
+    }
+    body
+}
+
+/// ADR-0066 §5: the stable machine code clients match on. It lives in
+/// the `reason` field; `error` is prose and is NOT a matchable contract.
+const FORK_QUARANTINED_REASON: &str = "fork_quarantined";
+
+/// ADR-0066 §5: the machine-readable remedy carried in
+/// `fork_quarantine.clear_with`.
+const FORK_QUARANTINE_CLEAR_ROUTE: &str = "POST /groups/:id/quarantine/clear";
+
+/// ADR-0066 §5: the informational sentence. It must state all three of
+/// the condition (this node holds authenticated fork evidence), why the
+/// operation is refused (the roster is contested), and the exit — and
+/// the exit it names has to be the one that actually works for the
+/// group's own shape, so the wording branches on `no_anchor`:
+///
+/// - owner-axis marker (`no_anchor == false`): an owner-anchored commit
+///   advancing past the evidence revision clears it, and the manual
+///   route clears it now; on a node holding the owner user key the CLI
+///   needs no flags (`clear_group_quarantine` path (a)).
+/// - `no_anchor` marker: nothing clears it automatically, and the manual
+///   route has no owner axis to attest with, so the operator override
+///   (`--force` plus a reason) is the only exit (path (b)).
+fn fork_quarantine_refusal_message(group_id: &str, marker: &x0x::groups::ForkQuarantine) -> String {
+    let revision = marker.revision;
+    if marker.no_anchor {
+        format!(
+            "group is fork-quarantined on this node: authenticated fork evidence at \
+             revision {revision} means the roster is contested, so this operation is \
+             refused here. This group has no owner axis, so nothing clears the marker \
+             automatically — the only exit is the manual clear \
+             {FORK_QUARANTINE_CLEAR_ROUTE} (CLI: `x0x groups quarantine clear \
+             {group_id} --force --reason \"<why>\"`)."
+        )
+    } else {
+        format!(
+            "group is fork-quarantined on this node: authenticated fork evidence at \
+             revision {revision} means the roster is contested, so this operation is \
+             refused here. It clears when an owner-anchored commit advances past \
+             revision {revision}, or immediately with the manual clear \
+             {FORK_QUARANTINE_CLEAR_ROUTE} (CLI: `x0x groups quarantine clear \
+             {group_id}`, which needs `--force --reason \"<why>\"` unless this install \
+             holds the group's owner user key)."
+        )
+    }
 }
 
 #[cfg(test)]

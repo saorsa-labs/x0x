@@ -1818,3 +1818,252 @@ async fn adr0064_owner_anchored_conflict_label_lands_on_fresh_evidence() -> Resu
     );
     Ok(())
 }
+
+/// ADR-0066 §5 acceptance bar, asserted in ONE place so the three
+/// pre-existing refusal sites and every future refusing row check the
+/// same contract instead of each re-deriving it (§3e: one helper builds
+/// the refusal, so one helper should assert it).
+///
+/// WHY each clause matters, not just what it checks:
+/// - `reason` is the stable machine code. R5 moved it out of `error`
+///   precisely so that `error` is free to be prose; if `reason` is
+///   missing, every client that migrated has silently lost its match.
+/// - `error` must NOT equal the code. This is the clause that fails if
+///   someone reverts to `api_error(CONFLICT, "fork_quarantined")` — the
+///   exact regression §5 exists to prevent, and one a "409 is returned"
+///   test cannot see.
+/// - `error` must name the quarantine, the reason operations are
+///   refused, and the clearing path. R5 removed the warn-only window on
+///   the condition that a user always learns why; a marker that never
+///   auto-clears turns a bare code into a permanent mystery, so
+///   "mentions quarantine" alone is not the bar — "actionable" is.
+/// - `fork_quarantine.clear_with` carries the remedy machine-readably so
+///   a GUI or script can offer it without parsing prose.
+pub(super) fn assert_fork_quarantine_refusal_body(body: &serde_json::Value) {
+    assert_eq!(
+        body["ok"].as_bool(),
+        Some(false),
+        "ADR-0066 §5: `ok: false` is unchanged — the envelope shape is compatible: {body}"
+    );
+    assert_eq!(
+        body["reason"].as_str(),
+        Some("fork_quarantined"),
+        "ADR-0066 §5: the stable machine code lives in `reason`: {body}"
+    );
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        !message.is_empty(),
+        "ADR-0066 §5: a refusal without a message is a failing test, not a cosmetic gap: {body}"
+    );
+    assert_ne!(
+        message, "fork_quarantined",
+        "ADR-0066 §5 regression guard: `error` must be prose, never the bare machine code — \
+         this assertion is what fails if the refusal reverts to `api_error`: {body}"
+    );
+    assert!(
+        message.contains("fork-quarantined"),
+        "ADR-0066 §5: the sentence must name the condition: {message}"
+    );
+    assert!(
+        message.contains("contested") && message.contains("refused"),
+        "ADR-0066 §5: the sentence must say WHY the operation was refused: {message}"
+    );
+    assert!(
+        message.contains("/quarantine/clear") && message.contains("x0x groups quarantine clear"),
+        "ADR-0066 §5: a message that names the condition but not the remedy does not satisfy \
+         R5 — the CLI command is named for CLI users: {message}"
+    );
+    let marker = &body["fork_quarantine"];
+    assert!(
+        marker["revision"].is_u64(),
+        "ADR-0066 §5: which divergence: {body}"
+    );
+    assert!(
+        marker["observed_at_ms"].is_u64(),
+        "ADR-0066 §5: when this node saw it: {body}"
+    );
+    assert!(
+        marker["no_anchor"].is_boolean(),
+        "ADR-0066 §5: whether anything will clear this automatically: {body}"
+    );
+    assert_eq!(
+        marker["clear_with"].as_str(),
+        Some("POST /groups/:id/quarantine/clear"),
+        "ADR-0066 §5: the remedy, machine-readable: {body}"
+    );
+}
+
+/// A marker built without a daemon, for the inert payload-contract test.
+fn synthetic_marker(no_anchor: bool) -> Result<x0x::groups::ForkQuarantine> {
+    let kp = AgentKeypair::generate()?;
+    let info = x0x::groups::GroupInfo::with_policy(
+        "payload-contract".to_string(),
+        String::new(),
+        crate::identity::AgentId::from_public_key(kp.public_key()),
+        "aa".repeat(32),
+        invite_only_policy(),
+    );
+    let header = info.terminal_commit_header();
+    Ok(x0x::groups::ForkQuarantine {
+        revision: 7,
+        state_hash: "0".repeat(64),
+        committed_by: "ff".repeat(32),
+        observed_at_ms: 1_700_000_000_123,
+        snapshot: x0x::groups::ForkSnapshot {
+            terminal_commit: header.clone(),
+            conflicting_commit: header,
+            classification: None,
+        },
+        no_anchor,
+    })
+}
+
+/// WHY (ADR-0066 §5, slice 1): the refusal must explain itself. R5
+/// removed the warn-only window *on the condition* that a user always
+/// learns why an operation was refused, so the message is part of the
+/// containment contract, not presentation polish.
+///
+/// Both marker shapes are asserted because the remedy differs and a
+/// wrong remedy is worse than none: an owner-axis marker also clears
+/// when the owner anchor advances, while a `no_anchor` marker never
+/// auto-clears and its manual clear has no owner axis to attest with, so
+/// it can only be cleared with the operator override
+/// (`clear_group_quarantine` path (b)). A message that told an ordinary
+/// group's operator to "wait for the owner anchor", or told them to run
+/// the clear without `--force`, would send them down a path that cannot
+/// succeed.
+///
+/// Inert by construction: no AppState, no Agent, no sockets — the §5
+/// bar is a property of the body, and a payload test that needs a node
+/// stood up is a payload test nobody runs.
+#[test]
+fn adr0066_refusal_body_carries_the_machine_code_and_an_actionable_message() -> Result<()> {
+    let group_id = "c1".repeat(32);
+
+    let owner_axis = fork_quarantine_refusal_body(&group_id, &synthetic_marker(false)?);
+    assert_fork_quarantine_refusal_body(&owner_axis);
+    let owner_message = owner_axis["error"].as_str().unwrap_or_default();
+    assert!(
+        owner_message.contains("owner-anchored commit advances past revision 7"),
+        "an owner-axis marker's exit includes the anchored advance, named with the \
+         evidenced revision: {owner_message}"
+    );
+    assert_eq!(
+        owner_axis["fork_quarantine"]["no_anchor"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(owner_axis["fork_quarantine"]["revision"].as_u64(), Some(7));
+    assert_eq!(
+        owner_axis["fork_quarantine"]["observed_at_ms"].as_u64(),
+        Some(1_700_000_000_123)
+    );
+
+    let no_anchor = fork_quarantine_refusal_body(&group_id, &synthetic_marker(true)?);
+    assert_fork_quarantine_refusal_body(&no_anchor);
+    let no_anchor_message = no_anchor["error"].as_str().unwrap_or_default();
+    assert!(
+        no_anchor_message.contains("nothing clears the marker automatically"),
+        "a `no_anchor` marker must say plainly that no advance will lift it: {no_anchor_message}"
+    );
+    assert!(
+        no_anchor_message.contains("--force") && no_anchor_message.contains("--reason"),
+        "the only clear available to a group with no owner axis is the operator override: \
+         {no_anchor_message}"
+    );
+    assert!(
+        !no_anchor_message.contains("owner-anchored commit advances"),
+        "a `no_anchor` marker must NOT offer the anchored advance — it cannot happen: \
+         {no_anchor_message}"
+    );
+    assert_eq!(
+        no_anchor["fork_quarantine"]["no_anchor"].as_bool(),
+        Some(true)
+    );
+
+    // The group id is in the CLI hint so the remedy is copy-pasteable
+    // rather than a template the operator has to fill in under
+    // incident pressure.
+    assert!(
+        owner_message.contains(&group_id) && no_anchor_message.contains(&group_id),
+        "the printed remedy names the group"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0066 §5 + R5 no-grace): the message must arrive on the
+/// FIRST refused request after the marker installs. R5 rejected the
+/// warn-only window, so there is no request budget, counter threshold or
+/// elapsed-time window that lets one operation through unexplained; this
+/// is the regression test for that rejected design, so a future
+/// re-introduction of grace fails loudly instead of silently weakening
+/// containment.
+#[tokio::test]
+async fn adr0066_first_request_after_install_is_refused_with_the_message() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "c3".repeat(32);
+    let base =
+        sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp)).await?;
+    let fork_a = owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = owner_seal_variant(&state, &base, "fork-b").await?;
+    let first = apply_commit(
+        &state,
+        &group_id,
+        fork_a.commit_log.last().expect("sealed").commit.clone(),
+        "fork-a",
+    )
+    .await?;
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+    let second = apply_commit(
+        &state,
+        &group_id,
+        fork_b.commit_log.last().expect("sealed").commit.clone(),
+        "fork-b",
+    )
+    .await?;
+    assert!(second.is_err(), "the twin conflicts");
+    let marker_revision = live_record(&state, &group_id)
+        .await
+        .fork_quarantine
+        .as_ref()
+        .expect("marker installed")
+        .revision;
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_refusals,
+        0,
+        "no request has been refused yet — the first one below is the first"
+    );
+
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the very first request after the install is refused — no grace: {}",
+        json.0
+    );
+    assert_fork_quarantine_refusal_body(&json.0);
+    assert_eq!(
+        json.0["fork_quarantine"]["revision"].as_u64(),
+        Some(marker_revision),
+        "the body names the divergence the live marker recorded, not a placeholder"
+    );
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_refusals,
+        1,
+        "§3e: one refusal, one increment — the message did not change the diagnostic contract"
+    );
+    Ok(())
+}
