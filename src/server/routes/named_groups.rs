@@ -3805,8 +3805,7 @@ fn fork_quarantine_for_evidence(
 /// owner-axis group without lineage is an authority-side record, not a
 /// joiner stub. Its evaluation therefore stays exactly as it shipped.
 fn fork_evidence_path_open(current: &x0x::groups::GroupInfo) -> bool {
-    current.invite_lineage.is_some()
-        || current.policy.admission.owner_certified_user_id().is_none()
+    current.invite_lineage.is_some() || current.policy.admission.owner_certified_user_id().is_none()
 }
 
 /// The shared error arm of the two central apply hooks: evaluate the

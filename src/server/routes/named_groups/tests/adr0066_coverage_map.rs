@@ -335,7 +335,10 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ("POST /task-lists", RouteClass::Covered(&[20])),
     ("GET /task-lists/:id/tasks", RouteClass::Covered(&[20])),
     ("POST /task-lists/:id/tasks", RouteClass::Covered(&[20])),
-    ("PATCH /task-lists/:id/tasks/:tid", RouteClass::Covered(&[20])),
+    (
+        "PATCH /task-lists/:id/tasks/:tid",
+        RouteClass::Covered(&[20]),
+    ),
     // ── §1 row 23: the DM-plane file transfer, enumerated not gated ─────
     ("POST /files/send", RouteClass::Covered(&[23])),
     ("GET /files/transfers", RouteClass::Covered(&[23])),
@@ -385,7 +388,10 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ),
     ("GET /groups/discover", RouteClass::ControlPlane),
     ("GET /groups/discover/nearby", RouteClass::ControlPlane),
-    ("GET /groups/discover/subscriptions", RouteClass::ControlPlane),
+    (
+        "GET /groups/discover/subscriptions",
+        RouteClass::ControlPlane,
+    ),
     ("POST /groups/discover/subscribe", RouteClass::ControlPlane),
     (
         "DELETE /groups/discover/subscribe/:kind/:shard",
@@ -395,7 +401,10 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ("POST /groups/cards/import", RouteClass::ControlPlane),
     // The remedy the §5 message names: gating it would make every
     // `no_anchor` quarantine permanent.
-    ("POST /groups/:id/quarantine/clear", RouteClass::ControlPlane),
+    (
+        "POST /groups/:id/quarantine/clear",
+        RouteClass::ControlPlane,
+    ),
     // The MLS plane's own membership surface.
     ("POST /mls/groups", RouteClass::ControlPlane),
     ("GET /mls/groups", RouteClass::ControlPlane),

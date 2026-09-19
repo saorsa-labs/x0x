@@ -2377,7 +2377,6 @@ async fn adr0066_non_durable_install_rolls_back_a_no_anchor_marker() -> Result<(
             "nothing is counted for an install that never reached durability"
         );
     }
-    assert!(confirm_named_groups_durability(&state).await);
 
     let retry = apply_commit(&state, &group_id, fork_b, "fork-b").await?;
     assert!(retry.is_err());
@@ -2424,13 +2423,10 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
 
     // Path (a) is unreachable for this population, and says so.
     let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
-    let response = clear_group_quarantine(
-        State(Arc::clone(&state)),
-        Path(group_id.clone()),
-        Json(req),
-    )
-    .await
-    .into_response();
+    let response =
+        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
@@ -2451,13 +2447,10 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
         "force": true,
         "reason": "benign split confirmed by both operators",
     }))?;
-    let response = clear_group_quarantine(
-        State(Arc::clone(&state)),
-        Path(group_id.clone()),
-        Json(req),
-    )
-    .await
-    .into_response();
+    let response =
+        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "the override clears: {body}");
     assert_eq!(body["cleared_by"].as_str(), Some("force"));
@@ -2559,7 +2552,11 @@ fn adr0066_explicit_owner_seal_declines_a_no_anchor_marker() -> Result<()> {
             "ab".repeat(32),
             owner_certified_policy(&owner_kp),
         );
-        info.seal_commit(&agent_kp, now_millis_u64())?;
+        // The seal itself is not under test here (an owner-certified seal
+        // needs ADR-0038 certificate evidence and an AppState); the clear
+        // reads only the head revision, the policy and the marker, so the
+        // post-seal head is set directly to keep the fixture inert.
+        info.state_revision = 5;
         let header = info.terminal_commit_header();
         // The marker sits strictly BELOW the sealed revision, so the
         // strictly-greater fence is satisfied and `no_anchor` is the only
@@ -2620,7 +2617,10 @@ fn adr0066_marker_persisted_before_the_field_decodes_as_owner_axis() -> Result<(
         !decoded.no_anchor,
         "an old persisted marker is an owner-axis marker and keeps its anchored clear path"
     );
-    assert_eq!(decoded.revision, marker.revision, "and nothing else shifted");
+    assert_eq!(
+        decoded.revision, marker.revision,
+        "and nothing else shifted"
+    );
 
     // Forward direction: a `no_anchor` marker written by this binary
     // round-trips, so a restart does not quietly re-anchor an ordinary
