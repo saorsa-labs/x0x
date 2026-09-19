@@ -767,7 +767,19 @@ if [ -n "$NYC_TK" ]; then
             if a_is_live sydney && [ -n "$SYD_TK" ]; then
                 R=$(vps_post "$SYD_IP" "$SYD_TK" /groups/join "{\"invite\":\"$INVITE\",\"display_name\":\"Sydney Space Tester\"}")
                 check_not_error "Sydney joins via invite" "$R"
-                R=$(vps_get "$SYD_IP" "$SYD_TK" "/groups/$NG")
+                # #480: the join is committed by the authority (NYC) — Sydney's local
+                # members list stays in pending_authority_commit state until the
+                # authority-signed MemberAdded propagates back. Poll until Sydney's own
+                # view converges to include itself, then assert on the final response.
+                SYD_SELF_VISIBLE=false
+                for _ in $(seq 1 20); do
+                    R=$(vps_get "$SYD_IP" "$SYD_TK" "/groups/$NG")
+                    if echo "$R" | grep -q "$SYD_AID"; then
+                        SYD_SELF_VISIBLE=true
+                        break
+                    fi
+                    sleep 1
+                done
                 check_json "Sydney group info" "$R" "members"
                 check_contains "Sydney space member list includes self" "$R" "$SYD_AID"
                 check_contains "Sydney space member display name persisted" "$R" "Sydney Space Tester"
