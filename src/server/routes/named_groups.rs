@@ -13672,9 +13672,25 @@ pub(in crate::server) async fn get_group_public_messages(
         })
         .collect();
 
+    // ADR-0066 §3a (slice 4): this is the group plane's own ADR-0023 read —
+    // the §1 map gap slice 2's coverage fixture recorded as
+    // `GET /groups/:id/messages`. It is an ANNOTATE-class read, never
+    // refused, and it reuses the history surface's annotation verbatim so
+    // the two cannot drift. Envelope-level only: the payload here is
+    // `GroupPublicMessage` objects rather than store rows, so there is no
+    // per-row `seen_at_ms` to carry the R3 ingest tag — `GET /history` is
+    // where a reader gets that.
+    let markers = crate::server::routes::history::markers_for_scopes(
+        &state,
+        std::iter::once(&x0x::history::Scope::Group(stable_id.clone())),
+    )
+    .await;
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "messages": messages_with_id })),
+        Json(crate::server::routes::history::annotate(
+            serde_json::json!({ "ok": true, "messages": messages_with_id }),
+            &markers,
+        )),
     )
 }
 
@@ -19998,7 +20014,7 @@ fn reject_unverified_owner_certified_restore(
 /// so this helper is the single place the message is built — no route
 /// can refuse without explaining itself and no two routes can drift in
 /// wording (§3e).
-fn reject_fork_quarantined(
+pub(in crate::server) fn reject_fork_quarantined(
     state: &AppState,
     group_id: &str,
     info: &x0x::groups::GroupInfo,
@@ -20049,7 +20065,8 @@ const FORK_QUARANTINED_REASON: &str = "fork_quarantined";
 
 /// ADR-0066 §5: the machine-readable remedy carried in
 /// `fork_quarantine.clear_with`.
-const FORK_QUARANTINE_CLEAR_ROUTE: &str = "POST /groups/:id/quarantine/clear";
+pub(in crate::server) const FORK_QUARANTINE_CLEAR_ROUTE: &str =
+    "POST /groups/:id/quarantine/clear";
 
 /// ADR-0066 §5: the informational sentence. It must state all three of
 /// the condition (this node holds authenticated fork evidence), why the

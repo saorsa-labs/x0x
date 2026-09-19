@@ -6,6 +6,42 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Durable history under fork quarantine: the purge is REFUSED, every read
+  keeps serving and says so (ADR-0066 §3a / R3, slice 4; #732).** While this
+  node holds a fork-quarantine marker for a group,
+  `DELETE /history?scope=group:<ID>` answers the 409 `fork_quarantined` body
+  (§5 shape, from the one shared refusal helper) **before it deletes
+  anything**, so a refused purge leaves the store unchanged. A purge is the
+  irreversible destruction of the ADR-0023 durable record — the primary
+  post-hoc artefact for a fork — and nobody, operator or attacker, should be
+  able to delete the evidence mid-incident. Reads are the exact opposite and
+  are **never** refused, because containment must not blind the operator:
+  `GET /history`, `/history/message/:msg_id`, `/history/search`,
+  `/history/scopes`, `/history/stats`, `GET /diagnostics/history` and
+  `GET /groups/:id/messages` keep serving the same rows and add
+  `"fork_quarantined": true` plus `"fork_quarantine": { "clear_with": …,
+  "scopes": [{ "scope", "revision", "observed_at_ms", "no_anchor" }] }` to the
+  envelope. The per-scope object mirrors the §5 refusal body; the list exists
+  because these surfaces are not single-group — a cross-scope search, scope
+  enumeration and the two node-wide surfaces can each have several quarantined
+  groups in view. **Both keys are ABSENT — not `false`, not `null` — when
+  nothing in view is quarantined, so a client that ignores ADR-0066 sees a
+  byte-identical body.** Ingest is **tag-and-retain, never refused** (R3): rows
+  arriving while the marker is set are stored and served like any other, and a
+  row of a quarantined group whose `seen_at_ms` is at or after the marker's
+  `observed_at_ms` additionally carries `"fork_quarantined_at_ingest": true`,
+  so the incident window is distinguishable from the group's pre-fork traffic.
+  That tag is **derived from the marker, not persisted**: no `HistoryRecord`
+  field and no SQLite schema bump, so old rows need no migration and an older
+  binary still opens the same `history.db` after a rollback — the trade is that
+  a manual clear (the operator asserting the fork is resolved) drops the label
+  while keeping every row. Persisting it is a superseding-ADR decision.
+  `GET /groups/:id/messages` — the one gap slice 2's coverage fixture found in
+  the ADR's own §1 map — is folded in here as part of row 13 and annotated at
+  the envelope only (its payload is signed messages, not store rows, so it
+  carries no per-row ingest tag). Rows closed: **13, 14, 26**. Docs:
+  `docs/api-reference.md`, `docs/runbooks/fork-quarantine.md`.
+
 - **Ordinary (non-owner-axis) groups now receive the fork-quarantine marker
   (ADR-0066 §2, slice 2; #732) — a NEW availability failure mode with no
   automatic exit.** ADR-0064 set the marker only for owner-axis groups, so for

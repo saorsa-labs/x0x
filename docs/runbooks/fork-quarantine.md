@@ -32,6 +32,24 @@ HTTP 409 `fork_quarantined`:
 - `POST /groups/:id/send` (public group messages)
 - TreeKEM encrypt/decrypt
 - the `secure/encrypt`, `secure/decrypt`, `secure/reseal` family
+- `DELETE /history?scope=group:<ID>` — the durable-history purge (ADR-0066
+  §3a). Refused **before** anything is deleted, so the store is left
+  unchanged: a purge is the irreversible destruction of the forensic record
+  the quarantine exists to preserve. Clear the marker first if you genuinely
+  need to purge.
+
+**History READS are never refused — they are annotated.** `GET /history`,
+`/history/message/:msg_id`, `/history/search`, `/history/scopes`,
+`/history/stats`, `GET /diagnostics/history` and `GET /groups/:id/messages`
+keep serving during an incident and add `"fork_quarantined": true` plus a
+`fork_quarantine.scopes[]` list (each entry carrying `scope`, `revision`,
+`observed_at_ms`, `no_anchor`) to the envelope; both keys are absent when
+nothing in view is quarantined. Rows of a quarantined group that arrived at or
+after `observed_at_ms` also carry `"fork_quarantined_at_ingest": true`, so you
+can separate the incident window from the group's earlier traffic — ingest is
+tag-and-retain, never refused (ADR-0066 R3), so nothing is missing from the
+record. That label is derived from the live marker: **read the history you need
+BEFORE clearing**, because a clear keeps every row but drops the labels.
 
 ### The refusal body (ADR-0066 §5)
 
@@ -355,6 +373,8 @@ durable fix is a mandate-producing authority.
 | Observation | Meaning | Action |
 |---|---|---|
 | 409 `fork_quarantined` on send/encrypt | local marker set; authenticated fork evidence held | read `fork_quarantine` snapshot + classification (§2); let the owner anchor advance (§4.1–4.2); manual clear only per §4.3 |
+| 409 `fork_quarantined` on `DELETE /history` | the purge is refused to preserve the forensic record (§1) | read the history first; purge only after a deliberate clear — the store is untouched by the refusal |
+| history reads carry `fork_quarantined: true` | that scope spans a contested chain (§1) | expected; use `fork_quarantined_at_ingest` on the rows to find the incident window, and export what you need before clearing |
 | `classification: "owner_anchored_conflict"` | the owner anchored a successor this node cannot apply | this node likely holds the disowned chain — coordinate with the owner before any force-clear |
 | `fork_quarantine_owner_anchored_refusals` rising, marker persists | contested branch publishing owner-anchored successors | divergence still live; do not force-clear |
 | 409 `fork_quarantined` with `"no_anchor": true` | ordinary group contained; NO automatic clear exists (§5) | agree the canonical chain out of band, re-seat stragglers, then `x0x groups quarantine clear <ID> --force --reason "…"` |

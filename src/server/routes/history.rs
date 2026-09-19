@@ -59,7 +59,12 @@ fn query_from(params: &HistoryListParams, scope: Option<Scope>) -> HistoryQuery 
 /// Serialize one stored row for the REST surface. The signed artifact is
 /// omitted from list responses (it can be multi-KB per row); `signed`
 /// indicates whether one exists for offline re-verification.
-fn row_json(row: &StoredRecord) -> serde_json::Value {
+///
+/// `marker`, when present, is the fork-quarantine marker held for THIS
+/// row's group scope; a row seen at or after the marker's observation is
+/// additionally flagged `fork_quarantined_at_ingest` (ADR-0066 R3 — see
+/// [`fork_quarantined_at_ingest`]).
+fn row_json(row: &StoredRecord, marker: Option<&x0x::groups::ForkQuarantine>) -> serde_json::Value {
     let r = &row.record;
     let group_message = group_history_message(r);
     let msg_id = group_message
@@ -74,7 +79,7 @@ fn row_json(row: &StoredRecord) -> serde_json::Value {
         .as_ref()
         .and_then(|message| message.thread_parent.as_deref())
         .or(r.thread_parent.as_deref());
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "id": row.id,
         "msg_id": msg_id,
         "scope": r.scope.canonical(),
@@ -90,7 +95,163 @@ fn row_json(row: &StoredRecord) -> serde_json::Value {
         "replace_key": r.replace_key,
         "thread_root": thread_root,
         "thread_parent": thread_parent,
-    })
+    });
+    if marker.is_some_and(|marker| fork_quarantined_at_ingest(marker, r.seen_at_ms)) {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("fork_quarantined_at_ingest".to_string(), true.into());
+        }
+    }
+    json
+}
+
+/// ADR-0066 R3 (tag-and-retain): was this row ingested while the node held
+/// the fork-quarantine marker for its group?
+///
+/// The marker records the local observation time of the authenticated fork
+/// evidence, and `seen_at_ms` is the local receipt time of the row — both
+/// are this node's own clock, so the comparison is exact rather than a
+/// heuristic. Ingest is never refused (R3: refusing it would blank the
+/// record across the incident window, the opposite of §3a's purpose), so
+/// this flag is the only thing that separates rows that arrived on a
+/// contested roster from the rest of the scope.
+///
+/// **The tag is derived, not persisted, and that is a deliberate trade.**
+/// A stored column would survive a manual clear; it would also mean a new
+/// `HistoryRecord` field, a SQLite schema bump, and — because `migrate`
+/// refuses a database newer than the running binary — a history store an
+/// older x0x could no longer open after a rollback. The ADR scopes this
+/// slice to this file and asks only that ingest be distinguishable; a
+/// derived tag costs nothing to downgrade and is exact for as long as the
+/// marker (the very thing that makes the distinction interesting) exists.
+/// A clear is the operator asserting the fork is resolved; the rows
+/// survive it, only the contested label does not. Persisting it is a
+/// superseding-ADR decision, not a slice-4 one.
+fn fork_quarantined_at_ingest(marker: &x0x::groups::ForkQuarantine, seen_at_ms: i64) -> bool {
+    seen_at_ms >= i64::try_from(marker.observed_at_ms).unwrap_or(i64::MAX)
+}
+
+/// One fork-quarantined group in a response's view: its canonical history
+/// scope string and the marker this node holds for it.
+pub(in crate::server) type ScopeMarker = (String, x0x::groups::ForkQuarantine);
+
+/// ADR-0066 §3a: the read surface is **never** refused — containment must
+/// not blind the operator — so a history read with a fork-quarantined
+/// group in view says so in its envelope instead:
+///
+/// ```json
+/// "fork_quarantined": true,
+/// "fork_quarantine": {
+///   "clear_with": "POST /groups/:id/quarantine/clear",
+///   "scopes": [{"scope": "group:g1", "revision": 9,
+///               "observed_at_ms": 1758240000000, "no_anchor": true}]
+/// }
+/// ```
+///
+/// The per-scope object mirrors the §5 refusal body's `fork_quarantine`
+/// (`revision`, `observed_at_ms`, `no_anchor`, `clear_with`); §3a names
+/// the `fork_quarantined` flag and the marker's `revision` and
+/// `observed_at_ms` but does not say how to carry MORE than one marker,
+/// and these surfaces are not single-group: a cross-scope search,
+/// `/history/scopes`, `/history/stats` and `/diagnostics/history` can each
+/// have several quarantined groups in view. A list, always, beats a shape
+/// that changes with the query.
+///
+/// Returns `None` when nothing in view is quarantined, so both keys are
+/// ABSENT (not null) and an existing client's body is byte-identical.
+fn fork_quarantine_annotation(markers: &[ScopeMarker]) -> Option<serde_json::Value> {
+    if markers.is_empty() {
+        return None;
+    }
+    let scopes: Vec<serde_json::Value> = markers
+        .iter()
+        .map(|(scope, marker)| {
+            serde_json::json!({
+                "scope": scope,
+                "revision": marker.revision,
+                "observed_at_ms": marker.observed_at_ms,
+                "no_anchor": marker.no_anchor,
+            })
+        })
+        .collect();
+    Some(serde_json::json!({
+        "clear_with": crate::server::routes::named_groups::FORK_QUARANTINE_CLEAR_ROUTE,
+        "scopes": scopes,
+    }))
+}
+
+/// Fold [`fork_quarantine_annotation`] into a response envelope.
+///
+/// Visible to the whole server because `GET /groups/:id/messages`
+/// (`named_groups.rs`) is the same ADR-0023 read on the group plane — the
+/// §1 map gap slice 2 recorded — and it must carry the SAME annotation
+/// rather than a second dialect of it.
+pub(in crate::server) fn annotate(
+    mut body: serde_json::Value,
+    markers: &[ScopeMarker],
+) -> serde_json::Value {
+    let Some(annotation) = fork_quarantine_annotation(markers) else {
+        return body;
+    };
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("fork_quarantined".to_string(), true.into());
+        obj.insert("fork_quarantine".to_string(), annotation);
+    }
+    body
+}
+
+/// The marker for one row's scope, if that scope is a quarantined group.
+fn marker_for<'a>(
+    markers: &'a [ScopeMarker],
+    scope: &Scope,
+) -> Option<&'a x0x::groups::ForkQuarantine> {
+    let canonical = scope.canonical();
+    markers
+        .iter()
+        .find(|(scope, _)| *scope == canonical)
+        .map(|(_, marker)| marker)
+}
+
+/// Markers for the group scopes named by `scopes` (deduplicated, ordered
+/// by canonical scope so a response is stable page to page). Takes the
+/// `named_groups` read lock exactly once.
+pub(in crate::server) async fn markers_for_scopes<'a>(
+    state: &AppState,
+    scopes: impl IntoIterator<Item = &'a Scope>,
+) -> Vec<ScopeMarker> {
+    let wanted: std::collections::BTreeSet<&str> = scopes
+        .into_iter()
+        .filter_map(|scope| match scope {
+            Scope::Group(id) => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let groups = state.named_groups.read().await;
+    wanted
+        .into_iter()
+        .filter_map(|id| {
+            let marker = groups.get(id)?.fork_quarantine.clone()?;
+            Some((Scope::Group(id.to_string()).canonical(), marker))
+        })
+        .collect()
+}
+
+/// Every group this node currently holds a marker for. Used by the two
+/// node-wide surfaces (`/history/stats`, `/diagnostics/history`), where
+/// "in view" is the whole store rather than one scope.
+async fn all_quarantine_markers(state: &AppState) -> Vec<ScopeMarker> {
+    let groups = state.named_groups.read().await;
+    let mut markers: Vec<ScopeMarker> = groups
+        .iter()
+        .filter_map(|(id, info)| {
+            let marker = info.fork_quarantine.clone()?;
+            Some((Scope::Group(id.clone()).canonical(), marker))
+        })
+        .collect();
+    markers.sort_by(|(a, _), (b, _)| a.cmp(b));
+    markers
 }
 
 /// Recover the rendering identity and ADR-0029 ancestry from the verified
@@ -159,19 +320,29 @@ pub(in crate::server) async fn history_list(
         );
     }
     let store = Arc::clone(history.store());
-    let q = query_from(&params, Some(scope));
+    let q = query_from(&params, Some(scope.clone()));
     match tokio::task::spawn_blocking(move || store.query(&q)).await {
         Ok(Ok(rows)) => {
             let next_before_id = rows.last().map(|r| r.id);
-            let items: Vec<_> = rows.iter().map(row_json).collect();
+            // ADR-0066 §3a (row 13): serve, annotate, never refuse. The
+            // annotation comes from the REQUESTED scope, not from the rows,
+            // so an empty page of a quarantined group is still labelled.
+            let markers = markers_for_scopes(&state, std::iter::once(&scope)).await;
+            let items: Vec<_> = rows
+                .iter()
+                .map(|row| row_json(row, marker_for(&markers, &row.record.scope)))
+                .collect();
             (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "count": items.len(),
-                    "next_before_id": next_before_id,
-                    "records": items,
-                })),
+                Json(annotate(
+                    serde_json::json!({
+                        "ok": true,
+                        "count": items.len(),
+                        "next_before_id": next_before_id,
+                        "records": items,
+                    }),
+                    &markers,
+                )),
             )
         }
         Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("query: {e}")),
@@ -233,10 +404,19 @@ pub(in crate::server) async fn history_message(
     .await;
 
     match lookup {
-        Ok(Ok(Some(row))) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ok": true, "record": row_json(&row) })),
-        ),
+        Ok(Ok(Some(row))) => {
+            // ADR-0066 §3a (row 13): the row's OWN scope decides, so a
+            // point lookup made without `?scope=` is annotated too.
+            let markers = markers_for_scopes(&state, std::iter::once(&row.record.scope)).await;
+            let record = row_json(&row, marker_for(&markers, &row.record.scope));
+            (
+                StatusCode::OK,
+                Json(annotate(
+                    serde_json::json!({ "ok": true, "record": record }),
+                    &markers,
+                )),
+            )
+        }
         Ok(Ok(None)) => api_error(
             StatusCode::NOT_FOUND,
             "no history row for msg_id (canonical group ids require ?scope=group:<stable_id>; \
@@ -334,19 +514,33 @@ pub(in crate::server) async fn history_search(
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
     let store = Arc::clone(history.store());
-    let q = query_from(&params, scope);
+    let q = query_from(&params, scope.clone());
     match tokio::task::spawn_blocking(move || store.search(&needle, &q)).await {
         Ok(Ok(rows)) => {
             let next_before_id = rows.last().map(|r| r.id);
-            let items: Vec<_> = rows.iter().map(row_json).collect();
+            // ADR-0066 §3a (row 13). A cross-scope search (no `scope=`)
+            // can span several quarantined groups at once, which is why
+            // the annotation carries a list rather than one marker.
+            let markers = markers_for_scopes(
+                &state,
+                rows.iter().map(|r| &r.record.scope).chain(scope.iter()),
+            )
+            .await;
+            let items: Vec<_> = rows
+                .iter()
+                .map(|row| row_json(row, marker_for(&markers, &row.record.scope)))
+                .collect();
             (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "count": items.len(),
-                    "next_before_id": next_before_id,
-                    "records": items,
-                })),
+                Json(annotate(
+                    serde_json::json!({
+                        "ok": true,
+                        "count": items.len(),
+                        "next_before_id": next_before_id,
+                        "records": items,
+                    }),
+                    &markers,
+                )),
             )
         }
         Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("search: {e}")),
@@ -410,15 +604,22 @@ pub(in crate::server) async fn history_scopes(
     match tokio::task::spawn_blocking(move || store.scopes(after.as_ref(), limit)).await {
         Ok(Ok(summaries)) => {
             let next_after_scope = summaries.last().map(|s| s.scope.canonical());
+            // ADR-0066 §3a (row 13): annotate the quarantined groups on
+            // THIS page, so the label pages with the enumeration it
+            // describes.
+            let markers = markers_for_scopes(&state, summaries.iter().map(|s| &s.scope)).await;
             let items: Vec<_> = summaries.iter().map(scope_json).collect();
             (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "count": items.len(),
-                    "next_after_scope": next_after_scope,
-                    "scopes": items,
-                })),
+                Json(annotate(
+                    serde_json::json!({
+                        "ok": true,
+                        "count": items.len(),
+                        "next_after_scope": next_after_scope,
+                        "scopes": items,
+                    }),
+                    &markers,
+                )),
             )
         }
         Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("scopes: {e}")),
@@ -435,17 +636,24 @@ pub(in crate::server) async fn history_stats(
     };
     let store = Arc::clone(history.store());
     match tokio::task::spawn_blocking(move || store.stats()).await {
+        // ADR-0066 §3a (row 13). `stats` is node-wide, so "in view" is
+        // every group this node holds a marker for: the counts it reports
+        // include contested rows, and the operator is told which scopes
+        // those are.
         Ok(Ok(stats)) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "stats": stats,
-                "retention": {
-                    "max_bytes": state.history_config.max_bytes,
-                    "max_age_days": state.history_config.max_age_days,
-                    "scope_limits": state.history_config.scope_limits,
-                },
-            })),
+            Json(annotate(
+                serde_json::json!({
+                    "ok": true,
+                    "stats": stats,
+                    "retention": {
+                        "max_bytes": state.history_config.max_bytes,
+                        "max_age_days": state.history_config.max_age_days,
+                        "scope_limits": state.history_config.scope_limits,
+                    },
+                }),
+                &all_quarantine_markers(&state).await,
+            )),
         ),
         Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("stats: {e}")),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
@@ -461,6 +669,15 @@ pub(in crate::server) struct HistoryPurgeParams {
 
 /// DELETE /history — purge one scope from the local store. Local-only:
 /// nothing is propagated to the network (ADR-0023 non-goal).
+///
+/// ADR-0066 §3a (row 14) — REFUSED while the scope's group is
+/// fork-quarantined. This is the one history path that is gated, and it is
+/// gated for the same reason the reads are not: the ADR-0023 durable record
+/// is the primary post-hoc artefact for a fork, and a purge destroys it
+/// irreversibly. Reads stay open so the operator can see the incident;
+/// purge closes so nobody — operator or attacker — can delete the evidence
+/// mid-incident. The check runs BEFORE any deletion, so a refused purge
+/// leaves the store untouched.
 pub(in crate::server) async fn history_purge(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HistoryPurgeParams>,
@@ -472,6 +689,22 @@ pub(in crate::server) async fn history_purge(
         Ok(s) => s,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
+    if let Scope::Group(group_id) = &scope {
+        // §3e: the one shared refusal helper, so this route inherits the
+        // §5 message (machine `reason`, remedy-bearing `error`, and the
+        // `fork_quarantine` object) instead of minting its own wording.
+        let refusal = {
+            let groups = state.named_groups.read().await;
+            groups.get(group_id).and_then(|info| {
+                crate::server::routes::named_groups::reject_fork_quarantined(
+                    &state, group_id, info,
+                )
+            })
+        };
+        if let Some(refusal) = refusal {
+            return refusal;
+        }
+    }
     let store = Arc::clone(history.store());
     match tokio::task::spawn_blocking(move || store.purge(&scope)).await {
         Ok(Ok(removed)) => (
@@ -498,16 +731,23 @@ pub(in crate::server) async fn history_diagnostics(
     let c = history.counters();
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "enabled": true,
-            "written_total": c.written_total.load(Ordering::Relaxed),
-            "dropped_full": c.dropped_full.load(Ordering::Relaxed),
-            "dedup_hits": c.dedup_hits.load(Ordering::Relaxed),
-            "write_errors": c.write_errors.load(Ordering::Relaxed),
-            "abandoned_at_shutdown": c.abandoned_at_shutdown.load(Ordering::Relaxed),
-            "reaper_evicted_total": c.reaper_evicted_total.load(Ordering::Relaxed),
-        })),
+        Json(annotate(
+            serde_json::json!({
+                "ok": true,
+                "enabled": true,
+                "written_total": c.written_total.load(Ordering::Relaxed),
+                "dropped_full": c.dropped_full.load(Ordering::Relaxed),
+                "dedup_hits": c.dedup_hits.load(Ordering::Relaxed),
+                "write_errors": c.write_errors.load(Ordering::Relaxed),
+                "abandoned_at_shutdown": c.abandoned_at_shutdown.load(Ordering::Relaxed),
+                "reaper_evicted_total": c.reaper_evicted_total.load(Ordering::Relaxed),
+            }),
+            // ADR-0066 §3a (row 26): the writer/reaper counters are
+            // node-wide, so the annotation names every group this node has
+            // quarantined — R3 ingest keeps writing for them, and these
+            // counters are what an operator reads to confirm it.
+            &all_quarantine_markers(&state).await,
+        )),
     )
 }
 #[cfg(test)]
@@ -563,7 +803,7 @@ mod tests {
             },
         };
 
-        let json = row_json(&stored);
+        let json = row_json(&stored, None);
         assert_eq!(json["msg_id"], message.msg_id());
         assert_eq!(json["thread_root"], root);
         assert_eq!(json["thread_parent"], root);
@@ -959,11 +1199,11 @@ mod discovery_auth_tests {
 
     /// The fixture's durable API token (`secure_endpoint_test_state_at`
     /// hard-codes `"test-token"`).
-    const DURABLE: &str = "test-token";
+    pub(super) const DURABLE: &str = "test-token";
     const GRANTED_GROUP: &str = "granted-group";
 
     /// Owned state whose agent has a real, isolated history store.
-    async fn history_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
+    pub(super) async fn history_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
         let identity_dir = dir.join("identity");
         tokio::fs::create_dir_all(&identity_dir).await?;
         let agent = Arc::new(
@@ -1036,7 +1276,7 @@ mod discovery_auth_tests {
         token
     }
 
-    fn text_row(scope: Scope, body: &str, seen_at_ms: i64) -> HistoryRecord {
+    pub(super) fn text_row(scope: Scope, body: &str, seen_at_ms: i64) -> HistoryRecord {
         HistoryRecord {
             msg_id: HistoryRecord::compute_msg_id(None, body.as_bytes()),
             scope,
@@ -1286,6 +1526,391 @@ mod discovery_auth_tests {
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["count"], 0);
         assert!(json["next_before_id"].is_null(), "{json}");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod adr0066_fork_quarantine_tests {
+    //! ADR-0066 §3a (slice 4): rows 13, 14 and 26 — history purge is
+    //! REFUSED under the fork-quarantine marker while every read keeps
+    //! serving, annotated.
+    //!
+    //! WHY the asymmetry, encoded here so a later "consistency" refactor
+    //! cannot quietly flatten it: the ADR-0023 durable record is the
+    //! primary post-hoc artefact for a fork. Refusing reads would delete
+    //! the operator's only view of the incident at the moment it matters
+    //! (ADR-0066 Drivers); permitting a purge would delete the incident
+    //! itself, irreversibly, which is the act David's R5 fail-closed
+    //! decision exists to stop. Containment without blindness.
+    //!
+    //! Driven through the REAL router and the production auth middleware,
+    //! on an isolated on-disk store — a handler re-reading its own
+    //! predicate would not prove the gate is in the request path.
+
+    use super::discovery_auth_tests::{history_state, text_row, DURABLE};
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::{delete, get};
+    use tower::ServiceExt;
+
+    const QUARANTINED: &str = "contested-group";
+    const CLEAN: &str = "quiet-group";
+    /// Local observation time of the fork evidence. Rows seen before it
+    /// predate the incident; rows seen at or after it arrived on a
+    /// contested roster (R3).
+    const OBSERVED_AT_MS: u64 = 2_000;
+
+    /// Every history surface §1 rows 13/14/26 name, wired as
+    /// `server::mod` wires them and behind the production middleware.
+    fn full_history_router(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route("/history", get(history_list).delete(history_purge))
+            .route("/history/message/:msg_id", get(history_message))
+            .route("/history/scopes", get(history_scopes))
+            .route("/history/search", get(history_search))
+            .route("/history/stats", get(history_stats))
+            .route("/diagnostics/history", get(history_diagnostics))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {DURABLE}"))
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    /// Two rows in the contested group — one ingested BEFORE the evidence
+    /// was observed, one AFTER — plus one row in an unrelated group that
+    /// must stay completely unlabelled.
+    fn seed_rows(state: &AppState) {
+        let store = state.agent.history().expect("history enabled").store();
+        for (scope, body, seen) in [
+            (Scope::Group(QUARANTINED.into()), "before the fork", 1_000),
+            (
+                Scope::Group(QUARANTINED.into()),
+                "after the fork",
+                i64::try_from(OBSERVED_AT_MS).unwrap_or(i64::MAX) + 500,
+            ),
+            (Scope::Group(CLEAN.into()), "unrelated traffic", 1_500),
+        ] {
+            store.insert(&text_row(scope, body, seen)).expect("insert");
+        }
+    }
+
+    /// The full content of the store, in a form a purge cannot survive:
+    /// every row of every scope with its id, scope, payload bytes and
+    /// receipt time. Compared before and after a refused purge, this is
+    /// what "the store is unchanged" means operationally — and unlike
+    /// hashing `history.db`, it cannot pass because SQLite wrote the
+    /// deletion to the WAL instead of the main file.
+    fn store_snapshot(state: &AppState) -> Vec<(i64, String, Vec<u8>, i64)> {
+        let store = state.agent.history().expect("history enabled").store();
+        let mut rows: Vec<(i64, String, Vec<u8>, i64)> = store
+            .query(&HistoryQuery {
+                scope: None,
+                scope_kind: None,
+                since_ms: None,
+                until_ms: None,
+                limit: 0,
+                before_id: None,
+            })
+            .expect("snapshot query")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.id,
+                    row.record.scope.canonical(),
+                    row.record.payload.clone(),
+                    row.record.seen_at_ms,
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Install a group carrying the ADR-0066 §2 ordinary-group marker
+    /// (`no_anchor`), i.e. the population whose quarantine NOTHING clears
+    /// automatically — the sharpest case for both the refusal and its
+    /// message.
+    async fn quarantine(state: &AppState, group_id: &str) {
+        let creator = state.agent.agent_id();
+        let mut info = x0x::groups::GroupInfo::new(
+            group_id.to_string(),
+            "adr-0066 slice 4 fixture".to_string(),
+            creator,
+            format!("mls-{group_id}"),
+        );
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 9,
+            state_hash: info.state_hash.clone(),
+            committed_by: hex::encode(creator.as_bytes()),
+            observed_at_ms: OBSERVED_AT_MS,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: Some("signer_only".to_string()),
+            },
+            no_anchor: true,
+        });
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+    }
+
+    /// A group present in state with NO marker — the control that proves
+    /// the gate keys on the marker and not merely on the group existing.
+    async fn unquarantined(state: &AppState, group_id: &str) {
+        let creator = state.agent.agent_id();
+        let info = x0x::groups::GroupInfo::new(
+            group_id.to_string(),
+            "adr-0066 slice 4 control".to_string(),
+            creator,
+            format!("mls-{group_id}"),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+    }
+
+    /// WHY (ADR-0066 §1 row 14, §3a, and the R5 fail-closed ratification):
+    /// a purge is the irreversible destruction of the forensic record of a
+    /// fork. If it were permitted while the marker is set, the operator —
+    /// or whoever holds the token mid-incident — could delete the evidence
+    /// the whole quarantine exists to preserve. The gate must therefore
+    /// run BEFORE any deletion, which is why this asserts the store's full
+    /// contents are identical afterwards rather than merely that the
+    /// response was a 409: a refusal that deleted first and apologised
+    /// second would still read as green on status alone.
+    #[tokio::test]
+    async fn purge_is_refused_while_quarantined_and_the_store_is_untouched() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed_rows(&state);
+        quarantine(&state, QUARANTINED).await;
+        unquarantined(&state, CLEAN).await;
+        let app = full_history_router(Arc::clone(&state));
+        let before = store_snapshot(&state);
+        assert_eq!(before.len(), 3, "precondition: three seeded rows");
+
+        let (status, json) = call(&app, "DELETE", "/history?scope=group:contested-group").await;
+        assert_eq!(status, StatusCode::CONFLICT, "purge must refuse: {json}");
+        assert_eq!(
+            store_snapshot(&state),
+            before,
+            "a refused purge must leave the store byte-identical — the gate runs before \
+             `Store::purge`, not after it"
+        );
+
+        // §5's acceptance bar: the machine code lives in `reason`, and
+        // `error` is an actionable sentence, not the code again.
+        assert_eq!(json["reason"], "fork_quarantined", "§5 machine code: {json}");
+        let message = json["error"].as_str().unwrap_or_default();
+        assert!(
+            !message.is_empty() && message != "fork_quarantined",
+            "§5: `error` must be prose, not the machine code: {json}"
+        );
+        assert!(
+            message.contains("quarantine clear") || message.contains("quarantine/clear"),
+            "§5: the refusal must name the remedy: {json}"
+        );
+        assert_eq!(json["fork_quarantine"]["revision"], 9, "{json}");
+        assert_eq!(
+            json["fork_quarantine"]["no_anchor"], true,
+            "an ordinary group's marker says plainly that nothing clears it automatically: {json}"
+        );
+        assert_eq!(
+            json["fork_quarantine"]["clear_with"], "POST /groups/:id/quarantine/clear",
+            "{json}"
+        );
+
+        // The route itself still works: an unquarantined group purges, so
+        // the 409 above is the marker talking and not a broken handler.
+        let (status, json) = call(&app, "DELETE", "/history?scope=group:quiet-group").await;
+        assert_eq!(status, StatusCode::OK, "control purge: {json}");
+        assert_eq!(json["removed"], 1, "control purge removes its one row");
+        Ok(())
+    }
+
+    /// WHY (ADR-0066 §3a, rows 13 and 26): containment must not blind the
+    /// operator. Every read keeps serving the same rows it served before
+    /// the marker — the annotation is ADDITIVE — and a client that reads
+    /// no ADR-0066 field sees a byte-identical body for an unquarantined
+    /// scope. The absence assertion is the load-bearing half: an
+    /// annotation emitted as `false`/`null` for every group would be a
+    /// silent response-shape change on every history read in the fleet.
+    #[tokio::test]
+    async fn reads_serve_and_are_annotated_only_while_quarantined() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed_rows(&state);
+        let app = full_history_router(Arc::clone(&state));
+
+        // Before any marker: nothing at all is added.
+        let (status, clean) = call(&app, "GET", "/history?scope=group:contested-group").await;
+        assert_eq!(status, StatusCode::OK, "{clean}");
+        assert_eq!(clean["count"], 2, "both rows serve: {clean}");
+        assert!(
+            clean.get("fork_quarantined").is_none() && clean.get("fork_quarantine").is_none(),
+            "an unquarantined read must be byte-identical to the pre-ADR body: {clean}"
+        );
+
+        quarantine(&state, QUARANTINED).await;
+        unquarantined(&state, CLEAN).await;
+
+        let (status, annotated) = call(&app, "GET", "/history?scope=group:contested-group").await;
+        assert_eq!(status, StatusCode::OK, "reads are NEVER refused: {annotated}");
+        assert_eq!(
+            annotated["count"], 2,
+            "the same rows still serve under quarantine: {annotated}"
+        );
+        assert_eq!(annotated["fork_quarantined"], true, "{annotated}");
+        assert_eq!(annotated["fork_quarantine"]["scopes"][0]["scope"], "group:contested-group");
+        assert_eq!(annotated["fork_quarantine"]["scopes"][0]["revision"], 9);
+        assert_eq!(
+            annotated["fork_quarantine"]["scopes"][0]["observed_at_ms"],
+            OBSERVED_AT_MS
+        );
+        assert_eq!(annotated["fork_quarantine"]["scopes"][0]["no_anchor"], true);
+        assert_eq!(
+            annotated["records"].as_array().map(Vec::len),
+            clean["records"].as_array().map(Vec::len),
+            "annotation adds fields, it never drops rows: {annotated}"
+        );
+
+        // The unrelated group is untouched by its neighbour's quarantine.
+        let (_, other) = call(&app, "GET", "/history?scope=group:quiet-group").await;
+        assert!(
+            other.get("fork_quarantined").is_none(),
+            "one group's marker must not label another: {other}"
+        );
+
+        // A cross-scope search spans both and is annotated for exactly the
+        // contested one — the reason the annotation carries a list.
+        let (status, search) = call(&app, "GET", "/history/search?q=fork").await;
+        assert_eq!(status, StatusCode::OK, "{search}");
+        assert_eq!(search["fork_quarantined"], true, "{search}");
+        assert_eq!(
+            search["fork_quarantine"]["scopes"].as_array().map(Vec::len),
+            Some(1),
+            "only the quarantined scope is listed: {search}"
+        );
+
+        // Scope enumeration labels the page it describes.
+        let (status, scopes) = call(&app, "GET", "/history/scopes").await;
+        assert_eq!(status, StatusCode::OK, "{scopes}");
+        assert_eq!(scopes["fork_quarantined"], true, "{scopes}");
+        Ok(())
+    }
+
+    /// WHY (ADR-0066 R3 — tag-and-retain, never refuse): refusing ingest
+    /// would blank the durable record across exactly the incident window
+    /// an operator needs, which is the opposite of §3a's purpose. So a row
+    /// that arrives while the marker is set is STORED, served, and
+    /// distinguishable from the group's pre-fork traffic. The row seeded
+    /// before the evidence was observed must NOT be tagged — a tag on
+    /// every row of the scope would carry no information at all.
+    #[tokio::test]
+    async fn ingest_during_quarantine_is_retained_and_tagged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed_rows(&state);
+        quarantine(&state, QUARANTINED).await;
+        let app = full_history_router(Arc::clone(&state));
+
+        let (status, json) = call(&app, "GET", "/history?scope=group:contested-group").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let records = json["records"].as_array().cloned().unwrap_or_default();
+        assert_eq!(records.len(), 2, "nothing is dropped on ingest: {json}");
+
+        let tagged: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|row| row["fork_quarantined_at_ingest"] == serde_json::Value::Bool(true))
+            .collect();
+        assert_eq!(
+            tagged.len(),
+            1,
+            "exactly the row ingested after the evidence is tagged: {json}"
+        );
+        assert!(
+            tagged[0]["seen_at_ms"].as_i64().unwrap_or_default()
+                >= i64::try_from(OBSERVED_AT_MS).unwrap_or(i64::MAX),
+            "the tagged row is the one seen at or after the marker: {json}"
+        );
+        for row in &records {
+            if row["fork_quarantined_at_ingest"] != serde_json::Value::Bool(true) {
+                assert!(
+                    row.get("fork_quarantined_at_ingest").is_none(),
+                    "an untagged row carries no key at all, not a false one: {row}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// WHY (ADR-0066 §1 row 26 and §3a): `/history/stats` and
+    /// `/diagnostics/history` are node-wide — they report the counters an
+    /// operator reads to confirm that R3 ingest is still writing during an
+    /// incident. Reporting those totals without naming the contested
+    /// groups they include is the "unlabelled record" the ADR's attack
+    /// matrix calls out.
+    #[tokio::test]
+    async fn node_wide_surfaces_name_every_quarantined_group() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed_rows(&state);
+        let app = full_history_router(Arc::clone(&state));
+
+        for path in ["/history/stats", "/diagnostics/history"] {
+            let (status, json) = call(&app, "GET", path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {json}");
+            assert!(
+                json.get("fork_quarantined").is_none(),
+                "{path} must not annotate when no group is quarantined: {json}"
+            );
+        }
+
+        quarantine(&state, QUARANTINED).await;
+        unquarantined(&state, CLEAN).await;
+
+        for path in ["/history/stats", "/diagnostics/history"] {
+            let (status, json) = call(&app, "GET", path).await;
+            assert_eq!(status, StatusCode::OK, "{path} still serves: {json}");
+            assert_eq!(json["fork_quarantined"], true, "{path}: {json}");
+            assert_eq!(
+                json["fork_quarantine"]["scopes"],
+                serde_json::json!([{
+                    "scope": "group:contested-group",
+                    "revision": 9,
+                    "observed_at_ms": OBSERVED_AT_MS,
+                    "no_anchor": true,
+                }]),
+                "{path} names exactly the quarantined groups: {json}"
+            );
+        }
         Ok(())
     }
 }

@@ -158,14 +158,14 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         path: "History list / message / search / scopes / stats",
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
-        closed_by_slice: Some(4),
+        closed_by_slice: None,
     },
     CoverageRow {
         row: 14,
         path: "History purge",
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Refuse,
-        closed_by_slice: Some(4),
+        closed_by_slice: None,
     },
     CoverageRow {
         row: 15,
@@ -249,8 +249,23 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         path: "History diagnostics",
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
-        closed_by_slice: Some(4),
+        closed_by_slice: None,
     },
+];
+
+/// Rows whose disposition is SHIPPED, so `closed_by_slice` is `None` and
+/// the anchor must now actually consult the marker.
+///
+/// WHY a list rather than a per-row boolean: it is one line per slice, so
+/// the slices landing in parallel (3, 4, 5, 6) each append their own rows
+/// here instead of rewriting 26 struct literals — and a row that claims to
+/// be shipped is held to the same "the file consults the marker" clause
+/// the `Gated` rows are, which is what stops a row being marked done by
+/// editing this list alone.
+const SHIPPED_ROWS: &[u8] = &[
+    // Slice 4 (ADR-0066 §3a): purge refused, reads and node-wide
+    // diagnostics annotated in `src/server/routes/history.rs`.
+    13, 14, 26,
 ];
 
 /// How one registry endpoint relates to the §1 map.
@@ -279,12 +294,16 @@ enum RouteClass {
     /// A group-scoped path the §1 map does NOT name, recorded as a gap in
     /// the map rather than quietly folded into a neighbouring row.
     ///
-    /// The one current entry is a READ path, so the gap is in the
-    /// annotate class (§3a/§3d), never the refuse class — no authority
-    /// escapes through it. It is reported on the slice-2 PR for the
-    /// slice that owns annotations (slice 4/6) or a superseding ADR to
-    /// absorb. The set is asserted EXACTLY, so a new unmapped route fails
-    /// this fixture instead of joining a growing list.
+    /// **Currently unused, deliberately kept.** The one entry slice 2
+    /// found (`GET /groups/:id/messages`) was an annotate-class READ on
+    /// the history store, so slice 4 annotated it and moved it to row 13.
+    /// The variant stays because it is the classification the NEXT
+    /// unmapped route gets while review decides: a read joins the annotate
+    /// class (§3a/§3d); anything carrying authority needs a superseding
+    /// ADR before it may be left ungated. The set is asserted EXACTLY, so
+    /// a new unmapped route fails this fixture instead of joining a
+    /// growing list.
+    #[allow(dead_code)]
     MapGap,
 }
 
@@ -327,6 +346,15 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ("GET /history/stats", RouteClass::Covered(&[13])),
     ("DELETE /history", RouteClass::Covered(&[14])),
     ("GET /diagnostics/history", RouteClass::Covered(&[26])),
+    // The §1 map gap slice 2 recorded, ABSORBED by slice 4: this is the
+    // group plane's own ADR-0023 read (it queries the same history store
+    // for `group:<stable_id>` rows), so it is row 13's surface even though
+    // its handler lives in `named_groups.rs`. It carries the identical
+    // annotation, reusing `history::annotate` rather than a second
+    // dialect. Envelope-level only — its payload is `GroupPublicMessage`
+    // objects, not store rows, so there is no per-row `seen_at_ms` for the
+    // R3 ingest tag.
+    ("GET /groups/:id/messages", RouteClass::Covered(&[13])),
     // ── §1 rows 15, 16: delegations ─────────────────────────────────────
     ("POST /groups/:id/delegate", RouteClass::Covered(&[15])),
     ("GET /groups/:id/delegations", RouteClass::Covered(&[16])),
@@ -426,12 +454,18 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
         RouteClass::NotStateBound,
     ),
     // ── Gaps in the §1 map (read paths only — see RouteClass::MapGap) ───
-    ("GET /groups/:id/messages", RouteClass::MapGap),
+    // Empty: slice 4 absorbed the one gap slice 2 found
+    // (`GET /groups/:id/messages`, reclassified as row 13 above).
 ];
 
 /// The exact, complete set of §1 map gaps. Asserted as an equality, not a
 /// subset: a newly discovered gap must be argued for, not appended.
-const KNOWN_MAP_GAPS: &[&str] = &["GET /groups/:id/messages"];
+///
+/// Empty since slice 4: the single gap slice 2 recorded
+/// (`GET /groups/:id/messages`) was an annotate-class read on the history
+/// store, so slice 4 annotated it and reclassified it as row 13 rather
+/// than leaving the map permanently one route short.
+const KNOWN_MAP_GAPS: &[&str] = &[];
 
 /// The surfaces ADR-0066 §1 censused. A registry route under any of these
 /// prefixes is part of the data-plane candidate surface and must be
@@ -535,16 +569,35 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     for row in COVERAGE_MAP.iter() {
         let _ = read_anchor(row.anchor);
     }
-    // Slice 2 ships no new refusal. Every row still open names the slice
-    // that closes it, so "not done yet" is never indistinguishable from
-    // "forgotten".
+    // Every row still open names the slice that closes it, so "not done
+    // yet" is never indistinguishable from "forgotten"; a row listed in
+    // SHIPPED_ROWS has closed it and must consult the marker for real.
     for row in COVERAGE_MAP.iter() {
+        let shipped = SHIPPED_ROWS.contains(&row.row);
         match row.disposition {
-            Disposition::Gated | Disposition::KeepUngated | Disposition::OutOfScope => assert!(
-                row.closed_by_slice.is_none(),
-                "row {} needs no further slice",
-                row.row
-            ),
+            Disposition::Gated | Disposition::KeepUngated | Disposition::OutOfScope => {
+                assert!(
+                    row.closed_by_slice.is_none() && !shipped,
+                    "row {} needs no further slice and is not a shipped behaviour change",
+                    row.row
+                );
+            }
+            _ if shipped => {
+                assert!(
+                    row.closed_by_slice.is_none(),
+                    "row {} is shipped, so it no longer names a slice that will close it",
+                    row.row
+                );
+                let source = read_anchor(row.anchor);
+                assert!(
+                    source.contains("is_fork_quarantined")
+                        || source.contains("reject_fork_quarantined")
+                        || source.contains("fork_quarantine"),
+                    "§1 row {} claims its disposition shipped, but {} consults no marker",
+                    row.row,
+                    row.anchor
+                );
+            }
             _ => assert!(
                 row.closed_by_slice.is_some(),
                 "row {} changes behaviour, so it must name the slice that closes it",
