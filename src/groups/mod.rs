@@ -245,19 +245,22 @@ pub struct ForkSnapshot {
     pub classification: Option<String>,
 }
 
-/// ADR-0064 (Guard A): persistent per-node fork-quarantine marker for
-/// owner-axis (OwnerCertified / Home) groups. Set only from fork evidence
-/// that passed the authenticated-candidate gate
+/// ADR-0064 (Guard A): persistent per-node fork-quarantine marker. Set
+/// only from fork evidence that passed the authenticated-candidate gate
 /// (`evaluate_fork_evidence_candidate`); membership-gated routes refuse
-/// with `fork_quarantined` (409) while it is set. Clears ONLY through an
-/// owner-anchored path (verified head attestation on adoption, or a local
-/// owner-certified seal) — never by a contested branch's own commits.
+/// with `fork_quarantined` (409) while it is set.
 ///
-/// Slice-1 scope (deliberate boundary): set and gated ONLY for groups
-/// whose policy has an owner axis; non-owner-axis groups never receive a
-/// marker and are byte-for-byte unchanged. `no_anchor` is reserved for
-/// the documented non-owner-axis indefinite-quarantine semantics
-/// (`quarantine_no_anchor`) and is always `false` in this slice.
+/// Two populations, distinguished by [`ForkQuarantine::no_anchor`]:
+/// - **owner-axis** (OwnerCertified / Home, `no_anchor == false`) — clears
+///   through an owner-anchored path (verified head attestation on
+///   adoption, a mandate-carrying `MemberAdded` that verifies, or a local
+///   owner-certified seal), never by a contested branch's own commits;
+/// - **ordinary / non-owner-axis** (ADR-0066 §2, `no_anchor == true`) —
+///   there is no anchor to wait for, so NO commit on ANY ancestry ever
+///   clears it: the only exit is the manual
+///   `POST /groups/:id/quarantine/clear`. Every owner-anchored clear arm
+///   therefore consults
+///   [`ForkQuarantine::owner_anchored_clear_permitted`] and declines.
 ///
 /// Persistence: a serde-default `GroupInfo` field — old v0.41.4 binaries
 /// ignore the unknown field (JSON, not bincode; no wire enum grows a
@@ -276,10 +279,37 @@ pub struct ForkQuarantine {
     pub observed_at_ms: u64,
     /// Forensic snapshot of both competing commit headers.
     pub snapshot: ForkSnapshot,
-    /// True when the marker can never auto-clear (non-owner-axis
-    /// runbook case; slice 1 never sets it).
+    /// True when the marker can never auto-clear: the group's policy has
+    /// no owner axis, so there is no anchor any commit could carry
+    /// (ADR-0066 §2 — manual clear only). `#[serde(default)]` so a marker
+    /// persisted before ADR-0066 (which never set the field) decodes as
+    /// `false`, i.e. as the owner-axis marker it was.
     #[serde(default)]
     pub no_anchor: bool,
+}
+
+impl ForkQuarantine {
+    /// ADR-0066 §2: may an owner-anchored advance to `revision` clear this
+    /// marker? Both fences, in one predicate so the three owner-anchored
+    /// clear arms cannot drift:
+    ///
+    /// - a `no_anchor` marker is NEVER cleared by a commit, of any
+    ///   revision, on any ancestry — extending the marker to ordinary
+    ///   groups without this test would hand them an automatic clear and
+    ///   silently contradict the manual-only rule;
+    /// - the anchored revision must be STRICTLY greater than the evidenced
+    ///   one (ADR-0064 r2), so a same-revision sibling — the contested
+    ///   branch itself — can never buy a clear.
+    ///
+    /// This is a *clear* predicate only. The retry-rollback of a
+    /// non-durable install is NOT a clear and deliberately does not
+    /// consult it (ADR-0066 §2 table): gating an undo would strand a
+    /// marker whose evidence was retracted, turning a transient persist
+    /// failure into an unclearable quarantine.
+    #[must_use]
+    pub fn owner_anchored_clear_permitted(&self, revision: u64) -> bool {
+        !self.no_anchor && revision > self.revision
+    }
 }
 
 /// Metadata for a group.
@@ -630,8 +660,8 @@ impl std::fmt::Display for SetMemberCertificateError {
 impl GroupInfo {
     /// ADR-0064 (Guard A): whether this node currently refuses
     /// membership-gated routes for the group because authenticated fork
-    /// evidence is outstanding. Slice-1 scope: only ever true on
-    /// owner-axis groups.
+    /// evidence is outstanding. ADR-0066 §2: true for ordinary groups too
+    /// (the marker then carries `no_anchor`).
     #[must_use]
     pub fn is_fork_quarantined(&self) -> bool {
         self.fork_quarantine.is_some()
@@ -988,8 +1018,11 @@ impl GroupInfo {
     /// [`Self::seal_commit_with_owner_certs`] wrapper that ~22 routine
     /// mutation sites (rename, policy, add/ban/promote, …) seal through.
     /// All three conditions must hold:
-    /// - the group has an owner axis (non-owner-axis groups never carry
-    ///   a marker in this slice);
+    /// - the group has an owner axis, AND the marker itself does not claim
+    ///   `no_anchor` (ADR-0066 §2: the policy test and the marker's own
+    ///   claim are separate facts, and the marker's claim is
+    ///   authoritative — see
+    ///   [`ForkQuarantine::owner_anchored_clear_permitted`]);
     /// - the local install holds the OWNER USER KEY, fenced exactly like
     ///   the #469 A1b invite fence (`owner_key_unavailable`): the key is
     ///   loaded AND its derived user id EQUALS the policy owner — an
@@ -1011,7 +1044,7 @@ impl GroupInfo {
         let owner_key_held = owner_user_key.is_some_and(|kp| {
             crate::identity::UserId::from_public_key(kp.public_key()) == *owner_id
         });
-        if !owner_key_held || self.state_revision <= marker.revision {
+        if !owner_key_held || !marker.owner_anchored_clear_permitted(self.state_revision) {
             return;
         }
         self.fork_quarantine = None;

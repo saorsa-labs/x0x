@@ -3283,11 +3283,7 @@ fn evaluate_fork_evidence_candidate(
     // r4 (addendum item 7): after the first STORED evidence, silence ALL
     // diagnostics for this group's conflicts — a different post-first
     // conflict must not warn either (first COMPLETE evidence wins).
-    if current
-        .invite_lineage
-        .as_ref()
-        .is_some_and(|lineage| lineage.fork_evidence.is_some())
-    {
+    if fork_evidence_already_recorded(current) {
         return ForkEvidenceOutcome::NotEvidence;
     }
 
@@ -3378,6 +3374,23 @@ fn evaluate_fork_evidence_candidate(
             }
             evidence(None)
         }
+    }
+}
+
+/// The r4 "first COMPLETE evidence wins" silence gate: has this group
+/// already recorded fork evidence?
+///
+/// The stored record lives on `invite_lineage.fork_evidence`, so a group
+/// formed WITHOUT an invite has nowhere to keep one. ADR-0066 R2 widened
+/// the evidence path to those groups, and for them the installed
+/// quarantine marker IS the record — without this arm every later
+/// conflict on an already-contained ordinary group would re-evaluate,
+/// re-install and re-warn. Lineage-bearing groups keep the pre-ADR-0066
+/// test exactly (the marker is not consulted for them).
+fn fork_evidence_already_recorded(current: &x0x::groups::GroupInfo) -> bool {
+    match current.invite_lineage.as_ref() {
+        Some(lineage) => lineage.fork_evidence.is_some(),
+        None => current.fork_quarantine.is_some(),
     }
 }
 
@@ -3519,27 +3532,34 @@ async fn rollback_live_fork_evidence(
     let Some(info) = groups.get_mut(group_key) else {
         return;
     };
-    let Some(lineage) = info.invite_lineage.as_mut() else {
-        return;
-    };
-    let matches = lineage.fork_evidence.as_ref().is_some_and(|existing| {
-        existing.revision == rev
-            && existing.state_hash == hash
-            && existing.committed_by.eq_ignore_ascii_case(&by)
-    });
-    if matches {
-        lineage.fork_evidence = None;
-        // ADR-0064: the quarantine marker was installed by the SAME
-        // (non-durable) mutation — roll it back on the same identity
-        // match so "retryable" covers the marker too, not just the
-        // lineage record.
-        if info.fork_quarantine.as_ref().is_some_and(|marker| {
-            marker.revision == rev
-                && marker.state_hash == hash
-                && marker.committed_by.eq_ignore_ascii_case(&by)
-        }) {
-            info.fork_quarantine = None;
+    // ADR-0066 R2: a lineage-less ordinary group keeps the record in the
+    // MARKER (see `install_fork_evidence`), so the marker's own identity
+    // match is what makes the install retryable there. Rolling back an
+    // install is NOT a clear and deliberately does NOT consult
+    // `no_anchor` (ADR-0066 §2 table): a `no_anchor` marker whose evidence
+    // was retracted by a benign persist retry must go, or a transient
+    // failure leaves an unclearable quarantine behind.
+    if let Some(lineage) = info.invite_lineage.as_mut() {
+        let matches = lineage.fork_evidence.as_ref().is_some_and(|existing| {
+            existing.revision == rev
+                && existing.state_hash == hash
+                && existing.committed_by.eq_ignore_ascii_case(&by)
+        });
+        if !matches {
+            return;
         }
+        lineage.fork_evidence = None;
+    }
+    // ADR-0064: the quarantine marker was installed by the SAME
+    // (non-durable) mutation — roll it back on the same identity
+    // match so "retryable" covers the marker too, not just the
+    // lineage record.
+    if info.fork_quarantine.as_ref().is_some_and(|marker| {
+        marker.revision == rev
+            && marker.state_hash == hash
+            && marker.committed_by.eq_ignore_ascii_case(&by)
+    }) {
+        info.fork_quarantine = None;
     }
 }
 
@@ -3556,15 +3576,27 @@ async fn install_fork_evidence(
         let Some(info) = groups.get_mut(&install_key) else {
             return false;
         };
-        let Some(lineage) = info.invite_lineage.as_mut() else {
-            return false;
-        };
-        // ADR-0064: evidence and quarantine marker land in ONE
-        // first-complete-wins mutation — the marker is exactly as
-        // durable (and as retryable on failure) as the evidence record
-        // that justifies it.
-        if !fork_evidence_first_complete_wins(lineage, &evidence) {
-            return false;
+        match info.invite_lineage.as_mut() {
+            // ADR-0064: evidence and quarantine marker land in ONE
+            // first-complete-wins mutation — the marker is exactly as
+            // durable (and as retryable on failure) as the evidence record
+            // that justifies it.
+            Some(lineage) => {
+                if !fork_evidence_first_complete_wins(lineage, &evidence) {
+                    return false;
+                }
+            }
+            // ADR-0066 R2: an ordinary group formed without an invite has
+            // no lineage record to hold the evidence, so the MARKER is the
+            // durable record and carries the same first-complete-wins
+            // rule. Without a marker there is nothing to install at all
+            // (the pre-ADR-0066 no-op), and a group already carrying one
+            // keeps it.
+            None => {
+                if quarantine.is_none() || info.fork_quarantine.is_some() {
+                    return false;
+                }
+            }
         }
         if let Some(marker) = quarantine {
             if let Some(info) = groups.get_mut(&install_key) {
@@ -3717,20 +3749,32 @@ async fn apply_terminal_stateful_event_with_evidence(
     }
 }
 
-/// ADR-0064 slice 1 (Guard A): the persistent quarantine marker for ONE
-/// authenticated conflict — OWNER-AXIS groups ONLY (the deliberate slice
-/// scope: Home-suite / owner-certified groups; every non-owner-axis group
-/// is byte-for-byte unchanged and never receives a marker). The marker
-/// carries the forensic [`x0x::groups::ForkSnapshot`] of both competing
-/// commit headers and never carries TreeKEM/shared-secret material (the
-/// snapshot type excludes it by construction).
+/// ADR-0064 slice 1 (Guard A) → ADR-0066 §2 (slice 2): the persistent
+/// quarantine marker for ONE authenticated conflict, for EVERY group.
+///
+/// ADR-0064 confined the marker to owner-axis groups, which left the
+/// majority population (ordinary, non-owner-axis groups) completely
+/// uncontained — 0 of 26 data-plane paths gated — while the ADR's own text
+/// described `quarantine_no_anchor` semantics for exactly that case.
+/// ADR-0066 §2 closes it: an ordinary group receives the marker with
+/// `no_anchor: true`, which says plainly that nothing will clear it
+/// automatically (manual clear only). The authentication of the evidence
+/// is unchanged — only evidence that already passed
+/// [`evaluate_fork_evidence_candidate`] reaches here, so an
+/// unauthenticated or forged conflict still quarantines nothing.
+///
+/// The marker carries the forensic [`x0x::groups::ForkSnapshot`] of both
+/// competing commit headers and never carries TreeKEM/shared-secret
+/// material (the snapshot type excludes it by construction).
 fn fork_quarantine_for_evidence(
     current: &x0x::groups::GroupInfo,
     evidence: &x0x::groups::ForkEvidence,
     conflicting_commit: &x0x::groups::state_commit::GroupStateCommit,
     classification: Option<&'static str>,
 ) -> Option<x0x::groups::ForkQuarantine> {
-    current.policy.admission.owner_certified_user_id()?;
+    // ADR-0066 §2: no owner axis ⇒ no anchor ⇒ the marker says so and
+    // only the manual clear lifts it.
+    let no_anchor = current.policy.admission.owner_certified_user_id().is_none();
     Some(x0x::groups::ForkQuarantine {
         revision: evidence.revision,
         state_hash: evidence.state_hash.clone(),
@@ -3741,8 +3785,28 @@ fn fork_quarantine_for_evidence(
             conflicting_commit: conflicting_commit.clone(),
             classification: classification.map(str::to_string),
         },
-        no_anchor: false,
+        no_anchor,
     })
+}
+
+/// ADR-0066 R2: may a rejected commit on this group be evaluated as fork
+/// evidence at all?
+///
+/// Before ADR-0066 the answer was "only invite-derived groups"
+/// (`invite_lineage.is_some()`), because the evidence record has nowhere
+/// else to live. R2 ratified widening that fence so "ordinary group" is
+/// ONE population rather than two: an ordinary group formed without an
+/// invite recorded nothing at all, which is precisely the silent gap
+/// §2 exists to close. For those groups the marker is the record (see
+/// [`fork_evidence_already_recorded`]).
+///
+/// The widening is deliberately scoped to NON-owner-axis groups: ADR-0066's
+/// Migration table promises owner-axis groups an unchanged trigger, and an
+/// owner-axis group without lineage is an authority-side record, not a
+/// joiner stub. Its evaluation therefore stays exactly as it shipped.
+fn fork_evidence_path_open(current: &x0x::groups::GroupInfo) -> bool {
+    current.invite_lineage.is_some()
+        || current.policy.admission.owner_certified_user_id().is_none()
 }
 
 /// The shared error arm of the two central apply hooks: evaluate the
@@ -3762,7 +3826,7 @@ async fn record_fork_evidence_on_apply_error(
     persistence_lock_already_held: bool,
     error: &x0x::groups::state_commit::ApplyError,
 ) {
-    if current.invite_lineage.is_some() {
+    if fork_evidence_path_open(current) {
         match evaluate_fork_evidence_candidate(
             state,
             group_key,
@@ -3837,7 +3901,8 @@ async fn record_fork_evidence_on_apply_error(
 /// joiner's own base exactly like the adoption path; when every link
 /// authenticates but no owner anchor was reached, the fork is
 /// walk-authenticated evidence: install it with the `signer_only`
-/// classification and (owner-axis) the quarantine marker. A forged or
+/// classification and the quarantine marker (ADR-0066 §2: `no_anchor` for
+/// an ordinary group, anchored for an owner-axis one). A forged or
 /// self-inconsistent chain fails the walk and records nothing — the
 /// pre-slice-4 behaviour. A mandate that ANCHORS the refused terminal
 /// was already classified by the single-commit evaluation in the apply
@@ -4129,15 +4194,19 @@ async fn try_adopt_member_added_across_gap(
             // CAS against the terminal — which is one of the TWO
             // owner-anchored clears of the fork-quarantine marker (the
             // contested branch can never produce that attestation).
-            // Tier-2 adoptions (no owner axis) never carry a marker.
             // r2: the terminal revision must be STRICTLY greater than the
             // evidenced revision — an attested commit at or below the
             // evidence revision never clears.
+            // ADR-0066 §2: and a `no_anchor` marker declines outright. The
+            // owner-axis policy fence below already excludes ordinary
+            // groups, but that is a test of the POLICY while `no_anchor` is
+            // the MARKER's own claim — §2 makes the marker's claim
+            // authoritative, so both are asserted here.
             if current.policy.admission.owner_certified_user_id().is_some()
                 && adopted
                     .fork_quarantine
                     .as_ref()
-                    .is_some_and(|marker| commit.revision > marker.revision)
+                    .is_some_and(|marker| marker.owner_anchored_clear_permitted(commit.revision))
             {
                 adopted.fork_quarantine = None;
                 // Slice 4: every clear re-arms the evidence gate — the
@@ -9550,11 +9619,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 // is STRICTLY GREATER than the evidenced
                                 // one, clear the marker and re-arm the
                                 // evidence gate.
-                                if next
-                                    .fork_quarantine
-                                    .as_ref()
-                                    .is_some_and(|marker| commit.revision > marker.revision)
-                                {
+                                // ADR-0066 §2 (the load-bearing change):
+                                // this arm has NO owner-axis policy fence
+                                // of its own — it relied on the marker
+                                // only ever existing for owner-axis
+                                // groups, which §2 invalidates. Without
+                                // the `no_anchor` test an ordinary group
+                                // would get an automatic clear and
+                                // silently contradict the manual-only
+                                // rule.
+                                if next.fork_quarantine.as_ref().is_some_and(|marker| {
+                                    marker.owner_anchored_clear_permitted(commit.revision)
+                                }) {
                                     next.fork_quarantine = None;
                                     next.reset_fork_evidence_after_quarantine_clear();
                                     state
@@ -12504,9 +12580,16 @@ pub(in crate::server) async fn get_named_group(
 /// Without the owner key and without force the endpoint answers 409 with
 /// a typed reason: `owner_key_unavailable` (owner-axis group, keyless
 /// local install — use the force path deliberately) or `force_required`
-/// (no owner axis to attest with). A group without a marker (including
-/// every non-owner-axis group, which never sets one) answers 409 —
-/// nothing to clear. Requires the local API token (same auth layer as
+/// (no owner axis to attest with). A group without a marker answers 409 —
+/// nothing to clear.
+///
+/// ADR-0066 §2: this endpoint is now LOAD-BEARING rather than a niche
+/// override. An ordinary (non-owner-axis) group receives a `no_anchor`
+/// marker that NO commit ever clears, and such a group has no owner axis
+/// to attest with, so path (b) — `force: true` plus a non-empty reason —
+/// is its ONLY exit. Path (b) is deliberately not gated on `no_anchor`:
+/// the operator override is the remedy the §5 refusal message names.
+/// Requires the local API token (same auth layer as
 /// every `/groups` route). Increments `fork_quarantine_manual_clears`
 /// and returns the updated `fork_quarantine: null` view.
 pub(in crate::server) async fn clear_group_quarantine(
@@ -19903,10 +19986,11 @@ fn reject_unverified_owner_certified_restore(
 /// the ADR-0038 restore gate covers, plus outbound public sends).
 /// Inbound metadata events are deliberately NOT gated: the anchored
 /// clearing commit must still be able to arrive and apply. Owner-axis
-/// groups clear through the verified head attestation on adoption or a
-/// local owner-certified seal; non-owner-axis groups never receive a
-/// marker in this slice. Each refusal bumps the
-/// `fork_quarantine_refusals` diagnostic.
+/// groups clear through the verified head attestation on adoption, a
+/// mandate-carrying `MemberAdded`, or a local owner-certified seal;
+/// ordinary groups (ADR-0066 §2) carry a `no_anchor` marker that only the
+/// manual clear lifts. Each refusal bumps the `fork_quarantine_refusals`
+/// diagnostic.
 ///
 /// ADR-0066 §5 (slice 1): the machine code moved from `error` to
 /// `reason`, and `error` now carries the informational sentence R5 made
@@ -24027,9 +24111,12 @@ async fn record_recovery_fork_evidence(
         committed_by: journal_commit.committed_by.clone(),
         observed_at_ms: now_millis_u64(),
     };
-    // ADR-0064: same owner-axis-only rule as the live path — the
-    // recovery install writes the quarantine marker in the SAME store
-    // mutation as the evidence record.
+    // ADR-0064 → ADR-0066 §2: the recovery install writes the quarantine
+    // marker in the SAME store mutation as the evidence record, with the
+    // same per-population `no_anchor` rule as the live path. This path
+    // stays fenced to lineage-bearing groups: the store loop below needs a
+    // lineage record to hold the evidence, and ADR-0066 slice 2 widens the
+    // LIVE apply fence only.
     let quarantine = fork_quarantine_for_evidence(live, &evidence, &journal_commit, None);
     for store_path in [named_groups_path, home_suite_groups_path] {
         let Ok(json) = tokio::fs::read_to_string(store_path).await else {
