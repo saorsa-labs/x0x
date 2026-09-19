@@ -2805,3 +2805,426 @@ fn ingress_facts_separate_non_arrival_from_local_shedding() {
     // frames from the generator, which would invert the conclusion.
     assert!(ingress_facts(&sample(4, 0, 0, 4), "bb").contains("from_generator=?"));
 }
+
+// ── #611 eager-mesh oracle ────────────────────────────────────────────────────
+
+/// Check that every named peer on `topic` holds `role:"eager"` in a
+/// `peer_scores_by_topic` snapshot and that no peer carries an active cooldown.
+///
+/// # Why this matters (#611)
+///
+/// The existing oracle in this file observes **plane admission** only
+/// (`shape_diamond`): it checks that peers are connected and admitted to the
+/// gossip plane.  A mesh can look "admitted" while the PlumTree eager set has
+/// permanently collapsed to 1.  The failure mode is:
+///
+/// 1. Under sustained load a local CPU stall blows the per-peer 2500 ms send
+///    budget; five timeouts in 30 s book the peer as slow and apply a ≥120 s
+///    cooldown (`PEER_SUPPRESSION_COOLDOWN`, saorsa-gossip-pubsub).
+/// 2. The 1 Hz `refresh_topic_peers` re-adds the returning peer as **lazy**
+///    (by design, to avoid overriding a demotion) then runs `maintain_degree_at`,
+///    whose candidate filter (`can_graft_peer_at`) drops any cooled peer.
+/// 3. The issue-#32 cooling floor forbids suppressing the **last** eligible eager
+///    peer, so with `leaf_max_eager_degree = 2` the set pins at exactly 1 — never
+///    0, never back to 2 — for the remainder of the cooldown window (≥120 s).
+/// 4. Delivery continues via the pull path (IHAVE/IWANT) so the plane looks
+///    healthy, but every publication now incurs pull-path latency instead of
+///    eager push, silently degrading throughput without tripping the plane
+///    admission gate.
+///
+/// This predicate closes that gap.  It fails when any named peer is lazy,
+/// missing, or has a non-zero `cooldown_ms` — the exact signal that cooling is
+/// blocking re-promotion.
+///
+/// # Arguments
+///
+/// * `peer_scores_by_topic` — the value at key `"peer_scores_by_topic"` from
+///   `GET /diagnostics/gossip` (or an equivalent in-process snapshot).
+///   Shape: `{ "<topic>": { "<peer_id>": { "role": "eager"|"lazy",
+///   "cooling_events": u64, "cooldown_ms": u64|null, ... } } }`.
+/// * `topic` — the topic key as it appears in the map (named or hex8).
+/// * `peer_ids` — peer IDs expected to be present and eager on this topic.
+/// * `expected_degree` — `leaf_max_eager_degree` configured for this node
+///   (default **2** on a Leaf; confirmed in `src/gossip/config.rs`).
+///
+/// # Returns
+///
+/// `Ok(())` when all invariants hold.  `Err(String)` with a diagnostic message
+/// suitable for `assert!(…, "{}", err)` when any peer is lazy, absent, or
+/// has `cooldown_ms > 0`.
+///
+/// # Integration note
+///
+/// To assert recovery rather than just a snapshot, call this function on two
+/// consecutive observations taken after the load window and compare
+/// `cooling_events` between them.  Use [`check_eager_mesh_stable`] for that
+/// two-snapshot form.  Never use a fixed sleep between observations: poll up to
+/// a bounded iteration count so optimised builds cannot beat the wait
+/// (repo lesson from the race-test evidence trap).
+fn check_eager_mesh_recovered(
+    peer_scores_by_topic: &serde_json::Value,
+    topic: &str,
+    peer_ids: &[&str],
+    expected_degree: usize,
+) -> Result<(), String> {
+    let topic_map = match peer_scores_by_topic.get(topic) {
+        Some(serde_json::Value::Object(m)) => m,
+        Some(other) => {
+            return Err(format!(
+                "#611 eager-mesh oracle: topic {topic:?} is not an object in \
+                 peer_scores_by_topic: {other}"
+            ))
+        }
+        None => {
+            return Err(format!(
+                "#611 eager-mesh oracle: topic {topic:?} absent from peer_scores_by_topic \
+                 (present topics: {:?})",
+                peer_scores_by_topic
+                    .as_object()
+                    .map(|m| m.keys().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            ))
+        }
+    };
+
+    let mut eager_count = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for &peer_id in peer_ids {
+        let peer = match topic_map.get(peer_id) {
+            Some(v) => v,
+            None => {
+                errors.push(format!(
+                    "  peer {peer_id}: absent from topic {topic:?} \
+                     (present peers: {:?})",
+                    topic_map.keys().collect::<Vec<_>>()
+                ));
+                continue;
+            }
+        };
+
+        let role = peer
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(missing)");
+        let cooldown_ms = peer.get("cooldown_ms").and_then(|v| v.as_u64());
+        let suppression_state = peer
+            .get("suppression_state")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let cooling_events = peer.get("cooling_events").and_then(|v| v.as_u64());
+
+        if role == "eager" {
+            eager_count += 1;
+        } else {
+            errors.push(format!(
+                "  peer {peer_id}: role={role:?} want \"eager\" \
+                 [cooldown_ms={cooldown_ms:?} suppression_state={suppression_state:?} \
+                 cooling_events={cooling_events:?}] — peer is demoted, #611 collapse active"
+            ));
+        }
+
+        // An eager peer that still carries an active cooldown is in a recovery-probe
+        // state and can re-enter suppression under renewed load.  Flag it regardless
+        // of role so callers can assert full stability, not just momentary promotion.
+        if cooldown_ms.map(|ms| ms > 0).unwrap_or(false) {
+            errors.push(format!(
+                "  peer {peer_id}: cooldown_ms={cooldown_ms:?} > 0 \
+                 (suppression_state={suppression_state:?}) — recovery not complete"
+            ));
+        }
+    }
+
+    // Degree check: the count of eager peers must equal the configured ceiling.
+    // A count below expected_degree means the cool floor has pinned the set at a
+    // degraded value without the peer-level errors above catching it (e.g. a peer
+    // that was pruned entirely from the map and is therefore absent).
+    if eager_count != expected_degree {
+        // Prepend so the degree mismatch is the first line of the error.
+        errors.insert(
+            0,
+            format!(
+                "#611 eager-mesh oracle: eager_count={eager_count} want {expected_degree} \
+                 on topic {topic:?} — the cooling floor has degraded the eager set"
+            ),
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Two-snapshot stability check: verify that the eager mesh is not only
+/// recovered (`snapshot_after` passes [`check_eager_mesh_recovered`]) but also
+/// **stable** — `cooling_events` did not increment between the two observations.
+///
+/// An incrementing `cooling_events` counter across the recovery window means
+/// the peer was re-cooled after promotion, which looks like recovery in a single
+/// snapshot but is a transient that will produce another 2→1 collapse under
+/// the next load spike.
+///
+/// Call this after a bounded polling loop, never after a fixed sleep:
+/// `snapshot_before` is taken immediately after load completes;
+/// `snapshot_after` is taken after the same number of iterations that
+/// `check_eager_mesh_recovered` used to observe a passing state.
+fn check_eager_mesh_stable(
+    peer_scores_by_topic_before: &serde_json::Value,
+    peer_scores_by_topic_after: &serde_json::Value,
+    topic: &str,
+    peer_ids: &[&str],
+    expected_degree: usize,
+) -> Result<(), String> {
+    // The after snapshot must pass the single-snapshot check first.
+    check_eager_mesh_recovered(peer_scores_by_topic_after, topic, peer_ids, expected_degree)?;
+
+    // Then verify cooling_events did not advance between snapshots.
+    let before_map = peer_scores_by_topic_before.get(topic);
+    let after_map = peer_scores_by_topic_after
+        .get(topic)
+        .and_then(|v| v.as_object());
+
+    let Some(after_map) = after_map else {
+        return Err(format!(
+            "#611 stability oracle: topic {topic:?} absent from after-snapshot"
+        ));
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+    for &peer_id in peer_ids {
+        let before_events = before_map
+            .and_then(|m| m.get(peer_id))
+            .and_then(|p| p.get("cooling_events"))
+            .and_then(|v| v.as_u64());
+        let after_events = after_map
+            .get(peer_id)
+            .and_then(|p| p.get("cooling_events"))
+            .and_then(|v| v.as_u64());
+
+        match (before_events, after_events) {
+            (Some(b), Some(a)) if a > b => {
+                errors.push(format!(
+                    "  peer {peer_id}: cooling_events advanced {b}→{a} between observations \
+                     — peer was re-cooled after eager promotion, unstable recovery (#611)"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "#611 stability oracle: cooling_events advanced on topic {topic:?}:\n{}",
+            errors.join("\n")
+        ))
+    }
+}
+
+// ── Unit tests for the #611 oracle predicates ─────────────────────────────────
+//
+// These tests operate against **synthetic** peer_scores_by_topic JSON.
+// No daemon is spawned; no network I/O occurs.
+//
+// Induction of cooling deterministically end-to-end belongs in
+// saorsa-gossip's paused-clock test
+// `cooling_does_not_demote_when_no_graft_eligible_replacement_exists`
+// (sg#62/#65 PR #67).  The x0x layer only supplies the degree ceiling and the
+// diagnostic surface; the predicate logic below is what x0x owns.
+
+/// Happy path: both peers eager, no cooldown, degree == 2.
+/// This is the shape the diamond topology requires after load.
+#[test]
+fn eager_mesh_oracle_passes_on_fully_recovered_shape() {
+    let snapshot = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": {
+                "role": "eager",
+                "score": 1.0,
+                "cooling_events": 2,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            },
+            "peer_bbbb": {
+                "role": "eager",
+                "score": 0.9,
+                "cooling_events": 1,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            }
+        }
+    });
+    check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2)
+        .expect("fully-recovered shape must pass the #611 oracle");
+}
+
+/// **Negative control** — the oracle MUST fail on the exact #611 collapse shape:
+/// peer_bbbb demoted to lazy, cooldown_ms=120000, eager_count=1 while
+/// expected_degree=2.  Without this the oracle cannot be claimed "able to fail".
+///
+/// This is the synthetic version of what a degraded run's `peer_scores_by_topic`
+/// snapshot would show: peer was suppressed for 120 s and pinned the mesh at 1.
+#[test]
+fn eager_mesh_oracle_fails_on_611_collapse_shape() {
+    let snapshot = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": {
+                "role": "eager",
+                "score": 1.0,
+                "cooling_events": 5,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            },
+            "peer_bbbb": {
+                "role": "lazy",
+                "score": 0.1,
+                "cooling_events": 5,
+                "eager_eligible": false,
+                "suppression_state": "cooled",
+                "cooldown_ms": 120000
+            }
+        }
+    });
+    let result = check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "degraded shape (eager_count=1, peer_bbbb role=lazy cooldown=120s) must fail the \
+         #611 oracle; got Ok — the predicate is blind to the collapse"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("peer_bbbb"),
+        "#611 oracle error must name the demoted peer; got: {msg}"
+    );
+    assert!(
+        msg.contains("lazy") || msg.contains("eager_count"),
+        "#611 oracle error must explain the demotion; got: {msg}"
+    );
+}
+
+/// **Negative control** — a peer eager but carrying `cooldown_ms > 0` is in a
+/// recovery-probe window and can re-enter suppression under the next load spike.
+/// The oracle must flag this even though `role == "eager"`.
+#[test]
+fn eager_mesh_oracle_fails_on_eager_peer_with_active_cooldown() {
+    let snapshot = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": {
+                "role": "eager",
+                "score": 1.0,
+                "cooling_events": 0,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            },
+            "peer_bbbb": {
+                "role": "eager",
+                "score": 0.6,
+                "cooling_events": 3,
+                "eager_eligible": true,
+                "suppression_state": "recovery_probe",
+                "cooldown_ms": 45000
+            }
+        }
+    });
+    let result = check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "eager peer with cooldown_ms=45000 (recovery_probe) must fail the #611 oracle; \
+         a recovery-probe peer can re-enter suppression under renewed load"
+    );
+}
+
+/// **Negative control** — illustrates the gate/measure mismatch the old oracle
+/// suffered: asserting degree=1 would let a 2→1 collapse pass silently.
+/// The same snapshot must FAIL once we correctly assert degree=2.
+#[test]
+fn eager_mesh_oracle_degree_mismatch_is_detectable() {
+    // Only one peer is present and eager — the collapsed-mesh shape.
+    let snapshot = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": {
+                "role": "eager",
+                "score": 1.0,
+                "cooling_events": 0,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            }
+        }
+    });
+    // Wrong assertion (degree=1): silently passes — this is what the old
+    // oracle effectively did by not checking the eager set at all.
+    assert!(
+        check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa"], 1).is_ok(),
+        "degree=1 assertion passes on a single eager peer (illustrating old oracle blindness)"
+    );
+    // Correct assertion (degree=2): fails because peer_bbbb is absent.
+    // The degree check + absent-peer error together surface the collapse.
+    let result = check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "degree=2 assertion must fail when peer_bbbb is absent — \
+         the #611 collapse is now visible"
+    );
+}
+
+/// Stability oracle: `cooling_events` must not advance between two observations.
+/// If it does, the peer was re-cooled after promotion — a transient recovery.
+#[test]
+fn eager_mesh_stability_oracle_passes_when_events_stable() {
+    let make_snap = |events_a: u64, events_b: u64| {
+        serde_json::json!({
+            "dm_bus": {
+                "peer_aaaa": { "role": "eager", "cooling_events": events_a,
+                               "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+                "peer_bbbb": { "role": "eager", "cooling_events": events_b,
+                               "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
+            }
+        })
+    };
+    // Same event counts before and after — stable recovery.
+    let before = make_snap(3, 2);
+    let after = make_snap(3, 2);
+    check_eager_mesh_stable(&before, &after, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2)
+        .expect("stable cooling_events must pass the stability oracle");
+}
+
+/// **Negative control** — stability oracle must fail when `cooling_events`
+/// advanced (peer was re-cooled after eager promotion).
+#[test]
+fn eager_mesh_stability_oracle_fails_when_events_advance() {
+    let before = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": { "role": "eager", "cooling_events": 3, "eager_eligible": true,
+                           "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 2, "eager_eligible": true,
+                           "suppression_state": null, "cooldown_ms": null }
+        }
+    });
+    // peer_bbbb gained a new cooling event between observations.
+    let after = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": { "role": "eager", "cooling_events": 3, "eager_eligible": true,
+                           "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 3, "eager_eligible": true,
+                           "suppression_state": null, "cooldown_ms": null }
+        }
+    });
+    let result = check_eager_mesh_stable(&before, &after, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "advancing cooling_events must fail the stability oracle"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("peer_bbbb"),
+        "stability error must name the re-cooled peer; got: {msg}"
+    );
+}
