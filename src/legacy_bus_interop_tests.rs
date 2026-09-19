@@ -695,9 +695,23 @@ async fn diamond_observations_with_recorder(
         let end = diamond_now(clock);
         // Full, unfiltered returned IDs: an unknown peer is not silently lost.
         let admitted = peers.iter().map(|p| hex::encode(p.0)).collect::<Vec<_>>();
+        // Embed peer_scores_by_topic so capture_ready_diamond can run the
+        // #611 eager-role oracle beside diamond_peer_sets in the same retry loop.
+        // Null when the gossip runtime has not yet started; the eager check
+        // skips gracefully on null (scores lag plane admission by at most one
+        // iteration during the initial bring-up).
+        let peer_scores_by_topic = agent
+            .gossip_pubsub_stage_stats()
+            .and_then(|s| serde_json::to_value(&s.peer_scores_by_topic).ok())
+            .unwrap_or(serde_json::Value::Null);
         observations.insert(
             (*label).into(),
-            serde_json::json!({"admitted":admitted,"begin_ns":begin,"end_ns":end}),
+            serde_json::json!({
+                "admitted": admitted,
+                "begin_ns": begin,
+                "end_ns": end,
+                "peer_scores_by_topic": peer_scores_by_topic,
+            }),
         );
     }
     observations.into()
@@ -911,6 +925,56 @@ struct RejectedReadiness {
     diagnostics: Box<ReadinessDiagnostics>,
 }
 
+/// Run [`check_eager_mesh_recovered`] for every node in the diamond topology,
+/// using the `peer_scores_by_topic` embedded in `observed` by
+/// [`diamond_observations_with_recorder`].
+///
+/// Chained with [`diamond_peer_sets`] inside [`capture_ready_diamond`]'s
+/// bounded retry loop so that the eager-role check retries under the SETUP
+/// deadline alongside plane-admission validation.  This means a transient
+/// PlumTree set still at 1 (the #611 collapse shape) causes the loop to keep
+/// polling — no extra sleep or outer retry is needed.
+///
+/// Returns `Ok(())` when all four nodes have their two expected neighbors
+/// as eager peers.  Returns `Err(String)` naming the first failing node.
+///
+/// Skips gracefully when `identities` is `None` (peer IDs not yet resolved)
+/// or when a node's `peer_scores_by_topic` entry is `null` (gossip runtime
+/// not yet started); this keeps the retry loop safe during initial bring-up
+/// when scores lag plane admission by at most one iteration.
+///
+/// # Degree note
+/// Harness agents are built with `Agent::builder()` which produces Leaf
+/// nodes; the default `leaf_max_eager_degree = 2` is the right ceiling here.
+/// Full or relay nodes would need `FULL_EAGER_DEGREE_CEILING = 6`.
+fn check_eager_mesh_for_diamond(
+    observed: &serde_json::Value,
+    identities: Option<[[u8; 32]; 4]>,
+) -> Result<(), String> {
+    let Some(ids) = identities else {
+        return Ok(());
+    };
+    let bus_topic = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
+    // Expected neighbor indices per DIAMOND_LABELS order:
+    //   G5→{D5,O5}, D5→{G5,W5}, O5→{G5,W5}, W5→{D5,O5}
+    const NEIGHBOR_INDICES: [[usize; 2]; 4] = [[1, 2], [0, 3], [0, 3], [1, 2]];
+    for (i, label) in DIAMOND_LABELS.iter().enumerate() {
+        let scores = &observed[*label]["peer_scores_by_topic"];
+        if scores.is_null() {
+            // Gossip runtime not yet started; skip, the retry loop will revisit.
+            continue;
+        }
+        let neighbor_hex8: Vec<String> = NEIGHBOR_INDICES[i]
+            .iter()
+            .map(|&j| hex::encode(ids[j])[..16].to_string())
+            .collect();
+        let neighbor_refs: Vec<&str> = neighbor_hex8.iter().map(String::as_str).collect();
+        check_eager_mesh_recovered(scores, &bus_topic, &neighbor_refs, 2)
+            .map_err(|e| format!("node {label}: {e}"))?;
+    }
+    Ok(())
+}
+
 // One absolute deadline owns acquisition and polling. Only the full object
 // validated here can become pre_cut; timed-out partial acquisitions are dropped.
 async fn capture_ready_diamond<F, Fut>(
@@ -977,7 +1041,8 @@ where
                 return Err(rejected);
             }
         };
-        let validation = diamond_peer_sets(topology, &observed);
+        let validation = diamond_peer_sets(topology, &observed)
+            .and_then(|()| check_eager_mesh_for_diamond(&observed, identities));
         attempt.validation_end_ns = readiness_offset(start, tokio::time::Instant::now());
         rejected.diagnostics.clock_incomplete |= attempt.validation_end_ns.is_none();
         match validation {
@@ -2857,7 +2922,7 @@ fn ingress_facts_separate_non_arrival_from_local_shedding() {
 ///
 /// To assert recovery rather than just a snapshot, call this function on two
 /// consecutive observations taken after the load window and compare
-/// `cooling_events` between them.  Use [`check_eager_mesh_stable`] for that
+/// `last_cool_at_unix_ms` between them.  Use [`check_eager_mesh_stable`] for that
 /// two-snapshot form.  Never use a fixed sleep between observations: poll up to
 /// a bounded iteration count so optimised builds cannot beat the wait
 /// (repo lesson from the race-test evidence trap).
@@ -2912,7 +2977,8 @@ fn check_eager_mesh_recovered(
             .get("suppression_state")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        let cooling_events = peer.get("cooling_events").and_then(|v| v.as_u64());
+        // cooling_events is f64 in PeerScoreBreakdownSnapshot; use as_f64() not as_u64().
+        let cooling_events = peer.get("cooling_events").and_then(|v| v.as_f64());
 
         if role == "eager" {
             eager_count += 1;
@@ -2959,12 +3025,19 @@ fn check_eager_mesh_recovered(
 
 /// Two-snapshot stability check: verify that the eager mesh is not only
 /// recovered (`snapshot_after` passes [`check_eager_mesh_recovered`]) but also
-/// **stable** — `cooling_events` did not increment between the two observations.
+/// **stable** — the peer was not re-cooled between the two observations.
 ///
-/// An incrementing `cooling_events` counter across the recovery window means
-/// the peer was re-cooled after promotion, which looks like recovery in a single
-/// snapshot but is a transient that will produce another 2→1 collapse under
-/// the next load spike.
+/// Uses `last_cool_at_unix_ms` (monotonic `Option<u64>`) rather than
+/// `cooling_events` to detect re-cooling.  `cooling_events` is an **f64
+/// decayed counter** in `PeerScoreBreakdownSnapshot`; `serde_json`'s
+/// `Value::as_u64()` returns `None` for float JSON values, so a comparison
+/// on `cooling_events` can **never fire** on real saorsa-gossip-pubsub
+/// snapshots.  `last_cool_at_unix_ms` is `Option<u64>` and monotonically
+/// increases whenever the peer is cooled: if `after > before` the peer was
+/// re-cooled between observations.
+///
+/// A re-cooled peer will produce another 2→1 collapse under the next load
+/// spike even though the single-snapshot check passed.
 ///
 /// Call this after a bounded polling loop, never after a fixed sleep:
 /// `snapshot_before` is taken immediately after load completes;
@@ -2980,7 +3053,10 @@ fn check_eager_mesh_stable(
     // The after snapshot must pass the single-snapshot check first.
     check_eager_mesh_recovered(peer_scores_by_topic_after, topic, peer_ids, expected_degree)?;
 
-    // Then verify cooling_events did not advance between snapshots.
+    // Verify last_cool_at_unix_ms did not advance between snapshots.
+    // cooling_events is an f64 decayed counter; as_u64() is always None for
+    // float JSON values, making any cooling_events comparison silently vacuous.
+    // last_cool_at_unix_ms is monotonic Option<u64> and is safe to compare.
     let before_map = peer_scores_by_topic_before.get(topic);
     let after_map = peer_scores_by_topic_after
         .get(topic)
@@ -2994,23 +3070,28 @@ fn check_eager_mesh_stable(
 
     let mut errors: Vec<String> = Vec::new();
     for &peer_id in peer_ids {
-        let before_events = before_map
+        let before_ts = before_map
             .and_then(|m| m.get(peer_id))
-            .and_then(|p| p.get("cooling_events"))
+            .and_then(|p| p.get("last_cool_at_unix_ms"))
             .and_then(|v| v.as_u64());
-        let after_events = after_map
+        let after_ts = after_map
             .get(peer_id)
-            .and_then(|p| p.get("cooling_events"))
+            .and_then(|p| p.get("last_cool_at_unix_ms"))
             .and_then(|v| v.as_u64());
 
-        match (before_events, after_events) {
-            (Some(b), Some(a)) if a > b => {
-                errors.push(format!(
-                    "  peer {peer_id}: cooling_events advanced {b}→{a} between observations \
-                     — peer was re-cooled after eager promotion, unstable recovery (#611)"
-                ));
-            }
-            _ => {}
+        // (before=None, after=Some) = first cooling appeared during window.
+        // (Some(b), Some(a)) with a > b = timestamp advanced = re-cooled.
+        // (_, None) = no cooling recorded at all = stable.
+        let recooled = match (before_ts, after_ts) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(b), Some(a)) => a > b,
+        };
+        if recooled {
+            errors.push(format!(
+                "  peer {peer_id}: last_cool_at_unix_ms advanced {before_ts:?}→{after_ts:?} \
+                 — peer was re-cooled after eager promotion, unstable recovery (#611)"
+            ));
         }
     }
 
@@ -3018,7 +3099,7 @@ fn check_eager_mesh_stable(
         Ok(())
     } else {
         Err(format!(
-            "#611 stability oracle: cooling_events advanced on topic {topic:?}:\n{}",
+            "#611 stability oracle: re-cooling detected on topic {topic:?}:\n{}",
             errors.join("\n")
         ))
     }
@@ -3037,6 +3118,11 @@ fn check_eager_mesh_stable(
 
 /// Happy path: both peers eager, no cooldown, degree == 2.
 /// This is the shape the diamond topology requires after load.
+///
+/// Fixtures use **float** `cooling_events` (e.g. `2.0`) to match the real
+/// `PeerScoreBreakdownSnapshot` shape from saorsa-gossip-pubsub 0.5.82.
+/// `cooling_events` is an f64 decayed counter; integer JSON literals like `2`
+/// would silently pass `as_u64()` in the old code but float values never do.
 #[test]
 fn eager_mesh_oracle_passes_on_fully_recovered_shape() {
     let snapshot = serde_json::json!({
@@ -3044,7 +3130,8 @@ fn eager_mesh_oracle_passes_on_fully_recovered_shape() {
             "peer_aaaa": {
                 "role": "eager",
                 "score": 1.0,
-                "cooling_events": 2,
+                "cooling_events": 2.0,
+                "last_cool_at_unix_ms": null,
                 "eager_eligible": true,
                 "suppression_state": null,
                 "cooldown_ms": null
@@ -3052,7 +3139,8 @@ fn eager_mesh_oracle_passes_on_fully_recovered_shape() {
             "peer_bbbb": {
                 "role": "eager",
                 "score": 0.9,
-                "cooling_events": 1,
+                "cooling_events": 1.0,
+                "last_cool_at_unix_ms": null,
                 "eager_eligible": true,
                 "suppression_state": null,
                 "cooldown_ms": null
@@ -3076,7 +3164,8 @@ fn eager_mesh_oracle_fails_on_611_collapse_shape() {
             "peer_aaaa": {
                 "role": "eager",
                 "score": 1.0,
-                "cooling_events": 5,
+                "cooling_events": 5.0,
+                "last_cool_at_unix_ms": 1_700_000_000_000u64,
                 "eager_eligible": true,
                 "suppression_state": null,
                 "cooldown_ms": null
@@ -3084,7 +3173,8 @@ fn eager_mesh_oracle_fails_on_611_collapse_shape() {
             "peer_bbbb": {
                 "role": "lazy",
                 "score": 0.1,
-                "cooling_events": 5,
+                "cooling_events": 5.0,
+                "last_cool_at_unix_ms": 1_700_000_120_000u64,
                 "eager_eligible": false,
                 "suppression_state": "cooled",
                 "cooldown_ms": 120000
@@ -3118,7 +3208,8 @@ fn eager_mesh_oracle_fails_on_eager_peer_with_active_cooldown() {
             "peer_aaaa": {
                 "role": "eager",
                 "score": 1.0,
-                "cooling_events": 0,
+                "cooling_events": 0.0,
+                "last_cool_at_unix_ms": null,
                 "eager_eligible": true,
                 "suppression_state": null,
                 "cooldown_ms": null
@@ -3126,7 +3217,8 @@ fn eager_mesh_oracle_fails_on_eager_peer_with_active_cooldown() {
             "peer_bbbb": {
                 "role": "eager",
                 "score": 0.6,
-                "cooling_events": 3,
+                "cooling_events": 3.0,
+                "last_cool_at_unix_ms": 1_700_000_045_000u64,
                 "eager_eligible": true,
                 "suppression_state": "recovery_probe",
                 "cooldown_ms": 45000
@@ -3152,7 +3244,8 @@ fn eager_mesh_oracle_degree_mismatch_is_detectable() {
             "peer_aaaa": {
                 "role": "eager",
                 "score": 1.0,
-                "cooling_events": 0,
+                "cooling_events": 0.0,
+                "last_cool_at_unix_ms": null,
                 "eager_eligible": true,
                 "suppression_state": null,
                 "cooldown_ms": null
@@ -3175,52 +3268,115 @@ fn eager_mesh_oracle_degree_mismatch_is_detectable() {
     );
 }
 
-/// Stability oracle: `cooling_events` must not advance between two observations.
-/// If it does, the peer was re-cooled after promotion — a transient recovery.
+/// Stability oracle: `last_cool_at_unix_ms` must not advance between two
+/// observations.  If it does, the peer was re-cooled after promotion — a
+/// transient recovery.
+///
+/// Fixtures use float `cooling_events` (the real shape from saorsa-gossip-pubsub)
+/// to guard against any regression that re-introduces `cooling_events.as_u64()`.
 #[test]
-fn eager_mesh_stability_oracle_passes_when_events_stable() {
-    let make_snap = |events_a: u64, events_b: u64| {
+fn eager_mesh_stability_oracle_passes_when_ts_stable() {
+    let make_snap = |ts_a: Option<u64>, ts_b: Option<u64>| {
         serde_json::json!({
             "dm_bus": {
-                "peer_aaaa": { "role": "eager", "cooling_events": events_a,
+                "peer_aaaa": { "role": "eager", "cooling_events": 3.0,
+                               "last_cool_at_unix_ms": ts_a,
                                "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
-                "peer_bbbb": { "role": "eager", "cooling_events": events_b,
+                "peer_bbbb": { "role": "eager", "cooling_events": 2.0,
+                               "last_cool_at_unix_ms": ts_b,
                                "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
             }
         })
     };
-    // Same event counts before and after — stable recovery.
-    let before = make_snap(3, 2);
-    let after = make_snap(3, 2);
+    // Same last_cool_at_unix_ms before and after — stable recovery.
+    let before = make_snap(Some(1_700_000_000_000), Some(1_700_000_010_000));
+    let after = make_snap(Some(1_700_000_000_000), Some(1_700_000_010_000));
     check_eager_mesh_stable(&before, &after, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2)
-        .expect("stable cooling_events must pass the stability oracle");
+        .expect("stable last_cool_at_unix_ms must pass the stability oracle");
 }
 
-/// **Negative control** — stability oracle must fail when `cooling_events`
+/// **Negative control** — stability oracle must fail when `last_cool_at_unix_ms`
 /// advanced (peer was re-cooled after eager promotion).
+///
+/// Uses float `cooling_events` so that any attempt to re-introduce
+/// `cooling_events.as_u64()` would silently fail to detect re-cooling — this
+/// test would then incorrectly pass, making the regression visible.
 #[test]
-fn eager_mesh_stability_oracle_fails_when_events_advance() {
+fn eager_mesh_stability_oracle_fails_when_ts_advances() {
     let before = serde_json::json!({
         "dm_bus": {
-            "peer_aaaa": { "role": "eager", "cooling_events": 3, "eager_eligible": true,
-                           "suppression_state": null, "cooldown_ms": null },
-            "peer_bbbb": { "role": "eager", "cooling_events": 2, "eager_eligible": true,
-                           "suppression_state": null, "cooldown_ms": null }
+            "peer_aaaa": { "role": "eager", "cooling_events": 3.0,
+                           "last_cool_at_unix_ms": 1_700_000_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 2.0,
+                           "last_cool_at_unix_ms": 1_700_000_010_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
         }
     });
-    // peer_bbbb gained a new cooling event between observations.
+    // peer_bbbb was re-cooled: last_cool_at_unix_ms advanced.
     let after = serde_json::json!({
         "dm_bus": {
-            "peer_aaaa": { "role": "eager", "cooling_events": 3, "eager_eligible": true,
-                           "suppression_state": null, "cooldown_ms": null },
-            "peer_bbbb": { "role": "eager", "cooling_events": 3, "eager_eligible": true,
-                           "suppression_state": null, "cooldown_ms": null }
+            "peer_aaaa": { "role": "eager", "cooling_events": 3.0,
+                           "last_cool_at_unix_ms": 1_700_000_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 2.4,
+                           "last_cool_at_unix_ms": 1_700_000_130_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
         }
     });
     let result = check_eager_mesh_stable(&before, &after, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
     assert!(
         result.is_err(),
-        "advancing cooling_events must fail the stability oracle"
+        "advancing last_cool_at_unix_ms must fail the stability oracle"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("peer_bbbb"),
+        "stability error must name the re-cooled peer; got: {msg}"
+    );
+}
+
+/// **Negative control** for the `cooling_events` f64 / `as_u64()` trap.
+///
+/// `PeerScoreBreakdownSnapshot.cooling_events` is an **f64 decayed counter**;
+/// `serde_json::Value::as_u64()` always returns `None` for float JSON values.
+/// Any stability oracle that compares `cooling_events` via `as_u64()` would
+/// silently pass even when `cooling_events` advanced — invisible re-cooling.
+///
+/// This test uses float `cooling_events` (the real snapshot shape) and verifies
+/// that the oracle correctly detects re-cooling through `last_cool_at_unix_ms`
+/// even though `cooling_events.as_u64()` would return `None` for both values.
+#[test]
+fn eager_mesh_stability_oracle_not_fooled_by_float_cooling_events() {
+    // cooling_events is f64: as_u64() is always None, so the old oracle
+    // could never fire on this shape, even when cooling_events clearly advanced.
+    let before = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": { "role": "eager", "cooling_events": 2.0,
+                           "last_cool_at_unix_ms": 1_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 1.5,
+                           "last_cool_at_unix_ms": 2_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
+        }
+    });
+    // peer_bbbb was re-cooled: cooling_events advanced (f64, as_u64=None) AND
+    // last_cool_at_unix_ms advanced (u64, reliably detectable).
+    let after = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": { "role": "eager", "cooling_events": 2.0,
+                           "last_cool_at_unix_ms": 1_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 2.4,
+                           "last_cool_at_unix_ms": 3_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
+        }
+    });
+    let result = check_eager_mesh_stable(&before, &after, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "re-cooling must be detected via last_cool_at_unix_ms even when cooling_events is f64; \
+         if this passes, the oracle is silently blind to re-cooling on real snapshots (#611)"
     );
     let msg = result.unwrap_err();
     assert!(
