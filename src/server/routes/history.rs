@@ -696,9 +696,7 @@ pub(in crate::server) async fn history_purge(
         let refusal = {
             let groups = state.named_groups.read().await;
             groups.get(group_id).and_then(|info| {
-                crate::server::routes::named_groups::reject_fork_quarantined(
-                    &state, group_id, info,
-                )
+                crate::server::routes::named_groups::reject_fork_quarantined(&state, group_id, info)
             })
         };
         if let Some(refusal) = refusal {
@@ -1552,7 +1550,7 @@ mod adr0066_fork_quarantine_tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::Request;
-    use axum::routing::{delete, get};
+    use axum::routing::get;
     use tower::ServiceExt;
 
     const QUARANTINED: &str = "contested-group";
@@ -1579,11 +1577,7 @@ mod adr0066_fork_quarantine_tests {
             .with_state(state)
     }
 
-    async fn call(
-        app: &axum::Router,
-        method: &str,
-        path: &str,
-    ) -> (StatusCode, serde_json::Value) {
+    async fn call(app: &axum::Router, method: &str, path: &str) -> (StatusCode, serde_json::Value) {
         let req = Request::builder()
             .method(method)
             .uri(path)
@@ -1727,7 +1721,10 @@ mod adr0066_fork_quarantine_tests {
 
         // §5's acceptance bar: the machine code lives in `reason`, and
         // `error` is an actionable sentence, not the code again.
-        assert_eq!(json["reason"], "fork_quarantined", "§5 machine code: {json}");
+        assert_eq!(
+            json["reason"], "fork_quarantined",
+            "§5 machine code: {json}"
+        );
         let message = json["error"].as_str().unwrap_or_default();
         assert!(
             !message.is_empty() && message != "fork_quarantined",
@@ -1782,13 +1779,20 @@ mod adr0066_fork_quarantine_tests {
         unquarantined(&state, CLEAN).await;
 
         let (status, annotated) = call(&app, "GET", "/history?scope=group:contested-group").await;
-        assert_eq!(status, StatusCode::OK, "reads are NEVER refused: {annotated}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "reads are NEVER refused: {annotated}"
+        );
         assert_eq!(
             annotated["count"], 2,
             "the same rows still serve under quarantine: {annotated}"
         );
         assert_eq!(annotated["fork_quarantined"], true, "{annotated}");
-        assert_eq!(annotated["fork_quarantine"]["scopes"][0]["scope"], "group:contested-group");
+        assert_eq!(
+            annotated["fork_quarantine"]["scopes"][0]["scope"],
+            "group:contested-group"
+        );
         assert_eq!(annotated["fork_quarantine"]["scopes"][0]["revision"], 9);
         assert_eq!(
             annotated["fork_quarantine"]["scopes"][0]["observed_at_ms"],

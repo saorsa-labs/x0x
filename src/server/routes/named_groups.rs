@@ -20065,8 +20065,7 @@ const FORK_QUARANTINED_REASON: &str = "fork_quarantined";
 
 /// ADR-0066 §5: the machine-readable remedy carried in
 /// `fork_quarantine.clear_with`.
-pub(in crate::server) const FORK_QUARANTINE_CLEAR_ROUTE: &str =
-    "POST /groups/:id/quarantine/clear";
+pub(in crate::server) const FORK_QUARANTINE_CLEAR_ROUTE: &str = "POST /groups/:id/quarantine/clear";
 
 /// ADR-0066 §5: the informational sentence. It must state all three of
 /// the condition (this node holds authenticated fork evidence), why the
