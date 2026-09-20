@@ -26,6 +26,20 @@ All notable changes to this project will be documented in this file.
     already carries a marker, so the marker remains settable (an incoming
     record that ADDS one is the install path itself, the mirror of ADR-0066
     §2's rule that gating the retry-rollback would make a marker unclearable).
+- **Home provisioning and reseal no longer erase a marker installed mid-seal
+  (found in cross-model security review of #748).** `stamp_and_seal_home` and
+  `reseal_home` clone the Home record under a read guard, DROP that guard,
+  await `seal_commit_owner_certified`, then write the WHOLE record back. A
+  forked sibling device landing authenticated fork evidence on the Home group
+  inside that window had its marker **erased** by the write — containment
+  dropped silently, on the group where the owner axis matters most. Both sites
+  now capture the lifecycle epoch token in the same read guard as the clone and
+  re-check it under the write guard before the insert; on a mismatch the seal
+  is refused, nothing is written and **the marker survives**. Provisioning is
+  retried on the next pass, not looped. The comparison is `MarkerOnly` (a seal
+  bumps `state_revision` by construction) and refuses in BOTH directions —
+  erasure and resurrection — because unlike the TreeKEM persist this path never
+  installs a marker, so there is no install to mistake a new marker for.
 - **Encrypted (GSS) KvStore access fails closed under fork quarantine
   (ADR-0066 §1 rows 10–12, the bind-time gap; #732).** `GssKvSecureContext`
   was the one cached KV authorization context blind to the marker —

@@ -4457,6 +4457,55 @@ pub(in crate::server) enum EpochCheckedPersist {
     },
 }
 
+/// ADR-0067: which halves of the lifecycle epoch token a re-check compares.
+///
+/// Two modes, because the sites genuinely differ and conflating them would
+/// either refuse every legitimate write or miss the hazard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum EpochScope {
+    /// Full `(state_revision, marker_identity)` equality — the default, and
+    /// what a site should use unless it can justify otherwise. Any lifecycle
+    /// movement at all aborts the act.
+    Full,
+    /// Marker identity only, ignoring `state_revision`.
+    ///
+    /// For a site whose whole PURPOSE is to persist an advanced state — a
+    /// seal bumps `state_revision` by construction, so `Full` would refuse
+    /// every legitimate write there. The marker half still has to match
+    /// exactly, in BOTH directions:
+    ///
+    /// - live has a marker, the record being written does not ⇒ the write
+    ///   would ERASE containment. Refuse.
+    /// - live has none, the record being written has one ⇒ the write would
+    ///   RESURRECT a marker cleared during the window. Refuse.
+    ///
+    /// Both directions matter: erasure drops containment silently, and
+    /// resurrection re-quarantines a group an operator just released.
+    MarkerOnly,
+}
+
+impl EpochScope {
+    /// Does the token observed under the lock still match what the caller
+    /// captured? A `None` on either side is a real state ("no record here"),
+    /// never a wildcard.
+    fn matches(
+        self,
+        live: Option<&x0x::groups::LifecycleEpochToken>,
+        expected: Option<&x0x::groups::LifecycleEpochToken>,
+    ) -> bool {
+        match self {
+            Self::Full => live == expected,
+            Self::MarkerOnly => match (live, expected) {
+                (Some(live), Some(expected)) => live.same_marker(expected),
+                (None, None) => true,
+                // A record appearing or vanishing mid-operation is a
+                // mismatch under every scope.
+                _ => false,
+            },
+        }
+    }
+}
+
 /// ADR-0066 §4 / ADR-0067: run a roster mutation only if the group's
 /// lifecycle epoch token is still the one the caller captured at its
 /// authorization check.
@@ -4499,15 +4548,18 @@ pub(in crate::server) enum EpochCheckedPersist {
 /// present→present matches only on the same identity, and present→absent
 /// refuses. Treating a missing record as "unchanged" would be the fail-open
 /// reading, so it is never done.
+/// `scope` picks which halves of the token must match — see [`EpochScope`].
+///
 /// Named `_unlocked` for the same reason
-/// [`persist_named_groups_mutation_unlocked`] is: every caller so far already
-/// holds `named_groups_persistence_lock` (#457 r10 item 10.1 — taking it again
-/// under the guard self-deadlocks). A locking wrapper is deliberately NOT
-/// added until a caller needs one.
+/// [`persist_named_groups_mutation_unlocked`] is (#457 r10 item 10.1: taking
+/// `named_groups_persistence_lock` again under the guard self-deadlocks). Use
+/// [`persist_named_groups_mutation_epoch_checked`] when you do NOT already
+/// hold it.
 pub(in crate::server) async fn persist_named_groups_mutation_epoch_checked_unlocked<F>(
     state: &AppState,
     group_id: &str,
     expected: Option<&x0x::groups::LifecycleEpochToken>,
+    scope: EpochScope,
     mutate: F,
 ) -> EpochCheckedPersist
 where
@@ -4525,7 +4577,7 @@ where
         #[cfg(test)]
         epoch_recheck_barrier::before_recheck(group_id, groups);
         let live = crate::server::lifecycle_epoch_token_locked(groups, group_id);
-        if live.as_ref() != expected {
+        if !scope.matches(live.as_ref(), expected) {
             moved = Some(live);
             // Returning false leaves the map untouched AND skips the save,
             // so the abort costs nothing and writes nothing.
@@ -4538,6 +4590,25 @@ where
         Some(observed) => EpochCheckedPersist::EpochMoved { observed },
         None => EpochCheckedPersist::Applied(outcome),
     }
+}
+
+/// [`persist_named_groups_mutation_epoch_checked_unlocked`] for callers that do
+/// NOT already hold `named_groups_persistence_lock` — the same relationship
+/// [`persist_named_groups_mutation`] has to its unlocked variant, and the same
+/// lock order (persistence lock, then the roster map).
+pub(in crate::server) async fn persist_named_groups_mutation_epoch_checked<F>(
+    state: &AppState,
+    group_id: &str,
+    expected: Option<&x0x::groups::LifecycleEpochToken>,
+    scope: EpochScope,
+    mutate: F,
+) -> EpochCheckedPersist
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    persist_named_groups_mutation_epoch_checked_unlocked(state, group_id, expected, scope, mutate)
+        .await
 }
 
 /// ADR-0067 deterministic race harness — `cfg(test)` END TO END.
@@ -16129,6 +16200,7 @@ pub(in crate::server) async fn join_group_via_invite(
                         &state,
                         &group_id_hex,
                         joining_epoch_token.as_ref(),
+                        EpochScope::Full,
                         |groups| {
                             groups.insert(group_id_hex.clone(), info.clone());
                             true
@@ -24216,7 +24288,6 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         // which checks `withdrawn` only.
         //
         // Only the MARKER half of the token is compared here, and this is the
-        // Only the MARKER half of the token is compared here, and this is the
         // one site where that is correct: this function exists to persist an
         // ADVANCED state, so the caller's `state_revision` is expected to
         // differ from the live one and comparing it would refuse every
@@ -24231,6 +24302,17 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         // unsettable, exactly as §2 warns that gating the retry-rollback would
         // make a marker unclearable. Nothing needs protecting when the live
         // record has no marker; everything does once it has one.
+        //
+        // ACCEPTED CONSEQUENCE, asserted by
+        // `treekem_stale_snapshot_may_resurrect_a_cleared_marker`: because
+        // "adds a marker" is indistinguishable HERE from "is the install", a
+        // snapshot captured before a clear can re-assert a just-cleared
+        // marker. That direction fails CLOSED — the group is re-contained,
+        // not released — so the operator clears again, which is strictly
+        // safer than the erasure this gate exists to stop. Unlike this site,
+        // `EpochScope::MarkerOnly` (used by the Home seal paths, which never
+        // install) refuses BOTH directions, because there the ambiguity does
+        // not exist.
         if let Some((_, live)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
             let live_token = live.lifecycle_epoch_token();
             let captured = info.lifecycle_epoch_token();

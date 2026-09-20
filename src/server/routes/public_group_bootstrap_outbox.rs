@@ -1837,10 +1837,11 @@ mod tests {
     ///
     /// WHY the revision is a parameter rather than a constant: the row-21
     /// dedupe (`LOGGED_PUBLICATION_REFUSALS`) is process-global and keyed by
-    /// `(group id, revision)`, and every fixture here shares one mls group id,
-    /// so two tests at the same revision would have the second one's counter
-    /// assertion silently absorbed by the first one's dedupe entry. Each test
-    /// in this file owns a revision.
+    /// `(group id, revision, observed_at_ms)` (`:614`), and every fixture here
+    /// shares one mls group id AND a fixed `observed_at_ms`, so the revision is
+    /// the only varying component. Two tests at the same revision would have
+    /// the second one's counter assertion silently absorbed by the first one's
+    /// dedupe entry, so each test in this file owns a revision.
     fn quarantine_marker(
         info: &x0x::groups::GroupInfo,
         revision: u64,

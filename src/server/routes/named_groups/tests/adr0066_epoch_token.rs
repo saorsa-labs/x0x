@@ -32,7 +32,7 @@ use super::*;
 
 use crate::server::routes::named_groups::{
     epoch_recheck_barrier, persist_named_groups_mutation_epoch_checked_unlocked,
-    persist_named_groups_mutation_unlocked, EpochCheckedPersist,
+    persist_named_groups_mutation_unlocked, EpochCheckedPersist, EpochScope,
 };
 
 /// A minimal loopback-only daemon state on a temp dir. No sockets, no peers:
@@ -283,6 +283,7 @@ async fn run_with_injection(
         state,
         lookup_id,
         captured.as_ref(),
+        EpochScope::Full,
         |groups| {
             groups.insert(
                 "a-group-this-operation-had-no-business-writing".to_string(),
@@ -488,6 +489,7 @@ async fn no_marker_is_unchanged_behaviour() -> Result<()> {
         &state,
         key,
         captured.as_ref(),
+        EpochScope::Full,
         |groups| {
             groups.insert(
                 "clean-effect".to_string(),
@@ -579,6 +581,7 @@ async fn absent_capture_refuses_when_a_marker_appears() -> Result<()> {
         &state,
         key,
         captured.as_ref(),
+        EpochScope::Full,
         |_groups| panic!("the mutation must not run"),
     )
     .await;
@@ -601,6 +604,7 @@ async fn absent_capture_still_absent_proceeds() -> Result<()> {
         &state,
         "g-never-existed",
         captured.as_ref(),
+        EpochScope::Full,
         |groups| {
             groups.insert(
                 "fresh-join".to_string(),
@@ -613,6 +617,161 @@ async fn absent_capture_still_absent_proceeds() -> Result<()> {
     assert!(
         matches!(outcome, EpochCheckedPersist::Applied(Ok(_))),
         "absent -> absent is a MATCH: a first join must not be refused"
+    );
+    Ok(())
+}
+
+// ───── ADR-0067 Validation: the TreeKEM atomic-persist re-check site ─────
+//
+// Nit (b) from the cross-model security review: ADR-0067's Validation says
+// "per re-check site", and this site had no barrier-driven fixture. The two
+// tests below pin its asymmetric rule in BOTH directions, including the
+// direction it deliberately permits.
+
+/// Owner-axis (Home-shaped) state, the population the TreeKEM atomic persist
+/// serves.
+async fn owner_axis_state() -> Result<(Arc<AppState>, tempfile::TempDir, x0x::identity::UserKeypair)>
+{
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path();
+    let owner_seed = [0x67u8; 32];
+    let agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(data_dir.join("machine.key"))
+            .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+            .with_agent_cert_path(data_dir.join("agent.cert"))
+            .with_user_key(x0x::identity::UserKeypair::from_seed(&owner_seed)?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(data_dir.join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let state = secure_endpoint_test_state_at(data_dir, agent).await?;
+    Ok((
+        state,
+        dir,
+        x0x::identity::UserKeypair::from_seed(&owner_seed)?,
+    ))
+}
+
+/// Seed a real TreeKEM group and return `(hex id, info, live group)`.
+async fn seed_treekem_group(
+    state: &AppState,
+    owner: &x0x::identity::UserKeypair,
+    id_byte: u8,
+) -> Result<(String, x0x::groups::GroupInfo, x0x::mls::TreeKemMlsGroup)> {
+    let group_id = format!("{id_byte:02x}").repeat(32);
+    let group_id_bytes = hex::decode(&group_id)?;
+    let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    let group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, state.agent.agent_id(), &seed)?;
+    let epoch = group.epoch();
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "adr0067-treekem".to_string(),
+        "slice 7 treekem fixture".to_string(),
+        state.agent.agent_id(),
+        group_id.clone(),
+        x0x::groups::GroupPolicy {
+            discoverability: x0x::groups::GroupDiscoverability::Hidden,
+            admission: x0x::groups::GroupAdmission::OwnerCertified(owner.user_id()),
+            confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+            read_access: x0x::groups::GroupReadAccess::MembersOnly,
+            write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+        },
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    info.secret_epoch = epoch;
+    info.security_binding = Some(format!("treekem:epoch={epoch}"));
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info.clone());
+    Ok((group_id, info, group))
+}
+
+/// **Erasure is refused.** A marker installed while a TreeKEM
+/// roster+snapshot persist is in flight must abort the persist, because that
+/// persist writes a WHOLE record captured before the marker existed and would
+/// otherwise erase it.
+#[tokio::test]
+async fn treekem_atomic_persist_refuses_when_a_marker_lands_mid_operation() -> Result<()> {
+    let (state, _dir, owner) = owner_axis_state().await?;
+    let (id, info, group) = seed_treekem_group(&state, &owner, 0x61).await?;
+
+    // The marker lands after `info` was captured, exactly as a concurrent
+    // `install_fork_evidence` would leave it.
+    {
+        let mut groups = state.named_groups.write().await;
+        if let Some(live) = groups.get_mut(&id) {
+            live.fork_quarantine = Some(marker(11, false));
+        }
+    }
+
+    let result = persist_treekem_and_named_groups_atomic_with_info(&state, &id, info, &group).await;
+    let message = result
+        .expect_err("a marker landing mid-persist must abort the persist")
+        .to_string();
+    assert!(
+        message.contains("fork_quarantined"),
+        "the refusal must name the condition, got: {message}"
+    );
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(x0x::groups::GroupInfo::is_fork_quarantined),
+        "and the marker must SURVIVE — erasing it is the defect this gate exists to stop"
+    );
+    Ok(())
+}
+
+/// **Resurrection is PERMITTED here, deliberately, and this test is the
+/// record of that decision** (the "stale snapshot" case raised in review).
+///
+/// At this site "the incoming record adds a marker" is indistinguishable from
+/// "this IS the install path" — `install_fork_evidence` reaches the roster the
+/// same way — so a snapshot captured before a clear can re-assert a
+/// just-cleared marker. That direction fails CLOSED: the group is
+/// re-contained, never released, so an operator clears again. Making it
+/// refuse would make the marker unsettable, which is ADR-0066 §2's explicit
+/// trap.
+///
+/// `EpochScope::MarkerOnly` — used by the Home seal paths, which never install
+/// a marker — refuses BOTH directions precisely because that ambiguity does
+/// not exist there. If this assertion ever flips, the asymmetry has been
+/// tightened and the install path needs re-verifying.
+#[tokio::test]
+async fn treekem_stale_snapshot_may_resurrect_a_cleared_marker() -> Result<()> {
+    let (state, _dir, owner) = owner_axis_state().await?;
+    let (id, mut stale, group) = seed_treekem_group(&state, &owner, 0x62).await?;
+
+    // The captured snapshot carries a marker; the live record has none (an
+    // operator cleared it during the window).
+    stale.fork_quarantine = Some(marker(11, false));
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(x0x::groups::GroupInfo::is_fork_quarantined),
+        "precondition: the live record is clear"
+    );
+
+    persist_treekem_and_named_groups_atomic_with_info(&state, &id, stale, &group)
+        .await
+        .expect("the install direction must NOT be gated — see ADR-0066 §2");
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(x0x::groups::GroupInfo::is_fork_quarantined),
+        "documented, accepted outcome: a stale snapshot re-contains the group. Fail-closed \
+         direction — the operator clears again."
     );
     Ok(())
 }
