@@ -840,6 +840,9 @@ pub(in crate::server) async fn delegate_group_authority(
     // Group snapshot: membership, policy, state binding for the carrier.
     let snapshot = {
         let groups = state.named_groups.read().await;
+        // ADR0066-LOOKUP-WAIVER: row 15 (mint) resolves the group for the WHOLE route: a miss is a 404
+        // before any marker is read, so it fails closed, and the §3b gate six
+        // lines down consumes this same `info`. Same disposition as row 16.
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };

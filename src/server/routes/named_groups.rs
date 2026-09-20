@@ -3529,6 +3529,9 @@ async fn rollback_live_fork_evidence(
     let hash = evidence.state_hash.clone();
     let by = evidence.committed_by.clone();
     let mut groups = state.named_groups.write().await;
+    // ADR0066-LOOKUP-WAIVER: `group_key` is the resolved key the caller (`install_fork_evidence`'s
+    // rollback arm) already mutated under; a miss is a no-op that leaves the
+    // evidence in place, which the retry semantics already tolerate.
     let Some(info) = groups.get_mut(group_key) else {
         return;
     };
@@ -3573,6 +3576,10 @@ async fn install_fork_evidence(
     let install_key = group_key.to_string();
     let marker_was_carried = quarantine.is_some();
     let install = |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
+        // ADR0066-LOOKUP-WAIVER: `install_key` is the map key this function was CALLED with — the apply
+        // path's already-resolved record (`resolved_group_key`). Resolving again
+        // here could name a different record than the caller decided about, and
+        // a miss refuses the install rather than installing on a guess.
         let Some(info) = groups.get_mut(&install_key) else {
             return false;
         };
@@ -18936,6 +18943,8 @@ async fn owner_certified_seal_with_eviction(
             // quarantine.
             let commit = {
                 let groups = state.named_groups.read().await;
+                // ADR0066-LOOKUP-WAIVER: `id` was already resolved by `seal_group_state`'s own 404-first lookup;
+                // a miss here returns 404 without sealing, so it fails closed.
                 let Some(info) = groups.get(id) else {
                     return Some(Err(not_found("group not found")));
                 };
@@ -23381,11 +23390,20 @@ async fn treekem_group_encrypt(
     {
         let groups = state.named_groups.read().await;
         // #732: BOTH SPELLINGS, through the one shared resolver. Unlike the
-        // GSS family below, this arm FAILS OPEN on a miss — no record found
-        // means no gate runs and the ratchet advances — so an alias-keyed
-        // roster silently disarmed both the ADR-0038 restore gate and the
-        // ADR-0066 §3 quarantine gate for a group whose TreeKEM state was
-        // filed under the caller's spelling.
+        // GSS family below, this arm FAILS OPEN on a miss: no record found
+        // means neither gate runs — not the ADR-0038 restore gate and not the
+        // ADR-0066 §3 quarantine gate, since both sit inside this one
+        // `if let` — and the ratchet advances.
+        //
+        // This is defence in depth, not the repair of a known remote bypass
+        // (cross-model review of #750). The only callers,
+        // `secure_group_encrypt`/`_decrypt`, 404 an unresolvable spelling at
+        // route level first and run both gates on the map-key spelling under
+        // the same lock hold, so pre-#732 the fail-open was reachable only as
+        // a TOCTOU: the roster re-keyed between the route's `drop(groups)` and
+        // this inner re-acquire while `treekem_groups` still held the old
+        // spelling. Resolving both spellings closes that race and stops the
+        // helper depending on its caller's lookup for its own safety.
         if let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
@@ -23493,11 +23511,20 @@ async fn treekem_group_decrypt(
     {
         let groups = state.named_groups.read().await;
         // #732: BOTH SPELLINGS, through the one shared resolver. Unlike the
-        // GSS family below, this arm FAILS OPEN on a miss — no record found
-        // means no gate runs and the ratchet advances — so an alias-keyed
-        // roster silently disarmed both the ADR-0038 restore gate and the
-        // ADR-0066 §3 quarantine gate for a group whose TreeKEM state was
-        // filed under the caller's spelling.
+        // GSS family below, this arm FAILS OPEN on a miss: no record found
+        // means neither gate runs — not the ADR-0038 restore gate and not the
+        // ADR-0066 §3 quarantine gate, since both sit inside this one
+        // `if let` — and the ratchet advances.
+        //
+        // This is defence in depth, not the repair of a known remote bypass
+        // (cross-model review of #750). The only callers,
+        // `secure_group_encrypt`/`_decrypt`, 404 an unresolvable spelling at
+        // route level first and run both gates on the map-key spelling under
+        // the same lock hold, so pre-#732 the fail-open was reachable only as
+        // a TOCTOU: the roster re-keyed between the route's `drop(groups)` and
+        // this inner re-acquire while `treekem_groups` still held the old
+        // spelling. Resolving both spellings closes that race and stops the
+        // helper depending on its caller's lookup for its own safety.
         if let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
@@ -32133,6 +32160,7 @@ pub(in crate::server) mod tests {
     mod adr0066_epoch_token;
     mod adr0066_lookup_guard;
     mod adr0066_tasks;
+    mod adr0066_treekem_gates;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod hs_f2_membership_cluster;

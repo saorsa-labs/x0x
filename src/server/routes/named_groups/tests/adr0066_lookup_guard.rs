@@ -18,15 +18,17 @@
 //! 1. scan every non-test `.rs` file under `src/server`, with `//`/`/* */`
 //!    comments blanked out (so prose about a bare lookup is not a bare
 //!    lookup) and `#[cfg(test)]` blocks skipped;
-//! 2. find `.get(`, `.get_mut(` and `.contains_key(` whose receiver is the
+//! 2. find `.get(`, `.get_mut(`, `.contains_key(`, `.get_key_value(` and
+//!    `.entry(` whose receiver is the
 //!    named-groups map — the guard-binding names `groups` and `named_groups`,
 //!    which are the only two spellings this codebase uses for it;
-//! 3. keep only those whose surrounding lines (2 before, 15 after) mention
+//! 3. keep only those whose surrounding lines (2 before, 25 after) mention
 //!    `fork_quarantine` / `is_fork_quarantined`. That window is what makes
 //!    this "a lookup feeding a quarantine decision" rather than "any roster
-//!    lookup in a file that also mentions quarantine somewhere": the 15-line
-//!    reach covers the lookup, its `else` arm and the gate call that consumes
-//!    the `info`, which is the shape every real site has;
+//!    lookup in a file that also mentions quarantine somewhere": the 25-line
+//!    reach covers the lookup, its `else` arm, an intervening decision
+//!    `match`, and the gate call that consumes the `info`. See [`LOOKAHEAD`]
+//!    for why this is not the enclosing function;
 //! 4. a kept site must carry `ADR0066-LOOKUP-WAIVER: <reason>` within the six
 //!    source lines above it, with a non-empty reason. That is the allow-list,
 //!    and it lives AT the site on purpose — a table in this file would drift
@@ -47,13 +49,36 @@ struct Site {
     waived: bool,
 }
 
-const METHODS: [&str; 3] = [".get(", ".get_mut(", ".contains_key("];
+/// Every borrow/insert entry point onto the map that returns one group. Review
+/// of #750 named `.get_key_value(` and `.entry(` as unscanned evasions.
+const METHODS: [&str; 5] = [
+    ".get(",
+    ".get_mut(",
+    ".contains_key(",
+    ".get_key_value(",
+    ".entry(",
+];
 /// The only two names this codebase binds the named-groups map to.
 const RECEIVERS: [&str; 2] = ["groups", "named_groups"];
 const WAIVER: &str = "ADR0066-LOOKUP-WAIVER:";
-/// Lines after the lookup that may carry the quarantine mention. Covers the
-/// lookup, its `else` arm and the gate call that consumes the entry.
-const LOOKAHEAD: usize = 15;
+/// Lines after the lookup that may carry the quarantine mention.
+///
+/// Widened from 15 to 25 by review of #750, which showed
+/// `install_fork_evidence`'s FIRST `get_mut` — the actual install decision —
+/// sitting 20 lines from its `fork_quarantine` mention and therefore
+/// unflagged. 25 covers the lookup, its `else` arm, and a decision `match`
+/// between the two.
+///
+/// WHY NOT the enclosing function, the other option review offered: in this
+/// codebase the enclosing function reaches ~600 lines
+/// (`apply_named_group_metadata_event_inner_serialized`), and function scope
+/// flags 23 sites where 25-line scope flags 12. About half of those 11 extra
+/// waivers would read "this lookup has nothing to do with quarantine, the
+/// mention is 400 lines away" — and an allow-list whose reasons are mostly
+/// noise is one reviewers learn to skim. The window is the proximity claim
+/// ("this lookup feeds that decision") stated honestly; a site that moves its
+/// gate further away than this is a false negative we accept and name.
+const LOOKAHEAD: usize = 25;
 /// Lines above the lookup that may carry the waiver, so a multi-line reason
 /// can be written as prose instead of one unreadable line.
 const WAIVER_REACH: usize = 6;
@@ -202,10 +227,6 @@ fn sites(file: &str, source: &str) -> Vec<Site> {
                 if !RECEIVERS.contains(&receiver.as_str()) {
                     continue;
                 }
-                // `.get(` is a prefix of `.get_mut(`; count the longer one once.
-                if method == ".get(" && line[at..].starts_with(".get_mut(") {
-                    continue;
-                }
                 let window_from = index.saturating_sub(2);
                 let window_to = (index + LOOKAHEAD + 1).min(masked_lines.len());
                 let window = masked_lines[window_from..window_to].join("\n");
@@ -310,10 +331,11 @@ fn adr0066_lookup_guard_still_sees_the_waived_census() {
     let sites = all_sites();
     assert_eq!(
         sites.len(),
-        8,
-        "#732 census: 8 single-spelling roster lookups remain on quarantine \
-         paths, each waived at the site. If you added or removed one, say so \
-         here:\n{sites:#?}"
+        12,
+        "#732 census: 12 single-spelling roster lookups remain on quarantine \
+         paths, each waived at the site (8 at the original 15-line window, 4 \
+         more once review of #750 widened it to 25). If you added or removed \
+         one, say so here:\n{sites:#?}"
     );
     assert!(
         sites.iter().all(|site| site.waived),

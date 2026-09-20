@@ -22,10 +22,20 @@ All notable changes to this project will be documented in this file.
   independently in slices 3, 4 and 6, so the per-slice copies of the rule are
   replaced by the one `resolve_group_entry_locked` resolver (history scope
   markers and the purge gate, WS/SSE annotations, the public-group bootstrap
-  install check, the TreeKEM protector, the delegation gates), the two TreeKEM
-  crypto gates that skipped entirely on an alias-keyed roster now fire, and a
+  install check, the TreeKEM protector, the delegation gates), and a
   source-scanning fixture fails the build if a quarantine-relevant lookup
   spells the rule out for itself again without a waiver naming why.
+  Defence in depth in the same change: `treekem_group_encrypt`/`_decrypt` held
+  BOTH of their pre-crypto gates (ADR-0038 restore re-verification and the
+  ADR-0066 §3 quarantine gate) inside one single-spelling lookup, so a miss
+  skipped both and let the ratchet advance — the only arm in that family that
+  failed open rather than answering 404. This was not a known remote bypass:
+  their only callers 404 an unresolvable spelling at route level first and run
+  both gates on the map-key spelling under the same lock hold, leaving the
+  fail-open reachable only as a TOCTOU (the roster re-keyed between the
+  route's lock release and the helper's re-acquire while the live TreeKEM map
+  kept the old spelling). Both helpers now resolve both spellings, which also
+  closes that race.
 - **A fork-quarantine marker that lands mid-operation now aborts the operation
   instead of being overwritten by it (ADR-0066 §4, slice 7; ADR-0067; #732).**
   Every gate slices 1–6 added checks the marker at the START of an operation.
