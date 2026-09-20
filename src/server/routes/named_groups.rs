@@ -14413,7 +14413,15 @@ pub(in crate::server) async fn ingest_public_message(
             // drop — never cache an unauthorized attribution.
             if let Some(digest) = msg.delegation_digest.clone() {
                 let author = parse_agent_id_hex(&msg.author_agent_id);
-                let authorized = match author {
+                // ADR-0066 §3b row 18: carry the refusal REASON into the log
+                // instead of discarding it with `.is_ok()`. On this path the
+                // reason may be the §5 sentence (the group is
+                // fork-quarantined here), and §5's whole point is that a
+                // refusal explains itself — a generic "not effective for
+                // author" line would leave an operator debugging a delegation
+                // that is perfectly valid and simply not honoured on this
+                // node.
+                let refusal = match author {
                     Ok(actor) => crate::server::delegations::authorize_send_as(
                         state,
                         &stable_id,
@@ -14422,15 +14430,15 @@ pub(in crate::server) async fn ingest_public_message(
                         now_millis_u64(),
                     )
                     .await
-                    .is_ok(),
-                    Err(_) => false,
+                    .err(),
+                    Err(e) => Some(format!("unparseable author agent id: {e}")),
                 };
-                if !authorized {
+                if let Some(why) = refusal {
                     state.groups_diagnostics.record_other_drop(&stable_id);
                     tracing::warn!(
                         group_id = %group_id_for_log,
                         digest = %digest,
-                        "E: dropped send-as message: delegation not effective for author"
+                        "E: dropped send-as message: {why}"
                     );
                     return;
                 }
@@ -20077,7 +20085,7 @@ pub(in crate::server) fn fork_quarantine_annotation(
 /// contract is testable without a daemon fixture: the §5 acceptance bar
 /// is a property of the body, and a test that has to stand a node up to
 /// check it is a test nobody runs.
-fn fork_quarantine_refusal_body(
+pub(in crate::server) fn fork_quarantine_refusal_body(
     group_id: &str,
     marker: &x0x::groups::ForkQuarantine,
 ) -> serde_json::Value {

@@ -29,8 +29,9 @@
 use super::*;
 
 use crate::server::delegations::{
-    authorize, chain_members_active, delegate_group_authority, fork_quarantine_marker,
-    index_committed, list_group_delegations, rebuild_global_delegation_registry, DelegateRequest,
+    authorize, authorize_send_as, chain_members_active, delegate_group_authority,
+    fork_quarantine_marker, index_committed, list_group_delegations,
+    rebuild_global_delegation_registry, DelegateRequest,
 };
 
 /// A minimal loopback-only daemon state on a temp dir. No sockets are
@@ -98,6 +99,41 @@ async fn seed_group(
     let mut groups = state.named_groups.write().await;
     groups.insert(group_id.to_string(), info.clone());
     Ok((stable, info))
+}
+
+/// The same group, but filed in the roster map under a LOCAL ALIAS that is
+/// not its stable id — the shape a daemon ends up in when it learned the
+/// group under one name and the group's own genesis carries another.
+///
+/// Returns `(alias_key, stable_id)`, which are deliberately different.
+async fn seed_group_under_alias(
+    state: &AppState,
+    alias_key: &str,
+    stable_id: &str,
+    delegate_hex: &str,
+) -> Result<(String, String)> {
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "adr0066-delegations-alias".to_string(),
+        "slice 3 alias fixture".to_string(),
+        state.agent.agent_id(),
+        stable_id.to_string(),
+        signed_public_policy(),
+    );
+    let member = x0x::groups::GroupMember::new_member(
+        delegate_hex.to_string(),
+        None,
+        Some(hex::encode(state.agent.agent_id().as_bytes())),
+        1,
+    );
+    info.members_v2.insert(delegate_hex.to_string(), member);
+    let stable = info.stable_group_id().to_string();
+    assert_ne!(
+        stable, alias_key,
+        "fixture precondition: the whole point is that the map key is NOT the stable id"
+    );
+    let mut groups = state.named_groups.write().await;
+    groups.insert(alias_key.to_string(), info);
+    Ok((alias_key.to_string(), stable))
 }
 
 /// An authenticated-evidence marker, in whichever branch the caller wants.
@@ -731,5 +767,187 @@ async fn adr0066_slice3_does_not_touch_other_groups_or_ungrouped_delegations() -
         history_rows(&state, &healthy_stable) > 0,
         "while its neighbour served normally"
     );
+    Ok(())
+}
+
+/// WHY: row 17's REST surface is the delegation-cited branch of task
+/// claim/complete, and §5 lists row 17 among the rows that must carry the
+/// FULL body — a 403 with the sentence buried in a string would not satisfy
+/// it. `tasks.rs` returns exactly what this helper builds, so this pins the
+/// payload contract for that route.
+///
+/// HONEST LIMIT, stated rather than papered over: the end-to-end arm
+/// (walking `PATCH /task-lists/:id/tasks/:tid` and asserting the task is
+/// left unclaimed) is NOT covered by a unit test, because registering a
+/// group-scoped task list requires an initialized gossip runtime
+/// (`create_task_list_persistent` fails with "gossip runtime not
+/// initialized") and this file is deliberately loopback-only. What the
+/// unit suite does cover is both halves either side of that gap: the
+/// payload here, and the `authorize` / `chain_members_active` predicates
+/// above, which fail closed regardless of who calls them. The ordering
+/// claim — refusal before `committed_delegations` and before
+/// `claim_task_versioned` / `complete_task_versioned` — is a reading of
+/// `tasks.rs`, and the daemon harness in CI is what exercises it.
+#[test]
+fn adr0066_row17_task_execute_refusal_carries_the_five_body() -> Result<()> {
+    let group_id = "8b".repeat(16);
+    let info = x0x::groups::GroupInfo::with_policy(
+        "g".to_string(),
+        String::new(),
+        x0x::identity::AgentKeypair::generate()?.agent_id(),
+        group_id.clone(),
+        signed_public_policy(),
+    );
+    for no_anchor in [false, true] {
+        let m = marker(&info, no_anchor);
+        let body = crate::server::routes::named_groups::fork_quarantine_refusal_body(&group_id, &m);
+        assert_adr0066_refusal(&body, no_anchor, "task-execute refusal body");
+    }
+    Ok(())
+}
+
+// ──────────────────── alias-keyed rosters (review r1) ───────────────────
+
+/// WHY (cross-model review r1 — this was a real hole, not a hypothetical):
+/// the roster map is keyed by whichever alias this daemon learned the group
+/// under, and the apply path installs the marker under that MAP key. But
+/// every honour path arrives with the STABLE id, because that is what a
+/// delegation envelope carries. A gate that resolved only the map key
+/// therefore MISSED the marker whenever key ≠ stable id — and a missed
+/// marker does not degrade gracefully: row 19 is violated outright, because
+/// a contested group's gossiped grant is indexed and globally registered.
+///
+/// Every §3b surface reachable by stable id is asserted here, so the fix
+/// cannot be partially reverted one path at a time.
+#[tokio::test]
+async fn adr0066_slice3_gates_resolve_a_group_keyed_by_an_alias() -> Result<()> {
+    let (state, _dir) = delegation_state().await?;
+    let delegate_hex = hex::encode([0x18u8; 32]);
+    let alias_key = "5e".repeat(16);
+    let stable_id = "6f".repeat(16);
+    let (alias_key, stable_id) =
+        seed_group_under_alias(&state, &alias_key, &stable_id, &delegate_hex).await?;
+
+    // Control: with no marker, resolving by either spelling finds none.
+    assert!(
+        fork_quarantine_marker(&state, &stable_id).await.is_none(),
+        "control: a clean alias-keyed group is not quarantined under either name"
+    );
+
+    // The marker installs on the entry the map holds — i.e. under the ALIAS.
+    install_marker(&state, &alias_key, true).await;
+
+    // 1. The resolver itself must find it by the stable id. Without the
+    //    alias fallback this is `None` and every assertion below flips.
+    let by_stable = fork_quarantine_marker(&state, &stable_id).await;
+    assert!(
+        by_stable.is_some(),
+        "the marker is installed under the map key, but every honour path \
+         arrives with the stable id — resolving only one spelling serves the \
+         contested roster"
+    );
+    assert!(
+        fork_quarantine_marker(&state, &alias_key).await.is_some(),
+        "and the direct key hit still works — the fallback is additive"
+    );
+
+    // 2. Row 19, the path the miss broke outright: a gossiped grant for the
+    //    stable id must NOT be indexed and must NOT seed the registry.
+    let (sd, _actor, _active) = valid_grant(&stable_id)?;
+    index_committed(&state, &stable_id, sd).await;
+    assert!(
+        !index_has_entry(&state, &stable_id).await,
+        "row 19: an alias-keyed contested group's grant must not enter the index"
+    );
+    assert_eq!(
+        registry_ids(&state).await,
+        0,
+        "row 19: nor the global id registry"
+    );
+
+    // 3. Row 18 must refuse with the §5 SENTENCE, not by accident. Before
+    //    the fix this path failed closed only incidentally, via a
+    //    single-spelling roster read that produced a misleading "removed
+    //    member" error — right outcome, wrong and undiagnosable reason.
+    let why = authorize_send_as(
+        &state,
+        &stable_id,
+        &state.agent.agent_id(),
+        &"ab".repeat(32),
+        now_millis_u64(),
+    )
+    .await
+    .expect_err("row 18 must refuse for an alias-keyed contested group");
+    assert!(
+        why.contains("fork-quarantined") && why.contains("contested"),
+        "the reason must be the §5 sentence, not a misleading membership error: {why}"
+    );
+
+    // 4. Row 15 refuses through the alias key the REST path is called with.
+    let (status, body) = call_delegate(&state, &alias_key, &delegate_hex).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "row 15 on the alias key");
+    assert_adr0066_refusal(&body, true, "alias");
+    Ok(())
+}
+
+/// WHY: row 18 is the predicate the gossip-ingest seam calls, so it needs a
+/// direct test of its own rather than only being exercised through the
+/// ingest handler. The control arm is the point: with no marker the SAME
+/// call fails with the effectiveness error ("not durably committed"), so the
+/// quarantine refusal is provably distinguishable from a missing grant —
+/// the ADR's "contested rather than merely absent" bar.
+#[tokio::test]
+async fn adr0066_row18_authorize_send_as_refuses_contested_not_absent() -> Result<()> {
+    let (state, _dir) = delegation_state().await?;
+    let delegate_hex = hex::encode([0x19u8; 32]);
+    let group_id = "7a".repeat(16);
+    let (stable, _info) = seed_group(&state, &group_id, &delegate_hex).await?;
+    let digest_hex = "cd".repeat(32);
+
+    let absent = authorize_send_as(
+        &state,
+        &stable,
+        &state.agent.agent_id(),
+        &digest_hex,
+        now_millis_u64(),
+    )
+    .await
+    .expect_err("control: an uncommitted digest never authorizes");
+    assert!(
+        absent.contains("not durably committed"),
+        "control: without a marker the failure is the effectiveness rule: {absent}"
+    );
+    assert!(
+        !absent.contains("fork-quarantined"),
+        "control: and it is NOT the quarantine refusal: {absent}"
+    );
+
+    for no_anchor in [false, true] {
+        install_marker(&state, &group_id, no_anchor).await;
+        let why = authorize_send_as(
+            &state,
+            &stable,
+            &state.agent.agent_id(),
+            &digest_hex,
+            now_millis_u64(),
+        )
+        .await
+        .expect_err("row 18 fails closed on a contested roster");
+        assert!(
+            why.contains("fork-quarantined") && why.contains("contested"),
+            "the refusal names the contest: {why}"
+        );
+        assert!(
+            why.contains("x0x groups quarantine clear"),
+            "§5: and the remedy, even on the non-REST surface: {why}"
+        );
+        if no_anchor {
+            assert!(
+                why.contains("no owner axis"),
+                "the no_anchor branch says nothing clears this automatically: {why}"
+            );
+        }
+        manual_clear(&state, &group_id).await;
+    }
     Ok(())
 }

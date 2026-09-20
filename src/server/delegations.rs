@@ -254,14 +254,30 @@ pub(in crate::server) async fn committed_delegations(
 /// a marker installed after this read cannot let an act through that a
 /// later re-read would have stopped. Closing the reverse race (a marker
 /// installed mid-operation) is §4's epoch token, slice 7.
+///
+/// **BOTH SPELLINGS, and this is load-bearing (review r1).** The roster map
+/// is keyed by whichever alias this daemon learned the group under, and the
+/// apply path installs the marker under that MAP key. Every honour path
+/// here, however, arrives with the STABLE id, because that is what a
+/// delegation envelope carries (`delegate_group_authority` signs
+/// `info.stable_group_id()`). A bare `get(group_id)` therefore misses the
+/// marker whenever key ≠ stable id — and a §3b gate that misses the marker
+/// does not degrade gracefully, it serves the contested roster. So this
+/// resolves exactly the way the metadata apply path does (`named_groups.rs`
+/// `resolved_group_key`): direct key hit first, then a scan by
+/// `stable_group_id()`. `quarantined_group_ids` below already held itself to
+/// this standard for the boot filter; the live gates must too.
 pub(in crate::server) async fn fork_quarantine_marker(
     state: &AppState,
     group_id: &str,
 ) -> Option<x0x::groups::ForkQuarantine> {
     let groups = state.named_groups.read().await;
-    groups
-        .get(group_id)
-        .and_then(|info| info.fork_quarantine.clone())
+    let info = groups.get(group_id).or_else(|| {
+        groups
+            .values()
+            .find(|info| info.stable_group_id() == group_id)
+    })?;
+    info.fork_quarantine.clone()
 }
 
 /// ADR-0066 §3b: every group id this node currently holds a
@@ -282,6 +298,34 @@ async fn quarantined_group_ids(state: &AppState) -> std::collections::HashSet<St
         }
     }
     out
+}
+
+/// Groups whose ADR-0066 index refusal has already been logged, keyed by
+/// `(group id, evidence revision)`. Process-local and advisory: losing it
+/// costs one extra log line, never a missed refusal — the refusal itself
+/// and its counter increment never consult this.
+static LOGGED_INDEX_REFUSALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Is this the first index refusal to log for this group at this evidence
+/// revision? A new revision logs again — that is a new fork observation and
+/// the operator wants to see it.
+///
+/// Fails OPEN to logging: a poisoned lock logs rather than going quiet,
+/// because the failure mode of this cache is noise and the failure mode of
+/// silence is an unexplained outage.
+fn first_index_refusal_for(group_id: &str, revision: u64) -> bool {
+    let Ok(mut seen) = LOGGED_INDEX_REFUSALS.lock() else {
+        return true;
+    };
+    // Bound the set: a long-lived daemon watching many groups fork many
+    // times must not grow this without limit. Clearing costs at most one
+    // repeated line per group afterwards.
+    if seen.len() >= 1024 {
+        seen.clear();
+    }
+    seen.insert((group_id.to_string(), revision))
 }
 
 /// Reconstruct the GLOBAL delegation-id registry from ALL groups' durable
@@ -391,14 +435,25 @@ pub(in crate::server) async fn index_committed(
     // the wire never became effective here. The carrier's history row is
     // already committed by the caller and stays committed — R3 is
     // tag-and-retain, so refusing to index never blanks the record.
+    //
+    // EVERY refusal counts; only the first per (group, evidence revision)
+    // LOGS (review r1). A peer can gossip carriers at will, so a WARN per
+    // carrier is unbounded log growth an unauthenticated sender controls.
+    // The counter is the rate-bearing signal (§3e) and the sentence is
+    // identical for every carrier of the same marker, so repeating it buys
+    // an operator nothing.
     if let Some(marker) = fork_quarantine_marker(state, group_id).await {
         let reason = crate::server::routes::named_groups::fork_quarantine_refusal_reason(
             state, group_id, &marker,
         );
-        tracing::warn!(
-            group_id = %group_id,
-            "committed delegation not indexed: {reason}"
-        );
+        if first_index_refusal_for(group_id, marker.revision) {
+            tracing::warn!(
+                group_id = %group_id,
+                revision = marker.revision,
+                "committed delegation not indexed: {reason} (further carriers of this \
+                 marker are counted in fork_quarantine_refusals, not logged)"
+            );
+        }
         return;
     }
     // GLOBAL registry first (review r3): a reused id never indexes.
