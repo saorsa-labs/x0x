@@ -13485,7 +13485,7 @@ pub(in crate::server) async fn send_group_public_message(
 
     // Build + endpoint-side authz + sign under the write lock so
     // concurrent role changes can't race the check.
-    let (msg, direct_recipients) = {
+    let (msg, direct_recipients, captured_epoch) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
@@ -13496,6 +13496,11 @@ pub(in crate::server) async fn send_group_public_message(
         if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
             return resp;
         }
+        // ADR-0066 §1 row 1 / §4 (slice 9): capture the lifecycle epoch token
+        // under the SAME read guard as the gate above, so nothing can move
+        // between the authorization and the capture. It is re-checked
+        // immediately before the gossip publish below.
+        let captured_epoch = info.lifecycle_epoch_token();
 
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
@@ -13646,7 +13651,7 @@ pub(in crate::server) async fn send_group_public_message(
             req.delegation_digest,
             rider_provenance,
         ) {
-            Ok(m) => (m, direct_recipients),
+            Ok(m) => (m, direct_recipients, captured_epoch),
             Err(e) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -13671,6 +13676,23 @@ pub(in crate::server) async fn send_group_public_message(
             );
         }
     };
+    // ADR-0066 §1 row 1 / §4 (slice 9): THE EFFECT POINT. The publish below
+    // is the irreversible step — once the bytes are handed to gossip they are
+    // on the wire and the contested state has been exported. So the marker is
+    // re-checked HERE, after the last await on this path
+    // (`spawn_public_message_listener` above; the serialization between them
+    // is pure), leaving no suspension point between the check and the publish.
+    //
+    // Nothing has been exported or written yet when this refuses: signing is
+    // pure, the local cache write (`cache_public_message`) and the direct-DM
+    // fan-out race both happen AFTER the publish returns, and this path has no
+    // ratchet, so a refusal burns no generation and leaves the message cache,
+    // the outbox and the roster byte-identical.
+    if let Some(resp) =
+        reject_fork_quarantine_installed_before_effect(&state, &id, Some(&captured_epoch)).await
+    {
+        return resp;
+    }
     let fan_out = match state.agent.publish_with_fanout(&topic, bytes.clone()).await {
         Ok(n) => n,
         Err(e) => {
@@ -20366,6 +20388,188 @@ pub(in crate::server) fn reject_fork_quarantined_marker(
     )
 }
 
+/// ADR-0066 §1 rows 1, 2, 4 and 6 + §4 (slice 9): the re-check the four
+/// OUTBOUND paths run immediately before their irreversible effect.
+///
+/// **The window this closes.** Every row above is gated at request start
+/// ([`reject_fork_quarantined`]), so an operation is only admitted when the
+/// group carried NO marker at that moment. The residual window is a marker
+/// installed AFTER the entry gate and BEFORE the effect leaves the node —
+/// the gossip publish (row 1), the ratchet advance and ciphertext (row 2),
+/// the GSS ciphertext and its history row (row 4), the sealed envelope
+/// (row 6). Between the gate and the effect these handlers await on the
+/// rider-token mutex, a revocation-record read, the TreeKEM group mutex and
+/// the pubsub listener spawn, so the window is not theoretical: a fork
+/// observation landing at any of those suspension points would otherwise
+/// export contested state on an authorization that is no longer true.
+///
+/// **Why these rows could not use §4's own site.** ADR-0066 §4 puts the
+/// re-check "inside the same critical section as the mutation"
+/// ([`persist_named_groups_mutation_epoch_checked_unlocked`]). These four
+/// paths perform no roster mutation and take no persistence lock, so that
+/// sentence names no site for them (ADR-0067, "Deferral"), and ADR-0066
+/// defines no critical section for an outbound publish. What this helper
+/// applies is §4's *rule* — capture at the authorization check, re-validate
+/// before the irreversible step — at the only site these rows have: the last
+/// suspension-free point before the effect. It is an implementation of §1's
+/// Decision column, not a new decision.
+///
+/// **Only the marker half is compared, deliberately.** The caller's
+/// `state_revision` is expected to move under a concurrent legitimate roster
+/// advance, and a signed public message carries the `state_hash` /
+/// `state_revision` it was built against, so refusing every send that raced a
+/// rename would be an availability regression on the hot path with no
+/// containment benefit. The containment fact §4 exists to protect is the
+/// marker, and [`x0x::groups::LifecycleEpochToken::same_marker`] names that
+/// weaker comparison so it cannot be mistaken for the full one — the same
+/// discipline [`EpochScope::MarkerOnly`] applies at the persist sites.
+///
+/// **Asymmetry: a marker CLEARED mid-operation does not refuse, and cannot
+/// even occur.** The operation was admitted only because there was no marker
+/// at the entry gate, so the captured marker identity is always `None` for an
+/// admitted operation and `Some(identity) -> None` is unreachable here. The
+/// live-side test is therefore the whole rule: a marker present under the
+/// re-check that the capture did not carry — newly installed, or advanced to
+/// a different evidence identity — refuses; no marker means proceed, which is
+/// byte-identical to the behaviour before this slice for every unquarantined
+/// group. Stating this is the point: the persist-lock re-check refuses on a
+/// clear too (the captured authorization was computed against a record that no
+/// longer exists), and a reader must not conclude the two sites disagree by
+/// accident.
+///
+/// **A record that VANISHED is not a marker.** `None` from the resolver means
+/// this node no longer holds a record for the id, which is a terminality
+/// question the existing withdrawn / not-found paths already answer; inventing
+/// a quarantine refusal for it would change behaviour where no marker is
+/// involved. So the resolver miss falls through, and the fail-closed reading
+/// that matters — "a marker appeared" — is the one this helper enforces.
+///
+/// **Residual window (honest statement).** Between this re-check and the
+/// bytes actually reaching the wire or the caller, nothing holds the roster
+/// lock, so a marker installed in that last stretch does not stop the effect.
+/// The window is **one message wide** and is irreducible without a send-path
+/// critical section — a lock held from the authorization check until the
+/// client has the bytes — which ADR-0066 does not define and which would
+/// serialize the hot path behind a network write. It is acceptable because
+/// containment is about stopping the flow, not about the instant of the
+/// install: the re-check shrinks the exposure from the whole request duration
+/// (including every await above) to a tail with no suspension point, the very
+/// next request on the path refuses, and nothing about a local marker is
+/// atomic across the network anyway.
+///
+/// `group_id` is resolved under BOTH spellings
+/// ([`crate::server::resolve_group_entry_locked`]), because the roster map is
+/// keyed by whichever alias this daemon learned the group under while the
+/// caller holds whatever spelling the route gave it.
+///
+/// Cost on the hot path: one uncontended `state.named_groups` read
+/// acquisition, one resolver lookup and a scalar/identity compare. No I/O, no
+/// allocation on the success path, and no other lock is held across it — see
+/// the per-site comments for the one place (row 2) where an EXISTING nesting
+/// is reused rather than a new one introduced.
+pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect(
+    state: &AppState,
+    group_id: &str,
+    captured: Option<&x0x::groups::LifecycleEpochToken>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    // Slice-9 test barrier: an injected install lands HERE, immediately
+    // before the re-check takes its read guard — the tightest interleaving a
+    // concurrent writer can achieve against a read-lock re-check. `cfg(test)`
+    // end to end; a release build compiles neither the module nor this call.
+    #[cfg(test)]
+    send_recheck_barrier::before_recheck(group_id, state).await;
+
+    let groups = state.named_groups.read().await;
+    let (_, live) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
+    let marker = live.fork_quarantine.as_ref()?;
+    if captured.is_some_and(|captured| live.lifecycle_epoch_token().same_marker(captured)) {
+        // Same marker the operation was authorized with. Unreachable for an
+        // admitted operation (the entry gate refuses a group that already
+        // carries one), and kept as an equality rather than an
+        // `is_fork_quarantined()` shortcut so the comparison stays the
+        // ADR-0067 one if a future caller ever admits with a marker.
+        return None;
+    }
+    Some(reject_fork_quarantined_marker(state, group_id, marker))
+}
+
+/// ADR-0066 §1 rows 1/2/4/6 deterministic race harness — `cfg(test)` END TO
+/// END, and the sibling of [`epoch_recheck_barrier`] for the read-lock
+/// re-check.
+///
+/// The slice-9 fixtures must interleave a marker install between an entry gate
+/// and an outbound effect WITHOUT a sleep. [`epoch_recheck_barrier`] cannot
+/// serve them: it fires inside a roster WRITE guard the persist helper already
+/// holds, while these sites hold only a read guard and so can hand a hook no
+/// `&mut` map. This barrier therefore fires immediately before the re-check
+/// acquires its read guard and takes the write lock itself, which is the
+/// tightest interleaving a concurrent writer could achieve against a read-lock
+/// re-check — and it is exactly the interleaving the rule has to survive.
+///
+/// A production hook would be a permanent surface for a test-only need, so the
+/// module and its call site are both `cfg(test)`: a release build compiles
+/// neither. Removing a re-check must make the corresponding fixture fail; that
+/// is each row's negative control.
+#[cfg(test)]
+pub(in crate::server) mod send_recheck_barrier {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnMut(&mut HashMap<String, crate::groups::GroupInfo>) + Send>;
+
+    /// Keyed by the group id the hook is armed for.
+    ///
+    /// KEYED, not a single slot, and this is load-bearing for the same reason
+    /// [`super::epoch_recheck_barrier`] is keyed: the test binary runs these in
+    /// PARALLEL in one process, so a single global slot would let one test's
+    /// `install` overwrite another's and one test's guard drop clear
+    /// another's — showing up as a re-check that mysteriously did not fire.
+    static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Removes this test's hook on drop, and only this test's.
+    pub(in crate::server) struct BarrierGuard(String);
+
+    impl Drop for BarrierGuard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.remove(&self.0);
+            }
+        }
+    }
+
+    /// Arm a callback to run immediately before the send-path re-check for
+    /// `group_id`. The callback receives the live roster map under its write
+    /// guard, so it can install, advance or clear a marker.
+    pub(in crate::server) fn install(group_id: &str, hook: Hook) -> BarrierGuard {
+        if let Ok(mut hooks) = HOOKS.lock() {
+            hooks.insert(group_id.to_string(), hook);
+        }
+        BarrierGuard(group_id.to_string())
+    }
+
+    pub(in crate::server) async fn before_recheck(group_id: &str, state: &crate::server::AppState) {
+        // Armed test first, so an unarmed call (every call in every other
+        // test) takes no roster WRITE lock and cannot perturb the very
+        // interleaving the rest of the suite is measuring.
+        let armed = HOOKS
+            .lock()
+            .map(|hooks| hooks.contains_key(group_id))
+            .unwrap_or(false);
+        if !armed {
+            return;
+        }
+        // The write guard is acquired BEFORE the std mutex, so no `.await`
+        // ever happens while `HOOKS` is held.
+        let mut groups = state.named_groups.write().await;
+        if let Ok(mut hooks) = HOOKS.lock() {
+            if let Some(hook) = hooks.get_mut(group_id) {
+                hook(&mut groups);
+            }
+        }
+    }
+}
+
 /// ADR-0066 §3b/§3e (slice 3): the refusal where there is no HTTP
 /// response to carry it — a gossip-ingest honour path or an internal
 /// authority predicate whose only channel is `Err(String)`.
@@ -23348,7 +23552,12 @@ async fn treekem_group_encrypt(
         }
     };
     // ADR-0038 restore quarantine: refuse before touching ratchet state.
-    {
+    //
+    // ADR-0066 §1 row 2 / §4 (slice 9): the lifecycle epoch token is captured
+    // under the SAME read guard as the gate, so nothing can move between the
+    // authorization and the capture. Resolved under both spellings, because a
+    // caller may hold the stable id while the map is keyed by an alias.
+    let captured_epoch = {
         let groups = state.named_groups.read().await;
         if let Some(info) = groups.get(group_id_hex) {
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
@@ -23358,7 +23567,8 @@ async fn treekem_group_encrypt(
                 return resp;
             }
         }
-    }
+        crate::server::lifecycle_epoch_token_locked(&groups, group_id_hex)
+    };
     let group = {
         let map = state.treekem_groups.read().await;
         match map.get(group_id_hex) {
@@ -23372,6 +23582,28 @@ async fn treekem_group_encrypt(
         }
     };
     let mut guard = group.lock().await;
+    // ADR-0066 §1 row 2 / §4 (slice 9): THE EFFECT POINT. `encrypt_message`
+    // ADVANCES THE SEND RATCHET, and the advanced state is then persisted ten
+    // lines below — a refusal after it would have burned a generation that no
+    // message ever used. So the re-check runs here, while the SAME `guard` is
+    // held, with NO await and no suspension point between it and the advance:
+    // on a refusal the ratchet epoch is provably unmoved, the snapshot persist
+    // is never reached and no history row is recorded.
+    //
+    // Lock order is unchanged. Holding the per-group TreeKEM mutex across a
+    // `state.named_groups` read acquisition is not a new nesting: the very next
+    // step, `persist_treekem_snapshot_bound`, is already called with this same
+    // `guard` alive and takes that same read lock as its first act. The order
+    // (membership → roster → persistence → outbox) and the cycle-free shape
+    // are therefore exactly main's, and taking the re-check BEFORE the
+    // `group.lock().await` instead would have been strictly worse: a contended
+    // mutex would then sit inside the window.
+    if let Some(resp) =
+        reject_fork_quarantine_installed_before_effect(state, group_id_hex, captured_epoch.as_ref())
+            .await
+    {
+        return resp;
+    }
     let ciphertext = match guard.encrypt_message(&plaintext) {
         Ok(c) => c,
         Err(e) => {
@@ -23544,6 +23776,11 @@ pub(in crate::server) async fn secure_group_encrypt(
     if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
         return resp;
     }
+    // ADR-0066 §1 row 4 / §4 (slice 9): capture under the SAME read guard as
+    // the gate. Re-checked immediately before the effect below. The TreeKEM
+    // branch of this handler does its own capture and re-check inside
+    // `treekem_group_encrypt` (row 2), where the ratchet lives.
+    let captured_epoch = info.lifecycle_epoch_token();
 
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
@@ -23703,6 +23940,26 @@ pub(in crate::server) async fn secure_group_encrypt(
         Ok(attribution) => attribution,
         Err(resp) => return resp,
     };
+    // ADR-0066 §1 row 4 / §4 (slice 9): THE EFFECT POINT. The two
+    // irreversible steps on this path are the durable history row immediately
+    // below and the ciphertext returned to the caller; both are stopped by
+    // refusing here. The GSS plane has NO ratchet — the key is the group's
+    // epoch-keyed shared secret and every message carries a fresh random
+    // nonce — so there is no generation to burn and the computed ciphertext is
+    // simply discarded, leaving `secret_epoch`, the roster and the history
+    // store byte-identical.
+    //
+    // This is the last point on the path with no suspension between it and the
+    // effect: after `drop(groups)` above nothing awaits, so the re-check's own
+    // read acquisition is placed as late as the effect allows. It holds no
+    // other lock, and the terminality re-check below takes its read guard
+    // sequentially rather than nested.
+    if let Some(resp) =
+        reject_fork_quarantine_installed_before_effect(state.as_ref(), &id, Some(&captured_epoch))
+            .await
+    {
+        return resp;
+    }
     record_mls_history(
         state.as_ref(),
         &group_id_clone,
@@ -23914,6 +24171,9 @@ pub(in crate::server) async fn secure_group_reseal(
     if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
         return resp;
     }
+    // ADR-0066 §1 row 6 / §4 (slice 9): capture under the SAME read guard as
+    // the gate. Re-checked immediately before the sealed envelope is returned.
+    let captured_epoch = info.lifecycle_epoch_token();
 
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
@@ -23981,6 +24241,21 @@ pub(in crate::server) async fn secure_group_reseal(
             }
         };
 
+    // ADR-0066 §1 row 6 / §4 (slice 9): THE EFFECT POINT. This route persists
+    // nothing and advances no ratchet — its effect is that the group's shared
+    // secret, sealed to a recipient's ML-KEM key, LEAVES THE NODE in the
+    // response. Refusing here means the envelope is discarded before it is
+    // handed out, so a contested group cannot hand its key material onward,
+    // and `secret_epoch`, the roster and every durable file are untouched.
+    //
+    // As on row 4, nothing awaits between `drop(groups)` above and here, so
+    // this is the last suspension-free point before the effect.
+    if let Some(resp) =
+        reject_fork_quarantine_installed_before_effect(state.as_ref(), &id, Some(&captured_epoch))
+            .await
+    {
+        return resp;
+    }
     secure_group_effect_response_after_terminality_recheck(
         state.as_ref(),
         &id,
@@ -32082,6 +32357,7 @@ pub(in crate::server) mod tests {
     mod adr0066_coverage_map;
     mod adr0066_delegations;
     mod adr0066_epoch_token;
+    mod adr0066_send_path;
     mod adr0066_tasks;
     mod cache_hardening_followup;
     mod fork_quarantine;
