@@ -822,7 +822,7 @@ async fn adr0064_forced_persist_failure_leaves_marker_retryable() -> Result<()> 
     // Force the roster save itself to fail (the #470 fault cell compiled
     // into the production persist path).
     {
-        let _fault = set_save_fault(SaveFault::Error);
+        let _fault = set_save_fault(&state, SaveFault::Error);
         let second = apply_commit(&state, &group_id, fork_b_commit.clone(), "fork-b").await?;
         assert!(second.is_err(), "the conflicting twin is still refused");
         let record = live_record(&state, &group_id).await;
@@ -2350,7 +2350,7 @@ async fn adr0066_non_durable_install_rolls_back_a_no_anchor_marker() -> Result<(
 
     {
         // The install is visible in memory but never confirmed durable.
-        let _fault = set_save_fault(SaveFault::ReplacedNotDurable);
+        let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
         let second = apply_commit(&state, &group_id, fork_b.clone(), "fork-b").await?;
         assert!(second.is_err(), "the conflicting twin is still refused");
         let record = live_record(&state, &group_id).await;

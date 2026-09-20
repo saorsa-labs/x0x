@@ -1806,7 +1806,7 @@ async fn adr0064_s4_eviction_arm_non_durable_clear_keeps_marker_and_503s() -> Re
     // persist; the asserted contract — non-durable never 200s and the
     // marker survives — is the same transaction surface either way.)
     persist_named_groups_mutation(&state, |_| true).await?;
-    let _fault = set_save_fault(SaveFault::Error);
+    let _fault = set_save_fault(&state, SaveFault::Error);
     let response = seal_group_state(
         State(Arc::clone(&state)),
         axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),

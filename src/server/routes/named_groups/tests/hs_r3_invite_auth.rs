@@ -1469,7 +1469,7 @@ async fn mint_route_refusals_cap_size_owner_key_and_rollback() -> Result<()> {
         let before = state.named_groups.read().await[&group_id]
             .live_issued_invite_count(now_millis_u64() / 1_000);
         {
-            let _fault = set_save_fault(SaveFault::Error);
+            let _fault = set_save_fault(&state, SaveFault::Error);
             let response = create_group_invite(
                 State(Arc::clone(&state)),
                 axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
@@ -1712,7 +1712,7 @@ async fn card_mint_refusals_share_the_transaction() -> Result<()> {
         r3_insert_group(&state, &group_id, r3_owner_certified_policy(&owner_kp)).await;
         let before = state.named_groups.read().await[&group_id]
             .live_issued_invite_count(now_millis_u64() / 1_000);
-        let _fault = set_save_fault(SaveFault::Error);
+        let _fault = set_save_fault(&state, SaveFault::Error);
         let groups = card_groups_for(
             &state,
             Some(axum::extract::Extension(
@@ -2478,7 +2478,7 @@ async fn fork_evidence_failed_install_is_retryable_not_seen_marked() -> Result<(
     })
     .await?;
     {
-        let _fault = set_save_fault(SaveFault::Error);
+        let _fault = set_save_fault(&state, SaveFault::Error);
         let refused =
             r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "retry-b", false).await?;
         assert!(refused.is_err(), "the conflicting twin is refused");
@@ -2535,7 +2535,7 @@ async fn fork_evidence_failed_install_is_retryable_not_seen_marked() -> Result<(
         })
         .await?;
         {
-            let _fault = set_save_fault(SaveFault::ReplacedNotDurable);
+            let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
             let _persistence_guard = state.named_groups_persistence_lock.lock().await;
             let refused =
                 r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "rnd-b", true).await?;
@@ -2614,7 +2614,7 @@ async fn fork_evidence_replaced_not_durable_ordinary_path_rolls_back_and_retries
     // The fault leg: NO persistence lock held — the ordinary
     // live-ingress path — while the save returns ReplacedNotDurable.
     {
-        let _fault = set_save_fault(SaveFault::ReplacedNotDurable);
+        let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
         let refused =
             r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "ord-rnd-b", false).await?;
         assert!(refused.is_err(), "the conflicting twin is refused");
