@@ -278,7 +278,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/ws.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(6),
-        closed: false,
+        closed: true,
     },
     CoverageRow {
         row: 26,
@@ -619,8 +619,9 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     // that closing a row and reopening another cannot cancel out, and so
     // that a slice which lands its code without updating this map fails
     // here instead of leaving the map quietly describing a tree that no
-    // longer exists. Slice 3 closed 15–19 and slice 4 closed 13, 14 and
-    // 26; what remains is slice 5 (20, 21), slice 6 (25) and slice 7 (22).
+    // longer exists. Slice 3 closed 15–19, slice 4 closed 13, 14 and 26,
+    // and slice 6 closed 25; what remains is slice 5 (20, 21) and slice 7
+    // (22).
     let open: Vec<u8> = COVERAGE_MAP
         .iter()
         .filter(|row| !row.closed)
@@ -659,7 +660,7 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
 }
 
 /// The §1 rows whose behaviour change has not landed yet, in row order.
-const OPEN_ROWS: &[u8] = &[20, 21, 22, 25];
+const OPEN_ROWS: &[u8] = &[20, 21, 22];
 
 /// WHY (ADR-0066 Validation, the fixture's whole reason for existing):
 /// every route on the censused surface must be explicitly classified. Row

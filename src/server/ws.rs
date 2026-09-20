@@ -86,6 +86,14 @@ enum WsOutbound {
         topic: String,
         payload: String,
         origin: Option<String>,
+        /// ADR-0066 §3d: set on ADR-0023 BACKFILL frames replayed for a
+        /// fork-quarantined group's topic. Live gossip frames leave it
+        /// `None` — they are the raw topic plane the ADR's row-25 note
+        /// puts outside this row (as it does the `Publish` verb), and
+        /// keeping them untouched is what keeps the per-frame forwarder
+        /// free of any marker lookup. See [`ForkQuarantineAnnotation`].
+        #[serde(flatten)]
+        quarantine: Option<ForkQuarantineAnnotation>,
     },
     #[serde(rename = "direct_message")]
     DirectMessage {
@@ -112,7 +120,15 @@ enum WsOutbound {
     /// ADR-0023 backfill-then-live marker: everything before this frame on
     /// `topic` came from the durable store; everything after is live.
     #[serde(rename = "live")]
-    Live { topic: String },
+    Live {
+        topic: String,
+        /// ADR-0066 §3d: set when `topic` is a fork-quarantined group's
+        /// public topic, so the boundary frame of a backfill says the
+        /// replayed rows span a contested chain. See
+        /// [`ForkQuarantineAnnotation`].
+        #[serde(flatten)]
+        quarantine: Option<ForkQuarantineAnnotation>,
+    },
     /// ADR-0040 daemon-side mention routing: a validated group message (or
     /// delegation grant) naming the LOCAL agent. Emitted on the group's
     /// shared topic channel so subscribed clients get a structured signal
@@ -130,6 +146,13 @@ enum WsOutbound {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         mentions: Vec<String>,
         timestamp: u64,
+        /// ADR-0066 §3d: set when `group_id` is fork-quarantined on this
+        /// node. The annotation describes what was OBSERVED, not what was
+        /// authorized — a `delegation` mention may be annotated here while
+        /// §3b independently refuses the grant itself. See
+        /// [`ForkQuarantineAnnotation`].
+        #[serde(flatten)]
+        quarantine: Option<ForkQuarantineAnnotation>,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -163,6 +186,156 @@ struct WsBackfill {
     /// Max stored rows to replay per topic (server clamps like `/history`).
     #[serde(default)]
     limit: usize,
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0066 §3d — fork-quarantine annotation on group-scoped frames (row 25)
+// ---------------------------------------------------------------------------
+//
+// WHY annotate and never refuse: the WS plane is the live mirror of the
+// annotated history reads (§3a). An operator watching a live incident must
+// not lose the stream at the very moment it matters, so nothing here drops a
+// frame, cuts a subscription or returns an error — the frames simply say
+// that what they carry came from a contested roster. That is also why the
+// machine code travels in the annotation rather than in `WsOutbound::Error`:
+// that variant has only a `message` field (§5), so there is nowhere in it to
+// put a code a client could match on.
+//
+// SHAPE: deliberately identical to the history envelope's annotation —
+// `fork_quarantined: true` plus `fork_quarantine { clear_with, scopes: [{
+// scope, revision, observed_at_ms, no_anchor }] }` — so a client parses one
+// dialect for the REST reads and the WS mirror of them. A WS frame belongs
+// to exactly one group, so `scopes` always holds a single entry; it stays an
+// array rather than collapsing to a bare object precisely so the two planes
+// can share a parser.
+//
+// The builder below is small and local on purpose. Slice 4 (#743) adds
+// `history::annotate` over this same shape for the REST envelopes; once both
+// have landed the two should be folded into one shared helper. That is a
+// mechanical follow-up with no behaviour change, and neither slice needs the
+// other's code to be correct on its own.
+
+/// ADR-0066 §3d annotation, flattened onto the frame it describes.
+///
+/// Absent entirely — never `null`, never `false` — for a group that is not
+/// fork-quarantined, so today's frames stay byte-identical.
+#[derive(Debug, Clone, Serialize)]
+struct ForkQuarantineAnnotation {
+    /// Always `true` when the annotation is present. Present as its own
+    /// flag (rather than inferred from `fork_quarantine`) because the ADR's
+    /// Validation clause is written against it: "every frame carries
+    /// `fork_quarantined: true`".
+    fork_quarantined: bool,
+    /// The marker detail, in the §5 refusal body's vocabulary.
+    fork_quarantine: ForkQuarantineDetail,
+}
+
+/// Body of the §3d annotation.
+#[derive(Debug, Clone, Serialize)]
+struct ForkQuarantineDetail {
+    /// The remedy, machine-readable (§5) — the only exit for a `no_anchor`
+    /// marker, which never clears on its own.
+    clear_with: &'static str,
+    /// The quarantined scopes in view of this frame: exactly one.
+    scopes: Vec<ForkQuarantineScope>,
+}
+
+/// One quarantined scope — the same four fields the §5 refusal body carries.
+#[derive(Debug, Clone, Serialize)]
+struct ForkQuarantineScope {
+    /// Canonical history scope string (`group:<stable_id>`), so a client can
+    /// join a WS frame to a `/history` row without a second dialect.
+    scope: String,
+    /// Revision the evidenced conflicting commit claims.
+    revision: u64,
+    /// When THIS node observed the fork (unix ms).
+    observed_at_ms: u64,
+    /// `true` for an ordinary group: nothing will clear this automatically.
+    no_anchor: bool,
+}
+
+/// The group stable id a WS topic belongs to, or `None` for any topic that
+/// is not a public-group feed.
+///
+/// A non-group topic resolving to `None` is what keeps ordinary pub/sub
+/// subscriptions byte-identical to today.
+fn group_id_for_topic(topic: &str) -> Option<&str> {
+    let rest = topic.strip_prefix(crate::groups::PUBLIC_GROUP_TOPIC_PREFIX)?;
+    let id = rest.strip_prefix('.')?;
+    (!id.is_empty()).then_some(id)
+}
+
+/// Build the §3d annotation for `group_id`, or `None` when that group is not
+/// fork-quarantined on this node.
+///
+/// HOT-PATH COST (§3d's constraint): one `named_groups` read-lock
+/// acquisition, taken only at the two sites row 25 names — mention emit
+/// (once per ROUTED mention, on a path that already awaits `ws_topics` and
+/// sits downstream of ML-DSA validation) and `Subscribe` backfill (once per
+/// topic, beside a `spawn_blocking` store query that dominates it). The
+/// per-frame broadcast forwarder never calls this, so the high-volume live
+/// path adds nothing and needs no per-subscription cache to invalidate.
+///
+/// Resolving at EMIT time rather than at subscribe time is also what makes
+/// the marker transitions work for free: a session that subscribed before
+/// the marker was installed starts annotating on the next frame after the
+/// install, and stops on the next frame after a manual clear, with no
+/// cached state anywhere to go stale.
+///
+/// BOTH SPELLINGS, and this is load-bearing rather than defensive. The WS
+/// plane always names the group by its STABLE id — `MentionFrame.group_id`
+/// and the public topic both come from the ingest path's stable resolution —
+/// while `named_groups` is keyed by whichever alias this daemon happened to
+/// learn the group under (`resolved_group_key` tries the direct key first and
+/// then scans by `stable_group_id()`; pre-D.3 records fall back to
+/// `mls_group_id`). A single-spelling `get()` would therefore leave an
+/// alias-keyed group streaming UNANNOTATED through the whole incident —
+/// silently, and only for that group — which is precisely the failure §3d
+/// exists to prevent. The fallback scan is bounded by the group count and
+/// runs only at the two lookup points below, never per frame.
+///
+/// Slice 3 (#744) adds the same two-spelling resolver as
+/// `delegations::fork_quarantine_marker`; folding the two into one shared
+/// helper is part of the unification follow-up noted above.
+async fn fork_quarantine_annotation(
+    state: &AppState,
+    group_id: &str,
+) -> Option<ForkQuarantineAnnotation> {
+    // Copy the three fields out under the lock rather than cloning the
+    // marker: `ForkQuarantine` carries a forensic `ForkSnapshot` of both
+    // competing commit headers, which no frame needs.
+    let (revision, observed_at_ms, no_anchor) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_id).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id)
+        })?;
+        let marker = info.fork_quarantine.as_ref()?;
+        (marker.revision, marker.observed_at_ms, marker.no_anchor)
+    };
+    Some(ForkQuarantineAnnotation {
+        fork_quarantined: true,
+        fork_quarantine: ForkQuarantineDetail {
+            clear_with: crate::server::routes::named_groups::FORK_QUARANTINE_CLEAR_ROUTE,
+            scopes: vec![ForkQuarantineScope {
+                scope: crate::history::Scope::Group(group_id.to_string()).to_string(),
+                revision,
+                observed_at_ms,
+                no_anchor,
+            }],
+        },
+    })
+}
+
+/// [`fork_quarantine_annotation`] for a TOPIC: `None` unless the topic is a
+/// public-group feed whose group is quarantined.
+async fn topic_fork_quarantine_annotation(
+    state: &AppState,
+    topic: &str,
+) -> Option<ForkQuarantineAnnotation> {
+    let group_id = group_id_for_topic(topic)?;
+    fork_quarantine_annotation(state, group_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +744,12 @@ async fn handle_ws_connection(
                 &outbound_tx,
                 WsOutbound::Live {
                     topic: "direct".to_string(),
+                    // ADR-0066 §3d is group-scoped. This is the `/ws/direct`
+                    // DM backfill (the ADR's `ws.rs:527` census anchor); it
+                    // replays `dm:` scopes only, so there is no group whose
+                    // marker could apply — exactly as slice 4 leaves `dm:`
+                    // scopes unannotated on the REST side.
+                    quarantine: None,
                 },
                 &stats,
             );
@@ -841,6 +1020,12 @@ async fn handle_ws_command(
                                             topic: topic_clone.clone(),
                                             payload: BASE64.encode(&msg.payload),
                                             origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
+                                            // Raw live gossip plane: outside
+                                            // ADR-0066 row 25 (see the
+                                            // `Message::quarantine` note), and
+                                            // the one truly per-frame path —
+                                            // it takes no marker lock.
+                                            quarantine: None,
                                         };
                                         let _ = btx.send(out);
                                     }
@@ -868,6 +1053,11 @@ async fn handle_ws_command(
                 // during the query are deduped by payload hash below.
                 let mut backfill_hashes: Option<std::collections::HashSet<[u8; 32]>> = None;
                 if let Some(spec) = backfill.as_ref() {
+                    // ADR-0066 §3d (row 25): resolve the marker ONCE per
+                    // subscribed topic, beside the store query that dominates
+                    // this path. `None` for every non-group topic, which is
+                    // what keeps ordinary pub/sub backfill byte-identical.
+                    let quarantine = topic_fork_quarantine_annotation(state, topic).await;
                     if let Some(history) = state.agent.history() {
                         let store = Arc::clone(history.store());
                         let q = crate::history::HistoryQuery {
@@ -887,6 +1077,9 @@ async fn handle_ws_command(
                                         topic: topic.clone(),
                                         payload: BASE64.encode(&r.payload),
                                         origin: r.author_agent.clone(),
+                                        // Every replayed frame is annotated,
+                                        // per the ADR's §3d fixture clause.
+                                        quarantine: quarantine.clone(),
                                     };
                                     if !feed_droppable(tx, out, stats) {
                                         break;
@@ -909,6 +1102,7 @@ async fn handle_ws_command(
                         tx,
                         WsOutbound::Live {
                             topic: topic.clone(),
+                            quarantine,
                         },
                         stats,
                     );
@@ -1138,6 +1332,12 @@ fn render_gui_html() -> String {
 /// other topic frames: a lagging subscriber is dropped by the broadcast
 /// channel, never blocks ingest.
 pub(super) async fn emit_mention_event(state: &AppState, frame: MentionFrame) {
+    // ADR-0066 §3d (row 25): the annotation is resolved HERE, at emit time,
+    // and BEFORE the `ws_topics` read-lock — so the two locks are never
+    // nested, and every subscriber of the group's channel receives the same
+    // frame with the marker as it stands right now. The stream is never cut
+    // and no frame is dropped: this is the annotate class.
+    let quarantine = fork_quarantine_annotation(state, &frame.group_id).await;
     let topics = state.ws_topics.read().await;
     if let Some(shared) = topics.get(&frame.topic) {
         let _ = shared.channel.send(WsOutbound::Mention {
@@ -1148,6 +1348,7 @@ pub(super) async fn emit_mention_event(state: &AppState, frame: MentionFrame) {
             reason: frame.reason,
             mentions: frame.mentions,
             timestamp: frame.timestamp,
+            quarantine,
         });
     }
 }
@@ -1362,6 +1563,445 @@ mod tests {
         let (status, _body) = read("/ws".to_string(), None).await?;
         assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
         Ok(())
+    }
+
+    // ========================================================================
+    // ADR-0066 §3d (row 25) — fork-quarantine annotation on the WS plane.
+    //
+    // WHY these tests exist, in the ADR's own terms: row 25 is the LIVE
+    // MIRROR of the annotated history reads, and it is annotate-class
+    // precisely because "an operator watching a live incident must not lose
+    // the stream at the moment it matters". Two properties therefore have to
+    // hold at once, and each is a different failure:
+    //
+    //   - containment must be VISIBLE — a client watching a contested group
+    //     must be able to tell, from the frame alone and without a second
+    //     round trip, that what it is reading came from a disputed roster;
+    //   - containment must not become CENSORSHIP — no refusal, no dropped
+    //     frame, no closed subscription on the WS plane.
+    //
+    // A test that only checked the flag would pass on an implementation that
+    // annotated by cutting the stream, so the transition test asserts the
+    // frames keep arriving as well as what they say.
+    // ========================================================================
+
+    /// A group id shaped like a real stable id.
+    fn quarantine_test_group_id() -> String {
+        "aa".repeat(32)
+    }
+
+    /// Insert a plain (unquarantined) group under `map_key`, and return the
+    /// STABLE id the WS plane will name it by.
+    ///
+    /// The two can differ — that is the whole point of the alias fixture
+    /// below — so every caller is explicit about which spelling it is using:
+    /// the marker helpers take the MAP KEY (that is what `named_groups` is
+    /// keyed by), while the frames take the stable id.
+    async fn insert_test_group(state: &AppState, map_key: &str) -> String {
+        let info = crate::groups::GroupInfo::new(
+            "adr0066-ws".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "09".repeat(16),
+        );
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(map_key.to_string(), info);
+        stable
+    }
+
+    /// Install a fork-quarantine marker on an existing group entry, as the
+    /// evidence path does (ADR-0066 §2: `no_anchor` for an ordinary group,
+    /// so nothing will clear it automatically).
+    async fn set_test_marker(state: &AppState, group_id: &str) {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(group_id).expect("group present");
+        let header = info.terminal_commit_header();
+        let state_hash = info.state_hash.clone();
+        info.fork_quarantine = Some(crate::groups::ForkQuarantine {
+            revision: 9,
+            state_hash,
+            committed_by: "ff".repeat(32),
+            observed_at_ms: 1_788_091_300_000,
+            snapshot: crate::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+    }
+
+    /// The manual clear (`POST /groups/:id/quarantine/clear`) reduced to its
+    /// effect on the marker — the only exit a `no_anchor` marker has.
+    async fn clear_test_marker(state: &AppState, group_id: &str) {
+        let mut groups = state.named_groups.write().await;
+        groups
+            .get_mut(group_id)
+            .expect("group present")
+            .fork_quarantine = None;
+    }
+
+    /// Register a bare WS session so `handle_ws_command` will serve it.
+    async fn register_test_session(state: &AppState, session_id: &str) {
+        state.ws_sessions.write().await.insert(
+            session_id.to_string(),
+            WsSession {
+                id: session_id.to_string(),
+                subscribed_topics: HashSet::new(),
+                receives_direct: false,
+                topic_forwarders: HashMap::new(),
+            },
+        );
+    }
+
+    /// Next frame, with a deadline: a missing frame is a FAILURE here, never
+    /// a hang — "the stream is not cut" is half of what §3d requires.
+    async fn next_frame(rx: &mut mpsc::Receiver<WsOutbound>) -> WsOutbound {
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a frame within the deadline — the WS stream must not be cut")
+            .expect("the outbound channel must stay open")
+    }
+
+    /// Serialize a frame and return its top-level object.
+    fn frame_json(frame: &WsOutbound) -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::to_value(frame).expect("frame serializes") {
+            serde_json::Value::Object(map) => map,
+            other => panic!("frame must serialize to an object, got {other}"),
+        }
+    }
+
+    /// Assert the §3d annotation is ABSENT — not `null`, not `false`, but
+    /// the keys missing entirely, which is what keeps an unquarantined
+    /// group's frames byte-identical to the pre-ADR-0066 wire format.
+    fn assert_not_annotated(frame: &WsOutbound) {
+        let map = frame_json(frame);
+        assert!(
+            !map.contains_key("fork_quarantined") && !map.contains_key("fork_quarantine"),
+            "an unquarantined group's frame must be byte-identical to today: {map:?}"
+        );
+    }
+
+    /// Assert the §3d annotation is present and complete, in the same shape
+    /// the history envelope uses.
+    fn assert_annotated(frame: &WsOutbound, group_id: &str) {
+        let map = frame_json(frame);
+        assert_eq!(
+            map.get("fork_quarantined"),
+            Some(&serde_json::Value::Bool(true)),
+            "§3d: every frame for a quarantined group carries the flag: {map:?}"
+        );
+        let detail = map
+            .get("fork_quarantine")
+            .expect("the flag never ships without its detail");
+        assert_eq!(
+            detail["clear_with"], "POST /groups/:id/quarantine/clear",
+            "§5: the remedy must be machine-readable — a `no_anchor` marker has no other exit"
+        );
+        let scopes = detail["scopes"]
+            .as_array()
+            .expect("scopes is an array so WS and /history share one parser");
+        assert_eq!(scopes.len(), 1, "a WS frame belongs to exactly one group");
+        assert_eq!(scopes[0]["scope"], format!("group:{group_id}"));
+        assert_eq!(scopes[0]["revision"], 9, "the evidenced fork revision");
+        assert_eq!(scopes[0]["observed_at_ms"], 1_788_091_300_000u64);
+        assert_eq!(
+            scopes[0]["no_anchor"], true,
+            "an ordinary group's marker must say plainly that nothing clears it automatically"
+        );
+    }
+
+    /// Emit one ADR-0040 mention on the group's topic.
+    async fn emit_test_mention(state: &AppState, group_id: &str, topic: &str) {
+        emit_mention_event(
+            state,
+            MentionFrame {
+                topic: topic.to_string(),
+                group_id: group_id.to_string(),
+                msg_id: "m1".to_string(),
+                author_agent_id: "bb".repeat(32),
+                reason: "mention".to_string(),
+                mentions: vec!["cc".repeat(32)],
+                timestamp: 1_788_091_400_000,
+            },
+        )
+        .await;
+    }
+
+    /// WHY: §3d says the annotation must be ABSENT for an unquarantined
+    /// group, and the Migration table promises such groups are
+    /// "byte-for-byte unchanged". `#[serde(flatten)]` over an `Option` is
+    /// what buys that, and it is a property of the wire format rather than
+    /// of any handler — so it is asserted directly on the three frame
+    /// variants row 25 touches, including the exact full JSON of a mention
+    /// frame. A regression here is invisible to a client that ignores
+    /// unknown keys and fatal to one that compares envelopes.
+    #[test]
+    fn adr0066_ws_frames_omit_the_annotation_entirely_when_not_quarantined() {
+        let mention = WsOutbound::Mention {
+            topic: "x0x.groups.public.g1".to_string(),
+            group_id: "g1".to_string(),
+            msg_id: "m1".to_string(),
+            author_agent_id: "bb".repeat(32),
+            reason: "mention".to_string(),
+            mentions: vec!["cc".repeat(32)],
+            timestamp: 7,
+            quarantine: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&mention).expect("mention serializes"),
+            serde_json::json!({
+                "type": "mention",
+                "topic": "x0x.groups.public.g1",
+                "group_id": "g1",
+                "msg_id": "m1",
+                "author_agent_id": "bb".repeat(32),
+                "reason": "mention",
+                "mentions": ["cc".repeat(32)],
+                "timestamp": 7,
+            }),
+            "the pre-ADR-0066 mention envelope, unchanged"
+        );
+        assert_not_annotated(&mention);
+        assert_not_annotated(&WsOutbound::Message {
+            topic: "some.topic".to_string(),
+            payload: String::new(),
+            origin: None,
+            quarantine: None,
+        });
+        assert_not_annotated(&WsOutbound::Live {
+            topic: "some.topic".to_string(),
+            quarantine: None,
+        });
+    }
+
+    /// WHY: the ADR's §3d fixture clause — "a WS subscriber receives
+    /// `Mention` events and ADR-0023 backfill frames for a quarantined group
+    /// — the stream is **not** cut — and every frame carries
+    /// `fork_quarantined: true`" — plus the two TRANSITIONS that a
+    /// subscribe-time lookup or any per-subscription cache would get wrong:
+    ///
+    ///   1. the session here subscribes BEFORE the marker exists, and must
+    ///      start annotating once it is installed. An implementation that
+    ///      resolved the marker when the subscription was created would
+    ///      stream unlabelled frames through the whole incident — silently,
+    ///      and only for the clients that were already watching, which is
+    ///      the worst possible failure for an incident-time signal;
+    ///   2. after the manual clear (the only exit a `no_anchor` marker has,
+    ///      §2/R1) the annotation must STOP. A marker that outlived its
+    ///      clear would leave every future frame labelled contested, which
+    ///      trains operators to ignore the label.
+    ///
+    /// The frames are collected through the real `Subscribe` handler and the
+    /// real per-session forwarder, so "the stream is not cut" is observed
+    /// rather than assumed: every step below waits for an actual frame.
+    #[tokio::test]
+    async fn adr0066_ws_group_frames_annotate_across_marker_transitions() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = quarantine_test_group_id();
+        let topic = crate::groups::public_topic_for(&group_id);
+        insert_test_group(&state, &group_id).await;
+
+        // Subscribe FIRST, while the group is clean — the transition-1 setup.
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(64);
+        let stats = WsOutboundStats::default();
+        register_test_session(&state, "s1").await;
+        let subscribe = serde_json::json!({ "type": "subscribe", "topics": [&topic] }).to_string();
+        handle_ws_command(&state, "s1", &subscribe, &tx, &stats, false).await;
+        match next_frame(&mut rx).await {
+            WsOutbound::Subscribed { topics } => assert_eq!(topics, vec![topic.clone()]),
+            other => panic!("expected the subscribed ack, got {other:?}"),
+        }
+
+        // No marker → no annotation.
+        emit_test_mention(&state, &group_id, &topic).await;
+        let frame = next_frame(&mut rx).await;
+        assert!(
+            matches!(frame, WsOutbound::Mention { .. }),
+            "expected a mention frame, got {frame:?}"
+        );
+        assert_not_annotated(&frame);
+
+        // Transition 1: marker installed AFTER this session subscribed.
+        set_test_marker(&state, &group_id).await;
+        emit_test_mention(&state, &group_id, &topic).await;
+        let frame = next_frame(&mut rx).await;
+        assert!(
+            matches!(frame, WsOutbound::Mention { .. }),
+            "§3d is annotate-class: the mention must still ARRIVE, got {frame:?}"
+        );
+        assert_annotated(&frame, &group_id);
+
+        // Transition 2: the manual clear stops the annotation.
+        clear_test_marker(&state, &group_id).await;
+        emit_test_mention(&state, &group_id, &topic).await;
+        let frame = next_frame(&mut rx).await;
+        assert!(
+            matches!(frame, WsOutbound::Mention { .. }),
+            "expected a mention frame, got {frame:?}"
+        );
+        assert_not_annotated(&frame);
+        Ok(())
+    }
+
+    /// WHY: the second surface row 25 names — the ADR-0023 `Subscribe`
+    /// backfill. The `live` boundary frame is emitted unconditionally once
+    /// backfill is requested (even with the store disabled), so it is the
+    /// one frame a subscriber is guaranteed to see and therefore the one
+    /// that must carry the label; the replayed rows carry the same
+    /// annotation from the same lookup.
+    ///
+    /// The second half is the containment-is-not-censorship half: a
+    /// NON-group topic must be untouched, because a marker on some group
+    /// must never change what an unrelated pub/sub subscriber sees.
+    #[tokio::test]
+    async fn adr0066_ws_backfill_boundary_frame_is_annotated_for_a_quarantined_group(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = quarantine_test_group_id();
+        let group_topic = crate::groups::public_topic_for(&group_id);
+        insert_test_group(&state, &group_id).await;
+        set_test_marker(&state, &group_id).await;
+
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(64);
+        let stats = WsOutboundStats::default();
+        register_test_session(&state, "s1").await;
+        let subscribe = serde_json::json!({
+            "type": "subscribe",
+            "topics": [&group_topic, "plain.topic"],
+            "backfill": { "limit": 8 },
+        })
+        .to_string();
+        handle_ws_command(&state, "s1", &subscribe, &tx, &stats, false).await;
+
+        // Collect until both `live` boundary frames have arrived. Any
+        // replayed row seen on the way is asserted too: every frame of a
+        // quarantined group's backfill carries the label, and no frame of
+        // the unrelated topic does.
+        let mut group_live = None;
+        let mut plain_live = None;
+        while group_live.is_none() || plain_live.is_none() {
+            let frame = next_frame(&mut rx).await;
+            match &frame {
+                WsOutbound::Live { topic, .. } if topic == &group_topic => {
+                    assert_annotated(&frame, &group_id);
+                    group_live = Some(());
+                }
+                WsOutbound::Live { topic, .. } if topic == "plain.topic" => {
+                    assert_not_annotated(&frame);
+                    plain_live = Some(());
+                }
+                WsOutbound::Message { topic, .. } if topic == &group_topic => {
+                    assert_annotated(&frame, &group_id);
+                }
+                WsOutbound::Message { .. } => assert_not_annotated(&frame),
+                WsOutbound::Subscribed { .. } => {}
+                other => panic!("unexpected frame during backfill: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// WHY (found by cross-model review of this slice; the same hole slice 3
+    /// had): the WS plane and the roster map do not necessarily spell a group
+    /// the same way. Frames always name the STABLE id —
+    /// `MentionFrame.group_id` and the public topic both come from the ingest
+    /// path's stable resolution — while `named_groups` is keyed by whichever
+    /// alias this daemon learned the group under, which `resolved_group_key`
+    /// exists precisely to paper over (and which a pre-D.3 record makes
+    /// routine, since `stable_group_id()` then falls back to `mls_group_id`).
+    ///
+    /// A single-spelling `get()` therefore fails in the worst possible shape:
+    /// it does not error, it does not annotate some frames and not others —
+    /// it leaves ONE group streaming completely unlabelled through its entire
+    /// incident while every other group looks correct, so the gap is
+    /// invisible to any test that keys its fixture by the stable id. Both of
+    /// the surfaces this slice touches are asserted here, because they
+    /// resolve the marker through two different call sites.
+    #[tokio::test]
+    async fn adr0066_alias_keyed_group_is_annotated_on_both_surfaces() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        // Keyed by an ALIAS, not by the stable id the frames will carry.
+        let map_key = "adr0066-ws-alias-key";
+        let stable_id = insert_test_group(&state, map_key).await;
+        // The fixture is worthless if the two spellings coincide — assert its
+        // own premise rather than trusting it.
+        assert_ne!(
+            stable_id, map_key,
+            "the fixture must store the group under a key that is NOT its stable id"
+        );
+        set_test_marker(&state, map_key).await;
+        let topic = crate::groups::public_topic_for(&stable_id);
+
+        // Surface 1 — the ADR-0040 mention frame.
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(64);
+        let stats = WsOutboundStats::default();
+        register_test_session(&state, "s1").await;
+        let subscribe = serde_json::json!({ "type": "subscribe", "topics": [&topic] }).to_string();
+        handle_ws_command(&state, "s1", &subscribe, &tx, &stats, false).await;
+        match next_frame(&mut rx).await {
+            WsOutbound::Subscribed { .. } => {}
+            other => panic!("expected the subscribed ack, got {other:?}"),
+        }
+        emit_test_mention(&state, &stable_id, &topic).await;
+        let frame = next_frame(&mut rx).await;
+        assert!(
+            matches!(frame, WsOutbound::Mention { .. }),
+            "expected a mention frame, got {frame:?}"
+        );
+        assert_annotated(&frame, &stable_id);
+
+        // Surface 2 — the ADR-0023 backfill boundary frame, which resolves
+        // the marker from the TOPIC rather than from a frame's group_id.
+        let (tx2, mut rx2) = mpsc::channel::<WsOutbound>(64);
+        register_test_session(&state, "s2").await;
+        let subscribe = serde_json::json!({
+            "type": "subscribe",
+            "topics": [&topic],
+            "backfill": { "limit": 8 },
+        })
+        .to_string();
+        handle_ws_command(&state, "s2", &subscribe, &tx2, &stats, false).await;
+        loop {
+            let frame = next_frame(&mut rx2).await;
+            match &frame {
+                WsOutbound::Live { .. } => {
+                    assert_annotated(&frame, &stable_id);
+                    break;
+                }
+                WsOutbound::Message { .. } => assert_annotated(&frame, &stable_id),
+                WsOutbound::Subscribed { .. } => {}
+                other => panic!("unexpected frame during backfill: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// WHY: the topic→group resolution is the only place the WS plane
+    /// decides whether a frame is group-scoped at all. An over-eager prefix
+    /// match would annotate unrelated topics (a false incident signal); an
+    /// under-eager one would leave the group plane unlabelled.
+    #[test]
+    fn adr0066_group_topic_resolution_is_exact() {
+        assert_eq!(group_id_for_topic("x0x.groups.public.g1"), Some("g1"));
+        assert_eq!(group_id_for_topic("x0x.groups.public."), None);
+        assert_eq!(group_id_for_topic("x0x.groups.public"), None);
+        assert_eq!(group_id_for_topic("x0x.groups.publicX.g1"), None);
+        assert_eq!(group_id_for_topic("chat"), None);
+        // Round-trip against the canonical constructor, so a change to the
+        // topic scheme cannot silently unhook the annotation.
+        let id = quarantine_test_group_id();
+        assert_eq!(
+            group_id_for_topic(&crate::groups::public_topic_for(&id)),
+            Some(id.as_str())
+        );
     }
 
     // ========================================================================
