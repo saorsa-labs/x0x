@@ -978,6 +978,17 @@ pub async fn serve_with_options(
         owner_sync,
     });
 
+    // ADR-0068 D1: teach the history retention reaper which scopes are
+    // fork-quarantined. Installed HERE because this is the first point at
+    // which an `Arc<AppState>` exists — the reaper is spawned by the Agent,
+    // which knows nothing about named groups — and the source holds only a
+    // `Weak`, so it cannot form a cycle with the Agent that owns the store
+    // (#661 drop ordering). Absent when history is disabled, in which case
+    // there is no reaper to inform.
+    if routes::history::ReaperQuarantinePins::install(&state) {
+        tracing::debug!("[history] fork-quarantine pin source installed (ADR-0068 D1)");
+    }
+
     // Review r2 (#451): a store written by a pre-#451 Home-Suite binary
     // still holds owner-certified entries in named_groups.json — v0.40.x
     // would crash-loop on it. Migrate to the split layout immediately so

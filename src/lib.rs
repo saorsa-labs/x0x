@@ -15595,6 +15595,32 @@ impl TaskListHandle {
         }
     }
 
+    /// ADR-0068 D2: install the fork-quarantine gate for inbound peer deltas.
+    ///
+    /// Only a task list bound to a named group has one. While the gate reports
+    /// the group quarantined, inbound deltas are held in arrival order and the
+    /// CRDT is left byte-identical; they apply once the marker is gone. Returns
+    /// `false` when a gate was already installed (the existing one is kept).
+    pub fn install_ingest_gate(&self, gate: std::sync::Arc<dyn crdt::TaskIngestGate>) -> bool {
+        self.sync.ingest_gate().install(gate)
+    }
+
+    /// ADR-0068 D2: apply the deltas buffered under fork quarantine, in arrival
+    /// order. Returns how many applied.
+    ///
+    /// The listener drains on its own once it observes the marker gone; this is
+    /// the explicit entry point for the clear route and for deterministic tests.
+    pub async fn resume_quarantined_ingest(&self) -> usize {
+        self.sync.resume_quarantined_ingest().await
+    }
+
+    /// ADR-0068 D2: how many inbound deltas are held because this list's group
+    /// is fork-quarantined.
+    #[must_use]
+    pub fn quarantined_buffer_len(&self) -> usize {
+        self.sync.quarantined_buffer_len()
+    }
+
     /// Test-only: override the per-replica epoch so a pre-restart fence token
     /// can be simulated in-process without a real daemon restart.
     ///

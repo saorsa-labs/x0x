@@ -281,7 +281,7 @@ pub(in crate::server) async fn markers_for_scopes<'a>(
 /// the stable id is what `GET /history/scopes` and the rows themselves
 /// carry, and printing only one of the two would send the operator to a
 /// scope string that returns nothing.
-async fn all_quarantine_markers(state: &AppState) -> Vec<ScopeMarker> {
+pub(in crate::server) async fn all_quarantine_markers(state: &AppState) -> Vec<ScopeMarker> {
     let groups = state.named_groups.read().await;
     let mut markers: Vec<ScopeMarker> = Vec::new();
     for (key, info) in groups.iter() {
@@ -297,6 +297,55 @@ async fn all_quarantine_markers(state: &AppState) -> Vec<ScopeMarker> {
     markers.sort_by(|(a, _), (b, _)| a.cmp(b));
     markers.dedup_by(|(a, _), (b, _)| a == b);
     markers
+}
+
+/// ADR-0068 D1: the retention reaper's fork-quarantine pin source.
+///
+/// WHY it holds a `Weak` and not an `Arc`. `AppState` owns the `Agent`, which
+/// owns the `HistoryService` whose reaper reads this. An `Arc<AppState>` here
+/// would close that cycle and defeat #661's deterministic drop of the Agent's
+/// exclusive SQLite connection before `instance.lock` is released. An expired
+/// `Weak` means the daemon is shutting down: pin nothing, which is safe because
+/// the reaper is being aborted in the same breath.
+///
+/// WHY it reuses [`all_quarantine_markers`] rather than growing its own
+/// lookup: that function is already the node-wide marker enumeration, already
+/// lists BOTH spellings of an alias-keyed group (map key and
+/// `stable_group_id()`), and takes the `named_groups` read lock exactly once —
+/// which is precisely the reaper's contract (one resolver read per pass,
+/// O(scopes), never O(rows × groups)).
+pub(in crate::server) struct ReaperQuarantinePins {
+    state: std::sync::Weak<AppState>,
+}
+
+impl ReaperQuarantinePins {
+    /// Install this source on the agent's history handle, if history is on.
+    /// Idempotent: a second install is refused by the slot and reported.
+    pub(in crate::server) fn install(state: &Arc<AppState>) -> bool {
+        let Some(history) = state.agent.history() else {
+            return false;
+        };
+        history.install_quarantine_pins(std::sync::Arc::new(Self {
+            state: Arc::downgrade(state),
+        }))
+    }
+}
+
+impl x0x::history::QuarantinePins for ReaperQuarantinePins {
+    fn pinned_scopes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + '_>> {
+        Box::pin(async move {
+            let Some(state) = self.state.upgrade() else {
+                return Vec::new(); // shutting down — pin nothing
+            };
+            all_quarantine_markers(&state)
+                .await
+                .into_iter()
+                .map(|(scope, _)| scope)
+                .collect()
+        })
+    }
 }
 
 /// Recover the rendering identity and ADR-0029 ancestry from the verified
@@ -792,6 +841,15 @@ pub(in crate::server) async fn history_diagnostics(
                 "write_errors": c.write_errors.load(Ordering::Relaxed),
                 "abandoned_at_shutdown": c.abandoned_at_shutdown.load(Ordering::Relaxed),
                 "reaper_evicted_total": c.reaper_evicted_total.load(Ordering::Relaxed),
+                // ADR-0068 D1: the pin's two operator-visible numbers.
+                // `history_quarantine_pinned_scopes` is the `G` in the disk
+                // bound `max_bytes * (1 + G/16)`; a non-zero
+                // `history_quarantine_pinned_evictions` says a pinned group is
+                // at its own ceiling and shedding its oldest rows.
+                "history_quarantine_pinned_scopes":
+                    c.quarantine_pinned_scopes.load(Ordering::Relaxed),
+                "history_quarantine_pinned_evictions":
+                    c.quarantine_pinned_evictions.load(Ordering::Relaxed),
             }),
             // ADR-0066 §3a (row 26): the writer/reaper counters are
             // node-wide, so the annotation names every group this node has

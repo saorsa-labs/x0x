@@ -349,6 +349,115 @@ const COVERAGE_MAP: &[CoverageRow] = &[
     },
 ];
 
+/// ADR-0068's two surfaces, held to the same standard as the §1 map above —
+/// and kept in their OWN array because ADR-0066 is Accepted and frozen: its 26
+/// rows, its per-disposition counts and its empty `OPEN_ROWS` must not move
+/// because a later ADR found more paths.
+///
+/// WHY they need holding at all: both were found by cross-model review
+/// OUTSIDE the §1 census, which is the failure mode this whole file exists to
+/// make loud. An enumeration that cannot grow safely rots the same way one
+/// that is never checked does — so ADR-0068's rows are numbered from 27,
+/// asserted exactly, and anchored to files that must actually consult the
+/// mechanism they claim.
+const ADR0068_ROWS: &[CoverageRow] = &[
+    CoverageRow {
+        row: 27,
+        path: "ADR-0068 D1 — history retention reaper (ADR-0023 §6 eviction)",
+        anchor: "src/history/store.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
+        closed: true,
+    },
+    CoverageRow {
+        row: 28,
+        path: "ADR-0068 D2 — inbound peer task-CRDT delta apply",
+        anchor: "src/crdt/sync.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
+        closed: true,
+    },
+];
+
+/// The ADR-0068 extension rows are exact, closed, and anchored to code that
+/// really implements them.
+///
+/// The anchors cannot be checked with the §1 clause below (which greps for
+/// `is_fork_quarantined`/`reject_fork_quarantined`): neither mechanism refuses
+/// anything, and neither lives in the daemon — D1 is a pin the reaper applies
+/// through the store and D2 is a hold in the CRDT listener, both fed by the
+/// daemon's one resolver. So each row names the symbol that carries its
+/// behaviour, and a rename or deletion fails here.
+#[test]
+fn adr0068_extension_rows_are_exact_and_anchored() {
+    assert_eq!(
+        ADR0068_ROWS.len(),
+        2,
+        "ADR-0068 adds exactly two surfaces: D1 (reaper pin) and D2 (task delta hold)"
+    );
+    for (index, row) in ADR0068_ROWS.iter().enumerate() {
+        assert_eq!(
+            row.row as usize,
+            index + 27,
+            "ADR-0068's rows continue the §1 numbering without renumbering it"
+        );
+        assert!(row.closed, "row {} shipped in the ADR's own PR", row.row);
+        assert!(
+            row.closed_by_slice.is_none(),
+            "ADR-0068 ships in one PR, not in slices"
+        );
+    }
+    // ADR-0066's map is untouched by this extension — asserted here as well as
+    // in its own test, because THIS is the file a later ADR would be tempted to
+    // edit rather than extend.
+    assert_eq!(
+        COVERAGE_MAP.len(),
+        26,
+        "ADR-0066 §1 stays at 26 rows: ADR-0068 extends it, it does not edit it"
+    );
+
+    let pin = read_anchor(ADR0068_ROWS[0].anchor);
+    assert!(
+        pin.contains("retain_with_pins") && pin.contains("PinnedScopes"),
+        "row 27's anchor must carry the pinned-retention mechanism"
+    );
+    assert!(
+        pin.contains("evict_pinned_scope_to_ceiling") && pin.contains("pinned_ceiling"),
+        "row 27 promises a per-group CEILING, not an unbounded pin (option B, refused)"
+    );
+    let hold = read_anchor(ADR0068_ROWS[1].anchor);
+    assert!(
+        hold.contains("admit_or_buffer") && hold.contains("drain_quarantine_buffer"),
+        "row 28's anchor must both hold and replay inbound deltas"
+    );
+    assert!(
+        hold.contains("TASK_QUARANTINE_BUFFER_MAX_DELTAS")
+            && hold.contains("TASK_QUARANTINE_BUFFER_MAX_BYTES"),
+        "row 28 promises a BOUNDED hold, not an unbounded queue"
+    );
+    // The daemon side: both mechanisms must be fed through the ONE resolver,
+    // never a bare map read. This is the clause that fails if a later change
+    // re-grows a single-spelling lookup for either of them.
+    let reaper_source = read_anchor("src/server/routes/history.rs");
+    assert!(
+        reaper_source.contains("ReaperQuarantinePins")
+            && reaper_source.contains("all_quarantine_markers"),
+        "D1's pin source must be the node-wide both-spellings marker enumeration"
+    );
+    let gate_source = read_anchor("src/server/routes/tasks.rs");
+    assert!(
+        gate_source.contains("TaskQuarantineIngestGate")
+            && gate_source.contains("install_task_ingest_gate"),
+        "D2's gate must be installed from the task-list authorization choke point"
+    );
+    assert!(
+        gate_source.contains("delegations::fork_quarantine_marker"),
+        "D2's gate must resolve through the one resolver, so an alias-keyed group is gated"
+    );
+}
+
 /// How one registry endpoint relates to the §1 map.
 ///
 /// Every class here is a DECISION somebody made and can be argued with in

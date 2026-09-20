@@ -32461,6 +32461,8 @@ pub(in crate::server) mod tests {
     mod adr0066_send_path;
     mod adr0066_tasks;
     mod adr0066_treekem_gates;
+    mod adr0068_quarantine_pin;
+    mod adr0068_task_buffer;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod hs_f2_membership_cluster;

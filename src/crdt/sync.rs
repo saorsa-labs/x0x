@@ -225,6 +225,307 @@ pub struct TaskListSync {
     /// string (round-4 review: flag-only teardown left ghost listeners and a
     /// live responder until daemon shutdown).
     cancel: tokio_util::sync::CancellationToken,
+
+    /// ADR-0068 D2: set-once inbound-delta admission gate, installed by the
+    /// daemon for a task list bound to a named group. Shared with the listener
+    /// loop, which is already running by the time the daemon installs it.
+    ingest_gate: Arc<TaskIngestGateSlot>,
+
+    /// ADR-0068 D2: deltas received while the gate reported the group
+    /// quarantined, held in arrival order until the marker clears.
+    quarantine_buffer: Arc<std::sync::Mutex<QuarantineDeltaBuffer>>,
+}
+
+/// ADR-0068 D2: maximum inbound deltas one task list buffers while its group
+/// is fork-quarantined. Oldest is dropped on overflow.
+pub const TASK_QUARANTINE_BUFFER_MAX_DELTAS: usize = 1024;
+
+/// ADR-0068 D2: maximum buffered delta bytes per task list (1 MiB). Whichever
+/// of this and [`TASK_QUARANTINE_BUFFER_MAX_DELTAS`] is reached first drops
+/// the oldest buffered delta.
+pub const TASK_QUARANTINE_BUFFER_MAX_BYTES: usize = 1_048_576;
+
+/// ADR-0068 D2: how often a listener holding buffered deltas re-checks whether
+/// the marker has gone.
+///
+/// The drain is driven by OBSERVING the marker's absence rather than by hooking
+/// each site that can clear it — `fork_quarantine` is cleared at the manual
+/// route, on the metadata-apply path, at an explicit owner seal and on rollback
+/// arms, and an enumeration of clear writers whose failure mode is "one clear
+/// forgot to drain" is the fail-open census ADR-0067 rejected. This poll arm is
+/// armed ONLY while the buffer is non-empty, so a healthy list adds no timer.
+pub const TASK_QUARANTINE_DRAIN_POLL_SECS: u64 = 5;
+
+/// ADR-0068 D2: whether inbound task-CRDT deltas may be applied right now.
+///
+/// The CRDT layer knows nothing about fork quarantine, so the daemon installs
+/// this for a group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) and
+/// resolves the marker through the one resolver, under both spellings. A list
+/// with no gate — any list not bound to a named group — behaves exactly as it
+/// did before ADR-0068.
+pub trait TaskIngestGate: Send + Sync + 'static {
+    /// Is application suspended (a live fork-quarantine marker)? Consulted
+    /// once per inbound delta and once per drain attempt.
+    fn suspended(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>;
+
+    /// A delta was buffered instead of applied; `depth`/`bytes` are the
+    /// buffer's state after the push.
+    fn on_buffered(&self, depth: usize, bytes: usize);
+
+    /// `count` buffered deltas were dropped to make room (oldest first).
+    fn on_dropped(&self, count: u64);
+
+    /// `count` buffered deltas were applied after the marker cleared.
+    fn on_applied(&self, count: u64);
+}
+
+/// Set-once slot for the [`TaskIngestGate`].
+///
+/// Set-once because the daemon installs exactly one gate per handle, and it
+/// does so AFTER `start_with_spawner` has already spawned the listener — so the
+/// listener reads the gate through this slot on every delta rather than
+/// capturing it once.
+#[derive(Default)]
+pub struct TaskIngestGateSlot(std::sync::OnceLock<Arc<dyn TaskIngestGate>>);
+
+impl std::fmt::Debug for TaskIngestGateSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskIngestGateSlot")
+            .field("installed", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+impl TaskIngestGateSlot {
+    /// Install the gate. `false` when one was already installed (kept).
+    pub fn install(&self, gate: Arc<dyn TaskIngestGate>) -> bool {
+        self.0.set(gate).is_ok()
+    }
+
+    /// The installed gate, if any.
+    #[must_use]
+    pub fn gate(&self) -> Option<&Arc<dyn TaskIngestGate>> {
+        self.0.get()
+    }
+}
+
+/// One inbound delta held while the group is quarantined, with everything the
+/// merge needs so the replay is the SAME call the listener would have made.
+#[derive(Debug, Clone)]
+struct BufferedDelta {
+    /// OR-Set tag identity from the payload (issue #349 I3).
+    peer_id: PeerId,
+    /// The delta itself.
+    delta: TaskListDelta,
+    /// The V2-envelope-verified sender — the writer identity content policy
+    /// admits on. `None` for an unverified sender, exactly as the live path
+    /// passes it.
+    writer: Option<crate::identity::AgentId>,
+    /// Encoded size, for the byte bound.
+    bytes: usize,
+}
+
+/// ADR-0068 D2: bounded, arrival-ordered hold for one task list's inbound
+/// deltas while its group is fork-quarantined.
+///
+/// Process-local and never persisted: a restart loses it and the CRDT
+/// re-converges by anti-entropy, exactly as it does for any delta the node was
+/// offline for.
+/// Visibility: `pub` only because the `cfg(test)` `testing` surface names it;
+/// its fields and constructors stay private to this module.
+#[derive(Debug, Default)]
+pub struct QuarantineDeltaBuffer {
+    entries: std::collections::VecDeque<BufferedDelta>,
+    bytes: usize,
+}
+
+impl QuarantineDeltaBuffer {
+    /// Append a delta, dropping the OLDEST entries until both bounds hold.
+    /// Returns how many were dropped.
+    ///
+    /// Oldest-first because the newest deltas carry the most recent state, and
+    /// anything dropped is recoverable: merges are idempotent and the
+    /// state-sync side channel re-serves full state after the clear.
+    fn push(&mut self, entry: BufferedDelta) -> u64 {
+        let mut dropped = 0u64;
+        self.bytes = self.bytes.saturating_add(entry.bytes);
+        self.entries.push_back(entry);
+        while self.entries.len() > TASK_QUARANTINE_BUFFER_MAX_DELTAS
+            || (self.bytes > TASK_QUARANTINE_BUFFER_MAX_BYTES && self.entries.len() > 1)
+        {
+            match self.entries.pop_front() {
+                Some(old) => {
+                    self.bytes = self.bytes.saturating_sub(old.bytes);
+                    dropped += 1;
+                }
+                None => break,
+            }
+        }
+        dropped
+    }
+
+    /// Take everything, in arrival order.
+    fn take(&mut self) -> Vec<BufferedDelta> {
+        self.bytes = 0;
+        self.entries.drain(..).collect()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Lock the quarantine buffer, recovering a poisoned mutex.
+///
+/// Poison recovery rather than propagation: the buffer is a hold for deltas the
+/// node has decided not to apply, so a panic while it was locked must not wedge
+/// replication for the rest of the process's life.
+fn lock_buffer(
+    buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
+) -> std::sync::MutexGuard<'_, QuarantineDeltaBuffer> {
+    buffer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// ADR-0068 D2: the admission step — apply this delta now, or hold it?
+///
+/// Deliberately does NOT perform the merge. The listener's merge shares one
+/// write-lock critical section with the issue-#240 digest-verified full-replace
+/// adopt, and splitting that would open a window in which an interleaved merge
+/// could be pruned. So this decides, and the caller keeps its critical section
+/// exactly as it was.
+///
+/// Hot path when no marker is live: one gate read (a resolver read behind the
+/// daemon's implementation) and a scalar compare.
+pub(crate) async fn admit_or_buffer(
+    gate: Option<&Arc<dyn TaskIngestGate>>,
+    buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
+    peer_id: PeerId,
+    delta: TaskListDelta,
+    writer: Option<&crate::identity::AgentId>,
+    encoded_bytes: usize,
+) -> Option<TaskListDelta> {
+    let Some(gate) = gate else {
+        return Some(delta); // no group binding — pre-ADR-0068 behaviour
+    };
+    if !gate.suspended().await {
+        return Some(delta);
+    }
+    let (depth, bytes, dropped) = {
+        let mut held = lock_buffer(buffer);
+        let dropped = held.push(BufferedDelta {
+            peer_id,
+            delta,
+            writer: writer.copied(),
+            bytes: encoded_bytes,
+        });
+        (held.len(), held.bytes(), dropped)
+    };
+    gate.on_buffered(depth, bytes);
+    if dropped > 0 {
+        gate.on_dropped(dropped);
+        tracing::warn!(
+            dropped,
+            depth,
+            bytes,
+            "[tasks] fork-quarantine delta buffer full — dropped oldest \
+             (ADR-0068 D2; anti-entropy refills after the clear)"
+        );
+    }
+    None
+}
+
+/// ADR-0068 D2: apply every buffered delta, in arrival order, once the marker
+/// is gone. Returns how many were applied.
+///
+/// Arrival order matters even though CRDT merges are idempotent: the LWW
+/// registers are order-sensitive, so a replay out of order could pick a
+/// different winner than the live path would have.
+///
+/// Takes the buffer's contents BEFORE merging, so a concurrent inbound delta
+/// that arrives mid-drain queues behind this batch rather than interleaving
+/// with it.
+pub(crate) async fn drain_quarantine_buffer(
+    gate: Option<&Arc<dyn TaskIngestGate>>,
+    buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
+    task_list: &RwLock<TaskList>,
+) -> usize {
+    let pending = lock_buffer(buffer).take();
+    if pending.is_empty() {
+        return 0;
+    }
+    let mut applied = 0usize;
+    {
+        let mut list = task_list.write().await;
+        for entry in pending {
+            match list.merge_delta(&entry.delta, entry.peer_id, entry.writer.as_ref()) {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    tracing::warn!("failed to merge task delta buffered under fork quarantine: {e}")
+                }
+            }
+        }
+    }
+    if let Some(gate) = gate {
+        gate.on_applied(applied as u64);
+    }
+    if applied > 0 {
+        tracing::info!(
+            applied,
+            "[tasks] applied task deltas buffered under fork quarantine (ADR-0068 D2)"
+        );
+    }
+    applied
+}
+
+/// ADR-0068 D2: the admission step, the drain and the buffer type, exposed for
+/// in-process fixtures.
+///
+/// WHY a testing surface rather than tests in this module: the fixtures live
+/// beside the other ADR-0066/0068 quarantine fixtures, where a reviewer reads
+/// them as one family, and they drive the EXACT functions the listener calls —
+/// so a fixture cannot pass against a copy of the logic. `cfg(test)` only, so
+/// none of this is public API.
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+
+    /// The per-list hold. Per-instance, never a `static`: a global would couple
+    /// concurrently running tests, which is the flake class the `fork_quarantine`
+    /// fault-injection refactor removed.
+    pub type Buffer = std::sync::Mutex<QuarantineDeltaBuffer>;
+
+    /// [`super::admit_or_buffer`], verbatim.
+    pub async fn admit_or_buffer(
+        gate: Option<&Arc<dyn TaskIngestGate>>,
+        buffer: &Buffer,
+        peer_id: PeerId,
+        delta: TaskListDelta,
+        writer: Option<&crate::identity::AgentId>,
+        encoded_bytes: usize,
+    ) -> Option<TaskListDelta> {
+        super::admit_or_buffer(gate, buffer, peer_id, delta, writer, encoded_bytes).await
+    }
+
+    /// [`super::drain_quarantine_buffer`], verbatim.
+    pub async fn drain(
+        gate: Option<&Arc<dyn TaskIngestGate>>,
+        buffer: &Buffer,
+        task_list: &RwLock<TaskList>,
+    ) -> usize {
+        super::drain_quarantine_buffer(gate, buffer, task_list).await
+    }
+
+    /// How many deltas are held.
+    #[must_use]
+    pub fn len(buffer: &Buffer) -> usize {
+        lock_buffer(buffer).len()
+    }
 }
 
 /// Structural teardown (parallel-review finding): the background loops hold
@@ -338,7 +639,46 @@ impl TaskListSync {
             persist: std::sync::Mutex::new(None),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: tokio_util::sync::CancellationToken::new(),
+            ingest_gate: Arc::new(TaskIngestGateSlot::default()),
+            quarantine_buffer: Arc::new(std::sync::Mutex::new(QuarantineDeltaBuffer::default())),
         })
+    }
+
+    /// ADR-0068 D2: the inbound-delta gate slot, for the daemon to install a
+    /// fork-quarantine gate on a group-scoped list after `start`.
+    #[must_use]
+    pub fn ingest_gate(&self) -> &Arc<TaskIngestGateSlot> {
+        &self.ingest_gate
+    }
+
+    /// ADR-0068 D2: apply the deltas buffered under fork quarantine, in
+    /// arrival order, and persist once. Returns how many were applied.
+    ///
+    /// The listener also drains on its own once it observes the marker gone;
+    /// this is the explicit entry point for the clear route and for
+    /// deterministic tests, so neither has to wait for a poll.
+    pub async fn resume_quarantined_ingest(&self) -> usize {
+        let applied = drain_quarantine_buffer(
+            self.ingest_gate.gate(),
+            &self.quarantine_buffer,
+            &self.task_list,
+        )
+        .await;
+        if applied > 0 {
+            if let Some(ctx) = &self.persist_ctx() {
+                if let Err(e) = persist_snapshot(&self.task_list, ctx).await {
+                    tracing::warn!("failed to persist drained fork-quarantine task deltas: {e}");
+                }
+            }
+        }
+        applied
+    }
+
+    /// ADR-0068 D2: how many inbound deltas are currently held because the
+    /// group is fork-quarantined.
+    #[must_use]
+    pub fn quarantined_buffer_len(&self) -> usize {
+        lock_buffer(&self.quarantine_buffer).len()
     }
 
     /// The state-sync side topic for this task list.
@@ -405,14 +745,53 @@ impl TaskListSync {
         // Best-effort by design — a failing disk must never wedge
         // replication (the degraded flag refuses LOCAL mutations instead).
         let listener_persist = self.persist_ctx();
+        // ADR-0068 D2: read through the slot on every delta — the daemon
+        // installs the gate after this loop is already running.
+        let listener_gate = Arc::clone(&self.ingest_gate);
+        let listener_buffer = Arc::clone(&self.quarantine_buffer);
 
         spawn(Box::pin(async move {
             loop {
+                // ADR-0068 D2: the drain poll is armed ONLY while deltas are
+                // held, so a list that was never quarantined adds no timer.
+                let buffered = lock_buffer(&listener_buffer).len() > 0;
                 let msg = tokio::select! {
                     // cancel_sync tears down every loop (round-4 review) —
                     // recv alone would keep this listener alive until
                     // daemon shutdown.
                     () = listener_cancel.cancelled() => return,
+                    () = async {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            TASK_QUARANTINE_DRAIN_POLL_SECS,
+                        ))
+                        .await;
+                    }, if buffered => {
+                        // Observed rather than hooked at each clear site: see
+                        // TASK_QUARANTINE_DRAIN_POLL_SECS for why.
+                        let suspended = match listener_gate.gate() {
+                            Some(gate) => gate.suspended().await,
+                            None => false,
+                        };
+                        if !suspended {
+                            let applied = drain_quarantine_buffer(
+                                listener_gate.gate(),
+                                &listener_buffer,
+                                &task_list,
+                            )
+                            .await;
+                            if applied > 0 {
+                                if let Some(ctx) = &listener_persist {
+                                    if let Err(e) = persist_snapshot(&task_list, ctx).await {
+                                        tracing::warn!(
+                                            "failed to persist drained fork-quarantine task \
+                                             deltas: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     msg = sub.recv() => msg,
                 };
                 let Some(msg) = msg else {
@@ -427,6 +806,24 @@ impl TaskListSync {
                 };
                 match decode_delta::<TaskListDelta>(&msg.payload) {
                     Ok((peer_id, delta)) => {
+                        // ADR-0068 D2: while this list's group holds a live
+                        // fork-quarantine marker, the delta is HELD in arrival
+                        // order and the list is left byte-identical — the
+                        // remote mirror of row 20's local refusals, so a peer
+                        // seated by the disputed roster cannot move the CRDT
+                        // winner during the incident.
+                        let Some(delta) = admit_or_buffer(
+                            listener_gate.gate(),
+                            &listener_buffer,
+                            peer_id,
+                            delta,
+                            msg.sender.as_ref(),
+                            msg.payload.len(),
+                        )
+                        .await
+                        else {
+                            continue;
+                        };
                         let mut merged_ok = false;
                         {
                             let mut list = task_list.write().await;

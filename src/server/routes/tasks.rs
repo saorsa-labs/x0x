@@ -240,6 +240,91 @@ pub(in crate::server) async fn apply_group_authorization(
         }
     }
     handle.set_authorized_agents(agents).await;
+    install_task_ingest_gate(state, &scoped.group_id, handle);
+}
+
+/// ADR-0068 D2: the inbound-delta admission gate for a group-scoped task list.
+///
+/// WHY a `Weak<AppState>`: the gate is installed on a `TaskListHandle` the
+/// `AppState` owns (`state.task_lists`), so an `Arc` here would be a cycle and
+/// would keep the daemon's state alive for the life of the CRDT sync. An
+/// expired `Weak` means the daemon is gone, and a gate with no state suspends
+/// nothing — the sync loops are being torn down in the same breath.
+///
+/// WHY it resolves through
+/// [`crate::server::delegations::fork_quarantine_marker`]: the `named_groups`
+/// map is keyed by whichever alias this node learned the group under, while a
+/// task-list id carries the spelling its creator used. That wrapper is the one
+/// resolver, so an alias-keyed group is gated rather than silently ungated —
+/// the same defect review found three times in slices 3, 4 and 6.
+struct TaskQuarantineIngestGate {
+    state: std::sync::Weak<AppState>,
+    /// The group this list is bound to, as spelled in the list id. The
+    /// resolver accepts either spelling.
+    group_id: String,
+}
+
+impl x0x::crdt::TaskIngestGate for TaskQuarantineIngestGate {
+    fn suspended(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            let Some(state) = self.state.upgrade() else {
+                return false; // daemon gone — nothing left to contain
+            };
+            crate::server::delegations::fork_quarantine_marker(&state, &self.group_id)
+                .await
+                .is_some()
+        })
+    }
+
+    fn on_buffered(&self, depth: usize, bytes: usize) {
+        if let Some(state) = self.state.upgrade() {
+            state
+                .groups_diagnostics
+                .record_task_delta_quarantine_buffered(&self.group_id);
+            tracing::debug!(
+                group_id = %self.group_id,
+                depth,
+                bytes,
+                "[tasks] inbound task delta held under fork quarantine (ADR-0068 D2)"
+            );
+        }
+    }
+
+    fn on_dropped(&self, count: u64) {
+        if let Some(state) = self.state.upgrade() {
+            state
+                .groups_diagnostics
+                .record_task_deltas_quarantine_dropped(&self.group_id, count);
+        }
+    }
+
+    fn on_applied(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Some(state) = self.state.upgrade() {
+            state
+                .groups_diagnostics
+                .record_task_deltas_quarantine_applied(&self.group_id, count);
+        }
+    }
+}
+
+/// Install the ADR-0068 D2 gate on a group-scoped task list, if it has none.
+///
+/// Called from [`apply_group_authorization`] — the one choke point every path
+/// that produces a live handle already runs (create, join, and subscription
+/// rehydration), which is what keeps the gate from being missed on one of them.
+/// A list with no group binding never reaches here and is unaffected.
+pub(in crate::server) fn install_task_ingest_gate(
+    state: &Arc<AppState>,
+    group_id: &str,
+    handle: &x0x::TaskListHandle,
+) {
+    handle.install_ingest_gate(std::sync::Arc::new(TaskQuarantineIngestGate {
+        state: Arc::downgrade(state),
+        group_id: group_id.to_string(),
+    }));
 }
 
 // ---------------------------------------------------------------------------

@@ -50,7 +50,10 @@ pub use provenance::{
     canonical_op_bytes, purge_unattested_elements, sign_attestation, verify_attestation,
     OpAttestation, OpKind, CLAIM_DOMAIN, COMPLETE_DOMAIN,
 };
-pub use sync::TaskListSync;
+pub use sync::{
+    TaskIngestGate, TaskIngestGateSlot, TaskListSync, TASK_QUARANTINE_BUFFER_MAX_BYTES,
+    TASK_QUARANTINE_BUFFER_MAX_DELTAS, TASK_QUARANTINE_DRAIN_POLL_SECS,
+};
 pub use task::{TaskId, TaskMetadata};
 pub use task_item::{forge_unattested_delta_bytes, TaskItem};
 pub use task_list::{TaskList, TaskListId};
