@@ -217,3 +217,45 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
+
+# ============================================================================
+# TEMP — THROWAWAY A/B BRANCH ONLY. DO NOT MERGE. DO NOT COPY TO #736.
+#
+# Points every saorsa-gossip-* crate at saorsa-gossip main
+# rev 5da7906e77aae86bc26791375b30f3c554033e9f, which carries the two fixes
+# for the DM-pair regression the interleaved testnet A/B found on
+# #736 + sg 0.5.83 (25/240 failed pairs vs 10/240 on main + 0.5.82):
+#
+#   #84 8ea1cfd — fair recovery-intent admission with displacement
+#                 (IntentLimit starvation)
+#   #85 5da7906 — zero disabled-limiter dispatch overhead + bounded
+#                 late-offer catch-up + per-peer IWANT backoff
+#
+# sg main's workspace version is still 0.5.83, so this patch satisfies the
+# `=0.5.83` exact pins above. The x0x Build workflow resolves from crates.io
+# with no committed Cargo.lock and uses no `.deps/` symlinks, so a git patch
+# resolves there unaided.
+#
+# This branch exists ONLY to produce the CI-built `x0x-linux-x64-gnu`
+# artifact for a comparable A/B run — local macOS zigbuild binaries are a
+# proven confound. Close this PR after the A/B; sg 0.5.84 will replace it
+# with a published pin bump.
+#
+# Expected collateral: the #501 meter-premise check pins a crates.io
+# checksum for saorsa-gossip-pubsub, which a git source cannot produce, so
+# that gate will report PRODUCER_PIN_MISMATCH / INCONCLUSIVE here. Accepted
+# for this throwaway — only the Build job for x86_64-unknown-linux-gnu needs
+# to go green.
+# ============================================================================
+[patch.crates-io]
+saorsa-gossip-coordinator = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-crdt-sync = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-groups = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-identity = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-membership = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-presence = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-rendezvous = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-runtime = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-transport = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
+saorsa-gossip-types = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "5da7906e77aae86bc26791375b30f3c554033e9f" }
