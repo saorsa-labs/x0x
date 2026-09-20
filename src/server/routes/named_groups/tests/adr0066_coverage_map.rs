@@ -242,7 +242,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         path: "WebSocket fan-out — Mention events and ADR-0023 backfill",
         anchor: "src/server/ws.rs",
         disposition: Disposition::Annotate,
-        closed_by_slice: Some(6),
+        closed_by_slice: None,
     },
     CoverageRow {
         row: 26,
@@ -251,6 +251,22 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
     },
+];
+
+/// Rows whose disposition is SHIPPED, so `closed_by_slice` is `None` and
+/// the anchor must now actually consult the marker.
+///
+/// WHY a list rather than a per-row boolean: it is one line per slice, so
+/// the slices landing in parallel (3, 4, 5, 6) each append their own rows
+/// here instead of rewriting 26 struct literals — and a row that claims to
+/// be shipped is held to the same "the file consults the marker" clause
+/// the `Gated` rows are, which is what stops a row being marked done by
+/// editing this list alone.
+const SHIPPED_ROWS: &[u8] = &[
+    // Slice 6 (ADR-0066 §3d): the WebSocket plane annotates `Mention`
+    // frames and ADR-0023 `Subscribe` backfill frames in
+    // `src/server/ws.rs`. Annotate-class: nothing is refused or dropped.
+    25,
 ];
 
 /// How one registry endpoint relates to the §1 map.
@@ -535,16 +551,35 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     for row in COVERAGE_MAP.iter() {
         let _ = read_anchor(row.anchor);
     }
-    // Slice 2 ships no new refusal. Every row still open names the slice
-    // that closes it, so "not done yet" is never indistinguishable from
-    // "forgotten".
+    // Every row still open names the slice that closes it, so "not done
+    // yet" is never indistinguishable from "forgotten"; a row listed in
+    // SHIPPED_ROWS has closed it and must consult the marker for real.
     for row in COVERAGE_MAP.iter() {
+        let shipped = SHIPPED_ROWS.contains(&row.row);
         match row.disposition {
-            Disposition::Gated | Disposition::KeepUngated | Disposition::OutOfScope => assert!(
-                row.closed_by_slice.is_none(),
-                "row {} needs no further slice",
-                row.row
-            ),
+            Disposition::Gated | Disposition::KeepUngated | Disposition::OutOfScope => {
+                assert!(
+                    row.closed_by_slice.is_none() && !shipped,
+                    "row {} needs no further slice and is not a shipped behaviour change",
+                    row.row
+                );
+            }
+            _ if shipped => {
+                assert!(
+                    row.closed_by_slice.is_none(),
+                    "row {} is shipped, so it no longer names a slice that will close it",
+                    row.row
+                );
+                let source = read_anchor(row.anchor);
+                assert!(
+                    source.contains("is_fork_quarantined")
+                        || source.contains("reject_fork_quarantined")
+                        || source.contains("fork_quarantine"),
+                    "§1 row {} claims its disposition shipped, but {} consults no marker",
+                    row.row,
+                    row.anchor
+                );
+            }
             _ => assert!(
                 row.closed_by_slice.is_some(),
                 "row {} changes behaviour, so it must name the slice that closes it",

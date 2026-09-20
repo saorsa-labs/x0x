@@ -75,12 +75,39 @@ group-keyed data until an owner-anchored path (§4) advances the chain past
 the evidenced revision. It is containment, not a verdict: ADR-0064
 deliberately has NO automated eviction, and the membership-event ingest path
 is NOT gated (the owner-anchored clearing commit must still be able to
-arrive). History, delegations, tasks, the bootstrap outbox and the WS plane
-are not yet gated or annotated: ADR-0066 §1 enumerates all 26 data-plane paths
-with a disposition each, and slices 3–6 land them.
+arrive). History, delegations, tasks and the bootstrap outbox are not yet
+gated or annotated: ADR-0066 §1 enumerates all 26 data-plane paths with a
+disposition each, and slices 3–5 land them.
 
 Group membership reads, `/groups/:id/state`, and the diagnostics surfaces
 keep working while quarantined.
+
+### The WS plane is annotated, never cut (§3d, slice 6)
+
+A WebSocket subscriber watching a quarantined group keeps receiving
+everything it received before — the stream is deliberately NOT refused,
+because an operator watching a live incident must not lose the feed at the
+moment it matters. Two frame classes carry a label instead:
+
+- ADR-0040 `mention` frames (a validated group message or a delegation grant
+  naming the local agent) on the group's topic channel;
+- ADR-0023 `Subscribe` backfill frames replayed for a group topic, including
+  the `live` boundary frame that closes the backfill.
+
+Each carries `"fork_quarantined": true` plus a `fork_quarantine` object with
+`clear_with` and a one-entry `scopes` array (`scope`, `revision`,
+`observed_at_ms`, `no_anchor`) — the same shape the REST envelopes use, so
+one parser serves both. Both keys are **absent entirely** when the group is
+not quarantined, so unaffected groups and all non-group topics are
+byte-identical to before.
+
+A label on a `delegation` mention says what was OBSERVED, not what was
+authorized: the grant itself is refused independently (§3b).
+
+The marker is resolved when each frame is emitted, so a session that
+subscribed before the marker was installed starts seeing the label on its
+next frame, and stops on the next frame after the manual clear — no
+reconnect needed either way.
 
 ## 2) Reading the marker
 

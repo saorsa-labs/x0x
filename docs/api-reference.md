@@ -2003,6 +2003,43 @@ Server → client (complete outbound frame set):
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
 
+**Fork-quarantine annotation (ADR-0066 §3d).** When a group is
+fork-quarantined on this node, its group-scoped frames are **labelled, never
+refused and never dropped** — the WS plane is the live mirror of the
+annotated history reads, and an operator watching an incident must not lose
+the stream. Two frame classes carry the label:
+
+- `mention` frames on the group's topic channel;
+- ADR-0023 `subscribe` **backfill** frames for a group topic — the replayed
+  `message` rows and the `live` boundary frame that closes the backfill.
+
+```json
+{"type":"live","topic":"x0x.groups.public.<GROUP_ID>",
+ "fork_quarantined":true,
+ "fork_quarantine":{"clear_with":"POST /groups/:id/quarantine/clear",
+   "scopes":[{"scope":"group:<GROUP_ID>","revision":9,
+              "observed_at_ms":1788091300000,"no_anchor":true}]}}
+```
+
+- Both keys are **absent entirely** (never `null`, never `false`) when the
+  group is not quarantined, so unaffected groups, all non-group topics and
+  the `/ws/direct` DM backfill are byte-identical to before.
+- The per-scope object is the same shape the 409 `fork_quarantined` body and
+  the annotated `/history` envelopes use, so one parser serves both planes.
+  `scopes` always holds exactly one entry here: a WS frame belongs to one
+  group. `no_anchor: true` means nothing will clear the marker
+  automatically — `clear_with` is the only exit.
+- The label rides the annotation rather than the `error` frame because
+  `error` carries only `message`, with nowhere to put a matchable code.
+- A labelled `reason: "delegation"` mention describes what was **observed**,
+  not what was authorized: the grant itself is refused independently.
+- The marker is read when each frame is emitted, so a session that
+  subscribed before the marker was set starts seeing the label on its next
+  frame and stops on the next frame after a manual clear — no reconnect.
+- Live gossip `message` frames (the raw topic plane, like the `publish`
+  verb) are not annotated; use `mention` frames or a `/history` read for
+  the labelled view.
+
 **Delivery semantics and back-pressure contract (issues #122 / #147 / #149 / #287).**
 Each WebSocket session has one bounded outbound queue (1024 frames) between
 the daemon's feeders and the socket writer; it is the daemon's only memory

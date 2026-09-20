@@ -6,6 +6,35 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **WebSocket group frames are annotated while a group is fork-quarantined
+  (ADR-0066 §3d, row 25, slice 6; #732) — labelled, never refused.** The WS
+  plane consulted the marker nowhere (`grep -c quarantin src/server/ws.rs` →
+  0), so a client watching a contested group saw its traffic exactly as it
+  saw uncontested traffic. It is the live mirror of the annotated history
+  reads and is therefore annotate-class: nothing is refused, no frame is
+  dropped and no subscription is cut — an operator watching a live incident
+  must not lose the stream at the moment it matters. Two frame classes now
+  carry `"fork_quarantined": true` plus a `fork_quarantine` object
+  (`clear_with` and a one-entry `scopes` array of `scope`, `revision`,
+  `observed_at_ms`, `no_anchor`): ADR-0040 `mention` frames on the group's
+  topic channel, and ADR-0023 `subscribe` backfill frames for a group topic,
+  including the `live` boundary frame that closes the backfill. The shape is
+  deliberately the one the 409 `fork_quarantined` body and the annotated
+  `/history` envelopes use, so a client parses one dialect; the machine code
+  rides the annotation because the WS `error` frame has only a `message`
+  field with nowhere to put it. **Both keys are absent entirely — never
+  `null`, never `false` — for an unquarantined group**, so unaffected
+  groups, every non-group topic and the `/ws/direct` DM backfill stay
+  byte-identical. The marker is read when each frame is emitted, not when
+  the subscription is created, so a session that subscribed before the
+  marker was installed starts annotating on its next frame and stops on the
+  next frame after a manual clear — no reconnect, and no per-subscription
+  cache to go stale. The per-frame live gossip forwarder takes no marker
+  lock at all: the lookup happens once per routed mention and once per
+  subscribed topic at backfill. A label on a `reason: "delegation"` mention
+  describes what was OBSERVED, not what was authorized — the grant itself is
+  refused independently (§3b).
+
 - **Ordinary (non-owner-axis) groups now receive the fork-quarantine marker
   (ADR-0066 §2, slice 2; #732) — a NEW availability failure mode with no
   automatic exit.** ADR-0064 set the marker only for owner-axis groups, so for
