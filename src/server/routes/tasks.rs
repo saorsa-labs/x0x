@@ -499,6 +499,25 @@ pub(in crate::server) async fn update_task(
         } else {
             x0x::delegation::DelegationVerb::Complete
         };
+        // ADR-0066 §3b row 17: this branch HONOURS a delegation, so it is
+        // an authority act on the group's roster and fails closed before
+        // the claim/complete mutation below. Scoped strictly to the
+        // delegation-cited branch — gating group task mutations generally
+        // is row 20 (§3c, slice 5) and is not this slice's business.
+        //
+        // §5 says row 17 refuses with the full body, so the refusal goes
+        // through the shared helper rather than the local `forbidden`
+        // mapping: the caller gets the 409, the `fork_quarantined` reason
+        // and the remedy, not a bare 403.
+        let quarantine =
+            crate::server::delegations::fork_quarantine_marker(&state, &scoped.group_id).await;
+        if let Some(marker) = &quarantine {
+            return crate::server::routes::named_groups::reject_fork_quarantined_marker(
+                &state,
+                &scoped.group_id,
+                marker,
+            );
+        }
         let committed =
             crate::server::delegations::committed_delegations(&state, &scoped.group_id).await;
         let sd = committed
@@ -517,12 +536,19 @@ pub(in crate::server) async fn update_task(
             &scoped.group_id,
             crate::server::now_millis_u64(),
             &committed,
+            // Proven `None` by the refusal above; passed rather than
+            // hard-coded so the predicate's gate stays wired here.
+            quarantine.as_ref(),
         ) {
             return forbidden(format!("delegation does not authorize this action: {why}"));
         }
         let active = crate::server::delegations::active_members_of(&state, &scoped.group_id).await;
-        if let Err(why) = crate::server::delegations::chain_members_active(sd, &committed, &active)
-        {
+        if let Err(why) = crate::server::delegations::chain_members_active(
+            sd,
+            &committed,
+            &active,
+            quarantine.as_ref(),
+        ) {
             return forbidden(format!("delegation chain no longer active: {why}"));
         }
         authorized_via = Some(hex::encode(sd.delegation.from_agent.as_bytes()));
