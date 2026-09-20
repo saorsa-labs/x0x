@@ -392,6 +392,19 @@ fn validate_public_group_bootstrap_obligation(
         || group.state_revision != obligation.state_revision
         || group.state_hash != obligation.state_hash
         || group.withdrawn
+        // ADR-0066 §3c row 21: a fork-quarantine marker must NEVER ride an
+        // outbound payload — `signed_public_bootstrap_snapshot` strips it
+        // because containment is strictly per-node state. This is the
+        // structural half of the row: it makes "the marker leaked into a
+        // stored obligation" a refusal to write and a refusal to start,
+        // rather than something a future refactor of the stripping list
+        // could quietly re-enable. The LIVE half — this daemon declining to
+        // publish a group it currently holds a marker for — cannot live
+        // here, because this validator sees only the payload's own snapshot
+        // and by construction that snapshot never carries the marker; it is
+        // enforced at the two sites that consult the live roster
+        // (`reconcile_public_group_bootstrap_outbox`, and the worker step).
+        || group.fork_quarantine.is_some()
         || group.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
         // A bootstrap snapshot retains exactly its head commit; the receiver's
         // validator refuses anything else, so storing it would be dead weight.
@@ -572,6 +585,92 @@ pub(in crate::server) async fn cancel_public_group_bootstrap_obligations_for_rem
 // Retry engine
 // ---------------------------------------------------------------------------
 
+/// Groups whose ADR-0066 row-21 publication refusal has already been
+/// recorded, keyed by `(stable group id, evidence revision)`. Process-local
+/// and advisory, exactly like slice 3's `LOGGED_INDEX_REFUSALS`
+/// (`src/server/delegations.rs`): losing it costs one extra log line and one
+/// extra counter increment, never a missed suppression — the suppression
+/// itself never consults this.
+///
+/// WHY dedupe at all here, when slice 3 deduped only its log line: this row
+/// is driven by a POLLING worker, so an undeduped record would emit one WARN
+/// and one `fork_quarantine_refusals` increment per poll for as long as the
+/// marker stands, which for a `no_anchor` marker is "until a human
+/// intervenes". That turns the fleet-health signal the ADR's Consequences
+/// ask operators to alert on into a counter that measures uptime. One record
+/// per (group, fork observation) is the honest unit: a NEW revision is a new
+/// fork observation and records again.
+static LOGGED_PUBLICATION_REFUSALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Is this the first publication refusal to record for this group at this
+/// evidence revision?
+///
+/// Fails OPEN to recording: a poisoned lock records rather than going quiet,
+/// because the failure mode of this cache is noise and the failure mode of
+/// silence is an unexplained suppression.
+fn first_publication_refusal_for(group_id: &str, revision: u64) -> bool {
+    let Ok(mut seen) = LOGGED_PUBLICATION_REFUSALS.lock() else {
+        return true;
+    };
+    if seen.len() >= 1024 {
+        seen.clear();
+    }
+    seen.insert((group_id.to_string(), revision))
+}
+
+/// ADR-0066 §3c row 21: must this group's signed-public bootstrap snapshot be
+/// withheld because the group is fork-quarantined on this node?
+///
+/// This is the highest-severity row in the §1 census after §2, because it is
+/// the one ungated path that EXPORTS contested state to other nodes: a
+/// bootstrap snapshot is a whole roster/state frontier installed verbatim by
+/// its recipient. A background worker publishing one while the local daemon
+/// holds authenticated fork evidence would propagate one branch of a
+/// contested chain to a peer that has no evidence of the fork at all, and it
+/// would do so with nobody watching.
+///
+/// The marker is resolved through
+/// [`crate::server::delegations::fork_quarantine_marker`], which tries BOTH
+/// the roster map key and the stable id. That matters concretely here rather
+/// than theoretically: an obligation records `group.stable_group_id()`, while
+/// the roster map is keyed by whichever alias this daemon learned the group
+/// under, so a single-spelling lookup would publish exactly the groups whose
+/// two names differ.
+///
+/// Suppression is NON-DESTRUCTIVE by design. The obligation and its retry
+/// schedule are left untouched, so the debt survives (a member on the roster
+/// that nobody remembers to bootstrap is the failure this outbox exists to
+/// prevent) and delivery resumes on its own after `POST
+/// /groups/:id/quarantine/clear`.
+async fn withhold_bootstrap_publication(state: &Arc<AppState>, group_id: &str) -> bool {
+    let Some(marker) = crate::server::delegations::fork_quarantine_marker(state, group_id).await
+    else {
+        return false;
+    };
+    if first_publication_refusal_for(group_id, marker.revision) {
+        // The shared slice-1 helper: one `fork_quarantine_refusals`
+        // increment and the §5 sentence, so the operator reading the log
+        // learns the condition, the cause and the manual remedy (§3e) — the
+        // same words the REST refusals use.
+        let reason = crate::server::routes::named_groups::fork_quarantine_refusal_reason(
+            state, group_id, &marker,
+        );
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            "signed-public bootstrap publication withheld: {reason}"
+        );
+    } else {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            revision = marker.revision,
+            "signed-public bootstrap publication still withheld under fork quarantine"
+        );
+    }
+    true
+}
+
 /// `1s << min(attempts, 6)`, clamped to 60 s.
 fn public_group_bootstrap_retry_delay_ms(attempt_count: u32) -> u64 {
     let shift = attempt_count.min(6);
@@ -627,6 +726,19 @@ async fn reconcile_public_group_bootstrap_outbox(
             || group.withdrawn
             || group.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
         {
+            continue;
+        }
+        // ADR-0066 §3c row 21, at the predicate the ADR anchors the row to —
+        // but RETAINED, not dropped. `continue` here would delete the debt,
+        // and the marker on an ordinary group never auto-clears, so the
+        // member would be silently and permanently forgotten: the exact
+        // "roster entry with no obligation" failure this module's doc comment
+        // names. What is withheld is the REFRESH: re-deriving the stored
+        // payload from a contested frontier would rewrite a durable
+        // obligation with a snapshot of disputed state. The obligation stands
+        // as written and the worker below declines to send it.
+        if group.is_fork_quarantined() {
+            next.insert(obligation.key.clone(), obligation.clone());
             continue;
         }
         let mut replacement = match public_group_bootstrap_refreshed_snapshot(obligation, group) {
@@ -805,6 +917,23 @@ pub(in crate::server) async fn public_group_bootstrap_outbox_step(state: &Arc<Ap
     // this worker never sends a stale clone.
     let membership_lock = group_membership_lock(state, &candidate_group_id).await;
     let _membership_guard = membership_lock.lock().await;
+    // ADR-0066 §3c row 21: the single chokepoint for outbound publication.
+    // Both publishers funnel here — the periodic worker in
+    // `serve_with_options` and the REST nudge
+    // `spawn_public_group_bootstrap_delivery` that a member-add fires — so
+    // one gate closes the row for the background job and the REST surface
+    // alike, and neither can publish a contested group's snapshot.
+    //
+    // Placed inside the membership lock and BEFORE reconciliation: the lock
+    // is the one every signed-public frontier mutation takes, so a marker
+    // install either lands before this read (and we withhold) or after we
+    // release (and the snapshot we sent was uncontested when we sent it).
+    // Before reconciliation, because reconciliation is where a stored
+    // obligation would be refreshed from the live frontier, and R5 allows no
+    // grace: the FIRST due obligation after the marker installs is withheld.
+    if withhold_bootstrap_publication(state, &candidate_group_id).await {
+        return;
+    }
     match reconcile_public_group_bootstrap_outbox(state).await {
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
