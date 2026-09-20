@@ -2449,6 +2449,51 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
     Ok(MachineId(arr))
 }
 
+/// ADR-0066/ADR-0067: resolve one named-group record under **both
+/// spellings**, over a borrowed roster map.
+///
+/// The roster map is keyed by whichever alias this daemon learned the group
+/// under, while callers routinely arrive with the STABLE id (a delegation
+/// envelope signs `info.stable_group_id()`; an epoch token is captured
+/// against it). A bare `groups.get(id)` therefore misses the record whenever
+/// key ≠ stable id — and for a quarantine gate that does not degrade
+/// gracefully, it serves the contested roster. Direct key hit first, then a
+/// scan by `stable_group_id()`, exactly as the metadata apply path
+/// (`resolved_group_key`, `named_groups.rs:9124`) does.
+///
+/// **Synchronous and map-level on purpose.** ADR-0067's re-check runs INSIDE
+/// the `state.named_groups` write critical section that performs the
+/// mutation, so it cannot await a lock it is already holding. The async,
+/// `&AppState`-taking `delegations::fork_quarantine_marker` is now a thin
+/// wrapper over this, so the two cannot drift.
+///
+/// Unification of the remaining local copies (`history::resolve_group_entry`,
+/// `ws::fork_quarantine_annotation`) is deliberately NOT in ADR-0066 slice 7's
+/// scope and is left to a follow-up — those two annotate reads, and rewriting
+/// them here would mix a behaviour-neutral refactor into a security slice.
+pub(in crate::server) fn resolve_group_entry_locked<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<(&'a str, &'a x0x::groups::GroupInfo)> {
+    if let Some((key, info)) = groups.get_key_value(group_id) {
+        return Some((key.as_str(), info));
+    }
+    groups
+        .iter()
+        .find(|(_, info)| info.stable_group_id() == group_id)
+        .map(|(key, info)| (key.as_str(), info))
+}
+
+/// ADR-0067: the lifecycle epoch token for one group, resolved under both
+/// spellings. `None` when this node holds no record for the id — a caller
+/// re-checking a token MUST treat that as a mismatch, never as "unchanged".
+pub(in crate::server) fn lifecycle_epoch_token_locked(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<x0x::groups::LifecycleEpochToken> {
+    resolve_group_entry_locked(groups, group_id).map(|(_, info)| info.lifecycle_epoch_token())
+}
+
 /// Build a uniform `{ "ok": false, "error": <msg> }` JSON error response paired
 /// with the given status code. Used by handlers in place of hand-rolled literals.
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {

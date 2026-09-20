@@ -4439,6 +4439,164 @@ where
     outcome
 }
 
+/// ADR-0067: what an epoch-checked roster mutation did.
+#[derive(Debug)]
+pub(in crate::server) enum EpochCheckedPersist {
+    /// The captured token still matched under the persist lock, so the
+    /// mutation ran; this is the underlying persist result, unchanged.
+    Applied(std::io::Result<AtomicWriteOutcome>),
+    /// The group's lifecycle epoch moved between capture and the persist
+    /// lock. The mutation closure was **never called**, nothing was
+    /// serialized and nothing was written — the act aborted before its
+    /// irreversible step, leaving state byte-identical.
+    EpochMoved {
+        /// The token observed under the lock, or `None` when this node no
+        /// longer holds a record for the id (also a mismatch, never
+        /// "unchanged").
+        observed: Option<x0x::groups::LifecycleEpochToken>,
+    },
+}
+
+/// ADR-0066 §4 / ADR-0067: run a roster mutation only if the group's
+/// lifecycle epoch token is still the one the caller captured at its
+/// authorization check.
+///
+/// **The window this closes.** Every ADR-0066 gate consults the
+/// `fork_quarantine` marker at the START of an operation. Between that check
+/// and the persist, a marker can be installed (a fork observation lands), or
+/// cleared, or advanced to a new evidence revision. Without a re-check the
+/// operation persists on an authorization that is no longer true.
+///
+/// **Where the re-check runs.** Inside the closure
+/// [`persist_named_groups_mutation_unlocked`] invokes while holding the
+/// `state.named_groups` write guard — the SAME critical section as the
+/// mutation, so nothing can move the epoch between the comparison and the
+/// mutation. It adds no lock and performs no I/O: the established order
+/// (membership → roster → persistence → outbox) is unchanged, and no await
+/// is newly held under a lock.
+///
+/// **Why a mismatch aborts even when the marker was CLEARED.** ADR-0066 §4
+/// says "a mismatch aborts the act before the irreversible step", without
+/// qualification, and ADR-0067 keeps that: the captured authorization was
+/// computed against a record that no longer exists, so re-deriving it is the
+/// caller's job, not this helper's. A clear is not a hazard, so the refusal
+/// is immediately retryable — a retry captures the post-clear token and
+/// succeeds on its first attempt. There is no backoff, no request budget and
+/// no retry loop here: this returns once, the caller answers its request, and
+/// nothing is left queued or parked, so a refusal can neither freeze a queue
+/// head nor spin.
+///
+/// `group_id` is resolved under BOTH spellings
+/// ([`crate::server::resolve_group_entry_locked`]) because the roster map is
+/// keyed by whichever alias this daemon learned the group under, while the
+/// token was captured against whatever spelling the caller holds.
+///
+/// **`expected` is an `Option` on purpose.** `None` means "this node held no
+/// record for the id when I captured", which is the normal state of a first
+/// join. Comparing `Option` to `Option` therefore gets all four cases right:
+/// absent→absent matches (the operation proceeds), absent→present refuses (a
+/// marker landed on a group this operation was about to seat),
+/// present→present matches only on the same identity, and present→absent
+/// refuses. Treating a missing record as "unchanged" would be the fail-open
+/// reading, so it is never done.
+/// Named `_unlocked` for the same reason
+/// [`persist_named_groups_mutation_unlocked`] is: every caller so far already
+/// holds `named_groups_persistence_lock` (#457 r10 item 10.1 — taking it again
+/// under the guard self-deadlocks). A locking wrapper is deliberately NOT
+/// added until a caller needs one.
+pub(in crate::server) async fn persist_named_groups_mutation_epoch_checked_unlocked<F>(
+    state: &AppState,
+    group_id: &str,
+    expected: Option<&x0x::groups::LifecycleEpochToken>,
+    mutate: F,
+) -> EpochCheckedPersist
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    // `Some(observed)` iff the re-check fired. Distinguishing that from the
+    // mutation's own `false` (which also yields `NotReplaced`) is the whole
+    // point: a caller must not report "nothing to do" when it was refused.
+    let mut moved: Option<Option<x0x::groups::LifecycleEpochToken>> = None;
+    let outcome = persist_named_groups_mutation_unlocked(state, |groups| {
+        // ADR-0067 test barrier: the injected lifecycle event lands HERE,
+        // inside the write guard and immediately before the re-check — the
+        // tightest interleaving a concurrent writer could achieve. Compiled
+        // only under `cfg(test)`; see `epoch_recheck_barrier`.
+        #[cfg(test)]
+        epoch_recheck_barrier::before_recheck(group_id, groups);
+        let live = crate::server::lifecycle_epoch_token_locked(groups, group_id);
+        if live.as_ref() != expected {
+            moved = Some(live);
+            // Returning false leaves the map untouched AND skips the save,
+            // so the abort costs nothing and writes nothing.
+            return false;
+        }
+        mutate(groups)
+    })
+    .await;
+    match moved {
+        Some(observed) => EpochCheckedPersist::EpochMoved { observed },
+        None => EpochCheckedPersist::Applied(outcome),
+    }
+}
+
+/// ADR-0067 deterministic race harness — `cfg(test)` END TO END.
+///
+/// The §4 fixtures must interleave a marker install/clear/advance between an
+/// authorization capture and the persist, and must do so WITHOUT a sleep. A
+/// production hook (a field, a parameter, a branch) would be a permanent
+/// surface for a test-only need, so the hook exists only under `cfg(test)`:
+/// a release build compiles neither this module nor its call site, and
+/// `cargo build` sees no new code at all.
+///
+/// A test installs a callback, runs the operation, and the callback mutates
+/// the very map the persist is about to write — proving the re-check is
+/// load-bearing. Removing the re-check must make those tests fail; that is
+/// each fixture's negative control.
+#[cfg(test)]
+pub(in crate::server) mod epoch_recheck_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    type Hook = Box<dyn FnMut(&str, &mut HashMap<String, crate::groups::GroupInfo>) + Send>;
+
+    fn slot() -> &'static Mutex<Option<Hook>> {
+        static SLOT: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Removes the installed hook on drop, so one test cannot leak a hook
+    /// into the next.
+    pub(in crate::server) struct BarrierGuard;
+
+    impl Drop for BarrierGuard {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = slot().lock() {
+                *guard = None;
+            }
+        }
+    }
+
+    /// Install a callback to run immediately before the epoch re-check.
+    pub(in crate::server) fn install(hook: Hook) -> BarrierGuard {
+        if let Ok(mut guard) = slot().lock() {
+            *guard = Some(hook);
+        }
+        BarrierGuard
+    }
+
+    pub(in crate::server) fn before_recheck(
+        group_id: &str,
+        groups: &mut HashMap<String, crate::groups::GroupInfo>,
+    ) {
+        if let Ok(mut guard) = slot().lock() {
+            if let Some(hook) = guard.as_mut() {
+                hook(group_id, groups);
+            }
+        }
+    }
+}
+
 /// #470 compare-and-restore rollback (see
 /// [`persist_named_groups_mutation_unlocked`]): for every key the failed
 /// transaction touched (`before.get(k) != after.get(k)`), roll the live map
@@ -15912,6 +16070,33 @@ pub(in crate::server) async fn join_group_via_invite(
                     // covers a post-rename failure whose corrective save
                     // fails. A preflight that cannot confirm durability
                     // aborts the install before any roster write.
+                    // ADR-0066 §4 / ADR-0067: capture the group's lifecycle
+                    // epoch token BEFORE the two I/O awaits below, for
+                    // re-validation inside the persist's critical section.
+                    //
+                    // The window this closes is real and measured in disk
+                    // I/O, not instructions: `confirm_named_groups_durability_unlocked`
+                    // and `write_join_install_pending_marker` both fsync
+                    // before the insert. An `install_fork_evidence` for this
+                    // same group can land in that window (the metadata apply
+                    // path runs concurrently), and the insert below writes a
+                    // WHOLE record captured earlier — so without the re-check
+                    // it would not merely seat on a stale authorization, it
+                    // would ERASE the marker that arrived meanwhile.
+                    //
+                    // `None` here is the normal first-join case (no local
+                    // record yet) and matches an unchanged absent record; see
+                    // `persist_named_groups_mutation_epoch_checked`.
+                    //
+                    // SCOPE, stated plainly: this covers capture→persist. The
+                    // earlier part of the join flow (invite verification and
+                    // lineage checks) is NOT inside this token's window;
+                    // extending the capture upstream is follow-up work, not a
+                    // claim this slice makes.
+                    let joining_epoch_token = {
+                        let groups = state.named_groups.read().await;
+                        crate::server::lifecycle_epoch_token_locked(&groups, &group_id_hex)
+                    };
                     if state
                         .named_groups_requires_durability_confirmation
                         .load(Ordering::Acquire)
@@ -15933,11 +16118,53 @@ pub(in crate::server) async fn join_group_via_invite(
                             "named-group state is not directory-durable",
                         );
                     }
-                    let outcome = persist_named_groups_mutation_unlocked(&state, |groups| {
-                        groups.insert(group_id_hex.clone(), info.clone());
-                        true
-                    })
-                    .await;
+                    let outcome = match persist_named_groups_mutation_epoch_checked_unlocked(
+                        &state,
+                        &group_id_hex,
+                        joining_epoch_token.as_ref(),
+                        |groups| {
+                            groups.insert(group_id_hex.clone(), info.clone());
+                            true
+                        },
+                    )
+                    .await
+                    {
+                        EpochCheckedPersist::Applied(outcome) => outcome,
+                        EpochCheckedPersist::EpochMoved { observed } => {
+                            // Fail closed with nothing persisted: the mutation
+                            // closure never ran, so the live roster and every
+                            // durable file are byte-identical.
+                            //
+                            // The install marker written just above is
+                            // deliberately LEFT in place. It is the safe
+                            // direction and needs no new rollback path: the
+                            // marker excludes a group the roster does not
+                            // contain (no insert happened, no save happened),
+                            // and `clear_join_install_pending_markers` removes
+                            // it after the next durable save — the same
+                            // lifecycle #477 already defines for a marker
+                            // whose install aborted before any roster write.
+                            //
+                            // No queue head is frozen and nothing retries in a
+                            // loop: the caller gets exactly one answer.
+                            tracing::warn!(
+                                group_id = %group_id_hex,
+                                now_quarantined = observed
+                                    .as_ref()
+                                    .is_some_and(x0x::groups::LifecycleEpochToken::is_fork_quarantined),
+                                "ADR-0066 §4: refusing join install — the group's lifecycle \
+                                 epoch moved between authorization and the persist lock"
+                            );
+                            return api_error_with_reason(
+                                StatusCode::CONFLICT,
+                                "the group's fork-quarantine state changed while this join was \
+                                 being installed, so the seating was refused rather than \
+                                 overwriting it; re-read the group and retry (an operator \
+                                 clears a marker with POST /groups/:id/quarantine/clear)",
+                                "fork_quarantined",
+                            );
+                        }
+                    };
                     if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
                         // ROLLBACK (r7 item 1 → r8 item 1): `NotReplaced`/
                         // `Err` were already compare-and-restored by the
@@ -23962,6 +24189,55 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     // with a stale/absent snapshot and nothing on disk could repair it.
     let (named_groups_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
+        // ADR-0066 §4 / ADR-0067 — the epoch re-check, under the persistence
+        // lock this function already holds (`:24101`), before ANY journal or
+        // live-file write.
+        //
+        // The hazard is specific and destructive. `info` is the caller's
+        // snapshot, captured at its authorization check (for the store paths,
+        // `TreeKemGroupStoreProtector::current_info`, whose gate consults
+        // `is_fork_quarantined()`). The insert below makes that snapshot the
+        // durable record for `group_id_hex`. So if a fork-quarantine marker
+        // was installed on the LIVE record after the caller cloned it, this
+        // write does not merely proceed on a stale authorization — it
+        // ERASES the containment marker, because `info` predates it and
+        // carries `fork_quarantine: None`. The next operation then sees an
+        // unquarantined group and the containment is silently gone.
+        //
+        // `ensure_treekem_persistence_allowed` does NOT cover this: it
+        // resolves to `ensure_named_group_key_material_install_allowed`,
+        // which checks `withdrawn` only.
+        //
+        // Only the MARKER half of the token is compared here, and this is the
+        // one site where that is correct: this function exists to persist an
+        // ADVANCED state, so the caller's `state_revision` is expected to
+        // differ from the live one and comparing it would refuse every
+        // legitimate persist. `LifecycleEpochToken::same_marker` names that
+        // choice so it cannot be mistaken for a full-token comparison.
+        if let Some((_, live)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
+            let live_token = live.lifecycle_epoch_token();
+            let captured = info.lifecycle_epoch_token();
+            if !live_token.same_marker(&captured) {
+                // Fail closed BEFORE the irreversible step, leaving every
+                // durable file byte-identical. Retryable by construction: a
+                // retry re-reads the live record, so a legitimate clear costs
+                // one refused attempt and no spin — nothing is queued or
+                // parked here.
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    live_quarantined = live_token.is_fork_quarantined(),
+                    captured_quarantined = captured.is_fork_quarantined(),
+                    "ADR-0066 §4: refusing TreeKEM atomic persist — the group's \
+                     fork-quarantine marker changed between authorization and the \
+                     persist lock"
+                );
+                anyhow::bail!(
+                    "fork_quarantined: the group's fork-quarantine marker changed \
+                     between authorization and the persist lock; re-read the group \
+                     and retry (see docs/runbooks for the manual clear)"
+                );
+            }
+        }
         let mut next_groups = groups.clone();
         next_groups.insert(group_id_hex.to_string(), info.clone());
         // #458 r3: never durably capture OTHER groups' unconfirmed join

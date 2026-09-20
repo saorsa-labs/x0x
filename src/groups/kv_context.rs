@@ -487,6 +487,39 @@ impl GssKvSecureContext {
             state.active_members.clear();
             return;
         }
+        // ADR-0066 §4 / ADR-0067 — make a marker a REFRESH TRIGGER for this
+        // cached context, closing the bind-time gap in §1 rows 10–12 for the
+        // GSS plane.
+        //
+        // This was the one cached KV context blind to the marker.
+        // `PublicState::from_group` folds `!is_fork_quarantined()` into
+        // `valid`, and `TreeKemKvAuthorizationContext::update_from_group`
+        // clears its roster while quarantined — but `GssState` had no notion
+        // of quarantine at all, and neither did the refresh that feeds it. So
+        // a marker installed AFTER a GSS store bound was invisible to work
+        // already in flight: the cached roster kept authorizing writers on an
+        // authorization taken before the fork was observed. That is exactly
+        // the bind-time gap §4 exists to close, and the reason §4 asks for the
+        // install to be a refresh trigger "from both ends".
+        //
+        // The shape deliberately matches the TreeKEM context's: empty the
+        // roster and drop the secret so sealing, opening and membership all
+        // fail closed. It is NOT terminal like `withdrawn` — a later refresh
+        // after a manual clear re-arms the context from live state, because a
+        // quarantine is recoverable and a withdrawal is not.
+        if info.is_fork_quarantined() {
+            tracing::warn!(
+                target: "x0x::kv",
+                "gss kv context suspended for group {} (epoch {}): ADR-0066 fork quarantine — \
+                 sealing, opening and membership fail closed until the marker is cleared",
+                state.stable_group_id,
+                state.secret_epoch
+            );
+            state.shared_secret = None;
+            state.active_members.clear();
+            state.member_roles.clear();
+            return;
+        }
         let next = GssState::from_group(info);
         let changed = state.shared_secret != next.shared_secret
             || state.secret_epoch != next.secret_epoch

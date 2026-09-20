@@ -272,11 +272,10 @@ pub(in crate::server) async fn fork_quarantine_marker(
     group_id: &str,
 ) -> Option<x0x::groups::ForkQuarantine> {
     let groups = state.named_groups.read().await;
-    let info = groups.get(group_id).or_else(|| {
-        groups
-            .values()
-            .find(|info| info.stable_group_id() == group_id)
-    })?;
+    // ADR-0067: the both-spellings resolution above now lives in ONE place
+    // (`crate::server::resolve_group_entry_locked`) so the §3b gates and the
+    // §4 epoch re-check cannot drift apart on which record they mean.
+    let (_, info) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
     info.fork_quarantine.clone()
 }
 

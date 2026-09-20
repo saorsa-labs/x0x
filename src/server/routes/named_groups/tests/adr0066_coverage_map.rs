@@ -74,6 +74,38 @@ struct CoverageRow {
     /// turns "somebody shipped a row without saying so" — or reverted one
     /// — into a failing test rather than a quiet drift.
     closed: bool,
+    /// ADR-0067: does the §1 Decision column for this row ask for the §4
+    /// re-check *before the effect*, on top of the entry gate?
+    ///
+    /// WHY this is a separate field from `closed`. Rows 1, 2, 4 and 6 read
+    /// "Keep; add §4 re-check" — they are `Gated` at entry and therefore
+    /// already `closed: true`, so the `closed`/`OPEN_ROWS` machinery is
+    /// structurally blind to whether the re-check ever landed. Slice 7 lands
+    /// the mechanism (row 22) and the KV-plane re-check, but David deferred
+    /// those four outbound paths to a later slice: they perform no roster
+    /// mutation and take no persistence lock, so "inside the same critical
+    /// section as the mutation" does not define a site for them and ADR-0066
+    /// defines no critical section for an outbound publish (ADR-0067,
+    /// "Deferral").
+    ///
+    /// Without this field that deferral would ship invisible — the fixture
+    /// would pass either way. `PENDING_RECHECK` below turns it into an
+    /// asserted, exact fact instead, so `OPEN_ROWS` can be empty without the
+    /// map quietly claiming more coverage than the tree has.
+    recheck_before_effect: RecheckState,
+}
+
+/// ADR-0067: the state of a row's §4 "re-check before the effect"
+/// obligation, as distinct from its entry gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecheckState {
+    /// The §1 Decision column asks for no §4 re-check on this row.
+    NotRequired,
+    /// Asked for, and the re-check is in the tree.
+    Landed,
+    /// Asked for, deferred to a later slice, and held visible by
+    /// `PENDING_RECHECK`.
+    Pending,
 }
 
 /// The §1 table, transcribed. Deliberately verbatim: a divergence between
@@ -86,6 +118,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Pending,
         closed: true,
     },
     CoverageRow {
@@ -94,6 +127,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Pending,
         closed: true,
     },
     CoverageRow {
@@ -102,6 +136,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -110,6 +145,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Pending,
         closed: true,
     },
     CoverageRow {
@@ -118,6 +154,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -126,6 +163,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Pending,
         closed: true,
     },
     CoverageRow {
@@ -134,6 +172,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -142,6 +181,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -150,6 +190,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/stores.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -158,6 +199,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Landed,
         closed: true,
     },
     CoverageRow {
@@ -166,6 +208,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -174,6 +217,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/groups/kv_context.rs",
         disposition: Disposition::Gated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::Landed,
         closed: true,
     },
     CoverageRow {
@@ -182,6 +226,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -190,6 +235,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(4),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -198,6 +244,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -206,6 +253,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -214,6 +262,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -222,6 +271,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -230,6 +280,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/delegations.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(3),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -238,6 +289,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/tasks.rs",
         disposition: Disposition::Split,
         closed_by_slice: Some(5),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: false,
     },
     CoverageRow {
@@ -246,6 +298,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/public_group_bootstrap_outbox.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(5),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: false,
     },
     CoverageRow {
@@ -254,7 +307,8 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::Introduce,
         closed_by_slice: Some(7),
-        closed: false,
+        recheck_before_effect: RecheckState::Landed,
+        closed: true,
     },
     CoverageRow {
         row: 23,
@@ -262,6 +316,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/files.rs",
         disposition: Disposition::OutOfScope,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -270,6 +325,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/named_groups.rs",
         disposition: Disposition::KeepUngated,
         closed_by_slice: None,
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -278,6 +334,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/ws.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(6),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
     CoverageRow {
@@ -286,6 +343,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
+        recheck_before_effect: RecheckState::NotRequired,
         closed: true,
     },
 ];

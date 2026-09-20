@@ -312,6 +312,134 @@ impl ForkQuarantine {
     }
 }
 
+/// ADR-0067: which marker a group carries, as an identity.
+///
+/// The five fields that say *which fork observation* installed this marker.
+/// [`ForkQuarantine::snapshot`] is deliberately excluded: it is forensic
+/// detail derived from the same evidence, so it cannot differ between two
+/// markers whose identity fields agree, and carrying it would make every
+/// token clone a deep copy of two commit headers for no decision value.
+///
+/// **The destructuring in [`ForkQuarantineIdentity::from_marker`] is
+/// exhaustive on purpose.** A field added to [`ForkQuarantine`] that this
+/// type should consider fails the BUILD there rather than silently widening
+/// the set of marker changes the epoch token cannot see. That is a stronger
+/// guarantee than a test, and it is why no `..` appears in that pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkQuarantineIdentity {
+    revision: u64,
+    state_hash: String,
+    committed_by: String,
+    observed_at_ms: u64,
+    no_anchor: bool,
+}
+
+impl ForkQuarantineIdentity {
+    fn from_marker(marker: &ForkQuarantine) -> Self {
+        // Exhaustive — see the type doc. Do NOT add `..`.
+        let ForkQuarantine {
+            revision,
+            state_hash,
+            committed_by,
+            observed_at_ms,
+            snapshot: _,
+            no_anchor,
+        } = marker;
+        Self {
+            revision: *revision,
+            state_hash: state_hash.clone(),
+            committed_by: committed_by.clone(),
+            observed_at_ms: *observed_at_ms,
+            no_anchor: *no_anchor,
+        }
+    }
+
+    /// The evidenced revision this marker names.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+/// ADR-0067: the lifecycle epoch token, captured at an authorization check
+/// and re-validated inside the critical section that performs the
+/// irreversible act.
+///
+/// **Why this exists.** Every ADR-0066 gate (slices 1–6) consults the
+/// marker at the START of an operation. A marker installed — or cleared, or
+/// advanced to a new evidence revision — BETWEEN that check and the persist
+/// lets a contested write through, or wrongly refuses a permitted one.
+/// ADR-0066 §4 closes that window with a token; ADR-0067 settles what the
+/// token is.
+///
+/// **Why it is derived and not counted.** ADR-0066 §4 specified a
+/// `quarantine_generation` counter "on the group entry" while its own
+/// ratified R4 forbade "no new #470 full-equality participant" — and
+/// [`GroupInfo`] derives [`PartialEq`] with that full equality deliberately
+/// load-bearing for `persist_named_groups_mutation_unlocked`'s
+/// compare-and-restore rollback. The two cannot both hold. Worse, a census
+/// found three marker writers no process-local counter reaches: the on-disk
+/// recovery install, and the two clears that mutate the roster under a raw
+/// `named_groups.write()` without the persistence lock. A counter's
+/// completeness would rest on an enumeration whose failure mode is
+/// **fail-open**.
+///
+/// So the token is DERIVED from the live record on demand:
+/// `(state_revision, marker identity)`. Nothing is stored, so nothing can go
+/// stale, and every lifecycle event is visible without a hook at its site:
+///
+/// - install — `None` → `Some(identity)`;
+/// - clear — `Some(identity)` → `None`;
+/// - revision advance — `Some(a)` → `Some(b)`;
+/// - roster/lifecycle advance with no marker change — `state_revision` moves.
+///
+/// **Accepted weakness (ADR-0067 Consequences).** This is an identity, not a
+/// clock: it answers "same or different", never "newer". ABA is possible
+/// only if a byte-identical marker identity recurs while `state_revision`
+/// returns to its captured value within one operation's window — which needs
+/// an active coincidence, where a counter needs only a forgotten line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleEpochToken {
+    state_revision: u64,
+    marker: Option<ForkQuarantineIdentity>,
+}
+
+impl LifecycleEpochToken {
+    /// The state-commit revision this token was captured at.
+    #[must_use]
+    pub fn state_revision(&self) -> u64 {
+        self.state_revision
+    }
+
+    /// The marker identity this token was captured with, if the group
+    /// carried one.
+    #[must_use]
+    pub fn marker(&self) -> Option<&ForkQuarantineIdentity> {
+        self.marker.as_ref()
+    }
+
+    /// Was the group fork-quarantined when this token was captured?
+    #[must_use]
+    pub fn is_fork_quarantined(&self) -> bool {
+        self.marker.is_some()
+    }
+
+    /// Do these two tokens describe the same quarantine marker, ignoring
+    /// `state_revision`?
+    ///
+    /// **Use `==` unless you can justify this instead.** The full token is
+    /// the default comparison; this partial one exists for the single site
+    /// whose whole purpose is to persist an ADVANCED state — the TreeKEM
+    /// roster+snapshot atomic persist — where the captured and live
+    /// revisions are *expected* to differ and a full comparison would refuse
+    /// every legitimate write. Naming the weaker comparison keeps it from
+    /// being mistaken for the full one in review.
+    #[must_use]
+    pub fn same_marker(&self, other: &Self) -> bool {
+        self.marker == other.marker
+    }
+}
+
 /// Metadata for a group.
 ///
 /// Persisted as JSON. The legacy v1 layout used a flat `members: BTreeSet`
@@ -662,6 +790,22 @@ impl GroupInfo {
     /// membership-gated routes for the group because authenticated fork
     /// evidence is outstanding. ADR-0066 §2: true for ordinary groups too
     /// (the marker then carries `no_anchor`).
+    /// ADR-0067: this group's lifecycle epoch token, derived from the live
+    /// record.
+    ///
+    /// Capture this at an authorization check and re-validate it inside the
+    /// critical section that performs the irreversible act — see
+    /// [`LifecycleEpochToken`] for why it is derived rather than counted.
+    /// Cheap: two `u64`s and (only when quarantined) two small `String`
+    /// clones, with the forensic snapshot deliberately not copied.
+    #[must_use]
+    pub fn lifecycle_epoch_token(&self) -> LifecycleEpochToken {
+        LifecycleEpochToken {
+            state_revision: self.state_revision,
+            marker: self.fork_quarantine.as_ref().map(ForkQuarantineIdentity::from_marker),
+        }
+    }
+
     #[must_use]
     pub fn is_fork_quarantined(&self) -> bool {
         self.fork_quarantine.is_some()

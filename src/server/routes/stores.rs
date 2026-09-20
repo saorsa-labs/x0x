@@ -6,7 +6,8 @@
 use super::super::crdt_subscriptions;
 use super::super::state::AppState;
 use super::super::{
-    api_error, bad_request, direct_message_send_config, forbidden, not_found, parse_agent_id_hex,
+    api_error, api_error_with_reason, bad_request, direct_message_send_config, forbidden, not_found,
+    parse_agent_id_hex,
 };
 use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
 use crate as x0x;
@@ -800,9 +801,18 @@ impl TreeKemGroupStoreProtector {
             ));
         }
         let groups = self.state.named_groups.read().await;
-        let info = groups.get(&self.group_key).cloned().ok_or_else(|| {
-            x0x::kv::KvError::Unauthorized("TreeKEM group is unavailable".to_string())
-        })?;
+        // ADR-0067 hard requirement: BOTH spellings. This was a bare
+        // `groups.get(&self.group_key)`. It failed closed rather than open
+        // (the `stable_group_id()` comparison below catches a mismatch), but a
+        // protector bound under one alias while the roster is keyed by the
+        // other then reports "unavailable" for a perfectly live group — and a
+        // gate that resolves only one spelling is exactly the defect
+        // ADR-0066 slice 3 review r1 found. One shared resolver now.
+        let info = crate::server::resolve_group_entry_locked(&groups, &self.group_key)
+            .map(|(_, info)| info.clone())
+            .ok_or_else(|| {
+                x0x::kv::KvError::Unauthorized("TreeKEM group is unavailable".to_string())
+            })?;
         if info.withdrawn
             || info.is_fork_quarantined()
             || info.stable_group_id() != self.stable_group_id
@@ -1130,6 +1140,22 @@ fn validate_gss_store_group(
 ) -> Result<(), GroupStoreResponse> {
     if info.withdrawn {
         return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
+    }
+    // ADR-0066 §4 / ADR-0067: the GSS refresh validator was blind to the
+    // marker, so `gss_kv_refresh`'s per-operation refresh could re-arm a
+    // cached context for a group that had been quarantined since the bind.
+    // The marker is the one condition here that can appear mid-flight (a fork
+    // observation lands asynchronously), which is why it is checked on the
+    // refresh path and not only at bind time. §5: the refusal says what
+    // happened and how to lift it.
+    if info.is_fork_quarantined() {
+        return Err(api_error_with_reason(
+            StatusCode::CONFLICT,
+            "group is under ADR-0066 fork quarantine: authenticated fork evidence is \
+             outstanding, so encrypted-store access fails closed until an operator clears \
+             the marker (POST /groups/:id/quarantine/clear)",
+            "fork_quarantined",
+        ));
     }
     if !info.has_active_member(&hex::encode(caller.as_bytes())) {
         return Err(forbidden("not a member"));
