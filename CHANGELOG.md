@@ -6,6 +6,43 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A fork-quarantined group's history is no longer evicted by the retention
+  reaper, and inbound peer task-CRDT deltas for it are held instead of applied
+  (ADR-0068, D1 and D2; #732).** Both paths sat outside ADR-0066's §1 census, so
+  neither was a regression of a row — they were gaps in the enumeration itself,
+  found by cross-model review. Closes runbook known gaps (b) and (c).
+  - **Retention (D1).** `src/history/reaper.rs` ran ADR-0023 §6 age and byte
+    eviction against every scope unconditionally, so a quarantined group's
+    forensic record could be destroyed — and a flooder could *drive* that
+    destruction by raising byte pressure, which is the same deletion slice 4
+    already refuses at the explicit purge (row 14). The reaper now skips rows
+    whose `group:<id>` scope holds a live marker, under **both spellings**
+    (derived live from `named_groups` through the one resolver; no schema
+    change — `history.db` stays at v4), bounded by a per-group ceiling
+    `min(4 × base, max_bytes/16)` where `base` is the configured per-scope limit
+    or `max_bytes/64`, i.e. **64 MiB at the 1 GiB default**. Beyond the ceiling
+    the oldest rows **inside that group only** are evicted and counted in
+    `history_quarantine_pinned_evictions`;
+    `history_quarantine_pinned_scopes` reports how many scopes are pinned.
+    Worst-case disk `max_bytes × (1 + G/16)`, where `G` is the number of groups
+    this node has joined that are simultaneously forked — a flooder can inflate
+    rows (bounded by the ceiling) but cannot inflate `G`. On clear the scope
+    returns to normal retention on the next pass. Both counters are on
+    `GET /diagnostics/history`.
+  - **Task lists (D2).** Row 20 refused *local* task mutations while a group was
+    quarantined, but deltas from peers still merged — admitted by the
+    `authorized_agents` set derived from **the contested roster itself** — so a
+    peer seated by the disputed roster could keep claiming and completing, and
+    move the CRDT's winner, while the local operator was refused. Inbound deltas
+    for a quarantined group's list are now **held in arrival order** (1024
+    deltas / 1 MiB per list; oldest dropped and counted) with the CRDT left
+    byte-identical, and applied in order once the marker is gone. Reads keep
+    serving the frozen state with the existing `fork_quarantined` annotation.
+    The buffer is process-local: a restart converges by anti-entropy instead.
+    Group **metadata** ingest (row 24) is untouched, so the clearing commit still
+    arrives. Per-group counters `task_deltas_quarantine_buffered`,
+    `task_deltas_quarantine_dropped` and `task_deltas_quarantine_applied` are on
+    `GET /diagnostics/groups`.
 - **Outbound sends and secure-crypto routes now re-check the fork-quarantine
   marker immediately before their effect, not only at request start (ADR-0066
   §1 rows 1/2/4/6 and §4, slice 9; ADR-0067; #732).** These four paths were

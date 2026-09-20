@@ -2404,7 +2404,15 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
 | GET | `/diagnostics/relay` | `x0x diagnostics relay` | ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence |
-| GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023) |
+| GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023), including the ADR-0068 D1 quarantine-pin pair |
+
+`GET /diagnostics/history` adds two ADR-0068 D1 fields to the ADR-0023 writer and
+reaper counters:
+
+| Field | Kind | Meaning |
+|---|---|---|
+| `history_quarantine_pinned_scopes` | Gauge (last pass) | History scopes pinned because their group holds a live fork-quarantine marker, i.e. exempt from age and byte eviction. This is the `G` in the disk bound `[history] max_bytes × (1 + G/16)`. |
+| `history_quarantine_pinned_evictions` | Cumulative | Rows evicted from **inside** a pinned scope because that scope exceeded its own ceiling (`min(4 × base, max_bytes/16)`, `base` = its `scope_limits` entry or `max_bytes/64`; 64 MiB at the 1 GiB default). Non-zero means a quarantined group is at its ceiling and shedding its oldest rows — no other scope ever pays for that overshoot. |
 
 ### `GET /diagnostics/dm`
 
@@ -2477,6 +2485,9 @@ Key counter fields (flattened into each group row):
 |---|---|---|
 | `messages_dropped_write_policy_violation` | Receiver | Inbound public messages rejected by the ingest pipeline for write-policy reasons (e.g. `MembersOnly` author not in `members_v2`). The canary for the join-roster-propagation regression: a spike here on the owner side after a joiner posts means `members_v2` is stale. |
 | `sends_rejected_write_policy` | Sender | Outgoing sends from this daemon rejected locally by a members-only write-access policy. A non-zero value means this daemon is absent from its own roster copy. Tracked separately so operators can distinguish "I cannot see joiners" from "I am missing from my own roster". |
+| `task_deltas_quarantine_buffered` | Receiver | ADR-0068 D2: inbound peer task-CRDT deltas HELD (not applied) because this group's fork-quarantine marker is live. The CRDT state stays byte-identical while this climbs; held deltas apply in arrival order once the marker clears. |
+| `task_deltas_quarantine_dropped` | Receiver | ADR-0068 D2: held task deltas dropped because the per-list bound (1024 deltas / 1 MiB) was reached — oldest first. Not silent loss (merges are idempotent and anti-entropy refills after the clear), but a climbing value means the quarantine is outlasting the buffer. |
+| `task_deltas_quarantine_applied` | Receiver | ADR-0068 D2: held task deltas applied, in arrival order, after the marker cleared. |
 | `invites_refused_reasons` | Joiner / inviter | `{"<reason>": count}` map of signed-invite refusals for this group, keyed by the typed reason. Joiner-side (`POST /groups/join`): `invite_unsigned`, `invite_signature_invalid`, `inviter_key_mismatch`, `inviter_key_revoked`, `invite_owner_countersignature_missing`, `invite_owner_countersignature_invalid`, `invite_malformed`, plus the base/addressing/mode-matrix refusals the join route answers with 409. Inviter-side: `invite_not_addressed_to_joiner` when an addressed invite's `MemberJoined` arrives from a different agent (the secret is not consumed). **Omitted from the row while empty.** |
 
 ### `GET /diagnostics/connect`
