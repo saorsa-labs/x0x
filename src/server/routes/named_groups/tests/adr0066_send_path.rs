@@ -134,6 +134,68 @@ async fn roster_bytes(state: &AppState) -> Option<Vec<u8>> {
     tokio::fs::read(&state.named_groups_path).await.ok()
 }
 
+/// Rows in the durable MLS history store for one group scope.
+fn mls_history_rows(state: &AppState, stable_group_id: &str) -> usize {
+    let Some(history) = state.agent.history() else {
+        panic!("the fixture needs a live history store to prove a row was NOT written")
+    };
+    history
+        .store()
+        .query(&x0x::history::HistoryQuery {
+            scope: Some(x0x::history::Scope::Group(stable_group_id.to_string())),
+            ..Default::default()
+        })
+        .expect("query group history")
+        .len()
+}
+
+/// A **happens-after barrier** for the history writer, so "no row was written"
+/// is a real zero and not a not-yet.
+///
+/// `record_mls_history` enqueues on the writer's channel and returns; the
+/// commit happens on the writer thread. Polling with a sleep would make the
+/// assertion timing-dependent, so instead this enqueues a sentinel through
+/// `record_committed` — the SAME FIFO channel — and awaits its commit ack.
+/// Once that ack arrives, every record enqueued before it has been written, so
+/// a group whose row count is still zero never had one enqueued.
+///
+/// The sentinel lands under its own scope, so it cannot perturb the counts the
+/// caller is asserting.
+async fn drain_history_writer(state: &AppState, sentinel_scope: &str) {
+    let Some(history) = state.agent.history() else {
+        panic!("the fixture needs a live history store")
+    };
+    let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
+    history
+        .record_committed(x0x::history::HistoryRecord {
+            msg_id: x0x::history::HistoryRecord::compute_epoch_msg_id(
+                sentinel_scope,
+                0,
+                b"slice9 history barrier",
+            ),
+            scope: x0x::history::Scope::Group(sentinel_scope.to_string()),
+            author_agent: None,
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: now,
+            seen_at_ms: now,
+            direction: x0x::history::Direction::Outbound,
+            content_type: "text/plain".to_string(),
+            payload: b"slice9 history barrier".to_vec(),
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: x0x::history::Provenance::LocalAppDecrypt,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        })
+        .await
+        .expect("the sentinel must commit, or the barrier proves nothing");
+}
+
 // ───────────────────── the rule, as a truth table ─────────────────────
 
 /// The re-check's four cases, stated once so the rows below assert behaviour
@@ -692,6 +754,30 @@ async fn row4_marker_installed_before_effect_refuses_and_records_no_history() ->
         epoch_before,
         "the GSS epoch is unmoved — there is no generation to burn and none was"
     );
+
+    // THE DURABLE HISTORY ROW — the effect this test is named for (omp review
+    // nit 1: asserting the epoch and the roster did not cover it).
+    //
+    // Barrier first, so the zero below is a real zero: the history writer
+    // commits on its own thread, and every record enqueued before the sentinel
+    // is committed by the time the sentinel's ack arrives. The control arm's
+    // row is asserted present through the SAME barrier, so the mechanism is
+    // proven capable of landing a row on this state — a `0` for the armed group
+    // therefore means `record_mls_history` was never reached, not that the
+    // write is still in flight.
+    drain_history_writer(&state, "slice9-row4-history-barrier").await;
+    assert_eq!(
+        mls_history_rows(&state, control),
+        1,
+        "the control arm's encrypt MUST have written its history row — without this the \
+         armed arm's zero would prove nothing about the re-check"
+    );
+    assert_eq!(
+        mls_history_rows(&state, armed),
+        0,
+        "NO HISTORY ROW: the refusal happens before `record_mls_history`, so the \
+         quarantined group's plaintext never reaches the durable store"
+    );
     assert_eq!(
         roster_bytes(&state).await,
         roster_before,
@@ -802,6 +888,13 @@ async fn row6_marker_installed_before_return_hands_out_no_envelope() -> Result<(
     // ── armed arm ──
     assert_entry_gate_admitted(&state, armed).await;
     let roster_before = roster_bytes(&state).await;
+    let epoch_before = state
+        .named_groups
+        .read()
+        .await
+        .get(armed)
+        .expect("installed")
+        .secret_epoch;
     let guard = arm_install(armed, armed);
     let (status, body) = secure_group_reseal(
         State(Arc::clone(&state)),
@@ -832,6 +925,22 @@ async fn row6_marker_installed_before_return_hands_out_no_envelope() -> Result<(
             body.0
         );
     }
+    // omp review nit 2: assert the epoch is unmoved here as row 4 already
+    // does. A reseal seals the CURRENT `secret_epoch`, so the epoch is the
+    // state a refusal must leave alone — if a future change ever rotated the
+    // secret as part of resealing, this refusal would have to roll that back
+    // and this assertion is what would fail first.
+    assert_eq!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(armed)
+            .expect("installed")
+            .secret_epoch,
+        epoch_before,
+        "the GSS epoch is unmoved — a refused reseal rotates nothing"
+    );
     assert_eq!(
         roster_bytes(&state).await,
         roster_before,
