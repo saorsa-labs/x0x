@@ -1954,6 +1954,17 @@ R5: no warn-only window). DM and topic scopes are unaffected; only
 it (`x0x groups quarantine clear <ID>`, adding `--force --reason "…"` for an
 ordinary group), then purge.
 
+**Either spelling of the group id works.** History rows are scoped by the
+group's **stable** id (what `GET /history/scopes` lists), while a daemon's
+roster — and therefore the marker — is keyed by whichever id that daemon
+learned the group under; the two can differ. Both the purge gate and every
+annotation resolve the direct key first and then by stable id, so the refusal
+and the label are the same whichever spelling you use. The refusal's `error`
+sentence names the **roster key**, because `POST /groups/:id/quarantine/clear`
+looks a group up by that key only, and `/history/stats` +
+`/diagnostics/history` list both spellings when they differ — the stable one to
+query rows with, the key one to clear with.
+
 ## Remote exec
 
 Run a command on **another** agent's machine. Disabled by default; every request is authorized on the **responder** (target) daemon, not the caller. The target runs `argv` only if remote exec is enabled there, the sender is a verified `Accept`-trust contact, and the `(agent_id, machine_id)` pair + exact argv are allow-listed in its exec ACL (`docs/exec.md`). `argv` is never shell-interpreted. A denied request still returns `200` with a non-null `denial_reason` (e.g. `exec_disabled`, `unverified_sender`, `trust_rejected`, `agent_machine_not_in_acl`, `argv_not_allowed`, `cwd_not_allowed`, `shell_metachar_in_argv`) — the refusal is carried in the body, not the HTTP status.

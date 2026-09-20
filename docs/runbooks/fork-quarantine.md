@@ -51,6 +51,16 @@ tag-and-retain, never refused (ADR-0066 R3), so nothing is missing from the
 record. That label is derived from the live marker: **read the history you need
 BEFORE clearing**, because a clear keeps every row but drops the labels.
 
+**Two spellings of one group.** History scopes name the group's *stable* id
+(that is what `x0x history scopes` lists and what the rows carry); the local
+roster, and therefore the marker, is keyed by whichever id this daemon learned
+the group under. On the history surface either spelling reaches the gate and the
+annotation, so a purge cannot slip through under the stable name. Where it
+matters is the clear: `x0x groups quarantine clear` takes the **roster key**,
+which is the id the refusal's own message quotes — and `x0x diagnostics history`
+/ `GET /history/stats` list both spellings when they differ, so you do not have
+to guess which one a command wants.
+
 ### The refusal body (ADR-0066 §5)
 
 **Match on `reason`, not on `error`.** ADR-0066 §5 moved the stable machine

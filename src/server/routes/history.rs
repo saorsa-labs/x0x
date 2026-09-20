@@ -211,9 +211,51 @@ fn marker_for<'a>(
         .map(|(_, marker)| marker)
 }
 
+/// Resolve one group id to its roster entry under **either spelling**, and
+/// return the entry's MAP KEY alongside it.
+///
+/// **This is load-bearing, not defensive (review r1, omp/GLM-5.3).** The
+/// `named_groups` map is keyed by whichever alias this daemon learned the
+/// group under, and the apply path installs the marker under that map key
+/// (`resolved_group_key`, `named_groups.rs:9124`). History rows, by
+/// contrast, are always scoped by the **stable** id: the ingest record uses
+/// `GroupPublicMessage.group_id` (`named_groups.rs:13723`), and
+/// `GET /history/scopes` therefore hands the operator `group:<stable id>`.
+/// A bare `get(group_id)` misses the marker exactly when key ≠ stable id —
+/// and on the purge path a missed marker is not a degraded answer, it is a
+/// **deletion of the forensic record row 14 exists to protect**. So this
+/// resolves the same way the metadata apply path does: direct key hit
+/// first, then a scan by `stable_group_id()`. The scan is bounded by the
+/// group count and runs only at the lookup points below.
+///
+/// The key is returned because the manual clear endpoint
+/// (`clear_group_quarantine`, `named_groups.rs:12607`) looks the group up by
+/// **map key only** — so a refusal must name that spelling in its §5 remedy,
+/// or it would hand the operator an id its own clear route cannot find.
+///
+/// Slice 3 (#744, `delegations::fork_quarantine_marker`) and slice 6 (#745,
+/// `ws::fork_quarantine_annotation`) carry the same two-spelling resolver by
+/// deliberate duplication; folding the three into one shared helper is a
+/// follow-up, not a slice-4 refactor.
+fn resolve_group_entry<'a>(
+    groups: &'a std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<(&'a String, &'a x0x::groups::GroupInfo)> {
+    groups.get_key_value(group_id).or_else(|| {
+        groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == group_id)
+    })
+}
+
 /// Markers for the group scopes named by `scopes` (deduplicated, ordered
 /// by canonical scope so a response is stable page to page). Takes the
 /// `named_groups` read lock exactly once.
+///
+/// Each marker is reported under the scope spelling the CALLER used, which
+/// is also the spelling its rows carry — the lookup accepts either (see
+/// [`resolve_group_entry`]), so an alias-keyed group annotates whether the
+/// request named it by alias or by stable id.
 pub(in crate::server) async fn markers_for_scopes<'a>(
     state: &AppState,
     scopes: impl IntoIterator<Item = &'a Scope>,
@@ -232,7 +274,8 @@ pub(in crate::server) async fn markers_for_scopes<'a>(
     wanted
         .into_iter()
         .filter_map(|id| {
-            let marker = groups.get(id)?.fork_quarantine.clone()?;
+            let (_, info) = resolve_group_entry(&groups, id)?;
+            let marker = info.fork_quarantine.clone()?;
             Some((Scope::Group(id.to_string()).canonical(), marker))
         })
         .collect()
@@ -241,16 +284,28 @@ pub(in crate::server) async fn markers_for_scopes<'a>(
 /// Every group this node currently holds a marker for. Used by the two
 /// node-wide surfaces (`/history/stats`, `/diagnostics/history`), where
 /// "in view" is the whole store rather than one scope.
+///
+/// **Both spellings are listed when they differ**, because these two
+/// surfaces are where an operator learns which scopes are contested and
+/// then goes and queries them: the map key is what the clear route accepts,
+/// the stable id is what `GET /history/scopes` and the rows themselves
+/// carry, and printing only one of the two would send the operator to a
+/// scope string that returns nothing.
 async fn all_quarantine_markers(state: &AppState) -> Vec<ScopeMarker> {
     let groups = state.named_groups.read().await;
-    let mut markers: Vec<ScopeMarker> = groups
-        .iter()
-        .filter_map(|(id, info)| {
-            let marker = info.fork_quarantine.clone()?;
-            Some((Scope::Group(id.clone()).canonical(), marker))
-        })
-        .collect();
+    let mut markers: Vec<ScopeMarker> = Vec::new();
+    for (key, info) in groups.iter() {
+        let Some(marker) = info.fork_quarantine.clone() else {
+            continue;
+        };
+        let stable = info.stable_group_id();
+        if stable != key.as_str() {
+            markers.push((Scope::Group(stable.to_string()).canonical(), marker.clone()));
+        }
+        markers.push((Scope::Group(key.clone()).canonical(), marker));
+    }
     markers.sort_by(|(a, _), (b, _)| a.cmp(b));
+    markers.dedup_by(|(a, _), (b, _)| a == b);
     markers
 }
 
@@ -693,10 +748,18 @@ pub(in crate::server) async fn history_purge(
         // §3e: the one shared refusal helper, so this route inherits the
         // §5 message (machine `reason`, remedy-bearing `error`, and the
         // `fork_quarantine` object) instead of minting its own wording.
+        //
+        // BOTH SPELLINGS (review r1): the purge scope an operator holds is
+        // `group:<stable id>` — that is what the rows carry and what
+        // `GET /history/scopes` lists — while the marker sits under the map
+        // key. A single-spelling lookup here does not merely miss an
+        // annotation; it lets `Store::purge` below destroy the forensic
+        // record of a quarantined group. The refusal names the resolved MAP
+        // KEY, because that is the id the manual clear route accepts.
         let refusal = {
             let groups = state.named_groups.read().await;
-            groups.get(group_id).and_then(|info| {
-                crate::server::routes::named_groups::reject_fork_quarantined(&state, group_id, info)
+            resolve_group_entry(&groups, group_id).and_then(|(key, info)| {
+                crate::server::routes::named_groups::reject_fork_quarantined(&state, key, info)
             })
         };
         if let Some(refusal) = refusal {
@@ -1555,6 +1618,12 @@ mod adr0066_fork_quarantine_tests {
 
     const QUARANTINED: &str = "contested-group";
     const CLEAN: &str = "quiet-group";
+    /// The ALIAS-keyed contested group (review r1): the roster map key this
+    /// daemon learned it under…
+    const ALIAS_KEY: &str = "alias-key-a";
+    /// …and the STABLE id its history rows are scoped by. `ALIAS_KEY !=
+    /// ALIAS_STABLE` is the whole point of the fixture.
+    const ALIAS_STABLE: &str = "stable-id-s";
     /// Local observation time of the fork evidence. Rows seen before it
     /// predate the incident; rows seen at or after it arrived on a
     /// contested roster (R3).
@@ -1610,6 +1679,25 @@ mod adr0066_fork_quarantine_tests {
         }
     }
 
+    /// Rows for the ALIAS-keyed group, scoped by its STABLE id exactly as
+    /// the ingest path scopes them (`GroupPublicMessage.group_id`). One row
+    /// before the evidence, one after, so the ingest tag has something to
+    /// discriminate.
+    fn seed_alias_rows(state: &AppState) {
+        let store = state.agent.history().expect("history enabled").store();
+        for (body, seen) in [
+            ("alias row before the fork", 1_000),
+            (
+                "alias row after the fork",
+                i64::try_from(OBSERVED_AT_MS).unwrap_or(i64::MAX) + 500,
+            ),
+        ] {
+            store
+                .insert(&text_row(Scope::Group(ALIAS_STABLE.into()), body, seen))
+                .expect("insert");
+        }
+    }
+
     /// The full content of the store, in a form a purge cannot survive:
     /// every row of every scope with its id, scope, payload bytes and
     /// receipt time. Compared before and after a refused purge, this is
@@ -1647,12 +1735,30 @@ mod adr0066_fork_quarantine_tests {
     /// automatically — the sharpest case for both the refusal and its
     /// message.
     async fn quarantine(state: &AppState, group_id: &str) {
+        // The simple shape: this daemon learned the group under its own
+        // stable id, so map key == stable id == history scope id.
+        quarantine_under(state, group_id, group_id).await;
+    }
+
+    /// The ALIAS shape, which production reaches routinely: the roster map
+    /// is keyed by whatever id this daemon learned the group under
+    /// (`resolved_group_key`), while history rows are scoped by the group's
+    /// STABLE id. `map_key` is where the marker lives; `stable_id` is what
+    /// `GET /history/scopes` lists and what a purge request names.
+    async fn quarantine_under(state: &AppState, map_key: &str, stable_id: &str) {
         let creator = state.agent.agent_id();
         let mut info = x0x::groups::GroupInfo::new(
-            group_id.to_string(),
+            map_key.to_string(),
             "adr-0066 slice 4 fixture".to_string(),
             creator,
-            format!("mls-{group_id}"),
+            // `stable_group_id()` falls back to `mls_group_id` with no
+            // genesis record, so this is what makes key ≠ stable id.
+            stable_id.to_string(),
+        );
+        assert_eq!(
+            info.stable_group_id(),
+            stable_id,
+            "fixture precondition: the group's stable id is the scope its rows carry"
         );
         info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
             revision: 9,
@@ -1670,7 +1776,7 @@ mod adr0066_fork_quarantine_tests {
             .named_groups
             .write()
             .await
-            .insert(group_id.to_string(), info);
+            .insert(map_key.to_string(), info);
     }
 
     /// A group present in state with NO marker — the control that proves
@@ -1915,6 +2021,192 @@ mod adr0066_fork_quarantine_tests {
                 "{path} names exactly the quarantined groups: {json}"
             );
         }
+        Ok(())
+    }
+
+    /// WHY (review r1, omp/GLM-5.3 — the defect this test exists for): the
+    /// roster map is keyed by whichever id this daemon learned the group
+    /// under, while history rows are scoped by the group's STABLE id. A
+    /// single-spelling `groups.get(scope_id)` therefore misses the marker
+    /// for every alias-keyed group — and on THIS path a missed marker is not
+    /// a missing label, it is `Store::purge` destroying the forensic record
+    /// of a quarantined group. That is row 14's exact failure mode, reached
+    /// with the very scope string `GET /history/scopes` hands the operator.
+    ///
+    /// The tests above cannot catch it: they seed map key and rows under one
+    /// spelling, so a bare `get` looks correct. This one makes key ≠ stable
+    /// id, purges by the STABLE id (the rows' own spelling), and checks the
+    /// store afterwards.
+    #[tokio::test]
+    async fn alias_keyed_purge_is_refused_under_the_stable_scope_and_the_store_is_untouched(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed_alias_rows(&state);
+        quarantine_under(&state, ALIAS_KEY, ALIAS_STABLE).await;
+        let app = full_history_router(Arc::clone(&state));
+        let before = store_snapshot(&state);
+        assert_eq!(before.len(), 2, "precondition: two alias-scoped rows");
+        assert!(
+            before
+                .iter()
+                .all(|(_, scope, _, _)| scope == "group:stable-id-s"),
+            "precondition: rows carry the STABLE spelling, not the map key: {before:?}"
+        );
+
+        // The spelling an operator actually holds: the one /history/scopes
+        // lists and the rows carry.
+        let (status, json) = call(&app, "DELETE", "/history?scope=group:stable-id-s").await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a purge naming the STABLE id must still find the alias-keyed marker: {json}"
+        );
+        assert_eq!(
+            store_snapshot(&state),
+            before,
+            "the alias-keyed group's forensic record must survive a purge attempt"
+        );
+        assert_eq!(json["reason"], "fork_quarantined", "{json}");
+        // The §5 remedy must name the MAP KEY: `clear_group_quarantine`
+        // looks its group up by map key only, so a sentence naming the
+        // stable id would hand the operator an id the clear route cannot
+        // find.
+        let message = json["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(ALIAS_KEY),
+            "the remedy must name the id the clear route accepts ({ALIAS_KEY}): {json}"
+        );
+
+        // Reverse spelling: a caller naming the ALIAS is refused too (the
+        // direct key hit). Its rows live under the stable id, so even a
+        // permitted purge would have deleted nothing — but the refusal is
+        // what keeps the two spellings from disagreeing about one group.
+        let (status, json) = call(&app, "DELETE", "/history?scope=group:alias-key-a").await;
+        assert_eq!(status, StatusCode::CONFLICT, "alias spelling: {json}");
+        assert_eq!(store_snapshot(&state), before, "still untouched");
+
+        // A DM scope with the same text is not group state and never
+        // consults the marker — proof the gate keys on the group, not on
+        // the string.
+        let (status, json) = call(&app, "DELETE", "/history?scope=dm:stable-id-s").await;
+        assert_eq!(status, StatusCode::OK, "dm scopes are unaffected: {json}");
+        Ok(())
+    }
+
+    /// WHY (review r1, rows 13 and 26): the same alias miss silently
+    /// un-annotates every read surface for exactly one group — the operator
+    /// sees an ordinary history during a live fork. Each surface is driven
+    /// with the STABLE spelling, because that is what the rows and
+    /// `/history/scopes` carry, and `markers_for_scopes` is additionally
+    /// exercised with BOTH spellings because it is the shared path
+    /// `GET /groups/:id/messages` (`named_groups.rs`) annotates through.
+    #[tokio::test]
+    async fn alias_keyed_group_annotates_every_read_surface_and_tags_ingest() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        seed_alias_rows(&state);
+        quarantine_under(&state, ALIAS_KEY, ALIAS_STABLE).await;
+        let app = full_history_router(Arc::clone(&state));
+
+        // Scoped list: annotated, and the ingest tag discriminates the row
+        // that arrived after the evidence (R3 tag-and-retain).
+        let (status, list) = call(&app, "GET", "/history?scope=group:stable-id-s").await;
+        assert_eq!(status, StatusCode::OK, "reads never refuse: {list}");
+        assert_eq!(list["count"], 2, "both alias rows still serve: {list}");
+        assert_eq!(list["fork_quarantined"], true, "{list}");
+        assert_eq!(
+            list["fork_quarantine"]["scopes"][0]["scope"], "group:stable-id-s",
+            "the annotation names the scope the caller asked for: {list}"
+        );
+        assert_eq!(list["fork_quarantine"]["scopes"][0]["no_anchor"], true);
+        let tagged = list["records"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| {
+                        row["fork_quarantined_at_ingest"] == serde_json::Value::Bool(true)
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            tagged, 1,
+            "exactly the post-evidence alias row is tagged: {list}"
+        );
+
+        // Cross-scope search, scope enumeration, and the two node-wide
+        // surfaces.
+        for path in [
+            "/history/search?q=alias",
+            "/history/scopes",
+            "/history/stats",
+            "/diagnostics/history",
+        ] {
+            let (status, json) = call(&app, "GET", path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {json}");
+            assert_eq!(
+                json["fork_quarantined"], true,
+                "{path} must label the alias-keyed group: {json}"
+            );
+        }
+
+        // The node-wide surfaces list BOTH spellings, so the operator can
+        // match the scope their rows carry AND the id the clear route takes.
+        let (_, stats) = call(&app, "GET", "/history/stats").await;
+        let listed: Vec<&str> = stats["fork_quarantine"]["scopes"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["scope"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            listed,
+            vec!["group:alias-key-a", "group:stable-id-s"],
+            "both spellings, sorted: {stats}"
+        );
+
+        // Point lookup by dedupe id, with no `?scope=` at all: the row's own
+        // scope resolves the marker.
+        let msg_id = hex::encode(x0x::history::HistoryRecord::compute_msg_id(
+            None,
+            b"alias row after the fork",
+        ));
+        let (status, one) = call(&app, "GET", &format!("/history/message/{msg_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        assert_eq!(one["fork_quarantined"], true, "{one}");
+        assert_eq!(
+            one["record"]["fork_quarantined_at_ingest"],
+            serde_json::Value::Bool(true),
+            "{one}"
+        );
+
+        // The shared resolver both this module and `/groups/:id/messages`
+        // annotate through: EITHER spelling finds the one marker.
+        for spelling in [ALIAS_STABLE, ALIAS_KEY] {
+            let markers =
+                markers_for_scopes(&state, std::iter::once(&Scope::Group(spelling.to_string())))
+                    .await;
+            assert_eq!(
+                markers.len(),
+                1,
+                "markers_for_scopes must resolve `{spelling}` to the alias-keyed marker"
+            );
+            assert_eq!(markers[0].0, format!("group:{spelling}"));
+            assert_eq!(markers[0].1.revision, 9);
+        }
+
+        // And a group that is not quarantined at all stays unlabelled even
+        // though it shares the store.
+        unquarantined(&state, CLEAN).await;
+        let (_, other) = call(&app, "GET", "/history?scope=group:quiet-group").await;
+        assert!(
+            other.get("fork_quarantined").is_none(),
+            "the control group must not inherit the neighbour's label: {other}"
+        );
         Ok(())
     }
 }

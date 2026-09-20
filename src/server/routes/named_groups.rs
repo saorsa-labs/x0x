@@ -13680,6 +13680,11 @@ pub(in crate::server) async fn get_group_public_messages(
     // `GroupPublicMessage` objects rather than store rows, so there is no
     // per-row `seen_at_ms` to carry the R3 ingest tag — `GET /history` is
     // where a reader gets that.
+    //
+    // `stable_id` is deliberately the lookup key: `markers_for_scopes`
+    // resolves BOTH spellings (map key or stable id — review r1), so this
+    // annotates whether the URL named the alias this daemon keys the group
+    // under or the stable id the rows carry.
     let markers = crate::server::routes::history::markers_for_scopes(
         &state,
         std::iter::once(&x0x::history::Scope::Group(stable_id.clone())),

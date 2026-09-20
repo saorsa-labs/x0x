@@ -39,8 +39,19 @@ All notable changes to this project will be documented in this file.
   `GET /groups/:id/messages` — the one gap slice 2's coverage fixture found in
   the ADR's own §1 map — is folded in here as part of row 13 and annotated at
   the envelope only (its payload is signed messages, not store rows, so it
-  carries no per-row ingest tag). Rows closed: **13, 14, 26**. Docs:
-  `docs/api-reference.md`, `docs/runbooks/fork-quarantine.md`.
+  carries no per-row ingest tag). **The marker is found under either spelling
+  of the group id** (cross-model review r1): history rows are scoped by the
+  group's *stable* id while the roster map — and therefore the marker — is
+  keyed by whichever alias this daemon learned the group under, so the purge
+  gate and every annotation resolve direct-key-then-stable-id, the way the
+  metadata apply path does. A single-spelling lookup would have let
+  `DELETE /history?scope=group:<stable id>` delete an alias-keyed quarantined
+  group's forensic record — the exact failure row 14 exists to prevent. The
+  refusal names the map key, because that is the id the manual clear route
+  accepts, and `/history/stats` + `/diagnostics/history` list both spellings so
+  an operator can match the scope their rows carry as well as the id they must
+  clear. Rows closed: **13, 14, 26**. Docs: `docs/api-reference.md`,
+  `docs/runbooks/fork-quarantine.md`.
 
 - **Ordinary (non-owner-axis) groups now receive the fork-quarantine marker
   (ADR-0066 §2, slice 2; #732) — a NEW availability failure mode with no
