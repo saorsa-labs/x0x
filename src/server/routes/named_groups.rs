@@ -13672,9 +13672,30 @@ pub(in crate::server) async fn get_group_public_messages(
         })
         .collect();
 
+    // ADR-0066 §3a (slice 4): this is the group plane's own ADR-0023 read —
+    // the §1 map gap slice 2's coverage fixture recorded as
+    // `GET /groups/:id/messages`. It is an ANNOTATE-class read, never
+    // refused, and it reuses the history surface's annotation verbatim so
+    // the two cannot drift. Envelope-level only: the payload here is
+    // `GroupPublicMessage` objects rather than store rows, so there is no
+    // per-row `seen_at_ms` to carry the R3 ingest tag — `GET /history` is
+    // where a reader gets that.
+    //
+    // `stable_id` is deliberately the lookup key: `markers_for_scopes`
+    // resolves BOTH spellings (map key or stable id — review r1), so this
+    // annotates whether the URL named the alias this daemon keys the group
+    // under or the stable id the rows carry.
+    let markers = crate::server::routes::history::markers_for_scopes(
+        &state,
+        std::iter::once(&x0x::history::Scope::Group(stable_id.clone())),
+    )
+    .await;
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "messages": messages_with_id })),
+        Json(crate::server::routes::history::annotate(
+            serde_json::json!({ "ok": true, "messages": messages_with_id }),
+            &markers,
+        )),
     )
 }
 

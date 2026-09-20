@@ -182,7 +182,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
-        closed: false,
+        closed: true,
     },
     CoverageRow {
         row: 14,
@@ -190,7 +190,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Refuse,
         closed_by_slice: Some(4),
-        closed: false,
+        closed: true,
     },
     CoverageRow {
         row: 15,
@@ -286,7 +286,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         anchor: "src/server/routes/history.rs",
         disposition: Disposition::Annotate,
         closed_by_slice: Some(4),
-        closed: false,
+        closed: true,
     },
 ];
 
@@ -316,12 +316,16 @@ enum RouteClass {
     /// A group-scoped path the §1 map does NOT name, recorded as a gap in
     /// the map rather than quietly folded into a neighbouring row.
     ///
-    /// The one current entry is a READ path, so the gap is in the
-    /// annotate class (§3a/§3d), never the refuse class — no authority
-    /// escapes through it. It is reported on the slice-2 PR for the
-    /// slice that owns annotations (slice 4/6) or a superseding ADR to
-    /// absorb. The set is asserted EXACTLY, so a new unmapped route fails
-    /// this fixture instead of joining a growing list.
+    /// **Currently unused, deliberately kept.** The one entry slice 2
+    /// found (`GET /groups/:id/messages`) was an annotate-class READ on
+    /// the history store, so slice 4 annotated it and moved it to row 13.
+    /// The variant stays because it is the classification the NEXT
+    /// unmapped route gets while review decides: a read joins the annotate
+    /// class (§3a/§3d); anything carrying authority needs a superseding
+    /// ADR before it may be left ungated. The set is asserted EXACTLY, so
+    /// a new unmapped route fails this fixture instead of joining a
+    /// growing list.
+    #[allow(dead_code)]
     MapGap,
 }
 
@@ -364,6 +368,15 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ("GET /history/stats", RouteClass::Covered(&[13])),
     ("DELETE /history", RouteClass::Covered(&[14])),
     ("GET /diagnostics/history", RouteClass::Covered(&[26])),
+    // The §1 map gap slice 2 recorded, ABSORBED by slice 4: this is the
+    // group plane's own ADR-0023 read (it queries the same history store
+    // for `group:<stable_id>` rows), so it is row 13's surface even though
+    // its handler lives in `named_groups.rs`. It carries the identical
+    // annotation, reusing `history::annotate` rather than a second
+    // dialect. Envelope-level only — its payload is `GroupPublicMessage`
+    // objects, not store rows, so there is no per-row `seen_at_ms` for the
+    // R3 ingest tag.
+    ("GET /groups/:id/messages", RouteClass::Covered(&[13])),
     // ── §1 rows 15, 16: delegations ─────────────────────────────────────
     ("POST /groups/:id/delegate", RouteClass::Covered(&[15])),
     ("GET /groups/:id/delegations", RouteClass::Covered(&[16])),
@@ -463,12 +476,18 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
         RouteClass::NotStateBound,
     ),
     // ── Gaps in the §1 map (read paths only — see RouteClass::MapGap) ───
-    ("GET /groups/:id/messages", RouteClass::MapGap),
+    // Empty: slice 4 absorbed the one gap slice 2 found
+    // (`GET /groups/:id/messages`, reclassified as row 13 above).
 ];
 
 /// The exact, complete set of §1 map gaps. Asserted as an equality, not a
 /// subset: a newly discovered gap must be argued for, not appended.
-const KNOWN_MAP_GAPS: &[&str] = &["GET /groups/:id/messages"];
+///
+/// Empty since slice 4: the single gap slice 2 recorded
+/// (`GET /groups/:id/messages`) was an annotate-class read on the history
+/// store, so slice 4 annotated it and reclassified it as row 13 rather
+/// than leaving the map permanently one route short.
+const KNOWN_MAP_GAPS: &[&str] = &[];
 
 /// The surfaces ADR-0066 §1 censused. A registry route under any of these
 /// prefixes is part of the data-plane candidate surface and must be
@@ -600,9 +619,9 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     // that closing a row and reopening another cannot cancel out, and so
     // that a slice which lands its code without updating this map fails
     // here instead of leaving the map quietly describing a tree that no
-    // longer exists. Slice 3 closed 15–19, slice 5 closed 20 and 21, and
-    // slice 6 closed 25; what remains is slice 4 (13, 14, 26) and slice 7
-    // (22).
+    // longer exists. Slice 3 closed 15–19, slice 4 closed 13, 14 and 26,
+    // slice 5 closed 20 and 21, and slice 6 closed 25; what remains is the
+    // §4 epoch token, slice 7 (22).
     let open: Vec<u8> = COVERAGE_MAP
         .iter()
         .filter(|row| !row.closed)
@@ -641,7 +660,7 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
 }
 
 /// The §1 rows whose behaviour change has not landed yet, in row order.
-const OPEN_ROWS: &[u8] = &[13, 14, 22, 26];
+const OPEN_ROWS: &[u8] = &[22];
 
 /// WHY (ADR-0066 Validation, the fixture's whole reason for existing):
 /// every route on the censused surface must be explicitly classified. Row

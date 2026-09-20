@@ -1911,6 +1911,79 @@ the auth middleware answers `403` on both before the handler runs; a rider
 can neither read rows nor learn row counts for scopes outside its grants.
 That boundary is unchanged by this issue.
 
+### Fork quarantine on the history surface (ADR-0066 §3a)
+
+While this node holds a fork-quarantine marker for a group (see the 409
+`fork_quarantined` section under Error handling), the history surface splits in
+two: **reads always serve, the purge always refuses.**
+
+**Reads are annotated, never refused.** `GET /history`,
+`GET /history/message/:msg_id`, `GET /history/search`, `GET /history/scopes`,
+`GET /history/stats`, `GET /diagnostics/history` and
+`GET /groups/:id/messages` return the same rows they always did and add two
+envelope fields:
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "records": [
+    {"scope": "group:g1", "seen_at_ms": 1788091400000, "fork_quarantined_at_ingest": true}
+  ],
+  "fork_quarantined": true,
+  "fork_quarantine": {
+    "clear_with": "POST /groups/:id/quarantine/clear",
+    "scopes": [
+      {"scope": "group:g1", "revision": 9,
+       "observed_at_ms": 1788091300000, "no_anchor": true}
+    ]
+  }
+}
+```
+
+- `fork_quarantined` is a flag; `fork_quarantine.scopes` names every
+  quarantined group **in view**, each with the marker's `revision`,
+  `observed_at_ms` and `no_anchor` — the same fields the 409 body carries.
+  It is a list because these surfaces are not single-group: a cross-scope
+  search, scope enumeration, `/history/stats` and `/diagnostics/history` can
+  each see several at once. For the two node-wide surfaces, "in view" means
+  every group this node has quarantined.
+- **Both keys are absent when nothing in view is quarantined** — not `false`,
+  not `null` — so an existing client's body is byte-identical. No client is
+  required to read them.
+- `fork_quarantined_at_ingest` on a **row** means that row arrived at or after
+  the marker's `observed_at_ms`, i.e. on a contested roster. Ingest is never
+  refused (ADR-0066 R3: refusing it would blank the record across exactly the
+  incident window), so this tag is what separates the incident from the
+  group's earlier traffic. It is derived from the live marker rather than
+  stored, so a manual clear drops the label while keeping every row.
+  `GET /groups/:id/messages` serves signed messages rather than store rows and
+  therefore carries the envelope annotation only.
+- Why reads are never refused: the durable record is the operator's only view
+  of a fork while it is happening, and refusing it would delete that view at
+  the moment it matters most (ADR-0066 Drivers).
+
+**`DELETE /history?scope=group:<ID>` is refused** with the 409
+`fork_quarantined` body while the marker is set, and the check runs **before**
+any deletion, so the store is left unchanged. A purge destroys the ADR-0023
+forensic record irreversibly — the one thing quarantine exists to preserve —
+so it fails closed from the first request after the marker installs (ADR-0066
+R5: no warn-only window). DM and topic scopes are unaffected; only
+`group:<ID>` scopes consult the marker. The remedy is the marker's own: clear
+it (`x0x groups quarantine clear <ID>`, adding `--force --reason "…"` for an
+ordinary group), then purge.
+
+**Either spelling of the group id works.** History rows are scoped by the
+group's **stable** id (what `GET /history/scopes` lists), while a daemon's
+roster — and therefore the marker — is keyed by whichever id that daemon
+learned the group under; the two can differ. Both the purge gate and every
+annotation resolve the direct key first and then by stable id, so the refusal
+and the label are the same whichever spelling you use. The refusal's `error`
+sentence names the **roster key**, because `POST /groups/:id/quarantine/clear`
+looks a group up by that key only, and `/history/stats` +
+`/diagnostics/history` list both spellings when they differ — the stable one to
+query rows with, the key one to clear with.
+
 ## Remote exec
 
 Run a command on **another** agent's machine. Disabled by default; every request is authorized on the **responder** (target) daemon, not the caller. The target runs `argv` only if remote exec is enabled there, the sender is a verified `Accept`-trust contact, and the `(agent_id, machine_id)` pair + exact argv are allow-listed in its exec ACL (`docs/exec.md`). `argv` is never shell-interpreted. A denied request still returns `200` with a non-null `denial_reason` (e.g. `exec_disabled`, `unverified_sender`, `trust_rejected`, `agent_machine_not_in_acl`, `argv_not_allowed`, `cwd_not_allowed`, `shell_metachar_in_argv`) — the refusal is carried in the body, not the HTTP status.
@@ -2205,7 +2278,11 @@ membership-gated routes (`POST /groups/:id/send`, TreeKEM encrypt/decrypt, and
 the `secure/encrypt`, `secure/decrypt`, `secure/reseal` family), the delegation
 grant (`POST /groups/:id/delegate`, ADR-0066 §3b) and the group-scoped
 task-list mutations (`POST /task-lists`, `POST /task-lists/:id/tasks`,
-`PATCH /task-lists/:id/tasks/:tid`, ADR-0066 §3c) refuse with:
+`PATCH /task-lists/:id/tasks/:tid`, ADR-0066 §3c) refuse with the body below —
+and so does `DELETE /history?scope=group:<ID>` (ADR-0066 §3a: the purge destroys
+the forensic record, while history **reads** stay open and are annotated instead
+— see
+[Fork quarantine on the history surface](#fork-quarantine-on-the-history-surface-adr-0066-3a)):
 
 ```json
 {
