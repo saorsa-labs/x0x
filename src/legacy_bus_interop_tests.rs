@@ -1019,6 +1019,7 @@ fn check_eager_mesh_for_diamond(
 // validated here can become pre_cut; timed-out partial acquisitions are dropped.
 async fn capture_ready_diamond<F, Fut>(
     topology: &serde_json::Value,
+    non_subscriber_indices: &[usize],
     start: tokio::time::Instant,
     deadline: tokio::time::Instant,
     mut observe: F,
@@ -1081,18 +1082,9 @@ where
                 return Err(rejected);
             }
         };
-        // Extract declared non-subscriber indices from topology (set by shape_diamond).
-        // Empty when absent: all nodes are treated as DM bus subscribers.
-        let non_sub_indices: Vec<usize> = topology["dm_bus_non_subscriber_indices"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as usize))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let validation = diamond_peer_sets(topology, &observed)
-            .and_then(|()| check_eager_mesh_for_diamond(&observed, identities, &non_sub_indices));
+        let validation = diamond_peer_sets(topology, &observed).and_then(|()| {
+            check_eager_mesh_for_diamond(&observed, identities, non_subscriber_indices)
+        });
         attempt.validation_end_ns = readiness_offset(start, tokio::time::Instant::now());
         rejected.diagnostics.clock_incomplete |= attempt.validation_end_ns.is_none();
         match validation {
@@ -1164,19 +1156,8 @@ async fn shape_diamond(
             )
         })
         .collect();
-    // dm_bus_non_subscriber_indices: DIAMOND_LABELS indices of nodes built with
-    // with_skip_legacy_dm_bus(true) or otherwise not subscribed to the DM bus.
-    // Consumed by capture_ready_diamond → check_eager_mesh_for_diamond to decide
-    // whether a missing DM bus topic entry is a configuration invariant violation
-    // (non-subscriber with the topic) or a retryable failure (subscriber without).
-    let non_sub_json: serde_json::Value = dm_bus_non_subscriber_label_indices
-        .iter()
-        .map(|&i| serde_json::Value::Number(i.into()))
-        .collect::<Vec<_>>()
-        .into();
     raw["topology"] = serde_json::json!({"expected_allowed":expected,
         "forbidden_pairs":[["G5","W5"],["D5","O5"]],"peer_ids":peer_ids,
-        "dm_bus_non_subscriber_indices":non_sub_json,
         "operations":{},"observations":{},"suppression":{},"intervening_allowed_edge_state":"unknown",
         "configuration":"two reverse test Admin installations and two public forward disconnects; gossip admission only"});
     let mut originals = Vec::new();
@@ -1217,6 +1198,7 @@ async fn shape_diamond(
     let start = tokio::time::Instant::now();
     let pre_cut = capture_ready_diamond(
         &raw["topology"],
+        dm_bus_non_subscriber_label_indices,
         start,
         start + SETUP,
         |attempt| async move {
@@ -2402,11 +2384,12 @@ async fn diamond_readiness_returns_exact_validated_post_refresh_observation() {
     valid["W5"]["end_ns"] = serde_json::json!(12346);
     let mut observations = std::collections::VecDeque::from([missing, valid.clone()]);
     let start = tokio::time::Instant::now();
-    let observed = capture_ready_diamond(topology, start, start + Duration::from_secs(1), |_| {
-        std::future::ready(Ok(observations.pop_front().expect("two acquisitions")))
-    })
-    .await
-    .expect("second full observation is exact");
+    let observed =
+        capture_ready_diamond(topology, &[], start, start + Duration::from_secs(1), |_| {
+            std::future::ready(Ok(observations.pop_front().expect("two acquisitions")))
+        })
+        .await
+        .expect("second full observation is exact");
     assert_eq!(
         observed, valid,
         "retain every field and interval of the admitted object"
@@ -2435,6 +2418,7 @@ async fn diamond_readiness_retains_rejection_on_absolute_deadline() {
         let start = tokio::time::Instant::now();
         let result = capture_ready_diamond(
             &raw["topology"],
+            &[],
             start,
             start + Duration::from_millis(30),
             |_| {
@@ -2479,6 +2463,7 @@ async fn diamond_readiness_reports_no_completed_observation() {
     let start = tokio::time::Instant::now();
     let rejected = capture_ready_diamond(
         &raw["topology"],
+        &[],
         start,
         start + Duration::from_millis(10),
         |_| std::future::pending::<Result<serde_json::Value, String>>(),
@@ -2508,6 +2493,7 @@ async fn diamond_readiness_retains_last_rejection_on_acquisition_error() {
     let start = tokio::time::Instant::now();
     let rejected = capture_ready_diamond(
         &raw["topology"],
+        &[],
         start,
         start + Duration::from_secs(1),
         |_| std::future::ready(observations.pop_front().expect("two acquisitions")),
@@ -2537,18 +2523,19 @@ async fn readiness_diagnostic_distinguishes_terminal_branches_and_counts() {
             } else {
                 Duration::from_millis(5)
             };
-        let result = capture_ready_diamond(&raw["topology"], start, deadline, |_| async move {
-            match stage {
-                ReadinessTerminal::BeforeAcquireDeadline => {
-                    panic!("must not acquire after deadline")
+        let result =
+            capture_ready_diamond(&raw["topology"], &[], start, deadline, |_| async move {
+                match stage {
+                    ReadinessTerminal::BeforeAcquireDeadline => {
+                        panic!("must not acquire after deadline")
+                    }
+                    ReadinessTerminal::AcquireTimedOut => std::future::pending().await,
+                    ReadinessTerminal::AcquireError => Err("inert acquisition".to_owned()),
+                    _ => Ok(serde_json::json!({})),
                 }
-                ReadinessTerminal::AcquireTimedOut => std::future::pending().await,
-                ReadinessTerminal::AcquireError => Err("inert acquisition".to_owned()),
-                _ => Ok(serde_json::json!({})),
-            }
-        })
-        .await
-        .expect_err("every terminal branch remains nonpass");
+            })
+            .await
+            .expect_err("every terminal branch remains nonpass");
         let diag = result.diagnostics;
         assert_eq!(diag.terminal_stage, Some(stage));
         assert_eq!(diag.start_ns, 0);
@@ -2591,6 +2578,7 @@ async fn readiness_diagnostic_labels_late_valid_without_retaining_graph() {
     // arrive at the deadline and must still fail the separate validation-time check.
     let rejected = capture_ready_diamond(
         &raw["topology"],
+        &[],
         start,
         start + Duration::from_millis(1),
         |_| {
@@ -2623,6 +2611,7 @@ async fn readiness_diagnostic_keeps_distinct_rejected_and_partial_actual_core_at
     let start = tokio::time::Instant::now();
     let rejected = capture_ready_diamond(
         &raw["topology"],
+        &[],
         start,
         start + Duration::from_millis(30),
         |attempt| {
@@ -3565,4 +3554,48 @@ fn eager_mesh_for_diamond_declared_non_subscriber_with_topic_is_err() {
         msg.contains("O5"),
         "error must name the violating node; got: {msg}"
     );
+}
+
+// validate_topology rejects observations that still carry peer_scores_by_topic
+// (the field added by diamond_observations_with_recorder for oracle use), and
+// accepts observations where strip_peer_scores has removed it.  This pins the
+// topology-contract invariant so a regression surfaces inertly in CI rather
+// than through a live integration test panic.
+#[test]
+fn validate_topology_rejects_observation_with_extra_key() {
+    let mut evidence = synthetic_diamond_evidence();
+    // Inject the oracle field into one pre_cut observation, simulating the
+    // storage bug that existed before strip_peer_scores was applied.
+    evidence["topology"]["observations"]["pre_cut"]["G5"]["peer_scores_by_topic"] =
+        serde_json::Value::Null;
+    let result = validate_measurement(&evidence);
+    assert!(
+        result.is_err(),
+        "validate_topology must reject an observation carrying peer_scores_by_topic"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("topology keys mismatch"),
+        "expected 'topology keys mismatch'; got: {msg}"
+    );
+}
+
+#[test]
+fn validate_topology_accepts_stripped_observations() {
+    // synthetic_diamond_evidence already produces clean observations
+    // ({"admitted","begin_ns","end_ns"} only), so validate_measurement must pass
+    // the topology-contract portion of its checks.
+    let evidence = synthetic_diamond_evidence();
+    // validate_measurement may fail for reasons beyond topology keys (e.g. load
+    // counters not present in synthetic data), but the topology-key check must
+    // NOT be among them.
+    match validate_measurement(&evidence) {
+        Ok(()) => {} // clean pass — fine
+        Err(e) => {
+            assert!(
+                !e.contains("topology keys mismatch"),
+                "stripped observations must not trigger topology-key check; got: {e}"
+            );
+        }
+    }
 }
