@@ -2631,3 +2631,544 @@ fn adr0066_marker_persisted_before_the_field_decodes_as_owner_axis() -> Result<(
     assert_eq!(round_tripped, marker, "and the record is byte-equal");
     Ok(())
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// #732 — the STARTUP / JOURNAL-RECOVERY containment gap (GPT-6 Astra audit,
+// findings 1 and 2).
+//
+// Both defects live on the file-level recovery path that runs BEFORE the
+// in-memory roster loads and before any listener starts (`server::mod`
+// ordering), so every fixture here is on-disk state plus the production
+// recovery entry point — never a daemon.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A group sealed TWICE, so its retained commit log holds the revision-1
+/// predecessor that `fork_candidate_authenticated` authenticates a
+/// conflicting revision-2 commit against. Returns the base (revision 1), the
+/// advanced record (revision 2) and the signer that sealed both.
+fn recovery_fixture(
+    group_id: &str,
+    policy: GroupPolicy,
+) -> Result<(x0x::groups::GroupInfo, x0x::groups::GroupInfo, AgentKeypair)> {
+    let kp = AgentKeypair::generate()?;
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "recovery-under-test".to_string(),
+        String::new(),
+        crate::identity::AgentId::from_public_key(kp.public_key()),
+        group_id.to_string(),
+        policy,
+    );
+    info.seal_commit(&kp, now_millis_u64())?;
+    let base = info.clone();
+    info.description = "advanced".to_string();
+    info.seal_commit(&kp, now_millis_u64())?;
+    Ok((base, info, kp))
+}
+
+/// One record, encoded as the whole-file store image both the journal and the
+/// live store files use.
+fn store_image(key: &str, info: &x0x::groups::GroupInfo) -> Result<String> {
+    let mut view: HashMap<String, x0x::groups::GroupInfo> = HashMap::new();
+    view.insert(key.to_string(), info.clone());
+    Ok(serde_json::to_string(&view)?)
+}
+
+async fn read_store(path: &std::path::Path) -> Result<HashMap<String, x0x::groups::GroupInfo>> {
+    let json = tokio::fs::read_to_string(path).await?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+/// A durable `no_anchor` marker at the group's CURRENT frontier — the shape an
+/// authenticated fork observation installs, which deliberately advances
+/// neither `state_revision` nor `state_hash`.
+fn marker_at_frontier(info: &x0x::groups::GroupInfo) -> x0x::groups::ForkQuarantine {
+    x0x::groups::ForkQuarantine {
+        revision: info.state_revision,
+        state_hash: info.state_hash.clone(),
+        committed_by: "9c".repeat(32),
+        observed_at_ms: 1_700_000_000_000,
+        snapshot: x0x::groups::ForkSnapshot {
+            terminal_commit: info.terminal_commit_header(),
+            conflicting_commit: info.terminal_commit_header(),
+            classification: None,
+        },
+        no_anchor: info.policy.admission.owner_certified_user_id().is_none(),
+    }
+}
+
+fn evidence_at_frontier(info: &x0x::groups::GroupInfo) -> x0x::groups::ForkEvidence {
+    x0x::groups::ForkEvidence {
+        revision: info.state_revision,
+        state_hash: info.state_hash.clone(),
+        committed_by: "9c".repeat(32),
+        observed_at_ms: 1_700_000_000_000,
+    }
+}
+
+fn lineage_for(info: &x0x::groups::GroupInfo) -> x0x::groups::InviteLineage {
+    x0x::groups::InviteLineage {
+        base_revision: 1,
+        base_hash: info.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    }
+}
+
+/// WHY (#732 finding 1 — HIGH, CONFIRMED). A TreeKEM transaction whose
+/// snapshot/cleanup step fails AFTER the named save reached durability leaves
+/// BOTH journals at their live names on purpose (`persist_named_group_info`:
+/// "never discard a journal whose named half is durable"). The live record is
+/// then byte-equal to the journalled one, so the paired-replay verdict reads
+/// equal-revision/equal-hash and returns `Apply`. But an ADR-0066 marker
+/// installed in the meantime is NOT part of that frontier — the install
+/// advances neither revision nor hash — and the replay's wholesale record
+/// replacement therefore erased a containment decision that, being
+/// `no_anchor`, nothing would ever re-install automatically. A restart lifted
+/// the quarantine.
+///
+/// The claim this test defends: a marker is LOCAL containment state, and
+/// journal equality is not equality of containment.
+///
+/// Its two negative-control arms are what stop a vacuous pass. (a) the
+/// journal image genuinely carries no marker, and the replay still replaces
+/// every OTHER field of the live record — so this is not "the replay stopped
+/// writing". (b) a journal record that carries its OWN marker keeps it — so
+/// this is not "always prefer the live half", which would be a different (and
+/// wrong) rule.
+#[tokio::test]
+async fn issue732_journal_replay_preserves_a_durable_quarantine_marker() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = dir.path().join("named_groups.json");
+    let group_id = "d7".repeat(32);
+    let (_base, mut advanced, _kp) = recovery_fixture(&group_id, invite_only_policy())?;
+    advanced.invite_lineage = Some(lineage_for(&advanced));
+
+    // The journal image: the record exactly as the transaction staged it.
+    let journal_image = store_image(&group_id, &advanced)?;
+    assert!(
+        serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&journal_image)?[&group_id]
+            .fork_quarantine
+            .is_none(),
+        "negative control (a): the journal image must NOT already carry a marker, \
+         or the assertion below passes without the fix"
+    );
+
+    // The live half: the SAME committed frontier, plus the containment a
+    // later authenticated fork observation installed.
+    let mut contained = advanced.clone();
+    contained.fork_quarantine = Some(marker_at_frontier(&advanced));
+    contained.description = "stale-live-description".to_string();
+    if let Some(lineage) = contained.invite_lineage.as_mut() {
+        lineage.fork_evidence = Some(evidence_at_frontier(&advanced));
+    }
+    write_named_groups_json_atomic(&store, &store_image(&group_id, &contained)?).await?;
+
+    merge_group_record_into_store_file(&store, &group_id, &journal_image, "named groups").await?;
+
+    let after = read_store(&store).await?;
+    let record = &after[&group_id];
+    assert!(
+        record
+            .fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.revision == advanced.state_revision && marker.no_anchor),
+        "#732: the replay must carry the live marker forward — a restart is not a clear"
+    );
+    assert!(
+        record
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .is_some(),
+        "#732: the evidence record that justifies the marker survives with it"
+    );
+    // Negative control (a), the other half: the journalled record still wins
+    // everywhere else, so the fix did not disable the replay.
+    assert_eq!(
+        record.description, "advanced",
+        "the journalled roster/metadata still applies — only containment is preserved"
+    );
+    assert_eq!(record.state_revision, advanced.state_revision);
+    assert_eq!(record.state_hash, advanced.state_hash);
+
+    // Negative control (b): a journal record carrying its OWN marker keeps
+    // it. `first-complete-wins` is unchanged; the live half only FILLS an
+    // empty slot.
+    let mut journalled_marker = advanced.clone();
+    let mut own = marker_at_frontier(&advanced);
+    own.observed_at_ms = 1_600_000_000_000;
+    journalled_marker.fork_quarantine = Some(own);
+    let store_b = dir.path().join("named_groups_b.json");
+    write_named_groups_json_atomic(&store_b, &store_image(&group_id, &contained)?).await?;
+    merge_group_record_into_store_file(
+        &store_b,
+        &group_id,
+        &store_image(&group_id, &journalled_marker)?,
+        "named groups",
+    )
+    .await?;
+    assert_eq!(
+        read_store(&store_b).await?[&group_id]
+            .fork_quarantine
+            .as_ref()
+            .map(|marker| marker.observed_at_ms),
+        Some(1_600_000_000_000),
+        "negative control (b): the journal's own marker is not overwritten by the live one"
+    );
+    Ok(())
+}
+
+/// The alias-keyed variant of the finding-1 repair: the live store files a
+/// group under an alias key (map key ≠ stable group id) while the replay
+/// inserts at the journal's `group_id_hex`. A single-spelling carry-forward
+/// would miss the marker and the restart would lift the quarantine on exactly
+/// the population ADR-0066's both-spellings rule exists for.
+#[tokio::test]
+async fn issue732_journal_replay_preserves_a_marker_on_an_alias_keyed_store() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = dir.path().join("named_groups.json");
+    let group_id = "d8".repeat(32);
+    let (_base, advanced, _kp) = recovery_fixture(&group_id, invite_only_policy())?;
+    let mut contained = advanced.clone();
+    contained.fork_quarantine = Some(marker_at_frontier(&advanced));
+    // Filed under a human alias, exactly as the roster may key it.
+    write_named_groups_json_atomic(&store, &store_image("recovery-under-test", &contained)?)
+        .await?;
+    assert_eq!(
+        contained.stable_group_id(),
+        advanced.stable_group_id(),
+        "the alias record IS this group — the carry-forward must match on the stable id"
+    );
+
+    merge_group_record_into_store_file(
+        &store,
+        &group_id,
+        &store_image(&group_id, &advanced)?,
+        "named groups",
+    )
+    .await?;
+
+    let after = read_store(&store).await?;
+    assert!(
+        !after.contains_key("recovery-under-test"),
+        "the alias is superseded by the stable id, as before #732"
+    );
+    assert!(
+        after[&group_id].fork_quarantine.is_some(),
+        "#732: the marker is carried across the re-key — both spellings are consulted"
+    );
+    Ok(())
+}
+
+/// The same finding-1 repair through the REAL startup entry point, with the
+/// journal pair retained on disk the way a post-commit snapshot failure
+/// leaves it: `recover_treekem_named_journals` must replay the trio forward
+/// (snapshot written, journal consumed) and still leave the group contained.
+#[tokio::test]
+async fn issue732_startup_replay_leaves_the_group_contained() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let treekem = dir.path().join("treekem");
+    tokio::fs::create_dir_all(&treekem).await?;
+    let named_path = dir.path().join("named_groups.json");
+    let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+    let group_id = "d9".repeat(32);
+    let (_base, advanced, _kp) = recovery_fixture(&group_id, invite_only_policy())?;
+
+    let mut contained = advanced.clone();
+    contained.fork_quarantine = Some(marker_at_frontier(&advanced));
+    write_named_groups_json_atomic(&named_path, &store_image(&group_id, &contained)?).await?;
+
+    // The retained legacy journal (no `.hsjournal`: an ordinary group's
+    // sidecar half changes nothing) plus the snapshot the failed step owed.
+    let envelope = vec![9u8; 24];
+    let journal = TreeKemNamedPersistJournal {
+        version: TREEKEM_NAMED_JOURNAL_VERSION,
+        group_id_hex: group_id.clone(),
+        named_groups_json: store_image(&group_id, &advanced)?,
+        snapshot_envelope: envelope.clone(),
+    };
+    x0x::storage::write_private_bytes(
+        &treekem_journal_path(&treekem, &group_id),
+        postcard::to_stdvec(&journal)?,
+    )
+    .await?;
+
+    recover_treekem_named_journals(&named_path, &sidecar_path, &treekem).await?;
+
+    assert!(
+        read_store(&named_path).await?[&group_id]
+            .fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.no_anchor),
+        "#732: a restart that replays a retained journal must not lift the quarantine"
+    );
+    assert_eq!(
+        tokio::fs::read(treekem.join(format!("{group_id}.snap"))).await?,
+        envelope,
+        "and the replay still completes the trio it exists for"
+    );
+    assert!(
+        !treekem_journal_path(&treekem, &group_id).exists(),
+        "the journal is consumed once the live files are durable"
+    );
+    Ok(())
+}
+
+/// A conflicting sibling at the SAME revision: signed, structurally valid,
+/// and (when `signer` holds the revision-1 seat) authenticated.
+fn conflicting_sibling(
+    base: &x0x::groups::GroupInfo,
+    signer: &AgentKeypair,
+    description: &str,
+) -> Result<x0x::groups::GroupInfo> {
+    let mut variant = base.clone();
+    variant.description = description.to_string();
+    variant.seal_commit(signer, now_millis_u64())?;
+    Ok(variant)
+}
+
+/// WHY (#732 finding 2 — HIGH, CONFIRMED). ADR-0066 §2's whole purpose is
+/// that an ORDINARY group is one population, not two: a group formed without
+/// an invite has no lineage record to hold evidence, so the MARKER is the
+/// record. Slice 2 widened the LIVE apply fence and left the recovery path
+/// lineage-fenced as a named residual. The consequence at startup was the
+/// exact silence §2 exists to close: `record_recovery_fork_evidence` returned
+/// before doing anything, the conflicting journals were moved aside, startup
+/// continued — and the live group's data plane served both branches of an
+/// authenticated fork with no marker and no operator signal.
+///
+/// The claim: the recovery path installs the same marker-only,
+/// first-complete-wins, `no_anchor: true` containment the live path does, and
+/// the restored record then refuses the data plane with the §5 body.
+#[tokio::test]
+async fn issue732_startup_quarantines_a_lineage_free_ordinary_group() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let treekem = dir.path().join("treekem");
+    tokio::fs::create_dir_all(&treekem).await?;
+    let named_path = dir.path().join("named_groups.json");
+    let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+    let group_id = "da".repeat(32);
+    let (base, live, signer) = recovery_fixture(&group_id, invite_only_policy())?;
+    assert!(
+        live.invite_lineage.is_none(),
+        "the fixture's whole point: an ordinary group that never held an invite"
+    );
+
+    // The journal's record is the OTHER branch: same revision, different
+    // state hash, sealed by a holder of the retained revision-1 seat.
+    let fork = conflicting_sibling(&base, &signer, "the-other-branch")?;
+    assert_eq!(fork.state_revision, live.state_revision);
+    assert_ne!(
+        fork.state_hash, live.state_hash,
+        "equal revision, different hash — the only shape the verdict calls Fork"
+    );
+
+    write_named_groups_json_atomic(&named_path, &store_image(&group_id, &live)?).await?;
+    let journal = TreeKemNamedPersistJournal {
+        version: TREEKEM_NAMED_JOURNAL_VERSION,
+        group_id_hex: group_id.clone(),
+        named_groups_json: store_image(&group_id, &fork)?,
+        snapshot_envelope: vec![3u8; 8],
+    };
+    x0x::storage::write_private_bytes(
+        &treekem_journal_path(&treekem, &group_id),
+        postcard::to_stdvec(&journal)?,
+    )
+    .await?;
+
+    recover_treekem_named_journals(&named_path, &sidecar_path, &treekem).await?;
+
+    let restored = read_store(&named_path).await?[&group_id].clone();
+    let marker = restored.fork_quarantine.clone().ok_or_else(|| {
+        anyhow::anyhow!("#732: the lineage-free ordinary group must be contained")
+    })?;
+    assert!(
+        marker.no_anchor,
+        "ADR-0066 §2: no owner axis ⇒ no anchor ⇒ only the manual clear lifts it"
+    );
+    assert_eq!(marker.revision, fork.state_revision);
+    assert_eq!(marker.state_hash, fork.state_hash);
+    assert!(
+        restored.invite_lineage.is_none(),
+        "provenance is not invented to hold evidence — the marker IS the record"
+    );
+    assert_eq!(
+        restored.state_hash, live.state_hash,
+        "containment is not adoption: the live branch is untouched"
+    );
+
+    // The restored record refuses the data plane. Rows 4/5/6 are exercised
+    // directly here because their §3 gate sits ahead of every membership and
+    // GSS precondition; rows 1–3 consult the SAME `is_fork_quarantined()`
+    // predicate on the same record, pinned by `adr0066_send_path` and
+    // `adr0066_treekem_gates`.
+    let (state, _state_dir) = secure_endpoint_test_state().await?;
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), restored.clone());
+    assert!(
+        restored.is_fork_quarantined(),
+        "the predicate every §1 row consults is true after the restart"
+    );
+    let (status, body) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(serde_json::from_value::<SecureEncryptRequest>(
+            serde_json::json!({ "payload_b64": "aGVsbG8=" }),
+        )?),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "row 4 refuses: {}", body.0);
+    assert_fork_quarantine_refusal_body(&body.0);
+    let (status, body) = secure_group_decrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        Json(serde_json::from_value::<SecureDecryptRequest>(
+            serde_json::json!({ "ciphertext_b64": "aGVsbG8=" }),
+        )?),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "row 5 refuses: {}", body.0);
+    assert_fork_quarantine_refusal_body(&body.0);
+    let (status, body) = secure_group_reseal(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        Json(serde_json::from_value::<ResealRequest>(
+            serde_json::json!({ "recipient": "ab".repeat(32) }),
+        )?),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "row 6 refuses: {}", body.0);
+    assert_fork_quarantine_refusal_body(&body.0);
+    Ok(())
+}
+
+/// The negative control for finding 2, and the security boundary of the
+/// whole repair (ADR-0064 Attack matrix "false quarantine"): a `no_anchor`
+/// marker never auto-clears, so if an UNAUTHENTICATED journal could install
+/// one, anyone who could drop a file in the data directory — or a benign
+/// retry artifact — would take an ordinary group's data plane offline until a
+/// human intervened. The recovery install therefore runs behind the SAME
+/// `fork_candidate_authenticated` gate as the live path: signature verify
+/// plus committer Active+Admin in the retained predecessor roster.
+///
+/// Delete the authentication and this test fails while the positive test
+/// above still passes — that pair is what makes the gate observable.
+#[tokio::test]
+async fn issue732_unauthenticated_startup_conflict_quarantines_nothing() -> Result<()> {
+    for (label, group_id, forge) in [
+        ("stranger-signed", "db".repeat(32), false),
+        ("forged-signature", "dc".repeat(32), true),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await?;
+        let named_path = dir.path().join("named_groups.json");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        let (base, live, signer) = recovery_fixture(&group_id, invite_only_policy())?;
+
+        let mut fork = if forge {
+            conflicting_sibling(&base, &signer, "forged")?
+        } else {
+            // Genuinely signed, by a key that holds no seat in the retained
+            // predecessor roster.
+            conflicting_sibling(&base, &AgentKeypair::generate()?, "stranger")?
+        };
+        if forge {
+            if let Some(retained) = fork.commit_log.last_mut() {
+                retained.commit.signature = "not-a-signature".to_string();
+            }
+        }
+        assert_eq!(fork.state_revision, live.state_revision, "{label}");
+        assert_ne!(fork.state_hash, live.state_hash, "{label}");
+
+        write_named_groups_json_atomic(&named_path, &store_image(&group_id, &live)?).await?;
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: group_id.clone(),
+            named_groups_json: store_image(&group_id, &fork)?,
+            snapshot_envelope: vec![4u8; 8],
+        };
+        x0x::storage::write_private_bytes(
+            &treekem_journal_path(&treekem, &group_id),
+            postcard::to_stdvec(&journal)?,
+        )
+        .await?;
+
+        recover_treekem_named_journals(&named_path, &sidecar_path, &treekem).await?;
+
+        assert!(
+            !read_store(&named_path).await?[&group_id].is_fork_quarantined(),
+            "#732 ({label}): an unauthenticated journal conflict must never install a \
+             never-auto-clearing marker — that is a local/remote denial of service"
+        );
+    }
+    Ok(())
+}
+
+/// The owner axis is deliberately unchanged (ADR-0066 §2 Migration table:
+/// "trigger is unchanged" for owner-axis groups). An owner-certified group
+/// WITHOUT lineage is an authority-side record, not a joiner stub, so the
+/// recovery path must still install nothing for it — `fork_evidence_path_open`
+/// is the single predicate both paths now use, and this test is what stops
+/// #732's widening from leaking into that population.
+#[tokio::test]
+async fn issue732_owner_axis_lineage_free_group_is_unchanged_at_startup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let treekem = dir.path().join("treekem");
+    tokio::fs::create_dir_all(&treekem).await?;
+    let named_path = dir.path().join("named_groups.json");
+    let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+    let group_id = "dd".repeat(32);
+    // The PRODUCTION owner-certified seal (ADR-0038 requires certificate
+    // evidence), driven twice so the commit log retains the revision-1
+    // predecessor — and no lineage record is ever added.
+    let (state, _state_dir, owner) = owner_authority_state().await?;
+    let signer = state.agent.identity().agent_keypair();
+    let mut live = x0x::groups::GroupInfo::with_policy(
+        "owner-axis-recovery".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.clone(),
+        owner_certified_policy(&owner),
+    );
+    seal_commit_owner_certified(&state, &mut live, signer, now_millis_u64()).await?;
+    let base = live.clone();
+    live.description = "advanced".to_string();
+    seal_commit_owner_certified(&state, &mut live, signer, now_millis_u64()).await?;
+    assert!(
+        live.invite_lineage.is_none() && live.policy.admission.owner_certified_user_id().is_some(),
+        "owner axis, no lineage — the population whose trigger must not move"
+    );
+    let mut fork = base.clone();
+    fork.description = "the-other-branch".to_string();
+    seal_commit_owner_certified(&state, &mut fork, signer, now_millis_u64()).await?;
+    assert_eq!(fork.state_revision, live.state_revision);
+    assert_ne!(fork.state_hash, live.state_hash);
+
+    write_named_groups_json_atomic(&named_path, &store_image(&group_id, &live)?).await?;
+    let journal = TreeKemNamedPersistJournal {
+        version: TREEKEM_NAMED_JOURNAL_VERSION,
+        group_id_hex: group_id.clone(),
+        named_groups_json: store_image(&group_id, &fork)?,
+        snapshot_envelope: vec![5u8; 8],
+    };
+    x0x::storage::write_private_bytes(
+        &treekem_journal_path(&treekem, &group_id),
+        postcard::to_stdvec(&journal)?,
+    )
+    .await?;
+
+    recover_treekem_named_journals(&named_path, &sidecar_path, &treekem).await?;
+
+    assert!(
+        !read_store(&named_path).await?[&group_id].is_fork_quarantined(),
+        "#732 must not move the owner-axis trigger ADR-0066 promised unchanged"
+    );
+    Ok(())
+}

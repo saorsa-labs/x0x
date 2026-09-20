@@ -24952,8 +24952,17 @@ async fn record_recovery_fork_evidence(
     let Some(live) = live else {
         return;
     };
-    if live.invite_lineage.is_none() {
-        // No lineage to carry evidence — nothing to install.
+    // #732 (Codex audit finding 2) — the recovery trigger now uses the SAME
+    // population predicate as the live apply hook
+    // ([`fork_evidence_path_open`]): an ordinary group formed without an
+    // invite has no lineage record to hold evidence, but ADR-0066 §2 gives
+    // it the MARKER as the durable record. The pre-#732 shape returned here
+    // for every lineage-free group, so an authenticated equal-revision
+    // conflict found at STARTUP quarantined the journals aside and left the
+    // live group's data plane wide open — the one population §2 exists to
+    // contain. An owner-axis group without lineage stays fenced exactly as
+    // it shipped (it is an authority-side record, not a joiner stub).
+    if !fork_evidence_path_open(live) {
         return;
     }
     let journal_commit =
@@ -24986,11 +24995,12 @@ async fn record_recovery_fork_evidence(
     };
     // ADR-0064 → ADR-0066 §2: the recovery install writes the quarantine
     // marker in the SAME store mutation as the evidence record, with the
-    // same per-population `no_anchor` rule as the live path. This path
-    // stays fenced to lineage-bearing groups: the store loop below needs a
-    // lineage record to hold the evidence, and ADR-0066 slice 2 widens the
-    // LIVE apply fence only.
+    // same per-population `no_anchor` rule as the live path — so an
+    // ordinary group gets `no_anchor: true` here for the same reason it
+    // does there (no owner axis ⇒ nothing can clear it automatically).
     let quarantine = fork_quarantine_for_evidence(live, &evidence, &journal_commit, None);
+    let live_stable = live.stable_group_id().to_string();
+    let live_is_lineage_free = live.invite_lineage.is_none();
     for store_path in [named_groups_path, home_suite_groups_path] {
         let Ok(json) = tokio::fs::read_to_string(store_path).await else {
             continue;
@@ -24999,15 +25009,46 @@ async fn record_recovery_fork_evidence(
         else {
             continue;
         };
-        let Some(record) = store.get_mut(&journal.group_id_hex) else {
+        // #732 — both spellings at file level (no live map exists this
+        // early in startup to resolve through): the direct key, then a scan
+        // by `stable_group_id()` for an alias-keyed store. A single-spelling
+        // lookup here silently installed nothing on an alias-keyed store.
+        let Some(record_key) = store
+            .get(&journal.group_id_hex)
+            .filter(|info| info.stable_group_id() == live_stable)
+            .map(|_| journal.group_id_hex.clone())
+            .or_else(|| {
+                store
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == live_stable)
+                    .map(|(key, _)| key.clone())
+            })
+        else {
             continue;
         };
-        let Some(lineage) = record.invite_lineage.as_mut() else {
-            // Legacy-store sentinel for a sidecar record — skip.
+        let Some(record) = store.get_mut(&record_key) else {
             continue;
         };
-        if !fork_evidence_first_complete_wins(lineage, &evidence) {
-            continue;
+        match record.invite_lineage.as_mut() {
+            Some(lineage) => {
+                if !fork_evidence_first_complete_wins(lineage, &evidence) {
+                    continue;
+                }
+            }
+            // ADR-0066 §2/R2 — the lineage-free ordinary group: the MARKER
+            // is the durable record and carries the same
+            // first-complete-wins rule as the live install
+            // ([`install_fork_evidence`]'s `None` arm). Without a marker
+            // there is nothing to install; a group already contained keeps
+            // the marker it has.
+            None if live_is_lineage_free => {
+                if quarantine.is_none() || record.fork_quarantine.is_some() {
+                    continue;
+                }
+            }
+            // Legacy-store sentinel for a sidecar record of a
+            // lineage-BEARING group — skip, exactly as before #732.
+            None => continue,
         }
         // ADR-0064: install the marker with the evidence in the same
         // store re-encode — one write, one rollback surface.
@@ -25028,7 +25069,8 @@ async fn record_recovery_fork_evidence(
                     revision = evidence.revision,
                     state_hash = %evidence.state_hash,
                     committed_by = %LogHexId::agent(&evidence.committed_by),
-                    "#468 recovery: journal-recovery fork evidence recorded on the live lineage (no eviction; #472 owns the protocol response)"
+                    lineage_free = live_is_lineage_free,
+                    "#468 recovery / #732: journal-recovery fork evidence recorded (on the live lineage, or as the marker alone for a lineage-free ordinary group) — no eviction; #472 owns the protocol response"
                 );
                 return;
             }
@@ -26477,7 +26519,7 @@ async fn merge_group_record_into_store_file(
     let mut journal_view: HashMap<String, x0x::groups::GroupInfo> =
         serde_json::from_str(journal_image_json)
             .with_context(|| format!("parse {label} journal image"))?;
-    let Some(record) = journal_view.remove(group_id_hex) else {
+    let Some(mut record) = journal_view.remove(group_id_hex) else {
         // The journal predates this group's presence in that half —
         // nothing to merge for it.
         return Ok(());
@@ -26493,6 +26535,55 @@ async fn merge_group_record_into_store_file(
         };
     // Remove stale aliases (the record's stable id supersedes them).
     let stable = record.stable_group_id().to_string();
+    // #732 (Codex audit finding 1) — A QUARANTINE MARKER IS LOCAL
+    // CONTAINMENT STATE, NOT JOURNAL STATE. The journal image is a
+    // whole-file snapshot captured at stage time; an ADR-0066 marker (and
+    // the lineage `fork_evidence` record that justifies it) is installed
+    // AFTERWARDS by a mutation that deliberately does NOT advance
+    // `state_revision`/`state_hash`. So a pair retained by a post-commit
+    // failure (see `persist_named_group_info`, which leaves both journals
+    // in place once the named save is durable) replays at the SAME
+    // committed frontier the verdict calls `Apply` — and the wholesale
+    // record replacement below would silently erase a durable containment
+    // decision that never auto-clears. Carry it forward instead: journal
+    // equality is not equality of containment. Applied whenever the live
+    // half holds containment the journal record does not, so a
+    // forward-replay can no more lift a quarantine than an equal-frontier
+    // one; everything else about the replay (roster, keys, policy, the
+    // alias `retain` below) is untouched, so a group with no marker
+    // replays byte-identically. Both spellings are consulted — the map key
+    // AND `stable_group_id()` — because an alias-keyed store holds the
+    // record under the alias (ADR-0066's both-spellings rule at file
+    // level, where no live map exists to resolve through).
+    let carried = live
+        .get(group_id_hex)
+        .filter(|info| info.stable_group_id() == stable)
+        .or_else(|| live.values().find(|info| info.stable_group_id() == stable))
+        .map(|info| {
+            (
+                info.fork_quarantine.clone(),
+                info.invite_lineage
+                    .as_ref()
+                    .and_then(|lineage| lineage.fork_evidence.clone()),
+            )
+        });
+    if let Some((live_marker, live_evidence)) = carried {
+        if let (None, Some(marker)) = (record.fork_quarantine.as_ref(), live_marker) {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id_hex),
+                store = %label,
+                marker_revision = marker.revision,
+                no_anchor = marker.no_anchor,
+                "#732: journal replay preserved the live fork-quarantine marker — the journalled record predates it"
+            );
+            record.fork_quarantine = Some(marker);
+        }
+        if let Some(lineage) = record.invite_lineage.as_mut() {
+            if lineage.fork_evidence.is_none() {
+                lineage.fork_evidence = live_evidence;
+            }
+        }
+    }
     live.retain(|_key, info| info.stable_group_id() != stable);
     live.insert(group_id_hex.to_string(), record);
     let merged =
