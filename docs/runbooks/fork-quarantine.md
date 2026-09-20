@@ -619,21 +619,31 @@ threads that touch the same static can interfere and produce spurious failures.
 `cargo nextest` runs each test in a separate process and is unaffected. Always use
 `cargo nextest` or the project's `just test` recipe.
 
-**(g) TreeKEM snapshot persist is single-spelling; a stable-id caller can burn a
-generation.** Found while building slice 9's stable-id fixture, NOT introduced by
-it, and on a non-quarantine path. `named_groups.rs::persist_treekem_snapshot_bound`
-resolves one spelling (`groups.get(group_id_hex)`), so in the state #750 named —
-the roster re-keyed to an alias while `treekem_groups` still holds the live
-ratchet under the stable id — a stable-id encrypt advances the send ratchet and
-then fails its persist with a 500 `failed to persist secure group state`. The
-generation is burned with no snapshot written, so it is lost across a restart
-rather than reused (fail-safe for nonce reuse, not for availability). The fix is
-the mechanical one: route that lookup through
-`server::resolve_group_entry_locked` like #750 did for the gates. Slice 9's
-`row2_stable_id_spelling_reaches_the_recheck_and_is_refused` asserts reachability
-as "not 424 and the ratchet moved" rather than as a 200, precisely so the §4
-fixture is not coupled to this bug's lifetime. Note the §4 re-check makes this
-*less* reachable for a quarantined group, which now refuses before the advance.
+**(g) TreeKEM snapshot persist was single-spelling; a stable-id caller could burn
+a generation — CLOSED.** Found while building slice 9's stable-id fixture, NOT
+introduced by it, and on a non-quarantine path.
+`named_groups.rs::persist_treekem_snapshot_bound` resolved one spelling
+(`groups.get(group_id_hex)`), so in the state #750 named — the roster re-keyed to
+an alias while `treekem_groups` still holds the live ratchet under the stable id —
+a stable-id encrypt advanced the send ratchet and then failed its persist with a
+500 `failed to persist secure group state`. The generation was burned with no
+snapshot written, so it was lost across a restart rather than reused (fail-safe
+for nonce reuse, not for availability), and the path self-healed once the alias
+spelling or a reseal caught up. That lookup now goes through
+`server::resolve_group_entry_locked` like the gates #750 fixed, so the envelope
+binds to the same entry the gates resolved. The snapshot FILE is still written
+under the caller's spelling — only the roster resolution widened, so no persisted
+layout changed. All four callers benefit through the one function:
+`named_groups.rs::treekem_group_encrypt`, `named_groups.rs::treekem_group_decrypt`
+and `stores.rs::TreeKemGroupStoreProtector::{seal_record, open_record}`.
+`adr0066_treekem_gates.rs::issue732_treekem_encrypt_persists_the_snapshot_for_an_alias_keyed_group`
+asserts the clean direction end to end: 200, the snapshot on disk carrying the
+ADVANCED ratchet byte-for-byte, the generation advancing exactly once per accepted
+encrypt, and a round-trip decrypt. Slice 9's
+`row2_stable_id_spelling_reaches_the_recheck_and_is_refused` still asserts
+reachability as "not 424 and the ratchet moved" rather than as a 200, so the §4
+fixture stays uncoupled from this path's status. Note the §4 re-check already made
+this less reachable for a quarantined group, which refuses before the advance.
 
 ---
 

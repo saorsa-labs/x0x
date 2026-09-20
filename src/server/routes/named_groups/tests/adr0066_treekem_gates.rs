@@ -26,6 +26,14 @@
 //!
 //! Each test asserts the refusal AND that the ratchet epoch did not move, so a
 //! gate that refuses after burning a generation would still fail.
+//!
+//! The same end state also covers the CLEAN direction — known gap (g) of
+//! `docs/runbooks/fork-quarantine.md`. Cross-model review of PR #751 found that
+//! `named_groups.rs::persist_treekem_snapshot_bound` resolved only one spelling,
+//! so a clean alias-keyed encrypt passed both gates, advanced the send ratchet
+//! and then 500'd on the persist, burning a generation whose ciphertext was
+//! discarded. See
+//! `issue732_treekem_encrypt_persists_the_snapshot_for_an_alias_keyed_group`.
 
 use super::*;
 
@@ -231,6 +239,120 @@ async fn issue732_treekem_gates_do_not_refuse_a_clean_alias_keyed_group() -> Res
         status,
         StatusCode::CONFLICT,
         "no marker and no restore flag: neither gate may refuse: {}",
+        body.0
+    );
+    Ok(())
+}
+
+/// The per-sender generation counter of an encoded `ApplicationCiphertext`.
+///
+/// Read off the wire bytes rather than the live group because
+/// `TreeKemMlsGroup` exposes no send-generation accessor — and the wire value
+/// is the one that matters: it is what pins the AEAD nonce, so "the same
+/// generation twice" is exactly the reuse the snapshot persist exists to
+/// prevent.
+fn ciphertext_generation(ciphertext_b64: &str) -> Result<u32> {
+    use base64::Engine as _;
+    let bytes = BASE64.decode(ciphertext_b64)?;
+    let ct: saorsa_mls::treekem_group::ApplicationCiphertext = postcard::from_bytes(&bytes)?;
+    Ok(ct.generation)
+}
+
+/// #732 known gap (g): the CLEAN alias-keyed encrypt must SUCCEED, not 500.
+///
+/// WHY this matters, and why the control above could not see it. That control
+/// asserts only `status != CONFLICT`, so it passed while the route answered
+/// 500: both gates resolved the alias-keyed roster and let the encrypt through
+/// (which is what it was written to prove), the send ratchet advanced, and then
+/// `persist_treekem_snapshot_bound`'s bare `groups.get(group_id_hex)` missed the
+/// alias-keyed entry and failed the request. The generation was burned and its
+/// ciphertext discarded — an availability defect, not a confidentiality one: a
+/// burned generation is never reused, so there is no nonce reuse.
+///
+/// So the assertions here are the three things a correct persist owes the
+/// caller, and each can fail on its own:
+///
+/// 1. the request succeeds and returns a ciphertext (500 before the fix);
+/// 2. the snapshot is on disk AND is the ADVANCED ratchet, byte-for-byte —
+///    a persist that wrote a pre-encrypt snapshot would restore a state that
+///    re-issues this generation after a restart, which IS nonce reuse;
+/// 3. the generation advances EXACTLY once per accepted encrypt (0 then 1),
+///    so neither a skipped nor a repeated generation passes.
+///
+/// Then a round-trip decrypt of the first ciphertext, to prove the advanced,
+/// persisted state is still a usable ratchet rather than merely a changed one.
+#[tokio::test]
+async fn issue732_treekem_encrypt_persists_the_snapshot_for_an_alias_keyed_group() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let (alias_key, stable_id, live) =
+        alias_keyed_treekem_group(&state, &"9c".repeat(16), &"eb".repeat(32)).await?;
+    let snapshot_path = treekem_snapshot_path(&state.treekem_dir, &stable_id);
+    assert!(
+        !tokio::fs::try_exists(&snapshot_path).await?,
+        "fixture precondition: nothing is persisted yet"
+    );
+
+    let (status, body) = treekem_group_encrypt(&state, &stable_id, None, "aGVsbG8=", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a clean alias-keyed encrypt must not burn a generation on a persist \
+         that cannot find the roster entry the gates just resolved: {}",
+        body.0
+    );
+    let first = body.0["ciphertext_b64"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !first.is_empty(),
+        "the route returns a ciphertext: {}",
+        body.0
+    );
+
+    // (2) the persisted snapshot is the POST-encrypt ratchet, byte-for-byte.
+    let envelope = decode_treekem_snapshot_envelope(&tokio::fs::read(&snapshot_path).await?)?
+        .ok_or_else(|| anyhow::anyhow!("persisted bytes are not a TreeKEM snapshot envelope"))?;
+    assert_eq!(
+        envelope.snapshot,
+        live.lock().await.to_snapshot_bytes()?,
+        "the snapshot must capture the ADVANCED ratchet, not the state before \
+         the encrypt"
+    );
+    {
+        let groups = state.named_groups.read().await;
+        let info = groups
+            .get(&alias_key)
+            .ok_or_else(|| anyhow::anyhow!("alias-keyed roster entry vanished"))?;
+        assert!(
+            treekem_snapshot_envelope_matches_info(&envelope, info),
+            "the envelope binds to the ALIAS-keyed roster entry the gates \
+             resolved, not to some other record"
+        );
+    }
+
+    // (3) exactly one generation per accepted encrypt.
+    assert_eq!(
+        ciphertext_generation(&first)?,
+        0,
+        "the first encrypt on a fresh ratchet is generation 0"
+    );
+    let (status, body) = treekem_group_encrypt(&state, &stable_id, None, "aGVsbG8=", None).await;
+    assert_eq!(status, StatusCode::OK, "{}", body.0);
+    assert_eq!(
+        ciphertext_generation(body.0["ciphertext_b64"].as_str().unwrap_or_default())?,
+        1,
+        "the ratchet advanced exactly once per accepted encrypt — a burned \
+         generation would show up here as a skip"
+    );
+
+    // The advanced, persisted ratchet is still usable.
+    let (status, body) = treekem_group_decrypt(&state, &stable_id, None, &first).await;
+    assert_eq!(status, StatusCode::OK, "round-trip decrypt: {}", body.0);
+    assert_eq!(
+        body.0["payload_b64"].as_str(),
+        Some("aGVsbG8="),
+        "the plaintext round-trips: {}",
         body.0
     );
     Ok(())

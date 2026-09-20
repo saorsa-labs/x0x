@@ -403,6 +403,28 @@ All notable changes to this project will be documented in this file.
   error line positionally should match on the `reason:` key, not on trailing
   text.
 
+### Fixed
+
+- **TreeKEM snapshot persist now resolves alias-keyed groups, so a stable-id
+  send no longer burns a ratchet generation (#732, runbook known gap (g)).**
+  `persist_treekem_snapshot_bound` — the post-crypto step of
+  `treekem_group_encrypt`/`_decrypt` and of both TreeKEM group-store protector
+  paths — looked the roster entry up under one spelling. `named_groups` is keyed
+  by whichever alias a daemon learned a group under, so in the same TOCTOU end
+  state the gates above were taught to handle (roster re-keyed to an alias while
+  the live `treekem_groups` entry still answers to the stable id) a CLEAN,
+  non-quarantined encrypt passed both gates, advanced the send ratchet, and then
+  failed its persist with a 500 `failed to persist secure group state`. That
+  burned a send generation whose ciphertext was discarded. **Availability only:**
+  a burned generation is never reissued, so there was no nonce reuse, and the
+  path self-healed as soon as the alias spelling or a reseal caught up; it was
+  also not deterministically inducible by a remote peer. The lookup now goes
+  through the same `resolve_group_entry_locked` resolver as the gates, so the
+  persisted envelope binds to the entry those gates resolved. The snapshot FILE
+  is still written under the caller's spelling — only the roster resolution
+  widened, so no persisted or wire format changed, and the ADR-0067 epoch
+  re-check in the atomic persist is untouched.
+
 ### CI
 
 - **Coverage Gate no longer loses the ratchet on a red test pass (#607).** The

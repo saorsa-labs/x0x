@@ -24567,6 +24567,28 @@ async fn persist_treekem_snapshot_bytes(
 }
 
 /// Persist a TreeKEM snapshot bound to the currently durable named-group state.
+///
+/// The roster entry is resolved under BOTH spellings
+/// ([`crate::server::resolve_group_entry_locked`]) so the envelope binds to the
+/// same entry the caller's gates resolved.
+///
+/// #732 known gap (g), found by cross-model review of PR #751. This was a bare
+/// `groups.get(group_id_hex)`, and every caller is a post-crypto step: the two
+/// `secure_group_encrypt`/`_decrypt` helpers above and
+/// `TreeKemGroupStoreProtector::{seal_record, open_record}` all advance the
+/// ratchet and only then call this. In the TOCTOU end state slice 9 already
+/// tests for — roster filed under a local ALIAS while `treekem_groups` is still
+/// keyed by the stable id — the gates resolved the group fine, the CLEAN
+/// (non-quarantined) encrypt advanced the send ratchet, and then this lookup
+/// missed and the request 500'd. That burned a send generation whose ciphertext
+/// was discarded. Availability only: a burned generation is never reused, so
+/// there is no nonce reuse, and the path self-heals on the alias spelling or a
+/// reseal. Resolving both spellings here removes the burn entirely and stops
+/// this helper depending on its caller's lookup for its own success.
+///
+/// The snapshot FILE is still written under `group_id_hex`, the spelling the
+/// caller asked for and the one the restore path reads: only the roster
+/// resolution widens, so no persisted layout changes.
 pub(super) async fn persist_treekem_snapshot_bound(
     state: &AppState,
     group_id_hex: &str,
@@ -24574,9 +24596,8 @@ pub(super) async fn persist_treekem_snapshot_bound(
 ) -> anyhow::Result<()> {
     let info = {
         let groups = state.named_groups.read().await;
-        groups
-            .get(group_id_hex)
-            .cloned()
+        crate::server::resolve_group_entry_locked(&groups, group_id_hex)
+            .map(|(_, info)| info.clone())
             .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM snapshot"))?
     };
     ensure_treekem_persistence_allowed(
