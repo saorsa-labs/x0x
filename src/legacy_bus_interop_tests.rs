@@ -1224,7 +1224,7 @@ async fn shape_diamond(
         },
     )
     .await?;
-    raw["topology"]["observations"]["pre_cut"] = pre_cut;
+    raw["topology"]["observations"]["pre_cut"] = strip_peer_scores(pre_cut);
     for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(&originals) {
         let (check, _) = bounded(
             "pre-cut directed suppression check",
@@ -1238,6 +1238,21 @@ async fn shape_diamond(
             "ttl_ns":DIAMOND_TTL_NS,"margin_ns":DIAMOND_MARGIN_NS});
     }
     Ok(originals)
+}
+
+/// Remove the `peer_scores_by_topic` field that `diamond_observations_with_recorder`
+/// embeds in every per-label observation for oracle use.  The topology-contract
+/// checker (`validate_topology` → `diamond_keys`) expects exactly
+/// {"admitted", "begin_ns", "end_ns"} per observation; strip before storing.
+fn strip_peer_scores(mut observations: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = observations.as_object_mut() {
+        for obs in map.values_mut() {
+            if let Some(obj) = obs.as_object_mut() {
+                obj.remove("peer_scores_by_topic");
+            }
+        }
+    }
+    observations
 }
 
 fn diamond_keys(value: &serde_json::Value, expected: &[&str]) -> Result<(), String> {
@@ -2166,12 +2181,14 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     raw["load"] = json!({"quiescence":quiescence,"sent":sent,"payload_bytes":4096,"period_ms":50,"elapsed_ns":load_elapsed.as_nanos() as u64,"elapsed_excludes":"post-load drain barrier (see load.quiescence.waited_ms)","fanouts":fanouts,"witness_observed_during_load":observed.len(),"witness_attribution":"none"});
     raw["generator_diagnostics"]["cuts"]["t1"] = generator_cut(&agents[0], clock);
     attach_generator_load(&mut raw, &load_returns);
-    raw["topology"]["observations"]["t1"] = bounded(
-        "final diamond observation",
-        SETUP,
-        diamond_observations(agents, clock),
-    )
-    .await;
+    raw["topology"]["observations"]["t1"] = strip_peer_scores(
+        bounded(
+            "final diamond observation",
+            SETUP,
+            diamond_observations(agents, clock),
+        )
+        .await,
+    );
     for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(&originals) {
         let (check, returned) = bounded(
             "final directed suppression check",
