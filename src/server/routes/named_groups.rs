@@ -32000,6 +32000,7 @@ pub(in crate::server) mod tests {
     mod adr0066_coverage_map;
     mod adr0066_delegations;
     mod adr0066_epoch_token;
+    mod adr0066_tasks;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod hs_f2_membership_cluster;

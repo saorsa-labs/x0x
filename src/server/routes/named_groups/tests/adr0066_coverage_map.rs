@@ -290,7 +290,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         disposition: Disposition::Split,
         closed_by_slice: Some(5),
         recheck_before_effect: RecheckState::NotRequired,
-        closed: false,
+        closed: true,
     },
     CoverageRow {
         row: 21,
@@ -299,7 +299,7 @@ const COVERAGE_MAP: &[CoverageRow] = &[
         disposition: Disposition::Refuse,
         closed_by_slice: Some(5),
         recheck_before_effect: RecheckState::NotRequired,
-        closed: false,
+        closed: true,
     },
     CoverageRow {
         row: 22,
@@ -678,8 +678,11 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     // that a slice which lands its code without updating this map fails
     // here instead of leaving the map quietly describing a tree that no
     // longer exists. Slice 3 closed 15–19, slice 4 closed 13, 14 and 26,
-    // slice 6 closed 25 and slice 7 closed 22; what remains is slice 5
-    // (20, 21).
+    // slice 5 closed 20 and 21, slice 6 closed 25 and slice 7 closed 22 —
+    // so EVERY §1 row has now landed and the open set is EMPTY. That is a
+    // milestone, not a licence: see PENDING_RECHECK below, which is the
+    // reason an empty open set does not mean ADR-0066 §4 is fully
+    // discharged across the §1 surface.
     let open: Vec<u8> = COVERAGE_MAP
         .iter()
         .filter(|row| !row.closed)
@@ -688,6 +691,17 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     assert_eq!(
         open, OPEN_ROWS,
         "the §1 rows still awaiting their slice — update this list in the slice that closes one"
+    );
+
+    // ADR-0066 §1 is now fully landed, asserted as its OWN clause rather than
+    // left implicit in the equality above. Spelling it out means a future
+    // change that reopens a row fails with a message saying what was lost, and
+    // it records the milestone slice 7 completes.
+    assert!(
+        open.is_empty(),
+        "every §1 row's behaviour is supposed to be in the tree after slice 7 — these are \
+         open again: {open:?}. Coverage must not shrink; if a row genuinely needs reopening, \
+         say so in OPEN_ROWS and explain why."
     );
 
     // ADR-0067: the §4 "re-check before the effect" ledger, kept SEPARATE
@@ -755,10 +769,16 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
 
 /// The §1 rows whose behaviour change has not landed yet, in row order.
 ///
-/// Slice 7 closed row 22, so only slice 5's rows remain. When slice 5 lands,
-/// this becomes `&[]` — and note that an EMPTY `OPEN_ROWS` is not the same
-/// claim as "ADR-0066 §4 is fully discharged": see [`PENDING_RECHECK`].
-const OPEN_ROWS: &[u8] = &[20, 21];
+/// **EMPTY, and that is the point of this slice.** Slice 5 closed rows 20 and
+/// 21 and slice 7 closed row 22, so every one of the 26 normative §1 rows now
+/// has its behaviour in the tree. The emptiness is asserted explicitly below
+/// rather than merely observed, so a later change that reopens a row — or
+/// deletes a landed gate — fails here instead of quietly shrinking coverage.
+///
+/// An empty open set is NOT the claim that ADR-0066 §4 is fully discharged
+/// across the §1 surface: four rows are gated at entry but still await their
+/// re-check-before-effect. See [`PENDING_RECHECK`].
+const OPEN_ROWS: &[u8] = &[];
 
 /// ADR-0067 deferral ledger: the §1 rows whose Decision column asks for the
 /// §4 re-check *before the effect* and whose re-check is NOT in the tree yet,
@@ -767,12 +787,12 @@ const OPEN_ROWS: &[u8] = &[20, 21];
 /// Rows 1, 2, 4 and 6 — signed-public outbound send, TreeKEM encrypt, GSS
 /// encrypt, GSS reseal. All four are `Gated` at entry and therefore already
 /// `closed: true`, so nothing in the `closed`/`OPEN_ROWS` machinery can
-/// notice that their re-check is missing. They perform no roster mutation and
-/// take no persistence lock, so ADR-0066 §4's "inside the same critical
-/// section as the mutation" does not name a site for them; David deferred them
-/// to their own slice on 2026-09-20 (ADR-0067, "Deferral").
-///
-/// This list is the reason an empty `OPEN_ROWS` is honest.
+/// notice that their re-check is missing — and now that `OPEN_ROWS` is empty,
+/// this list is the ONLY thing standing between "every row landed" and a
+/// false claim that §4 is done. They perform no roster mutation and take no
+/// persistence lock, so ADR-0066 §4's "inside the same critical section as the
+/// mutation" does not name a site for them; David deferred them to their own
+/// slice on 2026-09-20 (ADR-0067, "Deferral").
 const PENDING_RECHECK: &[u8] = &[1, 2, 4, 6];
 
 /// WHY (ADR-0066 Validation, the fixture's whole reason for existing):

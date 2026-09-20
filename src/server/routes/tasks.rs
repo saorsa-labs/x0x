@@ -131,6 +131,75 @@ pub(in crate::server) async fn ensure_task_list_access(
     }
 }
 
+/// ADR-0066 §3c row 20: the fork-quarantine marker of the named group this
+/// task list is bound to, or `None` for a list that is not group-scoped.
+///
+/// WHY the lookup goes through [`crate::server::delegations::fork_quarantine_marker`]
+/// rather than a bare `named_groups.get(id)`: the roster map is keyed by
+/// whichever alias this daemon learned the group under, which is not
+/// necessarily the group's stable id — and a task-list id carries whichever
+/// spelling the creating client used. A single-spelling read would serve
+/// mutations on a contested roster whenever the two differ, which is the
+/// containment hole review found in slices 3, 4 and 6. That resolver is the
+/// one place both spellings are tried, so this row reuses it rather than
+/// adding a fourth copy of the fallback.
+///
+/// A malformed scoped id resolves to `None` deliberately: it is already
+/// denied with a 403 by [`ensure_task_list_access`], which every caller of
+/// this function runs first, so there is no group to be contested.
+pub(in crate::server) async fn task_list_fork_quarantine(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Option<(String, x0x::groups::ForkQuarantine)> {
+    let scoped = parse_group_scoped_task_list_id(id)?;
+    if scoped.is_malformed() {
+        return None;
+    }
+    let marker =
+        crate::server::delegations::fork_quarantine_marker(state, &scoped.group_id).await?;
+    Some((scoped.group_id, marker))
+}
+
+/// ADR-0066 §3c row 20 (mutation half): refuse a task-list mutation whose
+/// group is fork-quarantined on this node.
+///
+/// R5 made this immediate and unconditional — there is no warn-only window
+/// and no request budget, so the FIRST mutation after the marker installs is
+/// refused. Callers must invoke this before touching `state.task_lists`, so
+/// the refusal happens before any CRDT mutation, any snapshot write and any
+/// delta publish: a mutation accepted on a contested roster is an act taken
+/// under disputed membership even when the CRDT data itself is recoverable
+/// (the ADR's own answer to the warn-only argument it rejected).
+///
+/// The refusal goes through the single slice-1 helper, so it carries the §5
+/// body — machine `reason`, the human sentence, and the manual-clear remedy
+/// — and bumps `fork_quarantine_refusals` exactly once (§3e).
+///
+/// WHY it runs BEFORE [`ensure_task_list_access`] rather than after: #153's
+/// guard resolves the group with a single-spelling `named_groups.get(id)`, so
+/// for a group filed under a local alias it answers 403 "not a member" to a
+/// request naming the stable id. Ordering the quarantine check after it would
+/// make the alias case fail closed for the wrong, undiagnosable reason — the
+/// exact "right outcome, wrong reason" defect slice 3 found on row 18 — and
+/// R5's condition for removing the warn-only window was that the user always
+/// learns WHY. Containment is a property of the group's contested state, not
+/// of who is asking, and these are daemon-local control-plane endpoints
+/// authenticated by the daemon's own token, so there is no third party to
+/// leak the marker to. Slice 3 set the same precedent on
+/// `delegate_group_authority`, where the quarantine refusal precedes the
+/// ban/role checks.
+async fn reject_quarantined_task_mutation(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let (group_id, marker) = task_list_fork_quarantine(state, id).await?;
+    Some(
+        crate::server::routes::named_groups::reject_fork_quarantined_marker(
+            state, &group_id, &marker,
+        ),
+    )
+}
+
 /// Apply group authorization to a task list handle at the CRDT layer.
 ///
 /// If the list `id` is group-scoped (`x0x.group.<gid>.symphony.<lid>`), look
@@ -219,6 +288,16 @@ pub(in crate::server) struct UpdateTaskRequest {
 pub(in crate::server) struct TaskListEntry {
     pub(in crate::server) id: String,
     pub(in crate::server) topic: String,
+    /// ADR-0066 §3c row 20 (read half): present and `true` only while the
+    /// bound group carries a fork-quarantine marker. Absent — so the
+    /// response is byte-identical to the pre-ADR shape — otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::server) fork_quarantined: Option<bool>,
+    /// The marker itself, in the same shape the refusal body carries under
+    /// `fork_quarantine`, so a client parses one shape whether the
+    /// operation was served-with-a-warning or refused outright.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::server) fork_quarantine: Option<serde_json::Value>,
 }
 
 /// Task snapshot for API response.
@@ -264,9 +343,19 @@ pub(in crate::server) async fn list_task_lists(
     let mut entries = Vec::with_capacity(ids.len());
     for id in ids {
         if ensure_task_list_access(&state, &id).await.is_ok() {
+            // ADR-0066 §3c row 20 (read half): the collection SERVES,
+            // annotated. An operator listing lists during an incident must
+            // be able to see which of them are bound to a contested roster
+            // — that is what tells them why a mutation on one of these is
+            // being refused, without a second round trip per list.
+            let quarantine = task_list_fork_quarantine(&state, &id).await;
             entries.push(TaskListEntry {
                 id: id.clone(),
                 topic: id, // topic is used as ID
+                fork_quarantined: quarantine.as_ref().map(|_| true),
+                fork_quarantine: quarantine.as_ref().map(|(_, marker)| {
+                    crate::server::routes::named_groups::fork_quarantine_annotation(marker)
+                }),
             });
         }
     }
@@ -278,6 +367,15 @@ pub(in crate::server) async fn create_task_list(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTaskListRequest>,
 ) -> impl IntoResponse {
+    // ADR-0066 §3c row 20: binding a NEW task list to a contested roster is
+    // a mutation, not a read — it derives the CRDT's authorized-agent set
+    // from the disputed membership (`apply_group_authorization` below),
+    // writes a durable subscription registration and starts a sync listener
+    // that publishes deltas on the group's topic. Refusing here means none
+    // of that happens: no handle, no manifest row, no listener.
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &req.topic).await {
+        return refused;
+    }
     // #153: creating a group-scoped task list requires membership of that group.
     if let Err(denied) = ensure_task_list_access(&state, &req.topic).await {
         return denied;
@@ -364,6 +462,9 @@ pub(in crate::server) async fn list_tasks(
     if let Err(denied) = ensure_task_list_access(&state, &id).await {
         return denied;
     }
+    // ADR-0066 §3c row 20 (read half): resolved before the task-list lock is
+    // taken, so the roster read never nests inside it.
+    let quarantine = task_list_fork_quarantine(&state, &id).await;
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {
         return not_found("task list not found");
@@ -386,15 +487,31 @@ pub(in crate::server) async fn list_tasks(
                     completed_at: t.completed_at,
                 })
                 .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "version": fence.revision,
-                    "fence_token": fence.to_wire(),
-                    "tasks": entries,
-                })),
-            )
+            let mut body = serde_json::json!({
+                "ok": true,
+                "version": fence.revision,
+                "fence_token": fence.to_wire(),
+                "tasks": entries,
+            });
+            // ADR-0066 §3c row 20 (read half): reads are NEVER refused —
+            // containment must not blind the operator who is reading the
+            // list to work out what the contested roster has been doing —
+            // but the same response says plainly that the roster this list
+            // is bound to is disputed and that mutations are being refused.
+            // Absent (byte-identical response) when there is no marker.
+            if let Some((_, marker)) = &quarantine {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "fork_quarantined".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                    obj.insert(
+                        "fork_quarantine".to_string(),
+                        crate::server::routes::named_groups::fork_quarantine_annotation(marker),
+                    );
+                }
+            }
+            (StatusCode::OK, Json(body))
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
@@ -406,6 +523,14 @@ pub(in crate::server) async fn add_task(
     Path(id): Path<String>,
     Json(req): Json<AddTaskRequest>,
 ) -> impl IntoResponse {
+    // ADR-0066 §3c row 20: refuse BEFORE the handle is resolved, so nothing
+    // downstream can mutate the CRDT, write the `task-lists/<id>.bin`
+    // snapshot or publish a delta. The ordering is observable: on a
+    // quarantined group this returns 409 even for a list this daemon does
+    // not hold, where the ungated path returns 404.
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
+        return refused;
+    }
     // #153: group-scoped task lists require local-agent membership (write too).
     if let Err(denied) = ensure_task_list_access(&state, &id).await {
         return denied;
@@ -438,6 +563,19 @@ pub(in crate::server) async fn update_task(
     Path((id, tid)): Path<(String, String)>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
+    // ADR-0066 §3c row 20: claim/complete is a mutation, refused before any
+    // of this handler's work — before the handle is resolved, before the
+    // fence token is parsed and before the delegation branch below. That
+    // ordering subsumes slice 3's row-17 gate (`:~560`), which only guards
+    // the delegation-CITING branch: a plain claim on a contested roster is
+    // this row's business and used to be admitted. Composition is
+    // deliberate, not accidental duplication — because this gate returns
+    // first, a quarantined group produces exactly ONE refusal and one
+    // `fork_quarantine_refusals` increment, and row 17's check stays wired
+    // for the case where a future change narrows row 20's scope.
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
+        return refused;
+    }
     // #153: group-scoped task lists require local-agent membership (write too).
     if let Err(denied) = ensure_task_list_access(&state, &id).await {
         return denied;
