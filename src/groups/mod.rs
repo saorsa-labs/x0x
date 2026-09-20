@@ -320,11 +320,11 @@ impl ForkQuarantine {
 /// markers whose identity fields agree, and carrying it would make every
 /// token clone a deep copy of two commit headers for no decision value.
 ///
-/// **The destructuring in [`ForkQuarantineIdentity::from_marker`] is
-/// exhaustive on purpose.** A field added to [`ForkQuarantine`] that this
-/// type should consider fails the BUILD there rather than silently widening
-/// the set of marker changes the epoch token cannot see. That is a stronger
-/// guarantee than a test, and it is why no `..` appears in that pattern.
+/// **The destructuring in this type's `from_marker` constructor is exhaustive
+/// on purpose.** A field added to [`ForkQuarantine`] that this type should
+/// consider fails the BUILD there rather than silently widening the set of
+/// marker changes the epoch token cannot see. That is a stronger guarantee
+/// than a test, and it is why no `..` appears in that pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkQuarantineIdentity {
     revision: u64,
@@ -802,7 +802,10 @@ impl GroupInfo {
     pub fn lifecycle_epoch_token(&self) -> LifecycleEpochToken {
         LifecycleEpochToken {
             state_revision: self.state_revision,
-            marker: self.fork_quarantine.as_ref().map(ForkQuarantineIdentity::from_marker),
+            marker: self
+                .fork_quarantine
+                .as_ref()
+                .map(ForkQuarantineIdentity::from_marker),
         }
     }
 

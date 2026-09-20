@@ -135,6 +135,39 @@ the index from durable history and service resumes with no re-issuance.
 Group membership reads, `/groups/:id/state`, and the diagnostics surfaces
 keep working while quarantined.
 
+### A marker that lands mid-operation aborts that operation (§4, slice 7)
+
+Every refusal above is decided when an operation STARTS. A marker can arrive —
+or be cleared, or advance to a new evidence revision — while an operation is
+already in flight, and two paths persist a whole group record captured before
+that happened. Left alone they would not merely act on a stale authorization,
+they would **erase the marker**, ending containment silently. Both now
+re-derive the group's lifecycle epoch token inside the same critical section
+that performs the write and abort on a mismatch, before anything irreversible:
+
+| Path | What you see | What it means |
+|---|---|---|
+| invite join | 409 `fork_quarantined` naming "changed while this join was being installed" | evidence landed during the join's two fsyncs; the seating was refused rather than written over the marker. **Retry it** — the retry re-reads the group and either seats cleanly or refuses with the ordinary §1 gate |
+| TreeKEM roster+snapshot persist | log line `ADR-0066 §4: refusing TreeKEM atomic persist` and a failed operation | same window, same outcome. Nothing was written: no journal, no snapshot, no `named_groups.json` |
+
+**These are retryable and are not a lockout.** The refusal returns once and
+parks nothing: no queue head is frozen, nothing spins, and no request budget
+is consumed. A refusal caused by a *clear* landing mid-operation succeeds on
+the very next attempt. Repeated refusals on retry mean evidence is still
+arriving — triage the fork (§2), do not loop the client.
+
+A left-behind join install marker after such a refusal is expected and
+self-healing: it excludes a group the roster does not contain, and is cleared
+after the next durable roster save.
+
+**Encrypted (GSS) stores fail closed too, and recover.** A marker suspends the
+cached GSS authorization context on its next refresh — the shared secret is
+dropped and the roster emptied, so sealing, opening and membership all fail
+closed, and encrypted-store routes answer 409 `fork_quarantined`. Unlike a
+withdrawal this is **recoverable**: the next refresh after a clear (§4/§5)
+re-arms the context from live state. An encrypted store that stays dead after
+a clear is a bug, not the design — capture `/diagnostics` and report it.
+
 ### The WS plane is annotated, never cut (§3d, slice 6)
 
 A WebSocket subscriber watching a quarantined group keeps receiving
@@ -444,4 +477,6 @@ durable fix is a mandate-producing authority.
 | `fork_quarantine_set` rising across a fleet right after an upgrade | groups already silently forked are being contained for the first time | expected (ADR-0066 Migration); triage per §5, do not mass force-clear |
 | 409 `owner_mandate_missing` (retryable) | post-grace absent mandate from a recorded-capable authority | upgrade/repair the authority (owner user key); retry the send |
 | `mandate_capability` row `state: "refusing"` | that agent's grace window elapsed | same as above, per-agent |
+| 409 `fork_quarantined` naming "changed while this join was being installed" | evidence landed inside the join's persist window (§1, slice 7) | retry the join — the retry re-reads the group; a leftover install marker is self-healing |
+| encrypted (GSS) store refuses after a marker set | the cached authorization context is suspended (§1, slice 7) | expected; it re-arms on the next refresh after a clear — a store still dead after a clear is a bug, capture `/diagnostics` |
 | marker vanished after an old binary ran | downgrade dropped containment (§6) | re-upgrade; the node re-quarantines on the next authenticated conflict (gate re-arms on every clear/set) |

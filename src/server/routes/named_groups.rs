@@ -4556,42 +4556,49 @@ where
 #[cfg(test)]
 pub(in crate::server) mod epoch_recheck_barrier {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{LazyLock, Mutex};
 
-    type Hook = Box<dyn FnMut(&str, &mut HashMap<String, crate::groups::GroupInfo>) + Send>;
+    type Hook = Box<dyn FnMut(&mut HashMap<String, crate::groups::GroupInfo>) + Send>;
 
-    fn slot() -> &'static Mutex<Option<Hook>> {
-        static SLOT: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
-        SLOT.get_or_init(|| Mutex::new(None))
-    }
+    /// Keyed by the group id the hook is armed for.
+    ///
+    /// KEYED, not a single slot, and this is load-bearing: the test binary
+    /// runs these in PARALLEL in one process. A single global slot lets one
+    /// test's `install` overwrite another's, and one test's guard drop clear
+    /// another's — which shows up as a re-check that mysteriously did not
+    /// fire. Keying by group id gives each test its own arm/disarm, the same
+    /// way `TREEKEM_CACHE_WRITER_HOOKS` keys by on-disk path so temp-dir
+    /// tests cannot cross-talk.
+    static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    /// Removes the installed hook on drop, so one test cannot leak a hook
-    /// into the next.
-    pub(in crate::server) struct BarrierGuard;
+    /// Removes this test's hook on drop, and only this test's.
+    pub(in crate::server) struct BarrierGuard(String);
 
     impl Drop for BarrierGuard {
         fn drop(&mut self) {
-            if let Ok(mut guard) = slot().lock() {
-                *guard = None;
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.remove(&self.0);
             }
         }
     }
 
-    /// Install a callback to run immediately before the epoch re-check.
-    pub(in crate::server) fn install(hook: Hook) -> BarrierGuard {
-        if let Ok(mut guard) = slot().lock() {
-            *guard = Some(hook);
+    /// Arm a callback to run immediately before the epoch re-check for
+    /// `group_id`, inside the roster write guard.
+    pub(in crate::server) fn install(group_id: &str, hook: Hook) -> BarrierGuard {
+        if let Ok(mut hooks) = HOOKS.lock() {
+            hooks.insert(group_id.to_string(), hook);
         }
-        BarrierGuard
+        BarrierGuard(group_id.to_string())
     }
 
     pub(in crate::server) fn before_recheck(
         group_id: &str,
         groups: &mut HashMap<String, crate::groups::GroupInfo>,
     ) {
-        if let Ok(mut guard) = slot().lock() {
-            if let Some(hook) = guard.as_mut() {
-                hook(group_id, groups);
+        if let Ok(mut hooks) = HOOKS.lock() {
+            if let Some(hook) = hooks.get_mut(group_id) {
+                hook(groups);
             }
         }
     }
@@ -24209,15 +24216,25 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         // which checks `withdrawn` only.
         //
         // Only the MARKER half of the token is compared here, and this is the
+        // Only the MARKER half of the token is compared here, and this is the
         // one site where that is correct: this function exists to persist an
         // ADVANCED state, so the caller's `state_revision` is expected to
         // differ from the live one and comparing it would refuse every
         // legitimate persist. `LifecycleEpochToken::same_marker` names that
         // choice so it cannot be mistaken for a full-token comparison.
+        //
+        // ASYMMETRIC, and this is the ADR-0066 §2 trap restated: the test
+        // fires only when the LIVE record already carries a marker. An
+        // incoming `info` that ADDS one is the install path itself
+        // (`install_fork_evidence`, which uses `get_or_insert` and so never
+        // replaces an existing marker) — gating that would make the marker
+        // unsettable, exactly as §2 warns that gating the retry-rollback would
+        // make a marker unclearable. Nothing needs protecting when the live
+        // record has no marker; everything does once it has one.
         if let Some((_, live)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
             let live_token = live.lifecycle_epoch_token();
             let captured = info.lifecycle_epoch_token();
-            if !live_token.same_marker(&captured) {
+            if live_token.is_fork_quarantined() && !live_token.same_marker(&captured) {
                 // Fail closed BEFORE the irreversible step, leaving every
                 // durable file byte-identical. Retryable by construction: a
                 // retry re-reads the live record, so a legitimate clear costs
@@ -31982,6 +31999,7 @@ pub(in crate::server) mod tests {
     mod adr0038_owner_certified;
     mod adr0066_coverage_map;
     mod adr0066_delegations;
+    mod adr0066_epoch_token;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod hs_f2_membership_cluster;

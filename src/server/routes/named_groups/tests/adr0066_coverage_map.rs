@@ -678,8 +678,8 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
     // that a slice which lands its code without updating this map fails
     // here instead of leaving the map quietly describing a tree that no
     // longer exists. Slice 3 closed 15–19, slice 4 closed 13, 14 and 26,
-    // and slice 6 closed 25; what remains is slice 5 (20, 21) and slice 7
-    // (22).
+    // slice 6 closed 25 and slice 7 closed 22; what remains is slice 5
+    // (20, 21).
     let open: Vec<u8> = COVERAGE_MAP
         .iter()
         .filter(|row| !row.closed)
@@ -689,6 +689,42 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
         open, OPEN_ROWS,
         "the §1 rows still awaiting their slice — update this list in the slice that closes one"
     );
+
+    // ADR-0067: the §4 "re-check before the effect" ledger, kept SEPARATE
+    // from `closed` because rows 1/2/4/6 are `Gated` at entry and so are
+    // already closed — the `OPEN_ROWS` machinery is structurally incapable of
+    // noticing whether their re-check landed.
+    //
+    // Asserted as an exact equality, in row order, for the same reason
+    // `OPEN_ROWS` is: a later slice that lands one of these must move it out
+    // of this list, and a slice that quietly drops a landed re-check fails
+    // here. When `PENDING_RECHECK` empties, ADR-0066 §4 is fully discharged
+    // across the §1 surface — and until then an empty `OPEN_ROWS` cannot be
+    // mistaken for that.
+    let pending: Vec<u8> = COVERAGE_MAP
+        .iter()
+        .filter(|row| row.recheck_before_effect == RecheckState::Pending)
+        .map(|row| row.row)
+        .collect();
+    assert_eq!(
+        pending, PENDING_RECHECK,
+        "the §1 rows whose Decision column asks for a §4 re-check that is NOT in the tree \
+         yet — outbound send / TreeKEM encrypt / GSS encrypt / GSS reseal, deferred to their \
+         own slice (ADR-0067, \"Deferral\"). Update this list in the slice that lands one; \
+         do not delete the assertion."
+    );
+
+    // A row cannot claim a LANDED re-check while still being open: "the
+    // re-check is in the tree" presupposes the row's behaviour is.
+    for row in COVERAGE_MAP.iter() {
+        if row.recheck_before_effect == RecheckState::Landed {
+            assert!(
+                row.closed,
+                "§1 row {} claims a landed §4 re-check but is still open",
+                row.row
+            );
+        }
+    }
 
     // A row that claims to be CLOSED and whose disposition is a refusal,
     // a split or an annotation must actually consult the marker in its
@@ -718,7 +754,26 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
 }
 
 /// The §1 rows whose behaviour change has not landed yet, in row order.
-const OPEN_ROWS: &[u8] = &[20, 21, 22];
+///
+/// Slice 7 closed row 22, so only slice 5's rows remain. When slice 5 lands,
+/// this becomes `&[]` — and note that an EMPTY `OPEN_ROWS` is not the same
+/// claim as "ADR-0066 §4 is fully discharged": see [`PENDING_RECHECK`].
+const OPEN_ROWS: &[u8] = &[20, 21];
+
+/// ADR-0067 deferral ledger: the §1 rows whose Decision column asks for the
+/// §4 re-check *before the effect* and whose re-check is NOT in the tree yet,
+/// in row order.
+///
+/// Rows 1, 2, 4 and 6 — signed-public outbound send, TreeKEM encrypt, GSS
+/// encrypt, GSS reseal. All four are `Gated` at entry and therefore already
+/// `closed: true`, so nothing in the `closed`/`OPEN_ROWS` machinery can
+/// notice that their re-check is missing. They perform no roster mutation and
+/// take no persistence lock, so ADR-0066 §4's "inside the same critical
+/// section as the mutation" does not name a site for them; David deferred them
+/// to their own slice on 2026-09-20 (ADR-0067, "Deferral").
+///
+/// This list is the reason an empty `OPEN_ROWS` is honest.
+const PENDING_RECHECK: &[u8] = &[1, 2, 4, 6];
 
 /// WHY (ADR-0066 Validation, the fixture's whole reason for existing):
 /// every route on the censused surface must be explicitly classified. Row

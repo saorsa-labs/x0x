@@ -116,6 +116,27 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   arriving over gossip and delegated task-execute — until
   `POST /groups/:id/quarantine/clear`. `GET /groups/:id/delegations` keeps
   serving, annotated. See `docs/runbooks/fork-quarantine.md` §1.
+- **Fork quarantine, two further refusal conditions (ADR-0066 §4, slice 7;
+  ADR-0067):** the marker is also honoured when it lands *mid-operation*,
+  because two paths persist a whole group record captured earlier and would
+  otherwise overwrite — and thereby erase — a marker that arrived in the
+  meantime.
+  - **Invite join** (`POST /groups/join`-family install) answers 409
+    `fork_quarantined` when evidence lands inside its persist window. The body
+    is the §5 shape; `reason` is `fork_quarantined`. Nothing is seated and
+    nothing is written. **It is retryable:** a retry re-reads the group and
+    either seats cleanly or refuses with the ordinary §1 gate.
+  - **Encrypted (GSS) KvStore routes** now refuse with 409 `fork_quarantined`
+    while the group is quarantined — previously the cached authorization
+    context was blind to a marker installed after the store bound, so writes
+    kept being authorized on a pre-fork roster. Sealing, opening and
+    membership all fail closed. **Recoverable, unlike a withdrawal:** the
+    context re-arms on the next refresh after
+    `POST /groups/:id/quarantine/clear`.
+
+  Clients should already be matching `reason`, not `error`; no new code or
+  status is introduced. See `docs/runbooks/fork-quarantine.md` §1 ("A marker
+  that lands mid-operation").
 - **Device sync (ADR-0041):** `GET /sync/devices`, `POST /sync/devices/enroll`,
   `DELETE /sync/devices/:machine_id`; owner-to-owner SyncV1 streams.
 - **Placement & key-move (ADR-0043):** `GET /owner/placement`,
