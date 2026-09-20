@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Startup journal recovery no longer lifts a fork quarantine, and now contains
+  lineage-free ordinary groups (#732; found by a third-model static audit).** Two
+  HIGH defects on the file-level recovery path, which runs before the in-memory
+  roster loads and before any listener starts.
+  - **A replay could erase a durable marker.** When a TreeKEM transaction's
+    snapshot/cleanup step fails after the named save reached durability, both
+    journals are deliberately retained for forward replay
+    (`named_groups.rs::persist_named_group_info`). The live record is then
+    byte-equal to the journalled one, so the paired-replay verdict applies — and
+    an ADR-0066 marker installed in the meantime is not part of that frontier
+    (installing one advances neither `state_revision` nor `state_hash`), so
+    `named_groups.rs::merge_group_record_into_store_file`'s wholesale record
+    replacement silently deleted a `no_anchor` quarantine nothing re-installs
+    automatically: a restart lifted containment. The replay now carries the live
+    marker, and the lineage `fork_evidence` record that justifies it, forward —
+    resolved under **both spellings**, because no live map exists to resolve
+    through this early. First-complete-wins is unchanged and every other field
+    still comes from the journal, so a group with no marker replays byte-identically.
+  - **Lineage-free ordinary groups stayed open.**
+    `named_groups.rs::record_recovery_fork_evidence` returned immediately whenever
+    invite lineage was absent — a named residual of ADR-0066 slice 2, which
+    widened the LIVE apply fence only — so an authenticated equal-revision
+    conflicting journal for a locally created ordinary group left the data plane
+    serving both branches of a fork with no marker. Recovery now uses the same
+    population predicate as the live apply hook
+    (`named_groups.rs::fork_evidence_path_open`) and the same marker-only,
+    first-complete-wins install as `named_groups.rs::install_fork_evidence`'s
+    lineage-less arm, with `no_anchor: true`, behind the unchanged
+    `named_groups.rs::fork_candidate_authenticated` gate — so a forged or
+    stranger-signed journal still installs nothing (a never-auto-clearing marker
+    from unauthenticated content would be a denial of service). Owner-axis groups
+    without lineage keep the trigger ADR-0066 promised unchanged, and the store
+    loop resolves the record under both spellings so an alias-keyed store is no
+    longer silently skipped.
+  - No schema or wire change (the marker's fields already carry
+    `#[serde(default)]`). Closes runbook known gap (h).
+
 ### Changed
 
 - **A fork-quarantined group's history is no longer evicted by the retention

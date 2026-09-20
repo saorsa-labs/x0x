@@ -718,6 +718,62 @@ reachability as "not 424 and the ratchet moved" rather than as a 200, so the §4
 fixture stays uncoupled from this path's status. Note the §4 re-check already made
 this less reachable for a quarantined group, which refuses before the advance.
 
+**(h) Startup journal recovery could lift containment, and left lineage-free
+ordinary groups open — CLOSED (#732, third-model audit).** Two defects on the
+FILE-LEVEL recovery path, which runs before the in-memory roster loads and
+before any listener starts, so neither was visible to the live-path fixtures.
+
+*Marker erased by replay.* A TreeKEM transaction whose snapshot/cleanup step
+fails after the named save reached durability deliberately RETAINS both
+journals for forward replay (`named_groups.rs::persist_named_group_info` —
+"never discard a journal whose named half is durable"). The live record is then
+byte-equal to the journalled one, so the paired-replay verdict reads
+equal-revision/equal-hash and applies. A marker installed in the meantime is
+not part of that frontier — installing one advances neither `state_revision`
+nor `state_hash` — so the replay's wholesale record replacement silently
+DELETED a `no_anchor` quarantine that nothing re-installs automatically: **a
+restart lifted the containment.** The replay now carries the live marker, and
+the lineage `fork_evidence` record that justifies it, forward into the
+journalled record — resolved by both spellings, because at this point in
+startup there is no live map to resolve through. First-complete-wins is
+unchanged (the live half only fills an empty slot) and every other field still
+comes from the journal, so a group with no marker replays exactly as before.
+**What you see as an operator:** nothing new on a healthy node; on a contained
+one, a restart keeps the 409s and the marker's `observed_at_ms`, and the replay
+logs `#732: journal replay preserved the live fork-quarantine marker`.
+
+*Lineage-free ordinary groups unquarantined at startup.*
+`record_recovery_fork_evidence` returned immediately whenever invite lineage was
+absent — a named residual of ADR-0066 slice 2, which widened the LIVE apply
+fence only. So an authenticated equal-revision conflicting journal for a
+LOCALLY CREATED ordinary group moved the journals aside, startup continued, and
+the live group's data plane served both branches of a fork with no marker and no
+operator signal: the exact silence §2 exists to close. The recovery trigger now
+uses the SAME population predicate as the live apply hook
+(`named_groups.rs::fork_evidence_path_open`) and the same marker-only,
+first-complete-wins install as `named_groups.rs::install_fork_evidence`'s
+lineage-less arm, with `no_anchor: true`. **Authentication is unchanged and is
+the boundary of this widening:** only a journal commit that passes
+`named_groups.rs::fork_candidate_authenticated` (signature verify plus committer
+Active+Admin in the retained predecessor roster) installs anything, so a forged
+or stranger-signed journal cannot plant a never-auto-clearing marker — that
+would be a local denial of service. Owner-axis groups WITHOUT lineage keep the
+trigger ADR-0066's Migration table promised unchanged. The store loop also
+resolves the record by both spellings, so an alias-keyed store is no longer
+silently skipped. **What you see as an operator:** after a restart that finds a
+contested journal, an ordinary group can now be 409 `fork_quarantined` with
+`"no_anchor": true` where it previously served both branches — triage it exactly
+as §4.3c describes; the journals are still quarantined aside as before, so
+`docs/upgrade-system.md`'s journal guidance is unchanged. No schema or wire
+change: the marker's fields already carry `#[serde(default)]`.
+Source: `src/server/routes/named_groups.rs::merge_group_record_into_store_file`,
+`src/server/routes/named_groups.rs::record_recovery_fork_evidence`,
+`src/server/routes/named_groups.rs::recover_treekem_named_journals`,
+`src/server/routes/named_groups.rs::fork_evidence_path_open`,
+`src/server/routes/named_groups.rs::fork_candidate_authenticated`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_journal_replay_preserves_a_durable_quarantine_marker`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_startup_quarantines_a_lineage_free_ordinary_group`.
+
 ---
 
 ## 7. Mandate grace and the `owner_mandate_missing` refusal
