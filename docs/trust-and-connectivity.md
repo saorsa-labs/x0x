@@ -250,7 +250,7 @@ clearing path, alongside a `fork_quarantine` object with `revision`,
 `observed_at_ms`, `no_anchor` and a machine-readable `clear_with`. A client
 matching the old literal `error == "fork_quarantined"` sees a one-time break
 (HTTP 409 and `ok: false` are unchanged); see
-[the runbook](runbooks/fork-quarantine.md) §1. The marker carries a
+[the runbook](runbooks/fork-quarantine.md) §5 (Upgrade notes). The marker carries a
 forensic snapshot of both conflicting commit headers (no shared secrets, no
 TreeKEM material). The clear rule (round-2 maintainer decision, ADR-0064 §3
 "owner anchor = owner key") is deliberately narrow — the marker clears ONLY
