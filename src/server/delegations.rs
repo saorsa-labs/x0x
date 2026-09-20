@@ -243,6 +243,91 @@ pub(in crate::server) async fn committed_delegations(
     entry.by_digest.values().cloned().collect()
 }
 
+/// ADR-0066 §3b: the group's fork-quarantine marker, cloned out from
+/// under the roster lock.
+///
+/// Every §3b gate wants the marker and nothing else from `GroupInfo`, and
+/// wants it WITHOUT holding `named_groups` across an await (the honour
+/// paths below go on to scan durable history). Cloning one small struct
+/// is the cheapest way to get a decision that is still correct at the
+/// moment it is made — and rows 15–19 all refuse before any mutation, so
+/// a marker installed after this read cannot let an act through that a
+/// later re-read would have stopped. Closing the reverse race (a marker
+/// installed mid-operation) is §4's epoch token, slice 7.
+///
+/// **BOTH SPELLINGS, and this is load-bearing (review r1).** The roster map
+/// is keyed by whichever alias this daemon learned the group under, and the
+/// apply path installs the marker under that MAP key. Every honour path
+/// here, however, arrives with the STABLE id, because that is what a
+/// delegation envelope carries (`delegate_group_authority` signs
+/// `info.stable_group_id()`). A bare `get(group_id)` therefore misses the
+/// marker whenever key ≠ stable id — and a §3b gate that misses the marker
+/// does not degrade gracefully, it serves the contested roster. So this
+/// resolves exactly the way the metadata apply path does (`named_groups.rs`
+/// `resolved_group_key`): direct key hit first, then a scan by
+/// `stable_group_id()`. `quarantined_group_ids` below already held itself to
+/// this standard for the boot filter; the live gates must too.
+pub(in crate::server) async fn fork_quarantine_marker(
+    state: &AppState,
+    group_id: &str,
+) -> Option<x0x::groups::ForkQuarantine> {
+    let groups = state.named_groups.read().await;
+    let info = groups.get(group_id).or_else(|| {
+        groups
+            .values()
+            .find(|info| info.stable_group_id() == group_id)
+    })?;
+    info.fork_quarantine.clone()
+}
+
+/// ADR-0066 §3b: every group id this node currently holds a
+/// fork-quarantine marker for, under both its map key and its stable id.
+///
+/// Both spellings matter: a delegation envelope names the STABLE group id
+/// (`delegate_group_authority` signs `info.stable_group_id()`), while the
+/// roster map is keyed by whichever alias the local daemon learned the
+/// group under. Matching on only one of the two would let a contested
+/// group seed the registry through its other name.
+async fn quarantined_group_ids(state: &AppState) -> std::collections::HashSet<String> {
+    let groups = state.named_groups.read().await;
+    let mut out = std::collections::HashSet::new();
+    for (key, info) in groups.iter() {
+        if info.is_fork_quarantined() {
+            out.insert(key.clone());
+            out.insert(info.stable_group_id().to_string());
+        }
+    }
+    out
+}
+
+/// Groups whose ADR-0066 index refusal has already been logged, keyed by
+/// `(group id, evidence revision)`. Process-local and advisory: losing it
+/// costs one extra log line, never a missed refusal — the refusal itself
+/// and its counter increment never consult this.
+static LOGGED_INDEX_REFUSALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Is this the first index refusal to log for this group at this evidence
+/// revision? A new revision logs again — that is a new fork observation and
+/// the operator wants to see it.
+///
+/// Fails OPEN to logging: a poisoned lock logs rather than going quiet,
+/// because the failure mode of this cache is noise and the failure mode of
+/// silence is an unexplained outage.
+fn first_index_refusal_for(group_id: &str, revision: u64) -> bool {
+    let Ok(mut seen) = LOGGED_INDEX_REFUSALS.lock() else {
+        return true;
+    };
+    // Bound the set: a long-lived daemon watching many groups fork many
+    // times must not grow this without limit. Clearing costs at most one
+    // repeated line per group afterwards.
+    if seen.len() >= 1024 {
+        seen.clear();
+    }
+    seen.insert((group_id.to_string(), revision))
+}
+
 /// Reconstruct the GLOBAL delegation-id registry from ALL groups' durable
 /// history at startup (review r5): one deterministic rowid-ordered pass
 /// over every scope, so cross-group id reuse is rejected from the first
@@ -291,6 +376,37 @@ pub(in crate::server) async fn rebuild_global_delegation_registry(state: &AppSta
     // Extract delegation envelopes across ALL groups (signature-verified),
     // in commit order, and register their ids globally.
     let envelopes = envelopes_from_rows(&rows);
+    // ADR-0066 §3b row 19: the global registry must not be SEEDED from a
+    // contested roster. A quarantined group's history may hold both
+    // branches' grants, and boot is precisely when nobody is watching —
+    // a delegation admitted here would go on authorizing until an
+    // operator noticed. Skipping is fail-closed: an unregistered id
+    // cannot authorize, and the manual clear plus the next rescan
+    // re-admits the whole group at once.
+    let quarantined = quarantined_group_ids(state).await;
+    let mut skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let envelopes: Vec<x0x::delegation::SignedDelegation> = envelopes
+        .into_iter()
+        .filter(|sd| {
+            let group_id = &sd.delegation.group_id;
+            if quarantined.contains(group_id) {
+                skipped.insert(group_id.clone());
+                return false;
+            }
+            true
+        })
+        .collect();
+    // One typed refusal per contested GROUP, not per envelope: §3e counts
+    // refused operations, and re-seeding one group's registry is one
+    // operation however many grants its history holds.
+    for group_id in &skipped {
+        if let Some(marker) = fork_quarantine_marker(state, group_id).await {
+            let reason = crate::server::routes::named_groups::fork_quarantine_refusal_reason(
+                state, group_id, &marker,
+            );
+            tracing::warn!(group_id = %group_id, "delegation registry seeding refused: {reason}");
+        }
+    }
     let admitted = register_ids_globally(state, envelopes).await;
     tracing::info!(
         registered = admitted.len(),
@@ -306,6 +422,40 @@ pub(in crate::server) async fn index_committed(
     group_id: &str,
     sd: x0x::delegation::SignedDelegation,
 ) {
+    // ADR-0066 §3b row 19: refuse to index from a quarantined group,
+    // BEFORE the global id registry is touched and before the per-group
+    // map or its rowid watermark move — nothing about this call may
+    // mutate state for a contested roster.
+    //
+    // This is the NON-REST honour seam: the caller is
+    // `route_delegation_and_mentions`, reached from gossip ingest, so
+    // there is no response to carry the §5 body. The refusal is still
+    // typed and counted (`fork_quarantine_refusals`) and the §5 sentence
+    // is logged, so the operator sees WHY a delegation that arrived over
+    // the wire never became effective here. The carrier's history row is
+    // already committed by the caller and stays committed — R3 is
+    // tag-and-retain, so refusing to index never blanks the record.
+    //
+    // EVERY refusal counts; only the first per (group, evidence revision)
+    // LOGS (review r1). A peer can gossip carriers at will, so a WARN per
+    // carrier is unbounded log growth an unauthenticated sender controls.
+    // The counter is the rate-bearing signal (§3e) and the sentence is
+    // identical for every carrier of the same marker, so repeating it buys
+    // an operator nothing.
+    if let Some(marker) = fork_quarantine_marker(state, group_id).await {
+        let reason = crate::server::routes::named_groups::fork_quarantine_refusal_reason(
+            state, group_id, &marker,
+        );
+        if first_index_refusal_for(group_id, marker.revision) {
+            tracing::warn!(
+                group_id = %group_id,
+                revision = marker.revision,
+                "committed delegation not indexed: {reason} (further carriers of this \
+                 marker are counted in fork_quarantine_refusals, not logged)"
+            );
+        }
+        return;
+    }
     // GLOBAL registry first (review r3): a reused id never indexes.
     let fresh = register_ids_globally(state, vec![sd]).await;
     let Some(sd) = fresh.first() else {
@@ -353,7 +503,25 @@ pub(in crate::server) fn authorize(
     group_id: &str,
     now_ms: u64,
     committed: &[x0x::delegation::SignedDelegation],
+    quarantine: Option<&x0x::groups::ForkQuarantine>,
 ) -> Result<(), String> {
+    // ADR-0066 §3b row 17: a delegation is an authority transfer, and a
+    // quarantined group's roster is exactly the thing under dispute — so
+    // the predicate itself fails closed, FIRST, before any field of the
+    // grant is consulted. The reason names the contest (§5's sentence)
+    // rather than "not committed", so an operator can tell a contested
+    // group from a missing grant without reading the daemon log.
+    //
+    // The marker is a PARAMETER rather than a lookup because this
+    // predicate is sync and pure (it is also the list path's chain
+    // filter). Making it an argument means every call site must decide
+    // what the marker does there, which is the property that keeps a
+    // future caller from joining the ungated set by omission.
+    if let Some(marker) = quarantine {
+        return Err(
+            crate::server::routes::named_groups::fork_quarantine_refusal_message(group_id, marker),
+        );
+    }
     let d = &sd.delegation;
     if d.group_id != group_id {
         return Err(format!(
@@ -414,7 +582,21 @@ pub(in crate::server) fn chain_members_active(
     sd: &x0x::delegation::SignedDelegation,
     committed: &[x0x::delegation::SignedDelegation],
     active_hex: &std::collections::HashSet<String>,
+    quarantine: Option<&x0x::groups::ForkQuarantine>,
 ) -> Result<(), String> {
+    // ADR-0066 §3b row 17: the roster this predicate reads IS the
+    // contested object. `active_hex` under a fork is one branch's answer
+    // presented as the answer, so a chain that looks membered here may be
+    // membered on only one side of the split. Fail closed before reading
+    // it at all.
+    if let Some(marker) = quarantine {
+        return Err(
+            crate::server::routes::named_groups::fork_quarantine_refusal_message(
+                &sd.delegation.group_id,
+                marker,
+            ),
+        );
+    }
     let mut chain = vec![sd.delegation.from_agent, sd.delegation.to_agent];
     let mut current = sd;
     while current.delegation.depth > 1 {
@@ -452,6 +634,28 @@ pub(in crate::server) async fn authorize_send_as(
     digest_hex: &str,
     now_ms: u64,
 ) -> Result<x0x::delegation::SignedDelegation, String> {
+    // ADR-0066 §3b row 18: honouring a send-as attribution derived from a
+    // contested roster is the attack in the ADR's own matrix ("delegated
+    // send-as from a contested roster: honoured → fails closed"). Refuse
+    // FIRST — before the history scan, before the index is warmed or its
+    // watermark moves, and before any roster read — so a quarantined
+    // group's delegation cannot even re-seed the cache on its way to
+    // being rejected.
+    //
+    // This predicate is reached from BOTH surfaces: the REST send handler
+    // (already refused upstream by row 1's gate) and gossip ingest of a
+    // peer's send-as message, which has no response to carry the §5 body.
+    // The refusal is therefore counted and returned as the §5 sentence;
+    // ingest logs it and drops the message, which is the same fail-closed
+    // disposition it already applies to an unauthorized attribution.
+    let quarantine = fork_quarantine_marker(state, group_id).await;
+    if let Some(marker) = &quarantine {
+        return Err(
+            crate::server::routes::named_groups::fork_quarantine_refusal_reason(
+                state, group_id, marker,
+            ),
+        );
+    }
     let digest = hex::decode(digest_hex)
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok());
@@ -476,12 +680,16 @@ pub(in crate::server) async fn authorize_send_as(
         group_id,
         now_ms,
         &committed,
+        // Proven `None` by the early return above; passed rather than
+        // hard-coded so the predicate's own gate stays wired to this
+        // call site if the early return is ever moved.
+        quarantine.as_ref(),
     )?;
     // Chain-wide membership (review r2): every agent in the delegation
     // chain must still be an active member — removing the root delegator
     // stops the child grant's use.
     let active_hex = active_member_hex(state, group_id).await;
-    chain_members_active(sd, &committed, &active_hex)?;
+    chain_members_active(sd, &committed, &active_hex, quarantine.as_ref())?;
     Ok(sd.clone())
 }
 
@@ -638,6 +846,20 @@ pub(in crate::server) async fn delegate_group_authority(
         };
         if info.withdrawn {
             return not_found("group is withdrawn");
+        }
+        // ADR-0066 §3b row 15: minting NEW authority from a contested
+        // roster is refused, at the same site as the `withdrawn` check
+        // the ADR names. Everything irreversible this handler does comes
+        // later — the delegation id is drawn (`fresh_delegation_id`), the
+        // envelope is signed with the agent key, the carrier's history
+        // row is committed, the index is written and the carrier is
+        // published to the group bus. Refusing here means none of that
+        // runs: no signature exists, no row is written, nothing is
+        // gossiped. R5: immediately, with the §5 message and no grace.
+        if let Some(resp) =
+            crate::server::routes::named_groups::reject_fork_quarantined(&state, &id, info)
+        {
+            return resp.into_response();
         }
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("delegation rides the SignedPublic group bus");
@@ -886,9 +1108,13 @@ pub(in crate::server) async fn list_group_delegations(
         if !is_member && !read_open {
             return forbidden("members-only read policy");
         }
-        (info.stable_group_id().to_string(), info.members_v2.clone())
+        (
+            info.stable_group_id().to_string(),
+            info.members_v2.clone(),
+            info.fork_quarantine.clone(),
+        )
     };
-    let (stable_id, members) = snapshot;
+    let (stable_id, members, quarantine) = snapshot;
     let now_ms = crate::server::routes::now_millis_u64();
 
     let committed = committed_delegations(&state, &stable_id).await;
@@ -919,6 +1145,18 @@ pub(in crate::server) async fn list_group_delegations(
                     &stable_id,
                     now_ms,
                     &committed,
+                    // ADR-0066 §3b row 16: this call is a STRUCTURAL
+                    // filter (is the depth-2 chain committed and
+                    // verifiable?), not an authorization of an act. Row
+                    // 16 is annotate-class: the list keeps serving
+                    // exactly what it served before, and the annotation
+                    // below is what tells the reader the roster is
+                    // contested. Passing the marker here would silently
+                    // empty the list of chained grants, hiding the
+                    // authority an operator is reading the list to
+                    // audit — containment must not cost visibility
+                    // (§3a's rule, applied to §3b's read).
+                    None,
                 )
                 .is_ok()
         })
@@ -942,15 +1180,31 @@ pub(in crate::server) async fn list_group_delegations(
             .unwrap_or_default()
             .cmp(b["delegation_digest"].as_str().unwrap_or_default())
     });
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "group_id": stable_id,
-            "delegations": out,
-        })),
-    )
-        .into_response()
+    let mut body = serde_json::json!({
+        "ok": true,
+        "group_id": stable_id,
+        "delegations": out,
+    });
+    // ADR-0066 §3b row 16: the list SERVES, annotated. An operator
+    // auditing who holds authority during a fork must be able to see the
+    // grants — that is the whole reason this row is annotate and not
+    // refuse — but must also be told, in the same response, that the
+    // roster those grants rest on is contested and that §3b is refusing
+    // to honour them. The annotation is absent (byte-identical response)
+    // when there is no marker.
+    if let Some(marker) = &quarantine {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "fork_quarantined".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            obj.insert(
+                "fork_quarantine".to_string(),
+                crate::server::routes::named_groups::fork_quarantine_annotation(marker),
+            );
+        }
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 fn bad_request(msg: impl std::fmt::Display) -> axum::response::Response {
