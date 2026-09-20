@@ -1831,8 +1831,8 @@ mod tests {
     /// NON-group topic must be untouched, because a marker on some group
     /// must never change what an unrelated pub/sub subscriber sees.
     #[tokio::test]
-    async fn adr0066_ws_backfill_boundary_frame_is_annotated_for_a_quarantined_group()
-    -> anyhow::Result<()> {
+    async fn adr0066_ws_backfill_boundary_frame_is_annotated_for_a_quarantined_group(
+    ) -> anyhow::Result<()> {
         let (state, _dir) =
             crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
         let group_id = quarantine_test_group_id();
