@@ -1143,7 +1143,7 @@ helper API.
 | GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group delete <group_id>` | **Phase D.3**: any admin permanently deletes the group with a signed terminal withdrawal |
-| POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker — on a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set |
+| POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker (`:id` accepts either the roster map key or the group's stable id) — on a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set |
 | POST | `/groups/:id/send` | `x0x group send <group_id> <body> [--kind chat\|announcement] [--thread-root <id>] [--reply-to <id>] [--mentions <hex>...] [--delegation-digest <hex>]` | **Phase E**: publish a signed message to a SignedPublic group. `--mentions` (repeatable) routes structured ADR-0040 mentions daemon-side; `--delegation-digest` authorizes send-as attribution |
 | POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit). **ADR-0066 §3b**: 409 `fork_quarantined` while the group is fork-quarantined — refused before anything is signed, committed or published |
 | GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history. **ADR-0066 §3b**: keeps serving while fork-quarantined, with `fork_quarantined: true` and a `fork_quarantine` object added to the response |
@@ -2000,10 +2000,10 @@ roster — and therefore the marker — is keyed by whichever id that daemon
 learned the group under; the two can differ. Both the purge gate and every
 annotation resolve the direct key first and then by stable id, so the refusal
 and the label are the same whichever spelling you use. The refusal's `error`
-sentence names the **roster key**, because `POST /groups/:id/quarantine/clear`
-looks a group up by that key only, and `/history/stats` +
-`/diagnostics/history` list both spellings when they differ — the stable one to
-query rows with, the key one to clear with.
+sentence names the **roster key** (the spelling the roster is filed under), but
+since #732 `POST /groups/:id/quarantine/clear` accepts either spelling too, so
+either id in the refusal is usable. `/history/stats` + `/diagnostics/history`
+list both spellings when they differ.
 
 ## Remote exec
 

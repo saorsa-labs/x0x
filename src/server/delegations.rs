@@ -1096,6 +1096,9 @@ pub(in crate::server) async fn list_group_delegations(
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let snapshot = {
         let groups = state.named_groups.read().await;
+        // ADR0066-LOOKUP-WAIVER: row 16 (list) resolves the group for the WHOLE route, not just its
+        // quarantine annotation: a miss is a 404 before any marker is read, so it
+        // fails closed. Widening this route's own id semantics is not #732.
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };

@@ -294,9 +294,10 @@ fn group_id_for_topic(topic: &str) -> Option<&str> {
 /// exists to prevent. The fallback scan is bounded by the group count and
 /// runs only at the two lookup points below, never per frame.
 ///
-/// Slice 3 (#744) adds the same two-spelling resolver as
-/// `delegations::fork_quarantine_marker`; folding the two into one shared
-/// helper is part of the unification follow-up noted above.
+/// #732: that resolution now lives in ONE place
+/// ([`crate::server::resolve_group_entry_locked`]) rather than being spelled
+/// out again here — slices 3, 4, 6 and 7 each grew their own copy and review
+/// found the same single-spelling defect in three of them.
 async fn fork_quarantine_annotation(
     state: &AppState,
     group_id: &str,
@@ -306,11 +307,7 @@ async fn fork_quarantine_annotation(
     // competing commit headers, which no frame needs.
     let (revision, observed_at_ms, no_anchor) = {
         let groups = state.named_groups.read().await;
-        let info = groups.get(group_id).or_else(|| {
-            groups
-                .values()
-                .find(|info| info.stable_group_id() == group_id)
-        })?;
+        let (_, info) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
         let marker = info.fork_quarantine.as_ref()?;
         (marker.revision, marker.observed_at_ms, marker.no_anchor)
     };

@@ -3599,6 +3599,9 @@ async fn install_fork_evidence(
             }
         }
         if let Some(marker) = quarantine {
+            // ADR0066-LOOKUP-WAIVER: `install_key` is the map key this function was CALLED with and already
+            // used for the decision above — not a caller-supplied id. Re-resolving
+            // would pick a different record than the one just inspected.
             if let Some(info) = groups.get_mut(&install_key) {
                 info.fork_quarantine.get_or_insert(marker);
             }
@@ -12824,6 +12827,12 @@ pub(in crate::server) async fn get_named_group(
 /// to attest with, so path (b) — `force: true` plus a non-empty reason —
 /// is its ONLY exit. Path (b) is deliberately not gated on `no_anchor`:
 /// the operator override is the remedy the §5 refusal message names.
+///
+/// `:id` accepts EITHER spelling (#732): the roster map key or the group's
+/// stable id. It used to accept the map key alone, which made the one exit
+/// ADR-0066 §2 promises unreachable from the stable id every other surface
+/// shows the operator. Refusal bodies may still name the map key — that is
+/// the spelling the roster is filed under — but both now clear.
 /// Requires the local API token (same auth layer as
 /// every `/groups` route). Increments `fork_quarantine_manual_clears`
 /// and returns the updated `fork_quarantine: null` view.
@@ -12838,12 +12847,22 @@ pub(in crate::server) async fn clear_group_quarantine(
             Json(serde_json::json!({ "ok": false, "error": reason })),
         )
     };
-    let (stable_group_id, head_revision, head_state_hash, owner, marker_present) = {
+    // #732: BOTH SPELLINGS. The roster map is keyed by whichever alias this
+    // daemon learned the group under, while every id an operator can actually
+    // SEE elsewhere — a history scope, a WS/SSE `fork_quarantine` annotation,
+    // a delegation envelope, `GET /history/scopes` — is the STABLE id. A bare
+    // `groups.get(&id)` answered 404 for exactly that id, so the only exit
+    // ADR-0066 §2 promises an ordinary (`no_anchor`) group was unreachable
+    // from the spelling the refusal messages had taught the operator. The
+    // resolved MAP KEY is carried forward so the mutation below writes to the
+    // record this read decided about.
+    let (map_key, stable_group_id, head_revision, head_state_hash, owner, marker_present) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
+        let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, &id) else {
             return not_found("group not found");
         };
         (
+            key.to_string(),
             info.stable_group_id().to_string(),
             info.state_revision,
             info.state_hash.clone(),
@@ -12922,7 +12941,13 @@ pub(in crate::server) async fn clear_group_quarantine(
     }
     let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
     let outcome = persist_named_groups_mutation(&state, |groups| {
-        if let Some(info) = groups.get_mut(&id) {
+        // ADR0066-LOOKUP-WAIVER: `map_key` is what the shared resolver returned
+        // for EITHER spelling above, so this writes to the record that read
+        // decided about; re-resolving here would be a second, racier lookup of
+        // the same group. A concurrent rename of the key is the only way it
+        // misses, and then it is a no-op that leaves the marker in place —
+        // never a clear of the wrong group.
+        if let Some(info) = groups.get_mut(&map_key) {
             info.fork_quarantine = None;
             // ADR-0064 slice 4: the manual clear also re-arms the
             // evidence gate — the next authenticated conflict
@@ -13487,6 +13512,9 @@ pub(in crate::server) async fn send_group_public_message(
     // concurrent role changes can't race the check.
     let (msg, direct_recipients) = {
         let groups = state.named_groups.read().await;
+        // ADR0066-LOOKUP-WAIVER: the route's own group lookup (404 on a miss, so no contested roster is
+        // ever served); the §3 gate two lines down consumes the `info` it found.
+        // Widening the route's id semantics is out of #732's scope.
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
@@ -18847,6 +18875,8 @@ async fn owner_certified_seal_with_eviction(
                     let owner_user_key = state.agent.identity().user_keypair();
                     let clear_key = id.to_string();
                     let persist_outcome = persist_named_groups_mutation(state, |groups| {
+                        // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
+                        // a miss leaves the marker set on disk AND in memory, so it fails closed.
                         if let Some(info) = groups.get_mut(&clear_key) {
                             info.owner_cert_reverify_required = false;
                             // ADR-0064 slice 4 (slice-1 review non-blocking
@@ -23350,7 +23380,13 @@ async fn treekem_group_encrypt(
     // ADR-0038 restore quarantine: refuse before touching ratchet state.
     {
         let groups = state.named_groups.read().await;
-        if let Some(info) = groups.get(group_id_hex) {
+        // #732: BOTH SPELLINGS, through the one shared resolver. Unlike the
+        // GSS family below, this arm FAILS OPEN on a miss — no record found
+        // means no gate runs and the ratchet advances — so an alias-keyed
+        // roster silently disarmed both the ADR-0038 restore gate and the
+        // ADR-0066 §3 quarantine gate for a group whose TreeKEM state was
+        // filed under the caller's spelling.
+        if let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
@@ -23456,7 +23492,13 @@ async fn treekem_group_decrypt(
     // ADR-0038 restore quarantine: refuse before touching ratchet state.
     {
         let groups = state.named_groups.read().await;
-        if let Some(info) = groups.get(group_id_hex) {
+        // #732: BOTH SPELLINGS, through the one shared resolver. Unlike the
+        // GSS family below, this arm FAILS OPEN on a miss — no record found
+        // means no gate runs and the ratchet advances — so an alias-keyed
+        // roster silently disarmed both the ADR-0038 restore gate and the
+        // ADR-0066 §3 quarantine gate for a group whose TreeKEM state was
+        // filed under the caller's spelling.
+        if let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
@@ -23532,6 +23574,8 @@ pub(in crate::server) async fn secure_group_encrypt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
+    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
+    // and the §3 gate below consumes this same `info`. Out of #732's scope.
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
@@ -23739,6 +23783,8 @@ pub(in crate::server) async fn secure_group_decrypt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
+    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
+    // and the §3 gate below consumes this same `info`. Out of #732's scope.
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
@@ -23899,6 +23945,8 @@ pub(in crate::server) async fn secure_group_reseal(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
+    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
+    // and the §3 gate below consumes this same `info`. Out of #732's scope.
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
@@ -32079,9 +32127,11 @@ pub(in crate::server) mod tests {
     #[cfg(unix)]
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
+    mod adr0066_clear_route;
     mod adr0066_coverage_map;
     mod adr0066_delegations;
     mod adr0066_epoch_token;
+    mod adr0066_lookup_guard;
     mod adr0066_tasks;
     mod cache_hardening_followup;
     mod fork_quarantine;

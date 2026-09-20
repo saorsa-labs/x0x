@@ -55,11 +55,11 @@ BEFORE clearing**, because a clear keeps every row but drops the labels.
 (that is what `x0x history scopes` lists and what the rows carry); the local
 roster, and therefore the marker, is keyed by whichever id this daemon learned
 the group under. On the history surface either spelling reaches the gate and the
-annotation, so a purge cannot slip through under the stable name. Where it
-matters is the clear: `x0x groups quarantine clear` takes the **roster key**,
-which is the id the refusal's own message quotes — and `x0x diagnostics history`
-/ `GET /history/stats` list both spellings when they differ, so you do not have
-to guess which one a command wants.
+annotation, so a purge cannot slip through under the stable name. Since #732
+the clear takes either one too: `x0x groups quarantine clear <id>` accepts the
+roster key (the id the refusal's own message quotes) or the stable id, so the id
+you are holding is the id to use. `x0x diagnostics history` /
+`GET /history/stats` still list both spellings when they differ.
 
 ### The refusal body (ADR-0066 §5)
 

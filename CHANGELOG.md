@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The manual fork-quarantine clear now accepts the group's stable id as well
+  as its roster map key, and one shared resolver owns the two-spelling rule
+  (#732).** `named_groups` is keyed by whichever alias a daemon learned a group
+  under, while every id an operator can actually see — a history scope, a
+  WS/SSE `fork_quarantine` annotation, a delegation envelope — is the STABLE
+  id. `POST /groups/:id/quarantine/clear` (CLI `x0x groups quarantine clear`)
+  looked the group up under one spelling only, so for an alias-keyed group it
+  answered 404 to exactly the id its own refusal messages had taught the
+  operator to use: the single exit ADR-0066 §2 promises an ordinary
+  (`no_anchor`) group was unreachable. Both spellings now clear, with every
+  precondition (owner-key path (a) vs `force` + `reason` path (b)), the audit
+  log and the `fork_quarantine_manual_clears` counter unchanged; an unknown id
+  is still 404. Cross-model review had found the same single-spelling defect
+  independently in slices 3, 4 and 6, so the per-slice copies of the rule are
+  replaced by the one `resolve_group_entry_locked` resolver (history scope
+  markers and the purge gate, WS/SSE annotations, the public-group bootstrap
+  install check, the TreeKEM protector, the delegation gates), the two TreeKEM
+  crypto gates that skipped entirely on an alias-keyed roster now fire, and a
+  source-scanning fixture fails the build if a quarantine-relevant lookup
+  spells the rule out for itself again without a waiver naming why.
 - **A fork-quarantine marker that lands mid-operation now aborts the operation
   instead of being overwritten by it (ADR-0066 §4, slice 7; ADR-0067; #732).**
   Every gate slices 1–6 added checks the marker at the START of an operation.
