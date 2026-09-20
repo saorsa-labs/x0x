@@ -56,10 +56,46 @@ All notable changes to this project will be documented in this file.
     order, and the admission decision is taken under the list write lock so
     nothing can slip through between deciding and merging. A single delta larger
     than 1 MiB is dropped rather than held, so the per-list bound is the stated
-    one and not the transport's 4 MiB frame cap. **Residual:** a list's
-    `authorized_agents` set is captured at subscribe time, so a held delta from
-    an agent the clearing commit removes still applies at drain — identical to
-    live-path admission, recorded rather than silently inherited.
+    one and not the transport's 4 MiB frame cap.
+- **Three task-sync defects in that quarantine hold, found by an independent
+  third-model audit (GPT-6 Astra via Codex CLI) of the merged work; #732.** All
+  three are fixes that make the code match ADR-0068 D2, which is unchanged.
+  - **The gate is now installed before replication starts (finding 3).**
+    `Agent::{create,join}_task_list_persistent` start the delta listener before
+    they return a handle, and the daemon applied group authorization and the D2
+    gate to that returned handle — so on a restart with a quarantined group a
+    peer delta arriving during list restoration merged **and persisted** into a
+    list the marker says is frozen. The named-group binding (live authorized
+    writers + the gate) is now gathered by `tasks.rs::group_task_list_binding`
+    and handed to new `create_task_list_persistent_bound` /
+    `join_task_list_persistent_bound` constructors, which install it before the
+    listener exists. Both paths that produce a live handle — subscription
+    rehydration and `POST /task-lists` — use them. The authorization read also
+    goes through `server::resolve_group_entry_locked` now, so an **alias-keyed**
+    group's list is authorized and gated instead of silently getting neither
+    (the previous single-spelling `named_groups.get()` returned early, before the
+    gate install).
+  - **The drain re-authorizes against the roster the clearing commit left behind
+    (finding 4).** `authorized_agents` was snapshotted at create/rehydration, so
+    buffered deltas from a member the *clearing* commit removed were merged
+    against the contested roster. `TaskIngestGate` gains `authorized_writers()`;
+    `drain_quarantine_buffer` refreshes the set from the live roster inside the
+    same critical section as the merge (before the ADR-0067 re-check, so that
+    re-check is still the last thing before the first merge) and skips entries
+    whose writer the refreshed roster no longer seats, counting them in
+    `task_deltas_quarantine_dropped` with the reason logged. **Residual:** a
+    roster change with no quarantine drain still leaves the set stale until
+    restart — pre-existing, broader than ADR-0068, and unchanged here.
+  - **Incoming traffic can no longer starve the drain (finding 5).** The 5 s
+    drain poll was a fresh `sleep` created inside `select!` on every iteration,
+    so every received message cancelled it: with messages arriving less than 5 s
+    apart the buffer never drained, and post-clear deltas applied ahead of older
+    held ones. The deadline is now a pinned sleep that survives receives and is
+    reset only after it fires, and an inbound delta drains the buffer **before**
+    it is admitted — so under traffic the catch-up happens on the next delta
+    rather than on a timer, and arrival order is preserved. The runbook's
+    "picked up within 5 s" is true again, including under a flood of undecodable
+    payloads, which never reach admission.
 - **Outbound sends and secure-crypto routes now re-check the fork-quarantine
   marker immediately before their effect, not only at request start (ADR-0066
   §1 rows 1/2/4/6 and §4, slice 9; ADR-0067; #732).** These four paths were

@@ -22,6 +22,13 @@
 //!   bounds the blast radius;
 //! - the alias-keyed group is gated, through the one resolver;
 //! - group METADATA ingest stays ungated, so the clearing commit still arrives;
+//! - #732 finding 4: the drain re-authorizes against the roster the CLEARING
+//!   commit left behind, so a member that commit removed does not get their held
+//!   deltas applied (dropped and counted), while a member it kept does — and an
+//!   undeterminable roster changes nothing;
+//! - #732 finding 3: the binding handed to the constructor already carries the
+//!   gate and the live authorized set, and the two call sites that produce a
+//!   live handle use it — the gate exists before the listener does;
 //! - and the NEGATIVE CONTROL per mechanism: the same delta with no gate
 //!   installed merges, so "the state did not change" is a fact about the gate
 //!   and not about the fixture.
@@ -65,6 +72,10 @@ struct FakeGate {
     /// `None` ⇒ this node holds no record for the group, which a re-checking
     /// caller must treat as a mismatch.
     has_record: AtomicBool,
+    /// The scripted LIVE roster the drain re-authorizes against (#732 finding
+    /// 4). `None` ⇒ "cannot determine", which must leave the list's installed
+    /// set alone.
+    live_roster: std::sync::Mutex<Option<std::collections::HashSet<x0x::identity::AgentId>>>,
     buffered: AtomicU64,
     dropped: AtomicU64,
     applied: AtomicU64,
@@ -79,6 +90,7 @@ impl Default for FakeGate {
             suspension_reads: AtomicU64::new(0),
             marker_revision: std::sync::Mutex::new(None),
             has_record: AtomicBool::new(true),
+            live_roster: std::sync::Mutex::new(None),
             buffered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             applied: AtomicU64::new(0),
@@ -99,6 +111,16 @@ impl FakeGate {
             .marker_revision
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = revision;
+    }
+
+    /// Script the roster the drain will re-authorize against — the roster the
+    /// clearing commit left behind.
+    fn set_live_roster<I: IntoIterator<Item = x0x::identity::AgentId>>(&self, agents: I) {
+        *self
+            .live_roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(agents.into_iter().collect());
     }
 }
 
@@ -130,6 +152,24 @@ impl TaskIngestGate for FakeGate {
                 return None;
             }
             Some(scripted_token(self.marker_revision()))
+        })
+    }
+
+    fn authorized_writers(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Option<std::collections::HashSet<x0x::identity::AgentId>>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.live_roster
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         })
     }
 
@@ -244,6 +284,54 @@ impl Harness {
             x0x::crdt::sync::testing::Admission::Held => {}
             x0x::crdt::sync::testing::Admission::Apply(delta, mut list) => {
                 let _ = list.merge_delta(&delta, self.peer, Some(&self.writer));
+            }
+        }
+    }
+
+    /// Replace the list's authorized-writer set (the one a subscription
+    /// captures).
+    async fn authorize<I: IntoIterator<Item = x0x::identity::AgentId>>(&self, agents: I) {
+        self.list
+            .write()
+            .await
+            .set_authorized_agents(agents.into_iter().collect());
+    }
+
+    /// One inbound delta adding a task titled `title`, authored by `writer`.
+    fn delta_from(&self, seq: u64, title: &str, writer: &x0x::identity::AgentId) -> TaskListDelta {
+        let mut delta = TaskListDelta::new(seq);
+        let created_at = 1_700_000_000_000 + seq;
+        let id = x0x::crdt::TaskId::new(title, writer, created_at);
+        let metadata = x0x::crdt::TaskMetadata::new(title, "adr0068", 128, *writer, created_at);
+        let task = x0x::crdt::TaskItem::new(id, metadata, self.peer);
+        delta
+            .added_tasks
+            .insert(*task.id(), (task, (self.peer, seq)));
+        delta
+    }
+
+    /// The listener's step for one inbound delta from a specific writer.
+    async fn ingest_as(
+        &self,
+        gate: Option<&StdArc<dyn TaskIngestGate>>,
+        delta: TaskListDelta,
+        writer: &x0x::identity::AgentId,
+    ) {
+        let bytes = bincode::serialize(&delta).map(|b| b.len()).unwrap_or(0);
+        match x0x::crdt::sync::testing::admit_or_buffer(
+            gate,
+            &self.buffer,
+            &self.list,
+            self.peer,
+            delta,
+            Some(writer),
+            bytes,
+        )
+        .await
+        {
+            x0x::crdt::sync::testing::Admission::Held => {}
+            x0x::crdt::sync::testing::Admission::Apply(delta, mut list) => {
+                let _ = list.merge_delta(&delta, self.peer, Some(writer));
             }
         }
     }
@@ -697,4 +785,269 @@ fn adr0068_d2_leaves_row_24_metadata_ingest_ungated() {
         "group metadata/state-commit apply must NOT be gated by D2: gating it \
          would make an owner-anchored quarantine unclearable (row 24)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #732 finding 4 — the drain authorizes against the roster the CLEARING commit
+// left behind, not the one the subscription captured.
+// ---------------------------------------------------------------------------
+
+/// A member the clearing commit removed does not get their held deltas applied;
+/// a member the commit kept does, and the drop is counted.
+///
+/// Before the fix the drain merged every held delta against the membership
+/// snapshot taken at create/rehydrate time — the contested roster — so the
+/// disputed member's claims landed the moment the dispute was resolved AGAINST
+/// them.
+#[tokio::test]
+async fn adr0068_f4_a_member_the_clearing_commit_removed_does_not_get_held_deltas_applied() {
+    let h = Harness::new();
+    let gate = h.gate(true).expect("gate");
+    let removed = x0x::identity::AgentId([21u8; 32]);
+    let seated = h.writer;
+    // The roster as the subscription captured it: both members active.
+    h.authorize([removed, seated]).await;
+    h.gate.suspended.store(true, Ordering::SeqCst);
+
+    h.ingest_as(
+        Some(&gate),
+        h.delta_from(1, "disputed-claim", &removed),
+        &removed,
+    )
+    .await;
+    h.ingest_as(
+        Some(&gate),
+        h.delta_from(2, "seated-first", &seated),
+        &seated,
+    )
+    .await;
+    h.ingest_as(
+        Some(&gate),
+        h.delta_from(3, "seated-second", &seated),
+        &seated,
+    )
+    .await;
+    assert_eq!(
+        x0x::crdt::sync::testing::len(&h.buffer),
+        3,
+        "all three held while the marker is live"
+    );
+
+    // The clearing commit removes the disputed member, then the marker clears.
+    h.gate.set_live_roster([seated]);
+    h.gate.suspended.store(false, Ordering::SeqCst);
+    let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
+
+    assert_eq!(applied, 2, "only the seated member's held deltas applied");
+    assert_eq!(
+        h.gate.dropped.load(Ordering::SeqCst),
+        1,
+        "the removed member's delta is DROPPED and counted, never silently \
+         merged and never reported as applied"
+    );
+    let titles = h.titles().await;
+    assert!(
+        !titles.iter().any(|t| t == "disputed-claim"),
+        "the removed member's work must not land: {titles:?}"
+    );
+    assert_eq!(
+        titles,
+        vec!["seated-first".to_string(), "seated-second".to_string()],
+        "the seated member's held deltas applied, in arrival order: {titles:?}"
+    );
+
+    // NEGATIVE CONTROL: the same fixture where the clearing commit removes
+    // NOBODY ⇒ all three apply. Without this, "two applied" could be a drain
+    // that simply cannot handle three.
+    let control = Harness::new();
+    let control_gate = control.gate(true).expect("gate");
+    control.authorize([removed, control.writer]).await;
+    control.gate.suspended.store(true, Ordering::SeqCst);
+    control
+        .ingest_as(
+            Some(&control_gate),
+            control.delta_from(1, "disputed-claim", &removed),
+            &removed,
+        )
+        .await;
+    control
+        .ingest_as(
+            Some(&control_gate),
+            control.delta_from(2, "seated-first", &control.writer),
+            &control.writer,
+        )
+        .await;
+    control
+        .ingest_as(
+            Some(&control_gate),
+            control.delta_from(3, "seated-second", &control.writer),
+            &control.writer,
+        )
+        .await;
+    control.gate.set_live_roster([removed, control.writer]);
+    control.gate.suspended.store(false, Ordering::SeqCst);
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&control_gate), &control.buffer, &control.list).await,
+        3,
+        "control: an unchanged roster applies every held delta"
+    );
+    assert_eq!(
+        control.gate.dropped.load(Ordering::SeqCst),
+        0,
+        "control: nothing is dropped when the roster keeps everyone"
+    );
+    assert!(
+        control.titles().await.iter().any(|t| t == "disputed-claim"),
+        "control: the same delta DOES apply when the commit keeps its author — \
+         proof the assertion above is about the roster refresh"
+    );
+}
+
+/// A gate that cannot determine the live roster (`None` — no resolvable record,
+/// or the daemon is shutting down) leaves the installed set exactly as it was.
+/// `None` must mean "unknown", never "deny everyone" (which would lose a seated
+/// member's work) and never "allow everyone" (which would defeat the refresh).
+#[tokio::test]
+async fn adr0068_f4_an_undeterminable_roster_leaves_the_installed_set_alone() {
+    let h = Harness::new();
+    let gate = h.gate(true).expect("gate");
+    h.gate.suspended.store(true, Ordering::SeqCst);
+    h.ingest(Some(&gate), h.delta(1, "held")).await;
+    // live_roster stays None (the default).
+    h.gate.suspended.store(false, Ordering::SeqCst);
+
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
+        1,
+        "the writer the subscription authorized still applies"
+    );
+    assert_eq!(h.gate.dropped.load(Ordering::SeqCst), 0);
+    assert!(h.titles().await.iter().any(|t| t == "held"));
+}
+
+// ---------------------------------------------------------------------------
+// #732 finding 3 — the binding exists before the listener does
+// ---------------------------------------------------------------------------
+
+/// The binding a create/rehydrate hands the constructor carries a gate that
+/// suspends a QUARANTINED group, resolved under both spellings, and an
+/// authorized-writer set read from the live roster — all before any listener
+/// exists.
+///
+/// The negative control is the plain (non-group) list: it gets no gate at all,
+/// which is what bounds ADR-0068's blast radius.
+#[tokio::test]
+async fn adr0068_f3_the_prestart_binding_carries_the_gate_for_a_quarantined_group() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let stable = "adr0068-f3-stable";
+    let alias = "adr0068-f3-alias";
+    let member = state.agent.agent_id();
+    let mut info = x0x::groups::GroupInfo::new(
+        "adr0068".to_string(),
+        "F3 binding fixture".to_string(),
+        member,
+        stable.to_string(),
+    );
+    let header = info.terminal_commit_header();
+    info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+        revision: 9,
+        state_hash: "cafe0009".to_string(),
+        committed_by: "22".repeat(32),
+        observed_at_ms: 1_700_000_000_000,
+        snapshot: x0x::groups::ForkSnapshot {
+            terminal_commit: header.clone(),
+            conflicting_commit: header,
+            classification: None,
+        },
+        no_anchor: true,
+    });
+    assert_ne!(info.stable_group_id(), alias);
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(alias.to_string(), info);
+
+    // The list id carries the STABLE spelling, the map key is the alias.
+    let binding = crate::server::routes::group_task_list_binding(
+        &state,
+        &format!("x0x.group.{stable}.symphony.inbox"),
+    )
+    .await;
+    let gate = binding.ingest_gate.as_ref().expect(
+        "a group-scoped list must get its gate from the binding, i.e. BEFORE the \
+         listener starts (#732 finding 3)",
+    );
+    assert!(
+        gate.suspended().await,
+        "the pre-start gate must already suspend ingest for the quarantined group"
+    );
+    assert!(
+        gate.epoch_token().await.is_some(),
+        "and it must resolve the ADR-0067 token for the same record"
+    );
+    let live = gate
+        .authorized_writers()
+        .await
+        .expect("the live roster resolves under the stable spelling");
+    assert!(
+        live.contains(&member),
+        "the active member is authorized from the LIVE roster: {live:?}"
+    );
+    assert_eq!(
+        binding.authorized_agents.as_ref().map(|a| a.len()),
+        Some(live.len()),
+        "the binding's captured set comes from the same resolver"
+    );
+
+    // NEGATIVE CONTROL: a plain list gets no gate and no authorization, so a
+    // list with no group binding keeps its pre-ADR-0068 behaviour exactly.
+    let plain = crate::server::routes::group_task_list_binding(&state, "plain-topic").await;
+    assert!(
+        plain.ingest_gate.is_none() && plain.authorized_agents.is_none(),
+        "control: a list with no group binding is untouched"
+    );
+    Ok(())
+}
+
+/// The ordering itself, asserted at the two call sites that produce a live
+/// handle: both must pass the binding to the `_bound` constructor, because
+/// anything applied to the handle afterwards is applied after the listener has
+/// already started (#732 finding 3).
+///
+/// A source scan rather than a behavioural test because reproducing the race
+/// needs a gossip runtime; the behaviour itself is covered in-process by
+/// `crdt::sync::tests::quarantine_gate_installed_before_start_holds_the_first_delta`.
+#[test]
+fn adr0068_f3_the_handle_producing_call_sites_bind_before_they_start() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rehydrate = std::fs::read_to_string(root.join("src/server/crdt_subscriptions.rs"))
+        .expect("the rehydration path must exist");
+    let routes = std::fs::read_to_string(root.join("src/server/routes/tasks.rs"))
+        .expect("the task routes must exist");
+    for (name, source) in [("crdt_subscriptions.rs", &rehydrate), ("tasks.rs", &routes)] {
+        assert!(
+            source.contains("group_task_list_binding"),
+            "{name} must gather the group binding BEFORE constructing the list"
+        );
+    }
+    for (name, source, needle) in [
+        (
+            "crdt_subscriptions.rs",
+            &rehydrate,
+            "join_task_list_persistent_bound",
+        ),
+        (
+            "crdt_subscriptions.rs",
+            &rehydrate,
+            "create_task_list_persistent_bound",
+        ),
+        ("tasks.rs", &routes, "create_task_list_persistent_bound"),
+    ] {
+        assert!(
+            source.contains(needle),
+            "{name} must call {needle}, so the gate is installed before the \
+             delta listener is spawned"
+        );
+    }
 }
