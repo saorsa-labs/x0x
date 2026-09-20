@@ -281,6 +281,22 @@ fn group_id_for_topic(topic: &str) -> Option<&str> {
 /// the marker was installed starts annotating on the next frame after the
 /// install, and stops on the next frame after a manual clear, with no
 /// cached state anywhere to go stale.
+///
+/// BOTH SPELLINGS, and this is load-bearing rather than defensive. The WS
+/// plane always names the group by its STABLE id — `MentionFrame.group_id`
+/// and the public topic both come from the ingest path's stable resolution —
+/// while `named_groups` is keyed by whichever alias this daemon happened to
+/// learn the group under (`resolved_group_key` tries the direct key first and
+/// then scans by `stable_group_id()`; pre-D.3 records fall back to
+/// `mls_group_id`). A single-spelling `get()` would therefore leave an
+/// alias-keyed group streaming UNANNOTATED through the whole incident —
+/// silently, and only for that group — which is precisely the failure §3d
+/// exists to prevent. The fallback scan is bounded by the group count and
+/// runs only at the two lookup points below, never per frame.
+///
+/// Slice 3 (#744) adds the same two-spelling resolver as
+/// `delegations::fork_quarantine_marker`; folding the two into one shared
+/// helper is part of the unification follow-up noted above.
 async fn fork_quarantine_annotation(
     state: &AppState,
     group_id: &str,
@@ -290,7 +306,12 @@ async fn fork_quarantine_annotation(
     // competing commit headers, which no frame needs.
     let (revision, observed_at_ms, no_anchor) = {
         let groups = state.named_groups.read().await;
-        let marker = groups.get(group_id)?.fork_quarantine.as_ref()?;
+        let info = groups.get(group_id).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id)
+        })?;
+        let marker = info.fork_quarantine.as_ref()?;
         (marker.revision, marker.observed_at_ms, marker.no_anchor)
     };
     Some(ForkQuarantineAnnotation {
@@ -1569,19 +1590,27 @@ mod tests {
         "aa".repeat(32)
     }
 
-    /// Insert a plain (unquarantined) group so the topic resolves.
-    async fn insert_test_group(state: &AppState, group_id: &str) {
+    /// Insert a plain (unquarantined) group under `map_key`, and return the
+    /// STABLE id the WS plane will name it by.
+    ///
+    /// The two can differ — that is the whole point of the alias fixture
+    /// below — so every caller is explicit about which spelling it is using:
+    /// the marker helpers take the MAP KEY (that is what `named_groups` is
+    /// keyed by), while the frames take the stable id.
+    async fn insert_test_group(state: &AppState, map_key: &str) -> String {
         let info = crate::groups::GroupInfo::new(
             "adr0066-ws".to_string(),
             String::new(),
             state.agent.agent_id(),
             "09".repeat(16),
         );
+        let stable = info.stable_group_id().to_string();
         state
             .named_groups
             .write()
             .await
-            .insert(group_id.to_string(), info);
+            .insert(map_key.to_string(), info);
+        stable
     }
 
     /// Install a fork-quarantine marker on an existing group entry, as the
@@ -1872,6 +1901,82 @@ mod tests {
                     assert_annotated(&frame, &group_id);
                 }
                 WsOutbound::Message { .. } => assert_not_annotated(&frame),
+                WsOutbound::Subscribed { .. } => {}
+                other => panic!("unexpected frame during backfill: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// WHY (found by cross-model review of this slice; the same hole slice 3
+    /// had): the WS plane and the roster map do not necessarily spell a group
+    /// the same way. Frames always name the STABLE id —
+    /// `MentionFrame.group_id` and the public topic both come from the ingest
+    /// path's stable resolution — while `named_groups` is keyed by whichever
+    /// alias this daemon learned the group under, which `resolved_group_key`
+    /// exists precisely to paper over (and which a pre-D.3 record makes
+    /// routine, since `stable_group_id()` then falls back to `mls_group_id`).
+    ///
+    /// A single-spelling `get()` therefore fails in the worst possible shape:
+    /// it does not error, it does not annotate some frames and not others —
+    /// it leaves ONE group streaming completely unlabelled through its entire
+    /// incident while every other group looks correct, so the gap is
+    /// invisible to any test that keys its fixture by the stable id. Both of
+    /// the surfaces this slice touches are asserted here, because they
+    /// resolve the marker through two different call sites.
+    #[tokio::test]
+    async fn adr0066_alias_keyed_group_is_annotated_on_both_surfaces() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        // Keyed by an ALIAS, not by the stable id the frames will carry.
+        let map_key = "adr0066-ws-alias-key";
+        let stable_id = insert_test_group(&state, map_key).await;
+        // The fixture is worthless if the two spellings coincide — assert its
+        // own premise rather than trusting it.
+        assert_ne!(
+            stable_id, map_key,
+            "the fixture must store the group under a key that is NOT its stable id"
+        );
+        set_test_marker(&state, map_key).await;
+        let topic = crate::groups::public_topic_for(&stable_id);
+
+        // Surface 1 — the ADR-0040 mention frame.
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(64);
+        let stats = WsOutboundStats::default();
+        register_test_session(&state, "s1").await;
+        let subscribe = serde_json::json!({ "type": "subscribe", "topics": [&topic] }).to_string();
+        handle_ws_command(&state, "s1", &subscribe, &tx, &stats, false).await;
+        match next_frame(&mut rx).await {
+            WsOutbound::Subscribed { .. } => {}
+            other => panic!("expected the subscribed ack, got {other:?}"),
+        }
+        emit_test_mention(&state, &stable_id, &topic).await;
+        let frame = next_frame(&mut rx).await;
+        assert!(
+            matches!(frame, WsOutbound::Mention { .. }),
+            "expected a mention frame, got {frame:?}"
+        );
+        assert_annotated(&frame, &stable_id);
+
+        // Surface 2 — the ADR-0023 backfill boundary frame, which resolves
+        // the marker from the TOPIC rather than from a frame's group_id.
+        let (tx2, mut rx2) = mpsc::channel::<WsOutbound>(64);
+        register_test_session(&state, "s2").await;
+        let subscribe = serde_json::json!({
+            "type": "subscribe",
+            "topics": [&topic],
+            "backfill": { "limit": 8 },
+        })
+        .to_string();
+        handle_ws_command(&state, "s2", &subscribe, &tx2, &stats, false).await;
+        loop {
+            let frame = next_frame(&mut rx2).await;
+            match &frame {
+                WsOutbound::Live { .. } => {
+                    assert_annotated(&frame, &stable_id);
+                    break;
+                }
+                WsOutbound::Message { .. } => assert_annotated(&frame, &stable_id),
                 WsOutbound::Subscribed { .. } => {}
                 other => panic!("unexpected frame during backfill: {other:?}"),
             }

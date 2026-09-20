@@ -33,7 +33,12 @@ All notable changes to this project will be documented in this file.
   lock at all: the lookup happens once per routed mention and once per
   subscribed topic at backfill. A label on a `reason: "delegation"` mention
   describes what was OBSERVED, not what was authorized — the grant itself is
-  refused independently (§3b).
+  refused independently (§3b). The marker lookup matches **both spellings** of
+  a group id — the map key and `stable_group_id()` — because WS frames always
+  name the stable id while `named_groups` is keyed by whichever alias this
+  daemon learned the group under; a single-spelling lookup would leave an
+  alias-keyed group streaming entirely unlabelled through its whole incident
+  while every other group looked correct.
 
 - **Ordinary (non-owner-axis) groups now receive the fork-quarantine marker
   (ADR-0066 §2, slice 2; #732) — a NEW availability failure mode with no
