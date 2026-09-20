@@ -68,7 +68,7 @@ owner-axis-only is removed by ADR-0066 §2 / slice 2). Evidence must pass
 is written.
 
 1. A conflicting state-commit arrives through the live apply path
-   (`at bb77a61:8922` — deliberately ungated, see §3.3 row 24).
+   (`named_groups.rs::apply_named_group_metadata_event_inner` — deliberately ungated, see §3.3 row 24).
 2. The evidence authenticates: the committer's signature verifies, and the
    committer was an active admin in the retained predecessor roster.
 3. The ADR-0059 dedup gate checks the evidence is not a replay.
@@ -81,10 +81,12 @@ is written.
    counter: the token is derived on demand from the live record as
    `(state_revision, marker_identity)` (`src/groups/mod.rs`, `LifecycleEpochToken`
    type) — no new field, no new serde surface. It observes every install and clear
-   automatically, including the on-disk recovery install at `at bb77a61:24203`
-   and the two clears that bypass the persistence lock (`at bb77a61:3562`,
-   `at bb77a61:9633`), because the token is read from the live record at re-check
-   time.
+   automatically, including the on-disk recovery install at
+   `named_groups.rs::record_recovery_fork_evidence`
+   and the two clears that bypass the persistence lock (`at bb77a61:3562 inside
+   named_groups.rs::rollback_live_fork_evidence`, and the owner-anchored auto-clear
+   inside `named_groups.rs::apply_named_group_metadata_event_inner_serialized`),
+   because the token is read from the live record at re-check time.
 
 **Evidence path widened by ADR-0066 R2.** Ordinary groups formed without an invite
 are covered too (fence inside `install_fork_evidence` widened). "Ordinary group"
@@ -135,12 +137,12 @@ Match on **`reason`**, not on `error`. The body is (ADR-0066 §5):
 | 1 | `POST /groups/:id/send` — outbound signed-public send | `named_groups.rs::send_group_public_message` |
 | 2 | TreeKEM group encrypt | `named_groups.rs::treekem_group_encrypt` |
 | 3 | TreeKEM group decrypt | `named_groups.rs::treekem_group_decrypt` |
-| 4 | `POST /groups/:id/secure/encrypt` (GSS) | `at bb77a61:22967 (named_groups.rs, GSS encrypt route)` |
-| 5 | `POST /groups/:id/secure/decrypt` (GSS) | `at bb77a61:23177 (named_groups.rs, GSS decrypt route)` |
-| 6 | `POST /groups/:id/secure/reseal` (GSS) | `at bb77a61:23337 (named_groups.rs, GSS reseal route)` |
+| 4 | `POST /groups/:id/secure/encrypt` (GSS) | `named_groups.rs::secure_group_encrypt` |
+| 5 | `POST /groups/:id/secure/decrypt` (GSS) | `named_groups.rs::secure_group_decrypt` |
+| 6 | `POST /groups/:id/secure/reseal` (GSS) | `named_groups.rs::secure_group_reseal` |
 | 7 | TreeKEM group-store resolution | `stores.rs::resolve_gss_group_store` |
 | 8 | TreeKEM group-store live info re-read | `stores.rs::resolve_treekem_group_store` |
-| 9 | KV group-writer predicate | `at bb77a61:2051 (stores.rs, group-writer predicate)` |
+| 9 | KV group-writer predicate | `src/server/routes/stores.rs::group_writer` |
 | 10 | Signed-public KV authorization snapshot (bind-time) | `src/groups/kv_context.rs::from_group (signed-public type)` |
 | 11 | TreeKEM KV authorization context construct | `src/groups/kv_context.rs::from_group (TreeKEM type)` |
 | 12 | TreeKEM KV authorization context refresh | `src/groups/kv_context.rs::update_from_group` |
@@ -150,7 +152,7 @@ Match on **`reason`**, not on `error`. The body is (ADR-0066 §5):
 | 18 | Delegated send-as authorization | `src/server/delegations.rs::authorize_send_as` |
 | 19 | Committed-delegation registry rebuild / index | `src/server/delegations.rs::rebuild_global_delegation_registry`, `::index_committed` |
 | 20 (mutations) | `POST /task-lists`, `POST /task-lists/:id/tasks`, `PATCH /task-lists/:id/tasks/:tid` | `tasks.rs::reject_quarantined_task_mutation` |
-| 21 | Signed-public bootstrap outbox publish (withheld — see §3.3) | `outbox.rs::withhold_bootstrap_publication`, `::quarantined_markers` |
+| 21 | Signed-public bootstrap outbox publish (withheld — see §3.3) | `src/server/routes/public_group_bootstrap_outbox.rs::withhold_bootstrap_publication`, `::quarantined_markers` |
 
 Rows 1–12 were already gated before ADR-0066; they now refuse for ordinary groups
 too (ADR-0066 §2). Rows 14–21 are new refusals added by slices 3–5.
@@ -239,7 +241,7 @@ candidate is CHOSEN (not refused after the choice), so the outbox never stalls.
 The withheld publication has no HTTP response; it logs the §5 sentence at WARN
 and records one `fork_quarantine_refusals` increment, **deduplicated per
 `(group_id, revision, observed_at_ms)`, bounded 1024** —
-`outbox.rs::withhold_bootstrap_publication`. A new evidence revision or a clear
+`src/server/routes/public_group_bootstrap_outbox.rs::withhold_bootstrap_publication`. A new evidence revision or a clear
 followed by a re-quarantine logs and counts again.
 
 **Row 22 — Lifecycle epoch token (ADR-0067, slice 7).** Every persist-path
@@ -353,7 +355,7 @@ history rows carry as well as the id the clear route accepts.
 record a `fork_quarantine_refusals` increment and log the §5 sentence at WARN,
 deduplicated:
 - Bootstrap outbox (row 21): keyed by `(group_id, revision, observed_at_ms)`,
-  bounded 1024 (`outbox.rs::withhold_bootstrap_publication`).
+  bounded 1024 (`src/server/routes/public_group_bootstrap_outbox.rs::withhold_bootstrap_publication`).
 - Delegation index / registry (row 19): keyed by `(group_id, revision)`, bounded
   1024 (`src/server/delegations.rs::first_index_refusal_for`).
 
@@ -547,7 +549,7 @@ The shared `resolve_group_entry_locked`
 (`src/server/mod.rs::resolve_group_entry_locked`) is used by delegations and
 stores. Two local resolvers remain: `history::resolve_group_entry`
 (`history.rs::fork_quarantine_annotation` annotation function) and
-`ws::fork_quarantine_annotation` (`ws.rs::fork_quarantine_annotation`).
+`ws::fork_quarantine_annotation` (`src/server/ws.rs::fork_quarantine_annotation`).
 Unification is deliberately deferred from slice 7 to avoid mixing a
 behaviour-neutral refactor into a security slice (inside
 `src/server/mod.rs::resolve_group_entry_locked`).
@@ -623,7 +625,7 @@ mandate-producing authority.
 | `fork_quarantine_set` counter bump | inside `named_groups.rs::install_fork_evidence` |
 | `is_fork_quarantined()` | `src/groups/mod.rs::GroupInfo::is_fork_quarantined` |
 | Retry rollback (NOT a clear) | `named_groups.rs::rollback_live_fork_evidence` |
-| Apply path (deliberately ungated, row 24) | `at bb77a61:8922 (named_groups.rs, live apply path)` |
+| Apply path (deliberately ungated, row 24) | `named_groups.rs::apply_named_group_metadata_event_inner` |
 | Single refusal helper | `named_groups.rs::reject_fork_quarantined` |
 | Refusal body builder | `named_groups.rs::fork_quarantine_refusal_body` |
 | Refusal message (branches on `no_anchor`) | `named_groups.rs::fork_quarantine_refusal_message` |
@@ -638,15 +640,15 @@ mandate-producing authority.
 | `lifecycle_epoch_token_locked` | `src/server/mod.rs::lifecycle_epoch_token_locked` |
 | Lifecycle epoch token type | `src/groups/mod.rs::LifecycleEpochToken` |
 | History annotation function | `history.rs::fork_quarantine_annotation` |
-| WS annotation function | `ws.rs::fork_quarantine_annotation` |
-| WS scopes-array shape | inside `ws.rs::fork_quarantine_annotation` |
-| `fork_quarantine_refusals` counter declaration | `src/groups/diagnostics.rs::GroupForkQuarantineCounters.fork_quarantine_refusals` |
-| `fork_quarantine_set` counter declaration | `src/groups/diagnostics.rs::GroupForkQuarantineCounters.fork_quarantine_set` |
+| WS annotation function | `src/server/ws.rs::fork_quarantine_annotation` |
+| WS scopes-array shape | inside `src/server/ws.rs::fork_quarantine_annotation` |
+| `fork_quarantine_refusals` counter declaration | `src/groups/diagnostics.rs::GroupCounters.fork_quarantine_refusals` |
+| `fork_quarantine_set` counter declaration | `src/groups/diagnostics.rs::GroupCounters.fork_quarantine_set` |
 | History reaper (no quarantine check) | `src/history/reaper.rs` (47 lines, zero quarantine mentions) |
 | Task CRDT delta admission (ungated) | `src/crdt/task_list.rs::is_authorized_content_writer` |
 | Task group authorization setup (uses contested roster) | `tasks.rs::apply_group_authorization` |
 | Task quarantine check | `tasks.rs::reject_quarantined_task_mutation` |
-| Bootstrap outbox WARN dedupe | `outbox.rs::withhold_bootstrap_publication` |
+| Bootstrap outbox WARN dedupe | `src/server/routes/public_group_bootstrap_outbox.rs::withhold_bootstrap_publication` |
 | Bootstrap outbox dedup key | `(group_id, revision, observed_at_ms)`, bound 1024 |
 | Delegation index WARN dedupe | `src/server/delegations.rs::first_index_refusal_for` |
 | Delegation index dedup key | `(group_id, revision)`, bound 1024 |
