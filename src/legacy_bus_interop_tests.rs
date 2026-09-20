@@ -955,9 +955,9 @@ struct RejectedReadiness {
 ///   from passing vacuously when a subscriber's topic entry is transiently
 ///   absent from the snapshot.
 ///
-/// `non_subscriber_indices` is extracted from
-/// `topology["dm_bus_non_subscriber_indices"]` inside `capture_ready_diamond`,
-/// populated by `shape_diamond` at topology construction time.
+/// `non_subscriber_indices` is passed directly to `capture_ready_diamond` by
+/// `shape_diamond` (not embedded in the topology JSON, which must carry exactly
+/// the 8 canonical keys checked by `validate_topology` → `diamond_keys`).
 ///
 /// # Degree note
 /// Harness agents are built with `Agent::builder()` which produces Leaf
@@ -3458,8 +3458,8 @@ fn eager_mesh_stability_oracle_not_fooled_by_float_cooling_events() {
 //
 // These tests validate the configuration-driven subscriber/non-subscriber
 // distinction.  The subscription decision is driven by `non_subscriber_indices`
-// (derived from topology["dm_bus_non_subscriber_indices"] at runtime, set by
-// shape_diamond), NOT by observing whether the topic is absent in the snapshot.
+// (passed directly to `capture_ready_diamond` by shape_diamond, NOT embedded
+// in topology JSON), NOT by observing whether the topic is absent in the snapshot.
 //
 // All tests use synthetic observations; no daemon or network I/O is needed.
 
