@@ -941,14 +941,23 @@ struct RejectedReadiness {
 /// Skips gracefully when:
 /// - `identities` is `None` (peer IDs not yet resolved), or
 /// - a node's `peer_scores_by_topic` is `null` (gossip runtime not yet started;
-///   scores lag plane admission by at most one iteration during bring-up), or
-/// - the DM bus topic is absent from a node's `peer_scores_by_topic` — this is
-///   the correct behavior for the opt-out arm in tests like
-///   `paired_controlled_load_bus_eager_attempts_default_vs_optout`, where one
-///   node is built with `with_skip_legacy_dm_bus(true)` and does not subscribe
-///   to the DM bus topic.  Such a node has no PlumTree eager set for that topic
-///   and should not be checked.  The remaining subscribing nodes are still
-///   validated at their full expected degree.
+///   scores lag plane admission by at most one iteration during bring-up).
+///
+/// The subscription decision is **configuration-driven** via
+/// `non_subscriber_indices` (DIAMOND_LABELS indices of nodes built with
+/// `with_skip_legacy_dm_bus(true)` or otherwise not subscribed to DM bus):
+///
+/// - **Declared non-subscriber**: the DM bus topic MUST be absent from its
+///   `peer_scores_by_topic`.  If it is present, the function returns `Err` —
+///   the opt-out flag had no effect, a configuration invariant violation.
+/// - **Subscriber** (all other nodes): a missing topic entry is a **retryable
+///   failure** — the retry loop revisits in 10 ms.  This prevents the oracle
+///   from passing vacuously when a subscriber's topic entry is transiently
+///   absent from the snapshot.
+///
+/// `non_subscriber_indices` is extracted from
+/// `topology["dm_bus_non_subscriber_indices"]` inside `capture_ready_diamond`,
+/// populated by `shape_diamond` at topology construction time.
 ///
 /// # Degree note
 /// Harness agents are built with `Agent::builder()` which produces Leaf
@@ -957,6 +966,7 @@ struct RejectedReadiness {
 fn check_eager_mesh_for_diamond(
     observed: &serde_json::Value,
     identities: Option<[[u8; 32]; 4]>,
+    non_subscriber_indices: &[usize],
 ) -> Result<(), String> {
     let Some(ids) = identities else {
         return Ok(());
@@ -971,15 +981,28 @@ fn check_eager_mesh_for_diamond(
             // Gossip runtime not yet started; skip, the retry loop will revisit.
             continue;
         }
-        // Skip nodes that are not subscribed to the DM bus topic.  An opt-out
-        // node has no eager set to validate for this topic; requiring it would
-        // block the retry loop for the entire SETUP deadline (confirmed by the
-        // CI failure on the opt-out arm of
-        // paired_controlled_load_bus_eager_attempts_default_vs_optout: O5 has
-        // DM_BUS_TOPIC = a746d680e31732d1 absent from its peer_scores_by_topic
-        // while G5/D5/W5 all show degree=2 eager — the mesh was healthy).
-        if scores.get(&bus_topic).map(|v| v.is_null()).unwrap_or(true) {
-            continue;
+        let topic_present = scores
+            .get(&bus_topic)
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if non_subscriber_indices.contains(&i) {
+            // Declared non-subscriber: assert the DM bus topic is absent.
+            // Topic present means the opt-out flag had no effect — config error.
+            if topic_present {
+                return Err(format!(
+                    "node {label}: declared non-subscriber has DM bus topic {bus_topic:?} \
+                     in peer_scores_by_topic — with_skip_legacy_dm_bus flag had no effect"
+                ));
+            }
+            continue; // Correctly absent; nothing to check.
+        }
+        // Subscriber: topic absent is retryable (scores not yet populated),
+        // not a silent pass.  The retry loop revisits in 10 ms.
+        if !topic_present {
+            return Err(format!(
+                "node {label}: subscribes to DM bus but topic {bus_topic:?} absent from \
+                 peer_scores_by_topic — scores not yet populated (retryable)"
+            ));
         }
         let neighbor_hex8: Vec<String> = NEIGHBOR_INDICES[i]
             .iter()
@@ -1058,8 +1081,18 @@ where
                 return Err(rejected);
             }
         };
+        // Extract declared non-subscriber indices from topology (set by shape_diamond).
+        // Empty when absent: all nodes are treated as DM bus subscribers.
+        let non_sub_indices: Vec<usize> = topology["dm_bus_non_subscriber_indices"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
         let validation = diamond_peer_sets(topology, &observed)
-            .and_then(|()| check_eager_mesh_for_diamond(&observed, identities));
+            .and_then(|()| check_eager_mesh_for_diamond(&observed, identities, &non_sub_indices));
         attempt.validation_end_ns = readiness_offset(start, tokio::time::Instant::now());
         rejected.diagnostics.clock_incomplete |= attempt.validation_end_ns.is_none();
         match validation {
@@ -1118,6 +1151,7 @@ async fn shape_diamond(
     agents: &[Agent],
     raw: &mut serde_json::Value,
     clock: std::time::Instant,
+    dm_bus_non_subscriber_label_indices: &[usize],
 ) -> Result<Vec<std::time::Instant>, RejectedReadiness> {
     let expected = diamond_expected();
     let peer_ids: serde_json::Map<String, serde_json::Value> = DIAMOND_LABELS
@@ -1130,8 +1164,19 @@ async fn shape_diamond(
             )
         })
         .collect();
+    // dm_bus_non_subscriber_indices: DIAMOND_LABELS indices of nodes built with
+    // with_skip_legacy_dm_bus(true) or otherwise not subscribed to the DM bus.
+    // Consumed by capture_ready_diamond → check_eager_mesh_for_diamond to decide
+    // whether a missing DM bus topic entry is a configuration invariant violation
+    // (non-subscriber with the topic) or a retryable failure (subscriber without).
+    let non_sub_json: serde_json::Value = dm_bus_non_subscriber_label_indices
+        .iter()
+        .map(|&i| serde_json::Value::Number(i.into()))
+        .collect::<Vec<_>>()
+        .into();
     raw["topology"] = serde_json::json!({"expected_allowed":expected,
         "forbidden_pairs":[["G5","W5"],["D5","O5"]],"peer_ids":peer_ids,
+        "dm_bus_non_subscriber_indices":non_sub_json,
         "operations":{},"observations":{},"suppression":{},"intervening_allowed_edge_state":"unknown",
         "configuration":"two reverse test Admin installations and two public forward disconnects; gossip admission only"});
     let mut originals = Vec::new();
@@ -2026,7 +2071,8 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     // Provenance preparation ran before Agent construction; agent-dependent
     // universe/identity work and witness setup remain before shaping.
     // Only this fifth case now shapes the already prepared full mesh.
-    let originals = match shape_diamond(agents, &mut raw, clock).await {
+    // O5 = DIAMOND_LABELS index 2, built with with_skip_legacy_dm_bus(true).
+    let originals = match shape_diamond(agents, &mut raw, clock, &[2]).await {
         Ok(originals) => originals,
         Err(rejected) => {
             retain_rejected_readiness(&mut raw, &rejected);
@@ -3399,5 +3445,107 @@ fn eager_mesh_stability_oracle_not_fooled_by_float_cooling_events() {
     assert!(
         msg.contains("peer_bbbb"),
         "stability error must name the re-cooled peer; got: {msg}"
+    );
+}
+
+// ── Unit tests for check_eager_mesh_for_diamond subscription semantics ────────
+//
+// These tests validate the configuration-driven subscriber/non-subscriber
+// distinction.  The subscription decision is driven by `non_subscriber_indices`
+// (derived from topology["dm_bus_non_subscriber_indices"] at runtime, set by
+// shape_diamond), NOT by observing whether the topic is absent in the snapshot.
+//
+// All tests use synthetic observations; no daemon or network I/O is needed.
+
+/// **Negative control** — subscriber with topic absent: oracle must return Err
+/// (retryable), NOT silently pass.  Guards against the vacuous-pass scenario
+/// where a subscriber's scores haven't populated yet and the oracle passes.
+#[test]
+fn eager_mesh_for_diamond_subscriber_absent_topic_is_retryable_err() {
+    // G5 (index 0) has peer_scores_by_topic populated with another topic but
+    // NOT the DM bus topic — scores present but not yet populated for DM bus.
+    let other_topic = "cafebabe12345678";
+    let observed = serde_json::json!({
+        "G5": {
+            "admitted": [],
+            "peer_scores_by_topic": { other_topic: {} }
+        },
+        "D5": { "admitted": [], "peer_scores_by_topic": null },
+        "O5": { "admitted": [], "peer_scores_by_topic": null },
+        "W5": { "admitted": [], "peer_scores_by_topic": null },
+    });
+    // Non-zero fake identities so neighbor_hex8 is computable if the check
+    // ever reaches the peer lookup (it should not — topic check fires first).
+    let fake_ids = Some([[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
+    let result = check_eager_mesh_for_diamond(&observed, fake_ids, &[]);
+    assert!(
+        result.is_err(),
+        "subscriber (G5) with DM bus topic absent must return Err (retryable); \
+         a silent Ok would let the oracle pass vacuously before scores populate"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("G5"),
+        "retryable error must name the failing node; got: {msg}"
+    );
+    assert!(
+        msg.contains("retryable") || msg.contains("absent"),
+        "error must describe the retryable condition; got: {msg}"
+    );
+}
+
+/// Declared non-subscriber with topic absent: oracle must return Ok.
+/// This is the opt-out arm: O5 (index 2) is declared as non-subscriber and
+/// its `peer_scores_by_topic` correctly lacks the DM bus topic.
+#[test]
+fn eager_mesh_for_diamond_declared_non_subscriber_absent_topic_is_ok() {
+    let other_topic = "cafebabe12345678";
+    let observed = serde_json::json!({
+        "G5": { "admitted": [], "peer_scores_by_topic": null },
+        "D5": { "admitted": [], "peer_scores_by_topic": null },
+        // O5 has scores for other topics but not DM bus — correct opt-out shape.
+        "O5": {
+            "admitted": [],
+            "peer_scores_by_topic": { other_topic: {} }
+        },
+        "W5": { "admitted": [], "peer_scores_by_topic": null },
+    });
+    let fake_ids = Some([[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
+    // O5 = index 2 in DIAMOND_LABELS order.
+    check_eager_mesh_for_diamond(&observed, fake_ids, &[2])
+        .expect("declared non-subscriber (O5) with topic correctly absent must pass");
+}
+
+/// **Negative control** — declared non-subscriber WITH the DM bus topic present:
+/// oracle must return Err (opt-out flag had no effect — configuration violation).
+#[test]
+fn eager_mesh_for_diamond_declared_non_subscriber_with_topic_is_err() {
+    let dm_topic = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
+    // O5 declared non-subscriber but has the DM bus topic in its scores.
+    let mut o5_scores = serde_json::json!({});
+    o5_scores[&dm_topic] = serde_json::json!({
+        "peer_aaaa": {
+            "role": "eager", "cooling_events": 0.0,
+            "last_cool_at_unix_ms": null,
+            "eager_eligible": true, "suppression_state": null, "cooldown_ms": null
+        }
+    });
+    let observed = serde_json::json!({
+        "G5": { "admitted": [], "peer_scores_by_topic": null },
+        "D5": { "admitted": [], "peer_scores_by_topic": null },
+        "O5": { "admitted": [], "peer_scores_by_topic": o5_scores },
+        "W5": { "admitted": [], "peer_scores_by_topic": null },
+    });
+    let fake_ids = Some([[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
+    let result = check_eager_mesh_for_diamond(&observed, fake_ids, &[2]);
+    assert!(
+        result.is_err(),
+        "declared non-subscriber (O5) WITH the DM bus topic must return Err \
+         — the opt-out flag had no effect, a configuration invariant violation"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("O5"),
+        "error must name the violating node; got: {msg}"
     );
 }
