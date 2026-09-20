@@ -938,10 +938,17 @@ struct RejectedReadiness {
 /// Returns `Ok(())` when all four nodes have their two expected neighbors
 /// as eager peers.  Returns `Err(String)` naming the first failing node.
 ///
-/// Skips gracefully when `identities` is `None` (peer IDs not yet resolved)
-/// or when a node's `peer_scores_by_topic` entry is `null` (gossip runtime
-/// not yet started); this keeps the retry loop safe during initial bring-up
-/// when scores lag plane admission by at most one iteration.
+/// Skips gracefully when:
+/// - `identities` is `None` (peer IDs not yet resolved), or
+/// - a node's `peer_scores_by_topic` is `null` (gossip runtime not yet started;
+///   scores lag plane admission by at most one iteration during bring-up), or
+/// - the DM bus topic is absent from a node's `peer_scores_by_topic` — this is
+///   the correct behavior for the opt-out arm in tests like
+///   `paired_controlled_load_bus_eager_attempts_default_vs_optout`, where one
+///   node is built with `with_skip_legacy_dm_bus(true)` and does not subscribe
+///   to the DM bus topic.  Such a node has no PlumTree eager set for that topic
+///   and should not be checked.  The remaining subscribing nodes are still
+///   validated at their full expected degree.
 ///
 /// # Degree note
 /// Harness agents are built with `Agent::builder()` which produces Leaf
@@ -962,6 +969,16 @@ fn check_eager_mesh_for_diamond(
         let scores = &observed[*label]["peer_scores_by_topic"];
         if scores.is_null() {
             // Gossip runtime not yet started; skip, the retry loop will revisit.
+            continue;
+        }
+        // Skip nodes that are not subscribed to the DM bus topic.  An opt-out
+        // node has no eager set to validate for this topic; requiring it would
+        // block the retry loop for the entire SETUP deadline (confirmed by the
+        // CI failure on the opt-out arm of
+        // paired_controlled_load_bus_eager_attempts_default_vs_optout: O5 has
+        // DM_BUS_TOPIC = a746d680e31732d1 absent from its peer_scores_by_topic
+        // while G5/D5/W5 all show degree=2 eager — the mesh was healthy).
+        if scores.get(&bus_topic).map(|v| v.is_null()).unwrap_or(true) {
             continue;
         }
         let neighbor_hex8: Vec<String> = NEIGHBOR_INDICES[i]
