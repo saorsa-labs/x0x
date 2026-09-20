@@ -211,8 +211,9 @@ fn marker_for<'a>(
         .map(|(_, marker)| marker)
 }
 
-/// Resolve one group id to its roster entry under **either spelling**, and
-/// return the entry's MAP KEY alongside it.
+/// WHY the two lookups below go through
+/// [`crate::server::resolve_group_entry_locked`] rather than `groups.get()`,
+/// and return the entry's MAP KEY alongside it.
 ///
 /// **This is load-bearing, not defensive (review r1, omp/GLM-5.3).** The
 /// `named_groups` map is keyed by whichever alias this daemon learned the
@@ -228,34 +229,23 @@ fn marker_for<'a>(
 /// first, then a scan by `stable_group_id()`. The scan is bounded by the
 /// group count and runs only at the lookup points below.
 ///
-/// The key is returned because the manual clear endpoint
-/// (`clear_group_quarantine`, `named_groups.rs:12607`) looks the group up by
-/// **map key only** — so a refusal must name that spelling in its §5 remedy,
-/// or it would hand the operator an id its own clear route cannot find.
+/// The key is named in a refusal because it is the spelling the manual clear
+/// endpoint has always accepted. #732 taught that route the stable id too, so
+/// naming the map key is now a convenience rather than the operator's only
+/// usable handle — both spellings clear.
 ///
-/// Slice 3 (#744, `delegations::fork_quarantine_marker`) and slice 6 (#745,
-/// `ws::fork_quarantine_annotation`) carry the same two-spelling resolver by
-/// deliberate duplication; folding the three into one shared helper is a
-/// follow-up, not a slice-4 refactor.
-fn resolve_group_entry<'a>(
-    groups: &'a std::collections::HashMap<String, x0x::groups::GroupInfo>,
-    group_id: &str,
-) -> Option<(&'a String, &'a x0x::groups::GroupInfo)> {
-    groups.get_key_value(group_id).or_else(|| {
-        groups
-            .iter()
-            .find(|(_, info)| info.stable_group_id() == group_id)
-    })
-}
-
+/// #732: slices 3, 4, 6 and 7 each grew their own copy of this rule and
+/// review found the same single-spelling defect in three of them, so the
+/// local copies are gone and every site calls the one resolver.
+///
 /// Markers for the group scopes named by `scopes` (deduplicated, ordered
 /// by canonical scope so a response is stable page to page). Takes the
 /// `named_groups` read lock exactly once.
 ///
 /// Each marker is reported under the scope spelling the CALLER used, which
-/// is also the spelling its rows carry — the lookup accepts either (see
-/// [`resolve_group_entry`]), so an alias-keyed group annotates whether the
-/// request named it by alias or by stable id.
+/// is also the spelling its rows carry — the lookup accepts either (see the
+/// note above [`markers_for_scopes`]), so an alias-keyed group annotates
+/// whether the request named it by alias or by stable id.
 pub(in crate::server) async fn markers_for_scopes<'a>(
     state: &AppState,
     scopes: impl IntoIterator<Item = &'a Scope>,
@@ -274,7 +264,7 @@ pub(in crate::server) async fn markers_for_scopes<'a>(
     wanted
         .into_iter()
         .filter_map(|id| {
-            let (_, info) = resolve_group_entry(&groups, id)?;
+            let (_, info) = crate::server::resolve_group_entry_locked(&groups, id)?;
             let marker = info.fork_quarantine.clone()?;
             Some((Scope::Group(id.to_string()).canonical(), marker))
         })
@@ -758,7 +748,7 @@ pub(in crate::server) async fn history_purge(
         // KEY, because that is the id the manual clear route accepts.
         let refusal = {
             let groups = state.named_groups.read().await;
-            resolve_group_entry(&groups, group_id).and_then(|(key, info)| {
+            crate::server::resolve_group_entry_locked(&groups, group_id).and_then(|(key, info)| {
                 crate::server::routes::named_groups::reject_fork_quarantined(&state, key, info)
             })
         };

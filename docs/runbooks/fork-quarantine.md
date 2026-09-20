@@ -3,7 +3,8 @@
 > ADR-0066 (Accepted) · ADR-0067 (Accepted) · slice 8 — runbook and ops docs
 >
 > This file supersedes the slice 1–7 patchwork. Symbols verified at commit
-> bb77a61 (see Appendix A); line numbers kept only where no named symbol exists.
+> bb77a61 (see Appendix A), plus the #732 resolver-unification change that
+> closed gaps (d) and (e); line numbers kept only where no named symbol exists.
 
 Operator procedures for the persistent fork-quarantine marker and the owner
 mandate grace machinery. Everything here is **LOCAL, per-node state**: a marker
@@ -487,24 +488,25 @@ group's admins (compare `GET /groups/:id/state` heads across members), check
 (revision strictly greater), re-seat members still holding the disowned sibling,
 then force-clear — naming this runbook and what you verified in `--reason`.
 
-### 4.4 Alias-key caveat — clear by roster key, not stable id
+### 4.4 Two spellings of one group — either clears
 
-`clear_group_quarantine` (`named_groups.rs::clear_group_quarantine`) uses a bare
-`groups.get(&id)` — the MAP KEY only. A group learned under an alias (the key
-this daemon stored it under) must be cleared by that alias key; clearing by the
-stable id returns 404.
+A group's *stable* id is what history rows, `GET /history/scopes`, the WS/SSE
+`fork_quarantine` annotation and a delegation envelope all carry. The local
+roster — and therefore the marker — is keyed by whichever id this daemon learned
+the group under, which is not always the same string.
 
-**How to find the roster key:** the `error` field in the refusal body names it
-in prose; so do `GET /history/stats` and `GET /diagnostics/history`, which list
-both spellings when they differ. Use `x0x groups quarantine clear <roster_key>`.
+`clear_group_quarantine` (`named_groups.rs::clear_group_quarantine`) resolves
+**both** spellings through the shared resolver
+(`src/server/mod.rs::resolve_group_entry_locked`): direct key first, then a scan
+by `stable_group_id()`. Whichever id you are holding is the id to use.
 
-**Note:** on builds before the resolver-unification change tracked in §6d, clear
-by the key named in the refusal message's `error` field. After that change lands,
-clearing by stable id will also work.
+**Note:** on builds *before* the resolver-unification change (§6d), the clear
+took the MAP KEY only and answered 404 to the stable id. On those builds, clear
+by the key the refusal body's `error` field names in prose — `GET /history/stats`
+and `GET /diagnostics/history` list both spellings when they differ.
 
-This is a known limitation (see §6d). The manual clear for the force path has no
-owner axis to verify with regardless, so the 404 is the full error — not a silent
-success.
+A 404 from a current build therefore means the group is not on this node at all,
+under either name — not that you used the wrong spelling.
 
 ---
 
@@ -585,25 +587,29 @@ is not row 20, and row 24's "keep ungated" is about metadata/state-commit apply)
 Closing it needs a superseding decision about whether it is refuse-class or, like
 history ingest under R3, tag-and-retain.
 
-**(d) `clear_group_quarantine` single-spelling: alias vs stable id.**
-`clear_group_quarantine` (`named_groups.rs::clear_group_quarantine`) resolves the
-MAP KEY only via a bare `groups.get(&id)`. A group stored under an alias must be
-cleared by that alias key; clearing by stable id returns 404. The refusal messages
-name the roster key, and `/history/stats` and `/diagnostics/history` list both
-spellings when they differ. This is a known limitation; a follow-up should route
-the clear through `resolve_group_entry_locked`
-(`src/server/mod.rs::resolve_group_entry_locked`) the same way slices 3–5 do for
-their marker lookups.
+**(d) `clear_group_quarantine` single-spelling: alias vs stable id — RESOLVED.**
+The clear used to resolve the MAP KEY only, so a group stored under an alias
+could not be cleared by its stable id. It now goes through
+`src/server/mod.rs::resolve_group_entry_locked` like the other marker lookups,
+and both spellings clear (§4.4). Every precondition, the audit log and the
+`fork_quarantine_manual_clears` counter are unchanged, and an id this node holds
+no record for is still 404. Operators on older builds: see the note in §4.4.
 
-**(e) Three marker resolvers still local — pending unification.**
-The shared `resolve_group_entry_locked`
-(`src/server/mod.rs::resolve_group_entry_locked`) is used by delegations and
-stores. Two local resolvers remain: `history::resolve_group_entry`
-(`history.rs::fork_quarantine_annotation` annotation function) and
-`ws::fork_quarantine_annotation` (`src/server/ws.rs::fork_quarantine_annotation`).
-Unification is deliberately deferred from slice 7 to avoid mixing a
-behaviour-neutral refactor into a security slice (inside
-`src/server/mod.rs::resolve_group_entry_locked`).
+**(e) Three marker resolvers still local — RESOLVED.**
+The per-slice copies are gone: `src/server/routes/history.rs::markers_for_scopes`
+and the purge gate, `src/server/ws.rs::fork_quarantine_annotation` and the
+public-group bootstrap install check all call
+`src/server/mod.rs::resolve_group_entry_locked`, alongside
+`src/server/delegations.rs::fork_quarantine_marker` and the TreeKEM protector in
+`src/server/routes/stores.rs`. A `#[cfg(test)]` source scan
+(`named_groups/tests/adr0066_lookup_guard.rs`) now fails the build if a
+quarantine-relevant roster lookup spells the two-spelling rule out for itself
+again without an `ADR0066-LOOKUP-WAIVER:` comment giving the reason. The same
+change taught `named_groups.rs::treekem_group_encrypt` and
+`named_groups.rs::treekem_group_decrypt` to resolve both spellings: both of their
+pre-crypto gates sat inside one single-spelling lookup, so a miss skipped both
+and advanced the ratchet — reachable only as a TOCTOU behind their callers, but
+the only arm in that family that failed open rather than answering 404.
 
 **(f) `fork_quarantine` fault-injection test parallel-run flake under plain `cargo test`.**
 The `adr0064`/`adr0066` fault-injection tests use process-global statics
@@ -612,6 +618,22 @@ Under plain `cargo test` (which runs tests in the same process), concurrent test
 threads that touch the same static can interfere and produce spurious failures.
 `cargo nextest` runs each test in a separate process and is unaffected. Always use
 `cargo nextest` or the project's `just test` recipe.
+
+**(g) TreeKEM snapshot persist is single-spelling; a stable-id caller can burn a
+generation.** Found while building slice 9's stable-id fixture, NOT introduced by
+it, and on a non-quarantine path. `named_groups.rs::persist_treekem_snapshot_bound`
+resolves one spelling (`groups.get(group_id_hex)`), so in the state #750 named —
+the roster re-keyed to an alias while `treekem_groups` still holds the live
+ratchet under the stable id — a stable-id encrypt advances the send ratchet and
+then fails its persist with a 500 `failed to persist secure group state`. The
+generation is burned with no snapshot written, so it is lost across a restart
+rather than reused (fail-safe for nonce reuse, not for availability). The fix is
+the mechanical one: route that lookup through
+`server::resolve_group_entry_locked` like #750 did for the gates. Slice 9's
+`row2_stable_id_spelling_reaches_the_recheck_and_is_refused` asserts reachability
+as "not 424 and the ratchet moved" rather than as a 200, precisely so the §4
+fixture is not coupled to this bug's lifetime. Note the §4 re-check makes this
+*less* reachable for a quarantined group, which now refuses before the advance.
 
 ---
 
@@ -660,7 +682,7 @@ mandate-producing authority.
 | encrypted (GSS) store refuses after a marker set | cached authorization context is suspended (§3.3) | expected; re-arms on the next refresh after a clear; a store still dead after a clear is a bug, capture `/diagnostics` |
 | marker vanished after an old binary ran | downgrade dropped containment (§5.1) | re-upgrade; re-quarantines on the next authenticated conflict |
 | `signed-public bootstrap publication withheld` in log | row 21 suppression active (§3.3) | clear the marker per §4.3; delivery resumes automatically |
-| `clear` returns 404 on the stable id | alias-key limitation (§4.4, §6d) | use the roster key from the refusal message or `/history/stats` |
+| `clear` returns 404 on the stable id | pre-resolver build (§4.4, §6d); on a current build the group is simply not here | older build: use the roster key from the refusal message or `/history/stats` |
 
 ---
 
@@ -682,12 +704,15 @@ mandate-producing authority.
 | Refusal message (branches on `no_anchor`) | `named_groups.rs::fork_quarantine_refusal_message` |
 | Annotation shape (single-group) | `named_groups.rs::fork_quarantine_annotation` |
 | `api_error_with_reason` | `src/server/mod.rs::api_error_with_reason` |
-| `clear_group_quarantine` (bare `groups.get`) | `named_groups.rs::clear_group_quarantine` |
+| `clear_group_quarantine` (resolves both spellings) | `named_groups.rs::clear_group_quarantine` |
 | Owner-anchor apply-path clear | `named_groups.rs::apply_named_group_metadata_event_inner` |
 | Adoption clear | `named_groups.rs::try_adopt_member_added_across_gap` |
 | Owner-seal clear | `src/groups/mod.rs::clear_fork_quarantine_on_explicit_owner_seal` |
 | `resolve_group_entry_locked` | `src/server/mod.rs::resolve_group_entry_locked` |
-| Resolver unification follow-up note | inside `src/server/mod.rs::resolve_group_entry_locked` |
+| Resolver unification (gap (e) closed) | inside `src/server/mod.rs::resolve_group_entry_locked` |
+| Single-spelling lookup guard | `src/server/routes/named_groups/tests/adr0066_lookup_guard.rs` |
+| Waiver marker for a justified single-spelling site | `ADR0066-LOOKUP-WAIVER:` |
+| TreeKEM pre-crypto gates (both spellings) | `named_groups.rs::treekem_group_encrypt`, `named_groups.rs::treekem_group_decrypt` |
 | `lifecycle_epoch_token_locked` | `src/server/mod.rs::lifecycle_epoch_token_locked` |
 | Lifecycle epoch token type | `src/groups/mod.rs::LifecycleEpochToken` |
 | History annotation function | `history.rs::fork_quarantine_annotation` |

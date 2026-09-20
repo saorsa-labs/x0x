@@ -42,17 +42,47 @@ All notable changes to this project will be documented in this file.
   `docs/runbooks/fork-quarantine.md`. This empties the ADR-0067 deferral
   ledger: `PENDING_RECHECK` is now asserted empty alongside `OPEN_ROWS`, so
   ADR-0066 §1 and §4 are both discharged across the censused surface.
+- **The manual fork-quarantine clear now accepts the group's stable id as well
+  as its roster map key, and one shared resolver owns the two-spelling rule
+  (#732).** `named_groups` is keyed by whichever alias a daemon learned a group
+  under, while every id an operator can actually see — a history scope, a
+  WS/SSE `fork_quarantine` annotation, a delegation envelope — is the STABLE
+  id. `POST /groups/:id/quarantine/clear` (CLI `x0x groups quarantine clear`)
+  looked the group up under one spelling only, so for an alias-keyed group it
+  answered 404 to exactly the id its own refusal messages had taught the
+  operator to use: the single exit ADR-0066 §2 promises an ordinary
+  (`no_anchor`) group was unreachable. Both spellings now clear, with every
+  precondition (owner-key path (a) vs `force` + `reason` path (b)), the audit
+  log and the `fork_quarantine_manual_clears` counter unchanged; an unknown id
+  is still 404. Cross-model review had found the same single-spelling defect
+  independently in slices 3, 4 and 6, so the per-slice copies of the rule are
+  replaced by the one `resolve_group_entry_locked` resolver (history scope
+  markers and the purge gate, WS/SSE annotations, the public-group bootstrap
+  install check, the TreeKEM protector, the delegation gates), and a
+  source-scanning fixture fails the build if a quarantine-relevant lookup
+  spells the rule out for itself again without a waiver naming why.
+  Defence in depth in the same change: `treekem_group_encrypt`/`_decrypt` held
+  BOTH of their pre-crypto gates (ADR-0038 restore re-verification and the
+  ADR-0066 §3 quarantine gate) inside one single-spelling lookup, so a miss
+  skipped both and let the ratchet advance — the only arm in that family that
+  failed open rather than answering 404. This was not a known remote bypass:
+  their only callers 404 an unresolvable spelling at route level first and run
+  both gates on the map-key spelling under the same lock hold, leaving the
+  fail-open reachable only as a TOCTOU (the roster re-keyed between the
+  route's lock release and the helper's re-acquire while the live TreeKEM map
+  kept the old spelling). Both helpers now resolve both spellings, which also
+  closes that race.
 - **Fork quarantine operator runbook restructured (ADR-0066 slice 8; #732).** The
   per-slice patchwork in `docs/runbooks/fork-quarantine.md` (accumulated across
   slices 1–7) is replaced by a single coherent operator runbook. Coverage: what
   fork quarantine is; how a marker installs (install path, `no_anchor`, ADR-0067
   epoch token); the full 26-surface behaviour table with §5 refusal body and both
   annotation shapes (single-group and multi-scope); diagnose → decide → clear
-  procedure with alias-key caveat (`clear_group_quarantine` resolves MAP KEY only
-  via bare `groups.get(&id)`); upgrade notes; and six known gaps with file:line
+  procedure; upgrade notes; and six known gaps with file:line
   citations (send-path §4 re-check deferred rows 1/2/4/6, history reaper ignores
-  quarantine, inbound task-CRDT deltas apply ungated, alias-key clear limitation,
-  three marker resolvers pending unification, fault-injection test parallel flake
+  quarantine, inbound task-CRDT deltas apply ungated, the alias-key clear
+  limitation and the three pending marker resolvers — both closed by the
+  resolver-unification entry above — and the fault-injection test parallel flake
   under plain `cargo test`). All 26 ADR-0066 §1 rows have landed
   (`OPEN_ROWS == &[]`); rows 1, 2, 4 and 6 carried `PENDING_RECHECK` for their §4
   re-check before effect until slice 9 landed it (known gap (a) is now closed). **FALSE statement removed:** old runbook intro claimed

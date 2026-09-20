@@ -1177,11 +1177,11 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
 
     let installed_frontier_matches = {
         let groups = state.named_groups.read().await;
-        match groups.get(&group_id).or_else(|| {
-            groups
-                .values()
-                .find(|existing| existing.stable_group_id() == group_id)
-        }) {
+        // #732: the both-spellings rule comes from the one shared resolver —
+        // an alias-keyed local record must be recognised as the SAME group as
+        // the inbound snapshot's stable id, or the frontier comparison below
+        // reads "new group" and the install proceeds against the wrong record.
+        match crate::server::resolve_group_entry_locked(&groups, &group_id).map(|(_, info)| info) {
             Some(installed) => {
                 Some((installed.state_revision, installed.state_hash.clone()) == frontier)
             }

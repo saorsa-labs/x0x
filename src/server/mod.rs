@@ -2467,10 +2467,14 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
 /// `&AppState`-taking `delegations::fork_quarantine_marker` is now a thin
 /// wrapper over this, so the two cannot drift.
 ///
-/// Unification of the remaining local copies (`history::resolve_group_entry`,
-/// `ws::fork_quarantine_annotation`) is deliberately NOT in ADR-0066 slice 7's
-/// scope and is left to a follow-up — those two annotate reads, and rewriting
-/// them here would mix a behaviour-neutral refactor into a security slice.
+/// **The single resolver (#732).** Slices 3, 4, 6 and 7 each grew their own
+/// copy of this two-line rule and cross-model review found the same
+/// single-spelling defect three times independently, so the copies are now
+/// gone: `delegations::fork_quarantine_marker`, `history`'s scope markers and
+/// purge gate, `ws`'s frame annotation, the public-group bootstrap install
+/// check, `stores`' TreeKEM protector and the manual clear route all resolve
+/// here. A quarantine-relevant lookup that spells this rule out again is a
+/// defect the `adr0066_lookup_guard` fixture is there to catch.
 pub(in crate::server) fn resolve_group_entry_locked<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,

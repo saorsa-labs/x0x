@@ -494,11 +494,21 @@ async fn row1_alias_keyed_group_is_not_exempt() -> Result<()> {
 
 /// Seed a real TreeKEM group into BOTH the roster map and the live
 /// `treekem_groups` map, filed under `map_key` with `stable_group_id` as its
-/// genesis id.
-async fn seed_treekem(
+/// genesis id, and with the live ratchet keyed by `live_key`.
+///
+/// `live_key` is a parameter because the two maps are keyed INDEPENDENTLY.
+/// The roster is keyed by whichever alias this daemon learned the group under;
+/// `treekem_groups` is keyed by whatever the loader filed it under, and #750's
+/// own fixtures (`adr0066_treekem_gates.rs::alias_keyed_treekem_group`) seed it
+/// under the STABLE spelling — the TOCTOU end state where the roster has been
+/// re-keyed and the live map has not followed. Which spelling reaches the
+/// ratchet is therefore state, not an invariant, and the row-2 fixtures below
+/// exercise both.
+async fn seed_treekem_keyed(
     state: &Arc<AppState>,
     map_key: &str,
     stable_group_id: &str,
+    live_key: &str,
     id_byte: u8,
 ) -> Result<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>> {
     let group_id_bytes = vec![id_byte; 32];
@@ -523,8 +533,18 @@ async fn seed_treekem(
         .treekem_groups
         .write()
         .await
-        .insert(map_key.to_string(), Arc::clone(&handle));
+        .insert(live_key.to_string(), Arc::clone(&handle));
     Ok(handle)
+}
+
+/// The ordinary shape: both maps keyed the same way.
+async fn seed_treekem(
+    state: &Arc<AppState>,
+    map_key: &str,
+    stable_group_id: &str,
+    id_byte: u8,
+) -> Result<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>> {
+    seed_treekem_keyed(state, map_key, stable_group_id, map_key, id_byte).await
 }
 
 /// **Row 2.** The TreeKEM effect is a RATCHET ADVANCE, so the re-check has to
@@ -616,17 +636,14 @@ async fn row2_marker_installed_before_encrypt_refuses_with_the_ratchet_unmoved()
     Ok(())
 }
 
-/// **Row 2, alias-keyed.** A group whose roster map key is not its stable id
-/// must still be re-checked, and its ratchet must still be unmoved on the
-/// refusal.
+/// **Row 2, alias-keyed, MAP-KEY spelling.** A group whose roster map key is
+/// not its stable id must still be re-checked, and its ratchet must still be
+/// unmoved on the refusal.
 ///
-/// Only the map-key spelling is exercised, deliberately. `state.treekem_groups`
-/// is keyed by the LOCAL group key, so `treekem_group_encrypt` returns 424
-/// ("TreeKEM group not loaded") for a stable-id caller before any of this
-/// slice's code runs — that spelling is unreachable on this path, and a test
-/// asserting it would be asserting a 424, not a re-check. The resolver's
-/// stable-id branch is covered directly in
-/// [`the_recheck_refuses_exactly_a_marker_that_appeared_or_changed`].
+/// The stable-id spelling gets its own fixture below. An earlier revision of
+/// this file claimed that spelling was unreachable because `treekem_groups` is
+/// "keyed by the local group key" — #750 showed that is state, not an
+/// invariant, and its own fixtures build the opposite state deliberately.
 #[tokio::test]
 async fn row2_alias_keyed_group_is_not_exempt() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -662,6 +679,100 @@ async fn row2_alias_keyed_group_is_not_exempt() -> Result<()> {
         group.lock().await.to_snapshot_bytes()?,
         ratchet_before,
         "the refusal burned no generation"
+    );
+    Ok(())
+}
+
+/// **Row 2, alias-keyed, STABLE-ID spelling — the TOCTOU end state #750 named.**
+///
+/// The roster is keyed by an alias while `treekem_groups` holds the live
+/// ratchet under the STABLE id: the state left behind when a roster re-key is
+/// not mirrored into the live map. That is exactly the configuration
+/// `adr0066_treekem_gates.rs::alias_keyed_treekem_group` builds, and in it a
+/// stable-id caller is **not** stopped by the 424 — it resolves the roster
+/// through the shared resolver, finds the ratchet under its own spelling, and
+/// reaches the effect. So the §4 re-check has to hold on this spelling too,
+/// and this fixture is what says so.
+///
+/// Three assertions, in the order that makes each meaningful:
+///
+/// 1. a REACHABILITY control first — with no marker, the same stable-id call
+///    must NOT be a 424; if this ever starts failing, the spelling has become
+///    unreachable again and the refusal below would be proving nothing;
+/// 2. install-mid-op ⇒ §5 refusal naming the injected marker;
+/// 3. `to_snapshot_bytes()` byte-identical — no generation burned, the same
+///    property PR #750's alias fixtures pin.
+#[tokio::test]
+async fn row2_stable_id_spelling_reaches_the_recheck_and_is_refused() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let key = "slice9-row2-toctou-key";
+    let stable = "slice9-row2-toctou-stable";
+    assert_ne!(key, stable, "fixture precondition");
+    // Roster under the alias; live ratchet under the stable id.
+    let group = seed_treekem_keyed(&state, key, stable, stable, 0x24).await?;
+    let ratchet_before = group.lock().await.to_snapshot_bytes()?;
+
+    // (1) Reachability control: unarmed, the stable-id call must get PAST the
+    //     `treekem_groups` lookup and actually reach the ratchet. A 424 here
+    //     would mean this spelling never reaches the re-check, and the refusal
+    //     below would be vacuous.
+    //
+    //     Reachability is asserted as "not 424 AND the ratchet moved", NOT as a
+    //     200. In this state a clean call reaches the ratchet, advances it, and
+    //     then fails its snapshot persist with a 500: `persist_treekem_snapshot_bound`
+    //     still resolves ONE spelling (`groups.get(group_id_hex)`), so it cannot
+    //     find an alias-keyed roster record by stable id. That is a PRE-EXISTING
+    //     gap on a non-quarantine path — a burned generation with no persisted
+    //     snapshot — reported separately, not introduced or fixed here. Binding
+    //     this control to a 200 would couple the §4 fixture to that unrelated
+    //     bug's lifetime; the moved ratchet is the direct evidence the effect
+    //     point was reached, which is all this control needs to establish.
+    assert_entry_gate_admitted(&state, key).await;
+    let (status, body) =
+        treekem_group_encrypt(state.as_ref(), stable, Some(stable), "aGVsbG8=", None).await;
+    assert_ne!(
+        status,
+        StatusCode::FAILED_DEPENDENCY,
+        "the stable-id spelling must REACH the ratchet in this state, or the refusal \
+         below proves nothing: {}",
+        body.0
+    );
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "no marker is installed, so nothing may refuse this call: {}",
+        body.0
+    );
+    // That control DID advance the ratchet, so re-baseline before the armed arm.
+    let ratchet_after_control = group.lock().await.to_snapshot_bytes()?;
+    assert_ne!(
+        ratchet_after_control, ratchet_before,
+        "the control call must have REACHED and moved the ratchet — this is the \
+         reachability proof, and without it 'unmoved' below is not a property this \
+         fixture can observe"
+    );
+
+    // (2) + (3) Armed: the marker lands between the entry gate and the advance.
+    assert_entry_gate_admitted(&state, key).await;
+    let _guard = arm_install(key, stable);
+    let (status, body) =
+        treekem_group_encrypt(state.as_ref(), stable, Some(stable), "aGVsbG8=", None).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a stable-id caller that reaches the ratchet must be re-checked too: {}",
+        body.0
+    );
+    assert_recheck_refusal(&body.0);
+    assert!(
+        body.0.get("ciphertext_b64").is_none(),
+        "a refusal hands out no ciphertext: {}",
+        body.0
+    );
+    assert_eq!(
+        group.lock().await.to_snapshot_bytes()?,
+        ratchet_after_control,
+        "THE RATCHET IS UNMOVED on the stable spelling too — no send generation burned"
     );
     Ok(())
 }
