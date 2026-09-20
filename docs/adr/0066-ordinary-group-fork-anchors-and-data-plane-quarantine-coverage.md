@@ -1,9 +1,9 @@
 # ADR 0066: Ordinary-Group Fork Anchors and Data-Plane Quarantine Coverage
 
-- **Status:** Proposed
-- **Date:** 2026-09-18
+- **Status:** Accepted
+- **Date:** 2026-09-18 (proposed); 2026-09-19 (accepted)
 - **Decision owners:** David Irvine (direction), Claude Opus (design drafting)
-- **Reviewers:** pending — requires cross-model (omp) review and human ratification
+- **Reviewers:** omp / GLM-5.3 — cross-model review, 2 rounds (round 1 REQUEST-CHANGES on the §2 clear-arm set, the missing WS row, and the OQ5 recommendation; round 2 APPROVE-WITH-NITS); David Irvine — ratified 2026-09-19, overriding the OQ5 recommendation (see Ratified decisions §5)
 - **Supersedes:** none (completes the staged residuals of ADR 0064 §§2 and 3; does not edit any Accepted ADR)
 - **Superseded by:** none
 - **Related:** #732 (this decision), #472 (parent, closed into this ADR), #468, #469; ADR 0064 (owner-anchored fork authority, Accepted), ADR 0059 (InviteV4 + seating provenance), ADR 0016 (flat-admin state-commit chain), ADR 0023 (durable local history), ADR 0040 (agent delegation in spaces), ADR 0047 (CRDT KV delta gossip); #639 (alternate-chain fetch surface) and #646 (content-addressed base snapshot) are explicitly NOT absorbed
@@ -102,7 +102,8 @@ undecidable-sibling eviction.
 **Option 3 — Founder/creator-key anchor for ordinary groups.**
 Treat the group creator's agent key as a weak canonical anchor: a commit
 carrying a founder signature clears the marker.
-*Rejected as a decision, retained as Open Question 1.* The founder is an
+*Rejected as a decision; raised as Open Question 1 and settled by R1 (no
+founder anchor).* The founder is an
 ordinary member with no special custody, is frequently the first party to
 leave, and a compromised or coerced founder key becomes an unreviewable
 eviction oracle. It is, however, the only candidate anchor that does not
@@ -130,7 +131,7 @@ re-validate under the persist lock).
 without blinding the operator.
 
 **Option 7 — New monotonic `lifecycle_epoch` field on `GroupInfo`.**
-*Rejected in favour of a compound token, see Decision §4 and Open Question 4:*
+*Rejected in favour of a compound token, see Decision §4; confirmed by R4:*
 a new persisted field is a new serde surface, a new #470 full-equality
 participant, and a new bootstrap-strip obligation, to carry information
 `state_revision` plus a quarantine generation counter already carries.
@@ -229,10 +230,13 @@ the group's policy has no owner axis.
   call site (`info.fork_quarantine = None`) and differ only in provenance:
   a *clear* asserts the fork was resolved; a *rollback* asserts the install
   never durably happened. Only the former is constrained by §2.
-- **`invite_lineage` fence.** The evidence path is currently reached only for
-  invite-derived groups (`named_groups.rs:3765`). Ordinary groups formed
-  without an invite still record nothing. Widening that fence is **not**
-  decided here — see Open Question 2.
+- **`invite_lineage` fence — widened by R2.** The evidence path today is
+  reached only for invite-derived groups (`named_groups.rs:3765`), so ordinary
+  groups formed without an invite record nothing. R2 ratifies widening that
+  fence in slice 2, so "ordinary group" is one population rather than two.
+  Consequently this ADR's "the trigger is unchanged" statement above is scoped
+  to how evidence is *authenticated*, not to which groups can reach the
+  evidence path — that set grows.
 - **Scope inherited verbatim from ADR 0064 §3:** per-node, local-only,
   bootstrap-stripped outbound and rejected inbound. Nothing propagates.
 
@@ -242,14 +246,21 @@ removed.
 
 ### §3 — Per-path disposition for the ungated set
 
+**Posture (R5).** Every refusal below is **effective immediately in the release
+that ships its slice** — there is no warn-only window, no grace period and no
+per-row phasing, for ordinary and owner-axis groups alike. Every refusal carries
+the §5 informational message. The annotate-class rows refuse nothing and are
+unaffected by R5.
+
 **§3a — History (paths 13, 14).** Reads are **never** refused; they gain an
 explicit `fork_quarantined: true` field in the response envelope alongside the
 marker's `revision` and `observed_at_ms`, so an operator reading history during
 an incident can see that the record spans a contested chain. `history_purge`
 (`history.rs:464`) **is** refused with 409 `fork_quarantined`: purge destroys
-the forensic record ADR 0064 Decision §4 exists to preserve. Whether *ingest*
-of new group-scoped history entries should also be refused, or tagged and
-retained, is Open Question 3.
+the forensic record ADR 0064 Decision §4 exists to preserve. Ingest of new
+group-scoped history entries is **tagged and retained, never refused** (R3) —
+refusing it would blank the record across the incident window, which is the
+opposite of §3a's purpose.
 
 **§3b — Delegations (paths 15–19).** Delegation is an authority transfer, not a
 read: a quarantined group's roster is exactly the thing under dispute, so
@@ -284,9 +295,11 @@ describes what was observed, not what was authorized.
 
 **§3e — Typed refusal is uniform.** Every new refusal reuses
 `reject_fork_quarantined` (`named_groups.rs:19910`) or its exact contract — 409,
-body `fork_quarantined`, one `fork_quarantine_refusals` increment
+machine code `fork_quarantined`, one `fork_quarantine_refusals` increment
 (`diagnostics.rs:150`) — so that a single diagnostic counts the whole
-data-plane. No new error code, no new counter per route.
+data-plane. No new error code, no new counter per route. Under R5 that shared
+helper is also the single place the §5 message is built, so no route can refuse
+without explaining itself and no two routes can drift in wording.
 
 ### §4 — Lifecycle epoch token as a compound value, re-checked under the persist lock
 
@@ -310,7 +323,71 @@ generation in the token closes it from both ends. `stores.rs:796`
 (`current_info`) is the existing shipped precedent for a per-operation re-read
 and is the model to generalize.
 
-Representation is Open Question 4.
+Representation is settled by R4: compound, no new persisted field.
+
+### §5 — The refusal must explain itself (mandatory; added by R5)
+
+R5 removed the warn-only window on the condition that a user always learns why
+an operation was refused. This section is that contract. It is normative for
+every refusal this ADR adds, and a slice that ships a refusal without it is
+incomplete.
+
+**What ships today is a bare code.** `reject_fork_quarantined`
+(`named_groups.rs:19910`) returns
+`api_error(StatusCode::CONFLICT, "fork_quarantined")` at `:19919`. `api_error`
+(`src/server/mod.rs:2454`) builds `{ "ok": false, "error": <msg> }`, so the
+entire user-visible payload is the string `fork_quarantined` — a machine code in
+the human field, with no explanation and no remedy. For owner-axis groups that
+was tolerable because the marker cleared automatically on the next
+owner-anchored advance. Under R5 it is not: an ordinary group's marker never
+auto-clears, so a bare code becomes a permanent, unexplained refusal.
+
+**The contract.** Refusals move to `api_error_with_reason`
+(`src/server/mod.rs:2465`), which exists for exactly this case — its own doc
+comment says "adds a machine-readable `reason` field … Use when two responses
+share an HTTP status yet must stay machine-separable (e.g. two distinct 409
+CONFLICT conditions)". The response body becomes:
+
+| Field | Value | Role |
+|---|---|---|
+| `ok` | `false` | unchanged |
+| `reason` | `fork_quarantined` | **the stable machine code** — clients match on this |
+| `error` | human-readable sentence naming the condition, why the operation is refused, and the remedy | the informational message R5 requires |
+| `fork_quarantine.revision` | evidenced fork revision | which divergence |
+| `fork_quarantine.observed_at_ms` | local observation time | when this node saw it |
+| `fork_quarantine.no_anchor` | `true` for ordinary groups | says plainly that nothing will clear this automatically |
+| `fork_quarantine.clear_with` | `POST /groups/:id/quarantine/clear` | the remedy, machine-readable |
+
+The `error` sentence must state all three of: the group is fork-quarantined on
+this node; the operation was refused because the roster is contested; and that
+the exit is the manual clear (naming `x0x groups quarantine clear` for CLI
+users). A message that names the condition but not the remedy does not satisfy
+R5 — "actionable" is the acceptance bar, and the Validation fixtures assert it.
+
+**Where it is surfaced.**
+- **REST** — the body above, on every refusing row (14, 15, 17, 18, 19, 20-mutations, 21).
+- **CLI** — `src/cli/commands/groups.rs` already owns
+  `quarantine_clear` (`:85`, documented `:81`–`:84`); the refusal path prints the
+  `error` sentence and the `clear_with` remedy rather than a raw status code.
+- **WS** — `WsOutbound::Error { message }` (`ws.rs:134`–`135`) carries the same
+  sentence. Note this variant has only a `message` field, so the machine code
+  must be carried inside the annotation on the affected frames (§3d), not in
+  the error variant.
+- **GUI** — `grep -c quarantin src/gui/*.html` → **0** today; the embedded GUI
+  renders the `error` sentence wherever it renders other 409s.
+- **Diagnostics** — unchanged: one `fork_quarantine_refusals` increment
+  (`diagnostics.rs:150`) per refusal, per §3e.
+
+**Compatibility cost, stated plainly.** Moving the machine code from `error` to
+`reason` changes the `error` field's content from `fork_quarantined` to prose.
+Three existing tests assert the old shape —
+`named_groups/tests/hs_f2_membership_cluster.rs:5226` and `:5338`, and
+`named_groups/tests/adr0038_owner_certified.rs:1509`, each
+`assert_eq!(body["error"].as_str(), Some("fork_quarantined"))` — and must be
+updated to assert `body["reason"]` plus a non-empty, remedy-bearing `error`.
+Any out-of-tree client matching the literal `error == "fork_quarantined"` sees a
+one-time break; `reason` is the field to match from now on. This is a deliberate
+cost of R5, not an incidental refactor.
 
 ## Migration / Compatibility
 
@@ -318,7 +395,9 @@ Representation is Open Question 4.
 |---|---|
 | Owner-axis groups | Unchanged trigger and clear semantics; strictly more routes refuse while marked. |
 | Ordinary groups, no evidence | Byte-for-byte unchanged — no marker, no annotation, no refusal. |
-| Ordinary groups, authenticated evidence | New: persistent `no_anchor: true` marker, data-plane refusals per §3, manual clear only. This is a **new availability failure mode** for a population that previously degraded silently; see Open Question 5. |
+| Ordinary groups, authenticated evidence | New: persistent `no_anchor: true` marker, data-plane refusals per §3 **effective immediately** (R5 — no warn-only window), manual clear only. This is a **new availability failure mode** for a population that previously degraded silently; the §5 message is what makes it diagnosable rather than mysterious. |
+| **Upgraded node meeting an already-diverged ordinary group** | The marker is set by *evidence*, not by a startup scan, and evidence is produced on the apply path (`named_groups.rs:3756`). So on first start the group is **not** retroactively quarantined: nothing is marked until the next authenticated conflicting commit arrives, at which point the marker installs and refusals begin **at once**, with no grace. The practical consequence is a group that worked before the upgrade can begin refusing minutes after it, on the first conflicting commit — which is precisely why R5 required §5. Operators should expect `fork_quarantine_set` to rise on the upgrade wave for groups that were already silently forked. |
+| Already-quarantined owner-axis groups on upgrade | Marker persists (it always did); the newly gated rows begin refusing immediately, and the refusal text changes from the bare code to the §5 sentence. |
 | Mixed fleet | The marker is already a serde-default `GroupInfo` field ignored by older binaries (`src/groups/mod.rs:262`); `no_anchor` is likewise `#[serde(default)]`. Older binaries continue to serve a group this node quarantines — per-node scope, unchanged from ADR 0064. |
 | Bootstrap / signed-public snapshots | Marker and snapshot remain stripped outbound and rejected inbound. §3c additionally suppresses the whole snapshot while quarantined. |
 | Annotation fields | Purely additive response fields; no client is required to read them. |
@@ -337,7 +416,9 @@ Representation is Open Question 4.
 | Operator/attacker purges evidence mid-incident | Permitted | Refused (§3a) |
 | Marker installed mid-operation on a bound KV store | Cached snapshot still authorizes | Token mismatch aborts before persist (§4) |
 | Anchored clearing commit arrives at a quarantined node | Applies (apply path ungated) | Unchanged — deliberately still applies (path 24) |
-| Ordinary group stranded after a benign split | n/a | Manual clear required — accepted cost, Open Question 5 |
+| Ordinary group stranded after a benign split | n/a | Manual clear required — accepted cost (R1/R5); the §5 message names the remedy so the operator is not left guessing |
+| Upgraded node, ordinary group already silently forked | Serves both branches indefinitely | No retroactive scan; refuses from the next authenticated conflicting commit, immediately and with no grace (R5) |
+| User hits a refusal and cannot tell why | n/a — bare `fork_quarantined` code today (`named_groups.rs:19919`) | §5: machine `reason` + human sentence naming condition, cause and remedy across REST/CLI/WS/GUI |
 | False quarantine | Bounded by authenticated-evidence-only trigger | Same trigger; blast radius now larger by design |
 
 ## Consequences
@@ -357,8 +438,18 @@ Representation is Open Question 4.
 - A new availability failure mode for ordinary groups with **no automatic
   exit**: a benign network split that produces authenticated conflicting
   commits now strands the group until an operator calls the manual clear.
+- **R5's cost, accepted deliberately: refusals land on upgrade with no grace.**
+  An ordinary group that was already silently forked begins refusing on the
+  first authenticated conflicting commit after the upgrade — no warn-only
+  release softens the landing, and because the marker is `no_anchor` nothing
+  clears it but a human. This is the sharpest edge in the whole design and is
+  the direct reason §5 is mandatory rather than advisory: the mitigation for
+  an abrupt refusal is not a delay, it is an explanation the user can act on.
 - Blast radius of a false positive grows from the 6 shipped route surfaces
-  (rows 1–6) to 19 refusing or split surfaces once §3 lands.
+  (rows 1–6) to 19 refusing or split surfaces once §3 lands, and it grows on
+  the first release rather than over two.
+- The §5 shape change moves the machine code from `error` to `reason`, breaking
+  any client matching the old literal (three in-tree tests, listed in §5).
 - §4 adds a re-check to hot paths (KV delta apply, send, encrypt); the cost is
   a compare under a lock already taken, but it is on every operation.
 - History annotation is an additive response-shape change across seven
@@ -375,49 +466,59 @@ Representation is Open Question 4.
   fetch surface, the #646 content-addressed base snapshot, and any change to
   OwnerMandate or owner-axis quarantine.
 
-## Open questions for David
+## Ratified decisions (2026-09-19)
 
-1. **Founder-key anchor for ordinary groups?** Option 3 is the only non-quorum
-   anchor available. *Recommendation:* no — manual clear only (§2). The founder
-   has no special custody and a compromised founder key becomes an eviction
-   oracle. Reopen only if the manual-clear availability cost proves intolerable
-   in practice.
-2. **Widen the `invite_lineage` fence (`named_groups.rs:3765`)?** Ordinary
-   groups formed without an invite currently reach no evidence path at all, so
-   §2 does not cover them. *Recommendation:* widen it in the same change, so
-   "ordinary group" means one population rather than two. Flagged because it
-   enlarges the trigger surface, which §2 otherwise promises not to touch.
-3. **History ingest while quarantined — refuse or tag-and-retain?**
-   *Recommendation:* tag and retain. Refusing ingest creates a gap in the
-   record precisely across the incident window, which contradicts §3a's reason
-   for existing.
-4. **Epoch token representation — compound `(state_revision,
-   quarantine_generation)` or a new persisted `lifecycle_epoch` field?**
-   *Recommendation:* compound (§4). A new field is a new serde surface, a new
-   #470 full-equality participant, and a new bootstrap-strip obligation for
-   information already derivable.
-5. **Rollout posture for the new ordinary-group refusals — warn-only first
-   release, or fail-closed immediately?** *Recommendation (revised after
-   cross-model review — a blanket warn-only window was unsafe as first
-   drafted):* **split by reversibility, not by population.**
-   - **Fail closed immediately**, with no warn-only window, for every path
-     whose act is irreversible or outlives the window: history purge (row 14 —
-     destroys the forensic record ADR 0064 §4 exists to preserve), delegation
-     minting and honouring (rows 15, 17, 18 — authority granted during the
-     window survives the window), registry seeding (row 19), and signed-public
-     bootstrap publication (row 21 — exports contested state to other nodes,
-     which cannot be recalled).
-   - **Warn-only for one release** (annotate + count
-     `fork_quarantine_refusals`, do not refuse) for task mutations (row 20),
-     which are CRDT-recoverable, and for the purely additive annotations
-     (rows 13, 16, 25, 26), which refuse nothing in either posture.
+The five questions this ADR left open for David are settled. Four were ratified
+as recommended; **the fifth was overridden**, and the override is the reason
+§5 (the message contract) exists at all.
 
-   The original blanket recommendation traded containment for availability
-   uniformly; the defect is that "warn-only" is only a *deferral* for a
-   reversible act, but a *permanent grant* for an irreversible one. Owner-axis
-   behaviour is unchanged throughout. Still an open question because the split
-   itself — and whether row 20 deserves even one release of grace — is David's
-   call, not the drafter's.
+**R1 — No founder-key anchor for ordinary groups.** *As recommended.* Manual
+clear only (§2). The founder has no special custody and a compromised founder
+key would become an unreviewable eviction oracle. Reopen only if the
+manual-clear availability cost proves intolerable in practice.
+
+**R2 — Widen the `invite_lineage` fence (`named_groups.rs:3765`).** *As
+recommended.* Ordinary groups formed without an invite are covered too, so
+"ordinary group" means one population rather than two. This deliberately
+enlarges the evidence trigger surface; §2's "trigger is unchanged" promise is
+therefore scoped to the *authentication* of evidence, not to the set of groups
+that can reach the evidence path.
+
+**R3 — History ingest is tag-and-retain, never refused.** *As recommended.*
+Refusing ingest would create a gap in the record precisely across the incident
+window, contradicting §3a's reason for existing. Row 14 (purge) is still
+refused; ingest is not purge.
+
+**R4 — Compound epoch token.** *As recommended.* `(state_revision,
+quarantine_generation)` per §4, with no new persisted `lifecycle_epoch` field —
+no new serde surface, no new #470 full-equality participant, no new
+bootstrap-strip obligation for information already derivable.
+
+**R5 — Fail closed immediately on every gated path, with an informational
+message. DAVID OVERRODE THE RECOMMENDATION.** The ADR recommended splitting by
+reversibility and granting task mutations (row 20) plus the annotations one
+warn-only release. David chose **no warn-only window anywhere**: every path
+this ADR gates refuses from the first release that ships it, including row 20.
+
+The condition attached to the override is substantive, not cosmetic: **the
+refusal must tell the user what happened.** A silent 409 on a group that worked
+yesterday is an unexplained outage; the same refusal carrying "this group is
+fork-quarantined, here is why operations are refused, here is how to clear it"
+is a diagnosis. **§5 specifies that contract and is a mandatory part of every
+slice that adds a refusal** — a slice that adds a refusal without its message
+is incomplete, not merely unpolished.
+
+Annotate-class rows (13, 16, 20-reads, 25, 26) remain annotations. They refuse
+nothing, so the warn-only question never applied to them; R5 does not convert
+them into refusals.
+
+*Why the override is defensible against the drafter's own argument:* the ADR
+argued warn-only was safe for row 20 because CRDT task mutations are
+recoverable. That is true of the *data* and false of the *authority* — a task
+mutation accepted on a contested roster is still an act taken under disputed
+membership, and "recoverable" describes the cleanup, not the exposure. The
+split also asked operators to hold two mental models of one marker for one
+release. One rule plus a clear message is simpler and stricter.
 
 ## Validation
 
@@ -455,6 +556,25 @@ Representation is Open Question 4.
   - §3d fixture: a WS subscriber receives `Mention` events and ADR-0023
     backfill frames for a quarantined group — the stream is **not** cut — and
     every frame carries `fork_quarantined: true`.
+  - **§5 message fixtures (R5's acceptance bar — a refusal without its message
+    is a failing test, not a cosmetic gap).** For **every** refusing row:
+    `body["reason"] == "fork_quarantined"`; `body["error"]` is non-empty, is
+    **not** equal to the machine code, and mentions both the quarantine
+    condition and the clear remedy; `body["fork_quarantine"]` carries
+    `revision`, `observed_at_ms`, `no_anchor` and `clear_with`. A negative
+    control asserts a refusal built without the message helper fails the
+    suite — the message must be structurally impossible to omit, since §3e
+    makes one helper the only refusal path. A CLI fixture asserts the printed
+    output contains the remedy and not a raw status code. The three existing
+    `body["error"] == "fork_quarantined"` assertions
+    (`hs_f2_membership_cluster.rs:5226`, `:5338`,
+    `adr0038_owner_certified.rs:1509`) are migrated to the new shape in the
+    same slice.
+  - **R5 no-grace fixture:** a refusing row refuses on the *first* request
+    after the marker installs — there is no request budget, counter threshold
+    or elapsed-time window that permits one through. This is the regression
+    test for the rejected warn-only design, so a future re-introduction of
+    grace fails loudly rather than silently weakening containment.
   - §4 race fixture: install a marker between a KV authorization bind and its
     delta apply; assert the apply aborts with state byte-identical.
   - Mixed-version serde fixtures both directions for `no_anchor`.
@@ -463,10 +583,134 @@ Representation is Open Question 4.
   content-addressed base, re-examine §4's token — both introduce new
   irreversible steps that would need to capture it.
 
+## Implementation slices
+
+Ordered, each PR-sized and independently reviewable. Every slice carries the
+four ordered Rust gates.
+
+**Ordering constraint (normative).** §5's message is not a trailing slice: any
+slice that adds a refusal — or that makes an existing refusal reachable by a new
+population — must ship that refusal's message. **The message contract is
+therefore slice 1**, ahead of everything, and slices 3–6 each depend on it. The
+epoch-token slice depends on the marker slice.
+
+*Why this order and not the obvious one:* an earlier draft put the ordinary-group
+marker first. Cross-model review found that this would make rows 1–6 newly
+refusing for ordinary groups while the refusal still carried the bare machine
+code — and because a `no_anchor` marker never auto-clears, the result is a
+**permanent unexplained refusal**, exactly the state §5 declares intolerable.
+The marker slice has no dependency the message slice needs, so the message goes
+first. This ordering is part of the decision, not a scheduling preference.
+
+**Slice 1 — §5 refusal message contract.**
+*Scope:* move `reject_fork_quarantined` (`named_groups.rs:19910`) to
+`api_error_with_reason` (`src/server/mod.rs:2465`) with the §5 body; surface it
+in the CLI (`src/cli/commands/groups.rs`) and the GUI; migrate the three
+existing `body["error"]` assertions.
+*Files:* `src/server/routes/named_groups.rs`, `src/cli/commands/groups.rs`,
+`src/gui/`, the three test files named in §5.
+*Tests:* §5 message fixtures for rows 1–6 (the already-refusing owner-axis
+set); the no-grace fixture; CLI output fixture.
+*Rows closed:* none new — it re-shapes the existing six so every later slice,
+and every newly reachable population, inherits the message for free.
+*Depends on:* nothing.
+
+**Slice 2 — Marker for ordinary groups + exhaustiveness fixture.**
+*Scope:* remove the `owner_certified_user_id()?` early return at
+`named_groups.rs:3733`; set `no_anchor = true` when the policy has no owner
+axis (`:3744`); widen the `invite_lineage` fence at `:3765` per R2; add the
+`no_anchor` decline test to the three owner-anchored clear sites
+(`:4142`, `:9554`, `src/groups/mod.rs:1001`) and **leave the rollback arm
+`:3536`–`:3541` untouched**.
+*Files:* `src/server/routes/named_groups.rs`, `src/groups/mod.rs`.
+*Tests:* the §1 exhaustiveness fixture (26 rows, fails on any unclassified
+route); clear-arm discrimination fixtures in both directions; `no_anchor`
+serde round-trip and mixed-version fixtures; and — because this slice is what
+makes rows 1–6 refuse for ordinary groups — a fixture asserting those refusals
+carry the slice-1 message with `no_anchor: true` surfaced in it.
+*Rows closed:* none directly — this slice makes rows 1–12 **reachable** for
+ordinary groups, which is the whole point of the ADR; it changes 0-of-26 to
+12-of-26 for that population.
+*Depends on:* slice 1 (a refusal this slice makes reachable must already
+explain itself).
+
+**Slice 3 — Delegations fail closed (§3b).**
+*Scope:* quarantine checks in `delegate_group_authority` (`delegations.rs:540`,
+beside the `withdrawn` check at `:639`), `authorize` (`:349`),
+`chain_members_active` (`:413`), `authorize_send_as` (`:448`),
+`index_committed` (`:304`) and `rebuild_global_delegation_registry` (`:252`);
+annotation on `list_group_delegations` (`:871`).
+*Files:* `src/server/delegations.rs`.
+*Tests:* fail-closed fixtures per predicate asserting *contested* rather than
+merely absent; registry-seeding fixture; §5 message on each refusal.
+*Rows closed:* **15, 16, 17, 18, 19.**
+*Depends on:* slice 1.
+
+**Slice 4 — History purge refused, reads and ingest annotated (§3a, R3).**
+*Scope:* refuse `history_purge` (`history.rs:464`); add the
+`fork_quarantined` annotation to `history_list` (`:116`), `history_message`
+(`:203`), `history_search` (`:322`), `history_scopes` (`:397`),
+`history_stats` (`:430`) and `history_diagnostics` (`:488`); tag-and-retain on
+ingest.
+*Files:* `src/server/routes/history.rs`.
+*Tests:* purge refused with the §5 message; every read still serves and is
+annotated; ingest retained and tagged (the R3 fixture).
+*Rows closed:* **13, 14, 26.**
+*Depends on:* slice 1.
+
+**Slice 5 — Bootstrap publication and task mutations (§3c).**
+*Scope:* suppress a quarantined group's signed-public snapshot at the existing
+`withdrawn` predicates (`public_group_bootstrap_outbox.rs:394`, `:627`); refuse
+group task-list mutations and annotate reads (`tasks.rs:118`, `:157`).
+*Files:* `src/server/routes/public_group_bootstrap_outbox.rs`,
+`src/server/routes/tasks.rs`.
+*Tests:* snapshot absent while quarantined and present after a clear; task
+mutation refused with the §5 message on the *first* attempt (R5, no grace);
+task reads annotated.
+*Rows closed:* **20, 21.**
+*Depends on:* slice 1.
+
+**Slice 6 — WebSocket annotation (§3d).**
+*Scope:* carry `fork_quarantined` on `Mention` events (`ws.rs:116`–`:123`) and
+ADR-0023 backfill frames (`:145`–`:163`, `:527`); the stream is never cut.
+*Files:* `src/server/ws.rs`.
+*Tests:* the §3d fixture — subscriber keeps receiving, every frame annotated.
+*Rows closed:* **25.**
+*Depends on:* slice 1 (annotation only, but the WS plane shares the refusal vocabulary).
+
+**Slice 7 — Compound epoch token (§4, R4).**
+*Scope:* process-local `quarantine_generation` incremented on every install and
+every clear; capture `(state_revision, quarantine_generation)` at
+authorization and re-validate inside
+`persist_named_groups_mutation_unlocked` (`named_groups.rs:4330`); make marker
+install a refresh trigger for the cached KV contexts (`kv_context.rs:370`).
+*Files:* `src/server/routes/named_groups.rs`, `src/groups/kv_context.rs`,
+`src/server/routes/stores.rs`.
+*Tests:* the race fixture — install a marker between a KV authorization bind
+and its delta apply; assert the apply aborts with state byte-identical.
+*Rows closed:* **22**, and it closes the bind-time gap in rows 10–12.
+*Depends on:* slice 2 (the generation counter must count ordinary-group installs too).
+
+**Slice 8 — Runbook and ops docs.**
+*Scope:* the manual-clear runbook entry the Consequences call for; alerting
+guidance on `fork_quarantine_set` / `fork_quarantine_refusals`; the upgrade
+expectation from the Migration table.
+*Files:* `docs/`, SKILL.md as applicable.
+*Tests:* n/a (docs), but the runbook must be referenced from the §5 message's
+remedy wording.
+*Rows closed:* none — it makes R5's "actionable" claim true outside the API.
+*Depends on:* slice 1 (the message's remedy wording points at the runbook).
+
 ## Notes for AI-assisted work
 
-AI tools may help draft this ADR, but **must not mark it Accepted without human
-review**. Accepted ADRs are immutable: create a new superseding ADR rather than
-editing an Accepted ADR. This draft was produced by Claude Opus without the
-referenced design packet and requires cross-model (omp) review plus David's
-ratification of the five open questions before any implementation begins.
+AI tools may help draft an ADR, but **must not mark it Accepted without human
+review**. That review has happened: drafted by Claude Opus (without the
+referenced design packet — see the provenance note in Context), reviewed
+cross-model by omp / GLM-5.3 over two rounds, and ratified by David Irvine on
+2026-09-19 with one recommendation overridden (R5).
+
+**This ADR is now Accepted and therefore immutable.** Do not edit it — including
+to "fix" the record of the R5 override, which is deliberate. Any later change of
+direction requires a superseding ADR. Implementation proceeds through the
+Implementation slices section; a slice that diverges from a Decision or a
+Ratified decision needs the superseding ADR first, not a quiet edit here.

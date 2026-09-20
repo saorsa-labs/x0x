@@ -2130,6 +2130,60 @@ Common status codes:
 | 500 | Internal error |
 | 503 | Service temporarily unavailable |
 
+Error bodies are `{ "ok": false, "error": <message> }`. Some responses add a
+machine-readable `reason` field, for conditions that share an HTTP status but
+must stay machine-separable (two distinct 409 CONFLICT conditions, say). **Where
+a `reason` is present, match on `reason`; `error` is prose and its wording is
+not a contract.**
+
+The `x0x` CLI renders a reason-bearing error as
+`<message> (HTTP <code>, reason: <reason>)`, and one with no `reason` as
+`<message> (HTTP <code>)`. The reason-bearing responses today are the 409
+`fork_quarantined` below and the 409 `recipient_not_active` on group key
+sealing.
+
+### 409 `fork_quarantined` (ADR-0064 / ADR-0066 §5)
+
+While this node holds a fork-quarantine marker for a group, the
+membership-gated routes (`POST /groups/:id/send`, TreeKEM encrypt/decrypt, and
+the `secure/encrypt`, `secure/decrypt`, `secure/reseal` family) refuse with:
+
+```json
+{
+  "ok": false,
+  "reason": "fork_quarantined",
+  "error": "group is fork-quarantined on this node: … so this operation is refused here. It clears when an owner-anchored commit advances past revision 7, or immediately with the manual clear POST /groups/:id/quarantine/clear (CLI: `x0x groups quarantine clear <GROUP_ID>` …).",
+  "fork_quarantine": {
+    "revision": 7,
+    "observed_at_ms": 1700000000123,
+    "no_anchor": false,
+    "clear_with": "POST /groups/:id/quarantine/clear"
+  }
+}
+```
+
+`error` is a human sentence naming the condition, why the operation is refused,
+and the clearing path; it branches on `no_anchor`, because a `no_anchor` marker
+never auto-clears and its manual clear requires `force` plus a reason.
+`fork_quarantine.clear_with` is the same remedy, machine-readable.
+
+**`no_anchor` (ADR-0066 §2).** `true` means the group's policy has no owner
+axis, so **no commit on any ancestry will ever clear the marker** — the only
+exit is `POST /groups/:id/quarantine/clear` with `force: true` and a non-empty
+`reason` (without `force` that endpoint answers 409 `force_required`, because
+there is no owner axis to attest with). Before ADR-0066 these ordinary groups
+never received a marker at all and no route refused for them; they now refuse
+the same rows as owner-axis groups, from the first request after the marker
+installs. Operators should expect `fork_quarantine_set` to rise after
+upgrading — see the
+[fork quarantine runbook](runbooks/fork-quarantine.md) §5.
+
+**One-time compatibility break (ADR-0066 §5).** This body previously was
+`{ "ok": false, "error": "fork_quarantined" }`. A client matching the literal
+`error == "fork_quarantined"` must move to `reason`. HTTP 409 and `ok: false`
+are unchanged. See the
+[fork quarantine runbook](runbooks/fork-quarantine.md) §1.
+
 ## CLI quick examples
 
 ```bash

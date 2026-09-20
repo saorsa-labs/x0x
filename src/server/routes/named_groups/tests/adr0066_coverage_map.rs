@@ -1,0 +1,682 @@
+//! ADR-0066 §1 coverage-map EXHAUSTIVENESS fixture (slice 2).
+//!
+//! WHY this file exists at all: the §1 coverage map calls itself
+//! *normative*, and row 25 (the WebSocket plane) was missed by the first
+//! draft of that map and found only in cross-model review. A
+//! hand-maintained enumeration degrades — silently, and in the direction of
+//! leaving a path ungated. The ADR's Validation section therefore requires
+//! a fixture rather than a reading: "the only durable guarantee that a
+//! route added later cannot silently join the ungated set".
+//!
+//! Two halves, and the second is the load-bearing one:
+//!
+//! 1. **The map itself** — the 26 normative rows, their dispositions and
+//!    the ADR's own counts, encoded so that editing the map without
+//!    editing the test (or vice versa) fails. Each row also names its
+//!    source anchor, which is checked to exist, and a `Gated` row's file is
+//!    checked to actually consult the marker.
+//! 2. **The registry surface** — every endpoint in the shared registry
+//!    (`crate::api::ENDPOINTS`) that touches a surface §1 enumerated must
+//!    carry an explicit classification. A route added later is in NEITHER
+//!    the coverage map NOR the classification table, so the test fails
+//!    until somebody decides what the marker should do to it. That is the
+//!    whole point: the failure is the design review being demanded.
+//!
+//! Inert by construction: no `AppState`, no `Agent`, no sockets. A fixture
+//! that guards an enumeration must be one that always runs.
+
+use crate::api::{EndpointDef, Method, RequestSpec, ENDPOINTS};
+
+/// The disposition classes of ADR-0066 §1. One class per row; no row is
+/// counted twice (the ADR's own rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Already consults the marker on the path that performs the act
+    /// (rows 1–12) — "Keep" in the ADR table.
+    Gated,
+    /// 409 `fork_quarantined` while quarantined (§3).
+    Refuse,
+    /// Mutations refuse, reads annotate (row 20).
+    Split,
+    /// Serves, but carries `fork_quarantined: true` — never refused,
+    /// because containment must not blind the operator.
+    Annotate,
+    /// A mechanism that does not exist yet (row 22, the §4 epoch token).
+    Introduce,
+    /// Enumerated for completeness, deliberately not gated (row 23).
+    OutOfScope,
+    /// Deliberately ungated so the anchored clearing commit can arrive
+    /// (row 24). Gating this would make some quarantines unclearable.
+    KeepUngated,
+}
+
+/// One row of the §1 table.
+struct CoverageRow {
+    /// The ADR's own row number — the identifier reviewers cite.
+    row: u8,
+    /// What the path is, in the ADR's words.
+    path: &'static str,
+    /// Source file the ADR anchors the row to, relative to the crate root.
+    anchor: &'static str,
+    disposition: Disposition,
+    /// The implementation slice that closes the row: `Some(n)` while it is
+    /// still open, `None` once shipped. Slice 2 (this one) ships no new
+    /// refusal — it makes rows 1–12 REACHABLE for ordinary groups.
+    closed_by_slice: Option<u8>,
+}
+
+/// The §1 table, transcribed. Deliberately verbatim: a divergence between
+/// this array and the ADR is a defect in one of the two, and the
+/// assertions below are what surface it.
+const COVERAGE_MAP: &[CoverageRow] = &[
+    CoverageRow {
+        row: 1,
+        path: "POST /groups/:id/send — signed-public outbound send",
+        anchor: "src/server/routes/named_groups.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 2,
+        path: "TreeKEM group encrypt",
+        anchor: "src/server/routes/named_groups.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 3,
+        path: "TreeKEM group decrypt",
+        anchor: "src/server/routes/named_groups.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 4,
+        path: "POST /groups/:id/secure/encrypt (GSS)",
+        anchor: "src/server/routes/named_groups.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 5,
+        path: "POST /groups/:id/secure/decrypt (GSS)",
+        anchor: "src/server/routes/named_groups.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 6,
+        path: "POST /groups/:id/secure/reseal (GSS)",
+        anchor: "src/server/routes/named_groups.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 7,
+        path: "TreeKEM group-store resolution",
+        anchor: "src/server/routes/stores.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 8,
+        path: "TreeKEM group-store live info re-read",
+        anchor: "src/server/routes/stores.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 9,
+        path: "KV group-writer predicate",
+        anchor: "src/server/routes/stores.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 10,
+        path: "Signed-public KV authorization snapshot (bind-time only)",
+        anchor: "src/groups/kv_context.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 11,
+        path: "TreeKEM KV authorization context construct",
+        anchor: "src/groups/kv_context.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 12,
+        path: "TreeKEM KV authorization context refresh",
+        anchor: "src/groups/kv_context.rs",
+        disposition: Disposition::Gated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 13,
+        path: "History list / message / search / scopes / stats",
+        anchor: "src/server/routes/history.rs",
+        disposition: Disposition::Annotate,
+        closed_by_slice: Some(4),
+    },
+    CoverageRow {
+        row: 14,
+        path: "History purge",
+        anchor: "src/server/routes/history.rs",
+        disposition: Disposition::Refuse,
+        closed_by_slice: Some(4),
+    },
+    CoverageRow {
+        row: 15,
+        path: "POST /groups/:id/delegate — grant delegation",
+        anchor: "src/server/delegations.rs",
+        disposition: Disposition::Refuse,
+        closed_by_slice: Some(3),
+    },
+    CoverageRow {
+        row: 16,
+        path: "GET /groups/:id/delegations — list",
+        anchor: "src/server/delegations.rs",
+        disposition: Disposition::Annotate,
+        closed_by_slice: Some(3),
+    },
+    CoverageRow {
+        row: 17,
+        path: "Delegation authorization predicate",
+        anchor: "src/server/delegations.rs",
+        disposition: Disposition::Refuse,
+        closed_by_slice: Some(3),
+    },
+    CoverageRow {
+        row: 18,
+        path: "Delegated send-as authorization",
+        anchor: "src/server/delegations.rs",
+        disposition: Disposition::Refuse,
+        closed_by_slice: Some(3),
+    },
+    CoverageRow {
+        row: 19,
+        path: "Committed-delegation registry rebuild / index",
+        anchor: "src/server/delegations.rs",
+        disposition: Disposition::Refuse,
+        closed_by_slice: Some(3),
+    },
+    CoverageRow {
+        row: 20,
+        path: "Group task-list read/mutate",
+        anchor: "src/server/routes/tasks.rs",
+        disposition: Disposition::Split,
+        closed_by_slice: Some(5),
+    },
+    CoverageRow {
+        row: 21,
+        path: "Signed-public bootstrap outbox publish",
+        anchor: "src/server/routes/public_group_bootstrap_outbox.rs",
+        disposition: Disposition::Refuse,
+        closed_by_slice: Some(5),
+    },
+    CoverageRow {
+        row: 22,
+        path: "Ratchet / persist lifecycle epoch re-check",
+        anchor: "src/server/routes/named_groups.rs",
+        disposition: Disposition::Introduce,
+        closed_by_slice: Some(7),
+    },
+    CoverageRow {
+        row: 23,
+        path: "File transfer (ADR-0055 DM plane, not group-state bound)",
+        anchor: "src/server/routes/files.rs",
+        disposition: Disposition::OutOfScope,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 24,
+        path: "Inbound metadata / state-commit apply",
+        anchor: "src/server/routes/named_groups.rs",
+        disposition: Disposition::KeepUngated,
+        closed_by_slice: None,
+    },
+    CoverageRow {
+        row: 25,
+        path: "WebSocket fan-out — Mention events and ADR-0023 backfill",
+        anchor: "src/server/ws.rs",
+        disposition: Disposition::Annotate,
+        closed_by_slice: Some(6),
+    },
+    CoverageRow {
+        row: 26,
+        path: "History diagnostics",
+        anchor: "src/server/routes/history.rs",
+        disposition: Disposition::Annotate,
+        closed_by_slice: Some(4),
+    },
+];
+
+/// How one registry endpoint relates to the §1 map.
+///
+/// Every class here is a DECISION somebody made and can be argued with in
+/// review — which is exactly what an unclassified route denies. The point
+/// of the enum is that "nobody looked at it yet" is not one of the options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteClass {
+    /// Covered by these §1 rows: the disposition (gate, refusal or
+    /// annotation) lives there, not here.
+    Covered(&'static [u8]),
+    /// Group CONTROL plane: membership, lifecycle, policy, invites,
+    /// discovery, and the quarantine clear itself. §1 enumerates the DATA
+    /// plane; ADR-0064 §3 and ADR-0066 deliberately leave the control
+    /// plane ungated — a quarantined group must still be administrable,
+    /// and gating the clear route would make containment permanent.
+    ControlPlane,
+    /// Observability: reports the marker rather than acting under it.
+    /// Refusing here would hide the incident from the operator, which is
+    /// the failure mode ADR-0066's Drivers single out.
+    Observability,
+    /// Reached without consulting group authority state at all, so the
+    /// marker has nothing to gate.
+    NotStateBound,
+    /// A group-scoped path the §1 map does NOT name, recorded as a gap in
+    /// the map rather than quietly folded into a neighbouring row.
+    ///
+    /// The one current entry is a READ path, so the gap is in the
+    /// annotate class (§3a/§3d), never the refuse class — no authority
+    /// escapes through it. It is reported on the slice-2 PR for the
+    /// slice that owns annotations (slice 4/6) or a superseding ADR to
+    /// absorb. The set is asserted EXACTLY, so a new unmapped route fails
+    /// this fixture instead of joining a growing list.
+    MapGap,
+}
+
+/// The classification table for the registry's data-plane candidate
+/// surface. Keyed `"METHOD /path"` exactly as the registry spells it.
+const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
+    // ── §1 rows 1–6: the shipped owner-axis gates ───────────────────────
+    ("POST /groups/:id/send", RouteClass::Covered(&[1])),
+    ("POST /mls/groups/:id/encrypt", RouteClass::Covered(&[2])),
+    ("POST /mls/groups/:id/decrypt", RouteClass::Covered(&[3])),
+    ("POST /groups/:id/secure/encrypt", RouteClass::Covered(&[4])),
+    ("POST /groups/:id/secure/decrypt", RouteClass::Covered(&[5])),
+    ("POST /groups/:id/secure/reseal", RouteClass::Covered(&[6])),
+    // ── §1 rows 7–12: the KV / store surface ────────────────────────────
+    ("POST /groups/:id/stores", RouteClass::Covered(&[7, 9])),
+    (
+        "GET /groups/:id/stores/:app/legacy-imports",
+        RouteClass::Covered(&[7]),
+    ),
+    (
+        "POST /groups/:id/stores/:app/legacy-imports/:source_id",
+        RouteClass::Covered(&[7]),
+    ),
+    (
+        "GET /groups/:id/stores/:app/legacy-imports/:source_id",
+        RouteClass::Covered(&[7]),
+    ),
+    ("GET /stores", RouteClass::Covered(&[8])),
+    ("POST /stores", RouteClass::Covered(&[7, 9])),
+    ("POST /stores/:id/join", RouteClass::Covered(&[7, 10, 11])),
+    ("GET /stores/:id/keys", RouteClass::Covered(&[8, 10, 11])),
+    ("PUT /stores/:id/:key", RouteClass::Covered(&[8, 9, 10])),
+    ("GET /stores/:id/:key", RouteClass::Covered(&[8, 10, 11])),
+    ("DELETE /stores/:id/:key", RouteClass::Covered(&[8, 9, 10])),
+    // ── §1 rows 13, 14, 26: history ─────────────────────────────────────
+    ("GET /history", RouteClass::Covered(&[13])),
+    ("GET /history/message/:msg_id", RouteClass::Covered(&[13])),
+    ("GET /history/scopes", RouteClass::Covered(&[13])),
+    ("GET /history/search", RouteClass::Covered(&[13])),
+    ("GET /history/stats", RouteClass::Covered(&[13])),
+    ("DELETE /history", RouteClass::Covered(&[14])),
+    ("GET /diagnostics/history", RouteClass::Covered(&[26])),
+    // ── §1 rows 15, 16: delegations ─────────────────────────────────────
+    ("POST /groups/:id/delegate", RouteClass::Covered(&[15])),
+    ("GET /groups/:id/delegations", RouteClass::Covered(&[16])),
+    // ── §1 row 20: tasks ────────────────────────────────────────────────
+    ("GET /task-lists", RouteClass::Covered(&[20])),
+    ("POST /task-lists", RouteClass::Covered(&[20])),
+    ("GET /task-lists/:id/tasks", RouteClass::Covered(&[20])),
+    ("POST /task-lists/:id/tasks", RouteClass::Covered(&[20])),
+    (
+        "PATCH /task-lists/:id/tasks/:tid",
+        RouteClass::Covered(&[20]),
+    ),
+    // ── §1 row 23: the DM-plane file transfer, enumerated not gated ─────
+    ("POST /files/send", RouteClass::Covered(&[23])),
+    ("GET /files/transfers", RouteClass::Covered(&[23])),
+    ("GET /files/transfers/:id", RouteClass::Covered(&[23])),
+    ("POST /files/accept/:id", RouteClass::Covered(&[23])),
+    ("POST /files/reject/:id", RouteClass::Covered(&[23])),
+    // ── Group control plane ─────────────────────────────────────────────
+    ("POST /groups", RouteClass::ControlPlane),
+    ("GET /groups", RouteClass::ControlPlane),
+    ("GET /groups/:id", RouteClass::ControlPlane),
+    ("PATCH /groups/:id", RouteClass::ControlPlane),
+    ("DELETE /groups/:id", RouteClass::ControlPlane),
+    ("GET /groups/:id/members", RouteClass::ControlPlane),
+    ("POST /groups/:id/members", RouteClass::ControlPlane),
+    (
+        "DELETE /groups/:id/members/:agent_id",
+        RouteClass::ControlPlane,
+    ),
+    (
+        "PATCH /groups/:id/members/:agent_id/role",
+        RouteClass::ControlPlane,
+    ),
+    ("PATCH /groups/:id/policy", RouteClass::ControlPlane),
+    ("POST /groups/:id/ban/:agent_id", RouteClass::ControlPlane),
+    ("DELETE /groups/:id/ban/:agent_id", RouteClass::ControlPlane),
+    ("POST /groups/:id/invite", RouteClass::ControlPlane),
+    ("POST /groups/join", RouteClass::ControlPlane),
+    ("GET /groups/:id/join-status", RouteClass::ControlPlane),
+    ("PUT /groups/:id/display-name", RouteClass::ControlPlane),
+    ("GET /groups/:id/state", RouteClass::ControlPlane),
+    ("GET /groups/:id/state/commits", RouteClass::ControlPlane),
+    ("POST /groups/:id/state/seal", RouteClass::ControlPlane),
+    ("POST /groups/:id/state/withdraw", RouteClass::ControlPlane),
+    ("GET /groups/:id/requests", RouteClass::ControlPlane),
+    ("POST /groups/:id/requests", RouteClass::ControlPlane),
+    (
+        "POST /groups/:id/requests/:request_id/approve",
+        RouteClass::ControlPlane,
+    ),
+    (
+        "POST /groups/:id/requests/:request_id/reject",
+        RouteClass::ControlPlane,
+    ),
+    (
+        "DELETE /groups/:id/requests/:request_id",
+        RouteClass::ControlPlane,
+    ),
+    ("GET /groups/discover", RouteClass::ControlPlane),
+    ("GET /groups/discover/nearby", RouteClass::ControlPlane),
+    (
+        "GET /groups/discover/subscriptions",
+        RouteClass::ControlPlane,
+    ),
+    ("POST /groups/discover/subscribe", RouteClass::ControlPlane),
+    (
+        "DELETE /groups/discover/subscribe/:kind/:shard",
+        RouteClass::ControlPlane,
+    ),
+    ("GET /groups/cards/:id", RouteClass::ControlPlane),
+    ("POST /groups/cards/import", RouteClass::ControlPlane),
+    // The remedy the §5 message names: gating it would make every
+    // `no_anchor` quarantine permanent.
+    (
+        "POST /groups/:id/quarantine/clear",
+        RouteClass::ControlPlane,
+    ),
+    // The MLS plane's own membership surface.
+    ("POST /mls/groups", RouteClass::ControlPlane),
+    ("GET /mls/groups", RouteClass::ControlPlane),
+    ("GET /mls/groups/:id", RouteClass::ControlPlane),
+    ("POST /mls/groups/:id/members", RouteClass::ControlPlane),
+    (
+        "DELETE /mls/groups/:id/members/:agent_id",
+        RouteClass::ControlPlane,
+    ),
+    ("POST /mls/groups/:id/welcome", RouteClass::ControlPlane),
+    // ── Observability ───────────────────────────────────────────────────
+    ("GET /diagnostics/groups", RouteClass::Observability),
+    // ── Not bound to group authority state ──────────────────────────────
+    // The adversarial confidentiality-proof endpoint: it opens an envelope
+    // with THIS daemon's own KEM key and reads no group authority state
+    // beyond a withdrawn check.
+    (
+        "POST /groups/secure/open-envelope",
+        RouteClass::NotStateBound,
+    ),
+    // ── Gaps in the §1 map (read paths only — see RouteClass::MapGap) ───
+    ("GET /groups/:id/messages", RouteClass::MapGap),
+];
+
+/// The exact, complete set of §1 map gaps. Asserted as an equality, not a
+/// subset: a newly discovered gap must be argued for, not appended.
+const KNOWN_MAP_GAPS: &[&str] = &["GET /groups/:id/messages"];
+
+/// The surfaces ADR-0066 §1 censused. A registry route under any of these
+/// prefixes is part of the data-plane candidate surface and must be
+/// classified; anything else (contacts, presence, exec, …) is outside the
+/// ADR's subject matter.
+const CANDIDATE_PREFIXES: &[&str] = &[
+    "/groups",
+    "/mls/groups",
+    "/stores",
+    "/task-lists",
+    "/history",
+    "/files",
+    "/diagnostics/groups",
+    "/diagnostics/history",
+];
+
+fn is_candidate(path: &str) -> bool {
+    CANDIDATE_PREFIXES
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn registry_key(endpoint: &EndpointDef) -> String {
+    format!("{} {}", endpoint.method, endpoint.path)
+}
+
+/// The classifier, taken as a function of one endpoint so that a
+/// SYNTHETIC endpoint can be pushed through the exact same code path the
+/// real registry takes — that is what makes the negative control below a
+/// control rather than a comment.
+fn classify(endpoint: &EndpointDef) -> Option<RouteClass> {
+    let key = registry_key(endpoint);
+    ROUTE_CLASSIFICATION
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, class)| *class)
+}
+
+fn read_anchor(anchor: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(anchor);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("§1 anchor {anchor} must exist: {error}"))
+}
+
+/// WHY: the §1 map is normative, so its own shape has to be machine-held.
+/// A row that loses its disposition, a duplicated row number, a count that
+/// no longer matches the ADR's stated totals, or an anchor file that was
+/// renamed away are all ways the enumeration rots without anyone noticing.
+#[test]
+fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
+    assert_eq!(
+        COVERAGE_MAP.len(),
+        26,
+        "ADR-0066 §1 enumerates 26 data-plane paths"
+    );
+    for (index, row) in COVERAGE_MAP.iter().enumerate() {
+        assert_eq!(
+            row.row as usize,
+            index + 1,
+            "rows are transcribed in the ADR's order so a reviewer can diff them side by side"
+        );
+        assert!(!row.path.is_empty(), "row {} has no description", row.row);
+    }
+
+    let count = |disposition: Disposition| {
+        COVERAGE_MAP
+            .iter()
+            .filter(|row| row.disposition == disposition)
+            .count()
+    };
+    // The ADR's own totals: 12 gated today, 1 deliberately ungated, and
+    // the 13 ungated rows split 6 refuse / 1 split / 4 annotate /
+    // 1 introduce / 1 out-of-scope.
+    assert_eq!(count(Disposition::Gated), 12, "ADR-0066 §1 Counts");
+    assert_eq!(count(Disposition::KeepUngated), 1, "row 24");
+    assert_eq!(count(Disposition::Refuse), 6, "§1 disposition table");
+    assert_eq!(count(Disposition::Split), 1, "§1 disposition table");
+    assert_eq!(count(Disposition::Annotate), 4, "§1 disposition table");
+    assert_eq!(count(Disposition::Introduce), 1, "§1 disposition table");
+    assert_eq!(count(Disposition::OutOfScope), 1, "§1 disposition table");
+
+    // A row that claims to be gated today must actually consult the
+    // marker in the file the ADR anchors it to. This is the clause that
+    // fails if a gate is deleted or a module is split out from under the
+    // map.
+    for row in COVERAGE_MAP
+        .iter()
+        .filter(|row| row.disposition == Disposition::Gated)
+    {
+        let source = read_anchor(row.anchor);
+        assert!(
+            source.contains("is_fork_quarantined") || source.contains("reject_fork_quarantined"),
+            "§1 row {} claims {} is gated, but {} consults no marker",
+            row.row,
+            row.path,
+            row.anchor
+        );
+    }
+    // Every other row's anchor must at least still exist: the map's
+    // `file:line` promise is worthless if the file is gone.
+    for row in COVERAGE_MAP.iter() {
+        let _ = read_anchor(row.anchor);
+    }
+    // Slice 2 ships no new refusal. Every row still open names the slice
+    // that closes it, so "not done yet" is never indistinguishable from
+    // "forgotten".
+    for row in COVERAGE_MAP.iter() {
+        match row.disposition {
+            Disposition::Gated | Disposition::KeepUngated | Disposition::OutOfScope => assert!(
+                row.closed_by_slice.is_none(),
+                "row {} needs no further slice",
+                row.row
+            ),
+            _ => assert!(
+                row.closed_by_slice.is_some(),
+                "row {} changes behaviour, so it must name the slice that closes it",
+                row.row
+            ),
+        }
+    }
+}
+
+/// WHY (ADR-0066 Validation, the fixture's whole reason for existing):
+/// every route on the censused surface must be explicitly classified. Row
+/// 25 proves that a map defended only by reading degrades; this test is
+/// the defence that does not.
+///
+/// The failure mode it prevents is specific and silent: somebody adds a
+/// group data-plane route, nobody asks what a quarantined group should do
+/// with it, and the route joins the ungated set — which is precisely how
+/// ordinary groups came to be 0-of-26 gated in the first place.
+#[test]
+fn adr0066_every_group_data_plane_route_is_classified() {
+    let unclassified: Vec<String> = ENDPOINTS
+        .iter()
+        .filter(|endpoint| is_candidate(endpoint.path))
+        .filter(|endpoint| classify(endpoint).is_none())
+        .map(registry_key)
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "ADR-0066 §1 is normative and these registry routes are on the censused data-plane \
+         surface with no classification: {unclassified:?}. Decide what a fork-quarantined \
+         group does on each (gate it, annotate it, or record why the marker does not apply) \
+         and add it to ROUTE_CLASSIFICATION — do not delete this assertion."
+    );
+
+    // Every classification must point at rows that exist, so a typo'd row
+    // number cannot launder a route as covered.
+    for (key, class) in ROUTE_CLASSIFICATION {
+        if let RouteClass::Covered(rows) = class {
+            assert!(
+                !rows.is_empty(),
+                "{key} claims coverage without naming a §1 row"
+            );
+            for row in *rows {
+                assert!(
+                    COVERAGE_MAP.iter().any(|entry| entry.row == *row),
+                    "{key} cites §1 row {row}, which does not exist"
+                );
+            }
+        }
+    }
+
+    // The classification table must not accumulate entries for routes the
+    // registry no longer serves: a stale entry would mask a deletion and,
+    // worse, could silently "classify" a future route that reuses the
+    // path.
+    let stale: Vec<&str> = ROUTE_CLASSIFICATION
+        .iter()
+        .map(|(key, _)| *key)
+        .filter(|key| {
+            !ENDPOINTS
+                .iter()
+                .any(|endpoint| registry_key(endpoint) == *key)
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "ROUTE_CLASSIFICATION entries with no registry route: {stale:?}"
+    );
+
+    // Gaps in the ADR's own map are held to an EXACT set. A new one is a
+    // finding for review, not a line to append quietly.
+    let gaps: Vec<&str> = ROUTE_CLASSIFICATION
+        .iter()
+        .filter(|(_, class)| *class == RouteClass::MapGap)
+        .map(|(key, _)| *key)
+        .collect();
+    assert_eq!(
+        gaps, KNOWN_MAP_GAPS,
+        "a group-scoped route not named by the §1 map is a finding: if it is a READ path it \
+         joins the annotate class (slices 4/6); if it carries authority it needs a superseding \
+         ADR before it can be left ungated"
+    );
+}
+
+/// WHY: a guard nobody has seen fail is a guard nobody can trust. This is
+/// the NEGATIVE CONTROL for the fixture above — a synthetic new group
+/// data-plane route, pushed through the same `is_candidate` + `classify`
+/// pair the real test uses, must come back unclassified.
+///
+/// Without this control, `adr0066_every_group_data_plane_route_is_classified`
+/// could pass for the wrong reason: a classifier that matched everything,
+/// a prefix list that matched nothing, or a table lookup that silently
+/// defaulted. Each of those would make the fixture decorative while
+/// reading exactly as green.
+#[test]
+fn adr0066_exhaustiveness_fixture_fails_on_an_unclassified_route() {
+    let newcomer = EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/brand-new-data-plane-verb",
+        cli_name: "group brand-new",
+        description: "a route a future slice adds without classifying it",
+        category: "named-groups",
+        request: RequestSpec::None,
+    };
+    assert!(
+        is_candidate(newcomer.path),
+        "a new /groups route is on the censused surface — if this fails, the prefix list is \
+         too narrow and the real fixture is blind"
+    );
+    assert!(
+        classify(&newcomer).is_none(),
+        "an unclassified route must NOT be treated as covered — this is the assertion that \
+         proves the real fixture can fail"
+    );
+
+    // And the positive half of the control: a route that IS classified
+    // resolves, so the lookup is not simply always-None.
+    let classified = ENDPOINTS
+        .iter()
+        .find(|endpoint| registry_key(endpoint) == "POST /groups/:id/send")
+        .expect("the signed-public send route is in the registry");
+    assert_eq!(
+        classify(classified),
+        Some(RouteClass::Covered(&[1])),
+        "§1 row 1 is the shipped gate on the outbound send path"
+    );
+
+    // A route outside the censused surface is deliberately NOT demanded to
+    // carry a classification: the fixture guards the group data plane, not
+    // the whole API.
+    assert!(
+        !is_candidate("/contacts/:agent_id"),
+        "contacts are not group state"
+    );
+}

@@ -1504,12 +1504,10 @@ async fn fork_quarantine_gate_parity_with_reverify_gate() -> Result<()> {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "quarantined encrypt must 409");
-    assert_eq!(
-        json.0["error"].as_str(),
-        Some("fork_quarantined"),
-        "typed fork-quarantine error: {}",
-        json.0
-    );
+    // ADR-0066 §5 (slice 1): the machine code moved from `error` to
+    // `reason`, and `error` now carries the mandatory informational
+    // sentence. The whole contract is asserted in one shared place.
+    super::fork_quarantine::assert_fork_quarantine_refusal_body(&json.0);
 
     // The evidence-bearing seal clears BOTH containment kinds.
     let response = seal_group_state(
