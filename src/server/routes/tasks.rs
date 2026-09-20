@@ -276,6 +276,22 @@ impl x0x::crdt::TaskIngestGate for TaskQuarantineIngestGate {
         })
     }
 
+    /// ADR-0067's token for the bound group, resolved under both spellings by
+    /// the one resolver (`lifecycle_epoch_token_locked` is the thin wrapper over
+    /// it). `None` when this node holds no record for the id — which the CRDT
+    /// side must treat as a mismatch, never as "unchanged".
+    fn epoch_token(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<x0x::groups::LifecycleEpochToken>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let state = self.state.upgrade()?;
+            let groups = state.named_groups.read().await;
+            crate::server::lifecycle_epoch_token_locked(&groups, &self.group_id)
+        })
+    }
+
     fn on_buffered(&self, depth: usize, bytes: usize) {
         if let Some(state) = self.state.upgrade() {
             state
@@ -325,6 +341,52 @@ pub(in crate::server) fn install_task_ingest_gate(
         state: Arc::downgrade(state),
         group_id: group_id.to_string(),
     }));
+}
+
+/// ADR-0068 D2: apply the deltas held for `group_id`'s task lists now that its
+/// marker is gone. Returns how many deltas were applied across all its lists.
+///
+/// The listener's own poll would get there within
+/// `TASK_QUARANTINE_DRAIN_POLL_SECS`; calling this from the clear route makes an
+/// operator's manual clear take effect at once instead, which is the difference
+/// between "the list caught up while I watched" and "the list looked stuck for
+/// another five seconds". The poll remains the guarantee — it covers every OTHER
+/// way a marker clears (metadata apply, explicit owner seal, rollback arms),
+/// which is why the drain is observed rather than hooked at each of them.
+///
+/// **Must be called with NO `named_groups` guard held.** It awaits each list's
+/// CRDT write lock, and the ingest gate takes `named_groups.read()` inside that
+/// lock; the lock order is `TaskList` → `named_groups` (see `admit_or_buffer`),
+/// so holding the roster lock here would invert it.
+pub(in crate::server) async fn resume_group_task_ingest(
+    state: &Arc<AppState>,
+    group_id: &str,
+) -> usize {
+    // Snapshot the matching handles, then release the registry lock: the drain
+    // itself takes per-list CRDT locks and must not hold the map meanwhile.
+    let handles: Vec<x0x::TaskListHandle> = {
+        let lists = state.task_lists.read().await;
+        lists
+            .iter()
+            .filter(|(id, _)| {
+                parse_group_scoped_task_list_id(id)
+                    .is_some_and(|scoped| !scoped.is_malformed() && scoped.group_id == group_id)
+            })
+            .map(|(_, handle)| handle.clone())
+            .collect()
+    };
+    let mut applied = 0usize;
+    for handle in handles {
+        applied += handle.resume_quarantined_ingest().await;
+    }
+    if applied > 0 {
+        tracing::info!(
+            group_id = %group_id,
+            applied,
+            "[tasks] applied task deltas held under fork quarantine after the clear (ADR-0068 D2)"
+        );
+    }
+    applied
 }
 
 // ---------------------------------------------------------------------------

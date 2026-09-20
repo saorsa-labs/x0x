@@ -15608,8 +15608,15 @@ impl TaskListHandle {
     /// ADR-0068 D2: apply the deltas buffered under fork quarantine, in arrival
     /// order. Returns how many applied.
     ///
-    /// The listener drains on its own once it observes the marker gone; this is
-    /// the explicit entry point for the clear route and for deterministic tests.
+    /// Called by the manual clear route
+    /// (`server::routes::tasks::resume_group_task_ingest`) so an operator's
+    /// clear takes effect at once, and by the deterministic fixtures. The
+    /// listener's own poll is the GUARANTEE — it covers every other way a
+    /// marker clears — so this is an accelerator, never the only trigger.
+    ///
+    /// Applies nothing if a marker is live again, or if the ADR-0067 marker
+    /// identity moved since the drain decided: the deltas stay buffered, in
+    /// order, for the next observation.
     pub async fn resume_quarantined_ingest(&self) -> usize {
         self.sync.resume_quarantined_ingest().await
     }

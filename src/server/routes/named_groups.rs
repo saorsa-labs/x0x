@@ -12973,9 +12973,19 @@ pub(in crate::server) async fn clear_group_quarantine(
     state
         .groups_diagnostics
         .record_fork_quarantine_manual_clear(&stable_group_id);
+    // ADR-0068 D2: the marker is gone and durable, so the task deltas held
+    // under it can apply NOW rather than at the listener's next poll. Run
+    // after `persist_named_groups_mutation` has released the roster lock: the
+    // drain awaits each list's CRDT write lock and the ingest gate reads
+    // `named_groups` inside that lock, so the order is `TaskList` →
+    // `named_groups` and holding the roster lock here would invert it. The
+    // listener's poll still covers every other way a marker clears.
+    let task_deltas_resumed =
+        super::tasks::resume_group_task_ingest(&state, &stable_group_id).await;
     tracing::info!(
         group_id = %LogHexId::group(&stable_group_id),
         cleared_by,
+        task_deltas_resumed,
         reason = %req.reason.chars().take(256).collect::<String>(),
         "ADR-0064: fork quarantine manually cleared (local node only)"
     );

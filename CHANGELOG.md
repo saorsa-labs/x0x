@@ -28,7 +28,14 @@ All notable changes to this project will be documented in this file.
     this node has joined that are simultaneously forked — a flooder can inflate
     rows (bounded by the ceiling) but cannot inflate `G`. On clear the scope
     returns to normal retention on the next pass. Both counters are on
-    `GET /diagnostics/history`.
+    `GET /diagnostics/history`. **Residual:** that bound is payload-measured
+    while the whole-database phase measures the SQLite *file*, whose footprint is
+    ~4× the payload here (the FTS5 projection), so healthy-history displacement
+    under global saturation reaches 100 % at about `G≈4–5`, not 16 — watch
+    `history_quarantine_pinned_scopes` and raise `max_bytes` past 4. A global
+    pinned cap (total pinned ≤ `max_bytes/4`, evicting oldest pinned across
+    groups) is the recommended follow-up and needs its own ADR, since it trades
+    away "a flooder can burn only its own group's ceiling".
   - **Task lists (D2).** Row 20 refused *local* task mutations while a group was
     quarantined, but deltas from peers still merged — admitted by the
     `authorized_agents` set derived from **the contested roster itself** — so a
@@ -42,7 +49,17 @@ All notable changes to this project will be documented in this file.
     Group **metadata** ingest (row 24) is untouched, so the clearing commit still
     arrives. Per-group counters `task_deltas_quarantine_buffered`,
     `task_deltas_quarantine_dropped` and `task_deltas_quarantine_applied` are on
-    `GET /diagnostics/groups`.
+    `GET /diagnostics/groups`. A manual clear drains immediately; every other
+    clear path is picked up by the listener within 5 s. The drain re-checks the
+    ADR-0067 token (marker half) in the same critical section as the merge, so a
+    marker re-installing mid-drain abandons it with the deltas still buffered in
+    order, and the admission decision is taken under the list write lock so
+    nothing can slip through between deciding and merging. A single delta larger
+    than 1 MiB is dropped rather than held, so the per-list bound is the stated
+    one and not the transport's 4 MiB frame cap. **Residual:** a list's
+    `authorized_agents` set is captured at subscribe time, so a held delta from
+    an agent the clearing commit removes still applies at drain — identical to
+    live-path admission, recorded rather than silently inherited.
 - **Outbound sends and secure-crypto routes now re-check the fork-quarantine
   marker immediately before their effect, not only at request start (ADR-0066
   §1 rows 1/2/4/6 and §4, slice 9; ADR-0067; #732).** These four paths were

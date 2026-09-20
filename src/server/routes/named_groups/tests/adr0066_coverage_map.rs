@@ -437,6 +437,19 @@ fn adr0068_extension_rows_are_exact_and_anchored() {
             && hold.contains("TASK_QUARANTINE_BUFFER_MAX_BYTES"),
         "row 28 promises a BOUNDED hold, not an unbounded queue"
     );
+    // ADR-0068's "marker installed mid-apply" row promises the ADR-0067 token
+    // re-check before the drain's effect, and ONE critical section for the
+    // admit decision. Review found both missing while the ADR claimed them, so
+    // they are asserted here rather than left to a reading.
+    assert!(
+        hold.contains("epoch_token") && hold.contains("same_marker"),
+        "row 28's drain must capture and re-check the ADR-0067 token (marker half)"
+    );
+    assert!(
+        hold.contains("Admission::Apply") && hold.contains("RwLockWriteGuard"),
+        "row 28's admission must decide under the list write lock and hand that \
+         guard to the merge, so no marker can install between deciding and merging"
+    );
     // The daemon side: both mechanisms must be fed through the ONE resolver,
     // never a bare map read. This is the clause that fails if a later change
     // re-grows a single-spelling lookup for either of them.
@@ -455,6 +468,21 @@ fn adr0068_extension_rows_are_exact_and_anchored() {
     assert!(
         gate_source.contains("delegations::fork_quarantine_marker"),
         "D2's gate must resolve through the one resolver, so an alias-keyed group is gated"
+    );
+    assert!(
+        gate_source.contains("lifecycle_epoch_token_locked"),
+        "and its ADR-0067 token must come from the same resolver, both spellings"
+    );
+    // Review nit 3: `resume_quarantined_ingest` documented a clear-route caller
+    // it did not have. It has one now, and these two clauses keep the claim
+    // honest — the listener poll remains the guarantee for every other clear.
+    assert!(
+        gate_source.contains("resume_group_task_ingest"),
+        "the clear-route accelerator must exist"
+    );
+    assert!(
+        read_anchor("src/server/routes/named_groups.rs").contains("resume_group_task_ingest"),
+        "and the manual clear route must actually call it"
     );
 }
 

@@ -243,6 +243,13 @@ pub const TASK_QUARANTINE_BUFFER_MAX_DELTAS: usize = 1024;
 /// ADR-0068 D2: maximum buffered delta bytes per task list (1 MiB). Whichever
 /// of this and [`TASK_QUARANTINE_BUFFER_MAX_DELTAS`] is reached first drops
 /// the oldest buffered delta.
+///
+/// The bound is ABSOLUTE, including for a single delta: one delta larger than
+/// this on its own is dropped rather than retained (review nit 4 — an
+/// "always keep at least one" rule would have let the transport's own 4 MiB
+/// frame cap set the real per-list worst case, five times what the ADR states).
+/// Dropping is safe: merges are idempotent and the state-sync side channel
+/// re-serves full state after the clear.
 pub const TASK_QUARANTINE_BUFFER_MAX_BYTES: usize = 1_048_576;
 
 /// ADR-0068 D2: how often a listener holding buffered deltas re-checks whether
@@ -267,6 +274,23 @@ pub trait TaskIngestGate: Send + Sync + 'static {
     /// Is application suspended (a live fork-quarantine marker)? Consulted
     /// once per inbound delta and once per drain attempt.
     fn suspended(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>;
+
+    /// The ADR-0067 lifecycle epoch token for the bound group, or `None` when
+    /// this node holds no record for it.
+    ///
+    /// `None` is a MISMATCH for a re-checking caller, never "unchanged" — the
+    /// same rule `lifecycle_epoch_token_locked` documents. The CRDT layer never
+    /// interprets the token; it only asks whether the marker half still
+    /// describes the same quarantine it decided against.
+    fn epoch_token(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<crate::groups::LifecycleEpochToken>>
+                + Send
+                + '_,
+        >,
+    >;
 
     /// A delta was buffered instead of applied; `depth`/`bytes` are the
     /// buffer's state after the push.
@@ -348,10 +372,16 @@ impl QuarantineDeltaBuffer {
     /// state-sync side channel re-serves full state after the clear.
     fn push(&mut self, entry: BufferedDelta) -> u64 {
         let mut dropped = 0u64;
+        // A delta that cannot fit the byte bound on its own is dropped rather
+        // than retained (review nit 4): keeping it would let the transport's
+        // own frame cap — not this constant — decide the per-list worst case.
+        if entry.bytes > TASK_QUARANTINE_BUFFER_MAX_BYTES {
+            return 1;
+        }
         self.bytes = self.bytes.saturating_add(entry.bytes);
         self.entries.push_back(entry);
         while self.entries.len() > TASK_QUARANTINE_BUFFER_MAX_DELTAS
-            || (self.bytes > TASK_QUARANTINE_BUFFER_MAX_BYTES && self.entries.len() > 1)
+            || self.bytes > TASK_QUARANTINE_BUFFER_MAX_BYTES
         {
             match self.entries.pop_front() {
                 Some(old) => {
@@ -374,6 +404,10 @@ impl QuarantineDeltaBuffer {
         self.entries.len()
     }
 
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     fn bytes(&self) -> usize {
         self.bytes
     }
@@ -392,30 +426,64 @@ fn lock_buffer(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// ADR-0068 D2: the outcome of the admission step.
+///
+/// `Apply` carries the list write guard the decision was taken under, so the
+/// caller's merge happens inside the SAME critical section as the decision —
+/// there is no window for a marker to install between them (review nit 2).
+// `Apply` carries a delta and a lock guard while `Held` carries nothing, so the
+// variants differ in size by design: boxing the admitted delta to even them out
+// would put an allocation on the ingest hot path to save nothing (the value is
+// consumed immediately by the caller's merge, never stored or queued).
+#[allow(clippy::large_enum_variant)]
+pub enum Admission<'a> {
+    /// Merge this delta, using the guard the decision was taken under.
+    Apply(TaskListDelta, tokio::sync::RwLockWriteGuard<'a, TaskList>),
+    /// A marker is live: the delta is held, the list untouched.
+    Held,
+}
+
 /// ADR-0068 D2: the admission step — apply this delta now, or hold it?
 ///
-/// Deliberately does NOT perform the merge. The listener's merge shares one
-/// write-lock critical section with the issue-#240 digest-verified full-replace
-/// adopt, and splitting that would open a window in which an interleaved merge
-/// could be pruned. So this decides, and the caller keeps its critical section
-/// exactly as it was.
+/// **Decides under the list write lock and hands the guard back.** ADR-0068's
+/// "marker installed mid-apply" row promises that the decision and the effect
+/// share one critical section; an earlier draft decided first and let the caller
+/// lock afterwards, so a marker installing in that gap let one delta through
+/// (review nit 2). It deliberately does NOT perform the merge itself: the
+/// listener's merge shares its critical section with the issue-#240
+/// digest-verified full-replace adopt, and splitting THAT would let an
+/// interleaved merge be pruned. So the guard travels instead of the merge.
+///
+/// **Lock order: `TaskList` write → `named_groups` read** (the gate's own
+/// lookup). Nothing in the daemon holds a `named_groups` guard across a
+/// `TaskList` lock acquisition — `apply_group_authorization` drops its read
+/// guard before `set_authorized_agents`, and the clear route's resume runs after
+/// its write guard is released — so this order cannot cycle. A future caller
+/// that awaits a task list while holding `named_groups` would break it, which is
+/// why the order is stated here and at the resume helper.
 ///
 /// Hot path when no marker is live: one gate read (a resolver read behind the
-/// daemon's implementation) and a scalar compare.
-pub(crate) async fn admit_or_buffer(
+/// daemon's implementation) and a scalar compare, inside the lock the merge
+/// needed anyway.
+pub(crate) async fn admit_or_buffer<'a>(
     gate: Option<&Arc<dyn TaskIngestGate>>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
+    task_list: &'a RwLock<TaskList>,
     peer_id: PeerId,
     delta: TaskListDelta,
     writer: Option<&crate::identity::AgentId>,
     encoded_bytes: usize,
-) -> Option<TaskListDelta> {
+) -> Admission<'a> {
     let Some(gate) = gate else {
-        return Some(delta); // no group binding — pre-ADR-0068 behaviour
+        // No group binding — pre-ADR-0068 behaviour, one lock, no gate read.
+        return Admission::Apply(delta, task_list.write().await);
     };
+    let list = task_list.write().await;
     if !gate.suspended().await {
-        return Some(delta);
+        return Admission::Apply(delta, list);
     }
+    // Still holding the write guard: a merge cannot slip between this verdict
+    // and the buffering below, and a concurrent drain cannot interleave.
     let (depth, bytes, dropped) = {
         let mut held = lock_buffer(buffer);
         let dropped = held.push(BufferedDelta {
@@ -437,7 +505,8 @@ pub(crate) async fn admit_or_buffer(
              (ADR-0068 D2; anti-entropy refills after the clear)"
         );
     }
-    None
+    drop(list);
+    Admission::Held
 }
 
 /// ADR-0068 D2: apply every buffered delta, in arrival order, once the marker
@@ -447,21 +516,62 @@ pub(crate) async fn admit_or_buffer(
 /// registers are order-sensitive, so a replay out of order could pick a
 /// different winner than the live path would have.
 ///
-/// Takes the buffer's contents BEFORE merging, so a concurrent inbound delta
-/// that arrives mid-drain queues behind this batch rather than interleaving
-/// with it.
+/// Takes the buffer's contents under the list write lock, so a concurrent
+/// inbound delta queues behind this batch rather than interleaving with it.
+///
+/// **ADR-0067 re-check (ADR-0068's "marker installed mid-apply" row).** The
+/// token is captured when the drain observes "no marker" and re-checked inside
+/// the same critical section as the merge, with no await between the re-check
+/// and the first `merge_delta`. On a mismatch the drain is ABANDONED and the
+/// deltas stay buffered, in order, for the next observation — nothing is
+/// half-applied, because the buffer is only emptied after the re-check passes.
+///
+/// The comparison is the MARKER half ([`crate::groups::LifecycleEpochToken::same_marker`],
+/// whose doc-comment asks callers to justify choosing it over `==`). Justified
+/// here: this drain runs precisely when other group state is advancing — the
+/// clearing commit itself advances `state_revision` — so a full-token compare
+/// would refuse every legitimate drain and freeze the list until the next
+/// quiet poll. What must not have changed is the quarantine, and that is exactly
+/// what `same_marker` compares. A `None` token (this node holds no record for
+/// the group) is a mismatch, never "unchanged".
 pub(crate) async fn drain_quarantine_buffer(
     gate: Option<&Arc<dyn TaskIngestGate>>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
     task_list: &RwLock<TaskList>,
 ) -> usize {
-    let pending = lock_buffer(buffer).take();
-    if pending.is_empty() {
+    if lock_buffer(buffer).is_empty() {
         return 0;
     }
+    // Capture WITH the decision: suspension and token are read together,
+    // before the critical section opens.
+    let captured = match gate {
+        Some(gate) => {
+            if gate.suspended().await {
+                return 0; // still quarantined — nothing to do
+            }
+            let Some(token) = gate.epoch_token().await else {
+                // No record for the group at all ⇒ mismatch by ADR-0067's rule.
+                return 0;
+            };
+            Some(token)
+        }
+        None => None,
+    };
     let mut applied = 0usize;
     {
         let mut list = task_list.write().await;
+        // The re-check, inside the critical section, with no await between it
+        // and the merge below.
+        if let (Some(gate), Some(captured)) = (gate, captured.as_ref()) {
+            if gate.suspended().await {
+                return 0; // a marker installed after the observation
+            }
+            match gate.epoch_token().await {
+                Some(live) if live.same_marker(captured) => {}
+                _ => return 0, // marker identity moved, or the record is gone
+            }
+        }
+        let pending = lock_buffer(buffer).take();
         for entry in pending {
             match list.merge_delta(&entry.delta, entry.peer_id, entry.writer.as_ref()) {
                 Ok(()) => applied += 1,
@@ -500,17 +610,31 @@ pub mod testing {
     /// fault-injection refactor removed.
     pub type Buffer = std::sync::Mutex<QuarantineDeltaBuffer>;
 
-    /// [`super::admit_or_buffer`], verbatim.
-    pub async fn admit_or_buffer(
+    /// [`super::admit_or_buffer`], verbatim — including the fact that the
+    /// decision is taken under the list write lock and the guard travels with
+    /// the admitted delta, which is what the barrier fixtures exercise.
+    pub async fn admit_or_buffer<'a>(
         gate: Option<&Arc<dyn TaskIngestGate>>,
         buffer: &Buffer,
+        task_list: &'a RwLock<TaskList>,
         peer_id: PeerId,
         delta: TaskListDelta,
         writer: Option<&crate::identity::AgentId>,
         encoded_bytes: usize,
-    ) -> Option<TaskListDelta> {
-        super::admit_or_buffer(gate, buffer, peer_id, delta, writer, encoded_bytes).await
+    ) -> Admission<'a> {
+        super::admit_or_buffer(
+            gate,
+            buffer,
+            task_list,
+            peer_id,
+            delta,
+            writer,
+            encoded_bytes,
+        )
+        .await
     }
+
+    pub use super::Admission;
 
     /// [`super::drain_quarantine_buffer`], verbatim.
     pub async fn drain(
@@ -525,6 +649,12 @@ pub mod testing {
     #[must_use]
     pub fn len(buffer: &Buffer) -> usize {
         lock_buffer(buffer).len()
+    }
+
+    /// Held bytes, for the byte-bound fixture.
+    #[must_use]
+    pub fn bytes(buffer: &Buffer) -> usize {
+        lock_buffer(buffer).bytes()
     }
 }
 
@@ -754,7 +884,7 @@ impl TaskListSync {
             loop {
                 // ADR-0068 D2: the drain poll is armed ONLY while deltas are
                 // held, so a list that was never quarantined adds no timer.
-                let buffered = lock_buffer(&listener_buffer).len() > 0;
+                let buffered = !lock_buffer(&listener_buffer).is_empty();
                 let msg = tokio::select! {
                     // cancel_sync tears down every loop (round-4 review) —
                     // recv alone would keep this listener alive until
@@ -812,21 +942,26 @@ impl TaskListSync {
                         // remote mirror of row 20's local refusals, so a peer
                         // seated by the disputed roster cannot move the CRDT
                         // winner during the incident.
-                        let Some(delta) = admit_or_buffer(
+                        let (delta, admitted) = match admit_or_buffer(
                             listener_gate.gate(),
                             &listener_buffer,
+                            &task_list,
                             peer_id,
                             delta,
                             msg.sender.as_ref(),
                             msg.payload.len(),
                         )
                         .await
-                        else {
-                            continue;
+                        {
+                            Admission::Held => continue,
+                            Admission::Apply(delta, guard) => (delta, guard),
                         };
                         let mut merged_ok = false;
                         {
-                            let mut list = task_list.write().await;
+                            // The guard the admission decision was taken
+                            // under: decision and merge are one critical
+                            // section (ADR-0068 D2, review nit 2).
+                            let mut list = admitted;
                             // Layer A (issue #349): the V2-envelope-verified
                             // sender is the writer identity; the payload
                             // `peer_id` stays an OR-Set tag only (I3).
