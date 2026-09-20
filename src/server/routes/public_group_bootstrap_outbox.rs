@@ -1641,6 +1641,326 @@ mod tests {
         Ok(())
     }
 
+    /// The `fork_quarantine_refusals` counter for one group, read the way
+    /// `GET /diagnostics/groups` builds it.
+    async fn refusals_for(state: &AppState, group_id: &str) -> u64 {
+        let groups_snapshot = state.named_groups.read().await.clone();
+        state
+            .groups_diagnostics
+            .snapshot(
+                &groups_snapshot,
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                &std::collections::HashMap::new(),
+                state.groups_config.mandate_grace_days,
+            )
+            .groups
+            .into_iter()
+            .find(|g| g.group_id == group_id)
+            .map_or(0, |g| g.counters.fork_quarantine_refusals)
+    }
+
+    /// ADR-0066 §3c row 21 — the marker must NEVER ride an outbound payload.
+    ///
+    /// WHY as a validation failure rather than a filter: this is the one
+    /// census path that EXPORTS state to another node, and a bootstrap
+    /// snapshot is installed verbatim by its recipient. Containment is
+    /// per-node by ADR-0064's design, so a marker on the wire would both leak
+    /// local forensic state and quarantine a group on a peer that has no
+    /// evidence of the fork. `signed_public_bootstrap_snapshot` strips it
+    /// today; this assertion is what makes a future refactor of that
+    /// stripping list a refusal to write and a refusal to start, instead of a
+    /// silent leak.
+    #[test]
+    fn adr0066_row21_an_obligation_payload_may_never_carry_the_marker() -> Result<()> {
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let recipient = x0x::identity::AgentKeypair::generate()?;
+        let mut group =
+            signed_public_group(&authority, &hex::encode(recipient.agent_id().as_bytes()))?;
+        // Control: the honestly-prepared obligation validates.
+        let clean = prepare_public_group_bootstrap_obligation(recipient.agent_id(), group.clone())
+            .map_err(|error| anyhow::anyhow!(error))?;
+        validate_public_group_bootstrap_obligation(&clean)
+            .context("control: a stripped snapshot validates")?;
+
+        // Now smuggle a marker into the payload, re-deriving every digest so
+        // the ONLY thing left for the validator to object to is the marker.
+        group.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: group.state_revision,
+            state_hash: group.state_hash.clone(),
+            committed_by: "9e".repeat(32),
+            observed_at_ms: 1_726_000_000_000,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: group.terminal_commit_header(),
+                conflicting_commit: group.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        let smuggled = prepare_public_group_bootstrap_obligation(recipient.agent_id(), group)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let refused = validate_public_group_bootstrap_obligation(&smuggled);
+        assert!(
+            refused.is_err(),
+            "a payload carrying the fork-quarantine marker must never be \
+             storable or sendable"
+        );
+        Ok(())
+    }
+
+    /// ADR-0066 §3c row 21 — the worker withholds a contested group's
+    /// snapshot, and does so WITHOUT destroying the debt.
+    ///
+    /// WHY both halves matter. Withholding is the containment: this is the
+    /// highest-severity ungated path in the §1 census after §2, because a
+    /// background job publishing one branch of a contested chain propagates
+    /// the fork to a peer with nobody watching. Retaining is the
+    /// availability: an ordinary group's marker never auto-clears, so
+    /// dropping the obligation would leave a member permanently on the
+    /// roster with nobody remembering to bootstrap them — the failure this
+    /// outbox exists to prevent. The control arm is what proves the
+    /// withholding is real: with no marker the SAME call attempts delivery
+    /// and records the attempt in the obligation's retry state.
+    /// A marker in whichever branch the caller wants, at an explicit
+    /// revision.
+    ///
+    /// WHY the revision is a parameter rather than a constant: the row-21
+    /// dedupe (`LOGGED_PUBLICATION_REFUSALS`) is process-global and keyed by
+    /// `(group id, revision)`, and every fixture here shares one mls group id,
+    /// so two tests at the same revision would have the second one's counter
+    /// assertion silently absorbed by the first one's dedupe entry. Each test
+    /// in this file owns a revision.
+    fn quarantine_marker(
+        info: &x0x::groups::GroupInfo,
+        revision: u64,
+    ) -> x0x::groups::ForkQuarantine {
+        x0x::groups::ForkQuarantine {
+            revision,
+            state_hash: info.state_hash.clone(),
+            committed_by: "9e".repeat(32),
+            observed_at_ms: 1_726_000_000_000,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        }
+    }
+
+    /// Install (or clear) the marker on whichever roster entry holds the group
+    /// with this stable id, whatever key it is filed under.
+    async fn set_marker(state: &AppState, stable_id: &str, revision: Option<u64>) {
+        let mut groups = state.named_groups.write().await;
+        for info in groups.values_mut() {
+            if info.stable_group_id() == stable_id {
+                info.fork_quarantine = revision.map(|r| quarantine_marker(info, r));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn adr0066_row21_worker_withholds_a_contested_snapshot_and_keeps_the_debt() -> Result<()>
+    {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let obligation = seeded_obligation(&state).await?;
+        state
+            .public_group_bootstrap_outbox
+            .write()
+            .await
+            .insert(obligation.key.clone(), obligation.clone());
+        let group_id = obligation.group_id.clone();
+        assert!(
+            !state
+                .named_groups_requires_durability_confirmation
+                .load(Ordering::Acquire),
+            "fixture precondition: the worker must not be deferring for an \
+             unrelated reason, or 'nothing was sent' proves nothing"
+        );
+
+        // The quarantined arm runs FIRST, on an untouched obligation: R5's
+        // no-grace rule is about the FIRST due obligation after the marker
+        // installs, so the evidence must not come from one that has already
+        // been through a retry cycle.
+        set_marker(&state, &group_id, Some(31)).await;
+        let refusals_before = refusals_for(&state, &group_id).await;
+
+        public_group_bootstrap_outbox_step(&state).await;
+
+        let withheld = state
+            .public_group_bootstrap_outbox
+            .read()
+            .await
+            .get(&obligation.key)
+            .cloned()
+            .context(
+                "the debt must SURVIVE the suppression — a dropped obligation \
+                 is a member nobody remembers to bootstrap, and a no_anchor \
+                 marker never clears itself",
+            )?;
+        assert_eq!(
+            withheld.attempt_count, obligation.attempt_count,
+            "no delivery was attempted: the attempt counter did not move"
+        );
+        assert_eq!(
+            withheld.next_attempt_at_ms, obligation.next_attempt_at_ms,
+            "and the schedule was not touched, so delivery resumes by itself \
+             once the marker is cleared"
+        );
+        assert_eq!(
+            withheld.payload, obligation.payload,
+            "nor was the stored payload refreshed from the contested frontier"
+        );
+        let refusals_after = refusals_for(&state, &group_id).await;
+        assert_eq!(
+            refusals_after,
+            refusals_before + 1,
+            "§3e: one `fork_quarantine_refusals` increment for the withheld \
+             publication — the shared helper's, not a per-route counter"
+        );
+
+        // The dedupe: a POLLING worker must not turn a fleet-health counter
+        // into a measure of uptime. A second pass at the same marker revision
+        // withholds again and records nothing new.
+        public_group_bootstrap_outbox_step(&state).await;
+        assert_eq!(
+            refusals_for(&state, &group_id).await,
+            refusals_after,
+            "one record per (group, fork observation), not one per poll"
+        );
+
+        // CONTROL, in the other direction: after the manual clear the SAME
+        // worker pass attempts delivery. There is no peer, so the attempt
+        // fails and is rescheduled — and that movement is precisely the
+        // observable whose ABSENCE above proved the snapshot was withheld.
+        set_marker(&state, &group_id, None).await;
+        public_group_bootstrap_outbox_step(&state).await;
+        let resumed = state
+            .public_group_bootstrap_outbox
+            .read()
+            .await
+            .values()
+            .find(|entry| entry.group_id == group_id)
+            .cloned()
+            .context("control: the obligation survives a failed attempt")?;
+        assert!(
+            resumed.attempt_count > obligation.attempt_count,
+            "control: with no marker the worker attempts delivery and records \
+             the attempt — the manual clear is the exit for row 21 too"
+        );
+        Ok(())
+    }
+
+    /// ADR-0066 §3c row 21 — reconciliation RETAINS a contested group's
+    /// obligation instead of dropping it, and declines to refresh it.
+    ///
+    /// WHY this is not `continue` like the `withdrawn` arm beside it: a
+    /// withdrawn group is gone and its debt is void, whereas a fork is a
+    /// dispute that a human is expected to resolve with the manual clear. The
+    /// contrast is asserted in one test so a future edit that "tidies" the
+    /// two arms into one has to break a test that explains the difference.
+    #[tokio::test]
+    async fn adr0066_row21_reconciliation_retains_rather_than_drops_a_contested_debt() -> Result<()>
+    {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let seeded = seeded_obligation(&state).await?;
+        state
+            .public_group_bootstrap_outbox
+            .write()
+            .await
+            .insert(seeded.key.clone(), seeded.clone());
+
+        // Advance the group's frontier so reconciliation WOULD refresh the
+        // stored payload, then quarantine it. Both effects are then visible:
+        // retained, and not refreshed.
+        {
+            let mut groups = state.named_groups.write().await;
+            for info in groups.values_mut() {
+                if info.stable_group_id() == seeded.group_id {
+                    info.state_revision = info.state_revision.saturating_add(1);
+                    info.fork_quarantine = Some(quarantine_marker(info, 32));
+                }
+            }
+        }
+
+        reconcile_public_group_bootstrap_outbox(&state).await?;
+
+        let after = state.public_group_bootstrap_outbox.read().await;
+        let kept = after.get(&seeded.key).context(
+            "a contested group's debt must be RETAINED under its \
+                      original key, not dropped and not re-keyed",
+        )?;
+        assert_eq!(
+            kept.payload, seeded.payload,
+            "and not re-derived from the contested frontier"
+        );
+        assert_eq!(
+            kept.state_revision, seeded.state_revision,
+            "the stored frontier is the one that was committed before the fork \
+             evidence arrived"
+        );
+        Ok(())
+    }
+
+    /// ADR-0066 §3c row 21 — the alias-key regression, with its negative
+    /// control.
+    ///
+    /// WHY this shape is mandatory here specifically: an obligation records
+    /// `group.stable_group_id()`, while the roster map is keyed by whichever
+    /// alias this daemon learned the group under. So the worker arrives at the
+    /// gate holding the STABLE id while the marker sits under the ALIAS — the
+    /// two-spelling case is the normal case for this row, not an exotic one.
+    /// The first assertion is the negative control: the single-spelling read a
+    /// gate must not use provably misses, which is what makes the rest of the
+    /// test evidence about the resolver rather than about luck.
+    #[tokio::test]
+    async fn adr0066_row21_gate_resolves_a_group_keyed_by_an_alias() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let recipient = x0x::identity::AgentKeypair::generate()?;
+        let mut group =
+            signed_public_group(&authority, &hex::encode(recipient.agent_id().as_bytes()))?;
+        let stable_id = group.stable_group_id().to_string();
+        let alias_key = format!("alias-{}", "7c".repeat(8));
+        assert_ne!(
+            alias_key, stable_id,
+            "fixture precondition: the map key is NOT the stable id"
+        );
+        group.fork_quarantine = Some(quarantine_marker(&group, 33));
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(alias_key.clone(), group);
+
+        // NEGATIVE CONTROL: the single-spelling lookup misses entirely.
+        assert!(
+            state.named_groups.read().await.get(&stable_id).is_none(),
+            "control: `groups.get(stable_id)` misses an alias-keyed group — a \
+             gate built on it would publish exactly the contested groups whose \
+             two names differ"
+        );
+
+        assert!(
+            withhold_bootstrap_publication(&state, &stable_id).await,
+            "the gate must withhold when handed the STABLE id the obligation \
+             carries, with the marker filed under the alias"
+        );
+        assert!(
+            withhold_bootstrap_publication(&state, &alias_key).await,
+            "and the direct key hit still works — the fallback is additive"
+        );
+
+        // Control in the other direction: a clean group is published. Without
+        // this, a gate that withheld unconditionally would pass everything
+        // above.
+        assert!(
+            !withhold_bootstrap_publication(&state, &"e5".repeat(16)).await,
+            "a group this daemon holds no marker for is never withheld"
+        );
+        Ok(())
+    }
+
     /// Why: cancellation on removal must be exact. Dropping obligations for
     /// other members or other groups would strand them exactly as the
     /// fire-and-forget path did.

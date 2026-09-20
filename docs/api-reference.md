@@ -1557,11 +1557,25 @@ plane. See `docs/primers/groups.md`.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/task-lists` | `x0x tasks list` | List task lists |
-| POST | `/task-lists` | `x0x tasks create <name> <topic>` | Create a task list |
-| GET | `/task-lists/:id/tasks` | `x0x tasks show <list_id>` | List tasks |
-| POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task |
-| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim <list> <task> [--fence-token <t>] [--delegation <hex>]` / `x0x tasks complete ...` | Update task state (`action` is chosen by the subcommand). `--fence-token` is the local-replica CAS precondition (409 on mismatch); `--delegation` is the hex ADR-0040 digest authorizing the claim |
+| GET | `/task-lists` | `x0x tasks list` | List task lists. **ADR-0066 §3c**: a group-scoped entry gains `fork_quarantined: true` and a `fork_quarantine` object while its group is fork-quarantined |
+| POST | `/task-lists` | `x0x tasks create <name> <topic>` | Create a task list. **ADR-0066 §3c**: 409 `fork_quarantined` when the topic is group-scoped and that group is fork-quarantined — refused before any handle, registration or sync listener exists |
+| GET | `/task-lists/:id/tasks` | `x0x tasks show <list_id>` | List tasks. **ADR-0066 §3c**: keeps serving while fork-quarantined, with `fork_quarantined: true` and a `fork_quarantine` object added to the response |
+| POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task. **ADR-0066 §3c**: 409 `fork_quarantined` before any CRDT mutation, snapshot write or delta publish |
+| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim <list> <task> [--fence-token <t>] [--delegation <hex>]` / `x0x tasks complete ...` | Update task state (`action` is chosen by the subcommand). `--fence-token` is the local-replica CAS precondition (409 on mismatch); `--delegation` is the hex ADR-0040 digest authorizing the claim. **ADR-0066 §3c**: 409 `fork_quarantined` before the fence token is parsed and before any mutation, whether or not a delegation is cited |
+
+**Fork quarantine (ADR-0066 §3c, row 20).** A task list whose id is
+group-scoped (`x0x.group.<group_id>.symphony.<list_id>`) is bound to a named
+group, and while this node holds a fork-quarantine marker for that group its
+**mutations refuse and its reads keep serving, annotated**. The roster the
+list's CRDT admission set is derived from is exactly what is in dispute, so a
+claim or completion accepted on it is an act taken under disputed membership;
+losing the read, by contrast, would remove the only view of what the contested
+roster has been doing. The refusal is the standard 409 `fork_quarantined` body
+(below) and arrives on the **first** attempt after the marker installs — there
+is no warn-only window (ADR-0066 R5). Task lists that are not group-scoped are
+unaffected, as are group-scoped lists for any other group. The annotation keys
+are **absent entirely** — never `null`, never `false` — when there is no
+marker, so unquarantined responses are byte-identical to before.
 
 **Durability (#557): every list carries an on-disk content snapshot.** The
 daemon snapshots the full list state (task ids, titles, claim/complete
@@ -2188,7 +2202,10 @@ sealing.
 
 While this node holds a fork-quarantine marker for a group, the
 membership-gated routes (`POST /groups/:id/send`, TreeKEM encrypt/decrypt, and
-the `secure/encrypt`, `secure/decrypt`, `secure/reseal` family) refuse with:
+the `secure/encrypt`, `secure/decrypt`, `secure/reseal` family), the delegation
+grant (`POST /groups/:id/delegate`, ADR-0066 §3b) and the group-scoped
+task-list mutations (`POST /task-lists`, `POST /task-lists/:id/tasks`,
+`PATCH /task-lists/:id/tasks/:tid`, ADR-0066 §3c) refuse with:
 
 ```json
 {

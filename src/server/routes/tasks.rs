@@ -155,7 +155,8 @@ pub(in crate::server) async fn task_list_fork_quarantine(
     if scoped.is_malformed() {
         return None;
     }
-    let marker = crate::server::delegations::fork_quarantine_marker(state, &scoped.group_id).await?;
+    let marker =
+        crate::server::delegations::fork_quarantine_marker(state, &scoped.group_id).await?;
     Some((scoped.group_id, marker))
 }
 
@@ -173,6 +174,20 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// The refusal goes through the single slice-1 helper, so it carries the §5
 /// body — machine `reason`, the human sentence, and the manual-clear remedy
 /// — and bumps `fork_quarantine_refusals` exactly once (§3e).
+///
+/// WHY it runs BEFORE [`ensure_task_list_access`] rather than after: #153's
+/// guard resolves the group with a single-spelling `named_groups.get(id)`, so
+/// for a group filed under a local alias it answers 403 "not a member" to a
+/// request naming the stable id. Ordering the quarantine check after it would
+/// make the alias case fail closed for the wrong, undiagnosable reason — the
+/// exact "right outcome, wrong reason" defect slice 3 found on row 18 — and
+/// R5's condition for removing the warn-only window was that the user always
+/// learns WHY. Containment is a property of the group's contested state, not
+/// of who is asking, and these are daemon-local control-plane endpoints
+/// authenticated by the daemon's own token, so there is no third party to
+/// leak the marker to. Slice 3 set the same precedent on
+/// `delegate_group_authority`, where the quarantine refusal precedes the
+/// ban/role checks.
 async fn reject_quarantined_task_mutation(
     state: &Arc<AppState>,
     id: &str,
@@ -352,10 +367,6 @@ pub(in crate::server) async fn create_task_list(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTaskListRequest>,
 ) -> impl IntoResponse {
-    // #153: creating a group-scoped task list requires membership of that group.
-    if let Err(denied) = ensure_task_list_access(&state, &req.topic).await {
-        return denied;
-    }
     // ADR-0066 §3c row 20: binding a NEW task list to a contested roster is
     // a mutation, not a read — it derives the CRDT's authorized-agent set
     // from the disputed membership (`apply_group_authorization` below),
@@ -364,6 +375,10 @@ pub(in crate::server) async fn create_task_list(
     // of that happens: no handle, no manifest row, no listener.
     if let Some(refused) = reject_quarantined_task_mutation(&state, &req.topic).await {
         return refused;
+    }
+    // #153: creating a group-scoped task list requires membership of that group.
+    if let Err(denied) = ensure_task_list_access(&state, &req.topic).await {
+        return denied;
     }
     let id = req.topic.clone();
     // Reserve the entire handle+manifest transaction for this (kind,id) so
@@ -508,10 +523,6 @@ pub(in crate::server) async fn add_task(
     Path(id): Path<String>,
     Json(req): Json<AddTaskRequest>,
 ) -> impl IntoResponse {
-    // #153: group-scoped task lists require local-agent membership (write too).
-    if let Err(denied) = ensure_task_list_access(&state, &id).await {
-        return denied;
-    }
     // ADR-0066 §3c row 20: refuse BEFORE the handle is resolved, so nothing
     // downstream can mutate the CRDT, write the `task-lists/<id>.bin`
     // snapshot or publish a delta. The ordering is observable: on a
@@ -519,6 +530,10 @@ pub(in crate::server) async fn add_task(
     // not hold, where the ungated path returns 404.
     if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
         return refused;
+    }
+    // #153: group-scoped task lists require local-agent membership (write too).
+    if let Err(denied) = ensure_task_list_access(&state, &id).await {
+        return denied;
     }
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {
@@ -548,10 +563,6 @@ pub(in crate::server) async fn update_task(
     Path((id, tid)): Path<(String, String)>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
-    // #153: group-scoped task lists require local-agent membership (write too).
-    if let Err(denied) = ensure_task_list_access(&state, &id).await {
-        return denied;
-    }
     // ADR-0066 §3c row 20: claim/complete is a mutation, refused before any
     // of this handler's work — before the handle is resolved, before the
     // fence token is parsed and before the delegation branch below. That
@@ -564,6 +575,10 @@ pub(in crate::server) async fn update_task(
     // for the case where a future change narrows row 20's scope.
     if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
         return refused;
+    }
+    // #153: group-scoped task lists require local-agent membership (write too).
+    if let Err(denied) = ensure_task_list_access(&state, &id).await {
+        return denied;
     }
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {

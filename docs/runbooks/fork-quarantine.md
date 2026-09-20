@@ -75,9 +75,9 @@ group-keyed data until an owner-anchored path (§4) advances the chain past
 the evidenced revision. It is containment, not a verdict: ADR-0064
 deliberately has NO automated eviction, and the membership-event ingest path
 is NOT gated (the owner-anchored clearing commit must still be able to
-arrive). History, tasks and the bootstrap outbox are not yet gated or
-annotated: ADR-0066 §1 enumerates all 26 data-plane paths with a disposition
-each, and slices 4–5 land them.
+arrive). History reads, history purge and history diagnostics are not yet
+gated or annotated: ADR-0066 §1 enumerates all 26 data-plane paths with a
+disposition each, and slice 4 lands those three.
 
 **Delegations (ADR-0066 §3b, slice 3) are gated now.** Delegation is an
 authority transfer, and a quarantined group's roster is the thing under
@@ -88,7 +88,7 @@ from it — fails closed:
 |---|---|
 | `POST /groups/:id/delegate` (row 15) | **409 `fork_quarantined`.** Nothing is minted: no envelope is signed, no carrier row reaches history, nothing is published to the group bus. |
 | `GET /groups/:id/delegations` (row 16) | **Still serves**, with `fork_quarantined: true` and a `fork_quarantine` object (same shape as the refusal's) added to the response. Reading who holds authority during a fork is exactly what an operator needs. |
-| Delegated task-execute (`POST /task-lists/:id/tasks/:tid` citing `delegation`, row 17) | **409 `fork_quarantined`** before the claim/complete mutation. Task mutations *not* citing a delegation are row 20 and are not gated until slice 5. |
+| Delegated task-execute (`POST /task-lists/:id/tasks/:tid` citing `delegation`, row 17) | **409 `fork_quarantined`** before the claim/complete mutation. Task mutations *not* citing a delegation refuse too, as row 20 (see below) — since slice 5 the row-20 gate runs first, so either way there is exactly one refusal. |
 | Send-as authorization (row 18) | Fails closed. A peer's gossiped send-as message for a quarantined group is dropped at ingest, as it already is for any unauthorized attribution. |
 | Delegation index / global id registry (row 19) | A contested group's grants are not indexed and do not seed the registry — including at daemon start, where `rebuild_global_delegation_registry` skips the group entirely. An unregistered grant cannot authorize. |
 
@@ -106,6 +106,39 @@ the index from durable history and service resumes with no re-issuance.
 
 Group membership reads, `/groups/:id/state`, and the diagnostics surfaces
 keep working while quarantined.
+
+### Task lists and bootstrap publication (§3c, slice 5)
+
+| Surface | Behaviour while quarantined |
+|---|---|
+| `POST /task-lists` with a group-scoped topic (row 20) | **409 `fork_quarantined`.** Refused before the CRDT is created, before the durable subscription registration is written and before a sync listener starts — nothing is left behind. |
+| `POST /task-lists/:id/tasks`, `PATCH /task-lists/:id/tasks/:tid` (row 20) | **409 `fork_quarantined`** before any CRDT mutation, any `task-lists/<id>.bin` snapshot write and any delta publish. First attempt, no grace. |
+| `GET /task-lists`, `GET /task-lists/:id/tasks` (row 20) | **Still serve**, with `fork_quarantined: true` and a `fork_quarantine` object added (the collection annotates the affected entries). |
+| Signed-public bootstrap publication (row 21) | **Withheld.** The outbox worker declines to send a contested group's snapshot — this is the one path that *exports* contested state to another node, and the snapshot a recipient installs is a whole roster/state frontier. |
+
+**Row 21 is a suppression, not a deletion — nothing is lost.** The bootstrap
+debt stays in the outbox with its retry schedule untouched, and reconciliation
+retains it rather than refreshing it from the contested frontier, so **delivery
+resumes on its own within the normal retry backoff (≤60 s) after the manual
+clear** with no operator action beyond the clear. That matters because dropping
+the obligation would leave a member on the roster that nobody remembers to
+bootstrap, permanently, since a `no_anchor` marker never auto-clears.
+
+Both the periodic worker and the REST nudge a member-add fires go through the
+same gate, so there is no path by which a background job publishes a contested
+group's snapshot. A withheld publication has no HTTP response to carry the §5
+message, so it logs the sentence at WARN and records one
+`fork_quarantine_refusals` increment — **deduplicated per (group, marker
+revision)**, deliberately: this is a polling worker, and one record per poll
+would turn the counter operators alert on into a measure of uptime. A new
+evidence revision logs and counts again. So in triage, read row 21's
+contribution to `fork_quarantine_refusals` as "this group's publication is
+being withheld", not as a rate.
+
+If you see `signed-public bootstrap publication withheld` in the log for a
+group whose members are complaining they never received the group state, the
+answer is §4/§5 (clear the marker) — not restarting the daemon, which loses
+only the dedupe memory and changes nothing about the suppression.
 
 ### The WS plane is annotated, never cut (§3d, slice 6)
 

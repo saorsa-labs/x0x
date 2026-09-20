@@ -6,6 +6,58 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Group task-list mutations now REFUSE, and a contested group's bootstrap
+  snapshot is no longer published, while the group is fork-quarantined
+  (ADR-0066 §3c, rows 20 and 21, slice 5; #732) — an availability change,
+  deliberate.** Two effects an operator will notice. First, a task list whose
+  id is group-scoped (`x0x.group.<group_id>.symphony.<list_id>`) stops
+  accepting writes while this node holds a marker for that group: `POST
+  /task-lists`, `POST /task-lists/:id/tasks` and `PATCH
+  /task-lists/:id/tasks/:tid` return the 409 `fork_quarantined` body (§5) on
+  the **first** attempt after the marker installs, with no warn-only window —
+  ADR-0066 R5 rejected one for this row specifically, on the grounds that
+  "recoverable" describes the cleanup of a CRDT task mutation and not the
+  exposure: a claim accepted on a contested roster is still an act taken under
+  disputed membership. The refusal lands **before** anything happens: before
+  the task-list handle is resolved, before the fence token is parsed, before
+  any CRDT mutation, before the `task-lists/<id>.bin` snapshot write and before
+  any delta publish, so a refused request leaves the CRDT and the on-disk state
+  byte-identical and publishes nothing. A refused `POST /task-lists` leaves no
+  handle, no durable subscription registration and no sync listener. Reads are
+  **not** refused: `GET /task-lists` and `GET /task-lists/:id/tasks` keep
+  serving and gain `fork_quarantined: true` plus a `fork_quarantine` object
+  (`revision`, `observed_at_ms`, `no_anchor`, `clear_with`) — the same shape the
+  refusal body and the annotated WS envelopes use — because losing the read
+  would remove the only view of what the contested roster has been doing. Both
+  keys are **absent entirely**, never `null` and never `false`, when there is no
+  marker, so unquarantined responses are byte-identical. Task lists that are not
+  group-scoped are untouched, and so are group-scoped lists for any other group.
+  Second, the signed-public **bootstrap outbox no longer publishes a quarantined
+  group's snapshot** — the one enumerated path that *exports* contested state,
+  since a recipient installs the snapshot as a whole roster/state frontier.
+  Suppression is non-destructive and needs no operator action beyond the clear:
+  the obligation and its retry schedule are left untouched (reconciliation
+  retains it rather than refreshing it from the contested frontier), so delivery
+  resumes by itself within the normal backoff after `POST
+  /groups/:id/quarantine/clear`. Dropping the debt instead would strand a member
+  on the roster that nobody remembers to bootstrap — permanently, because a
+  `no_anchor` marker never auto-clears. The periodic worker and the REST nudge a
+  member-add fires funnel through one gate, so no background job can publish a
+  contested snapshot; the withheld publication has no HTTP response to carry the
+  §5 message, so it logs that sentence at WARN and records one
+  `fork_quarantine_refusals` increment **deduplicated per (group, marker
+  revision)** — a polling worker counting every poll would turn that
+  fleet-health signal into a measure of uptime. An obligation whose stored
+  payload carries a marker at all is now refused outright at write and at
+  startup load, so per-node containment state cannot reach the wire even if the
+  outbound stripping list is later edited. Every marker lookup this slice adds
+  resolves **both spellings** of a group id — the roster map key and
+  `stable_group_id()` — through the one shared resolver, because a task-list id
+  carries whichever spelling its creator used and a bootstrap obligation always
+  carries the stable id, while `named_groups` is keyed by whichever alias this
+  daemon learned the group under; a single-spelling lookup would admit mutations
+  and publish snapshots for exactly the contested groups whose two names differ.
+
 - **WebSocket group frames are annotated while a group is fork-quarantined
   (ADR-0066 §3d, row 25, slice 6; #732) — labelled, never refused.** The WS
   plane consulted the marker nowhere (`grep -c quarantin src/server/ws.rs` →
