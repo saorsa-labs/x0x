@@ -137,6 +137,25 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   Clients should already be matching `reason`, not `error`; no new code or
   status is introduced. See `docs/runbooks/fork-quarantine.md` §1 ("A marker
   that lands mid-operation").
+- **Fork quarantine on the outbound paths (ADR-0066 §1 rows 1/2/4/6, §4;
+  slice 9):** `POST /groups/:id/send`, `POST /groups/:id/secure/encrypt` and
+  `POST /groups/:id/secure/reseal` (and TreeKEM encrypt behind the second) now
+  re-check the marker **immediately before the effect** as well as at request
+  start. A marker that lands while the request is in flight yields the same 409
+  `fork_quarantined` body — same `reason`, same prose, same `clear_with`; no new
+  code and no new status. Nothing is exported on that refusal: no message is
+  published, no ciphertext or sealed envelope is returned, no history row is
+  written and no ratchet generation is burned.
+
+  Two client-visible points. First, unlike the invite-join refusal above this
+  one is **not retryable**: a retry meets the entry gate and refuses again,
+  because the group is now quarantined until
+  `POST /groups/:id/quarantine/clear`. Second, a concurrent legitimate roster
+  advance does **not** refuse a send — only the marker half of the epoch token
+  is compared. The residual window between the re-check and the bytes reaching
+  the wire is one message wide and documented in
+  `docs/runbooks/fork-quarantine.md` §1 ("Outbound sends and crypto re-check
+  just before the effect").
 - **Device sync (ADR-0041):** `GET /sync/devices`, `POST /sync/devices/enroll`,
   `DELETE /sync/devices/:machine_id`; owner-to-owner SyncV1 streams.
 - **Placement & key-move (ADR-0043):** `GET /owner/placement`,

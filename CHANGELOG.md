@@ -6,6 +6,42 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Outbound sends and secure-crypto routes now re-check the fork-quarantine
+  marker immediately before their effect, not only at request start (ADR-0066
+  §1 rows 1/2/4/6 and §4, slice 9; ADR-0067; #732).** These four paths were
+  gated at request start, so they were admitted only when the group carried no
+  marker at that instant — but between that gate and the effect they await on
+  the rider-token mutex, a revocation-record read, delegation verification, the
+  TreeKEM per-group mutex and a pubsub listener spawn. A fork observation
+  landing at any of those suspension points would have exported contested state
+  on an authorization that was no longer true. All four now capture the
+  ADR-0067 lifecycle epoch token under the same read guard as the gate and
+  re-check its marker half at the last point before the effect with no
+  suspension in between, refusing with the existing 409 `fork_quarantined` §5
+  body:
+  - `POST /groups/:id/send` (row 1) re-checks before the gossip publish. No
+    message reaches the wire, the local hot-tail cache is not written and the
+    direct-DM fan-out never starts.
+  - TreeKEM encrypt (row 2) re-checks while holding the same group mutex, with
+    no await before `encrypt_message`, so **no send-ratchet generation is
+    burned** on a refusal and the advanced-state snapshot persist is never
+    reached.
+  - `POST /groups/:id/secure/encrypt` (row 4) re-checks before the durable
+    history row and the returned ciphertext. The GSS plane has no ratchet, so
+    there is no generation to burn and none is.
+  - `POST /groups/:id/secure/reseal` (row 6) re-checks before the response, so
+    the group's shared secret sealed to a member's ML-KEM key never leaves the
+    node.
+
+  A marker CLEARED mid-operation does not refuse, and cannot occur: the
+  operation was admitted only because the gate saw no marker. Only the marker
+  half of the token is compared, so a concurrent legitimate roster advance does
+  not refuse a send. The residual window between the re-check and the bytes
+  reaching the wire is one message wide and irreducible without a send-path
+  critical section ADR-0066 does not define; it is documented as such in
+  `docs/runbooks/fork-quarantine.md`. This empties the ADR-0067 deferral
+  ledger: `PENDING_RECHECK` is now asserted empty alongside `OPEN_ROWS`, so
+  ADR-0066 §1 and §4 are both discharged across the censused surface.
 - **A fork-quarantine marker that lands mid-operation now aborts the operation
   instead of being overwritten by it (ADR-0066 §4, slice 7; ADR-0067; #732).**
   Every gate slices 1–6 added checks the marker at the START of an operation.

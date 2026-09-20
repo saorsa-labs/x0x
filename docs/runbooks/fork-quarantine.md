@@ -212,6 +212,70 @@ withdrawal this is **recoverable**: the next refresh after a clear (§4/§5)
 re-arms the context from live state. An encrypted store that stays dead after
 a clear is a bug, not the design — capture `/diagnostics` and report it.
 
+### Outbound sends and crypto re-check just before the effect (§4, slice 9)
+
+The two paths above persist a roster record, so §4's "inside the same critical
+section as the mutation" named a site for them. Four rows have no such site:
+they mutate no roster and take no persistence lock, and their effect is
+something leaving the node. They get the same §4 *rule* at the only site they
+have — the last point before the effect with no suspension between.
+
+| Row | Path (`file::symbol`) | The effect the re-check protects |
+|---|---|---|
+| 1 | `named_groups::send_group_public_message` | the gossip publish — once the bytes are handed to gossip the contested message is on the wire |
+| 2 | `named_groups::treekem_group_encrypt` | the send-ratchet advance and the ciphertext |
+| 4 | `named_groups::secure_group_encrypt` | the ciphertext and its durable history row (GSS plane) |
+| 6 | `named_groups::secure_group_reseal` | the group's shared secret, sealed to a member's ML-KEM key, in the response |
+
+All four share one helper,
+`named_groups::reject_fork_quarantine_installed_before_effect`. **The rule:** the
+lifecycle epoch token is captured under the same read guard as the entry gate,
+and its MARKER half is re-checked immediately before the effect. A marker that
+is present at the re-check and was not present at capture refuses with the same
+409 `fork_quarantined` body (§5) as any other quarantine refusal — same `reason`,
+same prose, same `clear_with`.
+
+**What you see, and what it means.** A 409 `fork_quarantined` on a send or a
+crypto route whose *earlier* attempts succeeded means evidence landed while that
+request was in flight. Nothing was exported: no message published, no ciphertext
+or envelope returned, no history row, no ratchet generation burned, every durable
+file byte-identical. It is the ordinary quarantine refusal and the ordinary
+remedy applies — triage the fork (§2), then clear (§4/§5). There is nothing
+extra to clean up and no operator action specific to this refusal.
+
+**Not a lockout, and not retry-worthy.** Unlike the two slice-7 refusals, a
+retry here will hit the ENTRY gate and refuse again, because the marker is now
+installed. That is correct: the group is contested until it is cleared. Do not
+loop the client.
+
+**Only the marker half is compared.** A concurrent legitimate roster advance
+(a rename, a role change) moves `state_revision` but does not refuse a send —
+comparing the full token would refuse every send that raced a rename, with no
+containment benefit. See `groups::LifecycleEpochToken::same_marker`.
+
+**A marker CLEARED mid-operation does not refuse, and cannot occur.** The
+operation was admitted only because the entry gate saw no marker, so the
+captured marker identity is always absent. This differs on purpose from the
+slice-7 persist-lock re-check, which does refuse on a clear (its captured
+authorization was computed against a record that no longer exists); do not read
+the difference as an inconsistency.
+
+**Residual window — stated honestly.** Between the re-check and the bytes
+actually reaching the wire or the caller, nothing holds the roster lock. A
+marker installed in that last stretch does not stop that one effect. The window
+is **one message wide** and is irreducible without a send-path critical
+section — a lock held from the authorization check until the client has the
+bytes — which ADR-0066 does not define and which would serialize the hot path
+behind a network write. It is acceptable because containment is about stopping
+the flow rather than about the instant of the install: the re-check shrinks the
+exposure from the whole request duration (which includes awaits on the
+rider-token mutex, a revocation lookup, delegation verification and the TreeKEM
+group mutex) down to a tail with no suspension point, the very next request
+refuses, and no local marker is atomic across the network in any case.
+Operationally: after installing or observing a marker, assume **at most one**
+message per in-flight request may already have left, and check the group's
+history and the peers' view accordingly.
+
 ### The WS plane is annotated, never cut (§3d, slice 6)
 
 A WebSocket subscriber watching a quarantined group keeps receiving

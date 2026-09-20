@@ -741,14 +741,6 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
 
     // A row cannot claim a LANDED re-check while still being open: "the
     // re-check is in the tree" presupposes the row's behaviour is.
-    //
-    // And — the clause that gives an empty `PENDING_RECHECK` teeth — a row
-    // claiming a landed re-check must have one IN its anchor file. Without
-    // this, the ledger is a comment: a refactor could delete
-    // `reject_fork_quarantine_installed_before_effect` from the send paths and
-    // the fixture would stay green while §4 was quietly undone. This is the
-    // same guarantee the `Gated` rows get for their entry gates, extended to
-    // the re-check.
     for row in COVERAGE_MAP.iter() {
         if row.recheck_before_effect == RecheckState::Landed {
             assert!(
@@ -756,27 +748,25 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
                 "§1 row {} claims a landed §4 re-check but is still open",
                 row.row
             );
-            let source = read_anchor(row.anchor);
-            assert!(
-                RECHECK_SYMBOLS.iter().any(|symbol| source.contains(symbol)),
-                "§1 row {} ({}) claims a LANDED §4 re-check, but {} contains none of \
-                 {RECHECK_SYMBOLS:?}. Either the re-check was removed — put it back — or \
-                 the row belongs in PENDING_RECHECK again with a reason.",
-                row.row,
-                row.path,
-                row.anchor
-            );
         }
     }
 
-    // …and because rows 1, 2, 4 and 6 share ONE anchor file with the helper's
-    // own definition, "the file mentions the symbol" above is satisfied by the
-    // definition alone and would not notice a deleted CALL. So the call sites
-    // are counted: one per row, all four in `named_groups.rs`
-    // (`send_group_public_message`, `treekem_group_encrypt`,
-    // `secure_group_encrypt`, `secure_group_reseal`). Delete any one of them
-    // and this fails, which is what makes the empty `PENDING_RECHECK` above a
-    // claim the tree has to keep earning.
+    // The clause that gives an empty `PENDING_RECHECK` teeth: rows 1, 2, 4 and
+    // 6 must each have a before-effect re-check CALL in their anchor file.
+    //
+    // Counted rather than merely searched for, because all four share one
+    // anchor with the helper's own definition — `source.contains(symbol)`
+    // would be satisfied by that definition alone and would not notice a
+    // deleted call, leaving the fixture green while §4 was quietly undone.
+    // One call per row: `send_group_public_message`, `treekem_group_encrypt`,
+    // `secure_group_encrypt`, `secure_group_reseal`.
+    //
+    // The other `Landed` rows are deliberately NOT checked this way. Row 22's
+    // mechanism is `persist_named_groups_mutation_epoch_checked`, asserted by
+    // the `adr0066_epoch_token` fixtures at the site itself, and rows 10/12's
+    // is a REFRESH TRIGGER in `kv_context.rs` — a marker making a cached
+    // authorization context re-derive — which has no single call symbol to
+    // count and is already covered by their `Gated` anchor clause above.
     let send_path_rows: Vec<u8> = COVERAGE_MAP
         .iter()
         .filter(|row| {
@@ -784,11 +774,17 @@ fn adr0066_coverage_map_matches_the_adr_counts_and_anchors() {
         })
         .map(|row| row.row)
         .collect();
+    assert_eq!(
+        send_path_rows,
+        vec![1u8, 2, 4, 6],
+        "the four send-path rows must all claim a landed re-check; slice 9 landed them and \
+         nothing since should have re-deferred one"
+    );
     let send_path_source = read_anchor("src/server/routes/named_groups.rs");
     let call_sites = send_path_source
         .lines()
         .filter(|line| {
-            line.contains("reject_fork_quarantine_installed_before_effect(")
+            line.contains(SEND_PATH_RECHECK_CALL)
                 && !line.contains("fn ")
                 && !line.trim_start().starts_with("//")
         })
@@ -867,19 +863,13 @@ const OPEN_ROWS: &[u8] = &[];
 /// fails this fixture instead of silently un-discharging §4.
 const PENDING_RECHECK: &[u8] = &[];
 
-/// The call a `RecheckState::Landed` row's anchor file must contain.
+/// The before-effect re-check call that rows 1, 2, 4 and 6 must each make.
 ///
-/// This is what keeps an empty [`PENDING_RECHECK`] honest. Without it the
-/// ledger would be a comment: a refactor that dropped a re-check would leave
-/// the fixture green and §4 quietly undone, which is the exact failure mode
-/// slice 7 introduced `recheck_before_effect` to prevent. Listed as
-/// alternatives because the two kinds of site legitimately differ — the
-/// persist-lock re-check (row 22) and the before-effect re-check (rows
-/// 1/2/4/6) — and a row satisfying either has a re-check in its anchor.
-const RECHECK_SYMBOLS: &[&str] = &[
-    "reject_fork_quarantine_installed_before_effect",
-    "persist_named_groups_mutation_epoch_checked",
-];
+/// Counting these call sites is what keeps an empty [`PENDING_RECHECK`] honest.
+/// Without it the ledger would be a comment: a refactor that dropped a re-check
+/// would leave the fixture green and §4 quietly undone, which is the exact
+/// failure mode slice 7 introduced `recheck_before_effect` to prevent.
+const SEND_PATH_RECHECK_CALL: &str = "reject_fork_quarantine_installed_before_effect(";
 
 /// WHY (ADR-0066 Validation, the fixture's whole reason for existing):
 /// every route on the censused surface must be explicitly classified. Row
