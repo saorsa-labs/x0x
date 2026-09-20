@@ -290,7 +290,6 @@ const COVERAGE_MAP: &[CoverageRow] = &[
     },
 ];
 
-
 /// How one registry endpoint relates to the §1 map.
 ///
 /// Every class here is a DECISION somebody made and can be argued with in
