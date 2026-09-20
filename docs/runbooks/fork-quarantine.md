@@ -1,76 +1,119 @@
-# Fork quarantine runbook (ADR-0064, ADR-0066)
+# Fork-Quarantine Operator Runbook
+
+> ADR-0066 (Accepted) · ADR-0067 (Accepted) · slice 8 — runbook and ops docs
+>
+> This file supersedes the slice 1–7 patchwork. Every statement is verified
+> against the tree and cited in Appendix A.
 
 Operator procedures for the persistent fork-quarantine marker and the owner
-mandate grace machinery. Everything here is LOCAL, per-node state: a marker
+mandate grace machinery. Everything here is **LOCAL, per-node state**: a marker
 on this daemon says this daemon holds authenticated evidence of a conflicting
 group state chain; it is never gossiped, and a member that never received the
-evidence has no marker and is not contained (ADR-0064 Decision 3). Design
-context: [docs/trust-and-connectivity.md](../trust-and-connectivity.md)
-(ADR-0064 sections), [ADR-0064](../adr/0064-owner-anchored-fork-authority.md),
-[ADR errata](../adr/README.md) (maintainer decisions of 2026-09-10/11),
-issues #468/#469/#472.
+evidence has no marker and is not contained (ADR-0064 Decision §3). Design
+context: [`docs/trust-and-connectivity.md`](../trust-and-connectivity.md),
+[ADR-0064](../adr/0064-owner-anchored-fork-authority.md),
+[ADR-0066](../adr/0066-ordinary-group-fork-anchors-and-data-plane-quarantine-coverage.md),
+[ADR-0067](../adr/0067-lifecycle-epoch-token-is-derived-marker-identity.md),
+issues #468/#469/#472/#732.
 
-Scope: **every group.** ADR-0064 gated owner-axis groups (Home-suite /
-`OwnerCertified` admission) only. ADR-0066 §2 extends the marker to ordinary
-(non-owner-axis) groups, where it carries `no_anchor: true` and **only the
-manual clear lifts it** — see §5.
+---
 
-> **Upgrade expectation (ADR-0066 Migration).** Expect `fork_quarantine_set`
-> to RISE on the upgrade wave, for groups that were already silently forked.
-> Nothing is quarantined retroactively — there is no startup scan — but the
-> first authenticated conflicting commit after the upgrade installs a marker
-> on an ordinary group that previously degraded silently, and that group's
-> data plane begins refusing at once, with no grace period (R5). Set alerting
-> thresholds on `fork_quarantine_set` and `fork_quarantine_refusals` before
-> rolling out, and read §5 first: for these groups a human is the only exit.
+## 1. What fork quarantine is
 
-## 1) What the 409 `fork_quarantined` refusal means
+A **fork-quarantine marker** is installed when this node applies and retains
+authenticated fork evidence: a conflicting state-commit whose signature verifies
+and whose committer was an Active Admin in the retained predecessor roster — the
+same deduplicated gate ADR-0059 uses. The marker says "this daemon holds evidence
+that the group's commit chain has branched"; it is containment, not a verdict.
 
-While the marker is set, the membership-gated routes refuse with the typed
-HTTP 409 `fork_quarantined`:
+Containment scope (inherited from ADR-0064, unchanged):
+- **Per-node and local-only.** A marker on this daemon says nothing about any
+  other daemon. Another node that never received the conflicting commit has no
+  marker and serves the group normally.
+- **No fleet-wide propagation.** Nothing here makes a marker travel.
+- **No automated eviction.** The membership-event ingest path is deliberately
+  NOT gated — the anchored clearing commit must still be able to arrive.
 
-- `POST /groups/:id/send` (public group messages)
-- TreeKEM encrypt/decrypt
-- the `secure/encrypt`, `secure/decrypt`, `secure/reseal` family
-- `DELETE /history?scope=group:<ID>` — the durable-history purge (ADR-0066
-  §3a). Refused **before** anything is deleted, so the store is left
-  unchanged: a purge is the irreversible destruction of the forensic record
-  the quarantine exists to preserve. Clear the marker first if you genuinely
-  need to purge.
+### Owner-axis groups vs ordinary (`no_anchor`) groups
 
-**History READS are never refused — they are annotated.** `GET /history`,
-`/history/message/:msg_id`, `/history/search`, `/history/scopes`,
-`/history/stats`, `GET /diagnostics/history` and `GET /groups/:id/messages`
-keep serving during an incident and add `"fork_quarantined": true` plus a
-`fork_quarantine.scopes[]` list (each entry carrying `scope`, `revision`,
-`observed_at_ms`, `no_anchor`) to the envelope; both keys are absent when
-nothing in view is quarantined. Rows of a quarantined group that arrived at or
-after `observed_at_ms` also carry `"fork_quarantined_at_ingest": true`, so you
-can separate the incident window from the group's earlier traffic — ingest is
-tag-and-retain, never refused (ADR-0066 R3), so nothing is missing from the
-record. That label is derived from the live marker: **read the history you need
-BEFORE clearing**, because a clear keeps every row but drops the labels.
+**Owner-axis groups** have an `OwnerCertified` admission policy and carry an
+owner key. Their markers auto-clear when an owner-anchored commit advances the
+chain past the evidenced revision (see §4.1–4.2).
 
-**Two spellings of one group.** History scopes name the group's *stable* id
-(that is what `x0x history scopes` lists and what the rows carry); the local
-roster, and therefore the marker, is keyed by whichever id this daemon learned
-the group under. On the history surface either spelling reaches the gate and the
-annotation, so a purge cannot slip through under the stable name. Where it
-matters is the clear: `x0x groups quarantine clear` takes the **roster key**,
-which is the id the refusal's own message quotes — and `x0x diagnostics history`
-/ `GET /history/stats` list both spellings when they differ, so you do not have
-to guess which one a command wants.
+**Ordinary groups** (the majority population) have no owner key by construction.
+ADR-0066 §2 extends the persistent marker to them; the marker carries
+`no_anchor: true` on the `GroupInfo` record. **Nothing auto-clears a `no_anchor`
+marker.** The only exit is the manual clear endpoint (§4.3). This is accepted
+design (R1/R5): a founder-key anchor was rejected because a compromised founder
+key would be an unreviewable eviction oracle; a quorum anchor was rejected because
+a two-member group's quorum is the attacker.
 
-### The refusal body (ADR-0066 §5)
+**The blunt operational truth (R1/R5, ADR-0066 Consequences):** a current admin's
+signed conflicting commit quarantines an ordinary group on every node that receives
+it — permanently, until a human runs the manual clear on each of those nodes. The
+trigger does not ask whether the admin was malicious or merely partitioned; it asks
+only that the committer held an active admin seat. A benign network split that
+produces authenticated conflicting commits strands the group. That is the accepted
+cost; the §5 refusal message (§3.1) is the mitigation — not a delay, an
+explanation the operator can act on.
 
-**Match on `reason`, not on `error`.** ADR-0066 §5 moved the stable machine
-code out of the human field so the human field can explain itself:
+---
+
+## 2. How a marker gets installed
+
+The install path is `fork_quarantine_for_evidence`
+(`src/server/routes/named_groups.rs:3733` — the former early-return fence for
+owner-axis-only is removed by ADR-0066 §2 / slice 2). Evidence must pass
+`evaluate_fork_evidence_candidate` and the ADR-0059 dedup gate before the marker
+is written.
+
+1. A conflicting state-commit arrives through the live apply path
+   (`named_groups.rs:8922` — deliberately ungated, see §3.3 row 24).
+2. The evidence authenticates: the committer's signature verifies, and the
+   committer was an active admin in the retained predecessor roster.
+3. The ADR-0059 dedup gate checks the evidence is not a replay.
+4. `install_fork_evidence` (`named_groups.rs:3566`) writes the marker into the
+   in-memory record; it is persisted at `:3609`/`:3611`.
+5. `no_anchor` is set to `true` when the group's policy has no owner axis
+   (`named_groups.rs:3744`, field `src/groups/mod.rs:280`).
+6. `fork_quarantine_set` counter is bumped (`named_groups.rs:3620`).
+7. **The quarantine generation in the lifecycle epoch token** (ADR-0067) is not a
+   counter: the token is derived on demand from the live record as
+   `(state_revision, marker_identity)` (`src/groups/mod.rs`, `LifecycleEpochToken`
+   type) — no new field, no new serde surface. It observes every install and clear
+   automatically, including the on-disk recovery install at `named_groups.rs:24203`
+   and the two clears that bypass the persistence lock (`:3562`, `:9633`), because
+   the token is read from the live record at re-check time.
+
+**Evidence path widened by ADR-0066 R2.** Ordinary groups formed without an invite
+are covered too (fence at `named_groups.rs:3765` widened). "Ordinary group" is one
+population, not two.
+
+**Retry rollback is NOT a clear.** A non-durable install retried on exact identity
+match (revision + state hash + committer) is rolled back by
+`rollback_live_fork_evidence` (`named_groups.rs:3536`–`:3541`) — an undo of an
+install that never durably happened. This is deliberately not gated on `no_anchor`;
+gating it would strand a group on a transient persist failure.
+
+---
+
+## 3. Surface behaviour
+
+**All 26 ADR-0066 §1 data-plane paths have landed** (`OPEN_ROWS == &[]`,
+asserted in the exhaustiveness fixture
+`src/server/routes/named_groups/tests/adr0066_coverage_map.rs`). Rows 1, 2, 4
+and 6 are gated at entry but still await their §4 re-check before effect
+(`PENDING_RECHECK == [1, 2, 4, 6]` — see §6a).
+
+### 3.1 Refused surfaces — 409 `fork_quarantined`
+
+Match on **`reason`**, not on `error`. The body is (ADR-0066 §5):
 
 ```json
 {
   "ok": false,
   "reason": "fork_quarantined",
-  "error": "group is fork-quarantined on this node: authenticated fork evidence at revision 7 means the roster is contested, so this operation is refused here. It clears when an owner-anchored commit advances past revision 7, or immediately with the manual clear POST /groups/:id/quarantine/clear (CLI: `x0x groups quarantine clear <GROUP_ID>`, which needs `--force --reason \"<why>\"` unless this install holds the group's owner user key).",
+  "error": "group is fork-quarantined on this node: authenticated fork evidence at revision 7 means the roster is contested, so this operation is refused here. It clears when an owner-anchored commit advances past revision 7, or immediately with the manual clear POST /groups/:id/quarantine/clear (CLI: `x0x groups quarantine clear <GROUP_ID>` …).",
   "fork_quarantine": {
     "revision": 7,
     "observed_at_ms": 1700000000123,
@@ -80,447 +123,519 @@ code out of the human field so the human field can explain itself:
 }
 ```
 
-- `reason` — the stable machine code. This is the field clients match.
-- `error` — prose, and NOT a matchable contract: its wording may change, and
-  it branches on `no_anchor` so the remedy it names is the one that can
-  actually succeed for that group (a `no_anchor` marker never auto-clears, and
-  its clear requires `--force` with a reason because there is no owner axis to
-  attest with — §4.3).
-- `fork_quarantine.clear_with` — the remedy, machine-readable, so a GUI or a
-  script can offer it without parsing the sentence.
+- `reason` — the stable machine code; **this is the field clients match**.
+- `error` — prose; branches on `no_anchor` so the remedy it names is the one
+  that can actually succeed for that group. Not a matchable contract.
+- `fork_quarantine.no_anchor: true` — ordinary group; nothing clears automatically.
+- `fork_quarantine.clear_with` — the remedy, machine-readable.
 
-**One-time compatibility break.** Before ADR-0066 §5 the body was
-`{"ok": false, "error": "fork_quarantined"}`. A client matching the literal
-`error == "fork_quarantined"` stops matching and must move to `reason`. HTTP
-409 and `ok: false` are unchanged. The `x0x` CLI prints the sentence, the
-remedy and the code (`… (HTTP 409, reason: fork_quarantined)`).
+| Row | Surface | File anchor |
+|-----|---------|-------------|
+| 1 | `POST /groups/:id/send` — outbound signed-public send | `named_groups.rs:13113`, gate `:13178` |
+| 2 | TreeKEM group encrypt | `named_groups.rs:22778`, gate `:22799` |
+| 3 | TreeKEM group decrypt | `named_groups.rs:22885`, gate `:22905` |
+| 4 | `POST /groups/:id/secure/encrypt` (GSS) | `named_groups.rs:22967`, gate `:22986` |
+| 5 | `POST /groups/:id/secure/decrypt` (GSS) | `named_groups.rs:23177`, gate `:23193` |
+| 6 | `POST /groups/:id/secure/reseal` (GSS) | `named_groups.rs:23337`, gate `:23356` |
+| 7 | TreeKEM group-store resolution | `stores.rs:1180`, gate `:1191` (409 "group is unavailable") |
+| 8 | TreeKEM group-store live info re-read | `stores.rs:796`, gate `:807` (`KvError::Unauthorized`) |
+| 9 | KV group-writer predicate | `stores.rs:2051`, gate `:2054` |
+| 10 | Signed-public KV authorization snapshot (bind-time) | `kv_context.rs:109`, gate `:122` |
+| 11 | TreeKEM KV authorization context construct | `kv_context.rs:360`, gate `:364` |
+| 12 | TreeKEM KV authorization context refresh | `kv_context.rs:370`, gate `:376` |
+| 14 | `DELETE /history?scope=group:<ID>` — purge | `history.rs:464` |
+| 15 | `POST /groups/:id/delegate` — grant delegation | `delegations.rs:540` |
+| 17 | Delegation authorization predicate (`authorize`) | `delegations.rs:349` |
+| 18 | Delegated send-as authorization | `delegations.rs:448` |
+| 19 | Committed-delegation registry rebuild / index | `delegations.rs:252`, `:304` |
+| 20 (mutations) | `POST /task-lists`, `POST /task-lists/:id/tasks`, `PATCH /task-lists/:id/tasks/:tid` | `tasks.rs:191` |
+| 21 | Signed-public bootstrap outbox publish (withheld — see §3.3) | `public_group_bootstrap_outbox.rs:394`, `:627` |
 
-The refusal means: this node has applied and retained authenticated
-fork evidence (a conflicting state-commit whose signature verifies and whose
-committer was an active admin in the retained predecessor roster — the same
-deduplicated gate ADR-0059 uses), and the node refuses to keep mutating
-group-keyed data until an owner-anchored path (§4) advances the chain past
-the evidenced revision. It is containment, not a verdict: ADR-0064
-deliberately has NO automated eviction, and the membership-event ingest path
-is NOT gated (the owner-anchored clearing commit must still be able to
-arrive). ADR-0066 §1 enumerates all 26 data-plane paths with a disposition
-each, and every one of them has now landed except the §4 lifecycle epoch token
-(row 22, slice 7) — so treat the tables in this section as the complete list of
-what refuses and what is annotated.
+Rows 1–12 were already gated before ADR-0066; they now refuse for ordinary groups
+too (ADR-0066 §2). Rows 14–21 are new refusals added by slices 3–5.
 
-**Delegations (ADR-0066 §3b, slice 3) are gated now.** Delegation is an
-authority transfer, and a quarantined group's roster is the thing under
-dispute, so minting new authority from it — or honouring authority derived
-from it — fails closed:
+**Every refusal is effective from the FIRST request after the marker installs.
+There is no warn-only window and no request budget (R5, no grace).**
 
-| Surface | Behaviour while quarantined |
-|---|---|
-| `POST /groups/:id/delegate` (row 15) | **409 `fork_quarantined`.** Nothing is minted: no envelope is signed, no carrier row reaches history, nothing is published to the group bus. |
-| `GET /groups/:id/delegations` (row 16) | **Still serves**, with `fork_quarantined: true` and a `fork_quarantine` object (same shape as the refusal's) added to the response. Reading who holds authority during a fork is exactly what an operator needs. |
-| Delegated task-execute (`POST /task-lists/:id/tasks/:tid` citing `delegation`, row 17) | **409 `fork_quarantined`** before the claim/complete mutation. Task mutations *not* citing a delegation refuse too, as row 20 (see below) — since slice 5 the row-20 gate runs first, so either way there is exactly one refusal. |
-| Send-as authorization (row 18) | Fails closed. A peer's gossiped send-as message for a quarantined group is dropped at ingest, as it already is for any unauthorized attribution. |
-| Delegation index / global id registry (row 19) | A contested group's grants are not indexed and do not seed the registry — including at daemon start, where `rebuild_global_delegation_registry` skips the group entirely. An unregistered grant cannot authorize. |
+Every new refusal uses `reject_fork_quarantined` / `reject_fork_quarantined_marker`
+(`named_groups.rs:20336` / `:20358`) — the single helper that owns the status, the
+body, and the one `fork_quarantine_refusals` increment. No route can refuse without
+explaining itself and none can double-count (§3e).
 
-Rows 17–19 have no HTTP response of their own on the gossip-ingest path, so
-there the refusal is recorded (one `fork_quarantine_refusals` increment, the
-same counter as the REST rows) and the §5 sentence is logged at WARN, rather
-than the message being dropped silently. Carrier history rows are still
-committed and retained — refusing to *honour* a delegation never blanks the
-forensic record.
+### 3.2 Annotated surfaces — pass-through with annotation
 
-Existing delegations stop being honoured for the group, so **a quarantine on a
-group that delegates work is an availability event for that work.** The exit is
-the same clear as everything else (§4/§5); after it, the next use re-derives
-the index from durable history and service resumes with no re-issuance.
+These surfaces continue to serve while the group is quarantined. Each response
+gains `"fork_quarantined": true` and a `"fork_quarantine"` object. Both keys are
+**absent entirely** (never `null`, never `false`) when the group is not quarantined,
+so unaffected groups are byte-identical.
 
-Group membership reads, `/groups/:id/state`, and the diagnostics surfaces
-keep working while quarantined.
+**Single-group annotation shape** (delegations, tasks, WS):
 
-### Task lists and bootstrap publication (§3c, slice 5)
+```json
+{
+  "fork_quarantined": true,
+  "fork_quarantine": {
+    "revision": 7,
+    "observed_at_ms": 1700000000123,
+    "no_anchor": false,
+    "clear_with": "POST /groups/:id/quarantine/clear"
+  }
+}
+```
 
-| Surface | Behaviour while quarantined |
-|---|---|
-| `POST /task-lists` with a group-scoped topic (row 20) | **409 `fork_quarantined`.** Refused before the CRDT is created, before the durable subscription registration is written and before a sync listener starts — nothing is left behind. |
-| `POST /task-lists/:id/tasks`, `PATCH /task-lists/:id/tasks/:tid` (row 20) | **409 `fork_quarantined`** before any CRDT mutation, any `task-lists/<id>.bin` snapshot write and any delta publish. First attempt, no grace. |
-| `GET /task-lists`, `GET /task-lists/:id/tasks` (row 20) | **Still serve**, with `fork_quarantined: true` and a `fork_quarantine` object added (the collection annotates the affected entries). |
-| Signed-public bootstrap publication (row 21) | **Withheld.** The outbox worker declines to send a contested group's snapshot — this is the one path that *exports* contested state to another node, and the snapshot a recipient installs is a whole roster/state frontier. |
+**Multi-scope annotation shape** (history endpoints, WS backfill): the
+`fork_quarantine` object carries `clear_with` and a `scopes` array (each entry:
+`scope`, `revision`, `observed_at_ms`, `no_anchor`), because these surfaces can
+span multiple quarantined groups in one response.
 
-**Row 21 is a suppression, not a deletion — nothing is lost.** The bootstrap
-debt stays in the outbox with its retry schedule untouched, and reconciliation
-retains it rather than refreshing it from the contested frontier, so
-**delivery resumes by itself on the first worker pass after the manual clear
-(the poll interval, ~0.5 s — there is no backoff to wait out, because the
-withheld obligation's schedule was never advanced)**, with no operator action
-beyond the clear. That matters because dropping the obligation would leave a
-member on the roster that nobody remembers to bootstrap, permanently, since a
-`no_anchor` marker never auto-clears.
+| Row | Surface | Shape |
+|-----|---------|-------|
+| 13 | `GET /history`, `/history/message/:msg_id`, `/history/search`, `/history/scopes`, `/history/stats`, `GET /groups/:id/messages` | multi-scope |
+| 16 | `GET /groups/:id/delegations` | single-group |
+| 20 (reads) | `GET /task-lists`, `GET /task-lists/:id/tasks` | single-group |
+| 25 | WebSocket `mention` frames and ADR-0023 `Subscribe` backfill frames | multi-scope (one-entry `scopes` array) |
+| 26 | `GET /diagnostics/history` | multi-scope |
 
-**One quarantined group does not delay any other group's bootstrap.**
-Quarantined groups are excluded when the worker chooses which obligation to
-send, not merely refused after it has chosen: a pass sends at most one
-obligation and picks the oldest due one, so gating after the choice would make
-a contested group the permanent head of the line and stall the whole outbox for
-as long as the marker stood. If you are triaging "no group is receiving its
-bootstrap", a single quarantined group is **not** the explanation.
+### 3.3 Special surfaces
 
-Both the periodic worker and the REST nudge a member-add fires go through the
-same gate, so there is no path by which a background job publishes a contested
-group's snapshot. A withheld publication has no HTTP response to carry the §5
-message, so it logs the sentence at WARN and records one
-`fork_quarantine_refusals` increment — **deduplicated per (group, marker
-revision, observation time)**, deliberately: this is a polling worker, and one
-record per poll would turn the counter operators alert on into a measure of
-uptime. A new evidence revision, or the same revision observed again after a
-clear, logs and counts again. So in triage, read row 21's contribution to
-`fork_quarantine_refusals` as "this group's publication is being withheld", not
-as a rate.
+**Row 13 — History reads: annotated, and `fork_quarantined_at_ingest` tag.**
+History reads (row 13) are **never** refused: containment must not blind the
+operator to the forensic record. Rows of a quarantined group whose `seen_at_ms`
+is at or after `observed_at_ms` carry `"fork_quarantined_at_ingest": true`. This
+tag is **derived from the live marker and is NOT persisted** (no schema bump); a
+manual clear keeps every row but drops the label. **Read the history you need
+BEFORE clearing.** Ingest of new group-scoped rows is tag-and-retain, never
+refused (ADR-0066 R3).
 
-If you see `signed-public bootstrap publication withheld` in the log for a
-group whose members are complaining they never received the group state, the
-answer is §4/§5 (clear the marker) — not restarting the daemon, which loses
-only the dedupe memory and changes nothing about the suppression.
-### A marker that lands mid-operation aborts that operation (§4, slice 7)
+**Row 14 — History purge: REFUSED.** `DELETE /history?scope=group:<ID>` is
+refused while quarantined — before anything is deleted, so the store is
+untouched. Purge is the irreversible destruction of the forensic record. Clear
+first if you genuinely need to purge.
 
-Every refusal above is decided when an operation STARTS. A marker can arrive —
-or be cleared, or advance to a new evidence revision — while an operation is
-already in flight, and two paths persist a whole group record captured before
-that happened. Left alone they would not merely act on a stale authorization,
-they would **erase the marker**, ending containment silently. Both now
-re-derive the group's lifecycle epoch token inside the same critical section
-that performs the write and abort on a mismatch, before anything irreversible:
+**Row 19 — Delegation index and registry.** The global delegation-id registry
+(`rebuild_global_delegation_registry`, `delegations.rs:252`) and per-group index
+(`index_committed`, `:304`) skip quarantined groups: a contested group's grants
+are not indexed and do not seed the registry. After a clear, the index re-derives
+from durable history automatically; no re-issuance is needed. Non-REST delegation
+paths (gossip ingest, boot rebuild) have no HTTP response; they record the same
+single `fork_quarantine_refusals` increment and log the §5 sentence at WARN
+(WARN dedupe keyed by `(group_id, revision)`, bounded 1024 —
+`delegations.rs:306`). Carrier history rows are still retained (R3).
+
+**Row 20 — Tasks: mutations refused, reads annotated.** Task-list mutations are
+refused from the first request; reads annotate. An inbound peer CRDT delta still
+applies ungated (see §6c).
+
+**Row 21 — Bootstrap outbox: WITHHELD, not dropped.** The outbox worker declines
+to send a contested group's snapshot. This is a suppression, not a deletion: the
+obligation and its retry schedule are left untouched. Delivery resumes by itself
+on the first worker pass after the manual clear — the poll interval (~0.5 s), with
+no backoff to wait out. A `no_anchor` marker never auto-clears, so dropping the
+debt would permanently strand a member on the roster. **One quarantined group does
+not delay any other group's bootstrap:** quarantined groups are excluded when the
+candidate is CHOSEN (not refused after the choice), so the outbox never stalls.
+The withheld publication has no HTTP response; it logs the §5 sentence at WARN
+and records one `fork_quarantine_refusals` increment, **deduplicated per
+`(group_id, revision, observed_at_ms)`, bounded 1024** —
+`public_group_bootstrap_outbox.rs:613`. A new evidence revision or a clear
+followed by a re-quarantine logs and counts again.
+
+**Row 22 — Lifecycle epoch token (ADR-0067, slice 7).** Every persist-path
+operation captures the lifecycle epoch token `(state_revision, marker_identity)`
+at its authorization check and re-validates it inside the same
+`state.named_groups` write critical section that performs the mutation. A mismatch
+aborts before anything irreversible, leaving state byte-identical:
 
 | Path | What you see | What it means |
-|---|---|---|
-| invite join | 409 `fork_quarantined` naming "changed while this join was being installed" | evidence landed during the join's two fsyncs; the seating was refused rather than written over the marker. **Retry it** — the retry re-reads the group and either seats cleanly or refuses with the ordinary §1 gate |
-| TreeKEM roster+snapshot persist | log line `ADR-0066 §4: refusing TreeKEM atomic persist` and a failed operation | same window, same outcome. Nothing was written: no journal, no snapshot, no `named_groups.json` |
+|------|-------------|---------------|
+| Invite join | 409 `fork_quarantined` "changed while this join was being installed" | Evidence landed during the join's two fsyncs; seating refused. **Retry** — succeeds on the first retry unless a marker is still present. |
+| TreeKEM roster+snapshot persist | log line `ADR-0066 §4: refusing TreeKEM atomic persist` | Same window. Nothing written: no journal, no snapshot, no `named_groups.json`. |
+| Home seal / reseal | 409 `fork_quarantined` | Marker installed during the seal; refuses rather than erasing the marker. Retried on the next provisioning pass. |
 
-**These are retryable and are not a lockout.** The refusal returns once and
-parks nothing: no queue head is frozen, nothing spins, and no request budget
-is consumed. A refusal caused by a *clear* landing mid-operation succeeds on
-the very next attempt. Repeated refusals on retry mean evidence is still
-arriving — triage the fork (§2), do not loop the client.
+A mismatch aborts even when the marker was **cleared** mid-operation (a cleared
+marker is stale authorization, not a retry hazard — the retry sees the cleared
+state and succeeds immediately). These refusals are retryable and are not a
+lockout; nothing parks.
 
-A left-behind join install marker after such a refusal is expected and
-self-healing: it excludes a group the roster does not contain, and is cleared
-after the next durable roster save.
+**Row 24 — Inbound metadata / state-commit apply: deliberately ungated.** The
+clearing commit must still be able to arrive. Gating this would make some
+quarantines unclearable.
 
-**Encrypted (GSS) stores fail closed too, and recover.** A marker suspends the
-cached GSS authorization context on its next refresh — the shared secret is
-dropped and the roster emptied, so sealing, opening and membership all fail
-closed, and encrypted-store routes answer 409 `fork_quarantined`. Unlike a
-withdrawal this is **recoverable**: the next refresh after a clear (§4/§5)
-re-arms the context from live state. An encrypted store that stays dead after
-a clear is a bug, not the design — capture `/diagnostics` and report it.
+**Row 25 — WebSocket: annotated, never cut.** A WS subscriber watching a
+quarantined group keeps receiving everything. `mention` frames (validated group
+messages, delegation grants) on the group topic channel, and ADR-0023 `Subscribe`
+backfill frames, carry the annotation. **Live raw-topic `Publish` frames are NOT
+annotated by design** (row 25 covers only mention and backfill; a raw-topic
+publish is not a group-scoped send and is covered by row 1 only when routed
+through `POST /groups/:id/send`). The marker is read when each frame is emitted,
+not when the subscription opens; a session that subscribed before the marker was
+installed starts seeing the label on its next frame and stops on the frame after a
+clear — no reconnect needed.
 
-### The WS plane is annotated, never cut (§3d, slice 6)
+**Home seals / invite-join / TreeKEM persist / KV persists: re-checked under the
+persist lock (ADR-0067 slice 7).** The lifecycle epoch token closes the bind-time
+gap in rows 10–12: `kv_context.rs` snapshots authorization at `from_group`
+(`:109`, `:360`) and only refreshes via `update_from_group` (`:370`), driven by
+roster change. ADR-0066 §2 makes a marker install a refresh trigger, and the
+epoch token closes the remaining window from both ends.
 
-A WebSocket subscriber watching a quarantined group keeps receiving
-everything it received before — the stream is deliberately NOT refused,
-because an operator watching a live incident must not lose the feed at the
-moment it matters. Two frame classes carry a label instead:
+**Encrypted (GSS) stores fail closed, and recover.** A GSS marker suspension
+drops the shared secret and empties the roster, so sealing, opening and
+membership all fail closed. Unlike a withdrawal, this is recoverable: the next
+refresh after a clear re-arms the context from live state.
 
-- ADR-0040 `mention` frames (a validated group message or a delegation grant
-  naming the local agent) on the group's topic channel;
-- ADR-0023 `Subscribe` backfill frames replayed for a group topic, including
-  the `live` boundary frame that closes the backfill.
+---
 
-Each carries `"fork_quarantined": true` plus a `fork_quarantine` object with
-`clear_with` and a one-entry `scopes` array (`scope`, `revision`,
-`observed_at_ms`, `no_anchor`) — the same shape the REST envelopes use, so
-one parser serves both. Both keys are **absent entirely** when the group is
-not quarantined, so unaffected groups and all non-group topics are
-byte-identical to before.
+## 4. Diagnose → decide → clear
 
-A label on a `delegation` mention says what was OBSERVED, not what was
-authorized: the grant itself is refused independently (§3b).
-
-The marker is resolved when each frame is emitted, so a session that
-subscribed before the marker was installed starts seeing the label on its
-next frame, and stops on the next frame after the manual clear — no
-reconnect needed either way.
-
-## 2) Reading the marker
+### 4.1 Reading the marker
 
 ```bash
-x0x group info <GROUP_ID>            # or: curl -H "Authorization: Bearer $TOKEN" $API/groups/<GROUP_ID>
+x0x group info <GROUP_ID>
+# or:
+curl -H "Authorization: Bearer $TOKEN" $API/groups/<GROUP_ID>
 ```
 
 The group record carries `fork_quarantine` (null when not quarantined):
 
-- `revision`, `state_hash` — the CONFLICTING commit the node evidenced
-  (not your own head; your head is in the snapshot below);
+- `revision`, `state_hash` — the CONFLICTING commit this node evidenced (not your
+  own head);
 - `committed_by` — hex agent id of the admin that committed the fork;
 - `observed_at_ms` — local observation time (unix ms);
-- `snapshot` — the forensic snapshot: both conflicting commit HEADERS
-  (`terminal_commit` = this node's own head at evidence time,
-  `conflicting_commit` = the fork), with `snapshot.classification`
-  (slice 4):
-  - `"owner_anchored_conflict"` — the conflicting commit carries an
-    OwnerMandate that anchors its exact header: the OWNER anchored a
-    successor this node cannot apply (it holds the disowned sibling).
-    Strongest signal that YOUR chain is the disowned one — contact the
-    owner; do not force-clear repeatedly and keep operating the losing
-    chain;
-  - `"signer_only"` — the signer was an active admin at the claimed
-    parent, but no owner anchor is reachable. The classic #468 shape
-    (a removed or rogue admin serving a self-consistent fork);
-  - `"unauthorized_signer"` — the signer held a seat somewhere in retained
-    history but was NOT an active admin at the claimed parent (an admin
-    removed by the very commit the fork chains from, or a plain member);
-  - `null`/absent — pre-slice-4 record shape (the claimed parent was not
-    retained, so only the legacy revision−1 signer check ran).
-- `no_anchor` — `true` when the group's policy has NO owner axis, i.e. there
-  is no anchor any commit could carry: nothing clears the marker
-  automatically and the manual clear (§4.3, force path) is the only exit
-  (§5). `false` on owner-axis groups, and on every marker persisted before
-  ADR-0066 (the field is `#[serde(default)]`, so an old record decodes as
-  the owner-axis marker it was).
+- `no_anchor` — `true` when the group has no owner axis; the manual
+  force-clear is the only exit (§4.3);
+- `snapshot` — forensic snapshot of both competing commit headers, with
+  `snapshot.classification`:
+  - `"owner_anchored_conflict"` — the conflicting commit carries an OwnerMandate
+    anchoring its exact header. Strongest signal that YOUR chain is the disowned
+    one. Contact the owner; do not force-clear repeatedly while the live
+    divergence persists.
+  - `"signer_only"` — the signer was an active admin at the claimed parent, but
+    no owner anchor is reachable (the classic #468 shape).
+  - `"unauthorized_signer"` — the signer held a seat in retained history but was
+    NOT an active admin at the claimed parent.
+  - `null`/absent — pre-slice-4 record shape.
 
 No shared secrets or TreeKEM material appear in the snapshot — it is
 header-only by construction.
 
-## 3) Diagnostics
+### 4.2 Diagnostics counters
 
 ```bash
 x0x diagnostics groups
+# or:
+curl -H "Authorization: Bearer $TOKEN" $API/diagnostics/groups
 ```
 
-Per group (`GET /diagnostics/groups`):
+Key counters per group (`GET /diagnostics/groups`):
 
-- `fork_quarantine_set` / `fork_quarantine_refusals` — durable marker
-  installs and gated-route refusals;
-- `fork_evidence_signer_only` / `fork_evidence_unauthorized_signer` —
-  classified conflict observations;
-- `fork_quarantine_owner_anchored_refusals` — owner-anchored conflicting
-  commits that were refused (the §4 strictly-greater/ancestry fence);
-  a non-zero value with a persistent marker usually means the contested
-  branch is publishing owner-anchored successors you cannot apply;
-- `fork_quarantine_owner_anchored_clears` / `fork_quarantine_manual_clears`
-  — apply-path anchored clears and manual endpoint clears;
-- `owner_mandate_minted` / `owner_mandate_valid` / `owner_mandate_invalid`
-  / `owner_mandate_absent` / `owner_mandate_missing` — mandate traffic
-  (see §7);
-- `mandate_capability_refusing_transitions` — one-shot Capable→Refusing
-  transitions per authority agent;
-- `mandate_capability: [{agent_id, state, first_seen_ms, refusals}]` —
-  per-authority-agent rows for agents whose capability has been OBSERVED:
-  `state` is the derived phase `"capable"` or `"refusing"` under the
-  configured grace window; `first_seen_ms` is the grace-clock anchor;
-  `refusals` is that agent's refused-event count. An agent with NO row is
-  `unknown` (never observed capability) — the absent entry IS that state.
+- `fork_quarantine_set` — durable marker installs (process-lifetime).
+- `fork_quarantine_refusals` — gated-route refusals (process-lifetime); becomes
+  a fleet-health signal after upgrade. Set alerting thresholds before rolling
+  out.
+- `fork_evidence_signer_only` / `fork_evidence_unauthorized_signer` — classified
+  conflict observations.
+- `fork_quarantine_owner_anchored_refusals` — owner-anchored conflicting commits
+  refused at the strictly-greater fence; non-zero with a persistent marker
+  usually means the contested branch is publishing owner-anchored successors this
+  node cannot apply — do not force-clear while this is rising.
+- `fork_quarantine_owner_anchored_clears` / `fork_quarantine_manual_clears` —
+  apply-path anchored clears and manual endpoint clears.
 
-The marker is derived for reads from the same persisted group record that
-survives restarts; counters are process-lifetime.
+History surfaces for the marker: `GET /history/stats` and
+`GET /diagnostics/history` annotate quarantined groups and list both spellings
+of the group id (roster map key and stable id), so you can match the scope your
+history rows carry as well as the id the clear route accepts.
 
-## 4) Clearing the marker — owner-anchored paths only
+**WARN dedupe semantics.** Background workers that cannot return an HTTP response
+record a `fork_quarantine_refusals` increment and log the §5 sentence at WARN,
+deduplicated:
+- Bootstrap outbox (row 21): keyed by `(group_id, revision, observed_at_ms)`,
+  bounded 1024 (`public_group_bootstrap_outbox.rs:613`).
+- Delegation index / registry (row 19): keyed by `(group_id, revision)`, bounded
+  1024 (`delegations.rs:306`).
 
-**A `no_anchor` marker (ordinary group) has NO automatic path at all.** Skip
-to §4.3 — none of the anchored arms below can clear it; each one tests
-`no_anchor` and declines, by design (ADR-0066 §2). Note that the *retry
-rollback* of a non-durable install is not a clear and is deliberately not
-gated, so a transient persist failure never leaves a marker stranded.
+Read row 21's `fork_quarantine_refusals` contribution as "this group's publication
+is being withheld", not as a rate. A new evidence revision, or the same revision
+re-observed after a clear, logs and counts again.
 
-For an owner-axis marker, it clears ONLY through an owner-anchored path, and
-every automatic path additionally requires the clearing commit to be one this node APPLIES
-at a revision STRICTLY GREATER than the evidenced revision (ADR-0064 §3 as
-clarified in the 2026-09-11 errata). The contested branch's own commits —
-same-revision siblings, lower revisions, however well-formed — NEVER clear;
-a conflicting owner-anchored successor does not clear either (it would
-un-gate a node still holding the disowned sibling and re-quarantine on the
-next canonical commit). The clears are:
+### 4.3 Clearing the marker
 
-1. **An owner-anchored commit this node applies at strictly greater
-   revision.** Concretely:
-   - tier-1 attestation-verified adoption of a `MemberAdded` anchored by
-     the owner-signed head attestation (the joiner recovery path), or
-   - a mandate-carrying `MemberAdded` whose `OwnerMandate` verifies
-     (gapless or walked adoption) — the apply-path anchored clear.
-   No operator action needed: keep the node online and reachable by the
-   authority; the clear rides the normal apply.
-2. **The explicit seal route on an owner-key node** —
-   `POST /groups/:id/state/seal` (`x0x group state-seal <GROUP_ID>`) —
-   BOTH arms (the all-clean seal and the seal that evicts failing
-   members), requiring: the local install holds the group's owner USER
-   key (the `owner_key_unavailable` fence — an agent-key seal carrying
-   only an ADR-0038 certificate verdict is NOT an owner anchor), AND the
-   sealed revision is strictly greater than the evidenced revision. The
-   ~22 routine mutation sites (rename, policy, add/ban/promote, …) that
-   share the sealing wrapper NEVER clear.
-3. **The manual clear endpoint** (the operator escape hatch, #472
-   decision 1) —
-   `POST /groups/:id/quarantine/clear`:
+**A `no_anchor` marker (ordinary group) has NO automatic path at all.** Use the
+force path (4.3c) — none of the anchored arms below can clear it. Each one tests
+`no_anchor` and declines by design (ADR-0066 §2). The retry rollback of a
+non-durable install is not a clear and is deliberately not gated.
 
-   ```bash
-   # On a node holding the group's owner USER key (no flags needed —
-   # the endpoint mints and verifies a fresh quarantine-clear attestation
-   # over the current head under x0x.quarantine-clear-attest.v1):
-   x0x groups quarantine clear <GROUP_ID>
+For owner-axis groups, the automatic paths additionally require the clearing
+commit to be applied at a revision **strictly greater** than the evidenced
+revision.
 
-   # On any node, as the documented operator override:
-   x0x groups quarantine clear <GROUP_ID> --force --reason "<what you verified and why>"
-   ```
+#### 4.3a Apply-path anchored clears (owner-axis only)
 
-   The owner-key path is owner-controlled; the force path is the operator
-   escape hatch — the `reason` is logged (info, capped at 256 chars) and
-   counted (`fork_quarantine_manual_clears`), and SHOULD name this runbook
-   plus what was verified. Typed 409s otherwise: `owner_key_unavailable`
-   (keyless node, no force), `force_required` (no owner axis / missing
-   reason), and a plain 409 when no marker is set. Remote-owner
-   attestation submission is out of scope.
+Keep the node online and reachable by the authority. The clear rides the normal
+apply — no operator action needed:
+- Tier-1 attestation-verified adoption of a `MemberAdded` anchored by the
+  owner-signed head attestation (the joiner recovery path).
+- A mandate-carrying `MemberAdded` whose `OwnerMandate` verifies (gapless or
+  walked adoption).
 
-EVERY clear re-arms the stored fork-evidence silence gate: after a clear,
-the next authenticated conflict re-evaluates, re-installs evidence, and
-re-quarantines. Containment is not one-shot-per-group — force-clearing
+#### 4.3b Explicit seal (owner-axis, owner-key node only)
+
+```bash
+x0x group state-seal <GROUP_ID>
+# or:
+curl -X POST -H "Authorization: Bearer $TOKEN" $API/groups/<GROUP_ID>/state/seal
+```
+
+Requires: the local install holds the group's owner USER key (an agent-key seal
+carrying only an ADR-0038 certificate verdict is NOT an owner anchor), AND the
+sealed revision is strictly greater than the evidenced revision. The ~22 routine
+mutation sites that share the sealing wrapper (rename, policy, add/ban/promote, …)
+NEVER clear.
+
+#### 4.3c Manual clear — the operator escape hatch
+
+```bash
+# On a node holding the group's owner USER key (no flags needed):
+x0x groups quarantine clear <GROUP_ID>
+
+# On any node — the documented operator override:
+x0x groups quarantine clear <GROUP_ID> --force --reason "<what you verified and why>"
+```
+
+REST: `POST /groups/:id/quarantine/clear`
+
+The `reason` is logged (info, capped at 256 chars) and counted
+(`fork_quarantine_manual_clears`). **Include this runbook and what you verified.**
+
+Typed 409 responses from the endpoint:
+- `owner_key_unavailable` — keyless node, no `force`.
+- `force_required` — no owner axis or missing reason. This is correct, not a
+  bug: there is nothing to mint an attestation with.
+- Plain 409 — no marker is set.
+
+**EVERY clear re-arms the evidence gate.** After a clear, the next authenticated
+conflict re-evaluates, re-installs evidence, and re-quarantines. Force-clearing
 without resolving the underlying divergence will re-quarantine on the next
 conflicting commit.
 
-**Before force-clearing, establish which chain is canonical.** Compare the
-snapshot's two commit headers with the owner's view (the owner-key node's
-`GET /groups/:id/state`), check `snapshot.classification`, and prefer the
-automatic paths: they exist so the marker cannot be cleared while the
-divergence is live. Force-clear is for: the evidenced fork is understood
-and abandoned, the owner is permanently unavailable, or containment is
-blocking an agreed recovery the automatic paths cannot express.
+**Before force-clearing:** establish which chain is canonical out of band with the
+group's admins (compare `GET /groups/:id/state` heads across members), check
+`snapshot.classification`, have an active admin of the AGREED chain advance it
+(revision strictly greater), re-seat members still holding the disowned sibling,
+then force-clear — naming this runbook and what you verified in `--reason`.
 
-## 5) Ordinary (non-owner-axis) groups — `no_anchor: true`, manual clear only
+### 4.4 Alias-key caveat — clear by roster key, not stable id
 
-**Changed by ADR-0066 §2 (supersedes #472 decision 2 of 2026-09-10).**
-Ordinary groups ARE now contained. An ordinary group has no owner key by
-construction, so there is no anchor to wait for: the marker it receives
-carries `no_anchor: true`, and **only a human clears it**.
+`clear_group_quarantine` (`named_groups.rs:12830`) uses a bare
+`groups.get(&id)` — the MAP KEY only. A group learned under an alias (the key
+this daemon stored it under) must be cleared by that alias key; clearing by the
+stable id returns 404.
 
-- **Trigger:** unchanged in how evidence is authenticated. Only a
-  conflicting commit whose signature verifies AND whose committer was an
-  active admin in the retained predecessor roster installs a marker. An
-  unauthenticated or forged conflict still records nothing (this is the
-  security boundary: a marker that any stranger could install would be a
-  remote denial of service with no automatic recovery). What DID widen is
-  which groups reach the evidence path — ADR-0066 R2 covers ordinary groups
-  formed without an invite too, so "ordinary group" is one population.
-- **Refusals:** the same rows as owner-axis groups — `POST /groups/:id/send`,
-  TreeKEM encrypt/decrypt, and the `secure/encrypt|decrypt|reseal` family —
-  effective on the FIRST request after the marker installs. No warn-only
-  window, no request budget (R5).
-- **No automatic clear, ever.** No commit, of any revision, on any ancestry
-  clears a `no_anchor` marker. All three owner-anchored clear arms test the
-  flag and decline.
-- **Said plainly: a CURRENT admin's own signed conflicting commit permanently
-  quarantines the group on every node that receives it, until a human runs the
-  manual `--force --reason` clear on each of those nodes.** The trigger asks
-  only that the committer was an Active Admin in the retained predecessor
-  roster — not whether that admin was malicious, confused, or merely
-  partitioned. An admin committing from a stale head (a laptop that was
-  offline; two admins sealing concurrently) therefore contains the group for
-  everyone who receives that commit, with no automatic recovery, and — because
-  the marker is per-node and never gossiped — no fleet-wide clear either: the
-  remedy is per-node too. This is accepted design, not an oversight: R1
-  rejected a founder-key anchor (a compromised founder key would be an
-  unreviewable eviction oracle) and R5 rejected every grace window, on the
-  condition that the refusal explains itself. Plan for it — an ordinary group
-  with several admins committing concurrently is the population most likely to
-  need this procedure.
-- **A recovery-time conflict on a lineage-less ordinary group records
-  nothing.** The journal-recovery evidence path
-  (`record_recovery_fork_evidence`) stays fenced to groups carrying an
-  `invite_lineage` record, because that record is where recovery-time evidence
-  is stored; ADR-0066 slice 2 widened the LIVE apply path only. So a conflict
-  discovered while replaying the persist journal for an ordinary group formed
-  without an invite installs no marker and fires no counter — the group is
-  contained on the next authenticated conflicting commit that arrives through
-  the live path instead. Treat a restart that logged a journal conflict on such
-  a group as NOT yet quarantined.
-- **The exit** is the manual clear with the operator override, because there
-  is no owner axis to attest with:
+**How to find the roster key:** the refusal body's `group_id` field names it; so
+do `GET /history/stats` and `GET /diagnostics/history`, which list both spellings
+when they differ. Use `x0x groups quarantine clear <roster_key>`.
 
-  ```bash
-  x0x groups quarantine clear <GROUP_ID> --force --reason "<what you verified and why>"
-  ```
+This is a known limitation, filed as a follow-up (see §6d). The manual clear for
+the force path has no owner axis to verify with regardless, so the 404 is the
+full error — not a silent success.
 
-  Without `--force` the endpoint answers 409 `force_required` — that is
-  correct, not a bug: there is nothing to mint an attestation with.
+---
 
-**What an operator should do before clearing.** Establish the canonical
-chain out of band with the group's admins (compare `GET /groups/:id/state`
-heads across members), have an active admin of the AGREED chain advance it
-(revision strictly greater), re-seat members still holding the disowned
-sibling (fresh invite/re-add), and only then force-clear — naming this
-runbook and what you verified in `--reason`, which is logged and counted.
-Clearing while the divergence is still live re-quarantines on the next
-authenticated conflicting commit (every clear re-arms the evidence gate).
+## 5. Upgrade notes
 
-**The accepted cost (ADR-0066 Consequences).** A benign network split that
-produces authenticated conflicting commits now strands an ordinary group
-until an operator intervenes. This was chosen over a founder-key anchor (R1:
-a compromised founder key would become an unreviewable eviction oracle) and
-over a quorum anchor (a two-member group's quorum is the attacker). The
-mitigation is the §1 refusal message, which names the condition, the cause
-and this exact remedy — not a delay.
+- **No retroactive quarantine at startup.** A startup scan does not run. The
+  marker is installed only when authenticated conflicting evidence arrives through
+  the live apply path. A group that was already silently forked is not quarantined
+  until the next authenticated conflicting commit arrives after the upgrade.
+- **Expect `fork_quarantine_set` to rise on the upgrade wave.** Groups that were
+  already silently forked begin refusing from the FIRST authenticated conflicting
+  commit after the upgrade — immediately, with no grace period (R5). Set alerting
+  thresholds on `fork_quarantine_set` and `fork_quarantine_refusals` BEFORE
+  rolling out.
+- **One-time compatibility break for literal `error` matchers.** The 409 body
+  previously was `{"ok": false, "error": "fork_quarantined"}`. The stable machine
+  code moved to `reason`. A client matching the literal `error == "fork_quarantined"`
+  must move to `body["reason"] == "fork_quarantined"`. HTTP 409 and `ok: false` are
+  unchanged.
+- **CLI error output now appends `reason:`.** The `x0x` CLI renders
+  `<message> (HTTP <code>, reason: <reason>)` for all `api_error_with_reason`
+  responses — today that means the `fork_quarantined` refusal and the pre-existing
+  409 `recipient_not_active`. Scripts matching CLI error output positionally
+  should match on the `reason:` key.
 
-## 6) Mixed-fleet notes
+### 5.1 Mixed-fleet notes
 
-- `fork_quarantine` and `mandate_capability` are serde-default JSON
-  fields: v0.41.4 binaries ignore them — no wire break, no brick.
-- **A downgrade loses containment, it never bricks.** An old binary that
-  rewrites `named_groups.json` drops fields it does not know.
+- `fork_quarantine` and `mandate_capability` are `#[serde(default)]` JSON
+  fields: older binaries ignore them — no wire break, no brick.
+- **A downgrade loses containment, it never bricks.** An old binary that rewrites
+  `named_groups.json` drops fields it does not know.
 - For owner-axis groups the AUTHORITATIVE persisted record is the
-  `home-suite-groups.json` sidecar (`named_groups.json` holds a legacy
-  placeholder also carrying the fields; the load path merges
-  sidecar-wins). Pinned by test: rewriting `named_groups.json` without
-  the fields loses nothing — the marker and grace clocks survive from
-  the sidecar.
-- Residual caveat: an OLD SIDECAR-AWARE binary that rewrites the SIDECAR
-  itself drops both fields from the authoritative record — a downgrade
-  across a sidecar-aware version loses containment (accepted; matches the
-  ADR migration table's "never bricks").
-- Upgrade order for the mandate machinery: authorities/owners first
-  (mandate production), then members (enforcement), then the grace window
-  closes.
+  `home-suite-groups.json` sidecar (`named_groups.json` holds a legacy placeholder
+  also carrying the fields; the load path merges sidecar-wins). Pinned by test:
+  rewriting `named_groups.json` without the fields loses nothing — the marker and
+  grace clocks survive from the sidecar.
+- Residual caveat: an old sidecar-aware binary that rewrites the sidecar itself
+  drops both fields from the authoritative record — a downgrade across a
+  sidecar-aware version loses containment (accepted; matches the ADR migration
+  table's "never bricks").
 
-## 7) Mandate grace and the `owner_mandate_missing` refusal
+---
 
-On owner-axis groups, an absent-mandate `MemberAdded` from an authority
-agent whose capability has been observed and whose grace window has
-elapsed is refused with the typed, RETRYABLE `owner_mandate_missing`
-(nothing is queued as a revision gap; the sender-side bounded resend or a
-mandate-carrying re-issue is the redelivery path — retry the operation,
-do not rejoin). Semantics:
+## 6. Known gaps and follow-ups
 
-- capability is recorded per AUTHORITY AGENT the first time that agent
-  produces a valid mandate or an owner-countersigned InviteV4
-  (`first_seen_ms`);
-- `unknown` agents (never observed capability — the keyless tier,
-  #472 decision 7) warn-accept indefinitely; A's capability never
-  implicates B;
-- the grace window defaults to **60 days** (one release cycle) and is
-  configured per daemon as `[groups] mandate_grace_days` (validated ≥ 1
-  at startup; the daemon refuses to start on 0);
-- a later valid mandate from the same agent restores `capable` but
-  RETAINS the original clock — a compromised authority cannot reset its
-  own window;
-- the clock is the node's LOCAL wall clock: a backwards clock jump flips
-  a refusing authority back to warn-accept until the clock recovers
-  (accepted; both skew directions fail toward the ADR-0016 checks).
+These are open items that ship visible, not closed silently. Each is asserted or
+noted at the file:line cited.
 
-If a legitimate admin's events start refusing: upgrade that admin's
-install (mandate production needs the owner user key on the authority),
-or have the owner/keyed authority perform the seating. Do NOT delete the
-capability map to "fix" refusals — the map is observational state; the
-durable fix is a mandate-producing authority.
+**(a) Send-path §4 re-check deferred — rows 1, 2, 4, 6.**
+ADR-0066 §1 Decision column asks for a §4 re-check before the effect on
+`POST /groups/:id/send` (row 1), TreeKEM encrypt (row 2), GSS encrypt (row 4) and
+GSS reseal (row 6). These paths perform no roster mutation and take no persistence
+lock, so ADR-0066's "inside the same critical section as the mutation" does not
+define a site for them. David deferred them to a later slice on 2026-09-20
+(ADR-0067, "Deferral"). They are gated at entry and therefore `closed: true` in
+the fixture, but carry `recheck_before_effect: RecheckState::Pending`; they appear
+exactly in `PENDING_RECHECK == &[1, 2, 4, 6]`.
+Source: `src/server/routes/named_groups/tests/adr0066_coverage_map.rs:796`.
 
-## 8) Quick triage
+**(b) History reaper ignores quarantine.**
+`src/history/reaper.rs` (47 lines, zero quarantine mentions) runs age/byte
+eviction against every group unconditionally. Age or byte pressure can destroy a
+quarantined group's history rows, and a flooder who sends the node a stream of new
+history events for the group can drive that pressure. Nothing blocks ingest
+(`R3: tag-and-retain, never refused`). **Operational mitigation during an
+incident: raise `[history] max_age_days` and `[history] max_bytes` retention
+bounds before beginning triage**, so the forensic record is not evicted while you
+are reading it.
+
+**(c) Inbound peer task-CRDT deltas apply ungated.**
+Row 20 gates the LOCAL REST mutations. Inbound task-CRDT deltas from peers still
+apply at `TaskList::is_authorized_content_writer`
+(`src/crdt/task_list.rs:214`), which tests the `authorized_agents` set that
+`apply_group_authorization` (`src/server/routes/tasks.rs:213`) derived from the
+group's active members — the contested roster itself. So while a quarantined
+group's own agent is refused locally, a peer's claim signed by a member of the
+disputed roster still merges and can move the deterministic winner. ADR-0066 §1
+enumerates no task-ingest row (it is not row 20, and row 24's "keep ungated" is
+about metadata/state-commit apply). Closing it needs a superseding decision about
+whether it is refuse-class or, like history ingest under R3, tag-and-retain.
+
+**(d) `clear_group_quarantine` single-spelling: alias vs stable id.**
+`clear_group_quarantine` (`named_groups.rs:12830`) resolves the MAP KEY only via
+a bare `groups.get(&id)`. A group stored under an alias must be cleared by that
+alias key; clearing by stable id returns 404. The refusal messages name the roster
+key, and `/history/stats` and `/diagnostics/history` list both spellings when they
+differ. This is a known limitation; a follow-up should route the clear through
+`resolve_group_entry_locked` (`src/server/mod.rs:2474`) the same way slices 3–5
+do for their marker lookups.
+
+**(e) Three marker resolvers still local — pending unification.**
+The shared `resolve_group_entry_locked` (`src/server/mod.rs:2474`) is used by
+delegations and stores. Two local resolvers remain: `history::resolve_group_entry`
+(`src/server/routes/history.rs:161` annotation function) and
+`ws::fork_quarantine_annotation` (`src/server/ws.rs:300`). Unification is
+deliberately deferred from slice 7 to avoid mixing a behaviour-neutral refactor
+into a security slice (`src/server/mod.rs:2470`).
+
+**(f) `fork_quarantine` fault-injection test parallel-run flake under plain `cargo test`.**
+The `adr0064`/`adr0066` fault-injection tests use process-global statics
+(`#[cfg(test)]` `LazyLock<Mutex<HashSet>>` barriers) to trigger race windows.
+Under plain `cargo test` (which runs tests in the same process), concurrent test
+threads that touch the same static can interfere and produce spurious failures.
+`cargo nextest` runs each test in a separate process and is unaffected. Always use
+`cargo nextest` or the project's `just test` recipe.
+
+---
+
+## 7. Mandate grace and the `owner_mandate_missing` refusal
+
+On owner-axis groups, an absent-mandate `MemberAdded` from an authority agent
+whose capability has been observed and whose grace window has elapsed is refused
+with the typed, **RETRYABLE** `owner_mandate_missing` (nothing is queued as a
+revision gap; the sender-side bounded resend or a mandate-carrying re-issue is the
+redelivery path — retry the operation, do not rejoin). Semantics:
+
+- Capability is recorded per AUTHORITY AGENT the first time that agent produces a
+  valid mandate or an owner-countersigned InviteV4 (`first_seen_ms`).
+- `unknown` agents (never observed capability — the keyless tier, #472 decision 7)
+  warn-accept indefinitely; A's capability never implicates B.
+- The grace window defaults to **60 days** (one release cycle) and is configured
+  per daemon as `[groups] mandate_grace_days` (validated ≥ 1 at startup).
+- A later valid mandate from the same agent restores `capable` but RETAINS the
+  original clock — a compromised authority cannot reset its own window.
+- The clock is the node's LOCAL wall clock: a backwards clock jump flips a
+  refusing authority back to warn-accept until the clock recovers.
+
+If a legitimate admin's events start refusing: upgrade that admin's install
+(mandate production needs the owner user key on the authority), or have the
+owner/keyed authority perform the seating. Do NOT delete the capability map to
+"fix" refusals — the map is observational state; the durable fix is a
+mandate-producing authority.
+
+---
+
+## 8. Quick triage
 
 | Observation | Meaning | Action |
 |---|---|---|
-| 409 `fork_quarantined` on send/encrypt | local marker set; authenticated fork evidence held | read `fork_quarantine` snapshot + classification (§2); let the owner anchor advance (§4.1–4.2); manual clear only per §4.3 |
-| 409 `fork_quarantined` on `DELETE /history` | the purge is refused to preserve the forensic record (§1) | read the history first; purge only after a deliberate clear — the store is untouched by the refusal |
-| history reads carry `fork_quarantined: true` | that scope spans a contested chain (§1) | expected; use `fork_quarantined_at_ingest` on the rows to find the incident window, and export what you need before clearing |
-| `classification: "owner_anchored_conflict"` | the owner anchored a successor this node cannot apply | this node likely holds the disowned chain — coordinate with the owner before any force-clear |
+| 409 `fork_quarantined` on send/encrypt | local marker set; authenticated fork evidence held | read `fork_quarantine` snapshot + classification (§4.1); let the owner anchor advance (§4.3a–4.3b); for `no_anchor` groups use manual clear only (§4.3c) |
+| 409 `fork_quarantined` on `DELETE /history` | purge refused to preserve forensic record (§3.3 row 14) | read the history first; purge only after a deliberate clear |
+| history reads carry `fork_quarantined: true` | scope spans a contested chain (§3.2 row 13) | expected; use `fork_quarantined_at_ingest` on rows to find the incident window; export what you need before clearing |
+| `classification: "owner_anchored_conflict"` | owner anchored a successor this node cannot apply | this node likely holds the disowned chain — coordinate with the owner before any force-clear |
 | `fork_quarantine_owner_anchored_refusals` rising, marker persists | contested branch publishing owner-anchored successors | divergence still live; do not force-clear |
-| 409 `fork_quarantined` with `"no_anchor": true` | ordinary group contained; NO automatic clear exists (§5) | agree the canonical chain out of band, re-seat stragglers, then `x0x groups quarantine clear <ID> --force --reason "…"` |
-| `force_required` from the clear endpoint | the group has no owner axis to attest with (§5) | re-run the clear with `--force` and a reason — this is the documented path, not a fault |
-| `fork_quarantine_set` rising across a fleet right after an upgrade | groups already silently forked are being contained for the first time | expected (ADR-0066 Migration); triage per §5, do not mass force-clear |
-| 409 `owner_mandate_missing` (retryable) | post-grace absent mandate from a recorded-capable authority | upgrade/repair the authority (owner user key); retry the send |
+| 409 `fork_quarantined` with `"no_anchor": true` | ordinary group contained; NO automatic clear (§1, §4.3c) | agree canonical chain out of band, re-seat stragglers, then `x0x groups quarantine clear <ID> --force --reason "…"` |
+| `force_required` from the clear endpoint | no owner axis to attest with | re-run with `--force` and a reason — this is the documented path, not a fault |
+| `fork_quarantine_set` rising fleet-wide right after upgrade | groups already silently forked are being contained | expected (ADR-0066 Migration / §5); triage per §4.3; do not mass force-clear; set alerting thresholds |
+| 409 `owner_mandate_missing` (retryable) | post-grace absent mandate from a recorded-capable authority | upgrade/repair the authority; retry the send |
 | `mandate_capability` row `state: "refusing"` | that agent's grace window elapsed | same as above, per-agent |
-| 409 `fork_quarantined` naming "changed while this join was being installed" | evidence landed inside the join's persist window (§1, slice 7) | retry the join — the retry re-reads the group; a leftover install marker is self-healing |
-| encrypted (GSS) store refuses after a marker set | the cached authorization context is suspended (§1, slice 7) | expected; it re-arms on the next refresh after a clear — a store still dead after a clear is a bug, capture `/diagnostics` |
-| marker vanished after an old binary ran | downgrade dropped containment (§6) | re-upgrade; the node re-quarantines on the next authenticated conflict (gate re-arms on every clear/set) |
+| 409 `fork_quarantined` "changed while this join was being installed" | evidence landed inside the join's persist window (§3.3 row 22) | retry the join; a leftover install marker is self-healing |
+| encrypted (GSS) store refuses after a marker set | cached authorization context is suspended (§3.3) | expected; re-arms on the next refresh after a clear; a store still dead after a clear is a bug, capture `/diagnostics` |
+| marker vanished after an old binary ran | downgrade dropped containment (§5.1) | re-upgrade; re-quarantines on the next authenticated conflict |
+| `signed-public bootstrap publication withheld` in log | row 21 suppression active (§3.3) | clear the marker per §4.3; delivery resumes automatically |
+| `clear` returns 404 on the stable id | alias-key limitation (§4.4, §6d) | use the roster key from the refusal message or `/history/stats` |
+
+---
+
+## Appendix A: Code reference
+
+| Claim | File:line |
+|---|---|
+| Marker install path | `src/server/routes/named_groups.rs:3566` (`install_fork_evidence`) |
+| Former owner-axis-only fence (removed by §2) | `named_groups.rs:3733` |
+| `no_anchor` set for ordinary groups | `named_groups.rs:3744` |
+| `no_anchor` field declaration | `src/groups/mod.rs:280` |
+| `invite_lineage` fence widened by R2 | `named_groups.rs:3765` |
+| `fork_quarantine_set` counter | `named_groups.rs:3620` |
+| `is_fork_quarantined()` | `src/groups/mod.rs:636` |
+| Retry rollback (NOT a clear) | `named_groups.rs:3536`–`:3541` |
+| Apply path (deliberately ungated, row 24) | `named_groups.rs:8922` |
+| Single refusal helper | `named_groups.rs:20336` (`reject_fork_quarantined`) |
+| Refusal body builder | `named_groups.rs:20415` (`fork_quarantine_refusal_body`) |
+| Refusal message (branches on `no_anchor`) | `named_groups.rs:20454` (`fork_quarantine_refusal_message`) |
+| Annotation shape (single-group) | `named_groups.rs:20395` (`fork_quarantine_annotation`) |
+| `api_error_with_reason` | `src/server/mod.rs:2510` |
+| `clear_group_quarantine` (bare `groups.get`) | `named_groups.rs:12830` |
+| Owner-anchor apply-path clear | `named_groups.rs:9554` (`apply_named_group_metadata_event_inner`) |
+| Adoption clear | `named_groups.rs:4142` (`try_adopt_member_added_across_gap`) |
+| Owner-seal clear | `src/groups/mod.rs:1001` (`clear_fork_quarantine_on_explicit_owner_seal`) |
+| `resolve_group_entry_locked` | `src/server/mod.rs:2474` |
+| Resolver unification follow-up note | `src/server/mod.rs:2470` |
+| `lifecycle_epoch_token_locked` | `src/server/mod.rs:2494` |
+| Lifecycle epoch token type | `src/groups/mod.rs` (`LifecycleEpochToken`) |
+| History annotation function | `src/server/routes/history.rs:161` |
+| WS annotation function | `src/server/ws.rs:300` |
+| WS uses scopes-array shape | `src/server/ws.rs:325` |
+| `fork_quarantine_refusals` counter declaration | `src/groups/diagnostics.rs:150` |
+| `fork_quarantine_set` counter declaration | `src/groups/diagnostics.rs:146` |
+| History reaper (no quarantine check) | `src/history/reaper.rs` (47 lines, zero quarantine mentions) |
+| Task CRDT delta admission (ungated) | `src/crdt/task_list.rs:214` (`is_authorized_content_writer`) |
+| Task group authorization setup (uses contested roster) | `src/server/routes/tasks.rs:213` (`apply_group_authorization`) |
+| Task quarantine check | `src/server/routes/tasks.rs:191` (`reject_quarantined_task_mutation`) |
+| Bootstrap outbox WARN dedupe | `src/server/routes/public_group_bootstrap_outbox.rs:613` |
+| Bootstrap outbox dedup key | `(group_id, revision, observed_at_ms)`, bound 1024 |
+| Delegation index WARN dedupe | `src/server/delegations.rs:306` |
+| Delegation index dedup key | `(group_id, revision)`, bound 1024 |
+| ADR-0066 §1 coverage fixture | `src/server/routes/named_groups/tests/adr0066_coverage_map.rs` |
+| `OPEN_ROWS == &[]` (all 26 rows landed) | `adr0066_coverage_map.rs:781` |
+| `PENDING_RECHECK == &[1, 2, 4, 6]` | `adr0066_coverage_map.rs:796` |
+| Exhaustiveness fixture | `adr0066_coverage_map.rs:807` |
