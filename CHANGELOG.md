@@ -38,16 +38,23 @@ All notable changes to this project will be documented in this file.
   Suppression is non-destructive and needs no operator action beyond the clear:
   the obligation and its retry schedule are left untouched (reconciliation
   retains it rather than refreshing it from the contested frontier), so delivery
-  resumes by itself within the normal backoff after `POST
-  /groups/:id/quarantine/clear`. Dropping the debt instead would strand a member
-  on the roster that nobody remembers to bootstrap — permanently, because a
-  `no_anchor` marker never auto-clears. The periodic worker and the REST nudge a
-  member-add fires funnel through one gate, so no background job can publish a
-  contested snapshot; the withheld publication has no HTTP response to carry the
-  §5 message, so it logs that sentence at WARN and records one
-  `fork_quarantine_refusals` increment **deduplicated per (group, marker
-  revision)** — a polling worker counting every poll would turn that
-  fleet-health signal into a measure of uptime. An obligation whose stored
+  resumes by itself on the first worker pass after `POST
+  /groups/:id/quarantine/clear` — the poll interval, with no backoff to wait out.
+  Dropping the debt instead would strand a member on the roster that nobody
+  remembers to bootstrap — permanently, because a `no_anchor` marker never
+  auto-clears. **One quarantined group does not delay any other group's
+  bootstrap:** a pass sends at most one obligation and picks the oldest due one,
+  so quarantined groups are excluded when that choice is *made* rather than
+  refused after it — gating after the choice would make a contested group the
+  permanent head of the line and stall the whole outbox for as long as the marker
+  stood. The periodic worker and the REST nudge a member-add fires funnel through
+  one gate, so no background job can publish a contested snapshot; the withheld
+  publication has no HTTP response to carry the §5 message, so it logs that
+  sentence at WARN and records one `fork_quarantine_refusals` increment
+  **deduplicated per (group, marker revision, observation time)** — a polling
+  worker counting every poll would turn that fleet-health signal into a measure
+  of uptime, while keying on the revision alone would hide a re-quarantine after
+  a clear. An obligation whose stored
   payload carries a marker at all is now refused outright at write and at
   startup load, so per-node containment state cannot reach the wire even if the
   outbound stripping list is later edited. Every marker lookup this slice adds
@@ -57,6 +64,20 @@ All notable changes to this project will be documented in this file.
   carries the stable id, while `named_groups` is keyed by whichever alias this
   daemon learned the group under; a single-spelling lookup would admit mutations
   and publish snapshots for exactly the contested groups whose two names differ.
+
+  **Known gap, recorded rather than silently closed (found in cross-model review
+  of this slice).** Row 20 gates the LOCAL REST mutations. Inbound task-CRDT
+  deltas from peers still apply ungated: admission is
+  `TaskList::is_authorized_content_writer` (`src/crdt/task_list.rs:214`), which
+  tests the `authorized_agents` set that `apply_group_authorization`
+  (`src/server/routes/tasks.rs:213`) derived from the group's active members —
+  the contested roster itself. So while a quarantined group's own agent is
+  refused locally, a peer's claim signed by a member of the disputed roster still
+  merges and can move the deterministic winner. ADR-0066 §1 enumerates no
+  task-ingest row (it is not row 20, and row 24's deliberate "keep ungated" is
+  about metadata/state-commit apply, not task content), so closing it needs a
+  superseding decision about whether it is refuse-class or, like history ingest
+  under R3, tag-and-retain. Nothing here changes that behaviour.
 
 - **WebSocket group frames are annotated while a group is fork-quarantined
   (ADR-0066 §3d, row 25, slice 6; #732) — labelled, never refused.** The WS

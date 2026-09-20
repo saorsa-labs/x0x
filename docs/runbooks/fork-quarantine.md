@@ -118,22 +118,33 @@ keep working while quarantined.
 
 **Row 21 is a suppression, not a deletion — nothing is lost.** The bootstrap
 debt stays in the outbox with its retry schedule untouched, and reconciliation
-retains it rather than refreshing it from the contested frontier, so **delivery
-resumes on its own within the normal retry backoff (≤60 s) after the manual
-clear** with no operator action beyond the clear. That matters because dropping
-the obligation would leave a member on the roster that nobody remembers to
-bootstrap, permanently, since a `no_anchor` marker never auto-clears.
+retains it rather than refreshing it from the contested frontier, so
+**delivery resumes by itself on the first worker pass after the manual clear
+(the poll interval, ~0.5 s — there is no backoff to wait out, because the
+withheld obligation's schedule was never advanced)**, with no operator action
+beyond the clear. That matters because dropping the obligation would leave a
+member on the roster that nobody remembers to bootstrap, permanently, since a
+`no_anchor` marker never auto-clears.
+
+**One quarantined group does not delay any other group's bootstrap.**
+Quarantined groups are excluded when the worker chooses which obligation to
+send, not merely refused after it has chosen: a pass sends at most one
+obligation and picks the oldest due one, so gating after the choice would make
+a contested group the permanent head of the line and stall the whole outbox for
+as long as the marker stood. If you are triaging "no group is receiving its
+bootstrap", a single quarantined group is **not** the explanation.
 
 Both the periodic worker and the REST nudge a member-add fires go through the
 same gate, so there is no path by which a background job publishes a contested
 group's snapshot. A withheld publication has no HTTP response to carry the §5
 message, so it logs the sentence at WARN and records one
 `fork_quarantine_refusals` increment — **deduplicated per (group, marker
-revision)**, deliberately: this is a polling worker, and one record per poll
-would turn the counter operators alert on into a measure of uptime. A new
-evidence revision logs and counts again. So in triage, read row 21's
-contribution to `fork_quarantine_refusals` as "this group's publication is
-being withheld", not as a rate.
+revision, observation time)**, deliberately: this is a polling worker, and one
+record per poll would turn the counter operators alert on into a measure of
+uptime. A new evidence revision, or the same revision observed again after a
+clear, logs and counts again. So in triage, read row 21's contribution to
+`fork_quarantine_refusals` as "this group's publication is being withheld", not
+as a rate.
 
 If you see `signed-public bootstrap publication withheld` in the log for a
 group whose members are complaining they never received the group state, the
