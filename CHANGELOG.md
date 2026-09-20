@@ -36,6 +36,22 @@ All notable changes to this project will be documented in this file.
   route's lock release and the helper's re-acquire while the live TreeKEM map
   kept the old spelling). Both helpers now resolve both spellings, which also
   closes that race.
+- **Fork quarantine operator runbook restructured (ADR-0066 slice 8; #732).** The
+  per-slice patchwork in `docs/runbooks/fork-quarantine.md` (accumulated across
+  slices 1–7) is replaced by a single coherent operator runbook. Coverage: what
+  fork quarantine is; how a marker installs (install path, `no_anchor`, ADR-0067
+  epoch token); the full 26-surface behaviour table with §5 refusal body and both
+  annotation shapes (single-group and multi-scope); diagnose → decide → clear
+  procedure; upgrade notes; and six known gaps with file:line
+  citations (send-path §4 re-check deferred rows 1/2/4/6, history reaper ignores
+  quarantine, inbound task-CRDT deltas apply ungated, the alias-key clear
+  limitation and the three pending marker resolvers — both closed by the
+  resolver-unification entry above — and the fault-injection test parallel flake
+  under plain `cargo test`). All 26 ADR-0066 §1 rows have landed
+  (`OPEN_ROWS == &[]`); rows 1, 2, 4 and 6 carry `PENDING_RECHECK` for their §4
+  re-check before effect. **FALSE statement removed:** old runbook intro claimed
+  slice 7 (row 22, lifecycle epoch token) had not yet shipped — it has.
+
 - **A fork-quarantine marker that lands mid-operation now aborts the operation
   instead of being overwritten by it (ADR-0066 §4, slice 7; ADR-0067; #732).**
   Every gate slices 1–6 added checks the marker at the START of an operation.

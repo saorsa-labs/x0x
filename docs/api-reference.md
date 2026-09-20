@@ -115,7 +115,7 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   and existing delegations are not honoured — including send-as attribution
   arriving over gossip and delegated task-execute — until
   `POST /groups/:id/quarantine/clear`. `GET /groups/:id/delegations` keeps
-  serving, annotated. See `docs/runbooks/fork-quarantine.md` §1.
+  serving, annotated. See `docs/runbooks/fork-quarantine.md` §3 (Surface behaviour).
 - **Fork quarantine, two further refusal conditions (ADR-0066 §4, slice 7;
   ADR-0067):** the marker is also honoured when it lands *mid-operation*,
   because two paths persist a whole group record captured earlier and would
@@ -135,8 +135,8 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
     `POST /groups/:id/quarantine/clear`.
 
   Clients should already be matching `reason`, not `error`; no new code or
-  status is introduced. See `docs/runbooks/fork-quarantine.md` §1 ("A marker
-  that lands mid-operation").
+  status is introduced. See `docs/runbooks/fork-quarantine.md` §3.3 (Special
+  surfaces — Row 22, lifecycle epoch token / persist-lock re-check).
 - **Device sync (ADR-0041):** `GET /sync/devices`, `POST /sync/devices/enroll`,
   `DELETE /sync/devices/:machine_id`; owner-to-owner SyncV1 streams.
 - **Placement & key-move (ADR-0043):** `GET /owner/placement`,
@@ -2339,7 +2339,7 @@ upgrading — see the
 `{ "ok": false, "error": "fork_quarantined" }`. A client matching the literal
 `error == "fork_quarantined"` must move to `reason`. HTTP 409 and `ok: false`
 are unchanged. See the
-[fork quarantine runbook](runbooks/fork-quarantine.md) §1.
+[fork quarantine runbook](runbooks/fork-quarantine.md) §5 (Upgrade notes).
 
 ## CLI quick examples
 
