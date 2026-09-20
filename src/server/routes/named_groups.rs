@@ -4764,45 +4764,51 @@ pub(in crate::server) enum SaveFault {
     PreflightOkThenReplacedNotDurableAfterWriteThenError = 6,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-static SAVE_FAULT_INJECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg_attr(not(test), allow(dead_code))]
-fn save_fault_short_circuit() -> Option<AtomicWriteOutcome> {
-    if !cfg!(test) {
-        return None;
-    }
-    match SAVE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
+// #470 — per-instance fault helpers; all `#[cfg(test)]` so no trace in
+// release builds. The storage cell lives on `AppState.named_groups_save_fault`
+// (also `#[cfg(test)]`) so parallel tests with independent `AppState`
+// instances cannot observe each other's injected faults (#732/#673).
+
+#[cfg(test)]
+fn save_fault_short_circuit(state: &AppState) -> Option<AtomicWriteOutcome> {
+    match state
+        .named_groups_save_fault
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
         1 => Some(AtomicWriteOutcome::NotReplaced),
         3 => Some(AtomicWriteOutcome::ReplacedNotDurable),
         _ => None,
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn save_fault_legacy_write_fails() -> bool {
-    cfg!(test) && SAVE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) == 2
+#[cfg(test)]
+fn save_fault_legacy_write_fails(state: &AppState) -> bool {
+    state
+        .named_groups_save_fault
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == 2
 }
 
 /// #477 (r8 item 1): one-shot post-rename fault — fires once, then clears
 /// (variant 4) or degrades to the legacy-write error (variant 5).
-#[cfg_attr(not(test), allow(dead_code))]
-fn save_fault_after_write_not_durable() -> bool {
-    if !cfg!(test) {
-        return false;
-    }
+#[cfg(test)]
+fn save_fault_after_write_not_durable(state: &AppState) -> bool {
     let ordering = std::sync::atomic::Ordering::SeqCst;
     // Variant 6: consume this (unfaulted) write and arm variant 5 for the
     // next one.
-    if SAVE_FAULT_INJECT
+    if state
+        .named_groups_save_fault
         .compare_exchange(6, 5, ordering, ordering)
         .is_ok()
     {
         return false;
     }
-    SAVE_FAULT_INJECT
+    state
+        .named_groups_save_fault
         .compare_exchange(4, 0, ordering, ordering)
         .is_ok()
-        || SAVE_FAULT_INJECT
+        || state
+            .named_groups_save_fault
             .compare_exchange(5, 2, ordering, ordering)
             .is_ok()
 }
@@ -4893,20 +4899,24 @@ async fn clear_join_install_pending_markers(named_groups_path: &FsPath) {
     }
 }
 
-/// #470 — RAII fault guard (see [`DeleteFaultGuard`]).
+/// #470 — RAII fault guard: holds a clone of the per-instance cell and
+/// clears it on drop, so a failing or panicking test cannot leak the fault
+/// into another test's `AppState` instance (see [`DeleteFaultGuard`]).
 #[cfg(test)]
-pub(in crate::server) struct SaveFaultGuard;
+pub(in crate::server) struct SaveFaultGuard(std::sync::Arc<std::sync::atomic::AtomicU8>);
 #[cfg(test)]
 impl Drop for SaveFaultGuard {
     fn drop(&mut self) {
-        SAVE_FAULT_INJECT.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.0.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 #[cfg(test)]
-pub(in crate::server) fn set_save_fault(fault: SaveFault) -> SaveFaultGuard {
-    SAVE_FAULT_INJECT.store(fault as u8, std::sync::atomic::Ordering::SeqCst);
-    SaveFaultGuard
+pub(in crate::server) fn set_save_fault(state: &AppState, fault: SaveFault) -> SaveFaultGuard {
+    state
+        .named_groups_save_fault
+        .store(fault as u8, std::sync::atomic::Ordering::SeqCst);
+    SaveFaultGuard(std::sync::Arc::clone(&state.named_groups_save_fault))
 }
 
 /// Re-establish directory durability for a previously visible roster
@@ -29515,10 +29525,11 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
         }
     }
     // #470 test fault cell: force a chosen save outcome through the
-    // production path (constant-false outside test builds). Checked after
-    // the hook above so every fault variant shares the deterministic
-    // interleave point; before any durable write.
-    if let Some(outcome) = save_fault_short_circuit() {
+    // production path (cfg(test) only). Checked after the hook above so
+    // every fault variant shares the deterministic interleave point; before
+    // any durable write.
+    #[cfg(test)]
+    if let Some(outcome) = save_fault_short_circuit(state) {
         return Ok(outcome);
     }
     // A non-empty sidecar body must reach disk before the roster view
@@ -29546,7 +29557,12 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     // failing HERE reproduces the documented #471 split outcome
     // (sidecar new / named old) through the production path — which the
     // rollback after the write must now undo.
-    let outcome = if save_fault_legacy_write_fails() {
+    //
+    // `#[cfg(test)]` / `#[cfg(not(test))]` are mutually exclusive; the
+    // test path adds fault injection (per-instance, never a global static),
+    // the production path is the bare write with no extra branches.
+    #[cfg(test)]
+    let outcome = if save_fault_legacy_write_fails(state) {
         Err(std::io::Error::other(
             "injected legacy roster write failure (#470/#471 test)",
         ))
@@ -29558,15 +29574,24 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
                 e
             })
             // #477 (r8 item 1) test fault: the rename happened; report the
-            // parent-dir fsync as failed (constant-false outside test builds).
+            // parent-dir fsync as failed.
             .map(|written| {
-                if written == AtomicWriteOutcome::Durable && save_fault_after_write_not_durable() {
+                if written == AtomicWriteOutcome::Durable
+                    && save_fault_after_write_not_durable(state)
+                {
                     AtomicWriteOutcome::ReplacedNotDurable
                 } else {
                     written
                 }
             })
     };
+    #[cfg(not(test))]
+    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &legacy_json)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to save named groups: {e}");
+            e
+        });
     // #471: the named write did NOT land (pre-rename failure or no
     // replacement) while the sidecar above already did — the split this
     // ordinary save path has no journal to repair. Undo the sidecar half
@@ -33249,6 +33274,7 @@ pub(in crate::server) mod tests {
             )),
             forward_service: None,
             owner_sync,
+            named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
 
         // Review r2 (#451): mirror daemon startup — migrate a pre-#451
@@ -36432,8 +36458,10 @@ pub(in crate::server) mod tests {
             // NEXT write (the candidate install) is `ReplacedNotDurable`
             // after the rename, and its corrective re-save then fails.
             let (code, body) = {
-                let _fault =
-                    set_save_fault(SaveFault::PreflightOkThenReplacedNotDurableAfterWriteThenError);
+                let _fault = set_save_fault(
+                    &joiner_state,
+                    SaveFault::PreflightOkThenReplacedNotDurableAfterWriteThenError,
+                );
                 route_join(&joiner_state, link).await
             };
             assert_eq!(
@@ -36540,7 +36568,7 @@ pub(in crate::server) mod tests {
                 }
                 let (_inviter, link) = mint_real_invite(&authority_state, &group).await;
                 let (code, body) = {
-                    let _fault = set_save_fault(fault);
+                    let _fault = set_save_fault(&joiner_state, fault);
                     route_join(&joiner_state, link).await
                 };
                 assert_eq!(
@@ -52023,7 +52051,7 @@ mod cas_rollback_470 {
         *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
             .lock()
             .expect("hook lock") = Some((Arc::clone(&reached), Arc::clone(&release)));
-        let _fault_guard = set_save_fault(fault);
+        let _fault_guard = set_save_fault(state, fault);
         let task_state = Arc::clone(state);
         let join = tokio::spawn(async move {
             persist_named_groups_mutation(&task_state, |groups| {
@@ -52230,7 +52258,7 @@ mod cas_rollback_470 {
         *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
             .lock()
             .expect("hook lock") = Some((Arc::clone(&reached), Arc::clone(&release)));
-        let _fault_guard = set_save_fault(SaveFault::NotReplaced);
+        let _fault_guard = set_save_fault(&case.state, SaveFault::NotReplaced);
         let task_state = Arc::clone(&case.state);
         let join = tokio::spawn(async move {
             // Returns true (a "successful" mutation) but changes nothing:

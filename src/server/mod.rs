@@ -976,6 +976,8 @@ pub async fn serve_with_options(
         connect_diagnostics,
         forward_service,
         owner_sync,
+        #[cfg(test)]
+        named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
     });
 
     // Review r2 (#451): a store written by a pre-#451 Home-Suite binary

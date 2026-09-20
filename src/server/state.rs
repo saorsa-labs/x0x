@@ -1136,6 +1136,13 @@ pub(super) struct AppState {
     /// `None` when the install has no owner key (ownerless installs sync
     /// nothing and register no acceptor).
     pub(super) owner_sync: Option<Arc<x0x::owner_sync::OwnerSyncService>>,
+    /// Per-instance fault-injection cell for `save_named_groups_checked_unlocked`.
+    /// Each test that calls `set_save_fault` arms and RAII-clears this; because it
+    /// lives on the `AppState` rather than in a process-global static, parallel
+    /// tests running on independent `AppState` instances cannot observe each
+    /// other's injected faults (fixes #732 / #673 ambient flake).
+    #[cfg(test)]
+    pub(super) named_groups_save_fault: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 #[derive(Clone)]
