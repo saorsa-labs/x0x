@@ -87,15 +87,25 @@ All notable changes to this project will be documented in this file.
     that fix found the refresh still racy — the gate releases the roster lock
     before the later awaits and `same_marker` ignores `state_revision`, so a
     commit landing in that window was accepted — so the member set now travels
-    with the token it was derived at (`crdt::AuthorizedRoster`, read under one
-    roster guard) and the re-check requires the **whole** token to be unchanged,
-    re-deriving up to three times and then abandoning with the buffer intact. A
-    clear that finds an EMPTY buffer refreshes the cached roster too, so live
-    admission afterwards uses the post-clear membership. **Residuals:** a roster
-    change with neither a drain nor a clear still leaves the set stale until
-    restart (pre-existing, broader than ADR-0068); and a group with no resolvable
-    record gets a gate but keeps **open** live admission, because installing an
-    empty set on a failed lookup would discard a seated member's work.
+    with the token it was derived at (`crdt::AuthorizedRoster`) — and, after a second
+    review round, the refresh and the merge now happen under **one pinned roster
+    read**: `crdt::TaskIngestGate::with_pinned_roster` takes the `named_groups`
+    read guard, derives set and token from it, and the drain installs, filters and
+    merges synchronously while that guard is held, so a roster writer cannot commit
+    mid-drain (it waits one bounded batch: ≤ 1024 merges, no I/O, no persistence).
+    That replaced a derive-release-compare-retry design which closed the window
+    only probabilistically and could be starved indefinitely by roster revision
+    churn — with admission coupled to the buffer that would have frozen the list —
+    so the retry budget is gone. A marker live at the pinned read abandons the
+    drain with the buffer intact. A clear that finds an EMPTY buffer refreshes the
+    cached roster too. **Residuals:** the two owner-anchored clears
+    (`named_groups.rs::try_adopt_member_added_across_gap`,
+    `apply_named_group_metadata_event_inner_serialized`) do not run the resume
+    hook, so after such a clear a removed member's NEW live deltas keep being
+    admitted until the next drain, manual clear or restart (their buffered deltas
+    are still re-authorized); and a group with no resolvable record gets a gate but
+    keeps **open** live admission, because installing an empty set on a failed
+    lookup would discard a seated member's work.
   - **Incoming traffic can no longer starve the drain (finding 5).** The 5 s
     drain poll was a fresh `sleep` created inside `select!` on every iteration,
     so every received message cancelled it: with messages arriving less than 5 s

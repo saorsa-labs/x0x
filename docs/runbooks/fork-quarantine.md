@@ -698,14 +698,20 @@ owes the list is refilled by anti-entropy. **What an operator sees:** after a
 clear that removed a member, `task_deltas_quarantine_applied` plus
 `task_deltas_quarantine_dropped` account for everything held, and the removed
 member's work is in the second number.
-The refresh is tied to a **validated roster revision**, not merely taken before
-the merge: the member set travels with the ADR-0067 token it was derived at, and
-the drain requires the whole token — `state_revision` and marker identity — to be
-unchanged immediately before the first merge. A roster commit landing in that
-window (which `same_marker` alone cannot see, because the marker half does not
-move) causes the authorization to be re-derived, up to three times, after which
-the drain is abandoned with the buffer intact and in order. Nothing merges against
-a roster older than the one current at merge time.
+The refresh and the merge happen under **one pinned roster read**: the gate takes
+its `named_groups` read guard, derives the member set and the ADR-0067 token from
+that single read, and the drain installs the set, filters the buffer and runs the
+whole merge loop synchronously while the guard is still held
+(`crdt/sync.rs::TaskIngestGate::with_pinned_roster`). A roster **writer** therefore
+cannot commit in the middle of a drain — it waits for one bounded batch (at most
+1024 merges / 1 MiB, no I/O, no signature checks, no persistence: the snapshot is
+written after the guard is released). This replaced an earlier
+derive-release-compare-retry design that closed the same window only
+probabilistically and could be abandoned indefinitely by sustained roster
+revision churn, which — with admission coupled to the buffer, below — would have
+frozen the list. Nothing merges against a roster older than the one current at
+merge time, and a marker live at that pinned read abandons the drain with the
+buffer intact.
 
 **A clear with an EMPTY buffer refreshes authorization too.** There is nothing to
 apply, but the cached roster is still replaced, so the deltas that arrive *next*
@@ -713,11 +719,27 @@ are admitted against the roster the clearing commit left behind. Without that, a
 clear that happened to find the buffer empty left the contested roster in place
 for live admission.
 
-**Remaining residual, precisely.** The refresh happens on a drain or a clear, not
-on every roster change. A membership change with **no** quarantine involved still
-leaves a list's `authorized_agents` set as captured at subscribe time until the
-daemon restarts — pre-existing behaviour, wider than fork quarantine, unchanged
-here. And a group this node holds **no resolvable record for** gets an ingest gate
+**Remaining residual, precisely (say this out loud during triage).** The cached
+`authorized_agents` set is refreshed at exactly three moments: when the list is
+created or rehydrated, when a buffer drains, and when the **manual** clear route
+runs its resume hook (`routes/tasks.rs::resume_group_task_ingest`, called by
+`named_groups.rs::clear_group_quarantine` after its roster write is durable). It is
+**not** refreshed by the two *owner-anchored* clears —
+`named_groups.rs::try_adopt_member_added_across_gap` and
+`named_groups.rs::apply_named_group_metadata_event_inner_serialized` — when the
+buffer is empty at that moment, because those clears run inside the roster
+critical section while the resume hook must be called with no roster guard held
+(lock order `TaskList` → `named_groups`), so wiring them up is a non-local change
+rather than a line. Consequence, stated plainly: after an owner-anchored clear
+that removed a member, **that member's NEW live deltas keep being admitted** until
+the next refresh — the next drain on that list, a manual clear, or a restart —
+because `crdt/task_list.rs::is_authorized_content_writer` still consults the
+captured set. Their *buffered* deltas are safe, because the drain re-authorizes
+under the pinned roster, and ADR-0066 row 20 still refuses local mutations while
+the marker is live; it is the post-clear live path that lags. A membership change
+with no quarantine at all has always behaved this way and still does — wider than
+fork quarantine, unchanged here. And a group this node holds **no resolvable
+record for** gets an ingest gate
 (so a marker arriving later is honoured) but keeps **open** live admission:
 `is_authorized_content_writer` returns `true` when no set is installed, and the
 refresh deliberately does not install an empty set, because denying every writer

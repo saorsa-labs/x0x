@@ -75,23 +75,33 @@ struct FakeGate {
     /// The scripted LIVE roster the drain re-authorizes against (#732 finding
     /// 4). `None` ⇒ "cannot determine", which must leave the list's installed
     /// set alone.
-    live_roster: std::sync::Mutex<Option<std::collections::HashSet<x0x::identity::AgentId>>>,
-    /// `state_revision` the scripted roster above was derived at. The drain
-    /// compares the WHOLE token, so this differing from `live_state_revision` is
-    /// "a roster commit landed after the refresh" (#756 review P1).
-    roster_state_revision: AtomicU64,
-    /// `state_revision` the scripted LIVE record is at.
+    /// Behind a REAL `tokio::sync::RwLock`, so "a roster writer cannot commit
+    /// while the merge runs" is a fact a fixture can observe rather than a claim
+    /// (#756 review r2). `None` ⇒ this node cannot resolve the record.
+    live_roster: tokio::sync::RwLock<Option<std::collections::HashSet<x0x::identity::AgentId>>>,
+    /// `state_revision` of the scripted live record; a scripted commit advances it.
     live_state_revision: AtomicU64,
-    /// From this many `authorized_writers()` reads on, a roster commit lands
-    /// between the refresh and the merge: `live_state_revision` advances and
-    /// `removed_by_race` leaves the live roster. `u64::MAX` = never.
-    move_roster_after_reads: AtomicU64,
-    /// Fire the roster barrier only ONCE (the interleaving case) rather than on
-    /// every read (the keeps-moving case).
-    move_roster_once: AtomicBool,
-    roster_reads: AtomicU64,
-    /// The member the scripted roster commit removes.
-    removed_by_race: std::sync::Mutex<Option<x0x::identity::AgentId>>,
+    /// When false the gate reproduces the PRE-FIX shape for a negative control:
+    /// derive the set, RELEASE the roster, let a commit land, then hand the caller
+    /// the now-stale set.
+    pin: AtomicBool,
+    /// Set while `apply` runs: could a writer have taken the roster? Under the
+    /// pinned contract this must be `false`.
+    writer_blocked_during_apply: AtomicBool,
+    /// Control instrumentation: did the scripted commit make the derived token
+    /// stale before `apply` ran? That is the condition the removed
+    /// compare-and-retry loop kept failing on.
+    token_stale_at_apply: AtomicBool,
+    /// The member a scripted commit removes (unpinned control path).
+    removed_by_commit: std::sync::Mutex<Option<x0x::identity::AgentId>>,
+    /// Install this marker identity AT the pinned read — the faithful model of "a
+    /// marker installed after the drain decided": the pinned token carries it, so
+    /// the drain must abandon. `None` = no marker installed at the pin.
+    install_marker_at_pin: std::sync::Mutex<Option<u64>>,
+    /// Advance `state_revision` on every pinned read, i.e. a roster commit landing
+    /// immediately after each derivation — the churn that starved the removed
+    /// compare-and-retry loop.
+    churn_at_pin: AtomicBool,
     /// From this many `suspended()` reads on, answer `false` — the clear landing
     /// at a scripted point, the mirror of `suspend_after_reads`.
     unsuspend_after_reads: AtomicU64,
@@ -109,13 +119,14 @@ impl Default for FakeGate {
             suspension_reads: AtomicU64::new(0),
             marker_revision: std::sync::Mutex::new(None),
             has_record: AtomicBool::new(true),
-            live_roster: std::sync::Mutex::new(None),
-            roster_state_revision: AtomicU64::new(0),
+            live_roster: tokio::sync::RwLock::new(None),
             live_state_revision: AtomicU64::new(0),
-            move_roster_after_reads: AtomicU64::new(u64::MAX),
-            move_roster_once: AtomicBool::new(false),
-            roster_reads: AtomicU64::new(0),
-            removed_by_race: std::sync::Mutex::new(None),
+            pin: AtomicBool::new(true),
+            writer_blocked_during_apply: AtomicBool::new(false),
+            token_stale_at_apply: AtomicBool::new(false),
+            removed_by_commit: std::sync::Mutex::new(None),
+            install_marker_at_pin: std::sync::Mutex::new(None),
+            churn_at_pin: AtomicBool::new(false),
             unsuspend_after_reads: AtomicU64::new(u64::MAX),
             buffered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -125,6 +136,17 @@ impl Default for FakeGate {
 }
 
 impl FakeGate {
+    /// A gate whose live roster seats `writer` — the default for a fixture, since
+    /// a real gate that reaches the merge always resolved a record. Tests that
+    /// need a different roster call [`Self::set_live_roster`]; the one that needs
+    /// "no record at all" calls [`Self::clear_live_roster`].
+    fn seating(writer: x0x::identity::AgentId) -> Self {
+        Self {
+            live_roster: tokio::sync::RwLock::new(Some(std::collections::HashSet::from([writer]))),
+            ..Self::default()
+        }
+    }
+
     fn marker_revision(&self) -> Option<u64> {
         *self
             .marker_revision
@@ -141,31 +163,49 @@ impl FakeGate {
 
     /// Script the roster the drain will re-authorize against — the roster the
     /// clearing commit left behind.
-    fn set_live_roster<I: IntoIterator<Item = x0x::identity::AgentId>>(&self, agents: I) {
-        *self
-            .live_roster
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(agents.into_iter().collect());
+    async fn set_live_roster<I: IntoIterator<Item = x0x::identity::AgentId>>(&self, agents: I) {
+        *self.live_roster.write().await = Some(agents.into_iter().collect());
     }
 
-    /// Arm the #756 P1 barrier: a roster commit that removes `member` lands
-    /// between the drain's refresh and its merge. `once` distinguishes the
-    /// interleaving case (one commit, so the retry converges) from a roster that
-    /// keeps moving (every read, so the drain must abandon).
-    fn arm_roster_race(&self, member: x0x::identity::AgentId, once: bool) {
+    /// This node resolves NO record for the group — the pinned read hands the
+    /// drain `None`.
+    async fn clear_live_roster(&self) {
+        *self.live_roster.write().await = None;
+    }
+
+    /// Arm "a marker installs after the drain decided": the pinned read carries
+    /// marker identity `revision`.
+    fn install_marker_at_pin(&self, revision: Option<u64>) {
         *self
-            .removed_by_race
+            .install_marker_at_pin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = revision;
+    }
+
+    /// Reproduce the PRE-FIX shape for a negative control: the roster is released
+    /// before `apply`, and a commit removing `member` lands in that gap.
+    fn unpin_with_commit(&self, member: x0x::identity::AgentId) {
+        *self
+            .removed_by_commit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(member);
-        self.move_roster_once.store(once, Ordering::SeqCst);
-        self.move_roster_after_reads
-            .store(self.roster_reads.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.pin.store(false, Ordering::SeqCst);
     }
 
-    fn disarm_roster_race(&self) {
-        self.move_roster_after_reads
-            .store(u64::MAX, Ordering::SeqCst);
+    /// One scripted roster commit: advance the revision and drop the member.
+    /// Used only by the unpinned control path, where the roster is free.
+    async fn commit_removal(&self) {
+        self.live_state_revision.fetch_add(1, Ordering::SeqCst);
+        let removed = *self
+            .removed_by_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(removed) = removed {
+            let mut roster = self.live_roster.write().await;
+            if let Some(agents) = roster.as_mut() {
+                agents.remove(&removed);
+            }
+        }
     }
 }
 
@@ -207,54 +247,58 @@ impl TaskIngestGate for FakeGate {
         })
     }
 
-    fn authorized_writers(
-        &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<x0x::crdt::AuthorizedRoster>> + Send + '_>,
-    > {
+    fn with_pinned_roster<'a>(
+        &'a self,
+        apply: &'a mut (dyn FnMut(Option<&x0x::crdt::AuthorizedRoster>) + Send),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let reads = self.roster_reads.fetch_add(1, Ordering::SeqCst);
-            // The set is derived HERE, at this revision…
-            let derived_at = self.roster_state_revision.load(Ordering::SeqCst);
-            let agents = self
-                .live_roster
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            // …and the scripted commit lands right after, before the caller can
-            // merge: the live record advances and loses the disputed member, so a
-            // drain that trusted this set would merge against a roster that is no
-            // longer current (#756 review P1).
-            if reads >= self.move_roster_after_reads.load(Ordering::SeqCst) {
-                if self.move_roster_once.load(Ordering::SeqCst) {
-                    self.disarm_roster_race();
-                }
-                let removed = *self
-                    .removed_by_race
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let advanced = self.live_state_revision.fetch_add(1, Ordering::SeqCst) + 1;
-                self.roster_state_revision.store(advanced, Ordering::SeqCst);
-                // One lock at a time: a re-lock inside an `if let` scrutinee would
-                // self-deadlock, because `if let` keeps its temporaries — the
-                // first guard included — alive for the whole block.
-                let current = self
-                    .live_roster
+            if self.pin.load(Ordering::SeqCst) {
+                // The contract: ONE roster guard, derive from it, call `apply`
+                // synchronously while it is held.
+                let guard = self.live_roster.read().await;
+                // A marker installing after the drain decided is visible HERE,
+                // because the token comes from the same pinned read the merge runs
+                // under — that is what makes the re-check airtight.
+                let pinned_marker = self
+                    .install_marker_at_pin
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                if let (Some(removed), Some(mut roster)) = (removed, current) {
-                    roster.remove(&removed);
-                    *self
-                        .live_roster
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(roster);
+                    .or_else(|| self.marker_revision());
+                let derived_at = self.live_state_revision.load(Ordering::SeqCst);
+                if self.churn_at_pin.load(Ordering::SeqCst) {
+                    // A roster commit lands immediately after this derivation. With
+                    // the removed retry loop this is what never converged.
+                    self.live_state_revision.fetch_add(1, Ordering::SeqCst);
                 }
+                let roster = guard.clone().map(|agents| x0x::crdt::AuthorizedRoster {
+                    agents,
+                    token: scripted_token(pinned_marker, derived_at),
+                });
+                // Observable proof that the roster is pinned for the caller's whole
+                // step: while this guard is held no writer can take it.
+                self.writer_blocked_during_apply
+                    .store(self.live_roster.try_write().is_err(), Ordering::SeqCst);
+                apply(roster.as_ref());
+                drop(guard);
+            } else {
+                // NEGATIVE CONTROL: the pre-fix shape. Derive, release, let a
+                // commit land, then apply the stale set.
+                let derived_at = self.live_state_revision.load(Ordering::SeqCst);
+                let roster = self.live_roster.read().await.clone().map(|agents| {
+                    x0x::crdt::AuthorizedRoster {
+                        agents,
+                        token: scripted_token(self.marker_revision(), derived_at),
+                    }
+                });
+                self.commit_removal().await;
+                self.token_stale_at_apply.store(
+                    derived_at != self.live_state_revision.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                self.writer_blocked_during_apply
+                    .store(self.live_roster.try_write().is_err(), Ordering::SeqCst);
+                apply(roster.as_ref());
             }
-            Some(x0x::crdt::AuthorizedRoster {
-                agents: agents?,
-                token: scripted_token(self.marker_revision(), derived_at),
-            })
         })
     }
 
@@ -316,7 +360,7 @@ impl Harness {
         Self {
             list: tokio::sync::RwLock::new(list),
             buffer: x0x::crdt::sync::testing::Buffer::default(),
-            gate: StdArc::new(FakeGate::default()),
+            gate: StdArc::new(FakeGate::seating(writer)),
             peer,
             writer,
         }
@@ -555,15 +599,16 @@ async fn adr0068_d2_buffer_is_bounded_and_drops_the_oldest_with_a_counter() {
     );
 }
 
-/// ADR-0068's "marker installed mid-apply" row, drain half: a marker that
-/// installs between the drain's token capture and its re-check ABANDONS the
-/// drain — nothing merges and the deltas stay buffered, in order.
+/// ADR-0068's "marker installed mid-apply" row, drain half: a marker that is live
+/// at the drain's PINNED read abandons the drain — nothing merges and the deltas
+/// stay buffered, in order.
 ///
-/// Deterministic by counting gate reads, not by racing: the barrier gate answers
-/// "not quarantined" for the capture read and "quarantined" from the re-check
-/// read onward.
+/// Since #756 review r2 the re-check is not a second read to be raced: the marker
+/// comes from the same pinned roster guard the merge runs under, so "installed
+/// after the decision" is exactly "present at the pin". Deterministic by arming
+/// that pin, not by racing a timer.
 #[tokio::test]
-async fn adr0068_d2_drain_abandons_when_a_marker_installs_between_capture_and_recheck() {
+async fn adr0068_d2_drain_abandons_when_a_marker_is_live_at_the_pinned_read() {
     let h = Harness::new();
     let gate = h.gate(true).expect("gate");
     // Buffer three deltas under a live marker.
@@ -575,12 +620,10 @@ async fn adr0068_d2_drain_abandons_when_a_marker_installs_between_capture_and_re
     let before = h.state_bytes().await;
     assert_eq!(x0x::crdt::sync::testing::len(&h.buffer), 3);
 
-    // The marker "clears", then re-installs exactly at the re-check read.
+    // The marker "clears" for the decision, then is live again at the pin.
     h.gate.suspended.store(false, Ordering::SeqCst);
-    let reads = h.gate.suspension_reads.load(Ordering::SeqCst);
-    h.gate
-        .suspend_after_reads
-        .store(reads + 1, Ordering::SeqCst);
+    h.gate.set_marker_revision(None);
+    h.gate.install_marker_at_pin(Some(11));
 
     let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
 
@@ -597,34 +640,34 @@ async fn adr0068_d2_drain_abandons_when_a_marker_installs_between_capture_and_re
     );
     assert_eq!(h.gate.applied.load(Ordering::SeqCst), 0);
 
-    // CONTROL: same fixture, barrier disarmed ⇒ the drain applies all three, in
-    // order. Without this the assertions above could hold because the drain
-    // never works at all.
-    h.gate.suspend_after_reads.store(u64::MAX, Ordering::SeqCst);
-    h.gate.suspended.store(false, Ordering::SeqCst);
+    // CONTROL: same fixture, nothing live at the pin ⇒ all three apply, in order.
+    // Without this the assertions above could hold because the drain never works.
+    h.gate.install_marker_at_pin(None);
     let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
     assert_eq!(
         applied, 3,
-        "control: the drain does apply when the token holds"
+        "control: the drain does apply when no marker is live at the pin"
     );
-    let titles = h.titles().await;
-    for want in ["first", "second", "third"] {
-        assert!(
-            titles.iter().any(|t| t == want),
-            "missing {want} in {titles:?}"
-        );
-    }
+    assert_eq!(
+        h.titles().await,
+        vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string()
+        ],
+        "and in arrival order"
+    );
 }
 
-/// The same row, TOKEN half: the ADR-0067 marker identity moves between capture
-/// and re-check while the suspension answer stays `false` the whole time.
+/// The same row, IDENTITY half: the marker identity at the pinned read is not the
+/// one the drain decided against — a clear → re-quarantine → clear that happened
+/// while it was deciding.
 ///
-/// This is the negative control for the token itself: a drain that re-checked
-/// only `suspended()` would apply these deltas, because both reads say "not
-/// quarantined". Only comparing the marker identity catches a
-/// clear → re-quarantine → clear that happened in the window.
+/// This is the negative control for the token itself: a re-check that only asked
+/// "is a marker live?" would let these deltas through in the control below, where
+/// the identity differs but suspension never said yes.
 #[tokio::test]
-async fn adr0068_d2_drain_abandons_when_the_marker_identity_moves_under_a_stable_suspension() {
+async fn adr0068_d2_drain_abandons_when_the_pinned_marker_identity_is_not_the_captured_one() {
     let h = Harness::new();
     let gate = h.gate(true).expect("gate");
     h.gate.suspended.store(true, Ordering::SeqCst);
@@ -632,15 +675,17 @@ async fn adr0068_d2_drain_abandons_when_the_marker_identity_moves_under_a_stable
     h.ingest(Some(&gate), h.delta(1, "held")).await;
     let before = h.state_bytes().await;
 
-    // Cleared for both suspension reads, but the identity moves in between.
+    // Suspension answers "clear" while the record still carries identity 7, so the
+    // captured token's marker half is Some(7) — then the pin reports a DIFFERENT
+    // identity.
     h.gate.suspended.store(false, Ordering::SeqCst);
-    let reads = h.gate.suspension_reads.load(Ordering::SeqCst);
-    h.gate
-        .move_marker_after_reads
-        .store(reads + 1, Ordering::SeqCst);
+    h.gate.install_marker_at_pin(Some(1_007));
 
-    let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
-    assert_eq!(applied, 0, "a moved marker identity abandons the drain");
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
+        0,
+        "a marker identity that is not the captured one abandons the drain"
+    );
     assert_eq!(h.state_bytes().await, before, "CRDT byte-identical");
     assert_eq!(
         x0x::crdt::sync::testing::len(&h.buffer),
@@ -648,14 +693,13 @@ async fn adr0068_d2_drain_abandons_when_the_marker_identity_moves_under_a_stable
         "delta still held"
     );
 
-    // CONTROL: identity stable ⇒ applied.
-    h.gate
-        .move_marker_after_reads
-        .store(u64::MAX, Ordering::SeqCst);
+    // CONTROL: the quarantine is really gone at the pin ⇒ applied.
+    h.gate.set_marker_revision(None);
+    h.gate.install_marker_at_pin(None);
     assert_eq!(
         x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
         1,
-        "control: a stable marker identity lets the drain through"
+        "control: with the marker gone the same buffer drains"
     );
 }
 
@@ -920,7 +964,7 @@ async fn adr0068_f4_a_member_the_clearing_commit_removed_does_not_get_held_delta
     );
 
     // The clearing commit removes the disputed member, then the marker clears.
-    h.gate.set_live_roster([seated]);
+    h.gate.set_live_roster([seated]).await;
     h.gate.suspended.store(false, Ordering::SeqCst);
     let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
 
@@ -970,7 +1014,10 @@ async fn adr0068_f4_a_member_the_clearing_commit_removed_does_not_get_held_delta
             &control.writer,
         )
         .await;
-    control.gate.set_live_roster([removed, control.writer]);
+    control
+        .gate
+        .set_live_roster([removed, control.writer])
+        .await;
     control.gate.suspended.store(false, Ordering::SeqCst);
     assert_eq!(
         x0x::crdt::sync::testing::drain(Some(&control_gate), &control.buffer, &control.list).await,
@@ -989,25 +1036,44 @@ async fn adr0068_f4_a_member_the_clearing_commit_removed_does_not_get_held_delta
     );
 }
 
-/// A gate that cannot determine the live roster (`None` — no resolvable record,
-/// or the daemon is shutting down) leaves the installed set exactly as it was.
-/// `None` must mean "unknown", never "deny everyone" (which would lose a seated
-/// member's work) and never "allow everyone" (which would defeat the refresh).
+/// A gate that cannot resolve the roster at all (`None` — no record for the group,
+/// or the daemon shutting down) ABANDONS the drain rather than merging on the set
+/// the subscription captured. ADR-0067's rule: no record is a mismatch, never
+/// "unchanged".
 #[tokio::test]
-async fn adr0068_f4_an_undeterminable_roster_leaves_the_installed_set_alone() {
+async fn adr0068_f4_an_unresolvable_roster_abandons_the_drain() {
     let h = Harness::new();
     let gate = h.gate(true).expect("gate");
     h.gate.suspended.store(true, Ordering::SeqCst);
     h.ingest(Some(&gate), h.delta(1, "held")).await;
-    // live_roster stays None (the default).
+    let before = h.state_bytes().await;
+    h.gate.clear_live_roster().await; // the pinned read resolves no record
     h.gate.suspended.store(false, Ordering::SeqCst);
 
     assert_eq!(
         x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
-        1,
-        "the writer the subscription authorized still applies"
+        0,
+        "no resolvable roster ⇒ abandon, not a merge on a stale set"
     );
-    assert_eq!(h.gate.dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(h.state_bytes().await, before, "CRDT byte-identical");
+    assert_eq!(
+        x0x::crdt::sync::testing::len(&h.buffer),
+        1,
+        "the delta stays held for the next observation"
+    );
+    assert_eq!(
+        h.gate.dropped.load(Ordering::SeqCst),
+        0,
+        "held, not dropped"
+    );
+
+    // CONTROL: the record resolves ⇒ the same buffer drains.
+    h.gate.set_live_roster([h.writer]).await;
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
+        1,
+        "control: a resolvable roster drains the same buffer"
+    );
     assert!(h.titles().await.iter().any(|t| t == "held"));
 }
 
@@ -1072,17 +1138,21 @@ async fn adr0068_f3_the_prestart_binding_carries_the_gate_for_a_quarantined_grou
         gate.epoch_token().await.is_some(),
         "and it must resolve the ADR-0067 token for the same record"
     );
-    let live = gate
-        .authorized_writers()
-        .await
-        .expect("the live roster resolves under the stable spelling");
+    // The pinned read resolves the same record under the stable spelling, and hands
+    // back the live members with the token derived from that one guard.
+    let mut pinned: Option<(usize, bool)> = None;
+    let mut capture = |roster: Option<&x0x::crdt::AuthorizedRoster>| {
+        pinned = roster.map(|r| (r.agents.len(), r.agents.contains(&member)));
+    };
+    gate.with_pinned_roster(&mut capture).await;
+    let (live_len, seats_member) = pinned.expect("the pinned read resolves the record");
     assert!(
-        live.agents.contains(&member),
-        "the active member is authorized from the LIVE roster: {live:?}"
+        seats_member,
+        "the active member is authorized from the LIVE roster"
     );
     assert_eq!(
         binding.authorized_agents.as_ref().map(|a| a.len()),
-        Some(live.agents.len()),
+        Some(live_len),
         "the binding's captured set comes from the same resolver"
     );
 
@@ -1148,20 +1218,24 @@ fn adr0068_f3_structural_guard_handle_producing_call_sites_bind_before_they_star
 }
 
 // ---------------------------------------------------------------------------
-// #756 review P1 — authorization is tied to a VALIDATED roster revision, so a
-// roster commit landing between the refresh and the merge cannot be missed.
+// #756 review r2 — the roster is PINNED across the whole re-authorize-then-merge
+// step, so a commit cannot land in the middle of it and churn cannot starve it.
 // ---------------------------------------------------------------------------
 
-/// A roster commit that removes the buffered writer lands in the window between
-/// the drain's refresh and its merge. The drain must notice (the whole token, not
-/// just the marker half, has to be unchanged), re-derive, and refuse that
-/// writer's held deltas.
+/// The merge runs with the roster held, so a roster writer that tries to commit
+/// during it waits: the set the drain authorizes against and the merge it performs
+/// can never be separated.
 ///
-/// Deterministic by a per-instance barrier counting `authorized_writers()` reads
-/// — no sleeps, no wall-clock, no process-global state. `same_marker` alone cannot
-/// see this: the marker half is identical throughout, only `state_revision` moves.
+/// Asserted three ways, none of them timing-dependent: the gate records that a
+/// write attempt cannot succeed while `apply` runs; a real writer task commits only
+/// after the drain returns, and its effect is then visible; and the merge's outcome
+/// is consistent with exactly one roster state.
+///
+/// The negative control is the PRE-FIX shape, reproduced by the same fixture gate:
+/// derive the set, release the roster, let the commit land, then merge on the stale
+/// set — which applies the removed member's delta.
 #[tokio::test]
-async fn adr0068_p1_a_roster_commit_between_refresh_and_merge_is_not_missed() {
+async fn adr0068_r2_the_roster_is_pinned_for_the_whole_merge() {
     let h = Harness::new();
     let gate = h.gate(true).expect("gate");
     let removed = x0x::identity::AgentId([21u8; 32]);
@@ -1182,36 +1256,59 @@ async fn adr0068_p1_a_roster_commit_between_refresh_and_merge_is_not_missed() {
     .await;
     assert_eq!(x0x::crdt::sync::testing::len(&h.buffer), 2);
 
-    // The marker clears. At the moment the drain reads the roster it still holds
-    // both members — and the removing commit lands immediately afterwards, before
-    // anything can merge.
-    h.gate.set_live_roster([removed, seated]);
+    // The roster at drain time still seats both members; the marker is gone.
+    h.gate.set_live_roster([removed, seated]).await;
     h.gate.suspended.store(false, Ordering::SeqCst);
-    h.gate.arm_roster_race(removed, true);
+
+    // A real roster writer, contending for the same lock the gate pins.
+    let writer_gate = StdArc::clone(&h.gate);
+    let writer = tokio::spawn(async move {
+        let mut roster = writer_gate.live_roster.write().await;
+        if let Some(agents) = roster.as_mut() {
+            agents.remove(&removed);
+        }
+        writer_gate
+            .live_state_revision
+            .fetch_add(1, Ordering::SeqCst);
+    });
 
     let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
+    writer
+        .await
+        .expect("the roster writer completes once the merge releases");
 
-    assert_eq!(
-        applied, 1,
-        "only the seated member's delta may merge: the drain re-derived after the \
-         roster moved under it"
+    assert!(
+        h.gate.writer_blocked_during_apply.load(Ordering::SeqCst),
+        "no writer may take the roster while the merge runs — that is the pin"
     );
     assert_eq!(
-        h.gate.dropped.load(Ordering::SeqCst),
-        1,
-        "the removed member's held delta is dropped and counted"
+        applied + h.gate.dropped.load(Ordering::SeqCst) as usize,
+        2,
+        "every held delta was accounted for: applied or dropped"
     );
     let titles = h.titles().await;
-    assert!(
-        !titles.iter().any(|t| t == "disputed-claim"),
-        "a roster commit in the refresh→merge window must still contain the \
-         removed member: {titles:?}"
+    // One roster state, consistently applied: both members were seated when the
+    // merge ran, so both deltas merge — and the writer's removal took effect only
+    // afterwards.
+    assert_eq!(
+        applied, 2,
+        "the pinned roster seated both writers: {titles:?}"
     );
-    assert!(titles.iter().any(|t| t == "seated-work"));
+    assert_eq!(h.gate.dropped.load(Ordering::SeqCst), 0);
+    assert!(
+        !h.gate
+            .live_roster
+            .read()
+            .await
+            .as_ref()
+            .expect("roster")
+            .contains(&removed),
+        "the commit did land — after the merge, not inside it"
+    );
 
-    // NEGATIVE CONTROL: the identical fixture with NO commit in the window ⇒ the
-    // same delta from the same writer merges. So the assertion above is about the
-    // interleaving, not about the drain refusing everything.
+    // NEGATIVE CONTROL: the pre-fix shape. The commit lands between deriving the
+    // set and merging, so the drain merges against a roster that is already stale
+    // — and the removed member's held delta is applied on it.
     let control = Harness::new();
     let control_gate = control.gate(true).expect("gate");
     control.authorize([removed, control.writer]).await;
@@ -1223,68 +1320,117 @@ async fn adr0068_p1_a_roster_commit_between_refresh_and_merge_is_not_missed() {
             &removed,
         )
         .await;
-    control.gate.set_live_roster([removed, control.writer]);
+    control
+        .gate
+        .set_live_roster([removed, control.writer])
+        .await;
     control.gate.suspended.store(false, Ordering::SeqCst);
+    control.gate.unpin_with_commit(removed);
+
+    let control_applied =
+        x0x::crdt::sync::testing::drain(Some(&control_gate), &control.buffer, &control.list).await;
+    assert!(
+        control.gate.token_stale_at_apply.load(Ordering::SeqCst),
+        "control: the commit really did land before the merge"
+    );
+    assert!(
+        !control
+            .gate
+            .writer_blocked_during_apply
+            .load(Ordering::SeqCst),
+        "control: the unpinned shape leaves the roster free during the merge — \
+         which is the defect"
+    );
     assert_eq!(
-        x0x::crdt::sync::testing::drain(Some(&control_gate), &control.buffer, &control.list).await,
-        1,
-        "control: with no roster commit in the window the held delta applies"
+        control_applied, 1,
+        "control: the stale set still seats the removed member, so their held \
+         delta merges — exactly what pinning prevents"
     );
     assert!(
         control.titles().await.iter().any(|t| t == "disputed-claim"),
-        "control: the same writer's delta DOES merge when the roster holds still"
+        "control: the removed member's work lands on the stale roster"
     );
 }
 
-/// A roster that keeps moving makes the drain give up — bounded, with the buffer
-/// intact and in order — rather than spin inside the list write guard or merge
-/// against a roster that is already stale.
+/// Sustained roster churn no longer starves the drain. The compare-and-retry loop
+/// this replaced re-derived the set and then re-read the token, so a commit landing
+/// after every derivation made every attempt mismatch; with a bounded attempt
+/// budget the drain abandoned, and with admission coupled to the buffer (P2) that
+/// meant newer deltas queued behind a buffer that never drained. Pinning removes
+/// the retry entirely — there is no second read to disagree with the first.
+///
+/// `churn_at_pin` advances the roster revision immediately after every derivation,
+/// which is precisely the interleaving that starved the old design. No spawned
+/// task, so nothing here depends on the scheduler.
 #[tokio::test]
-async fn adr0068_p1_a_roster_that_keeps_moving_abandons_the_drain_with_the_buffer_intact() {
+async fn adr0068_r2_sustained_roster_churn_no_longer_starves_the_drain() {
     let h = Harness::new();
     let gate = h.gate(true).expect("gate");
-    let removed = x0x::identity::AgentId([21u8; 32]);
-    h.authorize([removed, h.writer]).await;
+    h.authorize([h.writer]).await;
     h.gate.suspended.store(true, Ordering::SeqCst);
-    h.ingest_as(Some(&gate), h.delta_from(1, "first", &h.writer), &h.writer)
-        .await;
-    h.ingest_as(Some(&gate), h.delta_from(2, "second", &h.writer), &h.writer)
-        .await;
-    let before = h.state_bytes().await;
-
-    h.gate.set_live_roster([removed, h.writer]);
+    for (seq, title) in [(1u64, "first"), (2, "second"), (3, "third")] {
+        h.ingest_as(Some(&gate), h.delta_from(seq, title, &h.writer), &h.writer)
+            .await;
+    }
+    h.gate.set_live_roster([h.writer]).await;
     h.gate.suspended.store(false, Ordering::SeqCst);
-    // `once = false`: every refresh is followed by another commit.
-    h.gate.arm_roster_race(removed, false);
+    h.gate.churn_at_pin.store(true, Ordering::SeqCst);
+    let revision_before = h.gate.live_state_revision.load(Ordering::SeqCst);
 
-    assert_eq!(
-        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
-        0,
-        "the drain abandons rather than merging against a roster that has moved"
+    let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
+
+    assert!(
+        h.gate.live_state_revision.load(Ordering::SeqCst) > revision_before,
+        "the churn really did advance the roster revision during the drain"
     );
     assert_eq!(
-        h.state_bytes().await,
-        before,
-        "the CRDT is byte-identical — nothing half-applied"
+        applied, 3,
+        "the drain completes on its FIRST call under churn — there is no retry \
+         budget left to exhaust"
     );
     assert_eq!(
         x0x::crdt::sync::testing::len(&h.buffer),
-        2,
-        "both deltas stay buffered, in arrival order, for the next observation"
-    );
-    assert_eq!(h.gate.applied.load(Ordering::SeqCst), 0);
-
-    // CONTROL: the roster settles ⇒ the very same buffer drains in order.
-    h.gate.disarm_roster_race();
-    assert_eq!(
-        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
-        2,
-        "control: a settled roster drains the same buffer"
+        0,
+        "and the buffer is emptied, so admission stops queueing newer deltas"
     );
     assert_eq!(
         h.titles().await,
-        vec!["first".to_string(), "second".to_string()],
-        "and in arrival order"
+        vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string()
+        ],
+        "in arrival order"
+    );
+    assert_eq!(h.gate.dropped.load(Ordering::SeqCst), 0);
+
+    // CONTROL: the pre-fix shape on the same fixture — derive, let a commit land,
+    // merge on the stale set. `token_stale_at_apply` records the exact condition the
+    // removed retry loop kept failing on, which is why churn could starve it.
+    let control = Harness::new();
+    let control_gate = control.gate(true).expect("gate");
+    control.authorize([control.writer]).await;
+    control.gate.suspended.store(true, Ordering::SeqCst);
+    control
+        .ingest_as(
+            Some(&control_gate),
+            control.delta_from(1, "first", &control.writer),
+            &control.writer,
+        )
+        .await;
+    control.gate.set_live_roster([control.writer]).await;
+    control.gate.suspended.store(false, Ordering::SeqCst);
+    control.gate.unpin_with_commit(control.writer);
+    let control_applied =
+        x0x::crdt::sync::testing::drain(Some(&control_gate), &control.buffer, &control.list).await;
+    assert!(
+        control.gate.token_stale_at_apply.load(Ordering::SeqCst),
+        "control: without the pin the set handed to the merge was already stale — \
+         the condition the old retry loop could never win against"
+    );
+    assert_eq!(
+        control_applied, 1,
+        "control: and it merged anyway, on a roster that had already moved"
     );
 }
 
@@ -1373,7 +1519,7 @@ async fn adr0068_p4_a_clear_with_an_empty_buffer_still_refreshes_authorization()
     h.authorize([removed, h.writer]).await;
 
     // Nothing buffered; the clearing commit removed `removed`.
-    h.gate.set_live_roster([h.writer]);
+    h.gate.set_live_roster([h.writer]).await;
     assert_eq!(
         x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
         0,

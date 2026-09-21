@@ -351,29 +351,43 @@ impl x0x::crdt::TaskIngestGate for TaskQuarantineIngestGate {
         })
     }
 
-    /// The LIVE active-member set for the bound group with the lifecycle token it
-    /// was derived at, resolved under both spellings (#732 finding 4). The drain
-    /// reads this inside its merge critical section, so a member the clearing
-    /// commit removed does not get their buffered work applied. `None` — no
-    /// resolvable record, or the daemon is gone — leaves the installed set alone
-    /// rather than opening admission.
+    /// Pin the roster and hand the drain the live active-member set with the
+    /// lifecycle token derived from that same pinned read (#732 finding 4,
+    /// hardened by #756 review r2).
     ///
-    /// Set and token come from **one** `named_groups` guard (#756 review P1): the
-    /// drain proves the roster has not moved by re-reading the token and comparing
-    /// the whole of it, which is only sound if the pair it compares against was
-    /// true at a single instant.
-    fn authorized_writers(
-        &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<x0x::crdt::AuthorizedRoster>> + Send + '_>,
-    > {
+    /// One `named_groups` **read** guard is taken and held across the caller's
+    /// synchronous closure, so the whole re-authorize-then-merge step sees one
+    /// roster state and a roster WRITER cannot commit in the middle of it. The
+    /// caller already holds the task-list write guard, so this is the documented
+    /// `TaskList` → `named_groups` order — acquiring the roster second is that
+    /// order, not its inverse. The closure does no I/O and no `await`, and the
+    /// batch it runs is bounded by the ADR-0068 buffer bounds.
+    ///
+    /// `apply(None)` is still called when the record cannot be resolved (both
+    /// spellings tried) or the daemon has gone, so the drain can abandon rather
+    /// than merge on a stale set.
+    fn with_pinned_roster<'a>(
+        &'a self,
+        apply: &'a mut (dyn FnMut(Option<&x0x::crdt::AuthorizedRoster>) + Send),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let state = self.state.upgrade()?;
+            let Some(state) = self.state.upgrade() else {
+                apply(None);
+                return;
+            };
             let groups = state.named_groups.read().await;
-            let (_, info) = crate::server::resolve_group_entry_locked(&groups, &self.group_id)?;
-            let agents = active_members_of(info);
-            let token = crate::server::lifecycle_epoch_token_locked(&groups, &self.group_id)?;
-            Some(x0x::crdt::AuthorizedRoster { agents, token })
+            let pinned = crate::server::resolve_group_entry_locked(&groups, &self.group_id)
+                .and_then(|(_, info)| {
+                    let token =
+                        crate::server::lifecycle_epoch_token_locked(&groups, &self.group_id)?;
+                    Some(x0x::crdt::AuthorizedRoster {
+                        agents: active_members_of(info),
+                        token,
+                    })
+                });
+            // Synchronous, under the guard: nothing can write the roster until
+            // `apply` returns.
+            apply(pinned.as_ref());
         })
     }
 
