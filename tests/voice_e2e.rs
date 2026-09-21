@@ -243,11 +243,9 @@ async fn voice_pipeline_delivers_decodable_audio() {
 
     let samples = samples_per_20ms(SampleRate::Hz48000);
     let mut encoder = OpusEncoder::new(OpusEncoderConfig::default()).expect("encoder");
-    // Pace like the demo's real-time sender: one frame per 20 ms tick.
-    // `Delay` (not the default `Burst`) so a slow encode/send never emits a
-    // catch-up burst — the latency assertions hold under the demo's shape.
+    // Pace exactly like the demo's real-time sender: one frame per 20 ms tick
+    // with Tokio's default `Burst` missed-tick policy.
     let mut interval = tokio::time::interval(Duration::from_millis(20));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     for seq in 0..FRAMES {
         interval.tick().await;
         let frame = AudioFrame {
