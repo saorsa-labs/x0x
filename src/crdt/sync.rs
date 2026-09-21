@@ -1742,7 +1742,7 @@ impl TaskListSync {
     /// the list write). The `task_lists` registry is NOT taken by a section,
     /// so it is safe — though pointlessly blocking — to hold it here.
     ///
-    /// Mirrors [`KvStoreSync::cancel_sync_and_drain`] from #757; callers that
+    /// Mirrors [`crate::kv::KvStoreSync::cancel_sync_and_drain`] from #757; callers that
     /// cannot drain keep [`cancel_sync`](Self::cancel_sync) and accept its
     /// one-section residual.
     pub async fn cancel_sync_and_drain(&self) {
