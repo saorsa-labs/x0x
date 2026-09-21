@@ -1164,7 +1164,17 @@ pub async fn serve_with_options(
             queue.keys().cloned().collect()
         };
         for group_id in queue_groups {
-            replay_pending_causal_approvals(&state, &group_id).await;
+            // #759 item 1: consume any durable-clear the post-restore replay
+            // carried — here, with no membership/roster/persistence guard
+            // held, so the task-ingest drain can take its documented
+            // `TaskList` → `named_groups` order.
+            let mut cleared_quarantine = std::collections::BTreeSet::new();
+            replay_pending_causal_approvals(&state, &group_id, &mut cleared_quarantine).await;
+            routes::named_groups::resume_task_ingest_after_durable_clear(
+                &state,
+                &cleared_quarantine,
+            )
+            .await;
         }
     }
 
@@ -2763,6 +2773,10 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     // could be erased by a stale-snapshot rollback. Replay is
     // deferred until after the lock is released.
     let mut replay_after: Option<String> = None;
+    // #759 item 1: durable-clear spellings from the apply(s) below — both
+    // run under the membership guard, so their notification is consumed at
+    // the guard-free tail (`replay_after`'s consumption point), never here.
+    let mut cleared_after: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let _skip_iteration = 'admission: {
         let membership_lock = group_membership_lock(relay_state, &group_id_str).await;
         let _membership_guard = membership_lock.lock().await;
@@ -2789,6 +2803,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 Some(envelope_bytes),
                 None,
                 &mut replay_group_id,
+                &mut cleared_after,
                 true,
                 false,
             ))
@@ -3201,6 +3216,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 Some(envelope_bytes),
                 Some(admission_first_seen_ms),
                 &mut replay_group_id,
+                &mut cleared_after,
                 true, // lock_already_held
                 false,
             ))
@@ -3570,9 +3586,17 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
 
     // Finding 1: replay deferred until after lock release. The
     // replay acquires its own membership lock via _inner_serialized.
+    // #759 item 1: the relay path's durable-clear consumption — the
+    // membership lock is released above, so this is the guard-free point.
     if let Some(gid) = replay_after {
-        replay_pending_causal_approvals(relay_state, &gid).await;
+        let mut replay_cleared = std::collections::BTreeSet::new();
+        replay_pending_causal_approvals(relay_state, &gid, &mut replay_cleared).await;
+        cleared_after.extend(replay_cleared);
     }
+    // Consumed unconditionally: a witness apply can clear durably with no
+    // replayable approvals at all (`replay_after` is None), and the resume
+    // must still fire.
+    routes::named_groups::resume_task_ingest_after_durable_clear(relay_state, &cleared_after).await;
 }
 
 // ---------------------------------------------------------------------------

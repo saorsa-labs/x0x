@@ -5820,6 +5820,7 @@ async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> R
             None,
             None,
             &mut replay_group_id,
+            &mut std::collections::BTreeSet::new(),
             true,
             true,
         ),
@@ -5913,5 +5914,247 @@ async fn adr0066_adoption_clear_declines_a_no_anchor_marker() -> Result<()> {
         "ADR-0066 §2: an attestation-anchored adoption past the evidenced revision still \
          DECLINES a `no_anchor` marker — the marker's own claim outranks the policy fence"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #759 behavioural oracles — the explicit owner-seal clear must reach a
+// real live group-scoped task list through the production notification, and
+// a NON-DURABLE seal must not. Staging reuses the twin-conflict fixture
+// (the same shape `adr0064_owner_axis_twin_conflict_quarantines_gates_and_
+// owner_seal_clears` proves clears through the seal route); the live task
+// list comes from the shared #759 staging helper in `owner_mandate`.
+// ---------------------------------------------------------------------------
+
+/// Stage the twin-conflict quarantine (marker revision 2, owner-axis,
+/// owner key held) plus a live buffered task list for `group_id`.
+async fn stage_seal_quarantine_with_live_list(
+    id_seed: u8,
+    list_suffix: &str,
+) -> Result<(
+    Arc<AppState>,
+    tempfile::TempDir,
+    String,
+    std::sync::Arc<x0x::crdt::TaskListSync>,
+    x0x::crdt::TaskId,
+)> {
+    let (state, dir, owner_kp) = owner_authority_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "7c".repeat(32);
+    let base = adr0064_sealed_owner_group_with_lineage(
+        &state,
+        &group_id,
+        owner_certified_policy(&owner_kp),
+    )
+    .await?;
+    let fork_a = adr0064_owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = adr0064_owner_seal_variant(&state, &base, "fork-b").await?;
+    let first = adr0064_apply_commit(
+        &state,
+        &group_id,
+        fork_a.commit_log.last().expect("sealed").commit.clone(),
+        "fork-a",
+    )
+    .await?;
+    assert!(first.is_ok(), "the first fork applies cleanly: {first:?}");
+    persist_named_groups_mutation(&state, |groups| {
+        let info = groups.get_mut(&group_id).expect("group");
+        *info = first.expect("applied");
+        true
+    })
+    .await?;
+    let second = adr0064_apply_commit(
+        &state,
+        &group_id,
+        fork_b.commit_log.last().expect("sealed").commit.clone(),
+        "fork-b",
+    )
+    .await?;
+    assert!(second.is_err(), "the conflicting twin must be refused");
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the twin conflict set the marker"
+    );
+
+    let (sync, _handle, _snapshot) = super::owner_mandate::stage_live_group_task_list(
+        &state,
+        &group_id,
+        list_suffix,
+        id_seed,
+        dir.path(),
+    )
+    .await;
+    let writer = parse_agent_id_hex(&authority_hex).expect("authority agent id");
+    let from = saorsa_gossip_types::PeerId::new([7; 32]);
+    let (task_id, delta) = super::owner_mandate::one_task_delta(id_seed, &writer, from);
+    assert!(
+        sync.admit_delta_for_testing(from, delta, Some(&writer), 128)
+            .await,
+        "the live marker holds the delta"
+    );
+    assert_eq!(sync.quarantined_buffer_len(), 1);
+    Ok((state, dir, group_id, sync, task_id))
+}
+
+/// #759 P2 regression 4 — EXPLICIT OWNER SEAL: the seal route's durable
+/// clear consumes its notification AFTER the helper returns (membership
+/// guard dropped) and drains the live handle. No listener exists, so the
+/// drain can only have come from the route's `fork_marker_cleared` arm.
+///
+/// Mutation control (remove the `if fork_marker_cleared { resume… }` block
+/// in `seal_group_state`): the delta stays buffered and every assertion
+/// below the 200 fails.
+#[tokio::test]
+async fn owner_seal_clear_notifies_the_live_task_handle_759() -> Result<()> {
+    let (state, _dir, group_id, sync, task_id) =
+        stage_seal_quarantine_with_live_list(0x71, "seal-clear").await?;
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "seal clears the quarantine: {body}");
+    assert!(!state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .expect("group")
+        .is_fork_quarantined());
+    assert_eq!(
+        sync.quarantined_buffer_len(),
+        0,
+        "the seal's durable-clear notification drained the live list"
+    );
+    assert!(
+        sync.read().await.get_task(&task_id).is_some(),
+        "the held delta merged once the seal cleared the marker"
+    );
+    let row = diagnostics_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.task_deltas_quarantine_applied, 1);
+    Ok(())
+}
+
+/// #759 P2 regression 4b — NON-DURABLE seal control: with the roster save
+/// injected `NotReplaced` the seal route answers 503, the marker is kept
+/// (the pre-durable rollback restores it), and NOTHING notifies — the held
+/// delta stays buffered. The notification is durability-gated, not
+/// seal-attempt-gated.
+///
+/// Mutation control (return `fork_marker_cleared = true` ahead of the
+/// Durable check, or consume the notification inside the helper under its
+/// membership guard): the drain assertions below would pass here and the
+/// test fails.
+#[tokio::test]
+async fn non_durable_owner_seal_does_not_notify_759() -> Result<()> {
+    let (state, _dir, group_id, sync, task_id) =
+        stage_seal_quarantine_with_live_list(0x72, "seal-nondurable").await?;
+    let _fault = set_save_fault(&state, SaveFault::NotReplaced);
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    drop(_fault);
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the non-durable seal refuses: {body}"
+    );
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the rollback kept the marker"
+    );
+    assert_eq!(
+        sync.quarantined_buffer_len(),
+        1,
+        "no notification: the delta stays buffered"
+    );
+    assert!(sync.read().await.get_task(&task_id).is_none());
+    let row = diagnostics_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
+    Ok(())
+}
+
+/// #759 P2 r2 — VISIBLE-BUT-NOT-DURABLE owner-seal control, distinct from
+/// the `NotReplaced` refusal above: `ReplacedNotDurableAfterWriteThenError`
+/// lets the seal's roster write HAPPEN, so the cleared-marker candidate is
+/// VISIBLE (memory and disk hold it) while the parent-dir fsync is reported
+/// failed and the fault degrades so the corrective re-save cannot become
+/// Durable. The route still answers 503, the durability-confirmation flag
+/// is raised, and the `fork_marker_cleared` notification is withheld —
+/// although the live marker is absent and a replacement is visible, the
+/// helper's `Ok` tuple (which carries the flag) is never built.
+///
+/// Discriminating mutation controls: key the route's resume off the live
+/// marker's absence, or off "a replacement happened", or return
+/// `fork_marker_cleared = true` ahead of the `Durable` check — each would
+/// drain the held delta here and fail the withheld-effect assertions.
+/// Only the Durable-gated boolean draws the line this test and its
+/// `NotReplaced` sibling both hold.
+#[tokio::test]
+async fn replaced_not_durable_owner_seal_withholds_the_notification_759() -> Result<()> {
+    let (state, _dir, group_id, sync, task_id) =
+        stage_seal_quarantine_with_live_list(0x73, "seal-rnd").await?;
+    let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurableAfterWriteThenError);
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    drop(_fault);
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the visible-but-not-durable seal refuses: {body}"
+    );
+    // The VISIBLE CANDIDATE — the state that distinguishes this control
+    // from the NotReplaced refusal above (which restores the marker).
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the Watson ruling keeps the visible replacement: the cleared \
+         candidate is what memory and disk hold"
+    );
+    assert!(
+        state
+            .named_groups_requires_durability_confirmation
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the durability-confirmation flag is raised"
+    );
+    assert_eq!(
+        sync.quarantined_buffer_len(),
+        1,
+        "no notification despite the absent live marker: the delta stays buffered"
+    );
+    assert!(sync.read().await.get_task(&task_id).is_none());
+    let row = diagnostics_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
     Ok(())
 }

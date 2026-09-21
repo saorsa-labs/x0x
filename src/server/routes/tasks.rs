@@ -442,6 +442,37 @@ pub(in crate::server) fn install_task_ingest_gate(
     }));
 }
 
+/// #759: every spelling of `group_id` a group-scoped task-list id could carry
+/// for the group the id resolves to — the id itself, the resolved map key,
+/// the stable id, and every map key that shares that stable id (an
+/// alias-keyed store holds sibling spellings). A task-list id embeds the
+/// spelling its creator used (`TaskQuarantineIngestGate`'s docs), so an
+/// exact-string match against any ONE spelling — the manual route's stable
+/// id, the apply path's map key — can silently miss a list that is bound to
+/// the very group whose marker just cleared. Resolved through the one
+/// resolver's rule (exact key, then stable id); unresolvable ids keep only
+/// themselves, preserving the pre-#759 exact-match behavior for a record
+/// this node no longer holds.
+pub(in crate::server) fn group_task_resume_spellings(
+    groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut spellings = std::collections::BTreeSet::new();
+    spellings.insert(group_id.to_string());
+    let Some((map_key, info)) = crate::server::resolve_group_entry_locked(groups, group_id) else {
+        return spellings;
+    };
+    let stable = info.stable_group_id().to_string();
+    spellings.insert(map_key.to_string());
+    spellings.insert(stable.clone());
+    for (key, sibling) in groups {
+        if sibling.stable_group_id() == stable {
+            spellings.insert(key.clone());
+        }
+    }
+    spellings
+}
+
 /// ADR-0068 D2: apply the deltas held for `group_id`'s task lists now that its
 /// marker is gone. Returns how many deltas were applied across all its lists.
 ///
@@ -449,18 +480,38 @@ pub(in crate::server) fn install_task_ingest_gate(
 /// `TASK_QUARANTINE_DRAIN_POLL_SECS`; calling this from the clear route makes an
 /// operator's manual clear take effect at once instead, which is the difference
 /// between "the list caught up while I watched" and "the list looked stuck for
-/// another five seconds". The poll remains the guarantee — it covers every OTHER
-/// way a marker clears (metadata apply, explicit owner seal, rollback arms),
-/// which is why the drain is observed rather than hooked at each of them.
+/// another five seconds". Since #759 the same accelerator runs after the
+/// OWNER-ANCHORED clears that fire inside the metadata-apply machinery and the
+/// explicit owner seal route — via a durable-clear notification propagated to
+/// callers that have released every membership/roster/persistence guard —
+/// because the poll only arms while the buffer is NON-empty: with an empty
+/// buffer a clear left the listener's captured authorized-agent set stale
+/// indefinitely (until rehydrate), and the drain's empty-buffer arm is what
+/// refreshes it. The poll remains the guarantee for every other clear writer.
+///
+/// `group_id` may be any spelling: matching runs over
+/// [`group_task_resume_spellings`], so an alias-keyed list is not lost to
+/// exact-string filtering. Residual: a list whose scoped id carries a spelling
+/// that is no longer resolvable in the map (a pruned alias) matches only that
+/// spelling — its gate already resolves nothing either, so such a list is
+/// outside containment bookkeeping entirely.
 ///
 /// **Must be called with NO `named_groups` guard held.** It awaits each list's
 /// CRDT write lock, and the ingest gate takes `named_groups.read()` inside that
 /// lock; the lock order is `TaskList` → `named_groups` (see `admit_or_buffer`),
-/// so holding the roster lock here would invert it.
+/// so holding the roster lock here would invert it. The drain itself is a
+/// #759 lifecycle section per list (see `resume_quarantined_ingest`), so it is
+/// also serialized against a draining retire of the same list.
 pub(in crate::server) async fn resume_group_task_ingest(
     state: &Arc<AppState>,
     group_id: &str,
 ) -> usize {
+    // Resolve the spellings under one brief read, then release: the drain
+    // below must not hold the roster guard (lock order above).
+    let spellings = {
+        let groups = state.named_groups.read().await;
+        group_task_resume_spellings(&groups, group_id)
+    };
     // Snapshot the matching handles, then release the registry lock: the drain
     // itself takes per-list CRDT locks and must not hold the map meanwhile.
     let handles: Vec<x0x::TaskListHandle> = {
@@ -468,8 +519,9 @@ pub(in crate::server) async fn resume_group_task_ingest(
         lists
             .iter()
             .filter(|(id, _)| {
-                parse_group_scoped_task_list_id(id)
-                    .is_some_and(|scoped| !scoped.is_malformed() && scoped.group_id == group_id)
+                parse_group_scoped_task_list_id(id).is_some_and(|scoped| {
+                    !scoped.is_malformed() && spellings.contains(&scoped.group_id)
+                })
             })
             .map(|(_, handle)| handle.clone())
             .collect()
@@ -685,8 +737,19 @@ pub(in crate::server) async fn create_task_list(
                 // Roll back AND stop the discarded handle's sync — its
                 // bootstrap requester is infinite while unconverged
                 // (issue #238) and would otherwise chatter until shutdown.
-                if let Some(h) = state.task_lists.write().await.remove(&id) {
-                    h.cancel_sync();
+                // #759: the draining retire, so "rolled back" also means
+                // "no in-flight merge or snapshot write lands afterwards".
+                // The registry guard is dropped BEFORE awaiting the drain:
+                // a receive section takes no registry lock, so this is
+                // safety, not correctness — but holding the map across the
+                // drain would stall every other task-list route for the
+                // length of one merge section. The section's lock order is
+                // `lifecycle` -> `TaskList` write -> `named_groups` read
+                // (-> persist gate -> `TaskList` read); none of those is
+                // held here.
+                let discarded = state.task_lists.write().await.remove(&id);
+                if let Some(h) = discarded {
+                    h.cancel_sync_and_drain().await;
                 }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1137,5 +1200,68 @@ mod tests {
         let typo =
             serde_json::from_str::<UpdateTaskRequest>(r#"{"action":"claim","fence_tokn":"1:2"}"#);
         assert!(typo.is_err(), "typo'd field name must be rejected");
+    }
+
+    // ── group_task_resume_spellings (#759): an alias-keyed task list must
+    // not be lost to exact-string filtering when the resume is keyed by a
+    // different spelling of the same group.
+
+    /// Two map spellings of ONE group: the map key `alias-key` and the
+    /// stable id `stable-id` (an alias-keyed store holds siblings). The
+    /// MLS group id IS the stable id (`GroupInfo::new` pins genesis to it),
+    /// so `mls_group_id = "stable-id"` for both entries.
+    fn spellings_map() -> std::collections::HashMap<String, x0x::groups::GroupInfo> {
+        let creator = x0x::identity::AgentId([7; 32]);
+        let mut map = std::collections::HashMap::new();
+        let alias = x0x::groups::GroupInfo::new(
+            "alias".to_string(),
+            "alias-keyed spelling".to_string(),
+            creator,
+            "stable-id".to_string(),
+        );
+        let canonical = x0x::groups::GroupInfo::new(
+            "canonical".to_string(),
+            "stable-id spelling".to_string(),
+            creator,
+            "stable-id".to_string(),
+        );
+        map.insert("alias-key".to_string(), alias);
+        map.insert("stable-id".to_string(), canonical);
+        map
+    }
+
+    #[test]
+    fn spellings_from_the_stable_id_reach_the_alias_key() {
+        let map = spellings_map();
+        let spellings = group_task_resume_spellings(&map, "stable-id");
+        assert_eq!(
+            spellings,
+            std::collections::BTreeSet::from(["alias-key".to_string(), "stable-id".to_string()]),
+            "a resume keyed by the stable id must also match a list whose scoped \
+             id carries the alias spelling"
+        );
+    }
+
+    #[test]
+    fn spellings_from_an_alias_key_reach_the_stable_id() {
+        let map = spellings_map();
+        let spellings = group_task_resume_spellings(&map, "alias-key");
+        assert_eq!(
+            spellings,
+            std::collections::BTreeSet::from(["alias-key".to_string(), "stable-id".to_string()]),
+            "a resume keyed by the apply path's map-key spelling must also match \
+             a list whose scoped id carries the stable id"
+        );
+    }
+
+    #[test]
+    fn spellings_for_an_unknown_group_keep_only_the_id_itself() {
+        let map = spellings_map();
+        let spellings = group_task_resume_spellings(&map, "pruned-alias");
+        assert_eq!(
+            spellings,
+            std::collections::BTreeSet::from(["pruned-alias".to_string()]),
+            "an unresolvable spelling keeps the pre-#759 exact-match behavior"
+        );
     }
 }

@@ -150,7 +150,11 @@ pub struct GroupCounters {
     pub fork_quarantine_refusals: u64,
     /// ADR-0068 D2: inbound peer task-CRDT deltas HELD (not applied) because
     /// this group's fork-quarantine marker is live. The CRDT stays
-    /// byte-identical while this climbs.
+    /// byte-identical while this climbs — from the first delta that observes
+    /// the marker: the live admission path is deliberately unpinned, so at
+    /// most one already-admitted delta per listener can still merge just
+    /// after the marker installs (the accepted residual stated at
+    /// `crdt/sync.rs::admit_or_buffer`).
     pub task_deltas_quarantine_buffered: u64,
     /// ADR-0068 D2: buffered task deltas DROPPED because the per-list bound
     /// (1024 deltas / 1 MiB) was reached — oldest first. Not silent loss:

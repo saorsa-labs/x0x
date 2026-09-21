@@ -15623,6 +15623,16 @@ impl TaskListHandle {
         self.sync.cancel_sync();
     }
 
+    /// #759: [`cancel_sync`](Self::cancel_sync) plus a wait for every
+    /// in-flight receive section (merge and snapshot persist) to finish —
+    /// the draining retire. Callers that can await and hold no lock a
+    /// receive section takes (no `TaskList` guard, no persist gate, no
+    /// `named_groups` guard) should prefer this when they remove the handle;
+    /// plain `cancel_sync` leaves the documented one-section residual.
+    pub async fn cancel_sync_and_drain(&self) {
+        self.sync.cancel_sync_and_drain().await;
+    }
+
     /// Generate a fresh per-replica epoch at handle construction.
     ///
     /// Uses a CSPRNG incarnation nonce (64-bit random from `OsRng`) so a
@@ -15718,13 +15728,19 @@ impl TaskListHandle {
     ///
     /// Called by the manual clear route
     /// (`server::routes::tasks::resume_group_task_ingest`) so an operator's
-    /// clear takes effect at once, and by the deterministic fixtures. The
+    /// clear takes effect at once; by the #759 durable-clear notification
+    /// after the OWNER-ANCHORED clears that live inside locks the resume
+    /// helper must not be called under (the metadata-apply machinery and the
+    /// explicit owner seal route); and by the deterministic fixtures. The
     /// listener's own poll is the GUARANTEE — it covers every other way a
     /// marker clears — so this is an accelerator, never the only trigger.
     ///
     /// Applies nothing if a marker is live again, or if the ADR-0067 marker
     /// identity moved since the drain decided: the deltas stay buffered, in
     /// order, for the next observation.
+    ///
+    /// #759: fenced like the listener's receive sections — a retired list
+    /// answers 0 and applies nothing.
     pub async fn resume_quarantined_ingest(&self) -> usize {
         self.sync.resume_quarantined_ingest().await
     }
@@ -15734,6 +15750,37 @@ impl TaskListHandle {
     #[must_use]
     pub fn quarantined_buffer_len(&self) -> usize {
         self.sync.quarantined_buffer_len()
+    }
+
+    /// Test-only: park this list's ADR-0068 drain poll far out so a fixture
+    /// can prove a drain came from the explicit resume path, never the
+    /// timer (#759 notification fixtures).
+    #[cfg(test)]
+    pub fn set_drain_poll_millis_for_testing(&self, millis: u64) {
+        self.sync.set_drain_poll_millis(millis);
+    }
+
+    /// Test-only: wrap an explicitly constructed
+    /// [`TaskListSync`](crdt::TaskListSync) as a live handle. The #759
+    /// behavioural fixtures build the sync over a loopback-only pub/sub (no
+    /// seeds, no discovery) and register the handle in the test
+    /// `AppState`'s task-list registry, so the production
+    /// resume/notification wiring runs against a real group-scoped list
+    /// without the daemon's gossip runtime.
+    #[cfg(test)]
+    pub fn task_list_handle_for_testing(
+        sync: std::sync::Arc<crdt::TaskListSync>,
+        agent_id: identity::AgentId,
+        peer_id: saorsa_gossip_types::PeerId,
+        signing: std::sync::Arc<crate::gossip::SigningContext>,
+    ) -> Self {
+        Self {
+            sync,
+            agent_id,
+            peer_id,
+            replica_epoch: Self::fresh_epoch(),
+            signing,
+        }
     }
 
     /// Test-only: override the per-replica epoch so a pre-restart fence token
