@@ -152,6 +152,37 @@ jobs:
           name: test-results
           path: target/nextest/
 
+
+      # Run after the workspace artifact is uploaded so this nextest invocation
+      # cannot replace the full-suite results kept above.
+      - name: Voice pipeline acceptance
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        env:
+          X0X_ISOLATION_ROLE: voice-pipeline-acceptance
+          X0X_RUNTIME_TIMEOUT_SECONDS: 180
+        shell: bash
+        run: |
+          voice_artifact="${RUNNER_TEMP}/voice-pipeline"
+          mkdir -p -- "$voice_artifact"
+          set +e
+          RUNNER_TEMP="$voice_artifact" bash scripts/ci/nextest-isolated.sh --locked --all-features --test voice_e2e -- \
+            --run-ignored ignored-only --no-tests=fail \
+            -E 'test(=voice_pipeline_delivers_decodable_audio)' \
+            >"$voice_artifact/voice-pipeline.log" 2>&1
+          status=$?
+          set -e
+          cat "$voice_artifact/voice-pipeline.log"
+          printf '{"native_exit":%d}\n' "$status" >"$voice_artifact/voice-pipeline-exit.json"
+          exit "$status"
+
+      - name: Upload voice pipeline results
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        uses: actions/upload-artifact@v5
+        with:
+          name: voice-pipeline-results
+          path: ${{ runner.temp }}/voice-pipeline/
+          if-no-files-found: error
+
   signing-path-100k:
     name: Signing path 100k acceptance
     runs-on: ubuntu-latest

@@ -3,7 +3,8 @@
 //! Asserts the full 1:1 pipeline the `voice_call` example demonstrates:
 //! real Opus encode → `AudioDatagram` wire framing → `X0xLinkTransport`
 //! Audio lane → jitter buffer → Opus decode, between two in-process
-//! agents on loopback. 250 frames (5 s): ≥99 % delivered post-jitter,
+//! agents on loopback. 250 frames paced at 20 ms/frame (5 s of real-time
+//! traffic, matching the `voice_call` demo): ≥99 % delivered post-jitter,
 //! decoded tone dominates an off-band frequency (SNR sanity vs the
 //! synthesized source), p95 one-way frame latency < 100 ms.
 //!
@@ -47,7 +48,7 @@ fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
             || message.contains("network initialization failed"))
 }
 
-async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
+async fn build_agent(dir: &TempDir, name: &str) -> x0x::Agent {
     match x0x::Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
         .with_agent_key_path(dir.path().join(format!("{name}-agent.key")))
@@ -57,8 +58,11 @@ async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
         .build()
         .await
     {
-        Ok(agent) => Some(agent),
-        Err(e) if is_network_bind_permission_error(&e) => None,
+        Ok(agent) => agent,
+        Err(e) if is_network_bind_permission_error(&e) => panic!(
+            "E2E prerequisite failed: {name} cannot bind loopback UDP ({e}); \
+             run this ignored integration test in an environment that permits loopback UDP bind"
+        ),
         Err(e) => panic!("agent build failed: {e}"),
     }
 }
@@ -101,9 +105,9 @@ fn discovered_agent(
     }
 }
 
-async fn trusted_pair(dir: &TempDir) -> Option<(Arc<x0x::Agent>, Arc<x0x::Agent>)> {
-    let alice = Arc::new(build_agent(dir, "alice").await?);
-    let bob = Arc::new(build_agent(dir, "bob").await?);
+async fn trusted_pair(dir: &TempDir) -> (Arc<x0x::Agent>, Arc<x0x::Agent>) {
+    let alice = Arc::new(build_agent(dir, "alice").await);
+    let bob = Arc::new(build_agent(dir, "bob").await);
     alice.join_network().await.expect("alice joins");
     bob.join_network().await.expect("bob joins");
     let alice_network = alice.network().expect("alice network").clone();
@@ -117,14 +121,21 @@ async fn trusted_pair(dir: &TempDir) -> Option<(Arc<x0x::Agent>, Arc<x0x::Agent>
     let bob_peer = ant_quic::PeerId(bob.machine_id().0);
     let alice_peer = ant_quic::PeerId(alice.machine_id().0);
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut connected = false;
     while Instant::now() < deadline {
         if alice_network.is_connected(&bob_peer).await
             && bob_network.is_connected(&alice_peer).await
         {
+            connected = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        connected,
+        "bilateral transport connection not observed within 10 s; \
+         failing before discovery/signaling setup"
+    );
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -136,7 +147,7 @@ async fn trusted_pair(dir: &TempDir) -> Option<(Arc<x0x::Agent>, Arc<x0x::Agent>
     bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr, now_secs))
         .await;
     bob.set_contact_trusted_for_testing(alice.agent_id()).await;
-    Some((alice, bob))
+    (alice, bob)
 }
 
 fn tone_frame(frame_idx: usize, samples: usize) -> Vec<i16> {
@@ -176,9 +187,7 @@ fn now_ms() -> u64 {
 #[ignore = "two-agent loopback voice pipeline; binds UDP + waits on convergence. Integration tier."]
 async fn voice_pipeline_delivers_decodable_audio() {
     let dir = TempDir::new().expect("tmpdir");
-    let Some((alice, bob)) = trusted_pair(&dir).await else {
-        return;
-    };
+    let (alice, bob) = trusted_pair(&dir).await;
 
     let mut alice_link = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id());
     let mut bob_link = X0xLinkTransport::new(Arc::clone(&bob), alice.agent_id());
@@ -234,7 +243,13 @@ async fn voice_pipeline_delivers_decodable_audio() {
 
     let samples = samples_per_20ms(SampleRate::Hz48000);
     let mut encoder = OpusEncoder::new(OpusEncoderConfig::default()).expect("encoder");
+    // Pace like the demo's real-time sender: one frame per 20 ms tick.
+    // `Delay` (not the default `Burst`) so a slow encode/send never emits a
+    // catch-up burst — the latency assertions hold under the demo's shape.
+    let mut interval = tokio::time::interval(Duration::from_millis(20));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     for seq in 0..FRAMES {
+        interval.tick().await;
         let frame = AudioFrame {
             data: tone_frame(seq, samples),
             sample_rate: SampleRate::Hz48000,
