@@ -203,6 +203,14 @@ invalid evidence (#656).
 
 Verify rate = Δ(`inner_envelope_verify.count` + `pubsub_stages.verify.count`) / Δ`uptime_secs`.
 
+That combined rate is an **upper bound** on ML-DSA operations per second, not
+an exact count. The two counters draw the line differently: the outer
+`pubsub_stages.verify` stage times the whole saorsa-gossip verify call, so its
+`count` INCLUDES frames whose public key or signature is malformed and fail
+before any cryptography runs, whereas `inner_envelope_verify.count` excludes
+those. Conversely, outer frames rejected on the header version / payload-hash
+shape check return before the stage timer is recorded and are counted nowhere.
+
 `inner_envelope_verify` counts one observation per call that reaches the
 cryptographic verify. Envelopes rejected earlier (malformed key or signature,
 agent-id/public-key mismatch) cost no ML-DSA work and are not counted. The
@@ -211,8 +219,10 @@ points, not only gossip delivery.
 
 **Not covered by either verify counter:** presence-beacon verifies inside
 `saorsa-gossip-presence` (Bulk lane); application-layer verifies that run after
-delivery (identity announcements, agent/group cards, DM envelopes, revocations,
-KV and group state commits); and QUIC handshake verifies in `ant-quic`. Queue
+delivery (e.g., not exhaustive: identity announcements, agent/group cards, DM
+envelopes, revocations, KV and group state commits, CRDT provenance, forward
+attestations, delegation and owner-mandate certificates); and QUIC handshake
+verifies in `ant-quic`. Queue
 *age* is not measured — only depth.
 
 ## API-unserved watchdog (#384)
