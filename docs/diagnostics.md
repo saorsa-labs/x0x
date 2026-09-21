@@ -180,6 +180,41 @@ counts capability adverts and digest extensions that were dropped by the
 freshness pre-check (#674) without an ML-DSA-65 verify because the store
 already held state at least as new.
 
+## Soak instrumentation (#288)
+
+All fields below are on `GET /diagnostics/gossip`. Every counter is cumulative
+and monotonic for the life of the process, so a rate needs two samples and the
+clock: always record `uptime_secs` with a baseline, and discard a pair whose
+`uptime_secs` went backwards (the daemon restarted, e.g. a self-update).
+Use these rates, not host `%CPU`, for fleet acceptance — co-tenant `%CPU` is
+invalid evidence (#656).
+
+| JSON path | Meaning |
+|---|---|
+| `uptime_secs` | Seconds since this daemon started. |
+| `inner_envelope_verify.count` | x0x inner-envelope (V2/V3 signed pub/sub message) ML-DSA-65 verifies executed, successful and failed. |
+| `inner_envelope_verify.failed` | Subset of `count` whose signature did not verify. |
+| `inner_envelope_verify.total_ns` | Cumulative wall-clock nanoseconds inside those verify calls. |
+| `pubsub_stages.verify.count`, `.total_ns`, `.max_ns` | saorsa-gossip outer-frame verify stage (header ML-DSA-65 verify plus the ADR-012 payload-hash check), successful and failed. Duplicates dropped before verify are in `pubsub_stages.eager_duplicate_dropped_pre_verify`. |
+| `dispatcher.<lane>.received`, `.completed`, `.timed_out` | Per-lane handler counts; `<lane>` is `pubsub`, `membership` or `bulk`. |
+| `dispatcher.<lane>.total_elapsed_ns`, `.max_elapsed_ms` | Cumulative and worst handler wall-clock time. Mean = `total_elapsed_ns / (completed + timed_out)`. |
+| `dispatcher.<lane>.over_100ms_count`, `.over_1s_count`, `.over_5s_count`, `.over_30s_count` | Cumulative (not disjoint) counts of handler invocations at or above each threshold. |
+| `dispatcher.recv_depth.<lane>.latest`, `.max`, `.capacity` | Receive-queue depth sampled at dequeue. |
+
+Verify rate = Δ(`inner_envelope_verify.count` + `pubsub_stages.verify.count`) / Δ`uptime_secs`.
+
+`inner_envelope_verify` counts one observation per call that reaches the
+cryptographic verify. Envelopes rejected earlier (malformed key or signature,
+agent-id/public-key mismatch) cost no ML-DSA work and are not counted. The
+counters are process-wide, so they include every caller of the decode entry
+points, not only gossip delivery.
+
+**Not covered by either verify counter:** presence-beacon verifies inside
+`saorsa-gossip-presence` (Bulk lane); application-layer verifies that run after
+delivery (identity announcements, agent/group cards, DM envelopes, revocations,
+KV and group state commits); and QUIC handshake verifies in `ant-quic`. Queue
+*age* is not measured — only depth.
+
 ## API-unserved watchdog (#384)
 
 The daemon arms a self-probe watchdog at startup: a dedicated OS thread

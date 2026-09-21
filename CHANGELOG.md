@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Soak instrumentation on `GET /diagnostics/gossip` (#288, #656).** The 24 h
+  soak could not test two hypotheses because the counters did not exist, and
+  co-tenant `%CPU` is invalid acceptance evidence. Added: `uptime_secs` (the
+  clock every cumulative-counter baseline needs);
+  `inner_envelope_verify.{count,failed,total_ns}`, monotonic process-lifetime
+  counters for x0x inner-envelope ML-DSA-65 verifies, counted once per call
+  that reaches the cryptographic verify (failures included, pre-crypto rejects
+  excluded); and `dispatcher.<lane>.over_100ms_count`, a sub-second bucket that
+  separates a lane slow across the board from one hitting a rare 5 s cliff.
+  The saorsa-gossip outer-frame verify was already exposed as
+  `pubsub_stages.verify.{count,total_ns}` and is now documented. Not covered:
+  presence-beacon verifies inside saorsa-gossip, application-layer verifies
+  after delivery, and QUIC handshake verifies. See `docs/diagnostics.md`.
+
 ### Changed
 
 - **A fork-quarantined group's history is no longer evicted by the retention
