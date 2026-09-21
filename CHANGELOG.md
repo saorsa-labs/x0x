@@ -43,7 +43,9 @@ All notable changes to this project will be documented in this file.
     move the CRDT's winner, while the local operator was refused. Inbound deltas
     for a quarantined group's list are now **held in arrival order** (1024
     deltas / 1 MiB per list; oldest dropped and counted) with the CRDT left
-    byte-identical, and applied in order once the marker is gone. Reads keep
+    byte-identical from the first delta that observes the marker (the unpinned live
+    path leaves an accepted residual of one already-admitted delta per listener —
+    see below), and applied in order once the marker is gone. Reads keep
     serving the frozen state with the existing `fork_quarantined` annotation.
     The buffer is process-local: a restart converges by anti-entropy instead.
     Group **metadata** ingest (row 24) is untouched, so the clearing commit still
@@ -53,8 +55,10 @@ All notable changes to this project will be documented in this file.
     clear path is picked up by the listener within 5 s. The drain re-checks the
     ADR-0067 token (marker half) in the same critical section as the merge, so a
     marker re-installing mid-drain abandons it with the deltas still buffered in
-    order, and the admission decision is taken under the list write lock so
-    nothing can slip through between deciding and merging. A single delta larger
+    order, and the admission decision is taken under the list write lock, so no
+    other task-list writer can interleave between deciding and merging — though the
+    gate's roster read is released before the verdict, which is the one-delta
+    residual named below. A single delta larger
     than 1 MiB is dropped rather than held, so the per-list bound is the stated
     one and not the transport's 4 MiB frame cap.
 - **Three task-sync defects in that quarantine hold, found by an independent
@@ -78,7 +82,7 @@ All notable changes to this project will be documented in this file.
   - **The drain re-authorizes against the roster the clearing commit left behind
     (finding 4).** `authorized_agents` was snapshotted at create/rehydration, so
     buffered deltas from a member the *clearing* commit removed were merged
-    against the contested roster. `TaskIngestGate` gains `authorized_writers()`;
+    against the contested roster. `TaskIngestGate` gains `with_pinned_roster`;
     `drain_quarantine_buffer` refreshes the set from the live roster inside the
     same critical section as the merge (before the ADR-0067 re-check, so that
     re-check is still the last thing before the first merge) and skips entries

@@ -14101,7 +14101,8 @@ impl Agent {
 /// returned, i.e. after `TaskListSync::start_with_spawner` had already subscribed
 /// and spawned the delta listener. Supplying them here installs them before that
 /// loop exists, which is the only ordering in which ADR-0068 D2's promise — a
-/// quarantined group's list is left byte-identical — holds through a restart.
+/// quarantined group's list is left byte-identical from the first delta that
+/// observes the marker — holds through a restart.
 ///
 /// Both fields are optional and independent: a list with no group binding passes
 /// [`TaskListBinding::default()`](Default::default) and behaves exactly as it did

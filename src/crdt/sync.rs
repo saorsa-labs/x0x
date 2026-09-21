@@ -642,9 +642,11 @@ pub(crate) async fn admit_or_buffer<'a>(
 ///    entry whose writer that roster no longer seats.
 ///
 /// Because the roster cannot be written while the pin is held, there is no window
-/// between the refresh and the merge at all — the compare-and-retry loop this
+/// between this drain's refresh and its merge — the compare-and-retry loop this
 /// replaces was only a probabilistic version of the same property, and could be
-/// starved indefinitely by revision churn (review r2, P1+P2 together). Abandoning
+/// starved indefinitely by revision churn (review r2, P1+P2 together). That
+/// statement is about the DRAIN only: the live admission path is unpinned by
+/// design and carries its own one-delta residual, stated at the admission step. Abandoning
 /// leaves the buffer intact, in order, for the next observation; nothing is ever
 /// half-applied, because the buffer is only emptied after the checks pass.
 ///

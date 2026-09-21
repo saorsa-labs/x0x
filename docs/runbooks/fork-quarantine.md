@@ -689,8 +689,8 @@ daemon now reads the group's facts first
 (`tasks.rs::group_task_list_binding`) and passes them to the `_bound`
 constructors, which install them before the listener is spawned. Nothing is
 different for a list with no group binding, and nothing an operator does changes:
-the visible effect is that a quarantined list is frozen *through* a restart, not
-from a few milliseconds after it.
+the visible effect is that a quarantined list is frozen *through* a restart,
+rather than from some way into it.
 Source: `src/server/crdt_subscriptions.rs::rehydrate_one`,
 `src/server/routes/tasks.rs::group_task_list_binding`,
 `src/lib.rs::Agent::create_task_list_persistent_bound`,
@@ -717,9 +717,12 @@ its `named_groups` read guard, derives the member set and the ADR-0067 token fro
 that single read, and the drain installs the set, filters the buffer and runs the
 whole merge loop synchronously while the guard is still held
 (`crdt/sync.rs::TaskIngestGate::with_pinned_roster`). A roster **writer** therefore
-cannot commit in the middle of a drain — it waits for one bounded batch (at most
-1024 merges / 1 MiB, no I/O, no signature checks, no persistence: the snapshot is
-written after the guard is released). This replaced an earlier
+cannot commit in the middle of a drain — it waits for one bounded batch: at most
+1024 deltas totalling at most 1 MiB, CPU-only, with no I/O and no persistence (the
+snapshot is written after the guard is released). That batch is not free per delta
+— the merge verifies each delta's checkbox attestations and brackets it with two
+resolved-state fingerprint scans — so the bound is those merges, not a wall-clock
+figure. This replaced an earlier
 derive-release-compare-retry design that closed the same window only
 probabilistically and could be abandoned indefinitely by sustained roster
 revision churn, which — with admission coupled to the buffer, below — would have
