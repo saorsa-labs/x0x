@@ -926,6 +926,16 @@ struct TaskPersistCtx {
     /// node controls); remote-delta merges continue (replication is not
     /// wedged).
     degraded: std::sync::atomic::AtomicBool,
+    /// #759 CI repair, test-only: publishes the list version of every
+    /// snapshot commit as `save_task_list` SUCCEEDS — strictly after the
+    /// durable write, never at merge time — so a test awaiting it observes
+    /// persistence COMPLETION, not in-memory merge visibility (the listener
+    /// releases the TaskList write guard before it persists). Per-instance:
+    /// created with the context in `set_persistence`, never global. The
+    /// version-skip and failure paths of `persist_snapshot` send nothing, so
+    /// a received version means exactly those bytes were committed.
+    #[cfg(test)]
+    persisted: tokio::sync::watch::Sender<u64>,
 }
 
 /// Capture the list's `(version, bytes)` under the list read lock and the
@@ -947,6 +957,12 @@ async fn persist_snapshot(task_list: &RwLock<TaskList>, ctx: &TaskPersistCtx) ->
         }
         ctx.storage.save_task_list(&ctx.list_id, &snapshot).await?;
         *last = Some(version);
+        // Test-only durable-write notification (#759 CI repair): fires
+        // strictly after the snapshot bytes were committed, so a waiter
+        // attributes it to this persist — never to the in-memory merge,
+        // which is already visible here.
+        #[cfg(test)]
+        let _ = ctx.persisted.send(version);
         Ok(())
     }
     .await;
@@ -1835,6 +1851,10 @@ impl TaskListSync {
                 list_id,
                 gate: tokio::sync::Mutex::new(None),
                 degraded: std::sync::atomic::AtomicBool::new(false),
+                // #759 CI repair: per-instance durable-commit
+                // notification — see `TaskPersistCtx::persisted`.
+                #[cfg(test)]
+                persisted: tokio::sync::watch::Sender::new(0),
             }));
         }
     }
@@ -4024,22 +4044,56 @@ mod tests {
     /// and snapshotted by a live listener, so the retired assertions below
     /// cannot pass merely because the delta was undeliverable or
     /// inadmissible.
+    ///
+    /// Oracle (#759 CI repair): the listener releases the TaskList write
+    /// guard BEFORE it persists, so observing the in-memory merge proves
+    /// nothing about the file — the old test did exactly that and raced the
+    /// snapshot write in CI. The wait below is the persist context's
+    /// per-instance commit notification, which `persist_snapshot` sends
+    /// strictly AFTER `save_task_list` succeeds; it is a real notification
+    /// (no polling, no yields) with a bounded failure path (the timeout),
+    /// and the version it carries must advance past the pre-publish durable
+    /// version, so a stale or merge-time signal cannot satisfy it.
+    ///
+    /// Mutation control: delete the listener's `persist_snapshot` call (or
+    /// make the write fail) and the notification never advances — the
+    /// bounded wait fails on its timeout, deterministically, regardless of
+    /// scheduling. Signalling at merge time instead would not help: the
+    /// reload assertion below reads the file the listener committed and
+    /// demands the queued delta's task in it, so an in-memory-only merge
+    /// cannot pass.
     #[tokio::test]
     async fn live_control_listener_merges_and_persists_a_queued_delta_759() {
         let dir = tempfile::tempdir().expect("dir");
-        let (sync, pubsub, snapshot) = retire_list_fixture("tasks/759-live-control", &dir).await;
+        let (sync, pubsub, _snapshot) = retire_list_fixture("tasks/759-live-control", &dir).await;
         let loops = start_list_joinable(&sync).await;
+        // Subscribe BEFORE the delta exists so no commit can slip past the
+        // wait, and pin the durable version the commit must advance past.
+        let ctx = sync.persist_ctx().expect("persist armed");
+        let mut persisted = ctx.persisted.subscribe();
+        let durable_before = *persisted.borrow();
         let task_id = publish_queued_task_delta(&sync, &pubsub, 0xB1).await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while sync.read().await.get_task(&task_id).is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            persisted.wait_for(|&v| v > durable_before),
+        )
         .await
-        .expect("control: a live listener merges the queued delta");
+        .expect("control: the merged delta's snapshot write landed")
+        .expect("the persist context outlives this wait");
         assert!(
-            snapshot.exists(),
-            "control: the merged delta's snapshot write landed"
+            sync.read().await.get_task(&task_id).is_some(),
+            "control: a live listener merges the queued delta"
+        );
+        // File existence alone is not the claim — any snapshot write (even
+        // an empty list's) would satisfy it. Reload the exact bytes the
+        // listener committed and demand the queued delta's task in them.
+        let reloaded = TaskListStorage::new(dir.path().to_path_buf())
+            .load_task_list(&list_id(1))
+            .await
+            .expect("the listener's snapshot must reload");
+        assert!(
+            reloaded.get_task(&task_id).is_some(),
+            "the persisted snapshot contains the queued delta's task"
         );
         sync.cancel_sync_and_drain().await;
         join_list_loops(loops).await;
