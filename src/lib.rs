@@ -17135,6 +17135,11 @@ impl KvStoreHandle {
         self.sync.with_persist_gate_held_for_test(during).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn receive_section_active_for_test(&self) -> bool {
+        self.sync.receive_section_active_for_test()
+    }
+
     /// Publish `delta` on the store topic as if a peer had (test trigger for
     /// a receive-path merge that does not go through a local write).
     #[cfg(test)]
@@ -17283,6 +17288,17 @@ impl KvStoreHandle {
     pub async fn retire_and_drain(&self) {
         self.sync.invalidate_secure_context();
         self.sync.cancel_sync_and_drain().await;
+    }
+
+    /// Whether this store's background receive sections run a TreeKEM
+    /// protector — a property of the ACTUAL sync, not of the plane a caller
+    /// is asking for. Those sections can wait on the group membership guard
+    /// while holding the lifecycle lock, so a caller holding that guard must
+    /// use [`retire`](Self::retire), never
+    /// [`retire_and_drain`](Self::retire_and_drain) (#757).
+    #[must_use]
+    pub fn is_treekem_protected(&self) -> bool {
+        self.sync.has_treekem_protector()
     }
 
     /// Tear down this replica's background sync loops (delta listener,

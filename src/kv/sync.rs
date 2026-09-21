@@ -2149,6 +2149,29 @@ impl KvStoreSync {
                         if local_agent_id.is_some_and(|me| me == sender) {
                             continue; // our own announce echoed back
                         }
+                        // Validate BEFORE the receive section (#757 r3): an
+                        // announce that would be rejected, or change
+                        // nothing, must not queue behind the listener's
+                        // merge + snapshot write — it would stall the state
+                        // requests behind it in this loop. `learn_ownership`
+                        // re-validates under the lock below.
+                        let effect = responder_store.read().await.check_ownership_announce(
+                            owner,
+                            &policy,
+                            policy_version,
+                            &sender,
+                        );
+                        match effect {
+                            Err(e) => {
+                                tracing::warn!(
+                                    "rejected KvStore ownership announcement from {}: {e}",
+                                    hex::encode(sender.as_bytes())
+                                );
+                                continue;
+                            }
+                            Ok(crate::kv::store::OwnershipAnnounceEffect::Stale) => continue,
+                            Ok(_) => {}
+                        }
                         // #757 lifecycle fence — see the listener. Scoped to
                         // this arm only: the state-serve arms publish on the
                         // network and never mutate the store.
@@ -2360,6 +2383,14 @@ impl KvStoreSync {
         self.cancel.cancel();
     }
 
+    /// Whether receive sections of THIS sync run a TreeKEM protector. Such a
+    /// section can wait on locks the protector takes (in the daemon: the
+    /// group membership guard) while holding the lifecycle lock, so a caller
+    /// holding one of those must not drain it (#757).
+    pub fn has_treekem_protector(&self) -> bool {
+        self.treekem_secure.is_some()
+    }
+
     /// [`cancel_sync`](Self::cancel_sync), then wait out any receive-path
     /// section already running (#757).
     ///
@@ -2536,6 +2567,12 @@ impl KvStoreSync {
             &retained,
         )
         .await
+    }
+
+    /// True while a background receive section holds the lifecycle lock.
+    #[cfg(test)]
+    pub(crate) fn receive_section_active_for_test(&self) -> bool {
+        self.lifecycle.try_lock().is_err()
     }
 
     /// Run `during` while this store's snapshot gate is held, so any
@@ -4891,6 +4928,106 @@ mod tests {
             .get("secret-key")
             .map(|e| e.value.clone());
         assert_eq!(value, Some(b"hush".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn rejected_owner_announce_does_not_wait_behind_a_receive_section() {
+        // WHY (#757 r3, Codex P2): the responder serves state requests from
+        // the same loop that handles owner announces. If an announce that
+        // will be REJECTED first queued for the lifecycle lock, any peer
+        // could stall this replica's state serving for as long as the
+        // listener's merge + snapshot write takes (here: parked forever).
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let sender = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        // Anchored owner is NOT the pub/sub signer, so the signer's control
+        // messages are a remote peer's, not our own echo.
+        let mut store = KvStore::new(
+            store_id(1),
+            "Test".to_string(),
+            agent(1),
+            AccessPolicy::Allowlisted,
+        )
+        .expect("kv store");
+        store.allow_writer(sender, &agent(1)).expect("allow signer");
+        let sync = KvStoreSync::new(
+            store,
+            Arc::clone(&pubsub),
+            "store/757-announce".to_string(),
+            peer(1),
+            Some(agent(1)),
+        )
+        .expect("kv sync");
+        let dir = tempfile::tempdir().expect("tempdir");
+        sync.set_persist_path(dir.path().join("store.bin"));
+        sync.persist().await.expect("baseline snapshot");
+        let mut side = pubsub.subscribe(sync.state_sync_topic()).await;
+        let loops = start_joinable(&sync).await;
+
+        let served = sync
+            .with_persist_gate_held_for_test(async {
+                let entry = KvEntry::new(
+                    "late-key".to_string(),
+                    b"late".to_vec(),
+                    "text/plain".to_string(),
+                );
+                let mut delta = KvStoreDelta::new(1);
+                delta
+                    .added
+                    .insert("late-key".to_string(), (entry, (peer(2), 1)));
+                sync.publish_delta(peer(2), delta).await.expect("publish");
+                // Barrier: merged, so the listener now sits in its receive
+                // section with the snapshot write parked on the gate.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while sync.read().await.get("late-key").is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("listener must merge the delta");
+
+                // Rejected: the verified sender is not the claimed owner.
+                let announce = KvSyncMessage::OwnerAnnounce {
+                    owner: agent(9),
+                    policy: AccessPolicy::Signed,
+                    policy_version: 7,
+                };
+                for message in [announce, KvSyncMessage::StateRequest { requester: peer(3) }] {
+                    pubsub
+                        .publish(
+                            sync.state_sync_topic(),
+                            bytes::Bytes::from(bincode::serialize(&message).expect("control")),
+                        )
+                        .await
+                        .expect("publish control");
+                }
+                // Safety net, not a sleep oracle: success is the served
+                // marker arriving; the bound only turns a stall into a FAIL.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while let Some(msg) = side.recv().await {
+                        if matches!(
+                            bincode::deserialize::<KvSyncMessage>(&msg.payload),
+                            Ok(KvSyncMessage::StateServed { .. }
+                                | KvSyncMessage::StateServedV2 { .. })
+                        ) {
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .await
+            })
+            .await;
+        assert_eq!(
+            served,
+            Ok(true),
+            "state request stalled behind a rejected owner announce"
+        );
+        assert_eq!(sync.read().await.owner(), Some(&agent(1)));
+        sync.cancel_sync_and_drain().await;
+        join_loops(loops).await;
     }
 
     /// Delegating protector whose `merge_main_record` parks on a gate AFTER

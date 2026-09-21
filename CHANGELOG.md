@@ -549,14 +549,20 @@ All notable changes to this project will be documented in this file.
   return no background merge, ownership update or snapshot write is in flight
   or can start (read-only state serves and the requester publish are outside
   the fence).
-  - **Drains:** the GSS and public cached-binding-mismatch paths in
-    `open_bound_*_store`, before the handle is unregistered.
-  - **Cannot drain (deadlock), still `retire()`:** the TreeKEM mismatch path
-    (callers hold the group membership guard that `merge_main_record` takes
-    inside a section); the secure-refresh hooks (they run inside a section:
-    listener holds lifecycle -> hook takes `kv_stores`);
-    `retire_group_kv_stores` and the registration rollback (hold `kv_stores` /
-    the membership guard).
+  - **Drains:** the cached-binding-mismatch arms of `open_bound_*_store`,
+    before the handle is unregistered — when the CACHED sync is GSS or public.
+    The choice follows the cached sync, not the requested plane: a TreeKEM ->
+    SignedPublic policy change keeps the topic, so any arm can find any sync.
+  - **Cannot drain (deadlock), still `retire()`:** a cached TreeKEM sync in any
+    mismatch arm (callers hold the group membership guard that the protector's
+    `open_record` / `merge_main_record` take inside a section); the
+    secure-refresh hooks (they run inside a section: listener holds lifecycle
+    -> hook takes `kv_stores`); `retire_group_kv_stores` and the registration
+    rollback (hold `kv_stores` / the membership guard).
+  - An owner announce is validated BEFORE the responder enters its section
+    (`KvStore::check_ownership_announce`), so a rejected or stale announce
+    never queues behind the listener's merge + snapshot write and cannot stall
+    the state requests behind it.
   - **Residual (#760):** after a non-draining `retire()`, one already-admitted
     section may still land its snapshot write, and can race a later re-open of
     the same snapshot path.
