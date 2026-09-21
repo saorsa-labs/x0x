@@ -20,8 +20,8 @@ KINDS = ("eager", "ihave", "iwant", "anti_entropy")
 BUS = "a746d680e31732d1"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-PUBSUB_VERSION = "0.5.83"
-PUBSUB_SHA = "7886ce7293eecce58e59be0fa48f1fee5262af7a9e4e02be305dc12e94166912"
+PUBSUB_VERSION = "0.5.84"
+PUBSUB_SHA = "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"
 
 
 class Inconclusive(ValueError):

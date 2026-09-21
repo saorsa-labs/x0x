@@ -152,6 +152,22 @@ announce/discovery/caps/release lane). The #501 meter premise therefore moves
 from 0.5.79 to **0.5.80**, checksum `2f019ae3c17a73197ff7c48b5078caa2d03b669b7c0b724e30d2037e44e868b6`.
 
 
+## 2026-09-21 — meter producer premise moved to saorsa-gossip-pubsub 0.5.84
+
+saorsa-gossip 0.5.84 publishes the pubsub fixes merged in PR #84
+(`IntentLimit` recovery-intent admission fairness, merge `8ea1cfd`) and
+PR #85 (zero disabled-limiter dispatch overhead and bounded late-offer
+catch-up, merge `5da7906`). Release PR #86 merged as `24882f2`. The #501
+meter producer premise therefore moves to **0.5.84**, checksum
+`ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3`.
+
+The checksum was independently verified against both the crates.io sparse
+index record (published 2026-09-21 18:35:55 UTC, not yanked) and the SHA-256
+of the downloaded
+`saorsa-gossip-pubsub-0.5.84.crate`. This dependency update makes the
+fixes available to x0x; it is not evidence that either delivery regression is
+fixed on the fleet. Runtime and fleet acceptance remain separate gates.
+
 ## 2026-09-18 — meter producer premise moved to saorsa-gossip-pubsub 0.5.83
 
 saorsa-gossip 0.5.83 carries the #504 slice-2 Leaf egress work

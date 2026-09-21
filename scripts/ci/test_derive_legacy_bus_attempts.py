@@ -77,17 +77,17 @@ class DerivationControls(unittest.TestCase):
         )
 
     def test_source_premise_drift_is_rejected(self):
-        cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.83"\n'
+        cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.84"\n'
         rust = (
-            b'pinned[0]["version"].as_str() != Some("0.5.83")\n'
+            b'pinned[0]["version"].as_str() != Some("0.5.84")\n'
             b' || pinned[0]["checksum"].as_str()\n'
-            b' != Some("7886ce7293eecce58e59be0fa48f1fee5262af7a9e4e02be305dc12e94166912")'
+            b' != Some("ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3")'
         )
         module.validate_source_premise(cargo, rust)
         for cargo_input, rust_input, code in (
-            (cargo.replace(b"=0.5.83", b"0.5.83"), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
-            (cargo, rust.replace(b"0.5.83", b"0.5.82", 1), "RUST_PUBSUB_VERSION_MISMATCH"),
-            (cargo, rust.replace(b"7886ce", b"0886ce", 1), "RUST_PUBSUB_SHA_MISMATCH"),
+            (cargo.replace(b"=0.5.84", b"0.5.84"), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (cargo, rust.replace(b"0.5.84", b"0.5.83", 1), "RUST_PUBSUB_VERSION_MISMATCH"),
+            (cargo, rust.replace(b"ed849e", b"0d849e", 1), "RUST_PUBSUB_SHA_MISMATCH"),
         ):
             with self.subTest(code=code), self.assertRaisesRegex(module.Inconclusive, code):
                 module.validate_source_premise(cargo_input, rust_input)

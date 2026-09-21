@@ -838,6 +838,177 @@ reachability as "not 424 and the ratchet moved" rather than as a 200, so the §4
 fixture stays uncoupled from this path's status. Note the §4 re-check already made
 this less reachable for a quarantined group, which refuses before the advance.
 
+**(h) Startup journal recovery could lift containment, and left lineage-free
+ordinary groups open — CLOSED (#732, third-model audit).** Two defects on the
+FILE-LEVEL recovery path, which runs before the in-memory roster loads and
+before any listener starts, so neither was visible to the live-path fixtures.
+
+*Marker erased by replay.* A TreeKEM transaction whose snapshot/cleanup step
+fails after the named save reached durability deliberately RETAINS both
+journals for forward replay (`named_groups.rs::persist_named_group_info` —
+"never discard a journal whose named half is durable"). The live record is then
+byte-equal to the journalled one, so the paired-replay verdict reads
+equal-revision/equal-hash and applies. A marker installed in the meantime is
+not part of that frontier — installing one advances neither `state_revision`
+nor `state_hash` — so the replay's wholesale record replacement silently
+DELETED a `no_anchor` quarantine that nothing re-installs automatically: **a
+restart lifted the containment.** The replay now carries the live marker, and
+the lineage `fork_evidence` record that justifies it, forward into the
+journalled record — resolved by both spellings, because at this point in
+startup there is no live map to resolve through. First-complete-wins is
+unchanged (the live half only fills an empty slot) and every other field still
+comes from the journal, so a group with no marker replays exactly as before.
+**What you see as an operator:** nothing new on a healthy node; on a contained
+one, a restart keeps the 409s and the marker's `observed_at_ms`, and the replay
+logs `#732: journal replay preserved the live fork-quarantine marker`.
+
+*Lineage-free ordinary groups unquarantined at startup.*
+`record_recovery_fork_evidence` returned immediately whenever invite lineage was
+absent — a named residual of ADR-0066 slice 2, which widened the LIVE apply
+fence only. So an authenticated equal-revision conflicting journal for a
+LOCALLY CREATED ordinary group moved the journals aside, startup continued, and
+the live group's data plane served both branches of a fork with no marker and no
+operator signal: the exact silence §2 exists to close. The recovery trigger now
+uses the SAME population predicate as the live apply hook
+(`named_groups.rs::fork_evidence_path_open`) and the same marker-only,
+first-complete-wins install as `named_groups.rs::install_fork_evidence`'s
+lineage-less arm, with `no_anchor: true`. **Authentication is unchanged and is
+the boundary of this widening:** only a journal commit that passes
+`named_groups.rs::fork_candidate_authenticated` (signature verify plus committer
+Active+Admin in the retained predecessor roster) installs anything, so a forged
+or stranger-signed journal cannot plant a never-auto-clearing marker — that
+would be a local denial of service. Owner-axis groups WITHOUT lineage keep the
+trigger ADR-0066's Migration table promised unchanged. The store loop also
+resolves the record by both spellings, so an alias-keyed store is no longer
+silently skipped. **What you see as an operator:** after a restart that finds a
+contested journal, an ordinary group can now be 409 `fork_quarantined` with
+`"no_anchor": true` where it previously served both branches — triage it exactly
+as §4.3c describes; the journals are still quarantined aside as before, so
+`docs/upgrade-system.md`'s journal guidance is unchanged. No schema or wire
+change: the marker's fields already carry `#[serde(default)]`.
+*Which containment state a replay writes (r2, cross-model review).* The first
+repair only FILLED an empty journal slot, which both reviewers independently
+showed is wrong in two directions. The rule now turns on the frontier:
+
+- **EQUAL journal frontier ⇒ the LIVE containment pair wins, its ABSENCE
+  included.** A manual clear advances no revision either
+  (`named_groups.rs::clear_group_quarantine` removes the marker and re-arms the
+  evidence gate without touching the chain), so a journal staged *before* a
+  clear replays at the same frontier *after* it — and "fill an empty slot"
+  wrote the stale marker straight back, silently undoing an operator's durable
+  clear. Two markers at one frontier had the journal's win, too. At one
+  committed frontier there is exactly one containment truth and it is the local
+  one. **Operator consequence:** a clear survives a restart; you do not have to
+  clear twice.
+- **Forward journal frontier ⇒ the live marker is ALWAYS carried. NO replayed
+  advance clears a quarantine.** Every live clear arm requires either the OWNER
+  USER KEY in hand (`groups/mod.rs::GroupInfo::clear_fork_quarantine_on_explicit_owner_seal`,
+  which explicitly rejects an ADR-0038 certificate *verdict* as an owner
+  anchor), a verified mandate-carrying commit
+  (`named_groups.rs::apply_named_group_metadata_event_inner_serialized`), or the
+  adoption walk's terminal verification
+  (`named_groups.rs::try_adopt_member_added_across_gap`). **None of that
+  material is on disk:** neither the owner user key nor an `OwnerMandate` is
+  persisted with a group record (`RetainedCommit` carries the commit, its roster
+  projection and its public meta; `GroupInfo` keeps only the observational
+  `mandate_capability` map). Two earlier attempts to approximate it were both
+  broken by review — trusting the journal's unsigned outer revision, then
+  trusting "signed by an agent the roster certifies under the policy owner".
+  The second fails because in an OwnerCertified group *every* seated
+  certificate binds the owner key and quarantine evicts nobody, so the FORKER
+  itself — Active, Admin, holding only its own agent key — can sign a valid
+  higher-revision **descendant of the contested head** and satisfy it.
+  Ancestry excludes the other existing branch; it cannot stop this branch being
+  extended. #732 therefore does not add clear provenance to the on-disk format
+  (that is a schema change owed its own ADR) and fails closed instead.
+  **Operator consequence, know it before an incident:** if a daemon dies between
+  staging an owner-anchored clear and saving it, the marker is still there after
+  the restart. Nothing is wrong — clear it once by hand
+  (§4.3c / `x0x groups quarantine clear`). The alternative was a silent
+  containment bypass available to the very party the marker exists to contain.
+
+- **OLDER journal frontier AT ONE FILE ⇒ union: containment is never lifted.**
+  A journal stale against the MERGED store is consumed before any write, so
+  this is not a stale replay. It is the individual-FILE divergence
+  `named_groups.rs::merge_home_suite_groups` creates, where the authoritative
+  Home-Suite sidecar record intentionally supersedes a NEWER legacy placeholder
+  in `named_groups.json`. Taking that placeholder's pair verbatim could DROP a
+  marker the authoritative record carries, so containment is unioned across the
+  two halves and nothing is cleared — the one case where the live half is not
+  the authority on the group's state. The union is over containment STRENGTH,
+  not merely presence, through one total order
+  (`named_groups.rs::challenger_containment_is_stronger`): `no_anchor` first, then the
+  HIGHER evidenced `revision`, then keep the INCUMBENT on a tie (the marker already on the record being written). So a
+  supersession can neither downgrade a manual-only quarantine into a clearable
+  one, nor lower the clear threshold — a marker's `revision` is half of
+  `owner_anchored_clear_permitted`, so replacing revision 7 with revision 2
+  would let an advance at revision 3 clear a marker that had refused it. The
+  WHOLE stronger marker is installed, never a mix of fields from both halves.
+  Note what the two views mean here: this union protects `named_groups.json` (the
+  legacy view, and the copy that survives if the sidecar is lost), while the
+  authoritative merged view keeps the SIDECAR's own containment, which the
+  replay does not touch. Everything else about the supersession is
+  unchanged: the authoritative roster, policy and revision still replace the
+  placeholder's.
+
+*Duplicate spellings cannot disagree (r7).* A roster can legitimately hold two
+entries for one group: `named_groups.rs::merge_home_suite_groups` inserts the
+sidecar record under its key and does not remove a differently-keyed named
+entry. `server/mod.rs::resolve_group_entry_locked` answers an exact key match
+first, so an unmarked duplicate served the group while the roster showed it
+contained, and a successful clear could leave the other spelling quarantined
+with no remaining exit. Install, its rollback, the manual clear and the merge
+now all apply to EVERY entry sharing the stable id, at the same strongest
+containment. **Operator consequence:** `x0x groups quarantine clear` clears the
+group whichever spelling you name it by, and the result survives a restart;
+duplicate entries are left in place on purpose (deleting one risks losing a
+record), they simply cannot differ about containment any more.
+
+*The claimed conflict is bound to the verified commit (r2).* A `GroupInfo`'s
+outer `state_revision`/`state_hash` are plain fields beside its commit log, and
+the paired-replay verdict compares those scalars. So a LOCAL writer in the data
+directory could copy the live record, alter only the outer hash, keep the
+untouched valid terminal commit, and have recovery declare a fork — installing
+permanent `no_anchor` containment with no authenticated *conflicting* commit
+behind it. Recovery now also requires that the frontier the journal claims is
+the one its verified commit signs (same group, revision and state hash) and that
+the commit genuinely differs from the live committed state at that revision,
+which is the live hook's own definition of a fork. Severity was bounded — a
+local writer, no established remote vector — but a quarantine that never
+auto-clears is worth two comparisons. **Both comparisons are load-bearing
+(r3).** The second is not redundant behind the first: the MIRROR forgery edits
+the LIVE record's outer `state_hash` and leaves its signed log intact, so
+`terminal_commit_header` returns the log's hash, the journal is perfectly
+consistent, and only "the verified commit must genuinely differ from the live
+committed state at that revision" refuses the install. Recovery establishes no
+live outer/header invariant, so neither check can be dropped. **Operator consequence:** none on a
+healthy node; a hand-edited or truncated journal now logs
+`#732: journal record's claimed frontier is not the one its verified commit
+signs` and installs nothing, instead of contaminating the group.
+
+Source: `src/server/routes/named_groups.rs::merge_group_record_into_store_file`,
+`src/server/routes/named_groups.rs::record_recovery_fork_evidence`,
+`src/server/routes/named_groups.rs::recover_treekem_named_journals`,
+`src/server/routes/named_groups.rs::fork_evidence_path_open`,
+`src/server/routes/named_groups.rs::fork_candidate_authenticated`,
+`src/groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted`,
+`src/groups/mod.rs::GroupInfo::clear_fork_quarantine_on_explicit_owner_seal`,
+`src/server/routes/named_groups.rs::collect_same_stable_group_aliases`,
+`src/server/routes/named_groups.rs::clear_group_quarantine`,
+`src/server/mod.rs::resolve_group_entry_locked`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forward_replay_never_lifts_containment`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_certified_admin_resigned_advance_cannot_lift_containment`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_older_journal_at_one_file_unions_containment_through_recovery`,
+`src/server/routes/named_groups.rs::merge_home_suite_groups`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forged_forward_journal_cannot_lift_containment`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_mirror_forged_live_hash_installs_no_marker`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_older_journal_at_one_file_unions_containment`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_same_frontier_replay_takes_live_containment_including_absence`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forward_replay_honours_an_owner_anchored_clear`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forged_outer_hash_journal_installs_no_marker`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_journal_replay_preserves_a_durable_quarantine_marker`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_startup_quarantines_a_lineage_free_ordinary_group`.
+
 ---
 
 ## 7. Mandate grace and the `owner_mandate_missing` refusal
