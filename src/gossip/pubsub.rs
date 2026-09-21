@@ -83,6 +83,74 @@ fn effective_byte_policy(accepted: Option<LeafEgressConfig>) -> LeafBytePolicy {
     }
 }
 
+/// Cumulative cost of x0x inner-envelope ML-DSA-65 verifies (#288, #656).
+///
+/// Lets soak acceptance use verifies/s and ns/verify instead of host %CPU,
+/// which is invalid evidence on co-tenant hosts. One observation is recorded
+/// per call that reaches the cryptographic verify, whether it succeeds or
+/// fails; envelopes rejected earlier (malformed key, agent-id mismatch,
+/// malformed signature) cost no ML-DSA work and are not counted.
+///
+/// The saorsa-gossip outer-frame verify is NOT counted here; it is already
+/// exposed as `pubsub_stages.verify` in `GET /diagnostics/gossip`.
+#[derive(Debug, Default)]
+pub struct InnerVerifyStats {
+    count: AtomicU64,
+    failed: AtomicU64,
+    total_ns: AtomicU64,
+}
+
+/// JSON-friendly snapshot of [`InnerVerifyStats`]. All fields are monotonic
+/// for the life of the process; pair deltas with `uptime_secs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct InnerVerifyStatsSnapshot {
+    /// ML-DSA-65 verifies executed (successful and failed).
+    pub count: u64,
+    /// Subset of `count` whose signature did not verify.
+    pub failed: u64,
+    /// Cumulative wall-clock time inside the verify call, in nanoseconds.
+    pub total_ns: u64,
+}
+
+impl InnerVerifyStats {
+    const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, elapsed: Duration, verified: bool) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        if !verified {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.total_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// Snapshot the counters.
+    #[must_use]
+    pub fn snapshot(&self) -> InnerVerifyStatsSnapshot {
+        InnerVerifyStatsSnapshot {
+            count: self.count.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            total_ns: self.total_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Process-wide counters: the decode entry points are free functions shared
+/// by every caller in the daemon, and a daemon is one process.
+static INNER_VERIFY_STATS: InnerVerifyStats = InnerVerifyStats::new();
+
+/// Snapshot of this process's inner-envelope verify counters.
+#[must_use]
+pub fn inner_verify_stats() -> InnerVerifyStatsSnapshot {
+    INNER_VERIFY_STATS.snapshot()
+}
+
 /// Drop-detection counters for the pub/sub pipeline.
 ///
 /// Every stage of the publish → transport → receive → decode → deliver flow
@@ -2491,7 +2559,7 @@ fn take_lp<'a>(data: &'a [u8], pos: &mut usize, what: &str) -> NetworkResult<&'a
 
 /// Decode a v2 (signed) message, verifying the ML-DSA-65 signature.
 pub(crate) fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
-    decode_signed(data, SignedVersion::V2)
+    decode_signed(data, SignedVersion::V2, &INNER_VERIFY_STATS)
 }
 
 /// Decode and authenticate the V3 inner envelope required by Signed KV compatibility.
@@ -2505,7 +2573,7 @@ pub fn decode_signed_kv_v3(data: &[u8]) -> NetworkResult<PubSubMessage> {
             "V3 envelope exceeds 1 MiB".to_string(),
         ));
     }
-    let message = decode_signed(data, SignedVersion::V3)?;
+    let message = decode_signed(data, SignedVersion::V3, &INNER_VERIFY_STATS)?;
     if !message.verified {
         return Err(NetworkError::SerializationError(
             "Invalid V3 signature".to_string(),
@@ -2528,7 +2596,11 @@ fn validate_v3_bounds(total: usize, key_len: usize, sig_len: usize) -> NetworkRe
     Ok(())
 }
 
-fn decode_signed(data: &[u8], version: SignedVersion) -> NetworkResult<PubSubMessage> {
+fn decode_signed(
+    data: &[u8],
+    version: SignedVersion,
+    verify_stats: &InnerVerifyStats,
+) -> NetworkResult<PubSubMessage> {
     if data.first() != Some(&version.byte()) {
         return Err(NetworkError::SerializationError(
             "Unexpected signed message version".to_string(),
@@ -2577,6 +2649,7 @@ fn decode_signed(data: &[u8], version: SignedVersion) -> NetworkResult<PubSubMes
         topic.as_bytes(),
         &payload,
         signature_bytes,
+        verify_stats,
     );
 
     if !verified {
@@ -2644,6 +2717,7 @@ fn verify_signature(
     topic: &[u8],
     payload: &[u8],
     signature_bytes: &[u8],
+    verify_stats: &InnerVerifyStats,
 ) -> bool {
     let public_key = match ant_quic::MlDsaPublicKey::from_bytes(public_key_bytes) {
         Ok(pk) => pk,
@@ -2667,12 +2741,15 @@ fn verify_signature(
         return false;
     };
 
-    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+    let started = Instant::now();
+    let verified = ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
         &public_key,
         &signing_payload,
         &signature,
     )
-    .is_ok()
+    .is_ok();
+    verify_stats.record(started.elapsed(), verified);
+    verified
 }
 
 #[cfg(test)]
@@ -4071,6 +4148,113 @@ mod tests {
 
         let msg = decode_v2(&encoded).expect("decode");
         assert!(!msg.verified); // Signature should NOT verify
+    }
+
+    /// WHY (#288 / #656): soak acceptance divides this counter by wall time
+    /// to get verifies/s, because host %CPU is invalid on co-tenant hosts.
+    /// That only works if every ML-DSA verify is counted exactly once —
+    /// including the failed ones a forgery flood would generate — and if
+    /// envelopes rejected before any crypto ran are NOT booked as verify work.
+    #[test]
+    fn inner_verify_stats_count_each_crypto_verify_exactly_once() {
+        let kp = AgentKeypair::generate().expect("keygen");
+        let ctx = SigningContext::from_keypair(&kp);
+        let topic = "soak";
+        let payload = Bytes::from("original");
+        let signature = ctx
+            .sign(&build_signing_payload(
+                ctx.agent_id.as_bytes(),
+                topic.as_bytes(),
+                &payload,
+            ))
+            .expect("sign");
+        let encode = |agent_id: &AgentId, payload: &Bytes| {
+            encode_v2(agent_id, &ctx.public_key_bytes, &signature, topic, payload).expect("encode")
+        };
+        // A private instance, so parallel tests cannot perturb exact counts.
+        let stats = InnerVerifyStats::default();
+
+        let good = decode_signed(&encode(&ctx.agent_id, &payload), SignedVersion::V2, &stats)
+            .expect("decode");
+        assert!(good.verified);
+        let after_good = stats.snapshot();
+        assert_eq!((after_good.count, after_good.failed), (1, 0));
+        assert!(after_good.total_ns > 0, "an ML-DSA verify takes time");
+
+        let tampered = encode(&ctx.agent_id, &Bytes::from("TAMPERED"));
+        let bad = decode_signed(&tampered, SignedVersion::V2, &stats).expect("decode");
+        assert!(!bad.verified);
+        let after_bad = stats.snapshot();
+        assert_eq!((after_bad.count, after_bad.failed), (2, 1));
+        assert!(after_bad.total_ns >= after_good.total_ns, "monotonic");
+
+        // Agent-id mismatch is rejected before the ML-DSA call: no crypto
+        // cost, so it must not inflate the verify rate.
+        let wrong_id = encode(&AgentId([0xAB; 32]), &payload);
+        let rejected = decode_signed(&wrong_id, SignedVersion::V2, &stats).expect("decode");
+        assert!(!rejected.verified);
+        assert_eq!(stats.snapshot(), after_bad);
+    }
+
+    /// WHY: the daemon reads the process-wide counters, so every production
+    /// decode entry point must feed those and not a throwaway instance. Each
+    /// entry point is checked on its own, with one good and one tampered
+    /// envelope, so a single mis-wired path cannot hide behind the others.
+    ///
+    /// Deltas are `>=`, not `==`: the counters are process-wide and other
+    /// tests decoding in parallel threads (plain `cargo test`) add to them.
+    /// That same traffic could in principle mask a broken path here; the
+    /// exact per-verify accounting is pinned by the private-instance test
+    /// above, and under nextest (one process per test) these bounds are tight.
+    #[test]
+    fn production_decode_entry_points_feed_process_wide_verify_stats() {
+        let kp = AgentKeypair::generate().expect("keygen");
+        let ctx = SigningContext::from_keypair(&kp);
+        let payload = Bytes::from("p");
+        let signature = ctx
+            .sign(&build_signing_payload(
+                ctx.agent_id.as_bytes(),
+                b"soak",
+                &payload,
+            ))
+            .expect("sign");
+        let v2 = |payload: &Bytes| {
+            encode_v2(
+                &ctx.agent_id,
+                &ctx.public_key_bytes,
+                &signature,
+                "soak",
+                payload,
+            )
+            .expect("encode")
+        };
+        let v2_good = v2(&payload);
+        let v2_bad = v2(&Bytes::from("TAMPERED"));
+        let v3_good = v3_fixture(&ctx, "soak", b"p");
+        let mut v3_bad = v3_good.to_vec();
+        let last = v3_bad.len() - 1;
+        v3_bad[last] ^= 1;
+        let v3_bad = Bytes::from(v3_bad);
+
+        type Entry<'a> = (&'a str, &'a dyn Fn(&Bytes) -> bool, &'a Bytes, &'a Bytes);
+        let via_v2 = |d: &Bytes| decode_v2(d).is_ok_and(|m| m.verified);
+        let via_v3 = |d: &Bytes| decode_signed_kv_v3(d).is_ok_and(|m| m.verified);
+        let via_auto = |d: &Bytes| decode_auto(d.clone()).is_ok_and(|m| m.verified);
+        let entries: [Entry<'_>; 4] = [
+            ("decode_v2", &via_v2, &v2_good, &v2_bad),
+            ("decode_signed_kv_v3", &via_v3, &v3_good, &v3_bad),
+            ("decode_auto/v2", &via_auto, &v2_good, &v2_bad),
+            ("decode_auto/v3", &via_auto, &v3_good, &v3_bad),
+        ];
+        for (name, decode, good, bad) in entries {
+            let before = inner_verify_stats();
+            assert!(decode(good), "{name}: good envelope verifies");
+            assert!(!decode(bad), "{name}: tampered envelope is rejected");
+            let after = inner_verify_stats();
+            assert!(after.count >= before.count + 2, "{name}: two verifies");
+            assert!(after.failed > before.failed, "{name}: one failure");
+            assert!(after.total_ns > before.total_ns, "{name}: time accrued");
+        }
     }
 
     #[test]

@@ -581,6 +581,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                 StatusCode::OK,
                 Json(serde_json::json!({
                 "ok": true,
+                "uptime_secs": state.start_time.elapsed().as_secs(),
                 "stats": snap,
                 "participation": state.agent.gossip_participation(),
                 "subscribed_topics": egress["subscribed_topics"],
@@ -597,6 +598,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                     .unwrap_or_default(),
                 "relay_fanout": state.agent.gossip_relay_fanout().unwrap_or_default(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
+                "inner_envelope_verify": x0x::gossip::inner_verify_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
                 "discovery_cache_entries": {
                     "agents": agents,
@@ -674,6 +676,30 @@ mod participation_diagnostics_tests {
             assert_eq!(body["egress_budget"]["leaf_max_eager_degree"], 2);
             assert_eq!(body["egress_budget"]["byte_policy"], "observe_only");
             assert_eq!(body["egress_budget"]["applies_to_leaf"], !relay);
+            // #288 soak: cumulative counters are integrals, so the same
+            // response must carry the daemon clock, the inner-envelope verify
+            // cost (verify/s replaces co-tenant %CPU, #656) and the sub-second
+            // lane bucket. The outer-frame verify lives in pubsub_stages.
+            assert!(body["uptime_secs"].is_u64());
+            for field in ["count", "failed", "total_ns"] {
+                assert!(
+                    body["inner_envelope_verify"][field].is_u64(),
+                    "inner_envelope_verify.{field}"
+                );
+            }
+            for field in ["count", "total_ns"] {
+                assert!(
+                    body["pubsub_stages"]["verify"][field].is_u64(),
+                    "pubsub_stages.verify.{field}"
+                );
+            }
+            for lane in ["pubsub", "membership", "bulk"] {
+                assert_eq!(
+                    body["dispatcher"][lane]["over_100ms_count"].as_u64(),
+                    Some(0),
+                    "{lane}"
+                );
+            }
             let participation = &body["participation"];
             assert_eq!(participation["mode"], if relay { "full" } else { "leaf" });
             assert_eq!(

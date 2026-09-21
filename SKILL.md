@@ -848,7 +848,10 @@ with `{"ok":false,"error":"..."}`.
   `outbound_by_topic_named`, `egress_budget`, `outer_signature_policy`,
   `legacy_grants_enabled` (currently `false`), `outer_v1_receipts`,
   `gossip_publish_zero_fanout`, `pubsub_stages`, `dispatcher`, `recv_pump`,
-  and `discovery_cache_entries` (`agents`, `machines`, `users`). The route
+  and `discovery_cache_entries` (`agents`, `machines`, `users`). For soak
+  baselines it also carries `uptime_secs`, `inner_envelope_verify`
+  (`count`, `failed`, `total_ns`: cumulative inner-envelope ML-DSA-65
+  verifies) and, per `dispatcher` lane, `over_100ms_count`. The route
   returns 503 `gossip runtime not initialized` when gossip has no snapshot.
 - `/diagnostics/transport` returns `{"ok":true,"transport":{...}}` (503
   `network node not initialized`). The transport object includes active versus

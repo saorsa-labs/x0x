@@ -48,6 +48,22 @@ All notable changes to this project will be documented in this file.
   the default policy the only signal the budget is being exceeded at all; it
   is a lower bound, not a shed-count forecast. Also adds
   `egress_budget.leaf_egress_burst_bytes` and `max_serialized_frame_bytes`.
+- **Soak instrumentation on `GET /diagnostics/gossip` (#288, #656).** The 24 h
+  soak could not test two hypotheses because the counters did not exist, and
+  co-tenant `%CPU` is invalid acceptance evidence. Added: `uptime_secs` (the
+  clock every cumulative-counter baseline needs);
+  `inner_envelope_verify.{count,failed,total_ns}`, monotonic process-lifetime
+  counters for x0x inner-envelope ML-DSA-65 verifies, counted once per call
+  that reaches the cryptographic verify (failures included, pre-crypto rejects
+  excluded); and `dispatcher.<lane>.over_100ms_count`, a sub-second bucket that
+  separates a lane slow across the board from one hitting a rare 5 s cliff.
+  The saorsa-gossip outer-frame verify was already exposed as
+  `pubsub_stages.verify.{count,total_ns}` and is now documented. Not covered:
+  presence-beacon verifies inside saorsa-gossip, application-layer verifies
+  after delivery, and QUIC handshake verifies. The combined counter rate is an
+  upper-bound proxy for calls in the two observed stages; it is neither an
+  exact crypto-operation rate nor a bound on daemon-wide ML-DSA work. See
+  `docs/diagnostics.md`.
 ### Fixed
 
 - **Startup journal recovery no longer lifts a fork quarantine, and now contains
