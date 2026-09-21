@@ -23,13 +23,17 @@ static JOURNAL_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 static INTENT_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 #[cfg(test)]
-static FAIL_APPEND_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FAIL_APPEND_KEYS: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
-static FAIL_MARK_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FAIL_MARK_KEYS: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
-static FAIL_INTENT_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FAIL_INTENT_KEYS: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
-static FAIL_INTENT_DIR_SYNC_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static FAIL_INTENT_DIR_SYNC_KEYS: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
 static INTENT_DIR_SYNC_TARGETS: LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
@@ -120,16 +124,9 @@ pub(super) async fn append_receipt(
         };
     }
     #[cfg(test)]
-    if FAIL_APPEND_KEY
+    if FAIL_APPEND_KEYS
         .lock()
-        .map(|mut key| {
-            if key.as_deref() == Some(receipt.idempotency_key.as_str()) {
-                key.take();
-                true
-            } else {
-                false
-            }
-        })
+        .map(|mut keys| keys.remove(receipt.idempotency_key.as_str()))
         .unwrap_or(false)
     {
         return Err(std::io::Error::new(
@@ -163,16 +160,9 @@ pub(super) async fn mark_publish_accepted(
     }
     let updated = receipt.clone();
     #[cfg(test)]
-    if FAIL_MARK_KEY
+    if FAIL_MARK_KEYS
         .lock()
-        .map(|mut key| {
-            if key.as_deref() == Some(idempotency_key) {
-                key.take();
-                true
-            } else {
-                false
-            }
-        })
+        .map(|mut keys| keys.remove(idempotency_key))
         .unwrap_or(false)
     {
         return Err(std::io::Error::new(
@@ -408,16 +398,9 @@ pub(super) async fn write_intent(
         ));
     }
     #[cfg(test)]
-    if FAIL_INTENT_KEY
+    if FAIL_INTENT_KEYS
         .lock()
-        .map(|mut key| {
-            if key.as_deref() == Some(intent.idempotency_key.as_str()) {
-                key.take();
-                true
-            } else {
-                false
-            }
-        })
+        .map(|mut keys| keys.remove(intent.idempotency_key.as_str()))
         .unwrap_or(false)
     {
         return Err(std::io::Error::new(
@@ -463,16 +446,9 @@ async fn sync_intent_directory_entry(
     idempotency_key: &str,
 ) -> std::io::Result<()> {
     #[cfg(test)]
-    let injected = FAIL_INTENT_DIR_SYNC_KEY
+    let injected = FAIL_INTENT_DIR_SYNC_KEYS
         .lock()
-        .map(|mut key| {
-            if key.as_deref() == Some(idempotency_key) {
-                key.take();
-                true
-            } else {
-                false
-            }
-        })
+        .map(|mut keys| keys.remove(idempotency_key))
         .unwrap_or(false);
     #[cfg(test)]
     let synced = sync_directory_exact(kv_state_dir).await?;
@@ -510,29 +486,29 @@ pub(super) async fn ensure_intent_durable(
 
 #[cfg(test)]
 pub(super) fn fail_next_append_for_test(idempotency_key: &str) {
-    if let Ok(mut key) = FAIL_APPEND_KEY.lock() {
-        *key = Some(idempotency_key.to_string());
+    if let Ok(mut keys) = FAIL_APPEND_KEYS.lock() {
+        keys.insert(idempotency_key.to_string());
     }
 }
 
 #[cfg(test)]
 pub(super) fn fail_next_mark_for_test(idempotency_key: &str) {
-    if let Ok(mut key) = FAIL_MARK_KEY.lock() {
-        *key = Some(idempotency_key.to_string());
+    if let Ok(mut keys) = FAIL_MARK_KEYS.lock() {
+        keys.insert(idempotency_key.to_string());
     }
 }
 
 #[cfg(test)]
 pub(super) fn fail_next_intent_for_test(idempotency_key: &str) {
-    if let Ok(mut key) = FAIL_INTENT_KEY.lock() {
-        *key = Some(idempotency_key.to_string());
+    if let Ok(mut keys) = FAIL_INTENT_KEYS.lock() {
+        keys.insert(idempotency_key.to_string());
     }
 }
 
 #[cfg(test)]
 pub(super) fn fail_next_intent_dir_sync_for_test(idempotency_key: &str) {
-    if let Ok(mut key) = FAIL_INTENT_DIR_SYNC_KEY.lock() {
-        *key = Some(idempotency_key.to_string());
+    if let Ok(mut keys) = FAIL_INTENT_DIR_SYNC_KEYS.lock() {
+        keys.insert(idempotency_key.to_string());
     }
 }
 
@@ -656,6 +632,72 @@ mod tests {
         assert_eq!(saved.len(), 2);
         assert!(saved.iter().any(|item| item.idempotency_key == "key-a"));
         assert!(saved.iter().any(|item| item.idempotency_key == "key-b"));
+    }
+
+    #[tokio::test]
+    async fn independent_fault_injections_are_keyed_and_one_shot() {
+        let append_dir = tempfile::tempdir().expect("append tempdir");
+        let append_path = journal_path(append_dir.path());
+        fail_next_append_for_test("append-a");
+        fail_next_append_for_test("append-b");
+        for key in ["append-a", "append-b"] {
+            assert_eq!(
+                append_receipt(&append_path, receipt(key, key))
+                    .await
+                    .expect_err("each armed append fails")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            append_receipt(&append_path, receipt(key, key))
+                .await
+                .expect("each append fault is consumed once");
+        }
+
+        fail_next_mark_for_test("append-a");
+        fail_next_mark_for_test("append-b");
+        for key in ["append-a", "append-b"] {
+            assert_eq!(
+                mark_publish_accepted(&append_path, key)
+                    .await
+                    .expect_err("each armed mark fails")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            mark_publish_accepted(&append_path, key)
+                .await
+                .expect("each mark fault is consumed once");
+        }
+
+        let intent_dir = tempfile::tempdir().expect("intent tempdir");
+        fail_next_intent_for_test("intent-a");
+        fail_next_intent_for_test("intent-b");
+        for key in ["intent-a", "intent-b"] {
+            assert_eq!(
+                write_intent(intent_dir.path(), intent_input(key, key))
+                    .await
+                    .expect_err("each armed intent write fails")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            write_intent(intent_dir.path(), intent_input(key, key))
+                .await
+                .expect("each intent fault is consumed once");
+        }
+
+        fail_next_intent_dir_sync_for_test("sync-a");
+        fail_next_intent_dir_sync_for_test("sync-b");
+        for key in ["sync-a", "sync-b"] {
+            assert_eq!(
+                write_intent(intent_dir.path(), intent_input(key, key))
+                    .await
+                    .expect_err("each armed directory sync fails")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            ensure_intent_durable(intent_dir.path(), key)
+                .await
+                .expect("each directory-sync fault is consumed once");
+        }
     }
 
     #[tokio::test]

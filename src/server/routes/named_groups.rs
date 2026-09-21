@@ -15734,8 +15734,41 @@ fn build_signed_member_joined_resend(
 
 /// #477 (r6 item 1): test-only MemberJoined sign-failure injection.
 #[cfg(test)]
-static JOIN_TEST_FAIL_MEMBER_JOINED_SIGN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static JOIN_TEST_FAIL_MEMBER_JOINED_SIGN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+struct JoinSignFailureGuard((String, String));
+
+#[cfg(test)]
+impl Drop for JoinSignFailureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut groups) = JOIN_TEST_FAIL_MEMBER_JOINED_SIGN.lock() {
+            groups.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn fail_next_member_joined_sign_for_test(
+    group_id: &str,
+    member_agent_id: &str,
+) -> JoinSignFailureGuard {
+    let key = (group_id.to_string(), member_agent_id.to_string());
+    if let Ok(mut groups) = JOIN_TEST_FAIL_MEMBER_JOINED_SIGN.lock() {
+        groups.insert(key.clone());
+    }
+    JoinSignFailureGuard(key)
+}
+
+#[cfg(test)]
+fn take_member_joined_sign_failure_for_test(group_id: &str, member_agent_id: &str) -> bool {
+    JOIN_TEST_FAIL_MEMBER_JOINED_SIGN
+        .lock()
+        .map(|mut groups| groups.remove(&(group_id.to_string(), member_agent_id.to_string())))
+        .unwrap_or(false)
+}
 
 /// r3 (Codex 10): join-time bound on the invite-carried Home metadata's
 /// `primary_agent`. The field names an agent id — 64 hex chars (the
@@ -16281,7 +16314,7 @@ pub(in crate::server) async fn join_group_via_invite(
             // no pin, no attempt, no MLS group).
             #[cfg(test)]
             let inject_sign_failure =
-                JOIN_TEST_FAIL_MEMBER_JOINED_SIGN.load(std::sync::atomic::Ordering::SeqCst);
+                take_member_joined_sign_failure_for_test(&stable_id_for_event, &joiner_hex);
             #[cfg(not(test))]
             let inject_sign_failure = false;
             let signed_resend = if inject_sign_failure {
@@ -31705,17 +31738,46 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
 }
 
 #[cfg(test)]
-pub(in crate::server) fn set_join_poll_window_override(ms: u64) {
-    // Mirrors the poll fn's local override: the SAME static is not
-    // reachable from here, so the poll reads it via
-    // JOIN_POLL_WINDOW_OVERRIDE (below).
-    JOIN_POLL_WINDOW_OVERRIDE.store(ms, std::sync::atomic::Ordering::SeqCst);
+type JoinPollWindowKey = (String, String);
+
+/// #477 T7: test-only poll windows scoped to one group and attempt.
+#[cfg(test)]
+static JOIN_POLL_WINDOW_OVERRIDES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<JoinPollWindowKey, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+struct JoinPollWindowGuard(JoinPollWindowKey);
+
+#[cfg(test)]
+impl Drop for JoinPollWindowGuard {
+    fn drop(&mut self) {
+        if let Ok(mut overrides) = JOIN_POLL_WINDOW_OVERRIDES.lock() {
+            overrides.remove(&self.0);
+        }
+    }
 }
 
-/// #477 T7: the test-only poll window override (0 = production).
 #[cfg(test)]
-static JOIN_POLL_WINDOW_OVERRIDE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+fn set_join_poll_window_override(group_id: &str, attempt_id: &str, ms: u64) -> JoinPollWindowGuard {
+    let key = (group_id.to_string(), attempt_id.to_string());
+    if let Ok(mut overrides) = JOIN_POLL_WINDOW_OVERRIDES.lock() {
+        overrides.insert(key.clone(), ms);
+    }
+    JoinPollWindowGuard(key)
+}
+
+#[cfg(test)]
+fn join_poll_window_override(group_id: &str, attempt_id: &str) -> Option<u64> {
+    JOIN_POLL_WINDOW_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|overrides| {
+            overrides
+                .get(&(group_id.to_string(), attempt_id.to_string()))
+                .copied()
+        })
+}
 
 /// #477 T4 (r5 item 6) — test-only apply-path barriers. T4(a) parks the
 /// apply immediately AFTER a refusal is staged (membership mutex still
@@ -32496,8 +32558,7 @@ async fn poll_join_result_until_membership_confirmed(
     // short window; 0 = production constants).
     #[cfg(test)]
     let timeout = {
-        let override_ms = JOIN_POLL_WINDOW_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
-        if override_ms > 0 {
+        if let Some(override_ms) = join_poll_window_override(&group_id, &attempt_id) {
             std::time::Duration::from_millis(override_ms)
         } else {
             timeout
@@ -34184,6 +34245,56 @@ pub(in crate::server) mod tests {
             (state, dir)
         }
 
+        #[test]
+        fn join_test_hooks_are_scoped_to_independent_identities() {
+            let sign_a = fail_next_member_joined_sign_for_test("group", "member-a");
+            let _sign_b = fail_next_member_joined_sign_for_test("group", "member-b");
+            assert!(
+                !take_member_joined_sign_failure_for_test("other-group", "member-a"),
+                "a signing fault must not leak into another group"
+            );
+            assert!(
+                !take_member_joined_sign_failure_for_test("group", "other-member"),
+                "a signing fault must not leak into another member's join"
+            );
+            assert!(take_member_joined_sign_failure_for_test(
+                "group", "member-a"
+            ));
+            assert!(
+                take_member_joined_sign_failure_for_test("group", "member-b"),
+                "consuming member A must not overwrite member B"
+            );
+            assert!(
+                !take_member_joined_sign_failure_for_test("group", "member-a"),
+                "a signing fault is one-shot"
+            );
+            drop(sign_a);
+
+            let poll_a = set_join_poll_window_override("group-a", "attempt-a", 120);
+            let _poll_b = set_join_poll_window_override("group-b", "attempt-b", 2_000);
+            assert_eq!(join_poll_window_override("group-a", "attempt-a"), Some(120));
+            assert_eq!(
+                join_poll_window_override("group-b", "attempt-b"),
+                Some(2_000)
+            );
+            assert_eq!(
+                join_poll_window_override("group-a", "attempt-b"),
+                None,
+                "a poll override must match both group and attempt"
+            );
+            drop(poll_a);
+            assert_eq!(
+                join_poll_window_override("group-a", "attempt-a"),
+                None,
+                "dropping one guard clears only its identity"
+            );
+            assert_eq!(
+                join_poll_window_override("group-b", "attempt-b"),
+                Some(2_000),
+                "group B survives group A cleanup"
+            );
+        }
+
         fn golden_canonical() -> Vec<u8> {
             crate::server::routes::named_groups::canonical_member_joined_bytes(
                 "aabb",
@@ -34963,7 +35074,7 @@ pub(in crate::server) mod tests {
                         listener_token: None,
                     },
                 );
-            set_join_poll_window_override(120);
+            let _poll_window = set_join_poll_window_override(&group, "a7", 120);
             // #477 (r7 item 3): the poll's OWN handle sits in the attempt's
             // poll set (exactly as the route registers it) — the timeout
             // finalizer must deregister, never abort, its own task, or the
@@ -35021,7 +35132,6 @@ pub(in crate::server) mod tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            set_join_poll_window_override(0);
             assert!(
                 completed.load(std::sync::atomic::Ordering::SeqCst),
                 "the timeout owner ran to completion — it was NOT aborted by its own finalize"
@@ -36733,7 +36843,8 @@ pub(in crate::server) mod tests {
             let group = "ea".repeat(16);
             seed_authority_group(&authority_state, &group, "sec-route", None, false, false).await;
             let (_inviter, link) = mint_real_invite(&authority_state, &group).await;
-            JOIN_TEST_FAIL_MEMBER_JOINED_SIGN.store(true, std::sync::atomic::Ordering::SeqCst);
+            let joiner = hex::encode(joiner_state.agent.agent_id().as_bytes());
+            let _sign_failure = fail_next_member_joined_sign_for_test(&group, &joiner);
             let response = join_group_via_invite(
                 State(Arc::clone(&joiner_state)),
                 Json(JoinGroupRequest {
@@ -36745,10 +36856,8 @@ pub(in crate::server) mod tests {
             )
             .await
             .into_response();
-            JOIN_TEST_FAIL_MEMBER_JOINED_SIGN.store(false, std::sync::atomic::Ordering::SeqCst);
             let dbg_status = response.status();
             assert_eq!(dbg_status, StatusCode::SERVICE_UNAVAILABLE);
-            let joiner = hex::encode(joiner_state.agent.agent_id().as_bytes());
             assert!(
                 joiner_state
                     .pending_join_stubs
@@ -37571,7 +37680,7 @@ pub(in crate::server) mod tests {
                 .await
                 .expect("known group");
             let held = lock_arc.lock().await;
-            set_join_poll_window_override(2_000);
+            let _poll_window = set_join_poll_window_override(&group, "a6c", 2_000);
             let poll = tokio::spawn(poll_join_result_until_membership_confirmed(
                 Arc::clone(&state),
                 group.clone(),
@@ -37608,7 +37717,6 @@ pub(in crate::server) mod tests {
                 matches!(joined, Ok(Ok(()))),
                 "the poll exits on its own (not aborted, not timed out): {joined:?}"
             );
-            set_join_poll_window_override(0);
             assert_eq!(
                 fetches_sent_for(&group),
                 0,
@@ -37732,7 +37840,7 @@ pub(in crate::server) mod tests {
             let event_group = group.clone();
             let member = hex::encode(state.agent.agent_id().as_bytes());
             seed_pending_attempt(&state, &group, &event_group, &member, "a7b", String::new()).await;
-            set_join_poll_window_override(150);
+            let _poll_window = set_join_poll_window_override(&group, "a7b", 150);
             let done = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
             let lock_arc = group_membership_lock_for_known_group(&state, &group)
                 .await
@@ -37782,7 +37890,6 @@ pub(in crate::server) mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            set_join_poll_window_override(0);
             assert!(
                 done.load(std::sync::atomic::Ordering::SeqCst) >= 1,
                 "the OWNING poll ran to completion (it was never aborted by its own finalize)"
@@ -37813,7 +37920,7 @@ pub(in crate::server) mod tests {
                 group.clone(),
                 home_suite_stub_for(&group, crate::identity::AgentId([5; 32])),
             );
-            set_join_poll_window_override(120);
+            let _poll_window = set_join_poll_window_override(&group, "", 120);
             poll_join_result_until_membership_confirmed(
                 Arc::clone(&state),
                 group.clone(),
@@ -37825,7 +37932,6 @@ pub(in crate::server) mod tests {
                 String::new(),
             )
             .await;
-            set_join_poll_window_override(0);
             assert!(
                 state.named_groups.read().await.contains_key(&group),
                 "a durable group is never torn down by an unowned timeout"
