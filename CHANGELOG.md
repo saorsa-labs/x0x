@@ -103,7 +103,10 @@ All notable changes to this project will be documented in this file.
     `apply_named_group_metadata_event_inner_serialized`) do not run the resume
     hook, so after such a clear a removed member's NEW live deltas keep being
     admitted until the next drain, manual clear or restart (their buffered deltas
-    are still re-authorized); and a group with no resolvable record gets a gate but
+    are still re-authorized; the follow-up is to propagate a durable-clear
+    notification to those callers and run the resume hook after their locks
+    release, replay paths included); and a group with no resolvable record gets a
+    gate but
     keeps **open** live admission, because installing an empty set on a failed
     lookup would discard a seated member's work.
   - **Incoming traffic can no longer starve the drain (finding 5).** The 5 s
@@ -113,7 +116,12 @@ All notable changes to this project will be documented in this file.
     held ones. The deadline is now a pinned sleep that survives receives and is
     reset only after it fires, and an inbound delta drains the buffer **before**
     it is admitted — so under traffic the catch-up happens on the next delta
-    rather than on a timer, and arrival order is preserved. The runbook's
+    rather than on a timer, and arrival order is preserved. **Accepted residual:**
+    the live admission path is deliberately not roster-pinned (that would put a
+    roster read on every inbound delta), so a delta already admitted when a marker
+    installs still merges — at most **one per task-list listener**, after which
+    every delta observes the marker and is held. The freeze is therefore
+    "byte-identical from the first delta that observes the marker". The runbook's
     "picked up within 5 s" is true again, including under a flood of undecodable
     payloads, which never reach admission. Cross-model review found ordering still
     breakable when a drain attempt was **abandoned** — the clear could land between

@@ -621,11 +621,25 @@ regardless, admitted by the `authorized_agents` set that
 the contested roster itself — so a peer seated by the disputed roster could keep
 claiming and completing, and move the deterministic winner, while this node's own
 agent was refused. **What you now see as an operator:** a quarantined group's
-task lists **freeze and then catch up**. While the marker is live, inbound deltas
-are held in arrival order (bounded: 1024 deltas / 1 MiB per list, oldest dropped)
-and the CRDT is left byte-identical; reads keep serving that frozen state with
-the usual `fork_quarantined` annotation, so a list that looks quiet is quiet
-*because* it is contained. Once the marker is gone — manual clear or
+task lists **freeze and then catch up**. From the first inbound delta that
+observes the marker, deltas are held in arrival order (bounded: 1024 deltas / 1 MiB
+per list, oldest dropped) and the CRDT is left byte-identical; reads keep serving
+that frozen state with the usual `fork_quarantined` annotation, so a list that
+looks quiet is quiet *because* it is contained.
+
+**Accepted residual, bounded to one delta per listener (#756 review, 2026-09-21).**
+The freeze begins at the first delta that *observes* the marker, not at the
+instant the marker installs. The live admission path reads the marker through the
+gate and then releases the roster before merging, so a delta already admitted at
+that instant still merges — at most **one per task-list listener**, and never more,
+because the next delta reads the new marker and is held. That path is deliberately
+not roster-pinned: pinning it would put a roster read on every inbound delta, which
+is the cost ADR-0068 ruled out. The *drain* path, where a whole buffer's worth of a
+disputed member's work is at stake, **is** pinned, so re-authorization and the merge
+cannot be separated there. Practically: after installing a marker, expect the list
+to be frozen except for at most one delta that was already in flight; that delta is
+a normal authenticated delta from a then-seated member, not an unauthorized one.
+Source: `src/crdt/sync.rs::admit_or_buffer`, `src/crdt/sync.rs::Admission`. Once the marker is gone — manual clear or
 owner-anchored — the held deltas are applied in order, within seconds, without
 an operator step. Watch `GET /diagnostics/groups` for
 `task_deltas_quarantine_buffered` (held), `task_deltas_quarantine_dropped`
@@ -709,7 +723,9 @@ written after the guard is released). This replaced an earlier
 derive-release-compare-retry design that closed the same window only
 probabilistically and could be abandoned indefinitely by sustained roster
 revision churn, which — with admission coupled to the buffer, below — would have
-frozen the list. Nothing merges against a roster older than the one current at
+frozen the list. (Under the pin that starvation state is unreachable: a commit can
+only land before or after the pinned read, never between the derivation and the
+merge.) Nothing merges against a roster older than the one current at
 merge time, and a marker live at that pinned read abandons the drain with the
 buffer intact.
 
@@ -738,7 +754,11 @@ captured set. Their *buffered* deltas are safe, because the drain re-authorizes
 under the pinned roster, and ADR-0066 row 20 still refuses local mutations while
 the marker is live; it is the post-clear live path that lags. A membership change
 with no quarantine at all has always behaved this way and still does — wider than
-fork quarantine, unchanged here. And a group this node holds **no resolvable
+fork quarantine, unchanged here. **The safe follow-up** (to be filed as its own
+issue, not done here): propagate a durable-clear notification out of the two
+owner-anchored clear paths to their callers and call
+`routes/tasks.rs::resume_group_task_ingest` there, after every roster lock has been
+released — including the replay paths that re-apply those commits at startup. And a group this node holds **no resolvable
 record for** gets an ingest gate
 (so a marker arriving later is honoured) but keeps **open** live admission:
 `is_authorized_content_writer` returns `true` when no set is installed, and the
@@ -748,7 +768,7 @@ on a failed lookup would silently discard a seated member's work. Fail-open on t
 triaging a list whose group record is missing.
 Source: `src/crdt/sync.rs::admit_or_buffer`,
 `src/crdt/sync.rs::AuthorizedRoster`,
-`src/crdt/sync.rs::TaskIngestGate::authorized_writers`,
+`src/crdt/sync.rs::TaskIngestGate::with_pinned_roster`,
 `src/server/routes/tasks.rs::active_group_members`,
 `src/server/routes/tasks.rs::group_task_list_binding`,
 `src/crdt/sync.rs::drain_quarantine_buffer`,

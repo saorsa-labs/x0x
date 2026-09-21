@@ -29,6 +29,10 @@
 //! - #732 finding 3: the binding handed to the constructor already carries the
 //!   gate and the live authorized set, and the two call sites that produce a
 //!   live handle use it — the gate exists before the listener does;
+//! - #756 review: the PRODUCTION gate holds the real `named_groups` guard across
+//!   the drain's closure (a writer cannot commit inside it), a newer delta cannot
+//!   overtake pending ones when a clear interleaves, and a clear with an empty
+//!   buffer still refreshes authorization;
 //! - and the NEGATIVE CONTROL per mechanism: the same delta with no gate
 //!   installed merges, so "the state did not change" is a fact about the gate
 //!   and not about the fixture.
@@ -98,10 +102,6 @@ struct FakeGate {
     /// marker installed after the drain decided": the pinned token carries it, so
     /// the drain must abandon. `None` = no marker installed at the pin.
     install_marker_at_pin: std::sync::Mutex<Option<u64>>,
-    /// Advance `state_revision` on every pinned read, i.e. a roster commit landing
-    /// immediately after each derivation — the churn that starved the removed
-    /// compare-and-retry loop.
-    churn_at_pin: AtomicBool,
     /// From this many `suspended()` reads on, answer `false` — the clear landing
     /// at a scripted point, the mirror of `suspend_after_reads`.
     unsuspend_after_reads: AtomicU64,
@@ -126,7 +126,6 @@ impl Default for FakeGate {
             token_stale_at_apply: AtomicBool::new(false),
             removed_by_commit: std::sync::Mutex::new(None),
             install_marker_at_pin: std::sync::Mutex::new(None),
-            churn_at_pin: AtomicBool::new(false),
             unsuspend_after_reads: AtomicU64::new(u64::MAX),
             buffered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -265,11 +264,6 @@ impl TaskIngestGate for FakeGate {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .or_else(|| self.marker_revision());
                 let derived_at = self.live_state_revision.load(Ordering::SeqCst);
-                if self.churn_at_pin.load(Ordering::SeqCst) {
-                    // A roster commit lands immediately after this derivation. With
-                    // the removed retry loop this is what never converged.
-                    self.live_state_revision.fetch_add(1, Ordering::SeqCst);
-                }
                 let roster = guard.clone().map(|agents| x0x::crdt::AuthorizedRoster {
                     agents,
                     token: scripted_token(pinned_marker, derived_at),
@@ -1219,7 +1213,11 @@ fn adr0068_f3_structural_guard_handle_producing_call_sites_bind_before_they_star
 
 // ---------------------------------------------------------------------------
 // #756 review r2 — the roster is PINNED across the whole re-authorize-then-merge
-// step, so a commit cannot land in the middle of it and churn cannot starve it.
+// step, so a commit cannot land in the middle of it. (There is no "churn starves
+// the drain" fixture: under the pin a commit can only land before or after the
+// pinned read, so the state the removed compare-and-retry loop failed on is not
+// reachable — a faithful control cannot be written, and an unfaithful one that
+// advanced the revision beneath its own read guard was deleted in r4.)
 // ---------------------------------------------------------------------------
 
 /// The merge runs with the roster held, so a roster writer that tries to commit
@@ -1352,88 +1350,6 @@ async fn adr0068_r2_the_roster_is_pinned_for_the_whole_merge() {
     );
 }
 
-/// Sustained roster churn no longer starves the drain. The compare-and-retry loop
-/// this replaced re-derived the set and then re-read the token, so a commit landing
-/// after every derivation made every attempt mismatch; with a bounded attempt
-/// budget the drain abandoned, and with admission coupled to the buffer (P2) that
-/// meant newer deltas queued behind a buffer that never drained. Pinning removes
-/// the retry entirely — there is no second read to disagree with the first.
-///
-/// `churn_at_pin` advances the roster revision immediately after every derivation,
-/// which is precisely the interleaving that starved the old design. No spawned
-/// task, so nothing here depends on the scheduler.
-#[tokio::test]
-async fn adr0068_r2_sustained_roster_churn_no_longer_starves_the_drain() {
-    let h = Harness::new();
-    let gate = h.gate(true).expect("gate");
-    h.authorize([h.writer]).await;
-    h.gate.suspended.store(true, Ordering::SeqCst);
-    for (seq, title) in [(1u64, "first"), (2, "second"), (3, "third")] {
-        h.ingest_as(Some(&gate), h.delta_from(seq, title, &h.writer), &h.writer)
-            .await;
-    }
-    h.gate.set_live_roster([h.writer]).await;
-    h.gate.suspended.store(false, Ordering::SeqCst);
-    h.gate.churn_at_pin.store(true, Ordering::SeqCst);
-    let revision_before = h.gate.live_state_revision.load(Ordering::SeqCst);
-
-    let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
-
-    assert!(
-        h.gate.live_state_revision.load(Ordering::SeqCst) > revision_before,
-        "the churn really did advance the roster revision during the drain"
-    );
-    assert_eq!(
-        applied, 3,
-        "the drain completes on its FIRST call under churn — there is no retry \
-         budget left to exhaust"
-    );
-    assert_eq!(
-        x0x::crdt::sync::testing::len(&h.buffer),
-        0,
-        "and the buffer is emptied, so admission stops queueing newer deltas"
-    );
-    assert_eq!(
-        h.titles().await,
-        vec![
-            "first".to_string(),
-            "second".to_string(),
-            "third".to_string()
-        ],
-        "in arrival order"
-    );
-    assert_eq!(h.gate.dropped.load(Ordering::SeqCst), 0);
-
-    // CONTROL: the pre-fix shape on the same fixture — derive, let a commit land,
-    // merge on the stale set. `token_stale_at_apply` records the exact condition the
-    // removed retry loop kept failing on, which is why churn could starve it.
-    let control = Harness::new();
-    let control_gate = control.gate(true).expect("gate");
-    control.authorize([control.writer]).await;
-    control.gate.suspended.store(true, Ordering::SeqCst);
-    control
-        .ingest_as(
-            Some(&control_gate),
-            control.delta_from(1, "first", &control.writer),
-            &control.writer,
-        )
-        .await;
-    control.gate.set_live_roster([control.writer]).await;
-    control.gate.suspended.store(false, Ordering::SeqCst);
-    control.gate.unpin_with_commit(control.writer);
-    let control_applied =
-        x0x::crdt::sync::testing::drain(Some(&control_gate), &control.buffer, &control.list).await;
-    assert!(
-        control.gate.token_stale_at_apply.load(Ordering::SeqCst),
-        "control: without the pin the set handed to the merge was already stale — \
-         the condition the old retry loop could never win against"
-    );
-    assert_eq!(
-        control_applied, 1,
-        "control: and it merged anyway, on a roster that had already moved"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // #756 review P2 — a newer delta cannot overtake pending ones on clear.
 // ---------------------------------------------------------------------------
@@ -1506,6 +1422,125 @@ async fn adr0068_p2_a_newer_delta_cannot_overtake_pending_deltas_when_the_clear_
         "control: an empty buffer admits directly"
     );
     assert!(h.titles().await.iter().any(|t| t == "admitted-directly"));
+}
+
+/// The PRODUCTION gate holds the real `named_groups` guard across the caller's
+/// closure — asserted against `tasks.rs::TaskQuarantineIngestGate`, not against the
+/// fixture's own fake (#756 review r3).
+///
+/// Two proofs, both of which fail if the implementation released the guard before
+/// invoking the closure (verified by doing exactly that: the first assertion
+/// fires):
+///
+/// 1. a write attempt made *at that moment* — `named_groups.try_write()` from
+///    inside the closure — must fail, so a roster writer cannot commit while the
+///    drain's merge would be running;
+/// 2. a writer task spawned from inside the closure completes only after the
+///    closure returns, and its commit is then visible.
+///
+/// The writer is spawned INSIDE the closure on purpose. Spawning it beforehand
+/// races the gate's own `read().await`: `tokio::sync::RwLock` is write-preferring,
+/// so a queued writer makes the gate's read wait, the commit lands first, and the
+/// fixture would be asserting the opposite interleaving. Spawning under the guard
+/// fixes the order without a sleep.
+///
+/// It also proves the pinned read resolves the group under the STABLE spelling
+/// while the map is keyed by an alias, and hands back the members and the ADR-0067
+/// token from that same read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr0068_r3_the_production_gate_pins_the_real_named_groups_guard() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let stable = "adr0068-r3-stable";
+    let alias = "adr0068-r3-alias";
+    let member = state.agent.agent_id();
+    let info = x0x::groups::GroupInfo::new(
+        "adr0068".to_string(),
+        "r3 pin fixture".to_string(),
+        member,
+        stable.to_string(),
+    );
+    assert_ne!(info.stable_group_id(), alias);
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(alias.to_string(), info);
+
+    let binding = crate::server::routes::group_task_list_binding(
+        &state,
+        &format!("x0x.group.{stable}.symphony.inbox"),
+    )
+    .await;
+    let gate = binding
+        .ingest_gate
+        .expect("a group-scoped list gets a gate");
+
+    struct Observed {
+        write_refused: bool,
+        seats_member: bool,
+        live_len: usize,
+        writer: Option<tokio::task::JoinHandle<()>>,
+    }
+    let observed = StdArc::new(std::sync::Mutex::new(None::<Observed>));
+    let sink = StdArc::clone(&observed);
+    let probe_state = Arc::clone(&state);
+    let mut apply = move |roster: Option<&x0x::crdt::AuthorizedRoster>| {
+        // (1) A write attempt made right now, while the closure runs.
+        let write_refused = probe_state.named_groups.try_write().is_err();
+        // (2) A real writer, started under the guard so the interleaving is not a
+        // race: it cannot commit until this closure returns.
+        let writer_state = Arc::clone(&probe_state);
+        let writer = tokio::spawn(async move {
+            let mut groups = writer_state.named_groups.write().await;
+            groups.remove("adr0068-r3-alias");
+        });
+        let seats = roster.map(|r| (r.agents.len(), r.agents.contains(&member)));
+        *sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Observed {
+            write_refused,
+            seats_member: seats.is_some_and(|(_, has)| has),
+            live_len: seats.map_or(0, |(len, _)| len),
+            writer: Some(writer),
+        });
+    };
+    gate.with_pinned_roster(&mut apply).await;
+
+    // Take everything out under the guard, in its own scope, so no lock is held
+    // across the await below.
+    let (write_refused, seats_member, live_len, writer) = {
+        let mut slot = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = slot
+            .as_mut()
+            .expect("the production gate must invoke the closure exactly once");
+        (
+            recorded.write_refused,
+            recorded.seats_member,
+            recorded.live_len,
+            recorded.writer.take().expect("writer handle"),
+        )
+    };
+    assert!(
+        write_refused,
+        "the production gate must hold the named_groups read guard ACROSS the \
+         closure: a writer that could commit here is the #756 P1 defect"
+    );
+    assert!(
+        seats_member && live_len >= 1,
+        "the pinned read resolves the alias-keyed record by its STABLE id and \
+         hands back its active members"
+    );
+
+    // Released: the writer proceeds, proving it was a real contender rather than a
+    // task that never ran, and its commit lands only now.
+    writer.await.expect("roster writer completes after the pin");
+    assert!(
+        !state.named_groups.read().await.contains_key(alias),
+        "the roster commit landed after the pinned read, never inside it"
+    );
+    Ok(())
 }
 
 /// #756 review P4: a clear that finds an EMPTY buffer still refreshes the cached

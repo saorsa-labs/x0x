@@ -495,8 +495,13 @@ fn lock_buffer(
 /// ADR-0068 D2: the outcome of the admission step.
 ///
 /// `Apply` carries the list write guard the decision was taken under, so the
-/// caller's merge happens inside the SAME critical section as the decision —
-/// there is no window for a marker to install between them (review nit 2).
+/// caller's merge happens inside the SAME critical section as the decision — no
+/// other task-list writer can interleave, and no marker observed by this call can
+/// be raced (review nit 2). It does NOT mean the marker cannot change at all: the
+/// gate's roster read is released before the verdict, so one already-admitted
+/// delta per listener can still merge just after a marker installs — see the
+/// admission step's own documentation for why that residual is accepted and what
+/// bounds it.
 // `Apply` carries a delta and a lock guard while `Held` carries nothing, so the
 // variants differ in size by design: boxing the admitted delta to even them out
 // would put an allocation on the ingest hot path to save nothing (the value is
@@ -513,10 +518,11 @@ pub enum Admission<'a> {
 /// ADR-0068 D2: the admission step — apply this delta now, or hold it?
 ///
 /// **Decides under the list write lock and hands the guard back.** ADR-0068's
-/// "marker installed mid-apply" row promises that the decision and the effect
-/// share one critical section; an earlier draft decided first and let the caller
-/// lock afterwards, so a marker installing in that gap let one delta through
-/// (review nit 2). It deliberately does NOT perform the merge itself: the
+/// "marker installed mid-apply" row asks that the decision and the effect share
+/// one critical section; an earlier draft decided first and let the caller lock
+/// afterwards, so a marker installing in that gap let one delta through — and
+/// worse, the list could be locked by someone else in between (review nit 2). It
+/// deliberately does NOT perform the merge itself: the
 /// listener's merge shares its critical section with the issue-#240
 /// digest-verified full-replace adopt, and splitting THAT would let an
 /// interleaved merge be pruned. So the guard travels instead of the merge.
@@ -541,6 +547,19 @@ pub enum Admission<'a> {
 /// ADR-0067 re-check keeps abandoning), newer deltas queue behind it under the
 /// same bounds and drop counter rather than applying out of order. That is
 /// bounded, counted, and cleared by a restart.
+///
+/// **Accepted residual: one in-flight delta per listener (#756 review r3).** This
+/// is the LIVE path and it is deliberately NOT roster-pinned — pinning it would put
+/// a `named_groups` read on the ingest hot path, which ADR-0068's cost section
+/// rules out. `gate.suspended()` therefore releases the roster read before this
+/// function returns `Apply`, so a marker installing in that instant is not seen and
+/// the caller's merge proceeds: **at most one already-admitted delta per listener**
+/// can land immediately after a marker installs. Nothing accumulates — the next
+/// delta reads the new marker and is held — and the drain path, where a whole
+/// buffer is at stake, IS pinned. So the honest statement of ADR-0068 D2's freeze
+/// is "byte-identical from the first delta that observes the marker", not "from the
+/// instant the marker installs". Row 20's local refusals are unaffected, and the
+/// admitted delta is a normal authenticated delta, not an unauthorized one.
 ///
 /// Hot path when no marker is live: one gate read (a resolver read behind the
 /// daemon's implementation), one buffer-empty check and a scalar compare, inside
@@ -632,13 +651,16 @@ pub(crate) async fn admit_or_buffer<'a>(
 /// **Lock order and hold time.** `TaskList` write → roster read is the documented
 /// order (see [`admit_or_buffer`]); acquiring the roster *after* the list guard is
 /// that order, not its inverse. The pin is held for one bounded synchronous batch:
-/// at most [`TASK_QUARANTINE_BUFFER_MAX_DELTAS`] merges over at most
-/// [`TASK_QUARANTINE_BUFFER_MAX_BYTES`] of deltas, with no I/O, no signature
-/// verification (envelopes were verified at receive time) and no persistence —
-/// the snapshot write happens after the guard is released. Worst case a roster
-/// WRITER waits that batch out (milliseconds at these bounds); roster readers are
-/// unaffected except behind a queued writer, and this path runs only while a group
-/// is or has just been fork-quarantined.
+/// at most [`TASK_QUARANTINE_BUFFER_MAX_DELTAS`] deltas totalling at most
+/// [`TASK_QUARANTINE_BUFFER_MAX_BYTES`], CPU-only — no I/O, no network and no
+/// persistence (the snapshot write happens after the guard is released). It is NOT
+/// free per delta: `merge_delta` runs the ADR-0068/issue-#349 admission checks,
+/// which verify checkbox attestations, and brackets the merge with two
+/// `state_fingerprint` scans over the resolved list. So the honest bound is "that
+/// batch of merges, whatever they cost on this machine", not a wall-clock figure.
+/// Worst case a roster WRITER waits that batch out; roster readers are unaffected
+/// except behind a queued writer, and this path runs only while a group is or has
+/// just been fork-quarantined.
 ///
 /// **Empty buffer (#756 review P4).** With nothing to drain the authorization is
 /// still refreshed under the same pin, so a clear that finds an empty buffer does
@@ -1181,12 +1203,14 @@ impl TaskListSync {
                             )
                             .await;
                         }
-                        // ADR-0068 D2: while this list's group holds a live
-                        // fork-quarantine marker, the delta is HELD in arrival
-                        // order and the list is left byte-identical — the
-                        // remote mirror of row 20's local refusals, so a peer
-                        // seated by the disputed roster cannot move the CRDT
-                        // winner during the incident.
+                        // ADR-0068 D2: from the first delta that OBSERVES a live
+                        // fork-quarantine marker, deltas are HELD in arrival order
+                        // and the list is left byte-identical — the remote mirror
+                        // of row 20's local refusals, so a peer seated by the
+                        // disputed roster cannot move the CRDT winner during the
+                        // incident. One delta already admitted when the marker
+                        // installs may still merge; that residual is stated at
+                        // `admit_or_buffer` and is bounded to one per listener.
                         let (delta, admitted) = match admit_or_buffer(
                             listener_gate.gate(),
                             &listener_buffer,

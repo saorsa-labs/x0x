@@ -253,7 +253,7 @@ async fn active_group_members(
 
 /// The active members of one already-resolved record, as CRDT writer
 /// identities. Split out so the roster read and the ADR-0067 token read in
-/// [`TaskQuarantineIngestGate::authorized_writers`] happen under ONE guard
+/// [`TaskQuarantineIngestGate::with_pinned_roster`] happen under ONE guard
 /// (#756 review P1).
 fn active_members_of(
     info: &x0x::groups::GroupInfo,
