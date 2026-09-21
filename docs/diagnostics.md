@@ -204,6 +204,14 @@ invalid evidence (#656).
 Combined observed-stage call rate =
 Δ(`inner_envelope_verify.count` + `pubsub_stages.verify.count`) / Δ`uptime_secs`.
 
+The `inner_envelope_verify` fields are independent lock-free counters, not an
+atomic tuple snapshot. A verification in progress while the endpoint is read
+can appear in `count` before its `failed` or `total_ns` update appears. Treat
+failure ratios and mean verify time from small sample deltas as approximate;
+use a sufficiently large window or combine adjacent windows. Do not require
+the fields from one response, or one low-volume delta, to satisfy an exact
+ratio invariant.
+
 That combined rate is an **upper-bound proxy for cryptographic operations in
 these two observed stages**, not an exact operation count and not a bound on
 daemon-wide ML-DSA work. The two counters draw the line differently: the outer

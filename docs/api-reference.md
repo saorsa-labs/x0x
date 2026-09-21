@@ -2406,6 +2406,10 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/relay` | `x0x diagnostics relay` | ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence |
 | GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023), including the ADR-0068 D1 quarantine-pin pair |
 
+The inner-envelope verification fields are independent lock-free samples.
+Derived failure ratios and mean durations are approximate, especially over
+low-volume intervals; see the [sampling guidance](diagnostics.md#soak-instrumentation-288).
+
 `GET /diagnostics/history` adds two ADR-0068 D1 fields to the ADR-0023 writer and
 reaper counters:
 
