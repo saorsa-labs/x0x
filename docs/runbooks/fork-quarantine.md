@@ -645,8 +645,19 @@ inside the listener's `select!`, so every arriving message cancelled it and
 traffic closer together than 5 s starved the drain indefinitely), and an inbound
 delta drains the buffer BEFORE it is admitted — so under traffic the catch-up
 happens on the first delta after the clear, ahead of that delta's own effect,
-and never after it.
+and never after it. Ordering does not depend on the drain succeeding: a delta is
+admitted only when the buffer is **empty**, so if a drain attempt is abandoned (a
+marker still live at its read, or the roster moving under its re-authorization)
+the newer delta queues behind the pending ones instead of merging past them.
+**Consequence worth knowing before an incident:** while a buffer cannot be drained
+at all — a group record that never comes back, so the ADR-0067 re-check keeps
+abandoning — newer deltas keep queueing behind it under the same 1024 / 1 MiB
+bounds, oldest dropped and counted. The list stops converging until the record
+returns or the daemon restarts (a restart discards the buffer and anti-entropy
+takes over). `task_deltas_quarantine_buffered` climbing while
+`task_deltas_quarantine_applied` does not is that situation.
 Source: `src/crdt/sync.rs::TaskListSync::start_with_spawner`,
+`src/crdt/sync.rs::admit_or_buffer`,
 `src/crdt/sync.rs::drain_and_persist`,
 `src/crdt/sync.rs::TASK_QUARANTINE_DRAIN_POLL_SECS`.
 The drain re-checks the ADR-0067 token (marker half) inside the same critical
@@ -687,11 +698,34 @@ owes the list is refilled by anti-entropy. **What an operator sees:** after a
 clear that removed a member, `task_deltas_quarantine_applied` plus
 `task_deltas_quarantine_dropped` account for everything held, and the removed
 member's work is in the second number.
-**Remaining residual:** the refresh happens on a drain, not on every roster
-change, so a membership change with no quarantine involved still leaves a list's
-`authorized_agents` set as captured at subscribe time until the daemon restarts.
-That is pre-existing behaviour, wider than fork quarantine, and unchanged.
+The refresh is tied to a **validated roster revision**, not merely taken before
+the merge: the member set travels with the ADR-0067 token it was derived at, and
+the drain requires the whole token — `state_revision` and marker identity — to be
+unchanged immediately before the first merge. A roster commit landing in that
+window (which `same_marker` alone cannot see, because the marker half does not
+move) causes the authorization to be re-derived, up to three times, after which
+the drain is abandoned with the buffer intact and in order. Nothing merges against
+a roster older than the one current at merge time.
+
+**A clear with an EMPTY buffer refreshes authorization too.** There is nothing to
+apply, but the cached roster is still replaced, so the deltas that arrive *next*
+are admitted against the roster the clearing commit left behind. Without that, a
+clear that happened to find the buffer empty left the contested roster in place
+for live admission.
+
+**Remaining residual, precisely.** The refresh happens on a drain or a clear, not
+on every roster change. A membership change with **no** quarantine involved still
+leaves a list's `authorized_agents` set as captured at subscribe time until the
+daemon restarts — pre-existing behaviour, wider than fork quarantine, unchanged
+here. And a group this node holds **no resolvable record for** gets an ingest gate
+(so a marker arriving later is honoured) but keeps **open** live admission:
+`is_authorized_content_writer` returns `true` when no set is installed, and the
+refresh deliberately does not install an empty set, because denying every writer
+on a failed lookup would silently discard a seated member's work. Fail-open on the
+*authorization* half, fail-closed on the *containment* half — say so out loud when
+triaging a list whose group record is missing.
 Source: `src/crdt/sync.rs::admit_or_buffer`,
+`src/crdt/sync.rs::AuthorizedRoster`,
 `src/crdt/sync.rs::TaskIngestGate::authorized_writers`,
 `src/server/routes/tasks.rs::active_group_members`,
 `src/server/routes/tasks.rs::group_task_list_binding`,

@@ -306,25 +306,25 @@ pub trait TaskIngestGate: Send + Sync + 'static {
         >,
     >;
 
-    /// The bound group's **live** active-member set, or `None` when this node
-    /// holds no resolvable record for it.
+    /// The bound group's **live** active-member set together with the lifecycle
+    /// token it was derived at, or `None` when this node holds no resolvable
+    /// record for the group.
     ///
-    /// Read by the buffer drain inside its merge critical section so
-    /// the roster a held delta is authorized against is the one the CLEARING
-    /// commit left behind, not the one the subscription captured (#732 finding
-    /// 4): a member the clearing commit removed does not get their buffered
-    /// work applied. `None` means "cannot determine" and leaves the installed
-    /// set untouched — never "authorize everyone".
+    /// Read by the buffer drain inside its merge critical section so the roster a
+    /// held delta is authorized against is the one the CLEARING commit left
+    /// behind, not the one the subscription captured (#732 finding 4): a member
+    /// the clearing commit removed does not get their buffered work applied.
+    /// `None` means "cannot determine" and leaves the installed set untouched —
+    /// never "authorize everyone".
+    ///
+    /// **Implementations must read the member set and the token under ONE roster
+    /// guard** ([`AuthorizedRoster`] says why): the drain validates that the
+    /// roster has not moved by re-reading [`Self::epoch_token`] and comparing the
+    /// WHOLE token, so a set and a revision that were never true together would
+    /// make that check meaningless (#756 review P1).
     fn authorized_writers(
         &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Option<std::collections::HashSet<crate::identity::AgentId>>,
-                > + Send
-                + '_,
-        >,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<AuthorizedRoster>> + Send + '_>>;
 
     /// A delta was buffered instead of applied; `depth`/`bytes` are the
     /// buffer's state after the push.
@@ -339,6 +339,36 @@ pub trait TaskIngestGate: Send + Sync + 'static {
     /// `count` buffered deltas were applied after the marker cleared.
     fn on_applied(&self, count: u64);
 }
+
+/// A live active-member set and the lifecycle token it was derived at, read
+/// under one roster guard.
+///
+/// The pairing is the point (#756 review P1). The drain refreshes authorization
+/// and then merges, and it cannot hold the roster lock across that merge without
+/// inverting the `TaskList` → `named_groups` order. So instead it proves the
+/// roster did not move: it re-reads [`TaskIngestGate::epoch_token`] immediately
+/// before the first merge, with no await in between, and requires the WHOLE token
+/// — `state_revision` and marker identity — to equal the one this set was derived
+/// at. `state_revision` advances on every roster/lifecycle commit and never goes
+/// backwards, so equal tokens at the two reads mean no roster commit landed in
+/// between. That argument only holds if the set and the token describe the same
+/// instant, which is why they travel together.
+#[derive(Debug, Clone)]
+pub struct AuthorizedRoster {
+    /// The group's active members, as CRDT writer identities.
+    pub agents: std::collections::HashSet<crate::identity::AgentId>,
+    /// The ADR-0067 lifecycle token read under the same guard as `agents`.
+    pub token: crate::groups::LifecycleEpochToken,
+}
+
+/// How many times the drain will re-derive authorization when the roster moves
+/// under it before giving up and leaving the buffer intact (#756 review P1).
+///
+/// Bounded rather than a retry-until-quiet loop: a node under a storm of roster
+/// commits must not spin inside a task-list write guard. Abandoning is safe and
+/// costs only latency — the deltas stay buffered in arrival order and the next
+/// poll or the next inbound delta tries again.
+const QUARANTINE_DRAIN_AUTH_ATTEMPTS: usize = 3;
 
 /// Set-once slot for the [`TaskIngestGate`].
 ///
@@ -476,7 +506,8 @@ fn lock_buffer(
 pub enum Admission<'a> {
     /// Merge this delta, using the guard the decision was taken under.
     Apply(TaskListDelta, tokio::sync::RwLockWriteGuard<'a, TaskList>),
-    /// A marker is live: the delta is held, the list untouched.
+    /// The delta is held and the list untouched: either a marker is live, or
+    /// older deltas are still pending and this one must not overtake them.
     Held,
 }
 
@@ -499,9 +530,22 @@ pub enum Admission<'a> {
 /// that awaits a task list while holding `named_groups` would break it, which is
 /// why the order is stated here and at the resume helper.
 ///
+/// **Admission is coupled to the buffer, not just to the marker (#756 review
+/// P2).** A delta is admitted ONLY when the buffer is empty. Checking suspension
+/// alone left an overtaking window: the caller's drain attempt can observe a live
+/// marker (or abandon on the ADR-0067 re-check) and return without consuming the
+/// buffer, and if the marker clears before this function's own suspension read,
+/// the newer delta merged straight past deltas that arrived before it — and the
+/// LWW registers are order-sensitive. Both facts are now read under the same list
+/// write guard, so the decision cannot be split. The consequence, stated plainly:
+/// while a buffer cannot be drained (a group record that never comes back, so the
+/// ADR-0067 re-check keeps abandoning), newer deltas queue behind it under the
+/// same bounds and drop counter rather than applying out of order. That is
+/// bounded, counted, and cleared by a restart.
+///
 /// Hot path when no marker is live: one gate read (a resolver read behind the
-/// daemon's implementation) and a scalar compare, inside the lock the merge
-/// needed anyway.
+/// daemon's implementation), one buffer-empty check and a scalar compare, inside
+/// the lock the merge needed anyway.
 pub(crate) async fn admit_or_buffer<'a>(
     gate: Option<&Arc<dyn TaskIngestGate>>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
@@ -516,7 +560,14 @@ pub(crate) async fn admit_or_buffer<'a>(
         return Admission::Apply(delta, task_list.write().await);
     };
     let list = task_list.write().await;
-    if !gate.suspended().await {
+    let suspended = gate.suspended().await;
+    // The buffer cannot change while this guard is held: every path that
+    // consumes or appends to it (the drain, the resume entry point, this
+    // function) takes the list write lock first. So "suspended" and "anything
+    // pending" are read as ONE fact, and a newer delta cannot overtake older
+    // pending ones (#756 review P2).
+    let pending = !lock_buffer(buffer).is_empty();
+    if !suspended && !pending {
         return Admission::Apply(delta, list);
     }
     // Still holding the write guard: a merge cannot slip between this verdict
@@ -572,18 +623,44 @@ pub(crate) async fn admit_or_buffer<'a>(
 /// what `same_marker` compares. A `None` token (this node holds no record for
 /// the group) is a mismatch, never "unchanged".
 ///
-/// **Live re-authorization (#732 finding 4).** The authorized-writer set is
-/// refreshed from the gate's live roster inside the same critical section, so a
-/// member the CLEARING commit removed does not get their buffered work applied:
-/// their entries are skipped and counted as dropped, with the reason logged.
-/// Without this the drain would authorize against the roster the subscription
-/// captured — the contested one.
+/// **Live re-authorization, tied to a validated roster revision (#732 finding 4,
+/// hardened for #756 review P1).** The authorized-writer set is refreshed from
+/// the gate's live roster inside the same critical section, so a member the
+/// CLEARING commit removed does not get their buffered work applied: their
+/// entries are skipped and counted as dropped, with the reason logged. The
+/// refresh alone was not enough, because the gate releases the roster lock before
+/// this function's later awaits and `same_marker` ignores `state_revision` — a
+/// roster commit landing in that gap would have been accepted. So the set travels
+/// with the token it was derived at ([`AuthorizedRoster`]) and the re-check
+/// demands the WHOLE token to be unchanged; on a revision mismatch the
+/// authorization is re-derived and re-filtered, up to
+/// [`QUARANTINE_DRAIN_AUTH_ATTEMPTS`] times, and then the drain is abandoned with
+/// the buffer intact. Nothing ever merges against a roster older than the one
+/// current at merge time.
+///
+/// **Empty buffer (#756 review P4).** With nothing to drain the authorization is
+/// still refreshed, so a clear that finds an empty buffer does not leave the
+/// cached roster stale for the deltas that arrive next.
 pub(crate) async fn drain_quarantine_buffer(
     gate: Option<&Arc<dyn TaskIngestGate>>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
     task_list: &RwLock<TaskList>,
 ) -> usize {
     if lock_buffer(buffer).is_empty() {
+        // #756 review P4: a clear with an empty buffer still refreshes the
+        // cached authorization, so the roster the NEXT deltas are admitted
+        // against is the one the clearing commit left behind. Only reached from
+        // the explicit resume entry point — the poll and the pre-admission drain
+        // both run while the buffer is non-empty — so this costs nothing on the
+        // ingest path.
+        if let Some(gate) = gate {
+            if !gate.suspended().await {
+                let mut list = task_list.write().await;
+                if let Some(roster) = gate.authorized_writers().await {
+                    list.set_authorized_agents(roster.agents);
+                }
+            }
+        }
         return 0;
     }
     // Capture WITH the decision: suspension and token are read together,
@@ -605,29 +682,61 @@ pub(crate) async fn drain_quarantine_buffer(
     let mut refused = 0u64;
     {
         let mut list = task_list.write().await;
-        // #732 finding 4: refresh the authorized-writer set from the LIVE
-        // roster before anything merges. It runs BEFORE the token re-check on
-        // purpose, so the re-check remains the last thing that happens before
-        // the first `merge_delta` with no await in between. Reading
-        // `named_groups` here is the declared lock order (`TaskList` →
-        // `named_groups`), the same order `suspended()` below uses. A refresh
-        // followed by an abandoned drain is harmless: the set is not persisted
-        // and not version-bearing, and a fresher roster is never worse than the
-        // one the subscription captured.
-        if let Some(gate) = gate {
-            if let Some(live) = gate.authorized_writers().await {
-                list.set_authorized_agents(live);
-            }
-        }
-        // The re-check, inside the critical section, with no await between it
-        // and the merge below.
+        // #732 finding 4 + #756 P1: re-derive authorization and prove the roster
+        // did not move under it. Each attempt reads the live set WITH its token
+        // (one roster guard inside the gate), then re-reads the token and
+        // requires the WHOLE token — revision and marker — to be unchanged, with
+        // NO await between that comparison and the first `merge_delta`. A
+        // mismatch re-derives rather than merging against a roster that has since
+        // advanced. Reading `named_groups` here is the declared lock order
+        // (`TaskList` → `named_groups`), the same order `suspended()` uses.
+        let mut authorized = false;
         if let (Some(gate), Some(captured)) = (gate, captured.as_ref()) {
-            if gate.suspended().await {
-                return 0; // a marker installed after the observation
+            for attempt in 0..QUARANTINE_DRAIN_AUTH_ATTEMPTS {
+                let derived = gate.authorized_writers().await;
+                if gate.suspended().await {
+                    return 0; // a marker installed after the observation
+                }
+                let live = match gate.epoch_token().await {
+                    // The marker half must still describe the quarantine this
+                    // drain decided against (ADR-0067's rule; a `None` token is a
+                    // mismatch, never "unchanged").
+                    Some(live) if live.same_marker(captured) => live,
+                    _ => return 0, // marker identity moved, or the record is gone
+                };
+                match derived {
+                    // The set was derived at a roster state that is still
+                    // current: authorize against it and merge below.
+                    Some(roster) if roster.token == live => {
+                        list.set_authorized_agents(roster.agents);
+                        authorized = true;
+                        break;
+                    }
+                    // "Cannot determine" — no resolvable roster, although the
+                    // token half still describes the same quarantine. Keep the
+                    // installed set exactly as it is (never open admission, never
+                    // deny everyone) and proceed, which is the rule the gate's
+                    // `None` documents; re-deriving would not produce more.
+                    None => {
+                        authorized = true;
+                        break;
+                    }
+                    // Derived at a state that has since advanced: re-derive. The
+                    // last attempt falls through to the abandon below.
+                    Some(_) => {
+                        tracing::debug!(
+                            attempt,
+                            "[tasks] roster moved while re-authorizing buffered task deltas                              — re-deriving (ADR-0068 D2; #756 P1)"
+                        );
+                    }
+                }
             }
-            match gate.epoch_token().await {
-                Some(live) if live.same_marker(captured) => {}
-                _ => return 0, // marker identity moved, or the record is gone
+            if !authorized {
+                tracing::warn!(
+                    attempts = QUARANTINE_DRAIN_AUTH_ATTEMPTS,
+                    "[tasks] abandoning a fork-quarantine drain: the roster kept moving while                      re-authorizing. The deltas stay buffered in arrival order for the next                      observation (ADR-0068 D2; #756 P1)"
+                );
+                return 0;
             }
         }
         let pending = lock_buffer(buffer).take();
@@ -3249,15 +3358,13 @@ mod tests {
         fn authorized_writers(
             &self,
         ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Option<std::collections::HashSet<crate::identity::AgentId>>,
-                    > + Send
-                    + '_,
-            >,
+            Box<dyn std::future::Future<Output = Option<AuthorizedRoster>> + Send + '_>,
         > {
             // "Cannot determine" — the list's own admission rules stand. The
-            // roster-refresh behaviour is covered by the #732 finding 4 fixtures.
+            // roster-refresh behaviour, its revision validation and the bounded
+            // retry are covered by the #732 finding 4 / #756 P1 fixtures in
+            // `named_groups/tests/adr0068_task_buffer.rs`, which drive the same
+            // functions this listener calls.
             Box::pin(async move { None })
         }
 
@@ -3325,6 +3432,22 @@ mod tests {
     /// listener ever sees. The negative control is the pre-fix ordering — a
     /// delta arriving while the slot is still empty MERGES, which is exactly
     /// what a restart with a quarantined group used to do.
+    ///
+    /// **Why this test and its siblings do NOT use `tokio::time::pause()`**
+    /// (raised by both #756 reviewers, and a fair question). These four tests
+    /// drive the REAL listener, which means a real `PubSubManager` over a real
+    /// loopback QUIC node: gossip and transport keep their own timers, and under
+    /// paused time either they never fire (delivery stalls forever) or
+    /// auto-advance fires them in an order the test does not control — the test
+    /// would be less deterministic, not more. Determinism here comes from not
+    /// depending on elapsed time at all: the poll period is injected per instance
+    /// (`set_drain_poll_millis`), every wait is a bounded poll on observable
+    /// state rather than a fixed sleep, and no assertion mentions a duration. The
+    /// interleaving properties that DO need exact orderings — the ADR-0067
+    /// re-check, the #756 P1 roster race and the P2 clear-between-steps window —
+    /// are asserted with counting barriers and no clock at all, in
+    /// `named_groups/tests/adr0068_task_buffer.rs`, against the same functions
+    /// this listener calls.
     #[tokio::test]
     async fn quarantine_gate_installed_before_start_holds_the_first_delta() {
         let sync = make_signed_sync("tasks/adr0068-before-start").await;

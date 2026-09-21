@@ -83,9 +83,19 @@ All notable changes to this project will be documented in this file.
     same critical section as the merge (before the ADR-0067 re-check, so that
     re-check is still the last thing before the first merge) and skips entries
     whose writer the refreshed roster no longer seats, counting them in
-    `task_deltas_quarantine_dropped` with the reason logged. **Residual:** a
-    roster change with no quarantine drain still leaves the set stale until
-    restart — pre-existing, broader than ADR-0068, and unchanged here.
+    `task_deltas_quarantine_dropped` with the reason logged. Cross-model review of
+    that fix found the refresh still racy — the gate releases the roster lock
+    before the later awaits and `same_marker` ignores `state_revision`, so a
+    commit landing in that window was accepted — so the member set now travels
+    with the token it was derived at (`crdt::AuthorizedRoster`, read under one
+    roster guard) and the re-check requires the **whole** token to be unchanged,
+    re-deriving up to three times and then abandoning with the buffer intact. A
+    clear that finds an EMPTY buffer refreshes the cached roster too, so live
+    admission afterwards uses the post-clear membership. **Residuals:** a roster
+    change with neither a drain nor a clear still leaves the set stale until
+    restart (pre-existing, broader than ADR-0068); and a group with no resolvable
+    record gets a gate but keeps **open** live admission, because installing an
+    empty set on a failed lookup would discard a seated member's work.
   - **Incoming traffic can no longer starve the drain (finding 5).** The 5 s
     drain poll was a fresh `sleep` created inside `select!` on every iteration,
     so every received message cancelled it: with messages arriving less than 5 s
@@ -95,7 +105,14 @@ All notable changes to this project will be documented in this file.
     it is admitted — so under traffic the catch-up happens on the next delta
     rather than on a timer, and arrival order is preserved. The runbook's
     "picked up within 5 s" is true again, including under a flood of undecodable
-    payloads, which never reach admission.
+    payloads, which never reach admission. Cross-model review found ordering still
+    breakable when a drain attempt was **abandoned** — the clear could land between
+    the attempt and the admission check, letting the newer delta merge past the
+    pending ones — so admission is now coupled to the buffer: a delta is applied
+    only when the buffer is empty, otherwise it queues behind what is pending
+    (same bounds, same drop counter). **Consequence:** a buffer that cannot be
+    drained at all (a group record that never returns) holds newer deltas behind
+    it; bounded, counted, and cleared by a restart.
 - **Outbound sends and secure-crypto routes now re-check the fork-quarantine
   marker immediately before their effect, not only at request start (ADR-0066
   §1 rows 1/2/4/6 and §4, slice 9; ADR-0067; #732).** These four paths were

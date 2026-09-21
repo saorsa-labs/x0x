@@ -248,6 +248,16 @@ async fn active_group_members(
 ) -> Option<std::collections::HashSet<x0x::identity::AgentId>> {
     let groups = state.named_groups.read().await;
     let (_, info) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
+    Some(active_members_of(info))
+}
+
+/// The active members of one already-resolved record, as CRDT writer
+/// identities. Split out so the roster read and the ADR-0067 token read in
+/// [`TaskQuarantineIngestGate::authorized_writers`] happen under ONE guard
+/// (#756 review P1).
+fn active_members_of(
+    info: &x0x::groups::GroupInfo,
+) -> std::collections::HashSet<x0x::identity::AgentId> {
     let mut agents = std::collections::HashSet::new();
     for (agent_hex, member) in &info.members_v2 {
         if matches!(member.state, x0x::groups::GroupMemberState::Active) {
@@ -260,7 +270,7 @@ async fn active_group_members(
             }
         }
     }
-    Some(agents)
+    agents
 }
 
 /// Everything the CRDT layer needs to know about this list's named group,
@@ -341,24 +351,29 @@ impl x0x::crdt::TaskIngestGate for TaskQuarantineIngestGate {
         })
     }
 
-    /// The LIVE active-member set for the bound group, resolved under both
-    /// spellings (#732 finding 4). The drain reads this inside its merge
-    /// critical section, so a member the clearing commit removed does not get
-    /// their buffered work applied. `None` — no resolvable record, or the daemon
-    /// is gone — leaves the installed set alone rather than opening admission.
+    /// The LIVE active-member set for the bound group with the lifecycle token it
+    /// was derived at, resolved under both spellings (#732 finding 4). The drain
+    /// reads this inside its merge critical section, so a member the clearing
+    /// commit removed does not get their buffered work applied. `None` — no
+    /// resolvable record, or the daemon is gone — leaves the installed set alone
+    /// rather than opening admission.
+    ///
+    /// Set and token come from **one** `named_groups` guard (#756 review P1): the
+    /// drain proves the roster has not moved by re-reading the token and comparing
+    /// the whole of it, which is only sound if the pair it compares against was
+    /// true at a single instant.
     fn authorized_writers(
         &self,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Option<std::collections::HashSet<x0x::identity::AgentId>>,
-                > + Send
-                + '_,
-        >,
+        Box<dyn std::future::Future<Output = Option<x0x::crdt::AuthorizedRoster>> + Send + '_>,
     > {
         Box::pin(async move {
             let state = self.state.upgrade()?;
-            active_group_members(&state, &self.group_id).await
+            let groups = state.named_groups.read().await;
+            let (_, info) = crate::server::resolve_group_entry_locked(&groups, &self.group_id)?;
+            let agents = active_members_of(info);
+            let token = crate::server::lifecycle_epoch_token_locked(&groups, &self.group_id)?;
+            Some(x0x::crdt::AuthorizedRoster { agents, token })
         })
     }
 

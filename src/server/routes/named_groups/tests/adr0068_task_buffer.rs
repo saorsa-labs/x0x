@@ -76,6 +76,25 @@ struct FakeGate {
     /// 4). `None` ⇒ "cannot determine", which must leave the list's installed
     /// set alone.
     live_roster: std::sync::Mutex<Option<std::collections::HashSet<x0x::identity::AgentId>>>,
+    /// `state_revision` the scripted roster above was derived at. The drain
+    /// compares the WHOLE token, so this differing from `live_state_revision` is
+    /// "a roster commit landed after the refresh" (#756 review P1).
+    roster_state_revision: AtomicU64,
+    /// `state_revision` the scripted LIVE record is at.
+    live_state_revision: AtomicU64,
+    /// From this many `authorized_writers()` reads on, a roster commit lands
+    /// between the refresh and the merge: `live_state_revision` advances and
+    /// `removed_by_race` leaves the live roster. `u64::MAX` = never.
+    move_roster_after_reads: AtomicU64,
+    /// Fire the roster barrier only ONCE (the interleaving case) rather than on
+    /// every read (the keeps-moving case).
+    move_roster_once: AtomicBool,
+    roster_reads: AtomicU64,
+    /// The member the scripted roster commit removes.
+    removed_by_race: std::sync::Mutex<Option<x0x::identity::AgentId>>,
+    /// From this many `suspended()` reads on, answer `false` — the clear landing
+    /// at a scripted point, the mirror of `suspend_after_reads`.
+    unsuspend_after_reads: AtomicU64,
     buffered: AtomicU64,
     dropped: AtomicU64,
     applied: AtomicU64,
@@ -91,6 +110,13 @@ impl Default for FakeGate {
             marker_revision: std::sync::Mutex::new(None),
             has_record: AtomicBool::new(true),
             live_roster: std::sync::Mutex::new(None),
+            roster_state_revision: AtomicU64::new(0),
+            live_state_revision: AtomicU64::new(0),
+            move_roster_after_reads: AtomicU64::new(u64::MAX),
+            move_roster_once: AtomicBool::new(false),
+            roster_reads: AtomicU64::new(0),
+            removed_by_race: std::sync::Mutex::new(None),
+            unsuspend_after_reads: AtomicU64::new(u64::MAX),
             buffered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             applied: AtomicU64::new(0),
@@ -122,6 +148,25 @@ impl FakeGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(agents.into_iter().collect());
     }
+
+    /// Arm the #756 P1 barrier: a roster commit that removes `member` lands
+    /// between the drain's refresh and its merge. `once` distinguishes the
+    /// interleaving case (one commit, so the retry converges) from a roster that
+    /// keeps moving (every read, so the drain must abandon).
+    fn arm_roster_race(&self, member: x0x::identity::AgentId, once: bool) {
+        *self
+            .removed_by_race
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(member);
+        self.move_roster_once.store(once, Ordering::SeqCst);
+        self.move_roster_after_reads
+            .store(self.roster_reads.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+
+    fn disarm_roster_race(&self) {
+        self.move_roster_after_reads
+            .store(u64::MAX, Ordering::SeqCst);
+    }
 }
 
 impl TaskIngestGate for FakeGate {
@@ -131,6 +176,10 @@ impl TaskIngestGate for FakeGate {
             if reads >= self.suspend_after_reads.load(Ordering::SeqCst) {
                 // The barrier fires: a marker appeared at this exact read.
                 self.suspended.store(true, Ordering::SeqCst);
+            }
+            if reads >= self.unsuspend_after_reads.load(Ordering::SeqCst) {
+                // The mirror barrier: the quarantine CLEARED at this exact read.
+                self.suspended.store(false, Ordering::SeqCst);
             }
             if reads >= self.move_marker_after_reads.load(Ordering::SeqCst) {
                 // The other barrier: the quarantine was cleared and
@@ -151,25 +200,61 @@ impl TaskIngestGate for FakeGate {
             if !self.has_record.load(Ordering::SeqCst) {
                 return None;
             }
-            Some(scripted_token(self.marker_revision()))
+            Some(scripted_token(
+                self.marker_revision(),
+                self.live_state_revision.load(Ordering::SeqCst),
+            ))
         })
     }
 
     fn authorized_writers(
         &self,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Option<std::collections::HashSet<x0x::identity::AgentId>>,
-                > + Send
-                + '_,
-        >,
+        Box<dyn std::future::Future<Output = Option<x0x::crdt::AuthorizedRoster>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.live_roster
+            let reads = self.roster_reads.fetch_add(1, Ordering::SeqCst);
+            // The set is derived HERE, at this revision…
+            let derived_at = self.roster_state_revision.load(Ordering::SeqCst);
+            let agents = self
+                .live_roster
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+                .clone();
+            // …and the scripted commit lands right after, before the caller can
+            // merge: the live record advances and loses the disputed member, so a
+            // drain that trusted this set would merge against a roster that is no
+            // longer current (#756 review P1).
+            if reads >= self.move_roster_after_reads.load(Ordering::SeqCst) {
+                if self.move_roster_once.load(Ordering::SeqCst) {
+                    self.disarm_roster_race();
+                }
+                let removed = *self
+                    .removed_by_race
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let advanced = self.live_state_revision.fetch_add(1, Ordering::SeqCst) + 1;
+                self.roster_state_revision.store(advanced, Ordering::SeqCst);
+                // One lock at a time: a re-lock inside an `if let` scrutinee would
+                // self-deadlock, because `if let` keeps its temporaries — the
+                // first guard included — alive for the whole block.
+                let current = self
+                    .live_roster
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let (Some(removed), Some(mut roster)) = (removed, current) {
+                    roster.remove(&removed);
+                    *self
+                        .live_roster
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(roster);
+                }
+            }
+            Some(x0x::crdt::AuthorizedRoster {
+                agents: agents?,
+                token: scripted_token(self.marker_revision(), derived_at),
+            })
         })
     }
 
@@ -187,13 +272,14 @@ impl TaskIngestGate for FakeGate {
 /// An ADR-0067 token whose marker half is `revision`, built through the real
 /// `GroupInfo::lifecycle_epoch_token` derivation so the fixture cannot drift
 /// from the production shape.
-fn scripted_token(revision: Option<u64>) -> x0x::groups::LifecycleEpochToken {
+fn scripted_token(revision: Option<u64>, state_revision: u64) -> x0x::groups::LifecycleEpochToken {
     let mut info = x0x::groups::GroupInfo::new(
         "adr0068".to_string(),
         "token script".to_string(),
         x0x::identity::AgentId([3u8; 32]),
         "adr0068-token".to_string(),
     );
+    info.state_revision = state_revision;
     if let Some(revision) = revision {
         let header = info.terminal_commit_header();
         info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
@@ -991,12 +1077,12 @@ async fn adr0068_f3_the_prestart_binding_carries_the_gate_for_a_quarantined_grou
         .await
         .expect("the live roster resolves under the stable spelling");
     assert!(
-        live.contains(&member),
+        live.agents.contains(&member),
         "the active member is authorized from the LIVE roster: {live:?}"
     );
     assert_eq!(
         binding.authorized_agents.as_ref().map(|a| a.len()),
-        Some(live.len()),
+        Some(live.agents.len()),
         "the binding's captured set comes from the same resolver"
     );
 
@@ -1015,11 +1101,20 @@ async fn adr0068_f3_the_prestart_binding_carries_the_gate_for_a_quarantined_grou
 /// anything applied to the handle afterwards is applied after the listener has
 /// already started (#732 finding 3).
 ///
-/// A source scan rather than a behavioural test because reproducing the race
-/// needs a gossip runtime; the behaviour itself is covered in-process by
-/// `crdt::sync::tests::quarantine_gate_installed_before_start_holds_the_first_delta`.
+/// **This is a STRUCTURAL GUARD, not a behavioural test** (labelled as such after
+/// #756 review): it reads the two sources and asserts they name the bound
+/// constructors. A behavioural version would need a live gossip runtime to build
+/// a handle at all, which these in-process fixtures deliberately do without. The
+/// behaviour it guards — a gate installed before the listener holds the first
+/// delta — is asserted for real in
+/// `crdt::sync::tests::quarantine_gate_installed_before_start_holds_the_first_delta`,
+/// and the binding's own content behaviourally in
+/// `adr0068_f3_the_prestart_binding_carries_the_gate_for_a_quarantined_group`.
+/// What this adds over those two is the wiring: that the daemon's real call sites
+/// take that path. It fails if someone reverts a call site to the unbound
+/// constructor.
 #[test]
-fn adr0068_f3_the_handle_producing_call_sites_bind_before_they_start() {
+fn adr0068_f3_structural_guard_handle_producing_call_sites_bind_before_they_start() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let rehydrate = std::fs::read_to_string(root.join("src/server/crdt_subscriptions.rs"))
         .expect("the rehydration path must exist");
@@ -1050,4 +1145,265 @@ fn adr0068_f3_the_handle_producing_call_sites_bind_before_they_start() {
              delta listener is spawned"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #756 review P1 — authorization is tied to a VALIDATED roster revision, so a
+// roster commit landing between the refresh and the merge cannot be missed.
+// ---------------------------------------------------------------------------
+
+/// A roster commit that removes the buffered writer lands in the window between
+/// the drain's refresh and its merge. The drain must notice (the whole token, not
+/// just the marker half, has to be unchanged), re-derive, and refuse that
+/// writer's held deltas.
+///
+/// Deterministic by a per-instance barrier counting `authorized_writers()` reads
+/// — no sleeps, no wall-clock, no process-global state. `same_marker` alone cannot
+/// see this: the marker half is identical throughout, only `state_revision` moves.
+#[tokio::test]
+async fn adr0068_p1_a_roster_commit_between_refresh_and_merge_is_not_missed() {
+    let h = Harness::new();
+    let gate = h.gate(true).expect("gate");
+    let removed = x0x::identity::AgentId([21u8; 32]);
+    let seated = h.writer;
+    h.authorize([removed, seated]).await;
+    h.gate.suspended.store(true, Ordering::SeqCst);
+    h.ingest_as(
+        Some(&gate),
+        h.delta_from(1, "disputed-claim", &removed),
+        &removed,
+    )
+    .await;
+    h.ingest_as(
+        Some(&gate),
+        h.delta_from(2, "seated-work", &seated),
+        &seated,
+    )
+    .await;
+    assert_eq!(x0x::crdt::sync::testing::len(&h.buffer), 2);
+
+    // The marker clears. At the moment the drain reads the roster it still holds
+    // both members — and the removing commit lands immediately afterwards, before
+    // anything can merge.
+    h.gate.set_live_roster([removed, seated]);
+    h.gate.suspended.store(false, Ordering::SeqCst);
+    h.gate.arm_roster_race(removed, true);
+
+    let applied = x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await;
+
+    assert_eq!(
+        applied, 1,
+        "only the seated member's delta may merge: the drain re-derived after the \
+         roster moved under it"
+    );
+    assert_eq!(
+        h.gate.dropped.load(Ordering::SeqCst),
+        1,
+        "the removed member's held delta is dropped and counted"
+    );
+    let titles = h.titles().await;
+    assert!(
+        !titles.iter().any(|t| t == "disputed-claim"),
+        "a roster commit in the refresh→merge window must still contain the \
+         removed member: {titles:?}"
+    );
+    assert!(titles.iter().any(|t| t == "seated-work"));
+
+    // NEGATIVE CONTROL: the identical fixture with NO commit in the window ⇒ the
+    // same delta from the same writer merges. So the assertion above is about the
+    // interleaving, not about the drain refusing everything.
+    let control = Harness::new();
+    let control_gate = control.gate(true).expect("gate");
+    control.authorize([removed, control.writer]).await;
+    control.gate.suspended.store(true, Ordering::SeqCst);
+    control
+        .ingest_as(
+            Some(&control_gate),
+            control.delta_from(1, "disputed-claim", &removed),
+            &removed,
+        )
+        .await;
+    control.gate.set_live_roster([removed, control.writer]);
+    control.gate.suspended.store(false, Ordering::SeqCst);
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&control_gate), &control.buffer, &control.list).await,
+        1,
+        "control: with no roster commit in the window the held delta applies"
+    );
+    assert!(
+        control.titles().await.iter().any(|t| t == "disputed-claim"),
+        "control: the same writer's delta DOES merge when the roster holds still"
+    );
+}
+
+/// A roster that keeps moving makes the drain give up — bounded, with the buffer
+/// intact and in order — rather than spin inside the list write guard or merge
+/// against a roster that is already stale.
+#[tokio::test]
+async fn adr0068_p1_a_roster_that_keeps_moving_abandons_the_drain_with_the_buffer_intact() {
+    let h = Harness::new();
+    let gate = h.gate(true).expect("gate");
+    let removed = x0x::identity::AgentId([21u8; 32]);
+    h.authorize([removed, h.writer]).await;
+    h.gate.suspended.store(true, Ordering::SeqCst);
+    h.ingest_as(Some(&gate), h.delta_from(1, "first", &h.writer), &h.writer)
+        .await;
+    h.ingest_as(Some(&gate), h.delta_from(2, "second", &h.writer), &h.writer)
+        .await;
+    let before = h.state_bytes().await;
+
+    h.gate.set_live_roster([removed, h.writer]);
+    h.gate.suspended.store(false, Ordering::SeqCst);
+    // `once = false`: every refresh is followed by another commit.
+    h.gate.arm_roster_race(removed, false);
+
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
+        0,
+        "the drain abandons rather than merging against a roster that has moved"
+    );
+    assert_eq!(
+        h.state_bytes().await,
+        before,
+        "the CRDT is byte-identical — nothing half-applied"
+    );
+    assert_eq!(
+        x0x::crdt::sync::testing::len(&h.buffer),
+        2,
+        "both deltas stay buffered, in arrival order, for the next observation"
+    );
+    assert_eq!(h.gate.applied.load(Ordering::SeqCst), 0);
+
+    // CONTROL: the roster settles ⇒ the very same buffer drains in order.
+    h.gate.disarm_roster_race();
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
+        2,
+        "control: a settled roster drains the same buffer"
+    );
+    assert_eq!(
+        h.titles().await,
+        vec!["first".to_string(), "second".to_string()],
+        "and in arrival order"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #756 review P2 — a newer delta cannot overtake pending ones on clear.
+// ---------------------------------------------------------------------------
+
+/// The clear lands between the listener's drain attempt and its admission check:
+/// the drain sees a live marker and consumes nothing, then the marker is gone by
+/// the time the new delta is examined. The new delta must queue BEHIND the
+/// pending ones, not merge ahead of them.
+///
+/// Deterministic by counting `suspended()` reads — the clear is scripted to land
+/// at exactly the read between the two steps, so no timing is involved. The two
+/// steps are the listener's own: `drain` then `admit_or_buffer`.
+#[tokio::test]
+async fn adr0068_p2_a_newer_delta_cannot_overtake_pending_deltas_when_the_clear_interleaves() {
+    let h = Harness::new();
+    let gate = h.gate(true).expect("gate");
+    h.gate.suspended.store(true, Ordering::SeqCst);
+    h.ingest(Some(&gate), h.delta(1, "arrived-first")).await;
+    assert_eq!(x0x::crdt::sync::testing::len(&h.buffer), 1);
+    let before = h.state_bytes().await;
+
+    // The clear lands at the read AFTER the drain's — i.e. at the admission
+    // check, exactly the window P2 describes.
+    let reads = h.gate.suspension_reads.load(Ordering::SeqCst);
+    h.gate
+        .unsuspend_after_reads
+        .store(reads + 1, Ordering::SeqCst);
+
+    // Step 1, the listener's drain attempt: still quarantined at its read, so it
+    // consumes nothing.
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
+        0,
+        "the drain observes the marker and leaves the buffer alone"
+    );
+    // Step 2, the listener's admission: the marker is gone at THIS read.
+    h.ingest(Some(&gate), h.delta(2, "arrived-second")).await;
+
+    assert_eq!(
+        h.state_bytes().await,
+        before,
+        "the newer delta must NOT merge ahead of the pending one, even though the \
+         marker cleared before it was examined"
+    );
+    assert_eq!(
+        x0x::crdt::sync::testing::len(&h.buffer),
+        2,
+        "it queues behind the pending delta instead"
+    );
+
+    // Now the buffer drains, in arrival order, with the clear fully observed.
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
+        2
+    );
+    assert_eq!(
+        h.titles().await,
+        vec!["arrived-first".to_string(), "arrived-second".to_string()],
+        "order preserved: the delta that arrived first is applied first"
+    );
+
+    // CONTROL: with an EMPTY buffer and no marker, the same admission applies
+    // directly — so "Held" above is a fact about the pending buffer, not a gate
+    // that holds everything.
+    assert_eq!(x0x::crdt::sync::testing::len(&h.buffer), 0);
+    h.ingest(Some(&gate), h.delta(3, "admitted-directly")).await;
+    assert_eq!(
+        x0x::crdt::sync::testing::len(&h.buffer),
+        0,
+        "control: an empty buffer admits directly"
+    );
+    assert!(h.titles().await.iter().any(|t| t == "admitted-directly"));
+}
+
+/// #756 review P4: a clear that finds an EMPTY buffer still refreshes the cached
+/// authorization, so the deltas that arrive next are admitted against the roster
+/// the clearing commit left behind rather than the one the subscription captured.
+#[tokio::test]
+async fn adr0068_p4_a_clear_with_an_empty_buffer_still_refreshes_authorization() {
+    let h = Harness::new();
+    let gate = h.gate(true).expect("gate");
+    let removed = x0x::identity::AgentId([21u8; 32]);
+    h.authorize([removed, h.writer]).await;
+
+    // Nothing buffered; the clearing commit removed `removed`.
+    h.gate.set_live_roster([h.writer]);
+    assert_eq!(
+        x0x::crdt::sync::testing::drain(Some(&gate), &h.buffer, &h.list).await,
+        0,
+        "nothing to apply — the refresh is the whole point of this call"
+    );
+
+    // A delta from the removed member now arrives on the LIVE path.
+    h.ingest_as(
+        Some(&gate),
+        h.delta_from(1, "after-clear", &removed),
+        &removed,
+    )
+    .await;
+    assert!(
+        !h.titles().await.iter().any(|t| t == "after-clear"),
+        "live admission uses the refreshed roster: the removed member's content \
+         does not land"
+    );
+
+    // CONTROL: the same delta from a writer the commit KEPT does land, so the
+    // assertion above is about the refreshed roster and not about admission being
+    // broken.
+    h.ingest_as(
+        Some(&gate),
+        h.delta_from(2, "seated-after-clear", &h.writer),
+        &h.writer,
+    )
+    .await;
+    assert!(
+        h.titles().await.iter().any(|t| t == "seated-after-clear"),
+        "control: a seated member's delta still applies"
+    );
 }
