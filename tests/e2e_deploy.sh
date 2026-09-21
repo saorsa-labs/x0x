@@ -8,6 +8,10 @@
 # DEFAULT NETWORK = TESTNET. Pass --network prod to target the production
 # fleet (REAL USERS) — that path prints a loud red banner and waits 5 s for
 # Ctrl-C before any action.
+#
+# CONFIGURE_LOG_CAPS=0 skips the host-global journald/logrotate/cron policy
+# while retaining binary deployment and verification. The default is 1,
+# preserving the existing fleet behavior.
 # =============================================================================
 set -euo pipefail
 
@@ -42,6 +46,7 @@ else
     RUNNER_AGENT_DATA_DIR="/root/.local/share/x0x-testnet"
 fi
 DEPLOY_RUNNER="${DEPLOY_RUNNER:-1}"
+CONFIGURE_LOG_CAPS="${CONFIGURE_LOG_CAPS:-1}"
 MESH_VERIFY="${MESH_VERIFY:-0}"
 MESH_ANCHOR="${MESH_ANCHOR:-nyc}"
 MESH_DISCOVER_SECS="${MESH_DISCOVER_SECS:-45}"
@@ -55,6 +60,17 @@ SSH="ssh -C -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMa
 [ -n "${X0X_DEPLOY_SSH_CMD:-}" ] && SSH="$X0X_DEPLOY_SSH_CMD"
 # Per-node upload: up to 3 attempts, each capped at 900 s (#682).
 MAX_UPLOAD_ATTEMPTS=3
+
+# Log caps alter host-wide journald/logrotate policy. Testnet deployments may
+# opt out explicitly so deploying the parallel service cannot change the
+# production daemon's logging environment. Validate before any remote action.
+case "$CONFIGURE_LOG_CAPS" in
+    0|1) ;;
+    *)
+        echo "CONFIGURE_LOG_CAPS must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
 
 # CLI overrides (--mesh-verify / --skip-mesh-verify)
 for arg in "$@"; do
@@ -99,7 +115,17 @@ if [ "${SKIP_BUILD:-}" = "1" ] && [ -f "$BINARY" ]; then
 else
     cd "$PROJECT_DIR"
     echo "  Building x0xd for x86_64-unknown-linux-gnu..."
-    cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0xd 2>&1 | tail -5
+    BUILD_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/x0x-zigbuild.XXXXXX")
+    if cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0xd >"$BUILD_OUTPUT" 2>&1; then
+        tail -5 "$BUILD_OUTPUT"
+        rm -f "$BUILD_OUTPUT"
+    else
+        BUILD_STATUS=$?
+        cat "$BUILD_OUTPUT" >&2
+        rm -f "$BUILD_OUTPUT"
+        echo -e "  ${RED}Build failed (exit $BUILD_STATUS)${NC}" >&2
+        exit "$BUILD_STATUS"
+    fi
     if [ ! -f "$BINARY" ]; then
         echo -e "  ${RED}Build failed — binary not found at $BINARY${NC}"
         exit 1
@@ -171,8 +197,9 @@ for node in "${NODE_NAMES[@]}"; do
     # hourly (stock cadence is daily — too slow for busy bootstrap nodes).
     # Idempotent: safe to re-run every deploy. x0xd itself now logs per-packet
     # recv/send at DEBUG (not INFO), so steady-state volume is already low.
-    echo -n "    Enforcing log budget (<5G)... "
-    if $SSH root@"$ip" '
+    if [ "$CONFIGURE_LOG_CAPS" = "1" ]; then
+        echo -n "    Enforcing log budget (<5G)... "
+        if $SSH root@"$ip" '
         mkdir -p /etc/systemd/journald.conf.d
         printf "[Journal]\nSystemMaxUse=1G\nSystemMaxFileSize=200M\n" > /etc/systemd/journald.conf.d/99-x0x-cap.conf
         systemctl restart systemd-journald 2>/dev/null || true
@@ -205,10 +232,13 @@ LRCONF
         printf "#!/bin/sh\n/usr/sbin/logrotate /etc/logrotate.conf 2>/dev/null || true\n" > /etc/cron.hourly/x0x-logrotate
         chmod 0755 /etc/cron.hourly/x0x-logrotate
         /usr/sbin/logrotate -f /etc/logrotate.conf >/dev/null 2>&1 || true
-    ' 2>/dev/null; then
-        echo -e "${GREEN}done${NC}"
+        ' 2>/dev/null; then
+            echo -e "${GREEN}done${NC}"
+        else
+            echo -e "${YELLOW}log-cap setup failed (continuing)${NC}"
+        fi
     else
-        echo -e "${YELLOW}log-cap setup failed (continuing)${NC}"
+        echo "    Log-cap configuration skipped (CONFIGURE_LOG_CAPS=0)"
     fi
 
     # Mesh test runner — Python entrypoint + framing helper + unit + env file.
@@ -315,7 +345,7 @@ for node in "${NODE_NAMES[@]}"; do
         NODE_UPPER=$(echo "$node" | tr '[:lower:]' '[:upper:]')
         echo "${X0X_TOKEN_VAR_PREFIX}_${NODE_UPPER}_IP=\"$ip\"" >> "$TOKEN_FILE"
         echo "${X0X_TOKEN_VAR_PREFIX}_${NODE_UPPER}_TK=\"$TOKEN\"" >> "$TOKEN_FILE"
-        echo "    Token: ${TOKEN:0:16}..."
+        echo "    API token obtained"
     else
         echo -e "    ${RED}Could not read API token${NC}"
     fi
