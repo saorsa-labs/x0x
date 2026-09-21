@@ -149,6 +149,7 @@ pub struct DispatchStreamStats {
     timed_out: AtomicU64,
     max_elapsed_ms: AtomicU64,
     total_elapsed_ns: AtomicU64,
+    over_100ms_count: AtomicU64,
     over_1s_count: AtomicU64,
     over_5s_count: AtomicU64,
     over_30s_count: AtomicU64,
@@ -163,6 +164,9 @@ pub struct DispatchStreamStatsSnapshot {
     pub max_elapsed_ms: u64,
     /// Cumulative handler wall-clock time, in nanoseconds.
     pub total_elapsed_ns: u64,
+    /// Handler invocations that took at least 100 milliseconds (#288: tells a
+    /// lane that is slow across the board from one hitting a rare 5 s cliff).
+    pub over_100ms_count: u64,
     /// Handler invocations that took at least 1 second.
     pub over_1s_count: u64,
     /// Handler invocations that took at least 5 seconds.
@@ -191,6 +195,9 @@ impl DispatchStreamStats {
             .fetch_max(duration_ms(elapsed), Ordering::Relaxed);
         self.total_elapsed_ns
             .fetch_add(duration_ns(elapsed), Ordering::Relaxed);
+        if elapsed >= Duration::from_millis(100) {
+            self.over_100ms_count.fetch_add(1, Ordering::Relaxed);
+        }
         if elapsed >= Duration::from_secs(1) {
             self.over_1s_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -209,6 +216,7 @@ impl DispatchStreamStats {
             timed_out: self.timed_out.load(Ordering::Relaxed),
             max_elapsed_ms: self.max_elapsed_ms.load(Ordering::Relaxed),
             total_elapsed_ns: self.total_elapsed_ns.load(Ordering::Relaxed),
+            over_100ms_count: self.over_100ms_count.load(Ordering::Relaxed),
             over_1s_count: self.over_1s_count.load(Ordering::Relaxed),
             over_5s_count: self.over_5s_count.load(Ordering::Relaxed),
             over_30s_count: self.over_30s_count.load(Ordering::Relaxed),
@@ -1334,9 +1342,18 @@ mod tests {
         stats.pubsub.record_completed(Duration::from_millis(25));
         stats.membership.record_timed_out(Duration::from_secs(6));
         stats.bulk.record_timed_out(Duration::from_secs(31));
+        stats
+            .membership
+            .record_completed(Duration::from_millis(100));
 
         let snapshot = stats.snapshot();
         assert!(snapshot.pubsub.total_elapsed_ns >= 25_000_000);
+        // #288: 25 ms is healthy; the sub-second bucket must stay empty for it
+        // and fill for anything slower, or it cannot separate "slow across
+        // the board" from "rare 5 s cliff".
+        assert_eq!(snapshot.pubsub.over_100ms_count, 0);
+        assert_eq!(snapshot.membership.over_100ms_count, 2);
+        assert_eq!(snapshot.bulk.over_100ms_count, 1);
         assert_eq!(snapshot.pubsub.over_1s_count, 0);
         assert_eq!(snapshot.membership.over_1s_count, 1);
         assert_eq!(snapshot.membership.over_5s_count, 1);
