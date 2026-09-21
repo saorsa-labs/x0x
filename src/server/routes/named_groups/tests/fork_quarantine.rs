@@ -4131,8 +4131,10 @@ async fn issue732_older_journal_at_one_file_unions_containment_through_recovery(
 /// revision 3 from REFUSED to PERMITTED — the replay would hand out a clear
 /// nobody granted, one step removed.
 ///
-/// The claim: `challenger_containment_is_stronger` is a TOTAL order (`no_anchor`, then the
-/// higher `revision`, then keep live), so the surviving threshold is never lower
+/// The claim: `challenger_containment_is_stronger` is a TOTAL order (`no_anchor`
+/// class first, then the strictly higher `revision`; at equal strength the
+/// INCUMBENT survives — under #732 r8's sorted-key folds, the first candidate
+/// in key order), so the surviving threshold is never lower
 /// than either half's, and the WHOLE stronger marker is installed — never a mix
 /// of fields from both, which would describe a fork observation that never
 /// happened (ADR-0067 derives `ForkQuarantineIdentity` from exactly those
@@ -4398,6 +4400,604 @@ async fn issue732_every_spelling_resolves_to_containment_after_load() -> Result<
             .owner_certified_user_id()
             .is_some(),
         "the authoritative record still wins on policy"
+    );
+    Ok(())
+}
+
+/// #732 r8 (Codex r7 P1a): the four owner-anchored clear arms persist
+/// their cleared record through `persist_named_group_info` — a transaction
+/// that does NOT pass through `persist_named_groups_mutation_unlocked`, so
+/// an invariant enforced only at that chokepoint would leave the sibling
+/// spelling marked, and a restart would spread the marker back from disk.
+/// The clear must reach EVERY alias spelling in memory and survive reload.
+#[tokio::test]
+async fn issue732_owner_anchored_clear_reaches_every_alias_and_survives_reload() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let stable = "ee".repeat(32);
+    let alias_key = "issue732-owner-clear-alias".to_string();
+    let mut record = x0x::groups::GroupInfo::with_policy(
+        "owner-clear-spread".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        stable.clone(),
+        invite_only_policy(),
+    );
+    record.state_revision = 5;
+    record.fork_quarantine = Some(synthetic_marker(false)?);
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.insert(stable.clone(), record.clone());
+        groups.insert(alias_key.clone(), record.clone());
+    }
+
+    // What the seal/apply/adoption clear arms do: persist the ONE cleared
+    // record through `persist_named_group_info`.
+    let mut cleared = record.clone();
+    cleared.fork_quarantine = None;
+    cleared.reset_fork_evidence_after_quarantine_clear();
+    let outcome = super::super::persist_named_group_info(&state, &alias_key, cleared).await?;
+    assert!(
+        matches!(&outcome, super::super::AtomicWriteOutcome::Durable),
+        "fixture precondition — the clear itself was durable: {outcome:?}"
+    );
+
+    {
+        let groups = state.named_groups.read().await;
+        for key in [stable.as_str(), alias_key.as_str()] {
+            assert!(
+                groups[key].fork_quarantine.is_none(),
+                "#732 r8: the clear reached the `{key}` spelling in memory"
+            );
+        }
+    }
+    // Reload survival: the on-disk bytes carry the spread, not just memory.
+    let raw = tokio::fs::read_to_string(&state.named_groups_path).await?;
+    let disk: std::collections::HashMap<String, x0x::groups::GroupInfo> =
+        serde_json::from_str(&raw)?;
+    for key in [stable.as_str(), alias_key.as_str()] {
+        assert!(
+            disk[key].fork_quarantine.is_none(),
+            "#732 r8: the clear survived reload for `{key}` — the disk bytes were converged"
+        );
+    }
+    Ok(())
+}
+
+/// #732 r8 (Codex r7 P1b, at the LOAD BOUNDARY): the erasing sequence r7
+/// described needs a divergent map — sibling durably marked, the retried
+/// spelling clean — which a pre-invariant binary could write. The claim
+/// under test is about EXISTING inputs: `load_named_groups_merged` converges
+/// such a map before any live mutation can run, so (a) every spelling
+/// resolves contained, and (b) the first-complete-wins gate (`the marker IS
+/// the record`) refuses an identical re-install, leaving nothing for a
+/// durability rollback to erase. The clean-group control then shows the
+/// rollback restoring absence on EVERY spelling — no half state.
+#[tokio::test]
+async fn issue732_inherited_divergent_containment_survives_the_load_boundary() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let stable = "f0".repeat(32);
+    let alias_key = "issue732-inherited-alias".to_string();
+    let marker_x = synthetic_marker(false)?;
+
+    // Phase A — INHERITED divergence, exactly the pre-r8 disk shape: the
+    // stable-keyed spelling durably marked, the alias spelling clean. The
+    // pair is written to the NAMED STORE, because the load boundary reads
+    // files, not the live map.
+    {
+        let mut marked = x0x::groups::GroupInfo::with_policy(
+            "inherited-divergence".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            stable.clone(),
+            invite_only_policy(),
+        );
+        marked.state_revision = 5;
+        marked.fork_quarantine = Some(marker_x.clone());
+        let mut clean = marked.clone();
+        clean.fork_quarantine = None;
+        let mut disk = std::collections::HashMap::new();
+        disk.insert(stable.clone(), marked);
+        disk.insert(alias_key.clone(), clean);
+        write_named_groups_json_atomic(&state.named_groups_path, &serde_json::to_string(&disk)?)
+            .await?;
+    }
+    // The load boundary (the same merged view `server::serve` builds at
+    // startup) converges the inherited divergence: strongest whole pair on
+    // every spelling.
+    let merged =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    for key in [stable.as_str(), alias_key.as_str()] {
+        assert!(
+            merged[key].fork_quarantine.as_ref() == Some(&marker_x),
+            "#732 r8: the load boundary converged the inherited containment onto `{key}`"
+        );
+        assert!(
+            super::super::fork_evidence_already_recorded(&merged[key]),
+            "post-load, the dedup gate holds for `{key}` — an identical conflict is \
+             NotEvidence, so no re-install and no rollback can touch the inherited marker"
+        );
+    }
+    // And the gate's consequence, executed: an identical install is refused.
+    *state.named_groups.write().await = merged.clone();
+    let evidence = x0x::groups::ForkEvidence {
+        revision: marker_x.revision,
+        state_hash: marker_x.state_hash.clone(),
+        committed_by: marker_x.committed_by.clone(),
+        observed_at_ms: marker_x.observed_at_ms,
+    };
+    assert!(
+        !super::super::install_fork_evidence(
+            &state,
+            &stable,
+            evidence.clone(),
+            Some(marker_x.clone()),
+            false,
+        )
+        .await,
+        "first-complete-wins: an identical marker is already recorded, nothing installs"
+    );
+    {
+        let groups = state.named_groups.read().await;
+        assert_eq!(
+            groups[&alias_key].fork_quarantine.as_ref(),
+            Some(&marker_x),
+            "the inherited containment survived the refused retry on every spelling"
+        );
+    }
+
+    // Phase B — clean-group control: a fresh conflict installs under a
+    // durability fault, and the rollback restores absence EVERYWHERE.
+    let marker_y = {
+        let mut other = synthetic_marker(false)?;
+        other.revision = marker_x.revision + 1;
+        other
+    };
+    {
+        let mut groups = state.named_groups.write().await;
+        for key in [stable.clone(), alias_key.clone()] {
+            let info = groups
+                .get_mut(&key)
+                .ok_or_else(|| anyhow::anyhow!("gone"))?;
+            info.fork_quarantine = None;
+            info.reset_fork_evidence_after_quarantine_clear();
+        }
+    }
+    let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
+    let evidence_y = x0x::groups::ForkEvidence {
+        revision: marker_y.revision,
+        state_hash: marker_y.state_hash.clone(),
+        committed_by: marker_y.committed_by.clone(),
+        observed_at_ms: marker_y.observed_at_ms,
+    };
+    assert!(
+        !super::super::install_fork_evidence(
+            &state,
+            &stable,
+            evidence_y,
+            Some(marker_y.clone()),
+            false,
+        )
+        .await,
+        "the faulted install never reaches durability"
+    );
+    {
+        let groups = state.named_groups.read().await;
+        for key in [stable.as_str(), alias_key.as_str()] {
+            assert!(
+                groups[key].fork_quarantine.is_none(),
+                "#732 r8: the rollback restored absence on `{key}` — no half state, no \
+                 orphaned marker on a spelling the install never reached"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #732 r8: the load-side convergence is DETERMINISTIC. Two equal-strength
+/// markers (same anchor class, same revision, different `state_hash`) fold
+/// with ties to the incumbent, and the candidates are visited in sorted-key
+/// order — so the winner is a property of the MAP, not of hash iteration
+/// order, and swapping which key holds which marker moves the winner with
+/// the key, not randomly.
+#[test]
+fn issue732_reconcile_winner_is_deterministic_under_content_swap() -> Result<()> {
+    let stable = "f1".repeat(32);
+    let key_a = format!("{stable}-a");
+    let key_b = format!("{stable}-b");
+    let agent = crate::identity::AgentId([9u8; 32]);
+    let seeded = |hash: &str| -> Result<x0x::groups::GroupInfo> {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "reconcile-determinism".to_string(),
+            String::new(),
+            agent,
+            stable.clone(),
+            invite_only_policy(),
+        );
+        let mut marker = synthetic_marker(false)?;
+        marker.state_hash = hash.to_string();
+        info.fork_quarantine = Some(marker);
+        Ok(info)
+    };
+
+    let mut first = std::collections::HashMap::new();
+    first.insert(key_a.clone(), seeded("aaaa")?);
+    first.insert(key_b.clone(), seeded("bbbb")?);
+    super::super::reconcile_containment_across_aliases(&mut first);
+    let first_winner = first[&key_a].fork_quarantine.clone();
+    assert_eq!(
+        first[&key_b].fork_quarantine, first_winner,
+        "converged whole — one marker everywhere"
+    );
+    assert_eq!(
+        first_winner
+            .as_ref()
+            .map(|marker| marker.state_hash.as_str()),
+        Some("aaaa"),
+        "ties keep the incumbent: the lexicographically-first key's marker wins"
+    );
+
+    // Swap the CONTENT between the keys: the rule is about the KEY, so the
+    // same key wins with its new content — not the same content by luck.
+    let mut swapped = std::collections::HashMap::new();
+    swapped.insert(key_a.clone(), seeded("bbbb")?);
+    swapped.insert(key_b.clone(), seeded("aaaa")?);
+    super::super::reconcile_containment_across_aliases(&mut swapped);
+    assert_eq!(
+        swapped[&key_a]
+            .fork_quarantine
+            .as_ref()
+            .map(|marker| marker.state_hash.as_str()),
+        Some("bbbb"),
+        "deterministic by sorted key: key-a wins again, now carrying its own content"
+    );
+    assert_eq!(
+        swapped[&key_b].fork_quarantine, swapped[&key_a].fork_quarantine,
+        "still converged whole"
+    );
+    Ok(())
+}
+
+/// #732 r8 (Sol, mixed-lineage aliases; root's concrete sequence): a
+/// lineage-LESS alias and a lineage-BEARING sibling can share one stable
+/// id, and only the lineage-bearing record has a destination for the
+/// evidence half of containment. The tie in `strongest_containment` picks
+/// the lexicographically-first pair — the lineage-less `(M, None)` — and
+/// `write_containment` used to overwrite the sibling's lineage slot with
+/// that pair's `None`, SILENTLY ERASING a retained evidence record that
+/// matched the very marker being kept. With the record gone, the dedup
+/// gate re-opened, an identical conflict could re-install, and a non-
+/// durable rollback of that retry would identity-match and delete the
+/// pre-existing marker — containment lost from a converging write.
+///
+/// The contract under test, stated honestly: markers match across ALL
+/// aliases; evidence is coherent FOR DESTINATIONS THAT CAN CARRY IT, and a
+/// retained record matching the converged marker is never silently erased.
+/// No provenance is invented — the lineage-less record still stores no
+/// evidence.
+#[tokio::test]
+async fn issue732_mixed_lineage_aliases_keep_retained_evidence_and_refuse_the_identical_retry(
+) -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let stable = "f2".repeat(32);
+    // Lexicographically FIRST key (`a-…` < `f2…`), lineage-less, marker only.
+    let first_key = format!("a-{stable}");
+    let marker = synthetic_marker(false)?;
+    let evidence = x0x::groups::ForkEvidence {
+        revision: marker.revision,
+        state_hash: marker.state_hash.clone(),
+        committed_by: marker.committed_by.clone(),
+        observed_at_ms: marker.observed_at_ms,
+    };
+
+    // Phase 1 — LOAD: the divergent disk shape a pre-r8 binary could write.
+    {
+        let mut lineage_less = x0x::groups::GroupInfo::with_policy(
+            "mixed-lineage-first".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            stable.clone(),
+            invite_only_policy(),
+        );
+        lineage_less.state_revision = 5;
+        lineage_less.fork_quarantine = Some(marker.clone());
+        let mut lineage_bearing = lineage_less.clone();
+        lineage_bearing.invite_lineage = Some(x0x::groups::InviteLineage {
+            base_revision: 5,
+            base_hash: lineage_bearing.state_hash.clone(),
+            base_roster_root: String::new(),
+            seated_at_revision: None,
+            corroborated: false,
+            fork_evidence: Some(evidence.clone()),
+        });
+        let mut disk = std::collections::HashMap::new();
+        disk.insert(first_key.clone(), lineage_less);
+        disk.insert(stable.clone(), lineage_bearing);
+        write_named_groups_json_atomic(&state.named_groups_path, &serde_json::to_string(&disk)?)
+            .await?;
+    }
+    let merged =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert_eq!(
+        merged[&first_key].fork_quarantine.as_ref(),
+        Some(&marker),
+        "the marker converges onto the lineage-less first spelling"
+    );
+    assert_eq!(
+        merged[&stable].fork_quarantine.as_ref(),
+        Some(&marker),
+        "and onto the lineage-bearing sibling — markers match on ALL aliases"
+    );
+    assert_eq!(
+        merged[&stable]
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref()),
+        Some(&evidence),
+        "#732 r8: the retained matching evidence was NOT erased by convergence — \
+         evidence is coherent for the destination that can carry it"
+    );
+    for key in [first_key.as_str(), stable.as_str()] {
+        assert!(
+            super::super::fork_evidence_already_recorded(&merged[key]),
+            "post-load, the dedup gate holds for `{key}`"
+        );
+    }
+    // The gate's marker disjunct, pinned independently: a lineage-bearing
+    // record holding the marker with an EMPTY evidence slot is still
+    // recorded — that is exactly the shape whose retry used to erase M.
+    {
+        let mut marker_only = merged[&stable].clone();
+        if let Some(lineage) = marker_only.invite_lineage.as_mut() {
+            lineage.fork_evidence = None;
+        }
+        assert!(
+            super::super::fork_evidence_already_recorded(&marker_only),
+            "a marker with no evidence slot filled still counts as recorded"
+        );
+    }
+
+    // Phase 2 — the faulted identical retry: refused BEFORE any durability
+    // dependence, and nothing erases the pre-existing containment.
+    *state.named_groups.write().await = merged.clone();
+    {
+        let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
+        assert!(
+            !super::super::install_fork_evidence(
+                &state,
+                &stable,
+                evidence.clone(),
+                Some(marker.clone()),
+                false,
+            )
+            .await,
+            "first-complete-wins: the identical conflict does not re-install"
+        );
+    }
+    {
+        let groups = state.named_groups.read().await;
+        for key in [first_key.as_str(), stable.as_str()] {
+            assert_eq!(
+                groups[key].fork_quarantine.as_ref(),
+                Some(&marker),
+                "the faulted retry erased nothing on `{key}`"
+            );
+        }
+        assert_eq!(
+            groups[&stable]
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref()),
+            Some(&evidence),
+            "and the retained evidence survived the refused retry"
+        );
+    }
+
+    // Phase 3 — LIVE convergence from a lineage-less authoritative write:
+    // persisting the first spelling's marker-only record (the TreeKEM
+    // resurrection shape) must still not erase the sibling's evidence.
+    let again = state.named_groups.read().await[&first_key].clone();
+    let outcome = super::super::persist_named_group_info(&state, &first_key, again).await?;
+    assert!(
+        matches!(&outcome, super::super::AtomicWriteOutcome::Durable),
+        "fixture precondition: {outcome:?}"
+    );
+    {
+        let groups = state.named_groups.read().await;
+        assert_eq!(
+            groups[&stable]
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref()),
+            Some(&evidence),
+            "#732 r8: a live spread whose authoritative slot carries no evidence \
+             keeps a retained matching record on the sibling"
+        );
+        assert_eq!(
+            groups[&stable].fork_quarantine.as_ref(),
+            Some(&marker),
+            "and the marker stays converged"
+        );
+    }
+    Ok(())
+}
+
+/// #732 r8 (root review, atomic admission): the marker-presence refusal
+/// must hold INSIDE `install_fork_evidence`'s locked mutation, not only at
+/// the earlier `fork_evidence_already_recorded` check — that gate reads a
+/// `current` cloned before the persistence lock, so a marker landing in
+/// between would let a stale observation fill an empty lineage evidence
+/// slot while `get_or_insert` retains the pre-existing marker, and the
+/// non-durable rollback of that install would then DELETE the marker it
+/// never owned. The exact shape: lineage present, evidence slot EMPTY,
+/// marker PRESENT — the direct helper call must refuse and retain.
+#[tokio::test]
+async fn issue732_install_refuses_when_a_marker_already_exists_despite_an_empty_evidence_slot(
+) -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let stable = "f3".repeat(32);
+    let marker = synthetic_marker(false)?;
+    let evidence = x0x::groups::ForkEvidence {
+        revision: marker.revision,
+        state_hash: marker.state_hash.clone(),
+        committed_by: marker.committed_by.clone(),
+        observed_at_ms: marker.observed_at_ms,
+    };
+
+    let mut lineage_bearing = x0x::groups::GroupInfo::with_policy(
+        "atomic-admission".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        stable.clone(),
+        invite_only_policy(),
+    );
+    lineage_bearing.state_revision = 5;
+    lineage_bearing.fork_quarantine = Some(marker.clone());
+    lineage_bearing.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: 5,
+        base_hash: lineage_bearing.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+    });
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(stable.clone(), lineage_bearing.clone());
+
+    // The fault is armed to prove the refusal happens BEFORE any write the
+    // rollback semantics could touch: nothing installs, nothing rolls back.
+    let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
+    assert!(
+        !super::super::install_fork_evidence(
+            &state,
+            &stable,
+            evidence.clone(),
+            Some(marker.clone()),
+            false,
+        )
+        .await,
+        "atomic admission: a pre-existing marker refuses the install even with \
+         an empty lineage evidence slot"
+    );
+    drop(_fault);
+    {
+        let groups = state.named_groups.read().await;
+        assert_eq!(
+            groups[&stable].fork_quarantine.as_ref(),
+            Some(&marker),
+            "the pre-existing marker is retained — the refused install never \
+             owned it, so no rollback can identity-match it away"
+        );
+        assert_eq!(
+            groups[&stable]
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref()),
+            None,
+            "and the empty evidence slot stays empty — nothing installed"
+        );
+    }
+    Ok(())
+}
+
+/// #732 r8 (Sol P1, new-alias authority — the ACTUAL production caller):
+/// `import_group_card` inserts a clean discovered stub under the signed
+/// card's STABLE key whenever that exact key is absent, while an active,
+/// fork-quarantined record for the same stable id may live under an ALIAS
+/// key (the route's own lookup does not resolve aliases). The generic
+/// convergence used to read the insertion's `before=None →
+/// Some((None, None))` as an authoritative containment CHANGE and copy
+/// ABSENCE onto the quarantined alias — an ordinary, replayable, VALID
+/// card import performed an unauthorized clear. Insertion is not a
+/// containment mutation: the new stub JOINS the group's containment, and
+/// the quarantined alias is untouched.
+#[tokio::test]
+async fn issue732_valid_card_import_cannot_clear_a_quarantined_alias() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let stable = "f4".repeat(32);
+    let alias_key = format!("local-alias-{stable}");
+    let marker = synthetic_marker(false)?;
+
+    // The quarantined record exists ONLY under the alias; the stable key is
+    // absent, so the import takes the insert branch.
+    {
+        let mut quarantined = x0x::groups::GroupInfo::with_policy(
+            "card-import-alias".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            stable.clone(),
+            invite_only_policy(),
+        );
+        quarantined.state_revision = 5;
+        quarantined.fork_quarantine = Some(marker.clone());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(alias_key.clone(), quarantined);
+    }
+
+    // A genuinely valid, non-withdrawn, discoverable signed card.
+    let creator = AgentKeypair::generate()?;
+    let mut card = super::sample_group_card(&stable, 2, now_millis_u64());
+    card.sign(&creator)?;
+    let response = super::super::import_group_card(State(Arc::clone(&state)), Json(card))
+        .await
+        .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the valid card import is accepted — it is an ordinary supported operation"
+    );
+
+    {
+        let groups = state.named_groups.read().await;
+        assert!(
+            groups.contains_key(&stable),
+            "the import inserted the stable-keyed discovered stub"
+        );
+        for key in [alias_key.as_str(), stable.as_str()] {
+            assert_eq!(
+                groups[key].fork_quarantine.as_ref(),
+                Some(&marker),
+                "#732 r8: `{key}` — the new stub JOINED the group's containment and \
+                 the quarantined alias was NOT cleared by an unauthorized insertion"
+            );
+        }
+    }
+    // And the cleared-map write never reached disk either.
+    let merged =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    for key in [alias_key.as_str(), stable.as_str()] {
+        assert_eq!(
+            merged[key].fork_quarantine.as_ref(),
+            Some(&marker),
+            "the durable bytes keep both spellings contained"
+        );
+    }
+
+    // Control: a GENUINELY new group's card import inserts a clean stub —
+    // Rule 2 has no sibling to join, so nothing is marked and nothing warns.
+    let fresh_stable = "f5".repeat(32);
+    let mut fresh_card = super::sample_group_card(&fresh_stable, 2, now_millis_u64());
+    fresh_card.sign(&creator)?;
+    let response = super::super::import_group_card(State(Arc::clone(&state)), Json(fresh_card))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let groups = state.named_groups.read().await;
+    assert!(
+        !groups[&fresh_stable].is_fork_quarantined(),
+        "a genuinely new group imports clean — no containment is invented"
+    );
+    assert!(
+        groups[&fresh_stable]
+            .invite_lineage
+            .as_ref()
+            .is_none_or(|lineage| lineage.fork_evidence.is_none()),
+        "and no provenance is fabricated for a brand-new stub"
     );
     Ok(())
 }

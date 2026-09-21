@@ -405,12 +405,61 @@ pub struct LifecycleEpochToken {
 }
 
 impl LifecycleEpochToken {
-    /// The state-commit revision this token was captured at.
+    /// The state-commit revision this token was captured at. For a group
+    /// holding alias spellings this is the order-independent fold of every
+    /// spelling's revision (see [`Self::spanning_aliases`]), not one
+    /// spelling's raw value.
     #[must_use]
     pub fn state_revision(&self) -> u64 {
         self.state_revision
     }
 
+    /// #732 r8 — aggregate alias spellings into one group-wide identity.
+    ///
+    /// A single token is returned unchanged. For two or more spellings every
+    /// revision contributes `mix_state_revision(revision)` exactly once to a
+    /// wrapping sum. That makes the multi-spelling result symmetric: moving
+    /// the same records between alias keys cannot change the token, while an
+    /// advance of a lagging spelling still moves it (unlike a `max` fold).
+    /// Distinct revision multisets collide only on an exact 64-bit
+    /// compensating coincidence, the ABA class this token already documents.
+    ///
+    /// `marker` keeps the first present identity. The caller supplies tokens
+    /// in sorted-key order, making this deterministic for a pre-invariant
+    /// divergent record; under the containment invariant all markers agree.
+    #[must_use]
+    pub fn spanning_aliases(tokens: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut tokens = tokens.into_iter();
+        let first = tokens.next()?;
+        let Some(second) = tokens.next() else {
+            return Some(first);
+        };
+        let mut state_revision = mix_state_revision(first.state_revision)
+            .wrapping_add(mix_state_revision(second.state_revision));
+        let mut marker = first.marker.or(second.marker);
+        for token in tokens {
+            state_revision = state_revision.wrapping_add(mix_state_revision(token.state_revision));
+            marker = marker.or(token.marker);
+        }
+        Some(Self {
+            state_revision,
+            marker,
+        })
+    }
+}
+
+/// #732 r8: one symmetric fold contribution for [`LifecycleEpochToken::spanning_aliases`].
+/// splitmix64's finalizer, so structurally adjacent revisions (4 and 5)
+/// cannot compensate each other the way raw addition would (`4 + 9 == 5 + 8`
+/// would mask a real advance behind a rollback).
+fn mix_state_revision(revision: u64) -> u64 {
+    let mut mixed = revision.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
+}
+
+impl LifecycleEpochToken {
     /// The marker identity this token was captured with, if the group
     /// carried one.
     #[must_use]
