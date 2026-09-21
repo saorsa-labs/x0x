@@ -26662,8 +26662,10 @@ async fn merge_group_record_into_store_file(
     //    operator had durably cleared — and let a different journal marker
     //    replace the live one. At ONE frontier there is exactly one
     //    containment truth and it is the local one.
-    // 2. FORWARD journal frontier ⇒ the live marker is ALWAYS carried. NO
-    //    replayed advance clears: nothing on disk carries owner authorization
+    // 2. FORWARD journal frontier ⇒ containment is never lifted AND never
+    //    weakened: the STRONGER of the two markers survives
+    //    (`live_marker_is_stronger`), and since a live marker always beats none
+    //    this arm cannot lift. NO replayed advance clears: nothing on disk carries owner authorization
     //    of the strength every live clear arm demands (the owner user key and
     //    an `OwnerMandate` are simply not persisted), and the certificate test
     //    r3 reached for is satisfiable by the FORKER — still seated, holding
@@ -26699,23 +26701,11 @@ async fn merge_group_record_into_store_file(
         let journal_revision = record.state_revision;
         if journal_revision < live_revision {
             // Case 3 — individual-file divergence: union, never clear.
-            // #732 r4 nit: the union is over containment STRENGTH, not merely
-            // presence. A journal-side ANCHORED marker must not outrank a live
-            // `no_anchor` one, or the supersession would silently downgrade a
-            // manual-only quarantine into one an owner-anchored advance could
-            // clear — a lift by two steps instead of one.
-            let live_is_stronger = matches!(
-                (record.fork_quarantine.as_ref(), live_marker.as_ref()),
-                (None, Some(_))
-                    | (
-                        Some(_),
-                        Some(x0x::groups::ForkQuarantine {
-                            no_anchor: true,
-                            ..
-                        })
-                    )
-            );
-            if live_is_stronger {
+            // #732 r4/r5: the union is over containment STRENGTH, not merely
+            // presence — see `live_marker_is_stronger` for the total order and
+            // why a lower `revision` is a real weakening (it lowers the
+            // `owner_anchored_clear_permitted` threshold).
+            if live_marker_is_stronger(record.fork_quarantine.as_ref(), live_marker.as_ref()) {
                 if let Some(marker) = live_marker {
                     tracing::warn!(
                         group_id = %LogHexId::group(group_id_hex),
@@ -26741,20 +26731,28 @@ async fn merge_group_record_into_store_file(
             // the weaker certificate test r3 tried is satisfiable by the forker
             // itself — still seated, holding only its agent key, signing a
             // descendant of the contested head. Fail closed.
-            if let Some(marker) = live_marker {
-                tracing::warn!(
-                    group_id = %LogHexId::group(group_id_hex),
-                    store = %label,
-                    marker_revision = marker.revision,
-                    no_anchor = marker.no_anchor,
-                    journal_revision,
-                    live_revision,
-                    "#732: forward journal replay preserved the live fork-quarantine marker — the journalled advance does not clear it"
-                );
-                record.fork_quarantine = Some(marker);
-                if let Some(lineage) = record.invite_lineage.as_mut() {
-                    lineage.fork_evidence = live_evidence.or(lineage.fork_evidence.take());
+            // #732 r5: "never lifted" is also "never WEAKENED" — the same
+            // total order decides, so a journalled marker is kept only when it
+            // is at least as strong (and a live marker always beats none, which
+            // is what makes this arm fail closed).
+            if live_marker_is_stronger(record.fork_quarantine.as_ref(), live_marker.as_ref()) {
+                if let Some(marker) = live_marker {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(group_id_hex),
+                        store = %label,
+                        marker_revision = marker.revision,
+                        no_anchor = marker.no_anchor,
+                        journal_revision,
+                        live_revision,
+                        "#732: forward journal replay preserved the live fork-quarantine marker — the journalled advance does not clear it"
+                    );
+                    record.fork_quarantine = Some(marker);
                 }
+            }
+            if let Some(lineage) = record.invite_lineage.as_mut() {
+                // The evidence record only ever FILLS an empty slot here: the
+                // journal half is authoritative for everything else it carries.
+                lineage.fork_evidence = live_evidence.or(lineage.fork_evidence.take());
             }
         } else {
             // Case 1 — EQUAL frontier: the live pair verbatim.
@@ -26784,6 +26782,45 @@ async fn merge_group_record_into_store_file(
         anyhow::bail!("replayed {label} journal was not directory-durable");
     }
     Ok(())
+}
+
+/// #732 r5 (cross-model review, P2) — the ONE total order over containment
+/// STRENGTH, so no replay can weaken a marker in any dimension.
+///
+/// r4 ordered by `no_anchor` alone, which left the anchored-versus-anchored case
+/// unordered: a live marker at revision 7 could be replaced by a journalled one
+/// at revision 2, and that REGRESSES the clear threshold, because
+/// [`x0x::groups::ForkQuarantine::owner_anchored_clear_permitted`] demands a
+/// revision strictly past the evidenced one — so an advance at revision 3, which
+/// the live marker refused, would suddenly clear. A marker's revision is not
+/// bookkeeping; it is half the predicate.
+///
+/// The order, total and used at every union site:
+/// 1. `no_anchor` wins — a manual-only quarantine outranks a clearable one;
+/// 2. then the HIGHER evidenced `revision` — the higher clear threshold;
+/// 3. then keep LIVE, because at equal strength the local decision is the node's
+///    own and the journal is a stale snapshot of metadata.
+///
+/// Returns whether the LIVE marker should be taken. The caller installs the WHOLE
+/// marker it chooses and never mixes fields across the two: `revision`,
+/// `state_hash`, `committed_by`, `observed_at_ms` and `snapshot` describe ONE
+/// fork observation, and ADR-0067 builds `ForkQuarantineIdentity` out of exactly
+/// those, so a franken-marker would carry an identity that never existed.
+fn live_marker_is_stronger(
+    journal: Option<&x0x::groups::ForkQuarantine>,
+    live: Option<&x0x::groups::ForkQuarantine>,
+) -> bool {
+    match (journal, live) {
+        // Nothing live to take, or nothing journalled to beat.
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(journalled), Some(live)) => match (live.no_anchor, journalled.no_anchor) {
+            (true, false) => true,
+            (false, true) => false,
+            // Same anchor class: the higher clear threshold wins, ties to live.
+            _ => live.revision >= journalled.revision,
+        },
+    }
 }
 
 /// #457 r14 item 14.2 — does a QUARANTINED legacy journal exist for this

@@ -816,9 +816,18 @@ showed is wrong in two directions. The rule now turns on the frontier:
   marker the authoritative record carries, so containment is unioned across the
   two halves and nothing is cleared — the one case where the live half is not
   the authority on the group's state. The union is over containment STRENGTH,
-  not merely presence: if either half's marker is `no_anchor`, the survivor is
-  `no_anchor`, so a supersession can never quietly downgrade a manual-only
-  quarantine into one an owner-anchored advance could clear. Everything else about the supersession is
+  not merely presence, through one total order
+  (`named_groups.rs::live_marker_is_stronger`): `no_anchor` first, then the
+  HIGHER evidenced `revision`, then keep the live marker on a tie. So a
+  supersession can neither downgrade a manual-only quarantine into a clearable
+  one, nor lower the clear threshold — a marker's `revision` is half of
+  `owner_anchored_clear_permitted`, so replacing revision 7 with revision 2
+  would let an advance at revision 3 clear a marker that had refused it. The
+  WHOLE stronger marker is installed, never a mix of fields from both halves.
+  Note what the two views mean here: this union protects `named_groups.json` (the
+  legacy view, and the copy that survives if the sidecar is lost), while the
+  authoritative merged view keeps the SIDECAR's own containment, which the
+  replay does not touch. Everything else about the supersession is
   unchanged: the authoritative roster, policy and revision still replace the
   placeholder's.
 

@@ -3191,10 +3191,23 @@ async fn replay_scenario(
     stage_journal(&treekem, group_id, staged).await?;
     recover_treekem_named_journals(&named_path, &sidecar_path, &treekem).await?;
     let after = read_store(&named_path).await?;
-    after
+    let record = after
         .get(group_id)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("the replay left no record under the stable id"))
+        .ok_or_else(|| anyhow::anyhow!("the replay left no record under the stable id"))?;
+    // #732 r5 (review point 2): assert the AUTHORITATIVE in-memory view the
+    // daemon actually loads, not just the file on disk. With no sidecar these
+    // must agree; asserting it here makes that an invariant every fixture
+    // inherits rather than an argument.
+    let merged = load_named_groups_merged(&named_path, &sidecar_path).await?;
+    assert_eq!(
+        merged
+            .get(group_id)
+            .and_then(|info| info.fork_quarantine.clone()),
+        record.fork_quarantine,
+        "the merged authoritative view must carry the same containment as the named store"
+    );
+    Ok(record)
 }
 
 /// WHY (#732 r2 — cross-model review, Codex P2-b and omp nit (a); this test
@@ -3439,16 +3452,25 @@ async fn issue732_forward_replay_never_lifts_containment() -> Result<()> {
     );
 
     // Control 3 — when the journal image carries its OWN marker at the higher
-    // frontier, the LIVE marker is the one kept: it is this node's current
-    // containment decision and may be the stronger of the two.
+    // frontier, both halves assert containment and the STRONGER one survives
+    // (#732 r5, `live_marker_is_stronger`): here that is the journalled marker,
+    // whose higher `revision` is a HIGHER clear threshold. "Never lifted" is
+    // also "never weakened", so the arm asserts the stronger threshold — not
+    // "live always wins", which would have let a journalled rev-2 marker
+    // replace a live rev-7 one.
     let mut staged_marked = at_three.clone();
     staged_marked.fork_quarantine = Some(marker_at_frontier(&at_three));
+    let kept = replay_scenario(&group_id, &live, &staged_marked, &group_id)
+        .await?
+        .fork_quarantine
+        .ok_or_else(|| anyhow::anyhow!("containment must survive"))?;
+    assert_eq!(
+        kept.revision, at_three.state_revision,
+        "the STRONGER of the two markers is kept when both halves assert containment"
+    );
     assert!(
-        replay_scenario(&group_id, &live, &staged_marked, &group_id)
-            .await?
-            .fork_quarantine
-            .is_some_and(|kept| kept.revision == at_two.state_revision),
-        "the LIVE marker is kept when both halves assert containment"
+        !kept.owner_anchored_clear_permitted(at_three.state_revision),
+        "and the surviving threshold is the higher one — this advance cannot clear it"
     );
     Ok(())
 }
@@ -3513,30 +3535,15 @@ async fn issue732_forged_outer_hash_journal_installs_no_marker() -> Result<()> {
     Ok(())
 }
 
-/// WHY (#732 r3 — cross-model review, Codex P1; omp reached the same attack and
-/// rated it non-blocking). Rule 2 honoured a clear on the strength of the
-/// journal record's OUTER `state_revision`, which nothing signs:
-/// `TreeKemNamedPersistJournal` is an unsealed postcard envelope around plain
-/// JSON, and the paired-replay Apply arm runs no authentication at all. So a
-/// local journal writer could clone live state, bump that revision, strip the
-/// marker, sync the pair tags — and recovery would durably remove containment
-/// AND its evidence. That made RECOVERY the cheapest way to lift an
-/// owner-anchored marker, cheaper than any live clear arm, each of which demands
-/// a verified commit or the owner user key in hand.
-///
-/// The claim: a forward replay clears only what
-/// [`journal_advance_clears_marker`] authenticates — signature, the outer claim
-/// bound to the signed one, the production `owner_anchored_clear_permitted`
-/// predicate at the SIGNED revision, ancestry chaining from the live head, and
-/// owner provenance read from the LOCAL roster. This test's arms are the
-/// forgeries that each miss one of those.
-///
-/// #732 r4: the rule these arms defend became absolute — no replayed advance
-/// clears at all (see [`issue732_forward_replay_never_lifts_containment`] and
-/// the note above `install_fork_evidence`). The arms are KEPT rather than
-/// deleted: each is a distinct forgery that r2/r3 admitted, so they pin that the
-/// refusal is not accidentally re-narrowed to one shape. The APPLY side is the
-/// control — every arm asserts the record still advances.
+/// WHY. A forward journal replay never lifts containment (see
+/// [`issue732_forward_replay_never_lifts_containment`] for the rule and the note
+/// above `install_fork_evidence` for why no replayed advance can be owner
+/// authorization). These arms are the four distinct forgeries that #732's
+/// earlier, narrower rules each admitted — an unsigned bumped outer revision, a
+/// signed advance on another branch, a non-owner committer, and an ordinary
+/// group — kept so the refusal cannot be quietly re-narrowed to one shape. The
+/// APPLY side is the control: every arm asserts the record still advances, so
+/// "nothing was written" cannot pass for "containment survived".
 #[tokio::test]
 async fn issue732_forged_forward_journal_cannot_lift_containment() -> Result<()> {
     let group_id = "e3".repeat(32);
@@ -3792,14 +3799,22 @@ async fn issue732_older_journal_at_one_file_unions_containment() -> Result<()> {
 /// Like [`replay_scenario`] but also seeds the Home-Suite SIDECAR, so the merged
 /// view (which `merge_home_suite_groups` lets the sidecar win) can disagree with
 /// the individual `named_groups.json` file — the divergence #732's case 3 exists
-/// for. Returns the record left in the NAMED file, which is the one case 3
-/// writes.
+/// for.
+///
+/// Returns `(named record, merged authoritative record)`. #732 r5 (review point
+/// 2): both are handed back on purpose, because for a group present in the
+/// sidecar they are DIFFERENT records — the sidecar wins the merge, and with no
+/// `.hsjournal` staged the recovery rewrites only the named half. So case 3's
+/// union protects the LEGACY view (what an old binary reads, and what survives
+/// if the sidecar is lost) while the authoritative view keeps the sidecar's own
+/// containment, which recovery never touches. A fixture that asserted only one
+/// of the two would be claiming more, or less, than the code does.
 async fn replay_scenario_with_sidecar(
     group_id: &str,
     named_live: &x0x::groups::GroupInfo,
     sidecar_live: &x0x::groups::GroupInfo,
     staged: &x0x::groups::GroupInfo,
-) -> Result<x0x::groups::GroupInfo> {
+) -> Result<(x0x::groups::GroupInfo, x0x::groups::GroupInfo)> {
     let dir = tempfile::tempdir()?;
     let treekem = dir.path().join("treekem");
     tokio::fs::create_dir_all(&treekem).await?;
@@ -3816,11 +3831,17 @@ async fn replay_scenario_with_sidecar(
         "the sidecar record must win the merge, which is the premise of case 3"
     );
     recover_treekem_named_journals(&named_path, &sidecar_path, &treekem).await?;
-    read_store(&named_path)
+    let named_after = read_store(&named_path)
         .await?
         .get(group_id)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("the replay left no record under the stable id"))
+        .ok_or_else(|| anyhow::anyhow!("the replay left no record under the stable id"))?;
+    let merged_after = load_named_groups_merged(&named_path, &sidecar_path)
+        .await?
+        .get(group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("the merged view lost the group"))?;
+    Ok((named_after, merged_after))
 }
 
 /// WHY (#732 r4 — Codex's fixture gap). The r3 "non-owner committer" arm rewrote
@@ -3995,12 +4016,18 @@ async fn issue732_older_journal_at_one_file_unions_containment_through_recovery(
     placeholder.fork_quarantine = None;
     let mut staged = authoritative.clone();
     staged.fork_quarantine = Some(marker_at_frontier(&authoritative));
-    let after =
+    let (after, merged) =
         replay_scenario_with_sidecar(&group_id, &placeholder, &authoritative, &staged).await?;
     assert!(
         after.fork_quarantine.is_some(),
         "#732 r4: a placeholder's ABSENT containment must not erase the authoritative \
          record's marker"
+    );
+    assert!(
+        merged.fork_quarantine.is_none(),
+        "#732 r5: and the authoritative view is the SIDECAR record, which recovery never \
+         rewrote (no `.hsjournal` staged) — stated so the fixture claims exactly what the \
+         code does: case 3 protects the legacy view, the sidecar keeps its own containment"
     );
     assert_eq!(
         after.state_revision, authoritative.state_revision,
@@ -4023,13 +4050,17 @@ async fn issue732_older_journal_at_one_file_unions_containment_through_recovery(
     let mut weak = marker_at_frontier(&authoritative);
     weak.no_anchor = false;
     staged_anchored.fork_quarantine = Some(weak);
-    let after = replay_scenario_with_sidecar(
+    let (after, merged) = replay_scenario_with_sidecar(
         &group_id,
         &placeholder_no_anchor,
         &authoritative,
         &staged_anchored,
     )
     .await?;
+    assert_eq!(
+        merged.state_revision, authoritative.state_revision,
+        "#732 r5: the authoritative view is still the sidecar's record"
+    );
     assert!(
         after
             .fork_quarantine
@@ -4037,6 +4068,109 @@ async fn issue732_older_journal_at_one_file_unions_containment_through_recovery(
             .is_some_and(|marker| marker.no_anchor),
         "#732 r4: the union takes the STRONGER containment — an anchored journal marker \
          cannot downgrade a live `no_anchor` one into something a commit could clear"
+    );
+    Ok(())
+}
+
+/// WHY (#732 r5 — cross-model review, Codex P2; omp noted the same as a nit).
+/// r4 ordered containment strength by `no_anchor` alone, which left the
+/// ANCHORED-versus-ANCHORED case unordered. A live marker at revision 7 could
+/// therefore be replaced by a journalled one at revision 2, and that is not
+/// cosmetic: a marker's `revision` is half of
+/// `ForkQuarantine::owner_anchored_clear_permitted`, which requires a revision
+/// strictly past the evidenced one. Swapping 7 for 2 flips an advance at
+/// revision 3 from REFUSED to PERMITTED — the replay would hand out a clear
+/// nobody granted, one step removed.
+///
+/// The claim: `live_marker_is_stronger` is a TOTAL order (`no_anchor`, then the
+/// higher `revision`, then keep live), so the surviving threshold is never lower
+/// than either half's, and the WHOLE stronger marker is installed — never a mix
+/// of fields from both, which would describe a fork observation that never
+/// happened (ADR-0067 derives `ForkQuarantineIdentity` from exactly those
+/// fields).
+///
+/// Driven through `recover_treekem_named_journals`, with the merged
+/// authoritative view asserted alongside the named store.
+#[tokio::test]
+async fn issue732_anchored_union_keeps_the_higher_clear_threshold() -> Result<()> {
+    let group_id = "ea".repeat(32);
+    let (_state, _dir, authoritative, _at_three) = owner_axis_advance_fixture(&group_id).await?;
+
+    // The live (placeholder) half: ANCHORED at revision 7, observed later.
+    let mut placeholder = legacy_safe_placeholder(&authoritative);
+    placeholder.state_revision = authoritative.state_revision + 5;
+    let mut strong = marker_at_frontier(&authoritative);
+    strong.no_anchor = false;
+    strong.revision = 7;
+    strong.observed_at_ms = 200;
+    strong.state_hash = "77".repeat(32);
+    strong.committed_by = "71".repeat(32);
+    placeholder.fork_quarantine = Some(strong.clone());
+
+    // The journalled half: ANCHORED too, but at revision 2 and observed
+    // earlier — strictly weaker containment.
+    let mut staged = authoritative.clone();
+    let mut weak = marker_at_frontier(&authoritative);
+    weak.no_anchor = false;
+    weak.revision = 2;
+    weak.observed_at_ms = 100;
+    weak.state_hash = "22".repeat(32);
+    weak.committed_by = "21".repeat(32);
+    staged.fork_quarantine = Some(weak.clone());
+
+    assert!(
+        !strong.owner_anchored_clear_permitted(3),
+        "the LIVE threshold refuses an advance at revision 3"
+    );
+    assert!(
+        weak.owner_anchored_clear_permitted(3),
+        "the JOURNALLED threshold would permit it — that is the regression under test"
+    );
+
+    let (after, merged) =
+        replay_scenario_with_sidecar(&group_id, &placeholder, &authoritative, &staged).await?;
+    let kept = after
+        .fork_quarantine
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("containment must survive"))?;
+    assert_eq!(
+        kept.revision, 7,
+        "#732 r5: the HIGHER evidenced revision survives — the clear threshold cannot regress"
+    );
+    assert!(
+        !kept.owner_anchored_clear_permitted(3),
+        "so an advance at revision 3 is STILL refused after the replay"
+    );
+    // Coherence: the whole stronger marker, never a field mix.
+    assert_eq!(
+        kept, strong,
+        "the marker is installed whole; no franken-identity"
+    );
+    assert_eq!(kept.observed_at_ms, 200);
+    assert_eq!(kept.state_hash, "77".repeat(32));
+    assert_eq!(kept.committed_by, "71".repeat(32));
+    assert_eq!(
+        merged.state_revision, authoritative.state_revision,
+        "#732 r5: the authoritative view is still the sidecar's record, untouched by recovery"
+    );
+    // Negative control in the same test: with the halves swapped the journalled
+    // marker is the stronger one and IT survives, so this is a real order and
+    // not "live always wins".
+    let mut placeholder_weak = legacy_safe_placeholder(&authoritative);
+    placeholder_weak.state_revision = authoritative.state_revision + 5;
+    placeholder_weak.fork_quarantine = Some(weak.clone());
+    let mut staged_strong = authoritative.clone();
+    staged_strong.fork_quarantine = Some(strong.clone());
+    let (swapped, _) =
+        replay_scenario_with_sidecar(&group_id, &placeholder_weak, &authoritative, &staged_strong)
+            .await?;
+    assert_eq!(
+        swapped
+            .fork_quarantine
+            .as_ref()
+            .map(|marker| marker.revision),
+        Some(7),
+        "the order is over STRENGTH, not over which half the marker came from"
     );
     Ok(())
 }

@@ -40,20 +40,23 @@ All notable changes to this project will be documented in this file.
     without lineage keep the trigger ADR-0066 promised unchanged, and the store
     loop resolves the record under both spellings so an alias-keyed store is no
     longer silently skipped.
-  - **Which containment state a replay writes (round 2, after cross-model
-    review).** The first repair only filled an empty journal slot, which both
-    reviewers showed is wrong in two directions, so the rule now turns on the
-    frontier. At the SAME (or an older) journal frontier the live containment
-    pair wins, **its absence included** — a manual clear advances no revision
-    either, so a journal staged before a clear was resurrecting the marker
-    after it, and a differing journal marker was replacing the live one. On a
-    FORWARD frontier the live marker is carried *unless the journalled advance
-    is itself the clear*: `groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted`
-    is evaluated at the journalled revision and honoured only when the journal
-    image carries no marker of its own, so a crash after staging an
-    owner-anchored advance no longer has its clear reversed on restart. A
-    `no_anchor` marker, an advance not strictly past the evidenced revision,
-    and a journal carrying its own marker all keep containment.
+  - **Which containment state a replay writes.** The containment PAIR (the
+    marker and the lineage `fork_evidence` record every clear arm removes with
+    it) is decided by FRONTIER, and never from the journal alone. At the EQUAL
+    frontier the live pair wins verbatim, **its absence included** — a manual
+    clear advances no revision, so a journal staged before a clear must not
+    resurrect the marker after it, and a differing journal marker must not
+    replace the live one. On a FORWARD frontier containment is never lifted and
+    never weakened (see the round-4 entry below). At an OLDER frontier *at one
+    file* — the `merge_home_suite_groups` divergence, where the authoritative
+    sidecar record supersedes a newer legacy placeholder — the two halves are
+    UNIONED, because the placeholder is not authoritative about containment
+    either. Every union uses one total strength order
+    (`named_groups.rs::live_marker_is_stronger`): `no_anchor` first, then the
+    higher evidenced `revision` — which is half of
+    `ForkQuarantine::owner_anchored_clear_permitted`, so a lower one would
+    silently lower the clear threshold — then keep live on a tie. The whole
+    stronger marker is installed, never a mix of fields from both.
   - **NO replayed advance clears a quarantine (round 4, final).** Rounds 2 and 3
     each tried to honour a clear a staged advance had granted — first on the
     journal's unsigned outer revision, then on a verified commit signed by an
