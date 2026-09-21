@@ -770,8 +770,8 @@ change: the marker's fields already carry `#[serde(default)]`.
 repair only FILLED an empty journal slot, which both reviewers independently
 showed is wrong in two directions. The rule now turns on the frontier:
 
-- **Same (or older) journal frontier ⇒ the LIVE containment pair wins, its
-  ABSENCE included.** A manual clear advances no revision either
+- **EQUAL journal frontier ⇒ the LIVE containment pair wins, its ABSENCE
+  included.** A manual clear advances no revision either
   (`named_groups.rs::clear_group_quarantine` removes the marker and re-arms the
   evidence gate without touching the chain), so a journal staged *before* a
   clear replays at the same frontier *after* it — and "fill an empty slot"
@@ -781,21 +781,48 @@ showed is wrong in two directions. The rule now turns on the frontier:
   one. **Operator consequence:** a clear survives a restart; you do not have to
   clear twice.
 - **Forward journal frontier ⇒ the live marker is carried, UNLESS the
-  journalled advance is itself the clear.** A crash after staging an
+  journalled advance AUTHENTICATES the clear.** A crash after staging an
   owner-anchored advance or explicit owner seal but before the live save leaves
   a higher-revision journal that legitimately holds no marker; restoring one
-  would reverse a clear `groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted`
-  had already granted. That predicate is now evaluated at the JOURNALLED
-  revision, and the clear is honoured only when the journal image carries no
-  marker of its own. Three cases deliberately keep containment instead: a
-  `no_anchor` marker (never clearable by a commit — only the manual clear,
-  which is the same-frontier case above), an advance whose revision is not
-  strictly past the evidenced one, and a journal image that carries its own
-  marker (two assertions of containment, not a clear — the live marker is kept
-  because it may be the stronger of the two, and a wrongly-kept marker is
-  operator-clearable while a wrongly-lifted one is silent). **Operator
-  consequence:** a legitimate owner-anchored clear is not undone by a restart,
-  and nothing else lifts a marker on disk.
+  would reverse a clear
+  `groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted` had already
+  granted. But a journal is an UNSEALED envelope around plain JSON and the
+  replay's Apply arm authenticates nothing, so honouring a clear on the
+  strength of a higher OUTER revision made recovery the cheapest way to lift an
+  owner-anchored marker — cheaper than any live clear arm, each of which
+  demands a verified commit or the owner user key in hand. So the clear is now
+  honoured only when `named_groups.rs::journal_advance_clears_marker` accepts
+  the advance: the journalled TERMINAL COMMIT is retained (not synthesized) and
+  passes `groups/state_commit.rs::GroupStateCommit::verify_structure`
+  (ML-DSA signature, recomputed state hash, `committed_by` bound to the signing
+  key); the record's outer `(group, revision, state_hash)` claim IS that
+  commit's; `owner_anchored_clear_permitted` holds at the SIGNED revision; the
+  commit chains directly from the live terminal head; and the committer is the
+  agent the LIVE roster certifies as the policy owner's own, Active and at
+  least Admin. Anything less keeps containment, as do a `no_anchor` marker
+  (never clearable by a commit — only the manual clear, the same-frontier case
+  above), an advance not strictly past the evidenced revision, and a journal
+  carrying its own marker. **A consequence worth knowing before an incident:**
+  an owner-axis roster that binds NO agent to the owner (for example an
+  authority node's own seed entry, admitted before ADR-0038 bound
+  certificates into roster entries) can satisfy no owner provenance at file
+  level, so a staged clear interrupted by a crash will NOT be honoured on
+  restart — the marker comes back and you clear it again, once, by hand. That
+  is the deliberate fail-closed direction. **Operator consequence otherwise:**
+  a genuine owner-anchored clear survives a restart, and nothing forged lifts a
+  marker on disk.
+
+- **OLDER journal frontier AT ONE FILE ⇒ union: containment is never lifted.**
+  A journal stale against the MERGED store is consumed before any write, so
+  this is not a stale replay. It is the individual-FILE divergence
+  `named_groups.rs::merge_home_suite_groups` creates, where the authoritative
+  Home-Suite sidecar record intentionally supersedes a NEWER legacy placeholder
+  in `named_groups.json`. Taking that placeholder's pair verbatim could DROP a
+  marker the authoritative record carries, so containment is unioned across the
+  two halves and nothing is cleared — the one case where the live half is not
+  the authority on the group's state. Everything else about the supersession is
+  unchanged: the authoritative roster, policy and revision still replace the
+  placeholder's.
 
 *The claimed conflict is bound to the verified commit (r2).* A `GroupInfo`'s
 outer `state_revision`/`state_hash` are plain fields beside its commit log, and
@@ -808,7 +835,13 @@ the one its verified commit signs (same group, revision and state hash) and that
 the commit genuinely differs from the live committed state at that revision,
 which is the live hook's own definition of a fork. Severity was bounded — a
 local writer, no established remote vector — but a quarantine that never
-auto-clears is worth two comparisons. **Operator consequence:** none on a
+auto-clears is worth two comparisons. **Both comparisons are load-bearing
+(r3).** The second is not redundant behind the first: the MIRROR forgery edits
+the LIVE record's outer `state_hash` and leaves its signed log intact, so
+`terminal_commit_header` returns the log's hash, the journal is perfectly
+consistent, and only "the verified commit must genuinely differ from the live
+committed state at that revision" refuses the install. Recovery establishes no
+live outer/header invariant, so neither check can be dropped. **Operator consequence:** none on a
 healthy node; a hand-edited or truncated journal now logs
 `#732: journal record's claimed frontier is not the one its verified commit
 signs` and installs nothing, instead of contaminating the group.
@@ -819,6 +852,11 @@ Source: `src/server/routes/named_groups.rs::merge_group_record_into_store_file`,
 `src/server/routes/named_groups.rs::fork_evidence_path_open`,
 `src/server/routes/named_groups.rs::fork_candidate_authenticated`,
 `src/groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted`,
+`src/server/routes/named_groups.rs::journal_advance_clears_marker`,
+`src/server/routes/named_groups.rs::merge_home_suite_groups`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forged_forward_journal_cannot_lift_containment`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_mirror_forged_live_hash_installs_no_marker`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_older_journal_at_one_file_unions_containment`,
 `src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_same_frontier_replay_takes_live_containment_including_absence`,
 `src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forward_replay_honours_an_owner_anchored_clear`,
 `src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forged_outer_hash_journal_installs_no_marker`,

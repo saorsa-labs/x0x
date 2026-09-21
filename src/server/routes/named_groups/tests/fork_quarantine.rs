@@ -3313,6 +3313,19 @@ async fn owner_axis_advance_fixture(
         group_id.to_string(),
         owner_certified_policy(&owner),
     );
+    // ADR-0038: bind the builder-issued certificate into the creator's roster
+    // entry, so the roster ATTESTS that this agent is the policy owner's own —
+    // the trust `trusted_owner_public_key` derives and the one the recovery
+    // predicate needs. Without it an owner-axis roster names no owner agent at
+    // all and no replayed advance can be owner-provenanced (fail closed).
+    let creator_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let cert = state
+        .agent
+        .agent_certificate()
+        .ok_or_else(|| anyhow::anyhow!("builder-issued certificate"))?
+        .clone();
+    info.set_member_certificate(&creator_hex, cert)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     seal_commit_owner_certified(&state, &mut info, signer, now_millis_u64()).await?;
     info.description = "at-revision-two".to_string();
     seal_commit_owner_certified(&state, &mut info, signer, now_millis_u64()).await?;
@@ -3475,6 +3488,279 @@ async fn issue732_forged_outer_hash_journal_installs_no_marker() -> Result<()> {
             .fork_quarantine
             .is_some_and(|marker| marker.no_anchor),
         "the authenticated conflict still installs the marker — the binding is not a blanket refusal"
+    );
+    Ok(())
+}
+
+/// WHY (#732 r3 — cross-model review, Codex P1; omp reached the same attack and
+/// rated it non-blocking). Rule 2 honoured a clear on the strength of the
+/// journal record's OUTER `state_revision`, which nothing signs:
+/// `TreeKemNamedPersistJournal` is an unsealed postcard envelope around plain
+/// JSON, and the paired-replay Apply arm runs no authentication at all. So a
+/// local journal writer could clone live state, bump that revision, strip the
+/// marker, sync the pair tags — and recovery would durably remove containment
+/// AND its evidence. That made RECOVERY the cheapest way to lift an
+/// owner-anchored marker, cheaper than any live clear arm, each of which demands
+/// a verified commit or the owner user key in hand.
+///
+/// The claim: a forward replay clears only what
+/// [`journal_advance_clears_marker`] authenticates — signature, the outer claim
+/// bound to the signed one, the production `owner_anchored_clear_permitted`
+/// predicate at the SIGNED revision, ancestry chaining from the live head, and
+/// owner provenance read from the LOCAL roster. This test's arms are the
+/// forgeries that each miss one of those.
+///
+/// The genuine-advance control is
+/// [`issue732_forward_replay_honours_an_owner_anchored_clear`]: strip the
+/// authentication and this test fails; refuse everything and that one fails.
+#[tokio::test]
+async fn issue732_forged_forward_journal_cannot_lift_containment() -> Result<()> {
+    let group_id = "e3".repeat(32);
+    let (_state, _dir, at_two, at_three) = owner_axis_advance_fixture(&group_id).await?;
+    let mut live = at_two.clone();
+    let marker = marker_at_frontier(&at_two);
+    assert!(
+        marker.owner_anchored_clear_permitted(at_three.state_revision),
+        "the marker itself permits the GENUINE advance — so any refusal below is \
+         attributable to the authentication, not to the clear predicate"
+    );
+    live.fork_quarantine = Some(marker);
+    // A lineage record so the evidence half of the containment pair is
+    // observable too: the attack removes BOTH, so both must survive.
+    live.invite_lineage = Some(lineage_for(&at_two));
+    if let Some(lineage) = live.invite_lineage.as_mut() {
+        lineage.fork_evidence = Some(evidence_at_frontier(&at_two));
+    }
+
+    // Forgery 1 — THE ATTACK. Clone the live record, bump only the unsigned
+    // outer revision, strip the marker. The terminal commit is the one that
+    // sealed revision 2, so nothing signs revision 3.
+    let mut bumped = at_two.clone();
+    bumped.fork_quarantine = None;
+    // The attacker strips the whole containment PAIR — marker and evidence —
+    // which is what makes the lift durable; both must come back.
+    bumped.invite_lineage = Some(lineage_for(&at_two));
+    bumped.state_revision = at_three.state_revision;
+    let after = replay_scenario(&group_id, &live, &bumped, &group_id).await?;
+    assert!(
+        after.fork_quarantine.is_some(),
+        "#732 r3: an UNSIGNED forward revision must not lift containment — recovery \
+         may not be a cheaper clear than the live arms"
+    );
+    assert!(
+        after
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .is_some(),
+        "and the evidence that justifies the marker is not dropped either"
+    );
+
+    // Forgery 2 — a genuinely signed advance that does NOT chain from this
+    // node's head: a sibling sealed over revision 1, so it advances some other
+    // branch. Ancestry is what the live apply arm gets by construction.
+    let (state_b, _dir_b, owner_b) = owner_authority_state().await?;
+    let signer_b = state_b.agent.identity().agent_keypair();
+    let mut other_branch = x0x::groups::GroupInfo::with_policy(
+        "owner-axis-advance".to_string(),
+        String::new(),
+        state_b.agent.agent_id(),
+        group_id.clone(),
+        owner_certified_policy(&owner_b),
+    );
+    seal_commit_owner_certified(&state_b, &mut other_branch, signer_b, now_millis_u64()).await?;
+    other_branch.description = "a-different-branch".to_string();
+    seal_commit_owner_certified(&state_b, &mut other_branch, signer_b, now_millis_u64()).await?;
+    other_branch.description = "and-its-advance".to_string();
+    seal_commit_owner_certified(&state_b, &mut other_branch, signer_b, now_millis_u64()).await?;
+    assert_eq!(other_branch.state_revision, at_three.state_revision);
+    assert_ne!(
+        other_branch.prev_state_hash, at_three.prev_state_hash,
+        "the fixture must really be a different branch"
+    );
+    assert!(
+        replay_scenario(&group_id, &live, &other_branch, &group_id)
+            .await?
+            .fork_quarantine
+            .is_some(),
+        "#732 r3: a signed advance on ANOTHER branch does not clear this node's marker"
+    );
+
+    // Forgery 3 — a signed advance by an agent the live roster does NOT
+    // certify as the policy owner's own. Signature and ancestry are fine;
+    // owner provenance is not.
+    let mut stranger_advance = at_three.clone();
+    if let Some(retained) = stranger_advance.commit_log.last_mut() {
+        retained.commit.committed_by = "ab".repeat(16);
+    }
+    assert!(
+        replay_scenario(&group_id, &live, &stranger_advance, &group_id)
+            .await?
+            .fork_quarantine
+            .is_some(),
+        "#732 r3: only the owner's own certified agent anchors a clear"
+    );
+
+    // Forgery 4 — an ORDINARY group can never buy a clear this way, whatever
+    // the advance looks like: the predicate's owner-axis fence is the same one
+    // the live arms carry.
+    let ordinary_id = "e4".repeat(32);
+    let (_base, ordinary_live, ordinary_signer) =
+        recovery_fixture(&ordinary_id, invite_only_policy())?;
+    let mut ordinary_marked = ordinary_live.clone();
+    let mut ordinary_marker = marker_at_frontier(&ordinary_live);
+    // Pretend it is anchorable, so ONLY the owner-axis fence can refuse.
+    ordinary_marker.no_anchor = false;
+    ordinary_marked.fork_quarantine = Some(ordinary_marker);
+    let mut ordinary_advance = ordinary_live.clone();
+    ordinary_advance.description = "an-ordinary-advance".to_string();
+    ordinary_advance.seal_commit(&ordinary_signer, now_millis_u64())?;
+    assert!(
+        ordinary_advance.state_revision > ordinary_live.state_revision,
+        "the ordinary advance really advances"
+    );
+    assert!(
+        replay_scenario(
+            &ordinary_id,
+            &ordinary_marked,
+            &ordinary_advance,
+            &ordinary_id
+        )
+        .await?
+        .fork_quarantine
+        .is_some(),
+        "#732 r3: an ordinary group has no owner axis, so no replayed commit clears it"
+    );
+    Ok(())
+}
+
+/// WHY (#732 r3 — both reviewers, independently). The r2 code claimed Rule 3's
+/// second binding was unreachable behind the first. That holds only for a live
+/// record whose outer `state_hash` agrees with its own signed terminal commit,
+/// and recovery establishes no such invariant. The MIRROR forgery edits the
+/// LIVE record's outer hash and leaves the log intact: `terminal_commit_header`
+/// returns the log's hash, so the JOURNAL is perfectly consistent, binding (a)
+/// passes, and only (b) — "the verified commit must genuinely differ from the
+/// live committed state at that revision" — refuses the install.
+///
+/// Without (b) this shape installs permanent `no_anchor` containment on a group
+/// that never forked: the two halves hold the SAME signed commit.
+#[tokio::test]
+async fn issue732_mirror_forged_live_hash_installs_no_marker() -> Result<()> {
+    let group_id = "e5".repeat(32);
+    let (base, advanced, signer) = recovery_fixture(&group_id, invite_only_policy())?;
+
+    // The live half: outer hash rewritten, signed log untouched.
+    let mut live_forged = advanced.clone();
+    live_forged.state_hash = "ee".repeat(32);
+    assert_eq!(
+        live_forged
+            .commit_log
+            .last()
+            .map(|retained| retained.commit.state_hash.clone()),
+        Some(advanced.state_hash.clone()),
+        "the live log still signs the REAL frontier — that is what makes (a) pass"
+    );
+
+    // The journal half is the untouched record: same signed commit, consistent
+    // outer fields. There is no fork here at all.
+    let after = replay_scenario(&group_id, &live_forged, &advanced, &group_id).await?;
+    assert!(
+        !after.is_fork_quarantined(),
+        "#732 r3: two halves holding the SAME signed commit are not a fork — \
+         binding (b) is load-bearing, not redundant"
+    );
+
+    // The control: a genuinely different signed commit at that revision still
+    // installs, so (b) is not a blanket refusal.
+    let genuine = conflicting_sibling(&base, &signer, "the-other-branch")?;
+    assert!(
+        replay_scenario(&group_id, &live_forged, &genuine, &group_id)
+            .await?
+            .fork_quarantine
+            .is_some_and(|marker| marker.no_anchor),
+        "an authenticated CONFLICTING commit is still contained"
+    );
+    Ok(())
+}
+
+/// WHY (#732 r3 — Codex's Rule 1 note). "Equal or older" conflated two very
+/// different situations. A journal that is stale against the MERGED store is
+/// consumed before any write, so it never reaches this helper. But an
+/// individual FILE can still be newer than the journalled record: the merged
+/// load lets the authoritative Home-Suite sidecar record supersede a legacy
+/// placeholder in `named_groups.json` (`merge_home_suite_groups`), and that
+/// placeholder can carry a higher `state_revision` than the sidecar record the
+/// journal staged. Replacing it is intentional — it is the whole point of the
+/// supersession.
+///
+/// Taking case 1's rule there (the live pair VERBATIM) would let the
+/// placeholder's containment state overwrite the authoritative record's, which
+/// in the direction that matters means DROPPING a marker. So case 3 unions
+/// instead: the live half fills only what the journal record lacks, and nothing
+/// is ever cleared. Containment survives from whichever half holds it.
+///
+/// This exercises the merge helper directly on the exact on-disk divergence,
+/// because reaching it through the full entry needs a merged view that
+/// disagrees with the named file — state the load path creates, not the replay.
+#[tokio::test]
+async fn issue732_older_journal_at_one_file_unions_containment() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let group_id = "e6".repeat(32);
+    let (_base, advanced, _kp) = recovery_fixture(&group_id, invite_only_policy())?;
+
+    // Arm 1 — the direction that matters: the newer placeholder carries NO
+    // marker, the journalled authoritative record does. The marker must live.
+    let mut placeholder = legacy_safe_placeholder(&advanced);
+    placeholder.state_revision = advanced.state_revision + 5;
+    placeholder.fork_quarantine = None;
+    let mut authoritative = advanced.clone();
+    authoritative.fork_quarantine = Some(marker_at_frontier(&advanced));
+    let store = dir.path().join("named_groups.json");
+    write_named_groups_json_atomic(&store, &store_image(&group_id, &placeholder)?).await?;
+    merge_group_record_into_store_file(
+        &store,
+        &group_id,
+        &store_image(&group_id, &authoritative)?,
+        "named groups",
+    )
+    .await?;
+    assert!(
+        read_store(&store).await?[&group_id]
+            .fork_quarantine
+            .is_some(),
+        "#732 r3: a placeholder's ABSENT containment must not erase the authoritative \
+         record's marker — case 1's verbatim rule would have"
+    );
+
+    // Arm 2 — the other direction: the placeholder carries the marker (a
+    // placeholder clone preserves it) and the journalled record does not. The
+    // union keeps it: case 3 never clears.
+    let mut placeholder_marked = legacy_safe_placeholder(&advanced);
+    placeholder_marked.state_revision = advanced.state_revision + 5;
+    placeholder_marked.fork_quarantine = Some(marker_at_frontier(&advanced));
+    let store_b = dir.path().join("named_groups_b.json");
+    write_named_groups_json_atomic(&store_b, &store_image(&group_id, &placeholder_marked)?).await?;
+    merge_group_record_into_store_file(
+        &store_b,
+        &group_id,
+        &store_image(&group_id, &advanced)?,
+        "named groups",
+    )
+    .await?;
+    let after = read_store(&store_b).await?[&group_id].clone();
+    assert!(
+        after.fork_quarantine.is_some(),
+        "#732 r3: case 3 unions containment — an older journal never lifts it"
+    );
+    assert_eq!(
+        after.state_revision, advanced.state_revision,
+        "negative control: the authoritative record still supersedes the placeholder \
+         everywhere else, which is what the supersession is FOR"
+    );
+    assert!(
+        !after.members_v2.is_empty(),
+        "and the real roster is restored over the placeholder's empty one"
     );
     Ok(())
 }

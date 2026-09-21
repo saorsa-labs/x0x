@@ -54,6 +54,27 @@ All notable changes to this project will be documented in this file.
     owner-anchored advance no longer has its clear reversed on restart. A
     `no_anchor` marker, an advance not strictly past the evidenced revision,
     and a journal carrying its own marker all keep containment.
+  - **The forward clear is AUTHENTICATED (round 3).** A journal is an unsealed
+    envelope around plain JSON and the replay's Apply arm authenticates
+    nothing, so honouring a clear on a higher OUTER revision made recovery the
+    cheapest way to lift an owner-anchored marker — cheaper than any live clear
+    arm. `named_groups.rs::journal_advance_clears_marker` now requires a
+    retained terminal commit that passes
+    `GroupStateCommit::verify_structure`, an outer claim bound to that signed
+    commit, `owner_anchored_clear_permitted` at the SIGNED revision, ancestry
+    chaining from the live terminal head, and a committer the LIVE roster
+    certifies as the policy owner's own agent (Active + Admin). Anything less
+    carries the live marker. Note the deliberate fail-closed direction: an
+    owner-axis roster that binds no agent to the owner cannot satisfy file-level
+    provenance, so a crash-interrupted clear is not honoured on restart and is
+    re-applied by hand once.
+  - **An OLDER journal frontier at one file unions containment (round 3).** The
+    merged-view verdict consumes journals stale against the merged store, but an
+    individual file can still be newer: `named_groups.rs::merge_home_suite_groups`
+    lets the authoritative sidecar record supersede a newer legacy placeholder in
+    `named_groups.json`. Taking that placeholder's pair verbatim could drop a
+    marker, so containment is unioned across the halves and never cleared, while
+    the authoritative record still supersedes the placeholder everywhere else.
   - **The claimed conflict is bound to the verified commit (round 2).** A
     record's outer `state_revision`/`state_hash` sit beside its commit log and
     are what the replay verdict compares, so a local writer could copy the
@@ -62,7 +83,9 @@ All notable changes to this project will be documented in this file.
     `no_anchor` containment with no authenticated *conflicting* commit. It now
     requires the claimed frontier to be the one the verified commit signs, and
     that commit to genuinely differ from the live committed state at that
-    revision.
+    revision. Both checks are load-bearing (round 3): the mirror forgery edits
+    the LIVE record's outer hash and leaves its signed log intact, so the first
+    check passes on a consistent journal and only the second refuses.
   - No schema or wire change (the marker's fields already carry
     `#[serde(default)]`). Closes runbook known gap (h).
 
