@@ -937,8 +937,8 @@ showed is wrong in two directions. The rule now turns on the frontier:
   two halves and nothing is cleared — the one case where the live half is not
   the authority on the group's state. The union is over containment STRENGTH,
   not merely presence, through one total order
-  (`named_groups.rs::live_marker_is_stronger`): `no_anchor` first, then the
-  HIGHER evidenced `revision`, then keep the live marker on a tie. So a
+  (`named_groups.rs::challenger_containment_is_stronger`): `no_anchor` first, then the
+  HIGHER evidenced `revision`, then keep the INCUMBENT on a tie (the marker already on the record being written). So a
   supersession can neither downgrade a manual-only quarantine into a clearable
   one, nor lower the clear threshold — a marker's `revision` is half of
   `owner_anchored_clear_permitted`, so replacing revision 7 with revision 2
@@ -950,6 +950,19 @@ showed is wrong in two directions. The rule now turns on the frontier:
   replay does not touch. Everything else about the supersession is
   unchanged: the authoritative roster, policy and revision still replace the
   placeholder's.
+
+*Duplicate spellings cannot disagree (r7).* A roster can legitimately hold two
+entries for one group: `named_groups.rs::merge_home_suite_groups` inserts the
+sidecar record under its key and does not remove a differently-keyed named
+entry. `server/mod.rs::resolve_group_entry_locked` answers an exact key match
+first, so an unmarked duplicate served the group while the roster showed it
+contained, and a successful clear could leave the other spelling quarantined
+with no remaining exit. Install, its rollback, the manual clear and the merge
+now all apply to EVERY entry sharing the stable id, at the same strongest
+containment. **Operator consequence:** `x0x groups quarantine clear` clears the
+group whichever spelling you name it by, and the result survives a restart;
+duplicate entries are left in place on purpose (deleting one risks losing a
+record), they simply cannot differ about containment any more.
 
 *The claimed conflict is bound to the verified commit (r2).* A `GroupInfo`'s
 outer `state_revision`/`state_hash` are plain fields beside its commit log, and
@@ -980,6 +993,9 @@ Source: `src/server/routes/named_groups.rs::merge_group_record_into_store_file`,
 `src/server/routes/named_groups.rs::fork_candidate_authenticated`,
 `src/groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted`,
 `src/groups/mod.rs::GroupInfo::clear_fork_quarantine_on_explicit_owner_seal`,
+`src/server/routes/named_groups.rs::collect_same_stable_group_aliases`,
+`src/server/routes/named_groups.rs::clear_group_quarantine`,
+`src/server/mod.rs::resolve_group_entry_locked`,
 `src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forward_replay_never_lifts_containment`,
 `src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_certified_admin_resigned_advance_cannot_lift_containment`,
 `src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_older_journal_at_one_file_unions_containment_through_recovery`,

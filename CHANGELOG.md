@@ -52,10 +52,10 @@ All notable changes to this project will be documented in this file.
     sidecar record supersedes a newer legacy placeholder — the two halves are
     UNIONED, because the placeholder is not authoritative about containment
     either. Every union uses one total strength order
-    (`named_groups.rs::live_marker_is_stronger`): `no_anchor` first, then the
+    (`named_groups.rs::challenger_containment_is_stronger`): `no_anchor` first, then the
     higher evidenced `revision` — which is half of
     `ForkQuarantine::owner_anchored_clear_permitted`, so a lower one would
-    silently lower the clear threshold — then keep live on a tie. The whole
+    silently lower the clear threshold — then keep the INCUMBENT on a tie. The whole
     stronger marker is installed, never a mix of fields from both.
   - **NO replayed advance clears a quarantine (round 4, final).** Rounds 2 and 3
     each tried to honour a clear a staged advance had granted — first on the
@@ -104,6 +104,19 @@ All notable changes to this project will be documented in this file.
     consults. The sidecar still wins every other field; containment is now
     unioned under the same total order, whole marker plus its own evidence, so
     the authoritative view is never weaker than either half.
+  - **Duplicate alias entries can no longer disagree about containment (round
+    7).** A roster can legitimately hold TWO entries for one group —
+    `named_groups.rs::merge_home_suite_groups` inserts the sidecar record under
+    its key without removing a differently-keyed named entry, the shape
+    `named_groups.rs::collect_same_stable_group_aliases` exists for. Because
+    `server/mod.rs::resolve_group_entry_locked` returns an exact key match
+    first, an unmarked duplicate was a silent bypass, and a successful durable
+    clear left the other spelling quarantined with no remaining exit. The merge
+    now gives every entry sharing a stable id the same strongest containment,
+    and `named_groups.rs::install_fork_evidence`, its rollback arm and
+    `named_groups.rs::clear_group_quarantine` all apply to every spelling.
+    Entries are deliberately NOT canonicalised or deleted — losing a record is
+    worse than keeping a duplicate.
   - No schema or wire change (the marker's fields already carry
     `#[serde(default)]`). Closes runbook known gap (h).
 

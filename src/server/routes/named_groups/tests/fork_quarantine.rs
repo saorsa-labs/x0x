@@ -3453,7 +3453,7 @@ async fn issue732_forward_replay_never_lifts_containment() -> Result<()> {
 
     // Control 3 — when the journal image carries its OWN marker at the higher
     // frontier, both halves assert containment and the STRONGER one survives
-    // (#732 r5, `live_marker_is_stronger`): here that is the journalled marker,
+    // (#732 r5, `challenger_containment_is_stronger`): here that is the journalled marker,
     // whose higher `revision` is a HIGHER clear threshold. "Never lifted" is
     // also "never weakened", so the arm asserts the stronger threshold — not
     // "live always wins", which would have let a journalled rev-2 marker
@@ -4131,7 +4131,7 @@ async fn issue732_older_journal_at_one_file_unions_containment_through_recovery(
 /// revision 3 from REFUSED to PERMITTED — the replay would hand out a clear
 /// nobody granted, one step removed.
 ///
-/// The claim: `live_marker_is_stronger` is a TOTAL order (`no_anchor`, then the
+/// The claim: `challenger_containment_is_stronger` is a TOTAL order (`no_anchor`, then the
 /// higher `revision`, then keep live), so the surviving threshold is never lower
 /// than either half's, and the WHOLE stronger marker is installed — never a mix
 /// of fields from both, which would describe a fork observation that never
@@ -4309,6 +4309,95 @@ async fn issue732_merged_authoritative_view_keeps_recovered_containment() -> Res
             .owner_certified_user_id()
             .is_some(),
         "including the policy the placeholder deliberately strips"
+    );
+    Ok(())
+}
+
+/// WHY (#732 r7 — cross-model review, Codex P1). The merged view can
+/// legitimately hold TWO entries for one group: `merge_home_suite_groups`
+/// inserts the sidecar record under ITS key and does NOT remove a
+/// differently-keyed named entry, which is the shape
+/// `collect_same_stable_group_aliases` exists for. r6 unioned containment into
+/// the sidecar record only, so the alias entry stayed unmarked — and
+/// `server::resolve_group_entry_locked` returns an EXACT key match first, so a
+/// gate asked by the alias spelling resolved the unmarked entry and served the
+/// group. Containment present in the roster, absent at the gate.
+///
+/// The claim: after the load, EVERY spelling of a quarantined group resolves to
+/// a contained record. Entries are deliberately not canonicalised or deleted —
+/// losing a record is worse than keeping a duplicate — so the fix is that the
+/// duplicate cannot disagree about containment.
+///
+/// Negative control (executed): with the post-insert spread removed, the alias
+/// spelling resolves to an unmarked record and this test fails while the
+/// sidecar-keyed assertions still pass — exactly the r6 state.
+#[tokio::test]
+async fn issue732_every_spelling_resolves_to_containment_after_load() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let named_path = dir.path().join("named_groups.json");
+    let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+    let group_id = "ec".repeat(32);
+    let (_state, _sdir, authoritative, _at_three) = owner_axis_advance_fixture(&group_id).await?;
+
+    // The named half is filed under an ALIAS and carries NO containment — the
+    // shape a legacy rewrite or a re-keyed replay leaves behind.
+    let alias_key = "issue732-merge-alias";
+    let mut alias_entry = legacy_safe_placeholder(&authoritative);
+    alias_entry.fork_quarantine = None;
+    write_named_groups_json_atomic(&named_path, &store_image(alias_key, &alias_entry)?).await?;
+
+    // The sidecar half is the authoritative record, keyed by the stable id and
+    // QUARANTINED.
+    let mut sidecar_entry = authoritative.clone();
+    let marker = marker_at_frontier(&authoritative);
+    sidecar_entry.fork_quarantine = Some(marker.clone());
+    write_named_groups_json_atomic(
+        &sidecar_path,
+        &store_image(authoritative.stable_group_id(), &sidecar_entry)?,
+    )
+    .await?;
+
+    let merged = load_named_groups_merged(&named_path, &sidecar_path).await?;
+    assert_eq!(
+        merged
+            .values()
+            .filter(|info| info.stable_group_id() == authoritative.stable_group_id())
+            .count(),
+        2,
+        "the premise: the merge leaves the alias entry in place beside the sidecar's"
+    );
+    assert!(
+        merged.contains_key(alias_key),
+        "and the alias key really survived the merge"
+    );
+
+    // What the gates actually ask, by BOTH spellings.
+    for spelling in [alias_key, authoritative.stable_group_id()] {
+        let (_key, info) = crate::server::resolve_group_entry_locked(&merged, spelling)
+            .ok_or_else(|| anyhow::anyhow!("resolver lost {spelling}"))?;
+        assert!(
+            info.is_fork_quarantined(),
+            "#732 r7: the spelling `{spelling}` must resolve to a CONTAINED record — the \
+             resolver returns an exact key match first, so an unmarked duplicate is a \
+             silent bypass"
+        );
+    }
+    assert!(
+        merged
+            .values()
+            .filter(|info| info.stable_group_id() == authoritative.stable_group_id())
+            .all(|info| info.fork_quarantine.as_ref() == Some(&marker)),
+        "every spelling carries the SAME, whole marker — no field mix, no weaker copy"
+    );
+    // Negative control: sidecar-wins is untouched for everything else, so this
+    // is not "the merge stopped preferring the sidecar".
+    assert!(
+        merged[authoritative.stable_group_id()]
+            .policy
+            .admission
+            .owner_certified_user_id()
+            .is_some(),
+        "the authoritative record still wins on policy"
     );
     Ok(())
 }
