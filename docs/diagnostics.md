@@ -201,10 +201,12 @@ invalid evidence (#656).
 | `dispatcher.<lane>.over_100ms_count`, `.over_1s_count`, `.over_5s_count`, `.over_30s_count` | Cumulative (not disjoint) counts of handler invocations at or above each threshold. |
 | `dispatcher.recv_depth.<lane>.latest`, `.max`, `.capacity` | Receive-queue depth sampled at dequeue. |
 
-Verify rate = Δ(`inner_envelope_verify.count` + `pubsub_stages.verify.count`) / Δ`uptime_secs`.
+Combined observed-stage call rate =
+Δ(`inner_envelope_verify.count` + `pubsub_stages.verify.count`) / Δ`uptime_secs`.
 
-That combined rate is an **upper bound** on ML-DSA operations per second, not
-an exact count. The two counters draw the line differently: the outer
+That combined rate is an **upper-bound proxy for cryptographic operations in
+these two observed stages**, not an exact operation count and not a bound on
+daemon-wide ML-DSA work. The two counters draw the line differently: the outer
 `pubsub_stages.verify` stage times the whole saorsa-gossip verify call, so its
 `count` INCLUDES frames whose public key or signature is malformed and fail
 before any cryptography runs, whereas `inner_envelope_verify.count` excludes
@@ -216,6 +218,9 @@ cryptographic verify. Envelopes rejected earlier (malformed key or signature,
 agent-id/public-key mismatch) cost no ML-DSA work and are not counted. The
 counters are process-wide, so they include every caller of the decode entry
 points, not only gossip delivery.
+
+The proxy can still be lower than total daemon verification work because it
+does not include the paths below.
 
 **Not covered by either verify counter:** presence-beacon verifies inside
 `saorsa-gossip-presence` (Bulk lane); application-layer verifies that run after

@@ -18,8 +18,10 @@ All notable changes to this project will be documented in this file.
   The saorsa-gossip outer-frame verify was already exposed as
   `pubsub_stages.verify.{count,total_ns}` and is now documented. Not covered:
   presence-beacon verifies inside saorsa-gossip, application-layer verifies
-  after delivery, and QUIC handshake verifies. The combined verify rate is an
-  upper bound on ML-DSA ops/s, not exact. See `docs/diagnostics.md`.
+  after delivery, and QUIC handshake verifies. The combined counter rate is an
+  upper-bound proxy for calls in the two observed stages; it is neither an
+  exact crypto-operation rate nor a bound on daemon-wide ML-DSA work. See
+  `docs/diagnostics.md`.
 
 ### Changed
 
