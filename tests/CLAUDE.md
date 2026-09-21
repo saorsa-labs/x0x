@@ -3,6 +3,25 @@
 Auto-loaded only when Claude is working on files in `tests/`. Root `CLAUDE.md`
 covers project-wide rules and architecture.
 
+## Ordinary shared Wiki/Web testnet acceptance
+
+`e2e_vps_kv.py` is the strict ordinary group-store segment for #565. It is
+testnet-only and separate from legacy-import and GUI acceptance. The scenario
+must take the creator offline and restart a writer, so it fails before opening
+tunnels unless the operator supplies `--allow-service-restart`. Only
+`x0xd-testnet.service` is addressed, and a previously-active creator is
+restored in `finally`.
+
+```bash
+python3 tests/e2e_vps_kv.py --network test \
+  --tokens-file tests/.vps-tokens-test.env \
+  --allow-service-restart --report /absolute/path/phase-kv.json
+```
+
+The report contains assertion labels, status codes, store identifiers and
+content hashes, never bearer tokens or page bytes. Success here does not cover
+legacy migration or browser/GUI rendering.
+
 ## Integration Test Organization
 
 33 integration test files in `tests/` (curated core subset; the directory holds more):
