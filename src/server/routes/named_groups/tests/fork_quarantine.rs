@@ -3336,57 +3336,80 @@ async fn owner_axis_advance_fixture(
     Ok((state, dir, at_two, info))
 }
 
-/// WHY (#732 r2 — cross-model review, Codex P2-a and omp nit (b)). The first
-/// repair carried the live marker forward UNCONDITIONALLY, which reverses a
-/// clear the node had legitimately granted. The reachable shape: an
-/// owner-anchored advance (or explicit owner seal) clears the marker and stages
-/// its journal, then the process dies before the live store is replaced. The
-/// higher-revision journal legitimately holds no marker; restoring one there
-/// contradicts `ForkQuarantine::owner_anchored_clear_permitted`, which had
-/// already said this advance clears — and it does so silently, because the
-/// clear's provenance is not in the image.
+/// WHY (#732 r4 — this test is the INVERSE of what r2 and r3 shipped, and the
+/// change of contract is deliberately visible in the diff).
 ///
-/// The rule: a FORWARD replay honours exactly that predicate, evaluated at the
-/// JOURNALLED revision, and only when the journal image carries no marker of
-/// its own. Its three refusals are the controls below, and each is a case where
-/// carrying the marker is the fail-closed answer.
+/// r2 let a forward replay honour a clear on the journal's unsigned outer
+/// revision. r3 required the journalled advance to be a verified, head-chaining
+/// commit signed by an agent the live roster certified under the policy owner.
+/// Both reviewers then showed that the last condition is not owner
+/// authorization at all: in an OwnerCertified group EVERY seated member's
+/// certificate binds the owner key, quarantine evicts nobody, so the FORKER —
+/// seated, holding only its own agent key — can sign a fresh higher-revision
+/// DESCENDANT of the contested live head and satisfy every check. Ancestry
+/// excludes the other existing branch; it cannot stop this branch being
+/// extended. `GroupInfo::clear_fork_quarantine_on_explicit_owner_seal` makes
+/// the distinction explicit by rejecting a certificate verdict as an owner
+/// anchor and demanding the owner USER key.
+///
+/// Neither that key nor an `OwnerMandate` is persisted with a group record, so
+/// there is nothing on disk from which recovery could establish equal-strength
+/// authorization — and #732 does not add persistence for it, because that is a
+/// schema change owed its own ADR.
+///
+/// So the rule is now simply: a FORWARD replay NEVER lifts containment. The
+/// liveness cost is real and named in the runbook — a clear interrupted between
+/// staging and saving leaves the marker, and the operator clears it once by hand
+/// — and it is the price of not handing the contained adversary a bypass.
 #[tokio::test]
-async fn issue732_forward_replay_honours_an_owner_anchored_clear() -> Result<()> {
+async fn issue732_forward_replay_never_lifts_containment() -> Result<()> {
     let group_id = "e1".repeat(32);
     let (_state, _dir, at_two, at_three) = owner_axis_advance_fixture(&group_id).await?;
 
-    // The marker the advance clears: owner axis ⇒ `no_anchor: false`, at the
-    // revision the advance is past.
+    // THE STRONGEST-POSSIBLE GENUINE ADVANCE: owner-axis, `no_anchor: false`,
+    // sealed through the production owner-certified seal by the owner's own
+    // certificate-bound agent, chaining directly from the live head, at a
+    // revision strictly past the evidence — everything r3's predicate asked
+    // for, and everything the production clear predicate asks for BAR the owner
+    // user key, which no journal carries. It still must not clear.
     let mut live = at_two.clone();
     let marker = marker_at_frontier(&at_two);
     assert!(
         !marker.no_anchor,
-        "an owner-axis marker is the only kind a commit can clear"
+        "the fixture uses the only marker kind a commit could ever clear"
     );
     assert!(
         marker.owner_anchored_clear_permitted(at_three.state_revision),
-        "the fixture must satisfy the production predicate, or this test proves nothing"
+        "the PRODUCTION clear predicate is satisfied — so any refusal below is \
+         attributable to the missing owner authorization, not to that predicate"
+    );
+    assert_eq!(
+        at_three
+            .commit_log
+            .last()
+            .map(|r| r.commit.prev_state_hash.clone()),
+        Some(Some(at_two.state_hash.clone())),
+        "and the advance really chains from the live head"
     );
     live.fork_quarantine = Some(marker);
 
     let after = replay_scenario(&group_id, &live, &at_three, &group_id).await?;
     assert!(
-        after.fork_quarantine.is_none(),
-        "#732 r2: the journalled advance IS the clear — replaying it must not reverse it"
+        after.fork_quarantine.is_some(),
+        "#732 r4: NO replayed advance lifts containment — a certificate verdict is \
+         not owner authorization, and the forker holds one too"
     );
-    assert!(
-        after
-            .invite_lineage
-            .as_ref()
-            .and_then(|lineage| lineage.fork_evidence.as_ref())
-            .is_none(),
-        "a clear removes the evidence with the marker, as every production clear arm does"
+    assert_eq!(
+        after.state_revision, at_three.state_revision,
+        "negative control: the advance is still APPLIED — only containment is kept"
     );
-    assert_eq!(after.state_revision, at_three.state_revision);
+    assert_eq!(
+        after.description, at_three.description,
+        "negative control: the journalled record still wins on every other field"
+    );
 
-    // Control 1 — a `no_anchor` marker is NEVER cleared by a commit, of any
-    // revision. Only the manual clear removes it, and a manual clear is a
-    // same-frontier event covered by the rule above.
+    // Control 1 — a `no_anchor` marker is likewise never lifted. Only the
+    // manual clear removes it, and a manual clear is a same-frontier event.
     let mut live_no_anchor = at_two.clone();
     let mut no_anchor = marker_at_frontier(&at_two);
     no_anchor.no_anchor = true;
@@ -3415,11 +3438,9 @@ async fn issue732_forward_replay_honours_an_owner_anchored_clear() -> Result<()>
         "an advance level with the evidence revision does not clear"
     );
 
-    // Control 3 — the journal image carries its OWN marker at the higher
-    // frontier. Two assertions of containment are not a clear; the live
-    // marker is kept as the documented fail-closed choice (it may be the
-    // stronger of the two, and a wrongly-kept marker is operator-clearable
-    // while a wrongly-lifted one is silent).
+    // Control 3 — when the journal image carries its OWN marker at the higher
+    // frontier, the LIVE marker is the one kept: it is this node's current
+    // containment decision and may be the stronger of the two.
     let mut staged_marked = at_three.clone();
     staged_marked.fork_quarantine = Some(marker_at_frontier(&at_three));
     assert!(
@@ -3510,9 +3531,12 @@ async fn issue732_forged_outer_hash_journal_installs_no_marker() -> Result<()> {
 /// owner provenance read from the LOCAL roster. This test's arms are the
 /// forgeries that each miss one of those.
 ///
-/// The genuine-advance control is
-/// [`issue732_forward_replay_honours_an_owner_anchored_clear`]: strip the
-/// authentication and this test fails; refuse everything and that one fails.
+/// #732 r4: the rule these arms defend became absolute — no replayed advance
+/// clears at all (see [`issue732_forward_replay_never_lifts_containment`] and
+/// the note above `install_fork_evidence`). The arms are KEPT rather than
+/// deleted: each is a distinct forgery that r2/r3 admitted, so they pin that the
+/// refusal is not accidentally re-narrowed to one shape. The APPLY side is the
+/// control — every arm asserts the record still advances.
 #[tokio::test]
 async fn issue732_forged_forward_journal_cannot_lift_containment() -> Result<()> {
     let group_id = "e3".repeat(32);
@@ -3761,6 +3785,258 @@ async fn issue732_older_journal_at_one_file_unions_containment() -> Result<()> {
     assert!(
         !after.members_v2.is_empty(),
         "and the real roster is restored over the placeholder's empty one"
+    );
+    Ok(())
+}
+
+/// Like [`replay_scenario`] but also seeds the Home-Suite SIDECAR, so the merged
+/// view (which `merge_home_suite_groups` lets the sidecar win) can disagree with
+/// the individual `named_groups.json` file — the divergence #732's case 3 exists
+/// for. Returns the record left in the NAMED file, which is the one case 3
+/// writes.
+async fn replay_scenario_with_sidecar(
+    group_id: &str,
+    named_live: &x0x::groups::GroupInfo,
+    sidecar_live: &x0x::groups::GroupInfo,
+    staged: &x0x::groups::GroupInfo,
+) -> Result<x0x::groups::GroupInfo> {
+    let dir = tempfile::tempdir()?;
+    let treekem = dir.path().join("treekem");
+    tokio::fs::create_dir_all(&treekem).await?;
+    let named_path = dir.path().join("named_groups.json");
+    let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+    write_named_groups_json_atomic(&named_path, &store_image(group_id, named_live)?).await?;
+    write_named_groups_json_atomic(&sidecar_path, &store_image(group_id, sidecar_live)?).await?;
+    stage_journal(&treekem, group_id, staged).await?;
+    // The merged verdict must read Apply, or the journal is consumed as stale
+    // and this fixture proves nothing about the merge.
+    let merged = load_named_groups_merged(&named_path, &sidecar_path).await?;
+    assert_eq!(
+        merged[group_id].state_revision, sidecar_live.state_revision,
+        "the sidecar record must win the merge, which is the premise of case 3"
+    );
+    recover_treekem_named_journals(&named_path, &sidecar_path, &treekem).await?;
+    read_store(&named_path)
+        .await?
+        .get(group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("the replay left no record under the stable id"))
+}
+
+/// WHY (#732 r4 — Codex's fixture gap). The r3 "non-owner committer" arm rewrote
+/// `committed_by` WITHOUT re-signing, so `verify_structure` rejected it on the
+/// signature and the owner-provenance step was never reached: a passing test
+/// that proved the wrong thing. This is the attack properly built — and it is
+/// the attack that broke r3's design.
+///
+/// The adversary is the forker itself: still SEATED (quarantine evicts nobody),
+/// Active and Admin, holding a certificate that — like every seat in an
+/// OwnerCertified group — binds the policy owner's key, and holding only its OWN
+/// agent key. It signs a genuine, structurally valid, higher-revision DESCENDANT
+/// of the contested live head with the containment stripped. Every r3 condition
+/// is satisfied: retained terminal commit, `verify_structure` passes, the outer
+/// claim matches the signed one, `owner_anchored_clear_permitted` holds at that
+/// revision, ancestry chains from the live head, and the roster certifies the
+/// committer under the owner.
+///
+/// So "certified" is not "authorized", and the only safe answer is the one #732
+/// r4 takes: no replayed advance clears. The negative control is the code at
+/// `5b7b5da`, where this fixture lifts containment.
+#[tokio::test]
+async fn issue732_certified_admin_resigned_advance_cannot_lift_containment() -> Result<()> {
+    let group_id = "e7".repeat(32);
+    let (state, _dir, owner) = owner_authority_state().await?;
+    let signer = state.agent.identity().agent_keypair();
+    let mut live = x0x::groups::GroupInfo::with_policy(
+        "certified-admin-attack".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.clone(),
+        owner_certified_policy(&owner),
+    );
+    let creator_hex = hex::encode(state.agent.agent_id().as_bytes());
+    live.set_member_certificate(
+        &creator_hex,
+        state
+            .agent
+            .agent_certificate()
+            .ok_or_else(|| anyhow::anyhow!("builder-issued certificate"))?
+            .clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // THE FORKER: a second Active+Admin seat whose certificate is issued by the
+    // SAME owner user key — which is what every seat in an OwnerCertified group
+    // looks like — and which holds only its own agent key.
+    let forker_kp = AgentKeypair::generate()?;
+    let forker_hex =
+        hex::encode(crate::identity::AgentId::from_public_key(forker_kp.public_key()).as_bytes());
+    let creator_seat = live
+        .members_v2
+        .get(&creator_hex)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("creator seat"))?;
+    let mut forker_seat = creator_seat.clone();
+    forker_seat.agent_id = forker_hex.clone();
+    forker_seat.role = x0x::groups::GroupRole::Admin;
+    forker_seat.state = x0x::groups::GroupMemberState::Active;
+    // A cloned seat carries the CREATOR's certificate and its committed digest;
+    // clear both so this seat gets its own.
+    forker_seat.certificate = None;
+    forker_seat.certificate_digest = None;
+    live.members_v2.insert(forker_hex.clone(), forker_seat);
+    live.set_member_certificate(
+        &forker_hex,
+        crate::identity::AgentCertificate::issue(&owner, &forker_kp)
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    seal_commit_owner_certified(&state, &mut live, signer, now_millis_u64()).await?;
+    live.description = "the contested head".to_string();
+    seal_commit_owner_certified(&state, &mut live, signer, now_millis_u64()).await?;
+    let contested_head = live.clone();
+    let marker = marker_at_frontier(&contested_head);
+    assert!(!marker.no_anchor, "owner axis — the clearable kind");
+    live.fork_quarantine = Some(marker);
+    live.invite_lineage = Some(lineage_for(&contested_head));
+    if let Some(lineage) = live.invite_lineage.as_mut() {
+        lineage.fork_evidence = Some(evidence_at_frontier(&contested_head));
+    }
+
+    // The forker's own descendant of that head, VALIDLY SIGNED with its agent
+    // key, containment stripped.
+    let mut forked_advance = contested_head.clone();
+    forked_advance.description = "the forker's advance".to_string();
+    seal_commit_owner_certified(&state, &mut forked_advance, &forker_kp, now_millis_u64()).await?;
+    let staged = forked_advance
+        .commit_log
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("sealed"))?
+        .commit
+        .clone();
+    assert!(
+        staged.verify_structure().is_ok(),
+        "the attack commit VERIFIES — that is the whole point; r3's arm never got here"
+    );
+    assert_eq!(
+        staged.committed_by, forker_hex,
+        "signed by the forker itself"
+    );
+    assert_eq!(
+        staged.prev_state_hash.as_deref(),
+        Some(contested_head.state_hash.as_str()),
+        "and it is a DESCENDANT of the contested live head, not another branch"
+    );
+    assert!(
+        staged.revision > contested_head.state_revision,
+        "at a strictly higher revision, so the clear predicate would permit it"
+    );
+    assert!(
+        live.members_v2
+            .get(&forker_hex)
+            .and_then(|m| m.certificate.as_ref())
+            .is_some_and(
+                |cert| ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes())
+                    .is_ok_and(
+                        |pk| crate::identity::UserId::from_public_key(&pk) == owner.user_id()
+                    )
+            ),
+        "and the live roster certifies the forker UNDER THE POLICY OWNER — the \
+         degeneracy that made r3's provenance check vacuous"
+    );
+    assert!(forked_advance.fork_quarantine.is_none());
+    // The attacker keeps the provenance record and strips only the containment
+    // PAIR — marker and evidence — which is what makes the lift durable.
+    forked_advance.invite_lineage = Some(lineage_for(&contested_head));
+
+    let after = replay_scenario(&group_id, &live, &forked_advance, &group_id).await?;
+    assert!(
+        after.fork_quarantine.is_some(),
+        "#732 r4: a certified Active+Admin signing a descendant of the contested head \
+         is NOT owner authorization — containment must survive"
+    );
+    assert!(
+        after
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .is_some(),
+        "and the evidence with it: the attack strips the whole pair"
+    );
+    assert_eq!(
+        after.state_revision, forked_advance.state_revision,
+        "negative control: the advance is still applied — only containment is kept"
+    );
+    Ok(())
+}
+
+/// #732 r4 (Codex): the case-3 fixture, driven through the REAL startup entry
+/// rather than the merge helper. The divergence is built the way the load path
+/// builds it: `merge_home_suite_groups` lets the authoritative sidecar record win
+/// the MERGED view (so the verdict reads Apply), while `named_groups.json` still
+/// holds a legacy placeholder at a HIGHER `state_revision` — which is the live
+/// half the named-store merge then sees.
+///
+/// Both arms of the union are asserted, and the second is r3's nit: the union is
+/// over containment STRENGTH, so a journal-side ANCHORED marker must not outrank
+/// a live `no_anchor` one, or the supersession would silently downgrade a
+/// manual-only quarantine into one an owner-anchored advance could clear.
+#[tokio::test]
+async fn issue732_older_journal_at_one_file_unions_containment_through_recovery() -> Result<()> {
+    let group_id = "e8".repeat(32);
+    let (_state, _dir, authoritative, _at_three) = owner_axis_advance_fixture(&group_id).await?;
+
+    // Arm 1 — the direction that matters: the newer placeholder carries NO
+    // marker, the journalled authoritative record does. Case 1's verbatim rule
+    // would erase it.
+    let mut placeholder = legacy_safe_placeholder(&authoritative);
+    placeholder.state_revision = authoritative.state_revision + 5;
+    placeholder.fork_quarantine = None;
+    let mut staged = authoritative.clone();
+    staged.fork_quarantine = Some(marker_at_frontier(&authoritative));
+    let after =
+        replay_scenario_with_sidecar(&group_id, &placeholder, &authoritative, &staged).await?;
+    assert!(
+        after.fork_quarantine.is_some(),
+        "#732 r4: a placeholder's ABSENT containment must not erase the authoritative \
+         record's marker"
+    );
+    assert_eq!(
+        after.state_revision, authoritative.state_revision,
+        "negative control: the authoritative record still supersedes the placeholder"
+    );
+    assert!(
+        !after.members_v2.is_empty(),
+        "and the real roster replaces the placeholder's empty one"
+    );
+
+    // Arm 2 — strength, not presence: the live placeholder's marker is
+    // `no_anchor`, the journalled one is anchored. The result must be
+    // `no_anchor`, or a manual-only quarantine is quietly downgraded.
+    let mut placeholder_no_anchor = legacy_safe_placeholder(&authoritative);
+    placeholder_no_anchor.state_revision = authoritative.state_revision + 5;
+    let mut strong = marker_at_frontier(&authoritative);
+    strong.no_anchor = true;
+    placeholder_no_anchor.fork_quarantine = Some(strong);
+    let mut staged_anchored = authoritative.clone();
+    let mut weak = marker_at_frontier(&authoritative);
+    weak.no_anchor = false;
+    staged_anchored.fork_quarantine = Some(weak);
+    let after = replay_scenario_with_sidecar(
+        &group_id,
+        &placeholder_no_anchor,
+        &authoritative,
+        &staged_anchored,
+    )
+    .await?;
+    assert!(
+        after
+            .fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.no_anchor),
+        "#732 r4: the union takes the STRONGER containment — an anchored journal marker \
+         cannot downgrade a live `no_anchor` one into something a commit could clear"
     );
     Ok(())
 }

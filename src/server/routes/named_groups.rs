@@ -3487,101 +3487,47 @@ fn fork_candidate_authenticated(
         })
 }
 
-/// #732 r3 (cross-model review, P1) — may a REPLAYED forward advance clear a
-/// quarantine marker?
-///
-/// The problem this exists to solve. A `TreeKemNamedPersistJournal` is an
-/// unsealed postcard envelope wrapping plain JSON, and the paired-replay Apply
-/// arm authenticates nothing: it compares the record's OUTER
-/// `state_revision`/`state_hash` and the pair tags. So honouring a clear on the
-/// strength of a marker-less higher OUTER revision made recovery the CHEAPEST
-/// way to lift an owner-anchored marker — a local journal writer could clone
-/// live state, bump that revision, strip the marker, sync the tags, and recovery
-/// would durably remove containment AND its evidence. Every LIVE clear arm
-/// demands far more: a commit that verified through the adoption walk
-/// ([`try_adopt_member_added_across_gap`]), a verified mandate-carrying
-/// `MemberAdded` (the apply-path arm), or the OWNER USER KEY in hand
-/// ([`x0x::groups::GroupInfo::clear_fork_quarantine_on_explicit_owner_seal`]).
-///
-/// What recovery can honestly establish, and therefore requires. The owner user
-/// key and an `OwnerMandate` are NOT on disk — neither is persisted with a
-/// retained commit — so recovery cannot reproduce those two arms verbatim. What
-/// the journal image plus the LOCALLY TRUSTED live record do prove is the
-/// certificate-side owner anchor ADR-0038 defines, and this demands all of it:
-///
-/// 1. the group is owner-axis — the explicit fence arms 1 and 3 carry, and the
-///    only population whose marker a commit may clear at all;
-/// 2. the journalled terminal commit is RETAINED, not synthesized, so there is
-///    a signature to check in the first place;
-/// 3. it passes [`x0x::groups::state_commit::GroupStateCommit::verify_structure`]
-///    — ML-DSA signature, recomputed state hash, `committed_by` bound to the
-///    signing key;
-/// 4. the record's OUTER claim IS that commit's (same group, revision, state
-///    hash) — #732's Rule-3 binding applied here too, so the unsigned scalars
-///    the verdict reads cannot differ from the signed ones;
-/// 5. [`x0x::groups::ForkQuarantine::owner_anchored_clear_permitted`] at that
-///    SIGNED revision — which is where `!no_anchor` and "strictly past the
-///    evidenced revision" come from, unchanged;
-/// 6. ANCHORED ANCESTRY: the commit chains directly from the live terminal head
-///    — the property the apply-path arm gets "by construction" from the gapless
-///    apply;
-/// 7. OWNER PROVENANCE: the committer is the agent the LIVE roster certifies as
-///    the policy owner's own, Active and at least Admin — the same trust the
-///    live arms derive via [`trusted_owner_public_key`], read from local state
-///    rather than from the journal.
-///
-/// Anything less and the caller carries the live marker: a wrongly-kept marker
-/// is operator-clearable, a wrongly-lifted one is silent.
-fn journal_advance_clears_marker(
-    live: &x0x::groups::GroupInfo,
-    marker: &x0x::groups::ForkQuarantine,
-    record: &x0x::groups::GroupInfo,
-) -> bool {
-    // (1) owner-axis only.
-    let Some(owner_id) = live.policy.admission.owner_certified_user_id() else {
-        return false;
-    };
-    // (2) a RETAINED terminal commit — `terminal_commit_header` would happily
-    // synthesize one from the record's own unsigned fields, which would make
-    // this entire check circular.
-    let Some(retained) = record
-        .commit_log
-        .iter()
-        .rev()
-        .find(|rc| rc.commit.revision == record.state_revision)
-    else {
-        return false;
-    };
-    let commit = &retained.commit;
-    // (3) + (4): the signature, and the outer claim bound to it.
-    if commit.verify_structure().is_err()
-        || commit.group_id != live.stable_group_id()
-        || commit.revision != record.state_revision
-        || commit.state_hash != record.state_hash
-    {
-        return false;
-    }
-    // (5) the production clear predicate, at the SIGNED revision.
-    if !marker.owner_anchored_clear_permitted(commit.revision) {
-        return false;
-    }
-    // (6) anchored ancestry: it advances THIS node's head, not another branch's.
-    if commit.prev_state_hash.as_deref() != Some(live.terminal_commit_header().state_hash.as_str())
-    {
-        return false;
-    }
-    // (7) owner provenance from LOCAL state: the committer is the owner's own
-    // certified agent, seated Active+Admin.
-    live.members_v2.iter().any(|(agent_hex, member)| {
-        agent_hex.eq_ignore_ascii_case(&commit.committed_by)
-            && member.state == x0x::groups::GroupMemberState::Active
-            && member.role.at_least(x0x::groups::GroupRole::Admin)
-            && member.certificate.as_ref().is_some_and(|cert| {
-                ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes())
-                    .is_ok_and(|pk| crate::identity::UserId::from_public_key(&pk) == *owner_id)
-            })
-    })
-}
+// #732 r4 (cross-model review, P1 — twice) — WHY RECOVERY NEVER HONOURS A
+// CLEAR, and the predicate that used to live here.
+//
+// r3 added `journal_advance_clears_marker`: a forward journal replay could
+// clear a marker if its terminal commit verified, bound its outer claim,
+// chained from the live head, satisfied
+// [`x0x::groups::ForkQuarantine::owner_anchored_clear_permitted`] at the
+// signed revision, and was signed by an agent the LIVE roster certified
+// under the policy owner. Both reviewers then showed independently that the
+// last of those is NOT owner authorization:
+//
+// - in an OwnerCertified group EVERY seated member's certificate binds the
+//   owner key, so "certified under the owner" degenerates to "any live-seated
+//   Active+Admin" — and quarantine evicts nobody, so the FORKER is still
+//   seated. Holding only its own agent key it can sign a fresh higher-revision
+//   DESCENDANT of the contested live head and satisfy every check. Ancestry
+//   only excludes the other existing branch; it cannot stop this branch being
+//   extended;
+// - and the check read only the certificate's owner public key — neither the
+//   certificate's own signature nor its binding to `committed_by`.
+//
+// [`x0x::groups::GroupInfo::clear_fork_quarantine_on_explicit_owner_seal`]
+// makes the distinction explicit: an ADR-0038 certificate VERDICT is not an
+// owner anchor; that arm requires the OWNER USER KEY in hand. The other two
+// live arms require a verified mandate-carrying commit
+// ([`apply_named_group_metadata_event_inner_serialized`]) or the adoption
+// walk's terminal verification ([`try_adopt_member_added_across_gap`]).
+//
+// Neither the owner user key nor an [`x0x::groups::OwnerMandate`] is persisted
+// with a group record: `RetainedCommit` carries the commit, its roster
+// projection and its public meta, and `GroupInfo` keeps only the OBSERVATIONAL
+// `mandate_capability` map. So there is NO material on disk from which
+// recovery could establish owner authorization of equal strength, and #732
+// deliberately does not add any — persisting owner-signed clear provenance is
+// a schema change that belongs to its own ADR, not to a containment fix.
+//
+// Therefore a forward replay NEVER lifts containment. The cost is a liveness
+// edge, stated in the runbook: a crash between staging an owner-anchored clear
+// and saving it leaves the marker in place, and the operator clears it once by
+// hand. The alternative is a silent containment bypass reachable by the very
+// adversary the marker exists to contain.
 
 /// #468 A5 (r3 Fable 2 + Codex 9): install one evaluated fork-evidence
 /// record on the group's lineage DURABLY, through the standard mutation
@@ -26716,18 +26662,16 @@ async fn merge_group_record_into_store_file(
     //    operator had durably cleared — and let a different journal marker
     //    replace the live one. At ONE frontier there is exactly one
     //    containment truth and it is the local one.
-    // 2. FORWARD journal frontier ⇒ the live marker is carried unless the
-    //    journalled advance AUTHENTICATES the clear, which is
-    //    [`journal_advance_clears_marker`]: a verified, owner-provenanced,
-    //    head-chaining commit whose SIGNED revision satisfies
-    //    `ForkQuarantine::owner_anchored_clear_permitted`. The honest
-    //    reachable case is a crash after staging an owner-anchored advance but
-    //    before the live save — that journal legitimately holds no marker, and
-    //    resurrecting one would reverse a clear the node had already granted.
-    //    The unsigned OUTER revision alone is not enough (#732 r3 P1): a local
-    //    journal writer could bump it, strip the marker and lift containment
-    //    durably, which no live clear arm permits. A journal carrying its OWN
-    //    marker is two assertions of containment, not a clear.
+    // 2. FORWARD journal frontier ⇒ the live marker is ALWAYS carried. NO
+    //    replayed advance clears: nothing on disk carries owner authorization
+    //    of the strength every live clear arm demands (the owner user key and
+    //    an `OwnerMandate` are simply not persisted), and the certificate test
+    //    r3 reached for is satisfiable by the FORKER — still seated, holding
+    //    only its agent key, signing a descendant of the contested head. The
+    //    cost is a liveness edge (a clear interrupted by a crash is re-applied
+    //    by hand, once); the alternative was a silent bypass by the very
+    //    adversary the marker contains. See the note above
+    //    `install_fork_evidence`.
     // 3. OLDER journal frontier AT THIS FILE ⇒ union: the live pair fills only
     //    what the journal record lacks, and NOTHING is cleared. This is not "a
     //    stale replay" — the verdict consumes a journal that is stale against
@@ -26749,23 +26693,37 @@ async fn merge_group_record_into_store_file(
                 info.invite_lineage
                     .as_ref()
                     .and_then(|lineage| lineage.fork_evidence.clone()),
-                // Case 2's predicate reads the live roster, policy and terminal
-                // head, so it needs the whole locally-trusted record.
-                info.clone(),
             )
         });
-    if let Some((live_revision, live_marker, live_evidence, live_record)) = live_half {
+    if let Some((live_revision, live_marker, live_evidence)) = live_half {
         let journal_revision = record.state_revision;
         if journal_revision < live_revision {
             // Case 3 — individual-file divergence: union, never clear.
-            if record.fork_quarantine.is_none() {
+            // #732 r4 nit: the union is over containment STRENGTH, not merely
+            // presence. A journal-side ANCHORED marker must not outrank a live
+            // `no_anchor` one, or the supersession would silently downgrade a
+            // manual-only quarantine into one an owner-anchored advance could
+            // clear — a lift by two steps instead of one.
+            let live_is_stronger = matches!(
+                (record.fork_quarantine.as_ref(), live_marker.as_ref()),
+                (None, Some(_))
+                    | (
+                        Some(_),
+                        Some(x0x::groups::ForkQuarantine {
+                            no_anchor: true,
+                            ..
+                        })
+                    )
+            );
+            if live_is_stronger {
                 if let Some(marker) = live_marker {
                     tracing::warn!(
                         group_id = %LogHexId::group(group_id_hex),
                         store = %label,
                         journal_revision,
                         live_revision,
-                        "#732: this file's live half is NEWER than the journalled record (placeholder supersession) — containment is unioned, never lifted"
+                        no_anchor = marker.no_anchor,
+                        "#732: this file's live half is NEWER than the journalled record (placeholder supersession) — containment is unioned at its STRONGER form, never lifted"
                     );
                     record.fork_quarantine = Some(marker);
                 }
@@ -26776,25 +26734,14 @@ async fn merge_group_record_into_store_file(
                 }
             }
         } else if journal_revision > live_revision {
-            // Case 2 — forward replay.
-            let honours_a_clear = record.fork_quarantine.is_none()
-                && live_marker.as_ref().is_some_and(|marker| {
-                    journal_advance_clears_marker(&live_record, marker, &record)
-                });
-            if honours_a_clear {
-                tracing::warn!(
-                    group_id = %LogHexId::group(group_id_hex),
-                    store = %label,
-                    journal_revision,
-                    live_revision,
-                    "#732: forward journal replay HONOURS the owner-anchored clear its own advance granted — no marker restored"
-                );
-                // The staged image is post-clear, so its evidence slot is
-                // already empty; emptied explicitly so a legacy image can
-                // never leave evidence behind that would silence the next
-                // authenticated conflict through `fork_evidence_first_complete_wins`.
-                record.reset_fork_evidence_after_quarantine_clear();
-            } else if let Some(marker) = live_marker {
+            // Case 2 — forward replay: the live marker is ALWAYS carried.
+            // #732 r4: see the note above `install_fork_evidence` for why no
+            // replayed advance can clear. Nothing on disk carries owner
+            // authorization of the strength every live clear arm demands, and
+            // the weaker certificate test r3 tried is satisfiable by the forker
+            // itself — still seated, holding only its agent key, signing a
+            // descendant of the contested head. Fail closed.
+            if let Some(marker) = live_marker {
                 tracing::warn!(
                     group_id = %LogHexId::group(group_id_hex),
                     store = %label,

@@ -54,20 +54,20 @@ All notable changes to this project will be documented in this file.
     owner-anchored advance no longer has its clear reversed on restart. A
     `no_anchor` marker, an advance not strictly past the evidenced revision,
     and a journal carrying its own marker all keep containment.
-  - **The forward clear is AUTHENTICATED (round 3).** A journal is an unsealed
-    envelope around plain JSON and the replay's Apply arm authenticates
-    nothing, so honouring a clear on a higher OUTER revision made recovery the
-    cheapest way to lift an owner-anchored marker — cheaper than any live clear
-    arm. `named_groups.rs::journal_advance_clears_marker` now requires a
-    retained terminal commit that passes
-    `GroupStateCommit::verify_structure`, an outer claim bound to that signed
-    commit, `owner_anchored_clear_permitted` at the SIGNED revision, ancestry
-    chaining from the live terminal head, and a committer the LIVE roster
-    certifies as the policy owner's own agent (Active + Admin). Anything less
-    carries the live marker. Note the deliberate fail-closed direction: an
-    owner-axis roster that binds no agent to the owner cannot satisfy file-level
-    provenance, so a crash-interrupted clear is not honoured on restart and is
-    re-applied by hand once.
+  - **NO replayed advance clears a quarantine (round 4, final).** Rounds 2 and 3
+    each tried to honour a clear a staged advance had granted — first on the
+    journal's unsigned outer revision, then on a verified commit signed by an
+    agent the live roster certifies under the policy owner. Review broke both:
+    in an OwnerCertified group *every* seated certificate binds the owner key
+    and quarantine evicts nobody, so the FORKER itself (Active, Admin, holding
+    only its agent key) can sign a valid higher-revision **descendant of the
+    contested head** and satisfy the second. Every live clear arm needs the
+    owner user key, a verified mandate, or the adoption walk's terminal
+    verification, and none of that material is persisted with a group record —
+    so recovery now always carries the live marker and #732 adds no clear
+    provenance to the on-disk format (a schema change owed its own ADR). The
+    liveness cost is named in the runbook: a clear interrupted between staging
+    and saving is re-applied by hand, once.
   - **An OLDER journal frontier at one file unions containment (round 3).** The
     merged-view verdict consumes journals stale against the merged store, but an
     individual file can still be newer: `named_groups.rs::merge_home_suite_groups`
@@ -75,6 +75,9 @@ All notable changes to this project will be documented in this file.
     `named_groups.json`. Taking that placeholder's pair verbatim could drop a
     marker, so containment is unioned across the halves and never cleared, while
     the authoritative record still supersedes the placeholder everywhere else.
+    The union is over containment STRENGTH: if either half is `no_anchor`, the
+    survivor is `no_anchor`, so a supersession cannot downgrade a manual-only
+    quarantine.
   - **The claimed conflict is bound to the verified commit (round 2).** A
     record's outer `state_revision`/`state_hash` sit beside its commit log and
     are what the replay verdict compares, so a local writer could copy the

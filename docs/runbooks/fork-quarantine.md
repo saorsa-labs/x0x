@@ -780,37 +780,32 @@ showed is wrong in two directions. The rule now turns on the frontier:
   committed frontier there is exactly one containment truth and it is the local
   one. **Operator consequence:** a clear survives a restart; you do not have to
   clear twice.
-- **Forward journal frontier ⇒ the live marker is carried, UNLESS the
-  journalled advance AUTHENTICATES the clear.** A crash after staging an
-  owner-anchored advance or explicit owner seal but before the live save leaves
-  a higher-revision journal that legitimately holds no marker; restoring one
-  would reverse a clear
-  `groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted` had already
-  granted. But a journal is an UNSEALED envelope around plain JSON and the
-  replay's Apply arm authenticates nothing, so honouring a clear on the
-  strength of a higher OUTER revision made recovery the cheapest way to lift an
-  owner-anchored marker — cheaper than any live clear arm, each of which
-  demands a verified commit or the owner user key in hand. So the clear is now
-  honoured only when `named_groups.rs::journal_advance_clears_marker` accepts
-  the advance: the journalled TERMINAL COMMIT is retained (not synthesized) and
-  passes `groups/state_commit.rs::GroupStateCommit::verify_structure`
-  (ML-DSA signature, recomputed state hash, `committed_by` bound to the signing
-  key); the record's outer `(group, revision, state_hash)` claim IS that
-  commit's; `owner_anchored_clear_permitted` holds at the SIGNED revision; the
-  commit chains directly from the live terminal head; and the committer is the
-  agent the LIVE roster certifies as the policy owner's own, Active and at
-  least Admin. Anything less keeps containment, as do a `no_anchor` marker
-  (never clearable by a commit — only the manual clear, the same-frontier case
-  above), an advance not strictly past the evidenced revision, and a journal
-  carrying its own marker. **A consequence worth knowing before an incident:**
-  an owner-axis roster that binds NO agent to the owner (for example an
-  authority node's own seed entry, admitted before ADR-0038 bound
-  certificates into roster entries) can satisfy no owner provenance at file
-  level, so a staged clear interrupted by a crash will NOT be honoured on
-  restart — the marker comes back and you clear it again, once, by hand. That
-  is the deliberate fail-closed direction. **Operator consequence otherwise:**
-  a genuine owner-anchored clear survives a restart, and nothing forged lifts a
-  marker on disk.
+- **Forward journal frontier ⇒ the live marker is ALWAYS carried. NO replayed
+  advance clears a quarantine.** Every live clear arm requires either the OWNER
+  USER KEY in hand (`groups/mod.rs::GroupInfo::clear_fork_quarantine_on_explicit_owner_seal`,
+  which explicitly rejects an ADR-0038 certificate *verdict* as an owner
+  anchor), a verified mandate-carrying commit
+  (`named_groups.rs::apply_named_group_metadata_event_inner_serialized`), or the
+  adoption walk's terminal verification
+  (`named_groups.rs::try_adopt_member_added_across_gap`). **None of that
+  material is on disk:** neither the owner user key nor an `OwnerMandate` is
+  persisted with a group record (`RetainedCommit` carries the commit, its roster
+  projection and its public meta; `GroupInfo` keeps only the observational
+  `mandate_capability` map). Two earlier attempts to approximate it were both
+  broken by review — trusting the journal's unsigned outer revision, then
+  trusting "signed by an agent the roster certifies under the policy owner".
+  The second fails because in an OwnerCertified group *every* seated
+  certificate binds the owner key and quarantine evicts nobody, so the FORKER
+  itself — Active, Admin, holding only its own agent key — can sign a valid
+  higher-revision **descendant of the contested head** and satisfy it.
+  Ancestry excludes the other existing branch; it cannot stop this branch being
+  extended. #732 therefore does not add clear provenance to the on-disk format
+  (that is a schema change owed its own ADR) and fails closed instead.
+  **Operator consequence, know it before an incident:** if a daemon dies between
+  staging an owner-anchored clear and saving it, the marker is still there after
+  the restart. Nothing is wrong — clear it once by hand
+  (§4.3c / `x0x groups quarantine clear`). The alternative was a silent
+  containment bypass available to the very party the marker exists to contain.
 
 - **OLDER journal frontier AT ONE FILE ⇒ union: containment is never lifted.**
   A journal stale against the MERGED store is consumed before any write, so
@@ -820,7 +815,10 @@ showed is wrong in two directions. The rule now turns on the frontier:
   in `named_groups.json`. Taking that placeholder's pair verbatim could DROP a
   marker the authoritative record carries, so containment is unioned across the
   two halves and nothing is cleared — the one case where the live half is not
-  the authority on the group's state. Everything else about the supersession is
+  the authority on the group's state. The union is over containment STRENGTH,
+  not merely presence: if either half's marker is `no_anchor`, the survivor is
+  `no_anchor`, so a supersession can never quietly downgrade a manual-only
+  quarantine into one an owner-anchored advance could clear. Everything else about the supersession is
   unchanged: the authoritative roster, policy and revision still replace the
   placeholder's.
 
@@ -852,7 +850,10 @@ Source: `src/server/routes/named_groups.rs::merge_group_record_into_store_file`,
 `src/server/routes/named_groups.rs::fork_evidence_path_open`,
 `src/server/routes/named_groups.rs::fork_candidate_authenticated`,
 `src/groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted`,
-`src/server/routes/named_groups.rs::journal_advance_clears_marker`,
+`src/groups/mod.rs::GroupInfo::clear_fork_quarantine_on_explicit_owner_seal`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forward_replay_never_lifts_containment`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_certified_admin_resigned_advance_cannot_lift_containment`,
+`src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_older_journal_at_one_file_unions_containment_through_recovery`,
 `src/server/routes/named_groups.rs::merge_home_suite_groups`,
 `src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_forged_forward_journal_cannot_lift_containment`,
 `src/server/routes/named_groups/tests/fork_quarantine.rs::issue732_mirror_forged_live_hash_installs_no_marker`,
