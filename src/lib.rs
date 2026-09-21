@@ -17139,6 +17139,24 @@ impl KvStoreHandle {
         self.sync.cancel_sync();
     }
 
+    /// [`retire`](Self::retire), then wait until no background merge,
+    /// ownership update or snapshot write for this store is still in flight
+    /// (#757). After it returns the sync loops never touch the store or its
+    /// snapshot path again.
+    ///
+    /// `retire` alone only REQUESTS teardown: a receive section that already
+    /// started still completes, including its snapshot write. Callers that
+    /// go on to replace, remove or re-open the snapshot path need this one.
+    /// It must not be awaited while holding the group membership lock, the
+    /// named-groups map or the store registry (a receive section may be
+    /// waiting on them), which is why the group-lifecycle and registration
+    /// rollback paths — which hold those and never touch the path — keep
+    /// using `retire`.
+    pub async fn retire_and_drain(&self) {
+        self.sync.invalidate_secure_context();
+        self.sync.cancel_sync_and_drain().await;
+    }
+
     /// Tear down this replica's background sync loops (delta listener,
     /// responder, and the bootstrap requester — whose schedule is infinite
     /// while unconverged, issue #238). A discarded handle must call this or

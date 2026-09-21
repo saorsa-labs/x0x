@@ -378,6 +378,20 @@ pub struct KvStoreSync {
     /// live responder until daemon shutdown).
     cancel: tokio_util::sync::CancellationToken,
 
+    /// Receive-path lifecycle fence (#757). The listener and the responder
+    /// hold it across one whole `[cancel check -> merge / ownership update
+    /// -> persist]` section, and
+    /// [`cancel_sync_and_drain`](Self::cancel_sync_and_drain) takes it once
+    /// AFTER cancelling, so when that returns no background merge, ownership
+    /// update or snapshot write is in flight or can start.
+    ///
+    /// Lock order: this is the OUTERMOST lock of the background loops —
+    /// `lifecycle` -> locks taken by the secure-refresh hook / TreeKEM
+    /// protector (group membership, `named_groups`, `kv_stores`) -> `store`
+    /// -> `PersistCtx::gate`. It is never held across a network await (the
+    /// responder's state serve and the requester publish outside it).
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
+
     /// Group secure context for an [`AccessPolicy::Encrypted`] store
     /// (#341 Phase B). `None` for every plaintext policy. When set, ALL
     /// publications (deltas, full-state serves, side-topic control
@@ -468,6 +482,7 @@ impl KvStoreSync {
             persist: std::sync::Mutex::new(None),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: tokio_util::sync::CancellationToken::new(),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             secure: None,
             treekem_secure: None,
             secure_refresh: None,
@@ -1378,6 +1393,7 @@ impl KvStoreSync {
 
         let loop_persist_ctx = persist_ctx.clone();
         let listener_cancel = self.cancel.clone();
+        let listener_lifecycle = Arc::clone(&self.lifecycle);
         let listener_local_peer_id = self.local_peer_id;
         // Store id snapshot for the encrypted receive path (static for the
         // store's life).
@@ -1422,62 +1438,57 @@ impl KvStoreSync {
                     // subscribed topic (see start_with_spawner).
                     continue;
                 }
+                // #757 lifecycle fence: held to the end of this iteration, so
+                // the merge AND its snapshot write are one section a draining
+                // retire waits out. The cancel check is under the lock: once
+                // cancelled, no new section can start. Nothing below is ever
+                // dropped mid-flight — the TreeKEM path advances a receive
+                // ratchet that must reach its persist/rollback.
+                let _lifecycle = listener_lifecycle.lock().await;
+                if listener_cancel.is_cancelled() {
+                    return;
+                }
                 // #341 Phase B: an encrypted store takes the SEALED path —
                 // the payload is an EncryptedKvStoreRecordV1, and a plaintext
                 // delta can never decode, verify, or merge here.
                 if let Some(protector) = listener_treekem.as_ref() {
-                    let Some(merged) = unless_cancelled(
-                        &listener_cancel,
-                        Self::merge_treekem_record(
-                            protector,
-                            &store,
-                            &listener_store_id,
-                            listener_local_peer_id,
-                            &msg.payload,
-                            &listener_pages,
-                        ),
+                    if Self::merge_treekem_record(
+                        protector,
+                        &store,
+                        &listener_store_id,
+                        listener_local_peer_id,
+                        &msg.payload,
+                        &listener_pages,
                     )
                     .await
-                    else {
-                        return;
-                    };
-                    if merged {
+                    {
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
                             let _ = persist_snapshot(&store, ctx).await;
                         }
                     }
                 } else if let Some(ctx) = listener_secure.as_ref() {
                     let merged = if listener_is_encrypted {
-                        unless_cancelled(
-                            &listener_cancel,
-                            Self::merge_encrypted_record(
-                                ctx,
-                                listener_refresh.as_ref(),
-                                &store,
-                                &listener_store_id,
-                                listener_local_peer_id,
-                                &msg.payload,
-                                &listener_pages,
-                            ),
+                        Self::merge_encrypted_record(
+                            ctx,
+                            listener_refresh.as_ref(),
+                            &store,
+                            &listener_store_id,
+                            listener_local_peer_id,
+                            &msg.payload,
+                            &listener_pages,
                         )
                         .await
                     } else {
-                        unless_cancelled(
-                            &listener_cancel,
-                            Self::merge_group_signed_record(
-                                ctx,
-                                listener_refresh.as_ref(),
-                                &store,
-                                &listener_store_id,
-                                listener_local_peer_id,
-                                &msg.payload,
-                                &listener_pages,
-                            ),
+                        Self::merge_group_signed_record(
+                            ctx,
+                            listener_refresh.as_ref(),
+                            &store,
+                            &listener_store_id,
+                            listener_local_peer_id,
+                            &msg.payload,
+                            &listener_pages,
                         )
                         .await
-                    };
-                    let Some(merged) = merged else {
-                        return;
                     };
                     if merged {
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
@@ -1491,10 +1502,6 @@ impl KvStoreSync {
                     Ok((peer_id, delta)) => {
                         let merged = {
                             let mut s = store.write().await;
-                            // #757: retired while this message was in flight.
-                            if listener_cancel.is_cancelled() {
-                                return;
-                            }
                             // Pass sender identity for access control enforcement.
                             // The gossip V2 wire format includes a verified AgentId.
                             let writer = msg.sender.as_ref();
@@ -1640,6 +1647,7 @@ impl KvStoreSync {
         let local_agent_id = self.local_agent_id;
         let responder_served = Arc::clone(&served_evidence);
         let responder_cancel = self.cancel.clone();
+        let responder_lifecycle = Arc::clone(&self.lifecycle);
         // Encrypted-path handles (#341 Phase B): Some together whenever the
         // store is encrypted (enforced by the startup guard above).
         let responder_secure = self.secure.clone();
@@ -2135,12 +2143,15 @@ impl KvStoreSync {
                         if local_agent_id.is_some_and(|me| me == sender) {
                             continue; // our own announce echoed back
                         }
+                        // #757 lifecycle fence — see the listener. Scoped to
+                        // this arm only: the state-serve arms publish on the
+                        // network and never mutate the store.
+                        let _lifecycle = responder_lifecycle.lock().await;
+                        if responder_cancel.is_cancelled() {
+                            return;
+                        }
                         let learned = {
                             let mut s = responder_store.write().await;
-                            // #757: retired while this message was in flight.
-                            if responder_cancel.is_cancelled() {
-                                return;
-                            }
                             // learn_ownership can only refresh policy (when the
                             // owner matches and policy_version is forward) or
                             // record a conflict; it never establishes ownership.
@@ -2222,6 +2233,7 @@ impl KvStoreSync {
                 let _guard = BootstrapGuard(requester_bootstrap_active);
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
                     tokio::select! {
+                        biased;
                         // cancel_sync tears down every loop promptly, even
                         // mid-sleep (round-4 review).
                         () = requester_cancel.cancelled() => return,
@@ -2340,6 +2352,25 @@ impl KvStoreSync {
     /// senders on its next delivery.
     pub fn cancel_sync(&self) {
         self.cancel.cancel();
+    }
+
+    /// [`cancel_sync`](Self::cancel_sync), then wait out any receive-path
+    /// section already running (#757).
+    ///
+    /// When this returns, no background merge, ownership update or snapshot
+    /// write for this store is in flight, and none can start. Use it before
+    /// replacing or removing the snapshot path, or before opening another
+    /// sync over it. `cancel_sync` alone is only a request: a section that
+    /// already passed its cancel check still completes, including its write.
+    ///
+    /// Must NOT be awaited while holding any lock a receive section takes —
+    /// the group membership lock, `named_groups`, `kv_stores`, or this
+    /// store's own lock — nor from inside the secure-refresh hook (which
+    /// runs within a section); either deadlocks. Those callers use
+    /// `cancel_sync`.
+    pub async fn cancel_sync_and_drain(&self) {
+        self.cancel.cancel();
+        drop(self.lifecycle.lock().await);
     }
 
     /// Stop background synchronization.
@@ -2584,23 +2615,6 @@ fn encode_snapshot(store: &KvStore) -> Result<Vec<u8>> {
     out.extend_from_slice(SNAPSHOT_MAGIC);
     out.extend_from_slice(&bincode::serialize(&body)?);
     Ok(out)
-}
-
-/// Drive a receive-path merge unless the sync is retired first (#757).
-///
-/// Cancel-first on every poll: a merge suspended before it takes the store
-/// write guard is dropped, never applied, once `cancel_sync` has run. Every
-/// wrapped merge mutates synchronously under that guard, so a drop can never
-/// leave a half-applied merge. `None` means retired — the loop must exit.
-async fn unless_cancelled(
-    cancel: &tokio_util::sync::CancellationToken,
-    merge: impl std::future::Future<Output = bool>,
-) -> Option<bool> {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => None,
-        merged = merge => Some(merged),
-    }
 }
 
 /// Snapshot the store to the persistence context's path.
@@ -3977,7 +3991,16 @@ mod tests {
     /// queued delta and (if `retire`) the cancellation are ready in the same
     /// poll — the exact ordering an unbiased `select!` resolved at random.
     /// Returns `(key merged, snapshot bytes changed)`.
-    async fn queued_delta_outcome(topic: &str, retire: bool) -> (bool, bool) {
+    /// A persistent owner-signed sync with a baseline snapshot on disk.
+    struct RetireFixture {
+        sync: KvStoreSync,
+        pubsub: Arc<PubSubManager>,
+        _dir: tempfile::TempDir,
+        snapshot: PathBuf,
+        before: Vec<u8>,
+    }
+
+    async fn retire_fixture(topic: &str) -> RetireFixture {
         let node = make_node().await;
         let kp = crate::identity::AgentKeypair::generate().expect("keypair");
         let owner = kp.agent_id();
@@ -3998,6 +4021,71 @@ mod tests {
         sync.set_persist_path(snapshot.clone());
         sync.persist().await.expect("baseline snapshot");
         let before = std::fs::read(&snapshot).expect("baseline bytes");
+        RetireFixture {
+            sync,
+            pubsub,
+            _dir: dir,
+            snapshot,
+            before,
+        }
+    }
+
+    /// Publish one admissible delta and wait (barrier, not oracle) until it
+    /// sits in the listener's channel.
+    async fn publish_late_delta(fx: &RetireFixture) {
+        let entry = KvEntry::new(
+            "late-key".to_string(),
+            b"late".to_vec(),
+            "text/plain".to_string(),
+        );
+        let mut delta = KvStoreDelta::new(1);
+        delta
+            .added
+            .insert("late-key".to_string(), (entry, (peer(2), 1)));
+        let delivered_before = fx.pubsub.stats().delivered_to_subscriber;
+        fx.sync
+            .publish_delta(peer(2), delta)
+            .await
+            .expect("publish");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while fx.pubsub.stats().delivered_to_subscriber == delivered_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delta must reach the listener's channel");
+    }
+
+    /// Start the loops on the runtime, keeping their join handles so a test
+    /// can prove they have fully exited.
+    async fn start_joinable(sync: &KvStoreSync) -> Vec<tokio::task::JoinHandle<()>> {
+        let handles = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&handles);
+        sync.start_with_spawner(move |fut| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(tokio::spawn(fut));
+        })
+        .await
+        .expect("start_with_spawner");
+        let mut guard = handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *guard)
+    }
+
+    async fn join_loops(loops: Vec<tokio::task::JoinHandle<()>>) {
+        for handle in loops {
+            tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .expect("a cancelled loop must exit")
+                .expect("loop must not panic");
+        }
+    }
+
+    async fn queued_delta_outcome(topic: &str, retire: bool) -> (bool, bool) {
+        let fx = retire_fixture(topic).await;
+        let (sync, snapshot, before) = (&fx.sync, &fx.snapshot, &fx.before);
 
         let held: HeldLoops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gate = Arc::clone(&held);
@@ -4009,26 +4097,7 @@ mod tests {
         .await
         .expect("start_with_spawner");
 
-        let entry = KvEntry::new(
-            "late-key".to_string(),
-            b"late".to_vec(),
-            "text/plain".to_string(),
-        );
-        let mut delta = KvStoreDelta::new(1);
-        delta
-            .added
-            .insert("late-key".to_string(), (entry, (peer(2), 1)));
-        let delivered_before = pubsub.stats().delivered_to_subscriber;
-        sync.publish_delta(peer(2), delta).await.expect("publish");
-        // Barrier, not oracle: the delta must be sitting in the listener's
-        // channel before the loops run, or the scenario proves nothing.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while pubsub.stats().delivered_to_subscriber == delivered_before {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("delta must reach the held listener's channel");
+        publish_late_delta(&fx).await;
 
         if retire {
             sync.cancel_sync();
@@ -4051,7 +4120,7 @@ mod tests {
             }
             tokio::time::timeout(Duration::from_secs(10), async {
                 while sync.read().await.get("late-key").is_none()
-                    || std::fs::read(&snapshot).expect("snapshot bytes") == before
+                    || std::fs::read(snapshot).expect("snapshot bytes") == *before
                 {
                     tokio::task::yield_now().await;
                 }
@@ -4060,7 +4129,7 @@ mod tests {
             .expect("control: a live listener merges and persists the queued delta");
         }
         let merged = sync.read().await.get("late-key").is_some();
-        let persisted = std::fs::read(&snapshot).expect("snapshot bytes") != before;
+        let persisted = std::fs::read(snapshot).expect("snapshot bytes") != *before;
         sync.cancel_sync();
         (merged, persisted)
     }
@@ -4089,6 +4158,97 @@ mod tests {
                 "round {round}: retired sync merged/persisted a queued delta"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delta_pulled_before_cancel_is_dropped_under_the_lifecycle_lock() {
+        // WHY (#757 r2): cancel-first selects only cover a delta still in the
+        // channel. A listener that already PULLED the delta when the cancel
+        // lands must not merge it either, and a bare flag check cannot fence
+        // that across threads — the check has to sit under the lifecycle
+        // lock the draining retire takes. Holding that lock here parks the
+        // listener after its recv and before its check, then cancels.
+        let fx = retire_fixture("store/757-pulled").await;
+        let loops = start_joinable(&fx.sync).await;
+        let parked = fx.sync.lifecycle.clone().lock_owned().await;
+        publish_late_delta(&fx).await;
+        // The send woke the listener; on this current-thread runtime a few
+        // yields run it up to the lifecycle lock we hold.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        fx.sync.cancel_sync();
+        drop(parked);
+        join_loops(loops).await;
+        assert!(
+            fx.sync.read().await.get("late-key").is_none(),
+            "a delta pulled before the cancel was merged after it"
+        );
+        assert_eq!(
+            std::fs::read(&fx.snapshot).expect("snapshot bytes"),
+            fx.before,
+            "a retired listener wrote the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_retire_waits_for_an_in_flight_persist() {
+        // WHY (#757 r2): a merge admitted before the cancel still owes its
+        // snapshot write, and that write can start arbitrarily late (here:
+        // parked on the persist gate). "Retired" must therefore mean the
+        // write has FINISHED, or a caller that replaces the snapshot path
+        // next gets a rename onto its directory and a store latched
+        // durability-degraded — the CI failure this issue is about.
+        let fx = retire_fixture("store/757-inflight").await;
+        let loops = start_joinable(&fx.sync).await;
+        let ctx = fx.sync.persist_ctx().expect("persist armed");
+        let gate = ctx.gate.lock().await;
+        publish_late_delta(&fx).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while fx.sync.read().await.get("late-key").is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must merge the delta");
+        // Merged in memory, snapshot write parked on the gate: in flight.
+        let mut drain = Box::pin(fx.sync.cancel_sync_and_drain());
+        for _ in 0..64 {
+            assert!(
+                futures::poll!(drain.as_mut()).is_pending(),
+                "drain completed while a snapshot write was still in flight"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            std::fs::read(&fx.snapshot).expect("snapshot bytes"),
+            fx.before
+        );
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain must complete once the write finishes");
+        // No yield since the drain returned: the write is already on disk.
+        assert_ne!(
+            std::fs::read(&fx.snapshot).expect("snapshot bytes"),
+            fx.before,
+            "drain returned before the in-flight snapshot write landed"
+        );
+        // The caller now owns the path. Block it the way the stores
+        // legacy-import test does; nothing may touch it again.
+        std::fs::remove_file(&fx.snapshot).expect("remove snapshot");
+        std::fs::create_dir(&fx.snapshot).expect("block snapshot path");
+        join_loops(loops).await;
+        assert!(
+            !fx.sync.durability_degraded(),
+            "a retired loop wrote to the snapshot path after the drain"
+        );
+        assert_eq!(
+            std::fs::read_dir(&fx.snapshot)
+                .expect("still a directory")
+                .count(),
+            0
+        );
     }
 
     // ------------------------------------------------------------------

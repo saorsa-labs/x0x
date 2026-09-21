@@ -459,13 +459,21 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **A retired KV store sync no longer merges or persists a delta that was
-  already queued (#757).** The `KvStoreSync` listener and responder selected
-  between cancellation and the next message without `biased`, so after
+- **Retiring a KV store sync is now a real fence, and it can be drained
+  (#757).** The `KvStoreSync` listener and responder selected between
+  cancellation and the next message without `biased`, so after
   `retire()`/`cancel_sync()` a queued delta was still merged — and its snapshot
-  written — about half the time. Both selects are now cancel-first, and every
-  receive-path merge re-checks the cancellation before it mutates the store.
-  This was the mechanism behind the intermittent Coverage Gate failure of
+  written — about half the time; a merge admitted just before the cancel could
+  also start its snapshot write arbitrarily late. The loops now hold a per-sync
+  lifecycle lock across one whole `cancel check -> merge / ownership update ->
+  persist` section (never across a network await), their selects are
+  cancel-first, and new `KvStoreSync::cancel_sync_and_drain` /
+  `KvStoreHandle::retire_and_drain` cancel and then take that lock once: when
+  they return, no background merge, ownership update or snapshot write is in
+  flight or can start. No receive future is dropped mid-flight. `retire()` and
+  `cancel_sync()` keep their non-blocking "request teardown" meaning for callers
+  that hold the group membership lock or the store registry. This was the
+  mechanism behind the intermittent Coverage Gate failure of
   `legacy_import_unloaded_preview_ambiguity_and_receipt_retry_preserve_state`
   (`Is a directory (os error 21)`).
 

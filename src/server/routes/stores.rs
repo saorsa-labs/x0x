@@ -4438,7 +4438,10 @@ mod tests {
             )
             .await
             .expect("destination conflict");
-        handle.retire();
+        // Drained, not just cancelled (#757): this test replaces the
+        // snapshot path with a directory below, so no listener section —
+        // e.g. the self-echo of the put above — may still be writing it.
+        handle.retire_and_drain().await;
         state.kv_stores.write().await.remove(&topic);
 
         seed_public_migration_group(&state, &colliding_id).await;
