@@ -3472,6 +3472,48 @@ async fn issue732_forward_replay_never_lifts_containment() -> Result<()> {
         !kept.owner_anchored_clear_permitted(at_three.state_revision),
         "and the surviving threshold is the higher one — this advance cannot clear it"
     );
+
+    // Control 4 (#732 r6, omp's r5 nit) — MARKER AND EVIDENCE ARE ONE DECISION.
+    // Every clear arm removes them together
+    // (`GroupInfo::reset_fork_evidence_after_quarantine_clear`), so the evidence
+    // must follow the marker that WINS. r5 applied the evidence outside the
+    // strength gate, which let the LOSING half's evidence replace the winner's —
+    // producing a record that paired one observation's marker with another's
+    // evidence. Here the journalled marker wins on revision, so the journalled
+    // evidence must survive with it.
+    let mut live_with_evidence = live.clone();
+    live_with_evidence.invite_lineage = Some(lineage_for(&at_two));
+    if let Some(lineage) = live_with_evidence.invite_lineage.as_mut() {
+        let mut losing = evidence_at_frontier(&at_two);
+        losing.committed_by = "11".repeat(32);
+        losing.observed_at_ms = 111;
+        lineage.fork_evidence = Some(losing);
+    }
+    let mut staged_winning = at_three.clone();
+    staged_winning.fork_quarantine = Some(marker_at_frontier(&at_three));
+    staged_winning.invite_lineage = Some(lineage_for(&at_three));
+    if let Some(lineage) = staged_winning.invite_lineage.as_mut() {
+        let mut winning = evidence_at_frontier(&at_three);
+        winning.committed_by = "22".repeat(32);
+        winning.observed_at_ms = 222;
+        lineage.fork_evidence = Some(winning);
+    }
+    let after = replay_scenario(&group_id, &live_with_evidence, &staged_winning, &group_id).await?;
+    assert_eq!(
+        after.fork_quarantine.as_ref().map(|marker| marker.revision),
+        Some(at_three.state_revision),
+        "the journalled marker wins on revision"
+    );
+    assert_eq!(
+        after
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .map(|evidence| evidence.observed_at_ms),
+        Some(222),
+        "#732 r6: the WINNING marker's own evidence survives with it — the losing half's \
+         evidence may only fill an empty slot, never replace it"
+    );
     Ok(())
 }
 
@@ -3801,14 +3843,13 @@ async fn issue732_older_journal_at_one_file_unions_containment() -> Result<()> {
 /// the individual `named_groups.json` file — the divergence #732's case 3 exists
 /// for.
 ///
-/// Returns `(named record, merged authoritative record)`. #732 r5 (review point
-/// 2): both are handed back on purpose, because for a group present in the
-/// sidecar they are DIFFERENT records — the sidecar wins the merge, and with no
-/// `.hsjournal` staged the recovery rewrites only the named half. So case 3's
-/// union protects the LEGACY view (what an old binary reads, and what survives
-/// if the sidecar is lost) while the authoritative view keeps the sidecar's own
-/// containment, which recovery never touches. A fixture that asserted only one
-/// of the two would be claiming more, or less, than the code does.
+/// Returns `(named record, merged authoritative record)`. Both are handed back on
+/// purpose: for a group present in the sidecar the two records differ in every
+/// other field (the sidecar wins, and with no `.hsjournal` staged the recovery
+/// rewrites only the named half), so a fixture that inspected one would be silent
+/// about the other. #732 r6: they must NOT differ in containment — the merge
+/// unions it, because `server::serve_with_options` loads the merged view and a
+/// marker held only in the legacy half is invisible to every ADR-0066 gate.
 async fn replay_scenario_with_sidecar(
     group_id: &str,
     named_live: &x0x::groups::GroupInfo,
@@ -4024,10 +4065,11 @@ async fn issue732_older_journal_at_one_file_unions_containment_through_recovery(
          record's marker"
     );
     assert!(
-        merged.fork_quarantine.is_none(),
-        "#732 r5: and the authoritative view is the SIDECAR record, which recovery never \
-         rewrote (no `.hsjournal` staged) — stated so the fixture claims exactly what the \
-         code does: case 3 protects the legacy view, the sidecar keeps its own containment"
+        merged.fork_quarantine.is_some(),
+        "#732 r6: the AUTHORITATIVE view must carry it too. r5 asserted the opposite and \
+         called it benign; review was right that it is not — `serve_with_options` loads this \
+         view, so a marker preserved only in the legacy half is invisible to every \
+         ADR-0066 gate. The merge now unions containment."
     );
     assert_eq!(
         after.state_revision, authoritative.state_revision,
@@ -4059,7 +4101,14 @@ async fn issue732_older_journal_at_one_file_unions_containment_through_recovery(
     .await?;
     assert_eq!(
         merged.state_revision, authoritative.state_revision,
-        "#732 r5: the authoritative view is still the sidecar's record"
+        "the authoritative view is still the sidecar's record for every other field"
+    );
+    assert!(
+        merged
+            .fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.no_anchor),
+        "#732 r6: the authoritative view carries the STRONGER marker, `no_anchor` included"
     );
     assert!(
         after
@@ -4151,7 +4200,15 @@ async fn issue732_anchored_union_keeps_the_higher_clear_threshold() -> Result<()
     assert_eq!(kept.committed_by, "71".repeat(32));
     assert_eq!(
         merged.state_revision, authoritative.state_revision,
-        "#732 r5: the authoritative view is still the sidecar's record, untouched by recovery"
+        "the authoritative view is still the sidecar's record for every other field"
+    );
+    assert_eq!(
+        merged
+            .fork_quarantine
+            .as_ref()
+            .map(|marker| marker.revision),
+        Some(7),
+        "#732 r6: and the union reaches the AUTHORITATIVE view at its stronger form too"
     );
     // Negative control in the same test: with the halves swapped the journalled
     // marker is the stronger one and IT survives, so this is a real order and
@@ -4171,6 +4228,87 @@ async fn issue732_anchored_union_keeps_the_higher_clear_threshold() -> Result<()
             .map(|marker| marker.revision),
         Some(7),
         "the order is over STRENGTH, not over which half the marker came from"
+    );
+    Ok(())
+}
+
+/// WHY (#732 r6 — cross-model review, Codex P1; omp judged it pre-existing and
+/// benign, and I sided with Codex after establishing reachability).
+///
+/// `merge_home_suite_groups` replaces a named placeholder with the sidecar record
+/// wholesale (#451 sidecar-wins), and `server::serve_with_options` loads that
+/// merged view — so it is the only containment the running daemon's ADR-0066
+/// gates can see. Two recovery paths write containment to the NAMED half alone:
+///
+/// - `record_recovery_fork_evidence` walks `[named, sidecar]` and returns after
+///   its first successful write, and a Home-Suite group's named entry is a
+///   `legacy_safe_placeholder`, which preserves the record's identity and its
+///   `invite_lineage` — so the install lands there and returns;
+/// - the replay's Apply arm writes the sidecar half only when a decodable
+///   `.hsjournal` is present, while the named write is unconditional.
+///
+/// So a marker recovery had deliberately preserved could be discarded before the
+/// daemon ever loaded it. This fixture drives the second path through
+/// `recover_treekem_named_journals` and asserts the MERGED view, not just the
+/// file: containment must survive into the authoritative record while the sidecar
+/// still wins every other field.
+///
+/// Negative control: with the union at the merge removed, the merged view loses
+/// the marker and this test fails while the named-store assertions still pass —
+/// which is exactly the r5 state review rejected.
+#[tokio::test]
+async fn issue732_merged_authoritative_view_keeps_recovered_containment() -> Result<()> {
+    let group_id = "eb".repeat(32);
+    let (_state, _dir, authoritative, _at_three) = owner_axis_advance_fixture(&group_id).await?;
+
+    // The sidecar half is the authoritative record and carries NO containment —
+    // recovery never rewrote it, because no `.hsjournal` was staged.
+    let sidecar = authoritative.clone();
+    assert!(sidecar.fork_quarantine.is_none());
+
+    // The named half is the legacy placeholder. The journalled record is the
+    // authoritative record WITH the marker recovery preserved, so the named
+    // write is where containment lands.
+    let mut placeholder = legacy_safe_placeholder(&authoritative);
+    placeholder.state_revision = authoritative.state_revision + 5;
+    placeholder.fork_quarantine = None;
+    let mut staged = authoritative.clone();
+    let marker = marker_at_frontier(&authoritative);
+    staged.fork_quarantine = Some(marker.clone());
+
+    let (named_after, merged_after) =
+        replay_scenario_with_sidecar(&group_id, &placeholder, &sidecar, &staged).await?;
+    assert!(
+        named_after.fork_quarantine.is_some(),
+        "the legacy half holds the marker — that much already worked"
+    );
+    let authoritative_marker = merged_after.fork_quarantine.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "#732 r6: the AUTHORITATIVE merged view must carry the recovered marker — this is \
+             the view `serve_with_options` loads and every ADR-0066 gate consults"
+        )
+    })?;
+    assert_eq!(
+        authoritative_marker, marker,
+        "the whole marker crosses the merge, not a field mix"
+    );
+    // Negative control: the sidecar still wins everything else, so this is not
+    // "the merge stopped preferring the sidecar".
+    assert_eq!(
+        merged_after.state_revision, authoritative.state_revision,
+        "sidecar-wins is intact for every other field"
+    );
+    assert!(
+        !merged_after.members_v2.is_empty(),
+        "and the authoritative roster is the sidecar's, not the placeholder's empty one"
+    );
+    assert!(
+        merged_after
+            .policy
+            .admission
+            .owner_certified_user_id()
+            .is_some(),
+        "including the policy the placeholder deliberately strips"
     );
     Ok(())
 }

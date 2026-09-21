@@ -67,8 +67,9 @@ All notable changes to this project will be documented in this file.
     contested head** and satisfy the second. Every live clear arm needs the
     owner user key, a verified mandate, or the adoption walk's terminal
     verification, and none of that material is persisted with a group record —
-    so recovery now always carries the live marker and #732 adds no clear
-    provenance to the on-disk format (a schema change owed its own ADR). The
+    so recovery now carries the STRONGER of the live and journalled markers and
+    never clears, and #732 adds no clear provenance to the on-disk format (a
+    schema change owed its own ADR). The
     liveness cost is named in the runbook: a clear interrupted between staging
     and saving is re-applied by hand, once.
   - **An OLDER journal frontier at one file unions containment (round 3).** The
@@ -92,6 +93,17 @@ All notable changes to this project will be documented in this file.
     revision. Both checks are load-bearing (round 3): the mirror forgery edits
     the LIVE record's outer hash and leaves its signed log intact, so the first
     check passes on a consistent journal and only the second refuses.
+  - **The authoritative merged view can no longer lose containment (round 6).**
+    `named_groups.rs::merge_home_suite_groups` replaced a named placeholder with
+    the sidecar record wholesale (#451 sidecar-wins), and two recovery paths
+    write containment to the NAMED half alone —
+    `named_groups.rs::record_recovery_fork_evidence` returns after its first
+    successful store write, and the replay's sidecar write needs a decodable
+    `.hsjournal`. A marker recovery preserved was therefore discarded before
+    `server/mod.rs::serve_with_options` loaded the view every ADR-0066 gate
+    consults. The sidecar still wins every other field; containment is now
+    unioned under the same total order, whole marker plus its own evidence, so
+    the authoritative view is never weaker than either half.
   - No schema or wire change (the marker's fields already carry
     `#[serde(default)]`). Closes runbook known gap (h).
 

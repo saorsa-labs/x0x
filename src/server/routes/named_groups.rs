@@ -3490,8 +3490,8 @@ fn fork_candidate_authenticated(
 // #732 r4 (cross-model review, P1 — twice) — WHY RECOVERY NEVER HONOURS A
 // CLEAR, and the predicate that used to live here.
 //
-// r3 added `journal_advance_clears_marker`: a forward journal replay could
-// clear a marker if its terminal commit verified, bound its outer claim,
+// An earlier round let a forward journal replay clear a marker if its terminal
+// commit verified, bound its outer claim,
 // chained from the live head, satisfied
 // [`x0x::groups::ForkQuarantine::owner_anchored_clear_permitted`] at the
 // signed revision, and was signed by an agent the LIVE roster certified
@@ -26664,7 +26664,7 @@ async fn merge_group_record_into_store_file(
     //    containment truth and it is the local one.
     // 2. FORWARD journal frontier ⇒ containment is never lifted AND never
     //    weakened: the STRONGER of the two markers survives
-    //    (`live_marker_is_stronger`), and since a live marker always beats none
+    //    (`challenger_containment_is_stronger`), and since a live marker always beats none
     //    this arm cannot lift. NO replayed advance clears: nothing on disk carries owner authorization
     //    of the strength every live clear arm demands (the owner user key and
     //    an `OwnerMandate` are simply not persisted), and the certificate test
@@ -26702,27 +26702,23 @@ async fn merge_group_record_into_store_file(
         if journal_revision < live_revision {
             // Case 3 — individual-file divergence: union, never clear.
             // #732 r4/r5: the union is over containment STRENGTH, not merely
-            // presence — see `live_marker_is_stronger` for the total order and
+            // presence — see `challenger_containment_is_stronger` for the total order and
             // why a lower `revision` is a real weakening (it lowers the
             // `owner_anchored_clear_permitted` threshold).
-            if live_marker_is_stronger(record.fork_quarantine.as_ref(), live_marker.as_ref()) {
-                if let Some(marker) = live_marker {
-                    tracing::warn!(
-                        group_id = %LogHexId::group(group_id_hex),
-                        store = %label,
-                        journal_revision,
-                        live_revision,
-                        no_anchor = marker.no_anchor,
-                        "#732: this file's live half is NEWER than the journalled record (placeholder supersession) — containment is unioned at its STRONGER form, never lifted"
-                    );
-                    record.fork_quarantine = Some(marker);
-                }
+            if challenger_containment_is_stronger(
+                record.fork_quarantine.as_ref(),
+                live_marker.as_ref(),
+            ) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    store = %label,
+                    journal_revision,
+                    live_revision,
+                    no_anchor = ?live_marker.as_ref().map(|marker| marker.no_anchor),
+                    "#732: this file's live half is NEWER than the journalled record (placeholder supersession) — containment is unioned at its STRONGER form, never lifted"
+                );
             }
-            if let Some(lineage) = record.invite_lineage.as_mut() {
-                if lineage.fork_evidence.is_none() {
-                    lineage.fork_evidence = live_evidence;
-                }
-            }
+            union_containment_into(&mut record, live_marker, live_evidence);
         } else if journal_revision > live_revision {
             // Case 2 — forward replay: the live marker is ALWAYS carried.
             // #732 r4: see the note above `install_fork_evidence` for why no
@@ -26731,29 +26727,25 @@ async fn merge_group_record_into_store_file(
             // the weaker certificate test r3 tried is satisfiable by the forker
             // itself — still seated, holding only its agent key, signing a
             // descendant of the contested head. Fail closed.
-            // #732 r5: "never lifted" is also "never WEAKENED" — the same
-            // total order decides, so a journalled marker is kept only when it
-            // is at least as strong (and a live marker always beats none, which
-            // is what makes this arm fail closed).
-            if live_marker_is_stronger(record.fork_quarantine.as_ref(), live_marker.as_ref()) {
-                if let Some(marker) = live_marker {
-                    tracing::warn!(
-                        group_id = %LogHexId::group(group_id_hex),
-                        store = %label,
-                        marker_revision = marker.revision,
-                        no_anchor = marker.no_anchor,
-                        journal_revision,
-                        live_revision,
-                        "#732: forward journal replay preserved the live fork-quarantine marker — the journalled advance does not clear it"
-                    );
-                    record.fork_quarantine = Some(marker);
-                }
+            // #732 r5/r6: "never lifted" is also "never WEAKENED" — one total
+            // order decides, and marker + evidence move together
+            // (`union_containment_into`). A live marker always beats none, which
+            // is what makes this arm fail closed.
+            if challenger_containment_is_stronger(
+                record.fork_quarantine.as_ref(),
+                live_marker.as_ref(),
+            ) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    store = %label,
+                    marker_revision = ?live_marker.as_ref().map(|marker| marker.revision),
+                    no_anchor = ?live_marker.as_ref().map(|marker| marker.no_anchor),
+                    journal_revision,
+                    live_revision,
+                    "#732: forward journal replay preserved the live fork-quarantine marker — the journalled advance does not clear it"
+                );
             }
-            if let Some(lineage) = record.invite_lineage.as_mut() {
-                // The evidence record only ever FILLS an empty slot here: the
-                // journal half is authoritative for everything else it carries.
-                lineage.fork_evidence = live_evidence.or(lineage.fork_evidence.take());
-            }
+            union_containment_into(&mut record, live_marker, live_evidence);
         } else {
             // Case 1 — EQUAL frontier: the live pair verbatim.
             if record.fork_quarantine != live_marker {
@@ -26801,25 +26793,68 @@ async fn merge_group_record_into_store_file(
 /// 3. then keep LIVE, because at equal strength the local decision is the node's
 ///    own and the journal is a stale snapshot of metadata.
 ///
-/// Returns whether the LIVE marker should be taken. The caller installs the WHOLE
-/// marker it chooses and never mixes fields across the two: `revision`,
-/// `state_hash`, `committed_by`, `observed_at_ms` and `snapshot` describe ONE
-/// fork observation, and ADR-0067 builds `ForkQuarantineIdentity` out of exactly
-/// those, so a franken-marker would carry an identity that never existed.
-fn live_marker_is_stronger(
-    journal: Option<&x0x::groups::ForkQuarantine>,
-    live: Option<&x0x::groups::ForkQuarantine>,
+/// Returns whether `challenger` should REPLACE `incumbent`. The caller installs
+/// the WHOLE marker it chooses and never mixes fields across the two:
+/// `revision`, `state_hash`, `committed_by`, `observed_at_ms` and `snapshot`
+/// describe ONE fork observation, and ADR-0067 builds `ForkQuarantineIdentity`
+/// out of exactly those, so a franken-marker would carry an identity that never
+/// existed. Use [`union_containment_into`] rather than calling this directly, so
+/// the evidence record stays coherent with the marker that won.
+fn challenger_containment_is_stronger(
+    incumbent: Option<&x0x::groups::ForkQuarantine>,
+    challenger: Option<&x0x::groups::ForkQuarantine>,
 ) -> bool {
-    match (journal, live) {
-        // Nothing live to take, or nothing journalled to beat.
+    match (incumbent, challenger) {
+        // Nothing to take, or nothing to beat.
         (_, None) => false,
         (None, Some(_)) => true,
-        (Some(journalled), Some(live)) => match (live.no_anchor, journalled.no_anchor) {
+        (Some(incumbent), Some(challenger)) => match (challenger.no_anchor, incumbent.no_anchor) {
             (true, false) => true,
             (false, true) => false,
-            // Same anchor class: the higher clear threshold wins, ties to live.
-            _ => live.revision >= journalled.revision,
+            // Same anchor class: the higher clear threshold wins. Ties go to the
+            // CHALLENGER, which is the caller's locally-decided half at every
+            // site (equal strength ⇒ equal containment, so either is safe).
+            _ => challenger.revision >= incumbent.revision,
         },
+    }
+}
+
+/// #732 r6 — apply the STRONGER containment of two halves to `target`,
+/// COHERENTLY.
+///
+/// omp's r5 nit: the marker and the lineage `fork_evidence` record are one
+/// containment decision (every clear arm removes them together, see
+/// `GroupInfo::reset_fork_evidence_after_quarantine_clear`), so the evidence must
+/// follow the marker that WINS. r5 applied the evidence outside the strength
+/// gate, which let the losing half's evidence replace the winner's — a record
+/// pairing one observation's marker with another's evidence. Here the winner's
+/// own evidence comes with it, and the loser's may only FILL an empty slot.
+///
+/// Used by every union site: the forward-replay arm, the older-frontier arm, and
+/// the sidecar/named merge. The EQUAL-frontier arm deliberately does not use it
+/// — there, one frontier means one containment truth and it is the live one,
+/// absence included.
+fn union_containment_into(
+    target: &mut x0x::groups::GroupInfo,
+    challenger_marker: Option<x0x::groups::ForkQuarantine>,
+    challenger_evidence: Option<x0x::groups::ForkEvidence>,
+) {
+    if challenger_containment_is_stronger(
+        target.fork_quarantine.as_ref(),
+        challenger_marker.as_ref(),
+    ) {
+        target.fork_quarantine = challenger_marker;
+        if let Some(lineage) = target.invite_lineage.as_mut() {
+            // The winning marker's evidence; the target's own survives only
+            // where the winner has none.
+            lineage.fork_evidence = challenger_evidence.or(lineage.fork_evidence.take());
+        }
+    } else if let Some(lineage) = target.invite_lineage.as_mut() {
+        // The target's marker won: the challenger's evidence may only fill an
+        // empty slot, never replace the winner's.
+        if lineage.fork_evidence.is_none() {
+            lineage.fork_evidence = challenger_evidence;
+        }
     }
 }
 
@@ -27385,13 +27420,69 @@ pub(in crate::server) fn merge_home_suite_groups(
         if info.policy.admission.owner_certified_user_id().is_some() {
             info.owner_cert_reverify_required = true;
         }
-        if let Some(placeholder) = merged.get(&id) {
+        // #732 r6 (cross-model review, P1) — SIDECAR-WINS IS WRONG FOR
+        // CONTAINMENT, and the discrepancy is reachable, not theoretical.
+        //
+        // #451 makes the sidecar record authoritative and replaces the named
+        // placeholder wholesale, and `server::serve_with_options` loads THIS
+        // merged view. But two recovery paths write containment to the NAMED
+        // half alone:
+        //
+        // - `record_recovery_fork_evidence` walks `[named, sidecar]` and
+        //   RETURNS after the first successful write. A Home-Suite group's named
+        //   entry is a `legacy_safe_placeholder`, which keeps the record's
+        //   identity AND its `invite_lineage` (it strips policy, roster,
+        //   commit log and home only), so the named iteration finds it, installs
+        //   marker + evidence there, and returns — the sidecar never sees it.
+        // - `recover_treekem_named_journals`' Apply arm writes the sidecar half
+        //   only when a decodable `.hsjournal` is present; the named write is
+        //   unconditional. A legacy-only journal therefore updates named alone.
+        //
+        // Replacing the record wholesale then discarded that containment before
+        // the daemon ever saw it — a marker recovery had deliberately preserved,
+        // invisible to every ADR-0066 gate. So the sidecar still wins every
+        // other field, and containment is UNIONED under the same total order the
+        // replay uses, taking the whole stronger marker with its own evidence.
+        // The authoritative view is then never weaker than either half.
+        //
+        // Both spellings are consulted: the sidecar's key, then a scan by
+        // `stable_group_id()` for a named half filed under an alias.
+        let named_containment = merged
+            .get(&id)
+            .filter(|placeholder| placeholder.stable_group_id() == info.stable_group_id())
+            .or_else(|| {
+                merged
+                    .values()
+                    .find(|placeholder| placeholder.stable_group_id() == info.stable_group_id())
+            })
+            .map(|placeholder| {
+                (
+                    placeholder.state_revision,
+                    placeholder.fork_quarantine.clone(),
+                    placeholder
+                        .invite_lineage
+                        .as_ref()
+                        .and_then(|lineage| lineage.fork_evidence.clone()),
+                )
+            });
+        if let Some((placeholder_revision, placeholder_marker, placeholder_evidence)) =
+            named_containment
+        {
             tracing::debug!(
                 group_id = %id,
                 "restored Home-Suite group from sidecar over placeholder \
                  (legacy state_revision {})",
-                placeholder.state_revision
+                placeholder_revision
             );
+            let had_marker = info.fork_quarantine.is_some();
+            union_containment_into(&mut info, placeholder_marker, placeholder_evidence);
+            if !had_marker && info.fork_quarantine.is_some() {
+                tracing::warn!(
+                    group_id = %id,
+                    "#732: the authoritative Home-Suite record adopted the fork-quarantine \
+                     marker held only by its legacy half — recovery writes containment there"
+                );
+            }
         }
         merged.insert(id, info);
     }
