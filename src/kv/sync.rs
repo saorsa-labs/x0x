@@ -1397,6 +1397,10 @@ impl KvStoreSync {
         spawn(Box::pin(async move {
             loop {
                 let msg = tokio::select! {
+                    // Cancel-first (#757): an unbiased select picks at
+                    // random when a queued message and the cancel are both
+                    // ready, so a retired sync still merged and persisted.
+                    biased;
                     // cancel_sync tears down every loop (round-4 review) —
                     // recv alone would keep this listener alive until
                     // daemon shutdown.
@@ -1422,43 +1426,58 @@ impl KvStoreSync {
                 // the payload is an EncryptedKvStoreRecordV1, and a plaintext
                 // delta can never decode, verify, or merge here.
                 if let Some(protector) = listener_treekem.as_ref() {
-                    if Self::merge_treekem_record(
-                        protector,
-                        &store,
-                        &listener_store_id,
-                        listener_local_peer_id,
-                        &msg.payload,
-                        &listener_pages,
+                    let Some(merged) = unless_cancelled(
+                        &listener_cancel,
+                        Self::merge_treekem_record(
+                            protector,
+                            &store,
+                            &listener_store_id,
+                            listener_local_peer_id,
+                            &msg.payload,
+                            &listener_pages,
+                        ),
                     )
                     .await
-                    {
+                    else {
+                        return;
+                    };
+                    if merged {
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
                             let _ = persist_snapshot(&store, ctx).await;
                         }
                     }
                 } else if let Some(ctx) = listener_secure.as_ref() {
                     let merged = if listener_is_encrypted {
-                        Self::merge_encrypted_record(
-                            ctx,
-                            listener_refresh.as_ref(),
-                            &store,
-                            &listener_store_id,
-                            listener_local_peer_id,
-                            &msg.payload,
-                            &listener_pages,
+                        unless_cancelled(
+                            &listener_cancel,
+                            Self::merge_encrypted_record(
+                                ctx,
+                                listener_refresh.as_ref(),
+                                &store,
+                                &listener_store_id,
+                                listener_local_peer_id,
+                                &msg.payload,
+                                &listener_pages,
+                            ),
                         )
                         .await
                     } else {
-                        Self::merge_group_signed_record(
-                            ctx,
-                            listener_refresh.as_ref(),
-                            &store,
-                            &listener_store_id,
-                            listener_local_peer_id,
-                            &msg.payload,
-                            &listener_pages,
+                        unless_cancelled(
+                            &listener_cancel,
+                            Self::merge_group_signed_record(
+                                ctx,
+                                listener_refresh.as_ref(),
+                                &store,
+                                &listener_store_id,
+                                listener_local_peer_id,
+                                &msg.payload,
+                                &listener_pages,
+                            ),
                         )
                         .await
+                    };
+                    let Some(merged) = merged else {
+                        return;
                     };
                     if merged {
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
@@ -1472,6 +1491,10 @@ impl KvStoreSync {
                     Ok((peer_id, delta)) => {
                         let merged = {
                             let mut s = store.write().await;
+                            // #757: retired while this message was in flight.
+                            if listener_cancel.is_cancelled() {
+                                return;
+                            }
                             // Pass sender identity for access control enforcement.
                             // The gossip V2 wire format includes a verified AgentId.
                             let writer = msg.sender.as_ref();
@@ -1635,6 +1658,8 @@ impl KvStoreSync {
             let mut last_full_response: Option<tokio::time::Instant> = None;
             loop {
                 let msg = tokio::select! {
+                    // Cancel-first (#757), as in the listener above.
+                    biased;
                     // cancel_sync tears down every loop (round-4 review).
                     () = responder_cancel.cancelled() => return,
                     msg = sync_sub.recv() => msg,
@@ -2112,6 +2137,10 @@ impl KvStoreSync {
                         }
                         let learned = {
                             let mut s = responder_store.write().await;
+                            // #757: retired while this message was in flight.
+                            if responder_cancel.is_cancelled() {
+                                return;
+                            }
                             // learn_ownership can only refresh policy (when the
                             // owner matches and policy_version is forward) or
                             // record a conflict; it never establishes ownership.
@@ -2555,6 +2584,23 @@ fn encode_snapshot(store: &KvStore) -> Result<Vec<u8>> {
     out.extend_from_slice(SNAPSHOT_MAGIC);
     out.extend_from_slice(&bincode::serialize(&body)?);
     Ok(out)
+}
+
+/// Drive a receive-path merge unless the sync is retired first (#757).
+///
+/// Cancel-first on every poll: a merge suspended before it takes the store
+/// write guard is dropped, never applied, once `cancel_sync` has run. Every
+/// wrapped merge mutates synchronously under that guard, so a drop can never
+/// leave a half-applied merge. `None` means retired — the loop must exit.
+async fn unless_cancelled(
+    cancel: &tokio_util::sync::CancellationToken,
+    merge: impl std::future::Future<Output = bool>,
+) -> Option<bool> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        merged = merge => Some(merged),
+    }
 }
 
 /// Snapshot the store to the persistence context's path.
@@ -3916,6 +3962,133 @@ mod tests {
             landed.is_ok(),
             "remote delta was not merged by start() loop"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #757: a retired sync must not merge or persist a queued delta
+    // ------------------------------------------------------------------
+
+    type HeldLoops =
+        Arc<std::sync::Mutex<Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>>;
+
+    /// One #757 scenario. The background loops are HELD (never polled) by a
+    /// gated spawner while a valid delta is published and observed to reach
+    /// the listener's channel, so when the loops are finally driven the
+    /// queued delta and (if `retire`) the cancellation are ready in the same
+    /// poll — the exact ordering an unbiased `select!` resolved at random.
+    /// Returns `(key merged, snapshot bytes changed)`.
+    async fn queued_delta_outcome(topic: &str, retire: bool) -> (bool, bool) {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
+        let sync = KvStoreSync::new(
+            store,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("kv sync");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = dir.path().join("store.bin");
+        sync.set_persist_path(snapshot.clone());
+        sync.persist().await.expect("baseline snapshot");
+        let before = std::fs::read(&snapshot).expect("baseline bytes");
+
+        let held: HeldLoops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gate = Arc::clone(&held);
+        sync.start_with_spawner(move |fut| {
+            gate.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(fut);
+        })
+        .await
+        .expect("start_with_spawner");
+
+        let entry = KvEntry::new(
+            "late-key".to_string(),
+            b"late".to_vec(),
+            "text/plain".to_string(),
+        );
+        let mut delta = KvStoreDelta::new(1);
+        delta
+            .added
+            .insert("late-key".to_string(), (entry, (peer(2), 1)));
+        let delivered_before = pubsub.stats().delivered_to_subscriber;
+        sync.publish_delta(peer(2), delta).await.expect("publish");
+        // Barrier, not oracle: the delta must be sitting in the listener's
+        // channel before the loops run, or the scenario proves nothing.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pubsub.stats().delivered_to_subscriber == delivered_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delta must reach the held listener's channel");
+
+        if retire {
+            sync.cancel_sync();
+        }
+        let loops = std::mem::take(
+            &mut *held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if retire {
+            // Cancelled loops must run to completion on their own.
+            for fut in loops {
+                tokio::time::timeout(Duration::from_secs(10), fut)
+                    .await
+                    .expect("a cancelled loop must exit");
+            }
+        } else {
+            for fut in loops {
+                tokio::spawn(fut);
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while sync.read().await.get("late-key").is_none()
+                    || std::fs::read(&snapshot).expect("snapshot bytes") == before
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("control: a live listener merges and persists the queued delta");
+        }
+        let merged = sync.read().await.get("late-key").is_some();
+        let persisted = std::fs::read(&snapshot).expect("snapshot bytes") != before;
+        sync.cancel_sync();
+        (merged, persisted)
+    }
+
+    #[tokio::test]
+    async fn retired_sync_never_merges_or_persists_a_queued_delta() {
+        // Control: the identical queued delta IS merged and persisted by a
+        // live listener, so the retired assertions below cannot pass merely
+        // because the delta was undeliverable or inadmissible.
+        assert_eq!(
+            queued_delta_outcome("store/757-live", false).await,
+            (true, true)
+        );
+        // WHY (#757): retire()/cancel_sync() is the fence callers rely on
+        // when a group store goes away or its snapshot path is being
+        // replaced. A listener that still takes a queued delta after the
+        // fence mutates a retired replica and writes its snapshot behind the
+        // caller's back (in CI: a rename onto a directory, latching the
+        // store durability-degraded). The unbiased select lost this race
+        // about half the time, so repeat: 16 clean runs cannot happen by
+        // luck (p = 2^-16) if the select is ever made unbiased again.
+        for round in 0..16 {
+            assert_eq!(
+                queued_delta_outcome(&format!("store/757-retired-{round}"), true).await,
+                (false, false),
+                "round {round}: retired sync merged/persisted a queued delta"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

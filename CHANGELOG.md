@@ -459,6 +459,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A retired KV store sync no longer merges or persists a delta that was
+  already queued (#757).** The `KvStoreSync` listener and responder selected
+  between cancellation and the next message without `biased`, so after
+  `retire()`/`cancel_sync()` a queued delta was still merged — and its snapshot
+  written — about half the time. Both selects are now cancel-first, and every
+  receive-path merge re-checks the cancellation before it mutates the store.
+  This was the mechanism behind the intermittent Coverage Gate failure of
+  `legacy_import_unloaded_preview_ambiguity_and_receipt_retry_preserve_state`
+  (`Is a directory (os error 21)`).
+
 - **TreeKEM snapshot persist now resolves alias-keyed groups, so a stable-id
   send no longer burns a ratchet generation (#732, runbook known gap (g)).**
   `persist_treekem_snapshot_bound` — the post-crypto step of
