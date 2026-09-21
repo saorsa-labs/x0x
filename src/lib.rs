@@ -13862,8 +13862,13 @@ impl Agent {
     /// let list = agent.create_task_list("Sprint Planning", "team-sprint").await?;
     /// ```
     pub async fn create_task_list(&self, name: &str, topic: &str) -> error::Result<TaskListHandle> {
-        self.task_list_inner(topic, Some(name.to_string()), None)
-            .await
+        self.task_list_inner(
+            topic,
+            Some(name.to_string()),
+            None,
+            TaskListBinding::default(),
+        )
+        .await
     }
 
     /// Create (or restore) a task list with an on-disk state snapshot.
@@ -13888,7 +13893,55 @@ impl Agent {
         topic: &str,
         state_dir: &std::path::Path,
     ) -> error::Result<TaskListHandle> {
-        self.task_list_inner(topic, Some(name.to_string()), Some(state_dir))
+        self.task_list_inner(
+            topic,
+            Some(name.to_string()),
+            Some(state_dir),
+            TaskListBinding::default(),
+        )
+        .await
+    }
+
+    /// As [`create_task_list_persistent`](Self::create_task_list_persistent),
+    /// with the named-group binding installed BEFORE replication starts.
+    ///
+    /// #732 finding 3: `create_task_list_persistent` starts the delta listener
+    /// before it returns, so a caller that applies group authorization or the
+    /// ADR-0068 D2 fork-quarantine gate to the returned handle has already left
+    /// a window in which a peer delta merges ungated — on a quarantined group,
+    /// one that mutates and persists a list the marker says is frozen. This
+    /// variant takes those facts up front and installs them before the listener
+    /// exists, so the window does not.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`create_task_list_persistent`](Self::create_task_list_persistent).
+    pub async fn create_task_list_persistent_bound(
+        &self,
+        name: &str,
+        topic: &str,
+        state_dir: &std::path::Path,
+        binding: TaskListBinding,
+    ) -> error::Result<TaskListHandle> {
+        self.task_list_inner(topic, Some(name.to_string()), Some(state_dir), binding)
+            .await
+    }
+
+    /// As [`join_task_list_persistent`](Self::join_task_list_persistent), with
+    /// the named-group binding installed BEFORE replication starts. See
+    /// [`create_task_list_persistent_bound`](Self::create_task_list_persistent_bound)
+    /// for why the ordering matters (#732 finding 3).
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`join_task_list_persistent`](Self::join_task_list_persistent).
+    pub async fn join_task_list_persistent_bound(
+        &self,
+        topic: &str,
+        state_dir: &std::path::Path,
+        binding: TaskListBinding,
+    ) -> error::Result<TaskListHandle> {
+        self.task_list_inner(topic, None, Some(state_dir), binding)
             .await
     }
 
@@ -13901,6 +13954,7 @@ impl Agent {
         topic: &str,
         name: Option<String>,
         state_dir: Option<&std::path::Path>,
+        binding: TaskListBinding,
     ) -> error::Result<TaskListHandle> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
@@ -13953,6 +14007,18 @@ impl Agent {
         // the first moment the list does.
         if let Some(store) = &storage {
             sync.set_persistence(store.clone(), list_id);
+        }
+        // #732 finding 3: the group binding goes on BEFORE the listener exists.
+        // `start_with_spawner` subscribes and spawns the delta loop, so anything
+        // installed afterwards leaves a window in which an inbound delta merges
+        // with no authorized-writer set and no ADR-0068 D2 quarantine gate — on
+        // a quarantined group that window mutates and persists a list the marker
+        // says is frozen.
+        if let Some(agents) = binding.authorized_agents {
+            sync.write().await.set_authorized_agents(agents);
+        }
+        if let Some(gate) = binding.ingest_gate {
+            sync.ingest_gate().install(gate);
         }
         let sync = std::sync::Arc::new(sync);
         if storage.is_some() {
@@ -14007,7 +14073,8 @@ impl Agent {
     /// let list = agent.join_task_list("team-sprint").await?;
     /// ```
     pub async fn join_task_list(&self, topic: &str) -> error::Result<TaskListHandle> {
-        self.task_list_inner(topic, None, None).await
+        self.task_list_inner(topic, None, None, TaskListBinding::default())
+            .await
     }
 
     /// Join (or restore) a task list with an on-disk state snapshot.
@@ -14022,7 +14089,48 @@ impl Agent {
         topic: &str,
         state_dir: &std::path::Path,
     ) -> error::Result<TaskListHandle> {
-        self.task_list_inner(topic, None, Some(state_dir)).await
+        self.task_list_inner(topic, None, Some(state_dir), TaskListBinding::default())
+            .await
+    }
+}
+
+/// What a caller knows about a task list's named-group binding before the list's
+/// replication starts.
+///
+/// #732 finding 3: both facts used to be applied to the handle the constructor
+/// returned, i.e. after `TaskListSync::start_with_spawner` had already subscribed
+/// and spawned the delta listener. Supplying them here installs them before that
+/// loop exists, which is the only ordering in which ADR-0068 D2's promise — a
+/// quarantined group's list is left byte-identical from the first delta that
+/// observes the marker — holds through a restart.
+///
+/// Both fields are optional and independent: a list with no group binding passes
+/// [`TaskListBinding::default()`](Default::default) and behaves exactly as it did
+/// before ADR-0068.
+#[derive(Default)]
+pub struct TaskListBinding {
+    /// The group's active members, for CRDT admission. `None` leaves admission
+    /// open (the pre-existing behaviour for a group this node cannot resolve);
+    /// an EMPTY set denies all remote content, which is fail-closed for a group
+    /// with no active members.
+    pub authorized_agents: Option<std::collections::HashSet<identity::AgentId>>,
+    /// The ADR-0068 D2 inbound-delta gate. `None` for a list with no group
+    /// binding.
+    pub ingest_gate: Option<std::sync::Arc<dyn crdt::TaskIngestGate>>,
+}
+
+impl std::fmt::Debug for TaskListBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskListBinding")
+            .field(
+                "authorized_agents",
+                &self
+                    .authorized_agents
+                    .as_ref()
+                    .map(std::collections::HashSet::len),
+            )
+            .field("ingest_gate", &self.ingest_gate.is_some())
+            .finish()
     }
 }
 

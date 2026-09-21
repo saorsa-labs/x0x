@@ -221,26 +221,85 @@ pub(in crate::server) async fn apply_group_authorization(
     if scoped.is_malformed() {
         return;
     }
+    if let Some(agents) = active_group_members(state, &scoped.group_id).await {
+        handle.set_authorized_agents(agents).await;
+    }
+    // The gate goes on even for a group this node cannot resolve yet: it
+    // resolves the marker LIVE on every delta, so installing it costs nothing
+    // while there is no record and covers the case where the record (and its
+    // marker) arrives afterwards. The previous early return on an unresolvable
+    // group left such a list permanently ungated, which ADR-0068's alias-keyed
+    // row forbids.
+    install_task_ingest_gate(state, &scoped.group_id, handle);
+}
+
+/// The group's ACTIVE members as CRDT writer identities, or `None` when this
+/// node holds no resolvable record for `group_id` (admission is left open, as
+/// it has always been for an unknown group).
+///
+/// Resolved through [`crate::server::resolve_group_entry_locked`], not a bare
+/// `named_groups.get()`: the roster map is keyed by whichever alias this node
+/// learned the group under, while a task-list id carries the spelling its
+/// creator used. The single-spelling read this replaced left an alias-keyed
+/// group's list with open admission AND no ingest gate.
+async fn active_group_members(
+    state: &Arc<AppState>,
+    group_id: &str,
+) -> Option<std::collections::HashSet<x0x::identity::AgentId>> {
+    let groups = state.named_groups.read().await;
+    let (_, info) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
+    Some(active_members_of(info))
+}
+
+/// The active members of one already-resolved record, as CRDT writer
+/// identities. Split out so the roster read and the ADR-0067 token read in
+/// [`TaskQuarantineIngestGate::with_pinned_roster`] happen under ONE guard
+/// (#756 review P1).
+fn active_members_of(
+    info: &x0x::groups::GroupInfo,
+) -> std::collections::HashSet<x0x::identity::AgentId> {
     let mut agents = std::collections::HashSet::new();
-    {
-        let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&scoped.group_id) else {
-            return; // unknown group — can't authorize; leave open
-        };
-        for (agent_hex, member) in &info.members_v2 {
-            if matches!(member.state, x0x::groups::GroupMemberState::Active) {
-                if let Ok(bytes) = hex::decode(agent_hex) {
-                    if bytes.len() == x0x::identity::PEER_ID_LENGTH {
-                        let mut arr = [0u8; x0x::identity::PEER_ID_LENGTH];
-                        arr.copy_from_slice(&bytes);
-                        agents.insert(x0x::identity::AgentId(arr));
-                    }
+    for (agent_hex, member) in &info.members_v2 {
+        if matches!(member.state, x0x::groups::GroupMemberState::Active) {
+            if let Ok(bytes) = hex::decode(agent_hex) {
+                if bytes.len() == x0x::identity::PEER_ID_LENGTH {
+                    let mut arr = [0u8; x0x::identity::PEER_ID_LENGTH];
+                    arr.copy_from_slice(&bytes);
+                    agents.insert(x0x::identity::AgentId(arr));
                 }
             }
         }
     }
-    handle.set_authorized_agents(agents).await;
-    install_task_ingest_gate(state, &scoped.group_id, handle);
+    agents
+}
+
+/// Everything the CRDT layer needs to know about this list's named group,
+/// gathered BEFORE the list's replication starts.
+///
+/// #732 finding 3: [`apply_group_authorization`] can only run on a handle that
+/// already exists, and the constructor starts the delta listener before it
+/// returns one — so on a restart with a quarantined group a peer delta could
+/// merge and persist into a list the marker says is frozen. Pass this to
+/// `Agent::{create,join}_task_list_persistent_bound` instead and the gate is in
+/// place before the listener is. Returns an empty binding for a list with no
+/// group scoping, which therefore behaves exactly as it did before ADR-0068.
+pub(in crate::server) async fn group_task_list_binding(
+    state: &Arc<AppState>,
+    id: &str,
+) -> x0x::TaskListBinding {
+    let mut binding = x0x::TaskListBinding::default();
+    let Some(scoped) = parse_group_scoped_task_list_id(id) else {
+        return binding;
+    };
+    if scoped.is_malformed() {
+        return binding;
+    }
+    binding.authorized_agents = active_group_members(state, &scoped.group_id).await;
+    binding.ingest_gate = Some(std::sync::Arc::new(TaskQuarantineIngestGate {
+        state: Arc::downgrade(state),
+        group_id: scoped.group_id,
+    }));
+    binding
 }
 
 /// ADR-0068 D2: the inbound-delta admission gate for a group-scoped task list.
@@ -289,6 +348,46 @@ impl x0x::crdt::TaskIngestGate for TaskQuarantineIngestGate {
             let state = self.state.upgrade()?;
             let groups = state.named_groups.read().await;
             crate::server::lifecycle_epoch_token_locked(&groups, &self.group_id)
+        })
+    }
+
+    /// Pin the roster and hand the drain the live active-member set with the
+    /// lifecycle token derived from that same pinned read (#732 finding 4,
+    /// hardened by #756 review r2).
+    ///
+    /// One `named_groups` **read** guard is taken and held across the caller's
+    /// synchronous closure, so the whole re-authorize-then-merge step sees one
+    /// roster state and a roster WRITER cannot commit in the middle of it. The
+    /// caller already holds the task-list write guard, so this is the documented
+    /// `TaskList` → `named_groups` order — acquiring the roster second is that
+    /// order, not its inverse. The closure does no I/O and no `await`, and the
+    /// batch it runs is bounded by the ADR-0068 buffer bounds.
+    ///
+    /// `apply(None)` is still called when the record cannot be resolved (both
+    /// spellings tried) or the daemon has gone, so the drain can abandon rather
+    /// than merge on a stale set.
+    fn with_pinned_roster<'a>(
+        &'a self,
+        apply: &'a mut (dyn FnMut(Option<&x0x::crdt::AuthorizedRoster>) + Send),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(state) = self.state.upgrade() else {
+                apply(None);
+                return;
+            };
+            let groups = state.named_groups.read().await;
+            let pinned = crate::server::resolve_group_entry_locked(&groups, &self.group_id)
+                .and_then(|(_, info)| {
+                    let token =
+                        crate::server::lifecycle_epoch_token_locked(&groups, &self.group_id)?;
+                    Some(x0x::crdt::AuthorizedRoster {
+                        agents: active_members_of(info),
+                        token,
+                    })
+                });
+            // Synchronous, under the guard: nothing can write the roster until
+            // `apply` returns.
+            apply(pinned.as_ref());
         })
     }
 
@@ -544,16 +643,25 @@ pub(in crate::server) async fn create_task_list(
     // #557: the persistent variant arms per-list content snapshots under the
     // instance data dir (`task-lists/<id>.bin`) so restarts restore content,
     // not just the registration; it fails closed on a corrupt snapshot.
+    // #732 finding 3: the group binding (authorized writers + the ADR-0068 D2
+    // gate) is gathered here and installed by the constructor BEFORE it starts
+    // the delta listener, so no inbound delta can merge ungated.
+    let binding = group_task_list_binding(&state, &id).await;
     match state
         .agent
-        .create_task_list_persistent(&req.name, &req.topic, &state.task_list_state_dir)
+        .create_task_list_persistent_bound(
+            &req.name,
+            &req.topic,
+            &state.task_list_state_dir,
+            binding,
+        )
         .await
     {
         Ok(handle) => {
             let version = handle.version().await;
-            // Apply group authorization at the CRDT layer so remote admission
-            // rejects nonmember operations for group-scoped lists. Runs inside
-            // the reservation guard (serialized per (kind,id)).
+            // Re-apply group authorization now the listener is running: it
+            // refreshes the roster read taken for the binding above (the gate
+            // install is set-once and keeps the one already in place).
             apply_group_authorization(&state, &id, &handle).await;
             state.task_lists.write().await.insert(id.clone(), handle);
             // Persist the registration so it survives a daemon restart
