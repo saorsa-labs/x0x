@@ -40,6 +40,29 @@ All notable changes to this project will be documented in this file.
     without lineage keep the trigger ADR-0066 promised unchanged, and the store
     loop resolves the record under both spellings so an alias-keyed store is no
     longer silently skipped.
+  - **Which containment state a replay writes (round 2, after cross-model
+    review).** The first repair only filled an empty journal slot, which both
+    reviewers showed is wrong in two directions, so the rule now turns on the
+    frontier. At the SAME (or an older) journal frontier the live containment
+    pair wins, **its absence included** — a manual clear advances no revision
+    either, so a journal staged before a clear was resurrecting the marker
+    after it, and a differing journal marker was replacing the live one. On a
+    FORWARD frontier the live marker is carried *unless the journalled advance
+    is itself the clear*: `groups/mod.rs::ForkQuarantine::owner_anchored_clear_permitted`
+    is evaluated at the journalled revision and honoured only when the journal
+    image carries no marker of its own, so a crash after staging an
+    owner-anchored advance no longer has its clear reversed on restart. A
+    `no_anchor` marker, an advance not strictly past the evidenced revision,
+    and a journal carrying its own marker all keep containment.
+  - **The claimed conflict is bound to the verified commit (round 2).** A
+    record's outer `state_revision`/`state_hash` sit beside its commit log and
+    are what the replay verdict compares, so a local writer could copy the
+    live record, alter only the outer hash, keep the valid terminal commit, and
+    have `named_groups.rs::record_recovery_fork_evidence` install permanent
+    `no_anchor` containment with no authenticated *conflicting* commit. It now
+    requires the claimed frontier to be the one the verified commit signs, and
+    that commit to genuinely differ from the live committed state at that
+    revision.
   - No schema or wire change (the marker's fields already carry
     `#[serde(default)]`). Closes runbook known gap (h).
 

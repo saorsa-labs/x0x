@@ -24987,6 +24987,53 @@ async fn record_recovery_fork_evidence(
         );
         return;
     }
+    // #732 r2 (cross-model review, P1) — BIND THE CLAIMED CONFLICT TO THE
+    // VERIFIED COMMIT. `fork_candidate_authenticated` proves the journal's
+    // terminal commit is genuine and its committer held an Active+Admin seat,
+    // but the record's OUTER `state_revision`/`state_hash` are plain fields
+    // beside it: a local journal writer could copy the live record, alter
+    // ONLY the outer hash, keep the untouched valid commit, and the
+    // paired-replay verdict — which compares those outer scalars — would call
+    // it a fork. That installed a permanent `no_anchor` marker with no
+    // authenticated CONFLICTING commit behind it, and a `no_anchor` marker
+    // never auto-clears. So two bindings, both cheap:
+    //
+    // (a) the frontier the journal CLAIMS must be the one the verified commit
+    //     signs — same group, same revision, same state hash. Any of the
+    //     three differing means the claim is not what was signed.
+    // (b) that verified commit must genuinely CONFLICT with the live
+    //     committed state at the same revision, which is the live hook's own
+    //     definition of a fork (two different commits at one revision). The
+    //     live terminal header is the comparison, and it is always available:
+    //     the log trims oldest-first, so the terminal is retained, and
+    //     `terminal_commit_header` recomputes it from live state otherwise.
+    //
+    // A journal whose outer fields were edited fails (a); one that merely
+    // re-states the live commit fails (b). Neither installs anything, and
+    // both leave the journals to the quarantine-aside the caller performs.
+    if journal_commit.group_id != live.stable_group_id()
+        || journal_commit.revision != journal_revision
+        || journal_commit.state_hash != journal_state_hash
+    {
+        tracing::warn!(
+            group_id = %journal.group_id_hex,
+            claimed = ?(journal_revision, journal_state_hash),
+            signed = ?(journal_commit.revision, journal_commit.state_hash.clone()),
+            "#732: journal record's claimed frontier is not the one its verified commit signs — no evidence, no marker"
+        );
+        return;
+    }
+    if live.state_revision != journal_commit.revision
+        || live.terminal_commit_header().state_hash == journal_commit.state_hash
+    {
+        tracing::debug!(
+            group_id = %journal.group_id_hex,
+            live_revision = live.state_revision,
+            commit_revision = journal_commit.revision,
+            "#732: the verified journal commit does not conflict with the live committed state at its revision — no evidence, no marker"
+        );
+        return;
+    }
     let evidence = x0x::groups::ForkEvidence {
         revision: journal_revision,
         state_hash: journal_state_hash.to_string(),
@@ -26545,41 +26592,108 @@ async fn merge_group_record_into_store_file(
     // in place once the named save is durable) replays at the SAME
     // committed frontier the verdict calls `Apply` — and the wholesale
     // record replacement below would silently erase a durable containment
-    // decision that never auto-clears. Carry it forward instead: journal
-    // equality is not equality of containment. Applied whenever the live
-    // half holds containment the journal record does not, so a
-    // forward-replay can no more lift a quarantine than an equal-frontier
-    // one; everything else about the replay (roster, keys, policy, the
-    // alias `retain` below) is untouched, so a group with no marker
-    // replays byte-identically. Both spellings are consulted — the map key
-    // AND `stable_group_id()` — because an alias-keyed store holds the
-    // record under the alias (ADR-0066's both-spellings rule at file
-    // level, where no live map exists to resolve through).
-    let carried = live
+    // decision that never auto-clears. So the containment PAIR (the marker
+    // and the lineage `fork_evidence` record that justifies it — the two
+    // fields every clear arm removes together, see
+    // `GroupInfo::reset_fork_evidence_after_quarantine_clear`) is decided
+    // from the LIVE half, by frontier. Everything else about the replay
+    // (roster, keys, policy, the alias `retain` below) still comes from the
+    // journal, so a group that has never forked replays byte-identically.
+    // Both spellings are consulted — the map key AND `stable_group_id()` —
+    // because an alias-keyed store holds the record under the alias
+    // (ADR-0066's both-spellings rule at file level, where no live map
+    // exists to resolve through).
+    //
+    // The two frontier cases, from #732 r2 (cross-model review found the
+    // first shape — "fill an empty journal slot" — wrong in both
+    // directions):
+    //
+    // 1. SAME (or older) journal frontier ⇒ the live pair wins
+    //    UNCONDITIONALLY, its ABSENCE included. A manual clear advances no
+    //    revision either, so "fill only an empty slot" let an equal-frontier
+    //    journal whose own image still carried the pre-clear marker
+    //    RESURRECT a quarantine the operator had durably cleared — and let a
+    //    different journal marker replace the live one. At one frontier
+    //    there is exactly one containment truth and it is the local one.
+    // 2. FORWARD journal frontier ⇒ the live marker is carried, EXCEPT
+    //    where the journalled advance is itself the clear. A crash after
+    //    staging an owner-anchored advance (or explicit owner seal) but
+    //    before the live save leaves a higher-revision journal that
+    //    legitimately holds no marker; resurrecting one there would reverse
+    //    a clear `ForkQuarantine::owner_anchored_clear_permitted` had
+    //    already granted. So the clear is honoured on exactly that
+    //    predicate, at the JOURNALLED revision, and only when the journal
+    //    image carries no marker of its own. Everything else keeps
+    //    containment: a `no_anchor` marker is never clearable by a commit
+    //    (only the manual clear, which is case 1), an anchored revision not
+    //    past the evidence revision buys nothing, and a journal that
+    //    carries its OWN marker at a higher frontier is two assertions of
+    //    containment, not a clear — the live marker is kept as the
+    //    fail-closed choice, since it may be the stronger (`no_anchor`) of
+    //    the two and a wrongly-kept marker is operator-clearable while a
+    //    wrongly-lifted one is silent.
+    let live_half = live
         .get(group_id_hex)
         .filter(|info| info.stable_group_id() == stable)
         .or_else(|| live.values().find(|info| info.stable_group_id() == stable))
         .map(|info| {
             (
+                info.state_revision,
                 info.fork_quarantine.clone(),
                 info.invite_lineage
                     .as_ref()
                     .and_then(|lineage| lineage.fork_evidence.clone()),
             )
         });
-    if let Some((live_marker, live_evidence)) = carried {
-        if let (None, Some(marker)) = (record.fork_quarantine.as_ref(), live_marker) {
-            tracing::warn!(
-                group_id = %LogHexId::group(group_id_hex),
-                store = %label,
-                marker_revision = marker.revision,
-                no_anchor = marker.no_anchor,
-                "#732: journal replay preserved the live fork-quarantine marker — the journalled record predates it"
-            );
-            record.fork_quarantine = Some(marker);
-        }
-        if let Some(lineage) = record.invite_lineage.as_mut() {
-            if lineage.fork_evidence.is_none() {
+    if let Some((live_revision, live_marker, live_evidence)) = live_half {
+        let journal_revision = record.state_revision;
+        if journal_revision > live_revision {
+            // Case 2 — forward replay.
+            let honours_a_clear = record.fork_quarantine.is_none()
+                && live_marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.owner_anchored_clear_permitted(journal_revision));
+            if honours_a_clear {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    store = %label,
+                    journal_revision,
+                    live_revision,
+                    "#732: forward journal replay HONOURS the owner-anchored clear its own advance granted — no marker restored"
+                );
+                // The staged image is post-clear, so its evidence slot is
+                // already empty; emptied explicitly so a legacy image can
+                // never leave evidence behind that would silence the next
+                // authenticated conflict through `fork_evidence_first_complete_wins`.
+                record.reset_fork_evidence_after_quarantine_clear();
+            } else if let Some(marker) = live_marker {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    store = %label,
+                    marker_revision = marker.revision,
+                    no_anchor = marker.no_anchor,
+                    journal_revision,
+                    live_revision,
+                    "#732: forward journal replay preserved the live fork-quarantine marker — the journalled advance does not clear it"
+                );
+                record.fork_quarantine = Some(marker);
+                if let Some(lineage) = record.invite_lineage.as_mut() {
+                    lineage.fork_evidence = live_evidence.or(lineage.fork_evidence.take());
+                }
+            }
+        } else {
+            // Case 1 — same (or older) frontier: the live pair verbatim.
+            if record.fork_quarantine != live_marker {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    store = %label,
+                    live_marker_revision = ?live_marker.as_ref().map(|marker| marker.revision),
+                    journal_marker_revision = ?record.fork_quarantine.as_ref().map(|marker| marker.revision),
+                    "#732: same-frontier journal replay took the LIVE containment state — journal equality is not equality of containment"
+                );
+            }
+            record.fork_quarantine = live_marker;
+            if let Some(lineage) = record.invite_lineage.as_mut() {
                 lineage.fork_evidence = live_evidence;
             }
         }

@@ -2731,12 +2731,16 @@ fn lineage_for(info: &x0x::groups::GroupInfo) -> x0x::groups::InviteLineage {
 /// The claim this test defends: a marker is LOCAL containment state, and
 /// journal equality is not equality of containment.
 ///
-/// Its two negative-control arms are what stop a vacuous pass. (a) the
-/// journal image genuinely carries no marker, and the replay still replaces
-/// every OTHER field of the live record — so this is not "the replay stopped
-/// writing". (b) a journal record that carries its OWN marker keeps it — so
-/// this is not "always prefer the live half", which would be a different (and
-/// wrong) rule.
+/// Its negative-control arm is what stops a vacuous pass: the journal image
+/// genuinely carries no marker, and the replay still replaces every OTHER
+/// field of the live record — so this is not "the replay stopped writing".
+///
+/// #732 r2: the second arm of this test used to pin the OPPOSITE rule — "a
+/// journal record carrying its own marker keeps it" — which cross-model review
+/// showed is wrong at one frontier, and which now lives inverted in
+/// [`issue732_same_frontier_replay_takes_live_containment_including_absence`].
+/// It is replaced rather than relaxed so the change of contract is visible in
+/// the diff.
 #[tokio::test]
 async fn issue732_journal_replay_preserves_a_durable_quarantine_marker() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2793,30 +2797,6 @@ async fn issue732_journal_replay_preserves_a_durable_quarantine_marker() -> Resu
     assert_eq!(record.state_revision, advanced.state_revision);
     assert_eq!(record.state_hash, advanced.state_hash);
 
-    // Negative control (b): a journal record carrying its OWN marker keeps
-    // it. `first-complete-wins` is unchanged; the live half only FILLS an
-    // empty slot.
-    let mut journalled_marker = advanced.clone();
-    let mut own = marker_at_frontier(&advanced);
-    own.observed_at_ms = 1_600_000_000_000;
-    journalled_marker.fork_quarantine = Some(own);
-    let store_b = dir.path().join("named_groups_b.json");
-    write_named_groups_json_atomic(&store_b, &store_image(&group_id, &contained)?).await?;
-    merge_group_record_into_store_file(
-        &store_b,
-        &group_id,
-        &store_image(&group_id, &journalled_marker)?,
-        "named groups",
-    )
-    .await?;
-    assert_eq!(
-        read_store(&store_b).await?[&group_id]
-            .fork_quarantine
-            .as_ref()
-            .map(|marker| marker.observed_at_ms),
-        Some(1_600_000_000_000),
-        "negative control (b): the journal's own marker is not overwritten by the live one"
-    );
     Ok(())
 }
 
@@ -3169,6 +3149,332 @@ async fn issue732_owner_axis_lineage_free_group_is_unchanged_at_startup() -> Res
     assert!(
         !read_store(&named_path).await?[&group_id].is_fork_quarantined(),
         "#732 must not move the owner-axis trigger ADR-0066 promised unchanged"
+    );
+    Ok(())
+}
+
+/// Write a legacy TreeKEM journal (no `.hsjournal`: an ordinary group's
+/// sidecar half changes nothing) holding `record` as its staged image.
+async fn stage_journal(
+    treekem: &std::path::Path,
+    group_id: &str,
+    record: &x0x::groups::GroupInfo,
+) -> Result<()> {
+    let journal = TreeKemNamedPersistJournal {
+        version: TREEKEM_NAMED_JOURNAL_VERSION,
+        group_id_hex: group_id.to_string(),
+        named_groups_json: store_image(group_id, record)?,
+        snapshot_envelope: vec![6u8; 12],
+    };
+    x0x::storage::write_private_bytes(
+        &treekem_journal_path(treekem, group_id),
+        postcard::to_stdvec(&journal)?,
+    )
+    .await?;
+    Ok(())
+}
+
+/// One on-disk recovery scenario: write the live store and the staged journal,
+/// run the REAL startup entry, hand back the record it left behind.
+async fn replay_scenario(
+    group_id: &str,
+    live: &x0x::groups::GroupInfo,
+    staged: &x0x::groups::GroupInfo,
+    live_key: &str,
+) -> Result<x0x::groups::GroupInfo> {
+    let dir = tempfile::tempdir()?;
+    let treekem = dir.path().join("treekem");
+    tokio::fs::create_dir_all(&treekem).await?;
+    let named_path = dir.path().join("named_groups.json");
+    let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+    write_named_groups_json_atomic(&named_path, &store_image(live_key, live)?).await?;
+    stage_journal(&treekem, group_id, staged).await?;
+    recover_treekem_named_journals(&named_path, &sidecar_path, &treekem).await?;
+    let after = read_store(&named_path).await?;
+    after
+        .get(group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("the replay left no record under the stable id"))
+}
+
+/// WHY (#732 r2 — cross-model review, Codex P2-b and omp nit (a); this test
+/// INVERTS an assertion the first round shipped). The first repair only FILLED
+/// an empty journal slot, which is wrong in both directions at one frontier:
+///
+/// - **resurrection.** A manual clear advances no revision
+///   (`clear_group_quarantine` sets `fork_quarantine = None` and re-arms the
+///   evidence gate; the committed frontier is untouched). So a journal staged
+///   BEFORE the clear replays at the SAME frontier afterwards, and its own
+///   stale marker was written straight back: a restart undid an operator's
+///   durable clear, on a marker that then needs clearing again.
+/// - **replacement.** Two markers at one frontier meant the journal's won,
+///   even though the live one is the node's current containment decision and
+///   may be the stronger (`no_anchor`) of the two.
+///
+/// The rule: at the same committed frontier the containment PAIR is the live
+/// one, its ABSENCE included. There is exactly one containment truth per
+/// frontier and it is local — the journal is a snapshot of metadata, not of
+/// this node's decisions.
+///
+/// Negative control, in the same test: the journalled record still wins on
+/// every other field in BOTH arms, so this is not "same-frontier replays stop
+/// writing".
+#[tokio::test]
+async fn issue732_same_frontier_replay_takes_live_containment_including_absence() -> Result<()> {
+    let group_id = "de".repeat(32);
+    let (_base, advanced, _kp) = recovery_fixture(&group_id, invite_only_policy())?;
+
+    // Arm 1 — RESURRECTION. Live was cleared; the staged image predates the
+    // clear and still carries the marker.
+    let mut cleared = advanced.clone();
+    cleared.fork_quarantine = None;
+    cleared.description = "cleared-live".to_string();
+    let mut stale = advanced.clone();
+    stale.fork_quarantine = Some(marker_at_frontier(&advanced));
+    assert_eq!(
+        stale.state_hash, cleared.state_hash,
+        "a marker install and a clear both leave the frontier alone — that is the whole defect"
+    );
+    let after = replay_scenario(&group_id, &cleared, &stale, &group_id).await?;
+    assert!(
+        after.fork_quarantine.is_none(),
+        "#732 r2: a restart must not resurrect a marker the operator durably cleared"
+    );
+    assert_eq!(
+        after.description, "advanced",
+        "negative control: the journalled record still wins everywhere else"
+    );
+
+    // Arm 2 — REPLACEMENT. Both halves carry a marker at one frontier; the
+    // LIVE one is the node's decision.
+    let mut live_marked = advanced.clone();
+    let mut live_marker = marker_at_frontier(&advanced);
+    live_marker.observed_at_ms = 1_800_000_000_000;
+    live_marked.fork_quarantine = Some(live_marker);
+    live_marked.description = "stale-live".to_string();
+    let mut journal_marked = advanced.clone();
+    let mut journal_marker = marker_at_frontier(&advanced);
+    journal_marker.observed_at_ms = 1_600_000_000_000;
+    journal_marked.fork_quarantine = Some(journal_marker);
+    let after = replay_scenario(&group_id, &live_marked, &journal_marked, &group_id).await?;
+    assert_eq!(
+        after
+            .fork_quarantine
+            .as_ref()
+            .map(|marker| marker.observed_at_ms),
+        Some(1_800_000_000_000),
+        "#732 r2: the LIVE marker survives — a journal marker does not override local containment"
+    );
+    assert_eq!(after.description, "advanced", "negative control, arm 2");
+    Ok(())
+}
+
+/// The alias-keyed variant of the same-frontier rule: a live store that files
+/// the cleared record under an alias must still have its CLEAR honoured when
+/// the replay re-keys the record to the stable id. A single-spelling resolve
+/// would find no live half, fall through to "the journal record as staged",
+/// and resurrect the marker on exactly the population ADR-0066's
+/// both-spellings rule exists for.
+#[tokio::test]
+async fn issue732_same_frontier_alias_keyed_clear_is_not_resurrected() -> Result<()> {
+    let group_id = "df".repeat(32);
+    let (_base, advanced, _kp) = recovery_fixture(&group_id, invite_only_policy())?;
+    let mut cleared = advanced.clone();
+    cleared.fork_quarantine = None;
+    let mut stale = advanced.clone();
+    stale.fork_quarantine = Some(marker_at_frontier(&advanced));
+
+    let after = replay_scenario(&group_id, &cleared, &stale, "recovery-under-test").await?;
+    assert!(
+        after.fork_quarantine.is_none(),
+        "#732 r2: the alias-keyed live half is found, so its clear is honoured"
+    );
+    Ok(())
+}
+
+/// A three-revision owner-axis fixture through the PRODUCTION owner-certified
+/// seal (ADR-0038 requires certificate evidence, so `seal_commit` alone cannot
+/// build one). Returns the record at revision 2 and the same record advanced to
+/// revision 3 — the shape a staged owner-anchored advance leaves on disk.
+async fn owner_axis_advance_fixture(
+    group_id: &str,
+) -> Result<(
+    Arc<AppState>,
+    tempfile::TempDir,
+    x0x::groups::GroupInfo,
+    x0x::groups::GroupInfo,
+)> {
+    let (state, dir, owner) = owner_authority_state().await?;
+    let signer = state.agent.identity().agent_keypair();
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "owner-axis-advance".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.to_string(),
+        owner_certified_policy(&owner),
+    );
+    seal_commit_owner_certified(&state, &mut info, signer, now_millis_u64()).await?;
+    info.description = "at-revision-two".to_string();
+    seal_commit_owner_certified(&state, &mut info, signer, now_millis_u64()).await?;
+    let at_two = info.clone();
+    info.description = "the-anchored-advance".to_string();
+    seal_commit_owner_certified(&state, &mut info, signer, now_millis_u64()).await?;
+    assert_eq!(at_two.state_revision + 1, info.state_revision);
+    Ok((state, dir, at_two, info))
+}
+
+/// WHY (#732 r2 — cross-model review, Codex P2-a and omp nit (b)). The first
+/// repair carried the live marker forward UNCONDITIONALLY, which reverses a
+/// clear the node had legitimately granted. The reachable shape: an
+/// owner-anchored advance (or explicit owner seal) clears the marker and stages
+/// its journal, then the process dies before the live store is replaced. The
+/// higher-revision journal legitimately holds no marker; restoring one there
+/// contradicts `ForkQuarantine::owner_anchored_clear_permitted`, which had
+/// already said this advance clears — and it does so silently, because the
+/// clear's provenance is not in the image.
+///
+/// The rule: a FORWARD replay honours exactly that predicate, evaluated at the
+/// JOURNALLED revision, and only when the journal image carries no marker of
+/// its own. Its three refusals are the controls below, and each is a case where
+/// carrying the marker is the fail-closed answer.
+#[tokio::test]
+async fn issue732_forward_replay_honours_an_owner_anchored_clear() -> Result<()> {
+    let group_id = "e1".repeat(32);
+    let (_state, _dir, at_two, at_three) = owner_axis_advance_fixture(&group_id).await?;
+
+    // The marker the advance clears: owner axis ⇒ `no_anchor: false`, at the
+    // revision the advance is past.
+    let mut live = at_two.clone();
+    let marker = marker_at_frontier(&at_two);
+    assert!(
+        !marker.no_anchor,
+        "an owner-axis marker is the only kind a commit can clear"
+    );
+    assert!(
+        marker.owner_anchored_clear_permitted(at_three.state_revision),
+        "the fixture must satisfy the production predicate, or this test proves nothing"
+    );
+    live.fork_quarantine = Some(marker);
+
+    let after = replay_scenario(&group_id, &live, &at_three, &group_id).await?;
+    assert!(
+        after.fork_quarantine.is_none(),
+        "#732 r2: the journalled advance IS the clear — replaying it must not reverse it"
+    );
+    assert!(
+        after
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .is_none(),
+        "a clear removes the evidence with the marker, as every production clear arm does"
+    );
+    assert_eq!(after.state_revision, at_three.state_revision);
+
+    // Control 1 — a `no_anchor` marker is NEVER cleared by a commit, of any
+    // revision. Only the manual clear removes it, and a manual clear is a
+    // same-frontier event covered by the rule above.
+    let mut live_no_anchor = at_two.clone();
+    let mut no_anchor = marker_at_frontier(&at_two);
+    no_anchor.no_anchor = true;
+    live_no_anchor.fork_quarantine = Some(no_anchor);
+    assert!(
+        replay_scenario(&group_id, &live_no_anchor, &at_three, &group_id)
+            .await?
+            .fork_quarantine
+            .is_some_and(|marker| marker.no_anchor),
+        "a `no_anchor` marker survives a forward replay — the manual-only rule holds on disk too"
+    );
+
+    // Control 2 — an anchored revision that is NOT strictly past the
+    // evidenced one buys no clear (ADR-0064 r2: a same-revision sibling is
+    // the contested branch itself).
+    let mut live_same_revision = at_two.clone();
+    let mut at_advance = marker_at_frontier(&at_two);
+    at_advance.revision = at_three.state_revision;
+    assert!(!at_advance.owner_anchored_clear_permitted(at_three.state_revision));
+    live_same_revision.fork_quarantine = Some(at_advance);
+    assert!(
+        replay_scenario(&group_id, &live_same_revision, &at_three, &group_id)
+            .await?
+            .fork_quarantine
+            .is_some(),
+        "an advance level with the evidence revision does not clear"
+    );
+
+    // Control 3 — the journal image carries its OWN marker at the higher
+    // frontier. Two assertions of containment are not a clear; the live
+    // marker is kept as the documented fail-closed choice (it may be the
+    // stronger of the two, and a wrongly-kept marker is operator-clearable
+    // while a wrongly-lifted one is silent).
+    let mut staged_marked = at_three.clone();
+    staged_marked.fork_quarantine = Some(marker_at_frontier(&at_three));
+    assert!(
+        replay_scenario(&group_id, &live, &staged_marked, &group_id)
+            .await?
+            .fork_quarantine
+            .is_some_and(|kept| kept.revision == at_two.state_revision),
+        "the LIVE marker is kept when both halves assert containment"
+    );
+    Ok(())
+}
+
+/// WHY (#732 r2 — cross-model review, Codex P1). `fork_candidate_authenticated`
+/// proves the journal's terminal commit is genuine, but a `GroupInfo`'s OUTER
+/// `state_revision`/`state_hash` are plain fields beside the commit log. A
+/// local journal writer could copy the live record, alter ONLY the outer hash,
+/// and keep the untouched valid commit: the paired-replay verdict compares
+/// those outer scalars, so it declared a fork, and the lineage-free arm then
+/// installed PERMANENT `no_anchor` containment with no authenticated
+/// CONFLICTING commit behind it. Severity is bounded — it needs a local writer
+/// in the data directory, no remote induction was established — but the cost of
+/// binding is two comparisons and the damage is a quarantine nothing
+/// auto-clears.
+///
+/// The rule: the frontier the journal CLAIMS must be the frontier its verified
+/// commit SIGNS, and that commit must genuinely differ from the live committed
+/// state at the same revision.
+///
+/// The control is in this test rather than elsewhere: the SAME fixture with a
+/// genuinely different signed commit still installs the marker. Without that
+/// pair, "install nothing" would satisfy the forged arm.
+#[tokio::test]
+async fn issue732_forged_outer_hash_journal_installs_no_marker() -> Result<()> {
+    let group_id = "e2".repeat(32);
+    let (base, live, signer) = recovery_fixture(&group_id, invite_only_policy())?;
+
+    // The forgery: the LIVE record verbatim — its terminal commit still
+    // verifies and its committer still holds the revision-1 seat — with only
+    // the outer state hash rewritten so the verdict sees a fork.
+    let mut forged = live.clone();
+    forged.state_hash = "ff".repeat(32);
+    assert_eq!(
+        forged
+            .commit_log
+            .last()
+            .map(|retained| retained.commit.state_hash.clone()),
+        live.commit_log
+            .last()
+            .map(|retained| retained.commit.state_hash.clone()),
+        "the commit is untouched — only the record's outer claim was edited"
+    );
+    assert!(
+        !replay_scenario(&group_id, &live, &forged, &group_id)
+            .await?
+            .is_fork_quarantined(),
+        "#732 r2: a claimed frontier that no verified commit signs installs nothing"
+    );
+
+    // The control: a genuinely different signed commit at the same revision
+    // IS a fork, and still quarantines. Delete the binding and the arm above
+    // fails; delete the install and this arm fails.
+    let genuine = conflicting_sibling(&base, &signer, "the-other-branch")?;
+    assert!(
+        replay_scenario(&group_id, &live, &genuine, &group_id)
+            .await?
+            .fork_quarantine
+            .is_some_and(|marker| marker.no_anchor),
+        "the authenticated conflict still installs the marker — the binding is not a blanket refusal"
     );
     Ok(())
 }
