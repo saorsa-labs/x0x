@@ -3224,11 +3224,24 @@ async fn durable_apply_drains_an_alias_scoped_buffered_delta_once_759() -> Resul
         sync.read().await.get_task(&task_id).is_some(),
         "the held delta merged once the marker cleared"
     );
+    let list_id = *sync.read().await.id();
+    let persisted = crate::crdt::persistence::TaskListStorage::new(
+        snapshot
+            .parent()
+            .expect("task-list snapshot directory")
+            .to_path_buf(),
+    )
+    .load_task_list(&list_id)
+    .await
+    .expect("reload durable task-list snapshot");
     assert!(
-        snapshot.exists(),
-        "and its snapshot write landed (persistence was armed)"
+        persisted.get_task(&task_id).is_some(),
+        "the drained delta was committed to the durable task-list snapshot"
     );
-    let row = diag_row(state.as_ref(), &alias_key).await;
+    // Diagnostics intentionally coalesce every alias spelling onto the
+    // record's stable id. The resume gate records under the list's alias,
+    // but the public snapshot exposes the resulting counter on this row.
+    let row = diag_row(state.as_ref(), &group_id).await;
     assert_eq!(
         row.counters.task_deltas_quarantine_applied, 1,
         "exactly one apply — the resume ran once, not once per spelling (the \
@@ -3438,6 +3451,9 @@ async fn non_durable_apply_does_not_notify_the_live_handle_759() -> Result<()> {
             .await
     );
     assert_eq!(sync.quarantined_buffer_len(), 1);
+    let snapshot_before = tokio::fs::read(&snapshot)
+        .await
+        .expect("fixture setup persists the initial task-list snapshot");
 
     let event = member_added_event(
         &group_id,
@@ -3471,7 +3487,13 @@ async fn non_durable_apply_does_not_notify_the_live_handle_759() -> Result<()> {
         "no notification: the delta stays buffered"
     );
     assert!(sync.read().await.get_task(&task_id).is_none());
-    assert!(!snapshot.exists());
+    assert_eq!(
+        tokio::fs::read(&snapshot)
+            .await
+            .expect("initial task-list snapshot remains readable"),
+        snapshot_before,
+        "the refused apply neither drains nor changes the durable task-list snapshot"
+    );
     assert!(
         !sync.read().await.is_authorized_content_writer(&joiner),
         "no refresh: the captured roster is still the pre-clear one"
@@ -3529,6 +3551,9 @@ async fn replaced_not_durable_apply_keeps_the_visible_candidate_but_does_not_not
             .await
     );
     assert_eq!(sync.quarantined_buffer_len(), 1);
+    let snapshot_before = tokio::fs::read(&snapshot)
+        .await
+        .expect("fixture setup persists the initial task-list snapshot");
 
     let event = member_added_event(
         &group_id,
@@ -3584,7 +3609,13 @@ async fn replaced_not_durable_apply_keeps_the_visible_candidate_but_does_not_not
          would have applied the held delta here"
     );
     assert!(sync.read().await.get_task(&task_id).is_none());
-    assert!(!snapshot.exists());
+    assert_eq!(
+        tokio::fs::read(&snapshot)
+            .await
+            .expect("initial task-list snapshot remains readable"),
+        snapshot_before,
+        "the visible roster candidate does not change the durable task-list snapshot"
+    );
     let row = diag_row(state.as_ref(), &group_id).await;
     assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
     Ok(())
