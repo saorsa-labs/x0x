@@ -4000,9 +4000,16 @@ mod tests {
         assert_eq!(stats.snapshot(), after_bad);
     }
 
-    /// WHY: the daemon reads the process-wide counters, so the production
-    /// decode entry points must feed those and not a throwaway instance.
-    /// Deltas only — other tests in this process also decode.
+    /// WHY: the daemon reads the process-wide counters, so every production
+    /// decode entry point must feed those and not a throwaway instance. Each
+    /// entry point is checked on its own, with one good and one tampered
+    /// envelope, so a single mis-wired path cannot hide behind the others.
+    ///
+    /// Deltas are `>=`, not `==`: the counters are process-wide and other
+    /// tests decoding in parallel threads (plain `cargo test`) add to them.
+    /// That same traffic could in principle mask a broken path here; the
+    /// exact per-verify accounting is pinned by the private-instance test
+    /// above, and under nextest (one process per test) these bounds are tight.
     #[test]
     fn production_decode_entry_points_feed_process_wide_verify_stats() {
         let kp = AgentKeypair::generate().expect("keygen");
@@ -4015,21 +4022,43 @@ mod tests {
                 &payload,
             ))
             .expect("sign");
-        let encoded = encode_v2(
-            &ctx.agent_id,
-            &ctx.public_key_bytes,
-            &signature,
-            "soak",
-            &payload,
-        )
-        .expect("encode");
+        let v2 = |payload: &Bytes| {
+            encode_v2(
+                &ctx.agent_id,
+                &ctx.public_key_bytes,
+                &signature,
+                "soak",
+                payload,
+            )
+            .expect("encode")
+        };
+        let v2_good = v2(&payload);
+        let v2_bad = v2(&Bytes::from("TAMPERED"));
+        let v3_good = v3_fixture(&ctx, "soak", b"p");
+        let mut v3_bad = v3_good.to_vec();
+        let last = v3_bad.len() - 1;
+        v3_bad[last] ^= 1;
+        let v3_bad = Bytes::from(v3_bad);
 
-        let before = inner_verify_stats();
-        assert!(decode_v2(&encoded).expect("decode").verified);
-        let after = inner_verify_stats();
-        assert!(after.count > before.count);
-        assert!(after.total_ns > before.total_ns);
-        assert!(after.failed >= before.failed);
+        type Entry<'a> = (&'a str, &'a dyn Fn(&Bytes) -> bool, &'a Bytes, &'a Bytes);
+        let via_v2 = |d: &Bytes| decode_v2(d).is_ok_and(|m| m.verified);
+        let via_v3 = |d: &Bytes| decode_signed_kv_v3(d).is_ok_and(|m| m.verified);
+        let via_auto = |d: &Bytes| decode_auto(d.clone()).is_ok_and(|m| m.verified);
+        let entries: [Entry<'_>; 4] = [
+            ("decode_v2", &via_v2, &v2_good, &v2_bad),
+            ("decode_signed_kv_v3", &via_v3, &v3_good, &v3_bad),
+            ("decode_auto/v2", &via_auto, &v2_good, &v2_bad),
+            ("decode_auto/v3", &via_auto, &v3_good, &v3_bad),
+        ];
+        for (name, decode, good, bad) in entries {
+            let before = inner_verify_stats();
+            assert!(decode(good), "{name}: good envelope verifies");
+            assert!(!decode(bad), "{name}: tampered envelope is rejected");
+            let after = inner_verify_stats();
+            assert!(after.count >= before.count + 2, "{name}: two verifies");
+            assert!(after.failed > before.failed, "{name}: one failure");
+            assert!(after.total_ns > before.total_ns, "{name}: time accrued");
+        }
     }
 
     #[test]
