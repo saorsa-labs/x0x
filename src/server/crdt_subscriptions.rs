@@ -675,20 +675,32 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
             // network write is accepted; a corrupt snapshot fails closed
             // (Skipped — entry stays for the next restart) rather than
             // silently installing empty state.
+            // #732 finding 3: gather the named-group binding (authorized writers
+            // and the ADR-0068 D2 fork-quarantine gate) BEFORE constructing the
+            // list. The constructor starts the delta listener before it returns,
+            // so installing these on the returned handle — as this did — left a
+            // window in which a peer delta merged and PERSISTED into a list a
+            // live marker says is frozen.
+            let binding = super::routes::group_task_list_binding(&state, &entry.id).await;
             let result = match entry.role.as_str() {
                 ROLE_JOINED => {
                     state
                         .agent
-                        .join_task_list_persistent(&entry.topic, &state.task_list_state_dir)
+                        .join_task_list_persistent_bound(
+                            &entry.topic,
+                            &state.task_list_state_dir,
+                            binding,
+                        )
                         .await
                 }
                 ROLE_CREATED => {
                     state
                         .agent
-                        .create_task_list_persistent(
+                        .create_task_list_persistent_bound(
                             &entry.name,
                             &entry.topic,
                             &state.task_list_state_dir,
+                            binding,
                         )
                         .await
                 }

@@ -43,7 +43,9 @@ All notable changes to this project will be documented in this file.
     move the CRDT's winner, while the local operator was refused. Inbound deltas
     for a quarantined group's list are now **held in arrival order** (1024
     deltas / 1 MiB per list; oldest dropped and counted) with the CRDT left
-    byte-identical, and applied in order once the marker is gone. Reads keep
+    byte-identical from the first delta that observes the marker (the unpinned live
+    path leaves an accepted residual of one already-admitted delta per listener —
+    see below), and applied in order once the marker is gone. Reads keep
     serving the frozen state with the existing `fork_quarantined` annotation.
     The buffer is process-local: a restart converges by anti-entropy instead.
     Group **metadata** ingest (row 24) is untouched, so the clearing commit still
@@ -53,13 +55,86 @@ All notable changes to this project will be documented in this file.
     clear path is picked up by the listener within 5 s. The drain re-checks the
     ADR-0067 token (marker half) in the same critical section as the merge, so a
     marker re-installing mid-drain abandons it with the deltas still buffered in
-    order, and the admission decision is taken under the list write lock so
-    nothing can slip through between deciding and merging. A single delta larger
+    order, and the admission decision is taken under the list write lock, so no
+    other task-list writer can interleave between deciding and merging — though the
+    gate's roster read is released before the verdict, which is the one-delta
+    residual named below. A single delta larger
     than 1 MiB is dropped rather than held, so the per-list bound is the stated
-    one and not the transport's 4 MiB frame cap. **Residual:** a list's
-    `authorized_agents` set is captured at subscribe time, so a held delta from
-    an agent the clearing commit removes still applies at drain — identical to
-    live-path admission, recorded rather than silently inherited.
+    one and not the transport's 4 MiB frame cap.
+- **Three task-sync defects in that quarantine hold, found by an independent
+  third-model audit (GPT-6 Astra via Codex CLI) of the merged work; #732.** All
+  three are fixes that make the code match ADR-0068 D2, which is unchanged.
+  - **The gate is now installed before replication starts (finding 3).**
+    `Agent::{create,join}_task_list_persistent` start the delta listener before
+    they return a handle, and the daemon applied group authorization and the D2
+    gate to that returned handle — so on a restart with a quarantined group a
+    peer delta arriving during list restoration merged **and persisted** into a
+    list the marker says is frozen. The named-group binding (live authorized
+    writers + the gate) is now gathered by `tasks.rs::group_task_list_binding`
+    and handed to new `create_task_list_persistent_bound` /
+    `join_task_list_persistent_bound` constructors, which install it before the
+    listener exists. Both paths that produce a live handle — subscription
+    rehydration and `POST /task-lists` — use them. The authorization read also
+    goes through `server::resolve_group_entry_locked` now, so an **alias-keyed**
+    group's list is authorized and gated instead of silently getting neither
+    (the previous single-spelling `named_groups.get()` returned early, before the
+    gate install).
+  - **The drain re-authorizes against the roster the clearing commit left behind
+    (finding 4).** `authorized_agents` was snapshotted at create/rehydration, so
+    buffered deltas from a member the *clearing* commit removed were merged
+    against the contested roster. `TaskIngestGate` gains `with_pinned_roster`;
+    `drain_quarantine_buffer` refreshes the set from the live roster inside the
+    same critical section as the merge (before the ADR-0067 re-check, so that
+    re-check is still the last thing before the first merge) and skips entries
+    whose writer the refreshed roster no longer seats, counting them in
+    `task_deltas_quarantine_dropped` with the reason logged. Cross-model review of
+    that fix found the refresh still racy — the gate releases the roster lock
+    before the later awaits and `same_marker` ignores `state_revision`, so a
+    commit landing in that window was accepted — so the member set now travels
+    with the token it was derived at (`crdt::AuthorizedRoster`) — and, after a second
+    review round, the refresh and the merge now happen under **one pinned roster
+    read**: `crdt::TaskIngestGate::with_pinned_roster` takes the `named_groups`
+    read guard, derives set and token from it, and the drain installs, filters and
+    merges synchronously while that guard is held, so a roster writer cannot commit
+    mid-drain (it waits one bounded batch: ≤ 1024 merges, no I/O, no persistence).
+    That replaced a derive-release-compare-retry design which closed the window
+    only probabilistically and could be starved indefinitely by roster revision
+    churn — with admission coupled to the buffer that would have frozen the list —
+    so the retry budget is gone. A marker live at the pinned read abandons the
+    drain with the buffer intact. A clear that finds an EMPTY buffer refreshes the
+    cached roster too. **Residuals:** the two owner-anchored clears
+    (`named_groups.rs::try_adopt_member_added_across_gap`,
+    `apply_named_group_metadata_event_inner_serialized`) do not run the resume
+    hook, so after such a clear a removed member's NEW live deltas keep being
+    admitted until the next drain, manual clear or restart (their buffered deltas
+    are still re-authorized; the follow-up is to propagate a durable-clear
+    notification to those callers and run the resume hook after their locks
+    release, replay paths included); and a group with no resolvable record gets a
+    gate but
+    keeps **open** live admission, because installing an empty set on a failed
+    lookup would discard a seated member's work.
+  - **Incoming traffic can no longer starve the drain (finding 5).** The 5 s
+    drain poll was a fresh `sleep` created inside `select!` on every iteration,
+    so every received message cancelled it: with messages arriving less than 5 s
+    apart the buffer never drained, and post-clear deltas applied ahead of older
+    held ones. The deadline is now a pinned sleep that survives receives and is
+    reset only after it fires, and an inbound delta drains the buffer **before**
+    it is admitted — so under traffic the catch-up happens on the next delta
+    rather than on a timer, and arrival order is preserved. **Accepted residual:**
+    the live admission path is deliberately not roster-pinned (that would put a
+    roster read on every inbound delta), so a delta already admitted when a marker
+    installs still merges — at most **one per task-list listener**, after which
+    every delta observes the marker and is held. The freeze is therefore
+    "byte-identical from the first delta that observes the marker". The runbook's
+    "picked up within 5 s" is true again, including under a flood of undecodable
+    payloads, which never reach admission. Cross-model review found ordering still
+    breakable when a drain attempt was **abandoned** — the clear could land between
+    the attempt and the admission check, letting the newer delta merge past the
+    pending ones — so admission is now coupled to the buffer: a delta is applied
+    only when the buffer is empty, otherwise it queues behind what is pending
+    (same bounds, same drop counter). **Consequence:** a buffer that cannot be
+    drained at all (a group record that never returns) holds newer deltas behind
+    it; bounded, counted, and cleared by a restart.
 - **Outbound sends and secure-crypto routes now re-check the fork-quarantine
   marker immediately before their effect, not only at request start (ADR-0066
   §1 rows 1/2/4/6 and §4, slice 9; ADR-0067; #732).** These four paths were
