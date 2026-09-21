@@ -356,6 +356,24 @@ impl PersistOwner {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// True iff this generation still owns its path (#760).
+    ///
+    /// No-write ownership query for version-gated skips: it takes the
+    /// same leaf mutex as [`arm_persist`] and [`write_if_owner`], so the
+    /// answer linearizes against successor arming exactly like a write.
+    /// Query-before-arm — the caller's already-durable state was
+    /// legitimately current at that instant; arm-before-query — `false`,
+    /// and the caller must treat its unchanged-version skip as
+    /// supersession, not success.
+    pub(crate) fn is_current_owner(&self) -> bool {
+        let current = self
+            .entry
+            .persist_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current == self.generation
+    }
 }
 
 /// Arm `path` for a new persist owner and return its retained lease.
@@ -635,11 +653,17 @@ mod tests {
         let (_dir, path) = temp_path("persist-owner");
         let write = |p: &Path, b: &[u8]| write_snapshot_bytes(p, b);
         let g1 = arm_persist(&path);
+        assert!(g1.is_current_owner(), "fresh arming owns the path");
         assert!(
             write_if_owner(&g1, b"one", write).expect("owner write"),
             "current owner writes"
         );
         let g2 = arm_persist(&path);
+        assert!(
+            !g1.is_current_owner(),
+            "ownership query flips for the superseded generation"
+        );
+        assert!(g2.is_current_owner(), "query tracks the youngest arming");
         assert!(
             !write_if_owner(&g1, b"stale", write).expect("no io error"),
             "superseded generation is skipped"
