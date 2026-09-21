@@ -22,8 +22,9 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use super::named_groups::{
-    create_named_group, now_millis_u64, persist_named_groups_mutation, seal_commit_owner_certified,
-    update_named_group, AtomicWriteOutcome, CreateGroupRequest, UpdateGroupRequest,
+    create_named_group, now_millis_u64, persist_named_groups_mutation,
+    persist_named_groups_mutation_epoch_checked, seal_commit_owner_certified, update_named_group,
+    AtomicWriteOutcome, CreateGroupRequest, EpochCheckedPersist, EpochScope, UpdateGroupRequest,
 };
 use crate::server::AppState;
 
@@ -514,9 +515,14 @@ async fn stamp_and_seal_home(
     group_id: &str,
 ) -> Option<crate::groups::GroupInfo> {
     let signing_kp = state.agent.identity().agent_keypair();
-    let mut info = {
+    // ADR-0066 §4 / ADR-0067: capture the lifecycle epoch token in the SAME
+    // read guard as the clone, so the token and the record are the same
+    // observation. See the re-check at the persist below.
+    let (mut info, captured_epoch) = {
         let groups = state.named_groups.read().await;
-        groups.get(group_id).cloned()?
+        let info = groups.get(group_id).cloned()?;
+        let token = crate::server::lifecycle_epoch_token_locked(&groups, group_id);
+        (info, token)
     };
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let mut placements = std::collections::BTreeMap::new();
@@ -541,19 +547,56 @@ async fn stamp_and_seal_home(
         tracing::error!(group_id, "Home metadata seal failed: {e}");
         return None;
     }
-    if !matches!(
-        persist_named_groups_mutation(state, |groups| {
+    // ADR-0066 §4 / ADR-0067 — re-check under the write guard before the
+    // insert.
+    //
+    // THE HOLE THIS CLOSES (found in cross-model security review of #748).
+    // The clone above happens under a read guard that is then DROPPED, and
+    // `seal_commit_owner_certified` awaits real signing work. The insert
+    // below writes the WHOLE record. So a fork-quarantine marker installed
+    // during that window — e.g. a forked sibling device landing authenticated
+    // evidence on the Home group while this honest device is provisioning —
+    // was silently ERASED by this insert, and containment was dropped with
+    // nothing in the log.
+    //
+    // `MarkerOnly`: the seal bumps `state_revision` by construction, so a
+    // full-token compare would refuse every legitimate provisioning. The
+    // marker half is compared in BOTH directions — this path never installs
+    // a marker, so unlike the TreeKEM persist there is no install to
+    // mistake a new marker for, and resurrection is refused too.
+    match persist_named_groups_mutation_epoch_checked(
+        state,
+        group_id,
+        captured_epoch.as_ref(),
+        EpochScope::MarkerOnly,
+        |groups| {
             groups.insert(group_id.to_string(), info.clone());
             true
-        })
-        .await,
-        Ok(AtomicWriteOutcome::Durable)
-    ) {
-        tracing::error!(
-            group_id,
-            "Home metadata could not be persisted (marker not written; will retry)"
-        );
-        return None;
+        },
+    )
+    .await
+    {
+        EpochCheckedPersist::Applied(Ok(AtomicWriteOutcome::Durable)) => {}
+        EpochCheckedPersist::EpochMoved { observed } => {
+            // Nothing was written, so the marker SURVIVES. Provisioning is
+            // retried by its caller on the next pass; it is not looped here.
+            tracing::warn!(
+                group_id,
+                now_quarantined = observed
+                    .as_ref()
+                    .is_some_and(crate::groups::LifecycleEpochToken::is_fork_quarantined),
+                "ADR-0066 §4: refusing to seal Home metadata — the group's fork-quarantine \
+                 marker changed while the seal was in flight; the marker is preserved"
+            );
+            return None;
+        }
+        EpochCheckedPersist::Applied(_) => {
+            tracing::error!(
+                group_id,
+                "Home metadata could not be persisted (marker not written; will retry)"
+            );
+            return None;
+        }
     }
     Some(info)
 }
@@ -563,9 +606,12 @@ async fn stamp_and_seal_home(
 /// `home_digest` rides the signed state hash. Returns the resealed info.
 async fn reseal_home(state: &Arc<AppState>, group_id: &str) -> Option<crate::groups::GroupInfo> {
     let signing_kp = state.agent.identity().agent_keypair();
-    let mut info = {
+    // ADR-0066 §4 / ADR-0067: token captured in the same guard as the clone.
+    let (mut info, captured_epoch) = {
         let groups = state.named_groups.read().await;
-        groups.get(group_id).cloned()?
+        let info = groups.get(group_id).cloned()?;
+        let token = crate::server::lifecycle_epoch_token_locked(&groups, group_id);
+        (info, token)
     };
     info.home.as_ref()?;
     // Round-3 fix b: explicit Admin-role gate — resealing writes a signed
@@ -590,16 +636,37 @@ async fn reseal_home(state: &Arc<AppState>, group_id: &str) -> Option<crate::gro
         tracing::error!(group_id, "Home reseal failed");
         return None;
     }
-    if !matches!(
-        persist_named_groups_mutation(state, |groups| {
+    // ADR-0066 §4 / ADR-0067 — same hole, same fix as `stamp_and_seal_home`:
+    // clone, drop the guard, await the seal, then write the whole record. A
+    // marker installed in that window was erased by this insert.
+    match persist_named_groups_mutation_epoch_checked(
+        state,
+        group_id,
+        captured_epoch.as_ref(),
+        EpochScope::MarkerOnly,
+        |groups| {
             groups.insert(group_id.to_string(), info.clone());
             true
-        })
-        .await,
-        Ok(AtomicWriteOutcome::Durable)
-    ) {
-        tracing::error!(group_id, "resealed Home could not be persisted");
-        return None;
+        },
+    )
+    .await
+    {
+        EpochCheckedPersist::Applied(Ok(AtomicWriteOutcome::Durable)) => {}
+        EpochCheckedPersist::EpochMoved { observed } => {
+            tracing::warn!(
+                group_id,
+                now_quarantined = observed
+                    .as_ref()
+                    .is_some_and(crate::groups::LifecycleEpochToken::is_fork_quarantined),
+                "ADR-0066 §4: refusing to reseal Home — the group's fork-quarantine marker \
+                 changed while the reseal was in flight; the marker is preserved"
+            );
+            return None;
+        }
+        EpochCheckedPersist::Applied(_) => {
+            tracing::error!(group_id, "resealed Home could not be persisted");
+            return None;
+        }
     }
     Some(info)
 }
@@ -1801,6 +1868,143 @@ pub(in crate::server::routes) mod tests {
             .ok_or_else(|| anyhow::anyhow!("no group_id"))?;
         stamp_and_seal_home(state, &id).await;
         Ok(id)
+    }
+
+    // ───────── ADR-0066 §4 / ADR-0067: the Home seal TOCTOU ─────────
+
+    /// An authenticated-evidence marker for the Home group.
+    fn home_quarantine_marker(info: &crate::groups::GroupInfo) -> crate::groups::ForkQuarantine {
+        crate::groups::ForkQuarantine {
+            revision: info.state_revision.saturating_add(1),
+            state_hash: info.state_hash.clone(),
+            committed_by: "5c".repeat(32),
+            observed_at_ms: 1_726_500_000_000,
+            snapshot: crate::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            // Home is owner-axis, so this is the anchored branch.
+            no_anchor: false,
+        }
+    }
+
+    /// THE ATTACK, from the cross-model security review of PR #748.
+    ///
+    /// `reseal_home` clones the Home record under a read guard, DROPS that
+    /// guard, awaits `seal_commit_owner_certified`, then writes the WHOLE
+    /// record back. A forked sibling device that lands authenticated fork
+    /// evidence on the Home group inside that window used to have its marker
+    /// **erased** by the write — containment dropped silently, on the one
+    /// group where the owner axis matters most.
+    ///
+    /// The claim defended: the reseal is REFUSED and the marker SURVIVES.
+    #[tokio::test]
+    async fn adr0066_marker_installed_during_home_reseal_survives_and_the_reseal_refuses(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [7u8; 32]).await?;
+        let id = provision_duplicate_home(&state).await?;
+
+        // Arm the barrier to land the marker between the clone and the
+        // insert — inside the roster write guard, the tightest interleaving a
+        // concurrent writer could achieve.
+        let armed_id = id.clone();
+        let _guard = super::super::named_groups::epoch_recheck_barrier::install(
+            &id,
+            Box::new(move |groups| {
+                if let Some(info) = groups.get_mut(&armed_id) {
+                    if info.fork_quarantine.is_none() {
+                        info.fork_quarantine = Some(home_quarantine_marker(info));
+                    }
+                }
+            }),
+        );
+
+        assert!(
+            reseal_home(&state, &id).await.is_none(),
+            "a marker landing mid-reseal must REFUSE the reseal"
+        );
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Home record vanished"))?;
+        assert!(
+            live.is_fork_quarantined(),
+            "and the marker must SURVIVE — erasing it is the defect, and it is silent"
+        );
+        Ok(())
+    }
+
+    /// NEGATIVE CONTROL / blast radius: with no marker in play the Home
+    /// reseal behaves exactly as it did before this slice. A containment gate
+    /// that changes the unquarantined path is a regression for every install.
+    #[tokio::test]
+    async fn adr0066_home_reseal_is_unchanged_without_a_marker() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [8u8; 32]).await?;
+        let id = provision_duplicate_home(&state).await?;
+        let before = state.named_groups.read().await.get(&id).cloned();
+
+        assert!(
+            reseal_home(&state, &id).await.is_some(),
+            "an unquarantined Home must reseal exactly as before"
+        );
+        let after = state
+            .named_groups
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Home record vanished"))?;
+        assert!(!after.is_fork_quarantined());
+        assert!(
+            before.is_some_and(|b| b.state_revision < after.state_revision),
+            "the seal must still advance the chain — this is why the site compares \
+             EpochScope::MarkerOnly and not the full token"
+        );
+        Ok(())
+    }
+
+    /// The same window on the PROVISIONING path (`stamp_and_seal_home`), not
+    /// just the reseal. Both share the clone → await-seal → whole-record-write
+    /// shape, so both are gated; asserting only one would leave the other free
+    /// to regress.
+    #[tokio::test]
+    async fn adr0066_marker_installed_during_home_stamp_survives() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [9u8; 32]).await?;
+        let id = provision_duplicate_home(&state).await?;
+
+        let armed_id = id.clone();
+        let _guard = super::super::named_groups::epoch_recheck_barrier::install(
+            &id,
+            Box::new(move |groups| {
+                if let Some(info) = groups.get_mut(&armed_id) {
+                    if info.fork_quarantine.is_none() {
+                        info.fork_quarantine = Some(home_quarantine_marker(info));
+                    }
+                }
+            }),
+        );
+
+        assert!(
+            stamp_and_seal_home(&state, &id).await.is_none(),
+            "a marker landing mid-stamp must REFUSE the stamp"
+        );
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&id)
+                .is_some_and(crate::groups::GroupInfo::is_fork_quarantined),
+            "and the marker must survive the provisioning write"
+        );
+        Ok(())
     }
 
     /// WHY (review P2): an unreadable task-list manifest is not evidence of

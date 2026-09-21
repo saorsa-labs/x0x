@@ -110,7 +110,52 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
 - **Delegation & mentions (ADR-0040):** `POST /groups/:id/delegate`,
   `GET /groups/:id/delegations`; `mentions` and `delegation_digest` fields on
   `POST /groups/:id/send` and on the signed `GroupPublicMessage` wire object;
-  the WS `mention` event.
+  the WS `mention` event. **Availability note (ADR-0066 §3b):** while a group
+  is fork-quarantined, delegation minting refuses with 409 `fork_quarantined`
+  and existing delegations are not honoured — including send-as attribution
+  arriving over gossip and delegated task-execute — until
+  `POST /groups/:id/quarantine/clear`. `GET /groups/:id/delegations` keeps
+  serving, annotated. See `docs/runbooks/fork-quarantine.md` §3 (Surface behaviour).
+- **Fork quarantine, two further refusal conditions (ADR-0066 §4, slice 7;
+  ADR-0067):** the marker is also honoured when it lands *mid-operation*,
+  because two paths persist a whole group record captured earlier and would
+  otherwise overwrite — and thereby erase — a marker that arrived in the
+  meantime.
+  - **Invite join** (`POST /groups/join`-family install) answers 409
+    `fork_quarantined` when evidence lands inside its persist window. The body
+    is the §5 shape; `reason` is `fork_quarantined`. Nothing is seated and
+    nothing is written. **It is retryable:** a retry re-reads the group and
+    either seats cleanly or refuses with the ordinary §1 gate.
+  - **Encrypted (GSS) KvStore routes** now refuse with 409 `fork_quarantined`
+    while the group is quarantined — previously the cached authorization
+    context was blind to a marker installed after the store bound, so writes
+    kept being authorized on a pre-fork roster. Sealing, opening and
+    membership all fail closed. **Recoverable, unlike a withdrawal:** the
+    context re-arms on the next refresh after
+    `POST /groups/:id/quarantine/clear`.
+
+  Clients should already be matching `reason`, not `error`; no new code or
+  status is introduced. See `docs/runbooks/fork-quarantine.md` §3.3 (Special
+  surfaces — Row 22, lifecycle epoch token / persist-lock re-check).
+- **Fork quarantine on the outbound paths (ADR-0066 §1 rows 1/2/4/6, §4;
+  slice 9):** `POST /groups/:id/send`, `POST /groups/:id/secure/encrypt` and
+  `POST /groups/:id/secure/reseal` (and TreeKEM encrypt behind the second) now
+  re-check the marker **immediately before the effect** as well as at request
+  start. A marker that lands while the request is in flight yields the same 409
+  `fork_quarantined` body — same `reason`, same prose, same `clear_with`; no new
+  code and no new status. Nothing is exported on that refusal: no message is
+  published, no ciphertext or sealed envelope is returned, no history row is
+  written and no ratchet generation is burned.
+
+  Two client-visible points. First, unlike the invite-join refusal above this
+  one is **not retryable**: a retry meets the entry gate and refuses again,
+  because the group is now quarantined until
+  `POST /groups/:id/quarantine/clear`. Second, a concurrent legitimate roster
+  advance does **not** refuse a send — only the marker half of the epoch token
+  is compared. The residual window between the re-check and the bytes reaching
+  the wire is one message wide and documented in
+  `docs/runbooks/fork-quarantine.md` §3.3 (Special surfaces — rows 1, 2, 4 and
+  6, outbound send and crypto).
 - **Device sync (ADR-0041):** `GET /sync/devices`, `POST /sync/devices/enroll`,
   `DELETE /sync/devices/:machine_id`; owner-to-owner SyncV1 streams.
 - **Placement & key-move (ADR-0043):** `GET /owner/placement`,
@@ -1117,10 +1162,10 @@ helper API.
 | GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group delete <group_id>` | **Phase D.3**: any admin permanently deletes the group with a signed terminal withdrawal |
-| POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker — on a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set |
+| POST | `/groups/:id/quarantine/clear` | `x0x groups quarantine clear <group_id> [--force --reason <REASON>]` | **ADR-0064 slice 3**: manually clear the LOCAL fork-quarantine marker (`:id` accepts either the roster map key or the group's stable id) — on a node holding the group's owner USER key (no flags needed; the endpoint mints+verifies a fresh quarantine-clear attestation over the current head) or `force=true` with a non-empty `reason`; typed 409 (`owner_key_unavailable`/`force_required`) otherwise; 409 when no marker is set |
 | POST | `/groups/:id/send` | `x0x group send <group_id> <body> [--kind chat\|announcement] [--thread-root <id>] [--reply-to <id>] [--mentions <hex>...] [--delegation-digest <hex>]` | **Phase E**: publish a signed message to a SignedPublic group. `--mentions` (repeatable) routes structured ADR-0040 mentions daemon-side; `--delegation-digest` authorizes send-as attribution |
-| POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit) |
-| GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history |
+| POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit). **ADR-0066 §3b**: 409 `fork_quarantined` while the group is fork-quarantined — refused before anything is signed, committed or published |
+| GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history. **ADR-0066 §3b**: keeps serving while fork-quarantined, with `fork_quarantined: true` and a `fork_quarantine` object added to the response |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
@@ -1552,11 +1597,25 @@ plane. See `docs/primers/groups.md`.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/task-lists` | `x0x tasks list` | List task lists |
-| POST | `/task-lists` | `x0x tasks create <name> <topic>` | Create a task list |
-| GET | `/task-lists/:id/tasks` | `x0x tasks show <list_id>` | List tasks |
-| POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task |
-| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim <list> <task> [--fence-token <t>] [--delegation <hex>]` / `x0x tasks complete ...` | Update task state (`action` is chosen by the subcommand). `--fence-token` is the local-replica CAS precondition (409 on mismatch); `--delegation` is the hex ADR-0040 digest authorizing the claim |
+| GET | `/task-lists` | `x0x tasks list` | List task lists. **ADR-0066 §3c**: a group-scoped entry gains `fork_quarantined: true` and a `fork_quarantine` object while its group is fork-quarantined |
+| POST | `/task-lists` | `x0x tasks create <name> <topic>` | Create a task list. **ADR-0066 §3c**: 409 `fork_quarantined` when the topic is group-scoped and that group is fork-quarantined — refused before any handle, registration or sync listener exists |
+| GET | `/task-lists/:id/tasks` | `x0x tasks show <list_id>` | List tasks. **ADR-0066 §3c**: keeps serving while fork-quarantined, with `fork_quarantined: true` and a `fork_quarantine` object added to the response |
+| POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task. **ADR-0066 §3c**: 409 `fork_quarantined` before any CRDT mutation, snapshot write or delta publish |
+| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim <list> <task> [--fence-token <t>] [--delegation <hex>]` / `x0x tasks complete ...` | Update task state (`action` is chosen by the subcommand). `--fence-token` is the local-replica CAS precondition (409 on mismatch); `--delegation` is the hex ADR-0040 digest authorizing the claim. **ADR-0066 §3c**: 409 `fork_quarantined` before the fence token is parsed and before any mutation, whether or not a delegation is cited |
+
+**Fork quarantine (ADR-0066 §3c, row 20).** A task list whose id is
+group-scoped (`x0x.group.<group_id>.symphony.<list_id>`) is bound to a named
+group, and while this node holds a fork-quarantine marker for that group its
+**mutations refuse and its reads keep serving, annotated**. The roster the
+list's CRDT admission set is derived from is exactly what is in dispute, so a
+claim or completion accepted on it is an act taken under disputed membership;
+losing the read, by contrast, would remove the only view of what the contested
+roster has been doing. The refusal is the standard 409 `fork_quarantined` body
+(below) and arrives on the **first** attempt after the marker installs — there
+is no warn-only window (ADR-0066 R5). Task lists that are not group-scoped are
+unaffected, as are group-scoped lists for any other group. The annotation keys
+are **absent entirely** — never `null`, never `false` — when there is no
+marker, so unquarantined responses are byte-identical to before.
 
 **Durability (#557): every list carries an on-disk content snapshot.** The
 daemon snapshots the full list state (task ids, titles, claim/complete
@@ -1892,6 +1951,79 @@ the auth middleware answers `403` on both before the handler runs; a rider
 can neither read rows nor learn row counts for scopes outside its grants.
 That boundary is unchanged by this issue.
 
+### Fork quarantine on the history surface (ADR-0066 §3a)
+
+While this node holds a fork-quarantine marker for a group (see the 409
+`fork_quarantined` section under Error handling), the history surface splits in
+two: **reads always serve, the purge always refuses.**
+
+**Reads are annotated, never refused.** `GET /history`,
+`GET /history/message/:msg_id`, `GET /history/search`, `GET /history/scopes`,
+`GET /history/stats`, `GET /diagnostics/history` and
+`GET /groups/:id/messages` return the same rows they always did and add two
+envelope fields:
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "records": [
+    {"scope": "group:g1", "seen_at_ms": 1788091400000, "fork_quarantined_at_ingest": true}
+  ],
+  "fork_quarantined": true,
+  "fork_quarantine": {
+    "clear_with": "POST /groups/:id/quarantine/clear",
+    "scopes": [
+      {"scope": "group:g1", "revision": 9,
+       "observed_at_ms": 1788091300000, "no_anchor": true}
+    ]
+  }
+}
+```
+
+- `fork_quarantined` is a flag; `fork_quarantine.scopes` names every
+  quarantined group **in view**, each with the marker's `revision`,
+  `observed_at_ms` and `no_anchor` — the same fields the 409 body carries.
+  It is a list because these surfaces are not single-group: a cross-scope
+  search, scope enumeration, `/history/stats` and `/diagnostics/history` can
+  each see several at once. For the two node-wide surfaces, "in view" means
+  every group this node has quarantined.
+- **Both keys are absent when nothing in view is quarantined** — not `false`,
+  not `null` — so an existing client's body is byte-identical. No client is
+  required to read them.
+- `fork_quarantined_at_ingest` on a **row** means that row arrived at or after
+  the marker's `observed_at_ms`, i.e. on a contested roster. Ingest is never
+  refused (ADR-0066 R3: refusing it would blank the record across exactly the
+  incident window), so this tag is what separates the incident from the
+  group's earlier traffic. It is derived from the live marker rather than
+  stored, so a manual clear drops the label while keeping every row.
+  `GET /groups/:id/messages` serves signed messages rather than store rows and
+  therefore carries the envelope annotation only.
+- Why reads are never refused: the durable record is the operator's only view
+  of a fork while it is happening, and refusing it would delete that view at
+  the moment it matters most (ADR-0066 Drivers).
+
+**`DELETE /history?scope=group:<ID>` is refused** with the 409
+`fork_quarantined` body while the marker is set, and the check runs **before**
+any deletion, so the store is left unchanged. A purge destroys the ADR-0023
+forensic record irreversibly — the one thing quarantine exists to preserve —
+so it fails closed from the first request after the marker installs (ADR-0066
+R5: no warn-only window). DM and topic scopes are unaffected; only
+`group:<ID>` scopes consult the marker. The remedy is the marker's own: clear
+it (`x0x groups quarantine clear <ID>`, adding `--force --reason "…"` for an
+ordinary group), then purge.
+
+**Either spelling of the group id works.** History rows are scoped by the
+group's **stable** id (what `GET /history/scopes` lists), while a daemon's
+roster — and therefore the marker — is keyed by whichever id that daemon
+learned the group under; the two can differ. Both the purge gate and every
+annotation resolve the direct key first and then by stable id, so the refusal
+and the label are the same whichever spelling you use. The refusal's `error`
+sentence names the **roster key** (the spelling the roster is filed under), but
+since #732 `POST /groups/:id/quarantine/clear` accepts either spelling too, so
+either id in the refusal is usable. `/history/stats` + `/diagnostics/history`
+list both spellings when they differ.
+
 ## Remote exec
 
 Run a command on **another** agent's machine. Disabled by default; every request is authorized on the **responder** (target) daemon, not the caller. The target runs `argv` only if remote exec is enabled there, the sender is a verified `Accept`-trust contact, and the `(agent_id, machine_id)` pair + exact argv are allow-listed in its exec ACL (`docs/exec.md`). `argv` is never shell-interpreted. A denied request still returns `200` with a non-null `denial_reason` (e.g. `exec_disabled`, `unverified_sender`, `trust_rejected`, `agent_machine_not_in_acl`, `argv_not_allowed`, `cwd_not_allowed`, `shell_metachar_in_argv`) — the refusal is carried in the body, not the HTTP status.
@@ -2002,6 +2134,43 @@ Server → client (complete outbound frame set):
 | `mention` | `topic`, `group_id`, `msg_id`, `author_agent_id`, `reason` (`"mention"` \| `"delegation"`), `mentions[]` (omitted when empty), `timestamp` | An ingested, validated group message names the local agent (ADR-0040). **Emitted only on the group's shared topic channel — the session must be subscribed to the group's topic; an unsubscribed `/ws` session gets nothing (routing still happens daemon-side).** A delegation carrier directed at the local agent produces the same frame with `reason: "delegation"` — there is no separate `delegation` event type |
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
+
+**Fork-quarantine annotation (ADR-0066 §3d).** When a group is
+fork-quarantined on this node, its group-scoped frames are **labelled, never
+refused and never dropped** — the WS plane is the live mirror of the
+annotated history reads, and an operator watching an incident must not lose
+the stream. Two frame classes carry the label:
+
+- `mention` frames on the group's topic channel;
+- ADR-0023 `subscribe` **backfill** frames for a group topic — the replayed
+  `message` rows and the `live` boundary frame that closes the backfill.
+
+```json
+{"type":"live","topic":"x0x.groups.public.<GROUP_ID>",
+ "fork_quarantined":true,
+ "fork_quarantine":{"clear_with":"POST /groups/:id/quarantine/clear",
+   "scopes":[{"scope":"group:<GROUP_ID>","revision":9,
+              "observed_at_ms":1788091300000,"no_anchor":true}]}}
+```
+
+- Both keys are **absent entirely** (never `null`, never `false`) when the
+  group is not quarantined, so unaffected groups, all non-group topics and
+  the `/ws/direct` DM backfill are byte-identical to before.
+- The per-scope object is the same shape the 409 `fork_quarantined` body and
+  the annotated `/history` envelopes use, so one parser serves both planes.
+  `scopes` always holds exactly one entry here: a WS frame belongs to one
+  group. `no_anchor: true` means nothing will clear the marker
+  automatically — `clear_with` is the only exit.
+- The label rides the annotation rather than the `error` frame because
+  `error` carries only `message`, with nowhere to put a matchable code.
+- A labelled `reason: "delegation"` mention describes what was **observed**,
+  not what was authorized: the grant itself is refused independently.
+- The marker is read when each frame is emitted, so a session that
+  subscribed before the marker was set starts seeing the label on its next
+  frame and stops on the next frame after a manual clear — no reconnect.
+- Live gossip `message` frames (the raw topic plane, like the `publish`
+  verb) are not annotated; use `mention` frames or a `/history` read for
+  the labelled view.
 
 **Delivery semantics and back-pressure contract (issues #122 / #147 / #149 / #287).**
 Each WebSocket session has one bounded outbound queue (1024 frames) between
@@ -2130,6 +2299,67 @@ Common status codes:
 | 500 | Internal error |
 | 503 | Service temporarily unavailable |
 
+Error bodies are `{ "ok": false, "error": <message> }`. Some responses add a
+machine-readable `reason` field, for conditions that share an HTTP status but
+must stay machine-separable (two distinct 409 CONFLICT conditions, say). **Where
+a `reason` is present, match on `reason`; `error` is prose and its wording is
+not a contract.**
+
+The `x0x` CLI renders a reason-bearing error as
+`<message> (HTTP <code>, reason: <reason>)`, and one with no `reason` as
+`<message> (HTTP <code>)`. The reason-bearing responses today are the 409
+`fork_quarantined` below and the 409 `recipient_not_active` on group key
+sealing.
+
+### 409 `fork_quarantined` (ADR-0064 / ADR-0066 §5)
+
+While this node holds a fork-quarantine marker for a group, the
+membership-gated routes (`POST /groups/:id/send`, TreeKEM encrypt/decrypt, and
+the `secure/encrypt`, `secure/decrypt`, `secure/reseal` family), the delegation
+grant (`POST /groups/:id/delegate`, ADR-0066 §3b) and the group-scoped
+task-list mutations (`POST /task-lists`, `POST /task-lists/:id/tasks`,
+`PATCH /task-lists/:id/tasks/:tid`, ADR-0066 §3c) refuse with the body below —
+and so does `DELETE /history?scope=group:<ID>` (ADR-0066 §3a: the purge destroys
+the forensic record, while history **reads** stay open and are annotated instead
+— see
+[Fork quarantine on the history surface](#fork-quarantine-on-the-history-surface-adr-0066-3a)):
+
+```json
+{
+  "ok": false,
+  "reason": "fork_quarantined",
+  "error": "group is fork-quarantined on this node: … so this operation is refused here. It clears when an owner-anchored commit advances past revision 7, or immediately with the manual clear POST /groups/:id/quarantine/clear (CLI: `x0x groups quarantine clear <GROUP_ID>` …).",
+  "fork_quarantine": {
+    "revision": 7,
+    "observed_at_ms": 1700000000123,
+    "no_anchor": false,
+    "clear_with": "POST /groups/:id/quarantine/clear"
+  }
+}
+```
+
+`error` is a human sentence naming the condition, why the operation is refused,
+and the clearing path; it branches on `no_anchor`, because a `no_anchor` marker
+never auto-clears and its manual clear requires `force` plus a reason.
+`fork_quarantine.clear_with` is the same remedy, machine-readable.
+
+**`no_anchor` (ADR-0066 §2).** `true` means the group's policy has no owner
+axis, so **no commit on any ancestry will ever clear the marker** — the only
+exit is `POST /groups/:id/quarantine/clear` with `force: true` and a non-empty
+`reason` (without `force` that endpoint answers 409 `force_required`, because
+there is no owner axis to attest with). Before ADR-0066 these ordinary groups
+never received a marker at all and no route refused for them; they now refuse
+the same rows as owner-axis groups, from the first request after the marker
+installs. Operators should expect `fork_quarantine_set` to rise after
+upgrading — see the
+[fork quarantine runbook](runbooks/fork-quarantine.md) §5.
+
+**One-time compatibility break (ADR-0066 §5).** This body previously was
+`{ "ok": false, "error": "fork_quarantined" }`. A client matching the literal
+`error == "fork_quarantined"` must move to `reason`. HTTP 409 and `ok: false`
+are unchanged. See the
+[fork quarantine runbook](runbooks/fork-quarantine.md) §5 (Upgrade notes).
+
 ## CLI quick examples
 
 ```bash
@@ -2174,7 +2404,15 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
 | GET | `/diagnostics/relay` | `x0x diagnostics relay` | ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence |
-| GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023) |
+| GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023), including the ADR-0068 D1 quarantine-pin pair |
+
+`GET /diagnostics/history` adds two ADR-0068 D1 fields to the ADR-0023 writer and
+reaper counters:
+
+| Field | Kind | Meaning |
+|---|---|---|
+| `history_quarantine_pinned_scopes` | Gauge (last pass) | History scopes pinned because their group holds a live fork-quarantine marker, i.e. exempt from age and byte eviction. This is the `G` in the disk bound `[history] max_bytes × (1 + G/16)`. |
+| `history_quarantine_pinned_evictions` | Cumulative | Rows evicted from **inside** a pinned scope because that scope exceeded its own ceiling (`min(4 × base, max_bytes/16)`, `base` = its `scope_limits` entry or `max_bytes/64`; 64 MiB at the 1 GiB default). Non-zero means a quarantined group is at its ceiling and shedding its oldest rows — no other scope ever pays for that overshoot. |
 
 ### `GET /diagnostics/dm`
 
@@ -2247,6 +2485,9 @@ Key counter fields (flattened into each group row):
 |---|---|---|
 | `messages_dropped_write_policy_violation` | Receiver | Inbound public messages rejected by the ingest pipeline for write-policy reasons (e.g. `MembersOnly` author not in `members_v2`). The canary for the join-roster-propagation regression: a spike here on the owner side after a joiner posts means `members_v2` is stale. |
 | `sends_rejected_write_policy` | Sender | Outgoing sends from this daemon rejected locally by a members-only write-access policy. A non-zero value means this daemon is absent from its own roster copy. Tracked separately so operators can distinguish "I cannot see joiners" from "I am missing from my own roster". |
+| `task_deltas_quarantine_buffered` | Receiver | ADR-0068 D2: inbound peer task-CRDT deltas HELD (not applied) because this group's fork-quarantine marker is live. The CRDT state stays byte-identical while this climbs, from the first delta that observes the marker — the live admission path is not roster-pinned, so at most one already-admitted delta per listener can still merge just after the marker installs (accepted residual, see the runbook). Held deltas apply in arrival order once the marker clears. |
+| `task_deltas_quarantine_dropped` | Receiver | ADR-0068 D2: held task deltas dropped because the per-list bound (1024 deltas / 1 MiB) was reached — oldest first. Not silent loss (merges are idempotent and anti-entropy refills after the clear), but a climbing value means the quarantine is outlasting the buffer. |
+| `task_deltas_quarantine_applied` | Receiver | ADR-0068 D2: held task deltas applied, in arrival order, after the marker cleared. |
 | `invites_refused_reasons` | Joiner / inviter | `{"<reason>": count}` map of signed-invite refusals for this group, keyed by the typed reason. Joiner-side (`POST /groups/join`): `invite_unsigned`, `invite_signature_invalid`, `inviter_key_mismatch`, `inviter_key_revoked`, `invite_owner_countersignature_missing`, `invite_owner_countersignature_invalid`, `invite_malformed`, plus the base/addressing/mode-matrix refusals the join route answers with 409. Inviter-side: `invite_not_addressed_to_joiner` when an addressed invite's `MemberJoined` arrives from a different agent (the secret is not consumed). **Omitted from the row while empty.** |
 
 ### `GET /diagnostics/connect`

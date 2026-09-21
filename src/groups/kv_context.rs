@@ -487,6 +487,39 @@ impl GssKvSecureContext {
             state.active_members.clear();
             return;
         }
+        // ADR-0066 §4 / ADR-0067 — make a marker a REFRESH TRIGGER for this
+        // cached context, closing the bind-time gap in §1 rows 10–12 for the
+        // GSS plane.
+        //
+        // This was the one cached KV context blind to the marker.
+        // `PublicState::from_group` folds `!is_fork_quarantined()` into
+        // `valid`, and `TreeKemKvAuthorizationContext::update_from_group`
+        // clears its roster while quarantined — but `GssState` had no notion
+        // of quarantine at all, and neither did the refresh that feeds it. So
+        // a marker installed AFTER a GSS store bound was invisible to work
+        // already in flight: the cached roster kept authorizing writers on an
+        // authorization taken before the fork was observed. That is exactly
+        // the bind-time gap §4 exists to close, and the reason §4 asks for the
+        // install to be a refresh trigger "from both ends".
+        //
+        // The shape deliberately matches the TreeKEM context's: empty the
+        // roster and drop the secret so sealing, opening and membership all
+        // fail closed. It is NOT terminal like `withdrawn` — a later refresh
+        // after a manual clear re-arms the context from live state, because a
+        // quarantine is recoverable and a withdrawal is not.
+        if info.is_fork_quarantined() {
+            tracing::warn!(
+                target: "x0x::kv",
+                "gss kv context suspended for group {} (epoch {}): ADR-0066 fork quarantine — \
+                 sealing, opening and membership fail closed until the marker is cleared",
+                state.stable_group_id,
+                state.secret_epoch
+            );
+            state.shared_secret = None;
+            state.active_members.clear();
+            state.member_roles.clear();
+            return;
+        }
         let next = GssState::from_group(info);
         let changed = state.shared_secret != next.shared_secret
             || state.secret_epoch != next.secret_epoch
@@ -1023,5 +1056,90 @@ mod tests {
         assert!(!ctx.is_active_member(&owner));
         assert!(!ctx.is_authorized_writer(&owner));
         assert!(!ctx.is_authorized_reader(&owner));
+    }
+
+    /// An authenticated-evidence marker, minimal but well-formed.
+    fn quarantine_marker(info: &GroupInfo, revision: u64) -> crate::groups::ForkQuarantine {
+        crate::groups::ForkQuarantine {
+            revision,
+            state_hash: info.state_hash.clone(),
+            committed_by: "22".repeat(32),
+            observed_at_ms: 1,
+            snapshot: crate::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        }
+    }
+
+    /// ADR-0066 §4 / ADR-0067 — the bind-time gap, GSS plane (§1 rows 10–12).
+    ///
+    /// This was the ONE cached KV context blind to the marker: `PublicState`
+    /// folds `!is_fork_quarantined()` into `valid` and the TreeKEM context
+    /// clears its roster, but `GssState` had no notion of quarantine at all.
+    /// So a marker installed AFTER a GSS store bound was invisible to work
+    /// already in flight — the cached roster kept authorizing writers on an
+    /// authorization taken before the fork was observed.
+    ///
+    /// The claim defended here: a refresh that SEES the marker suspends the
+    /// context, so sealing, opening and membership all fail closed.
+    #[test]
+    fn gss_context_suspends_when_a_marker_appears_after_the_bind() {
+        let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
+        let member = keypair.agent_id();
+        let mut info = group("gss-quarantine-g", member);
+        let ctx = GssKvSecureContext::from_group(&info).expect("context");
+        let store_id = KvStoreId::new([21; 32]);
+
+        // Bound on a healthy group: the member is authorized and can seal.
+        assert!(ctx.is_active_member(&member));
+        assert!(ctx.seal(&store_id, b"before").is_ok());
+
+        // A fork observation lands.
+        info.fork_quarantine = Some(quarantine_marker(&info, 7));
+        ctx.update_from_group(&info);
+
+        assert!(
+            !ctx.is_active_member(&member),
+            "the cached roster must be emptied, or a contested roster keeps authorizing"
+        );
+        assert!(
+            !ctx.is_authorized_writer(&member),
+            "writes must fail closed while the group is quarantined"
+        );
+        assert!(
+            ctx.seal(&store_id, b"after").is_err(),
+            "the secret must be dropped so nothing new can be sealed under the fork"
+        );
+    }
+
+    /// ...and a quarantine is RECOVERABLE, unlike a withdrawal. After a manual
+    /// clear the next refresh re-arms the context from live state. Getting this
+    /// wrong would turn every quarantine into a permanently dead store, which
+    /// is why it is a separate assertion rather than a footnote.
+    #[test]
+    fn gss_context_re_arms_after_the_marker_is_cleared() {
+        let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
+        let member = keypair.agent_id();
+        let mut info = group("gss-clear-g", member);
+        let ctx = GssKvSecureContext::from_group(&info).expect("context");
+        let store_id = KvStoreId::new([22; 32]);
+
+        info.fork_quarantine = Some(quarantine_marker(&info, 7));
+        ctx.update_from_group(&info);
+        assert!(!ctx.is_active_member(&member));
+
+        info.fork_quarantine = None;
+        ctx.update_from_group(&info);
+        assert!(
+            ctx.is_active_member(&member),
+            "a cleared quarantine must re-arm the context — it is not terminal like withdrawal"
+        );
+        assert!(
+            ctx.seal(&store_id, b"after-clear").is_ok(),
+            "and sealing must work again once the marker is gone"
+        );
     }
 }

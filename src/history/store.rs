@@ -26,6 +26,39 @@ pub const MAX_QUERY_LIMIT: usize = 500;
 /// Rows evicted per retention round-trip while over budget.
 const RETAIN_EVICT_BATCH: usize = 256;
 
+/// ADR-0068 D1: a pinned (fork-quarantined) scope may hold this multiple of
+/// its normal per-scope bound before the reaper evicts inside it.
+///
+/// Four retention windows' worth of the group's own history, so the forensic
+/// record spans the incident rather than its last few minutes.
+pub const HISTORY_QUARANTINE_PIN_MULTIPLIER: u64 = 4;
+
+/// ADR-0068 D1: the synthetic per-scope bound for a pinned scope the operator
+/// configured no [`ScopeLimit`] for, as a divisor of
+/// [`RetentionPolicy::max_bytes`].
+///
+/// Such a scope has no per-scope bound in the code at all — its only bound is
+/// the whole-database budget — so one has to be synthesised. `1/64` of the
+/// budget (16 MiB at the 1 GiB default) makes the resulting pinned ceiling
+/// `1/16` of the budget.
+pub const HISTORY_QUARANTINE_PIN_BASE_DIVISOR: u64 = 64;
+
+/// ADR-0068 D1: hard cap on one pinned scope's ceiling, as a divisor of
+/// [`RetentionPolicy::max_bytes`].
+///
+/// A cap, not a second policy: it bites only when an operator configured a
+/// per-scope limit larger than `max_bytes / 64`, and stops `4 ×` a large
+/// explicit limit from swallowing the whole store. At the defaults this arm
+/// and the multiplier arm coincide at 64 MiB.
+pub const HISTORY_QUARANTINE_PIN_ABSOLUTE_DIVISOR: u64 = 16;
+
+/// Connection-local table holding the pinned scopes of the pass in flight.
+///
+/// `TEMP`, so `SCHEMA_VERSION` and [`migrate`] are untouched and an older
+/// binary opening the same `history.db` sees nothing new (ADR-0068 D1: "no
+/// schema change").
+const PINNED_SCOPES_TEMP_TABLE: &str = "history_pinned_scopes";
+
 /// Outcome of an insert (mirrors the donor's `InsertOutcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
@@ -116,6 +149,88 @@ pub struct RetentionPolicy {
     pub max_age_days: u64,
     /// Per-scope byte overrides.
     pub scope_limits: Vec<ScopeLimit>,
+}
+
+/// ADR-0068 D1: the scopes one retention pass must not evict from freely
+/// because they hold a live fork-quarantine marker.
+///
+/// Built from canonical scope strings (`group:<id>`) — the spelling
+/// `/history/scopes` and the marker surfaces already use — and deliberately
+/// accepts BOTH spellings of an alias-keyed group (map key and
+/// `stable_group_id()`): rows live under the stable id, and the alias costs one
+/// extra set member rather than leaving the group unprotected.
+///
+/// Unparseable entries are ignored rather than failing the pass: a pin source
+/// that hands over one bad string must not stop retention for everyone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PinnedScopes {
+    /// Parsed `(scope_kind, scope_id)` pairs, deduplicated and ordered.
+    scopes: std::collections::BTreeSet<(i64, String)>,
+}
+
+impl PinnedScopes {
+    /// Nothing is pinned — the pre-ADR-0068 behaviour, and what a library
+    /// embedding with no pin source installed gets.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Parse canonical scope strings (`group:<id>`); unparseable ones are
+    /// skipped.
+    pub fn from_canonical<I, S>(scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self {
+            scopes: scopes
+                .into_iter()
+                .filter_map(|raw| {
+                    Scope::parse(raw.as_ref())
+                        .ok()
+                        .map(|scope| (scope.kind(), scope.id().to_string()))
+                })
+                .collect(),
+        }
+    }
+
+    /// Is nothing pinned? The hot path: a node with no quarantine anywhere
+    /// runs the original retention statements untouched.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.scopes.is_empty()
+    }
+
+    /// How many scopes are pinned (`G` in the ADR's disk bound).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Is this scope pinned? Compared on the stored `(kind, id)` columns, so
+    /// the answer does not depend on the spelling the caller parsed from.
+    #[must_use]
+    pub fn contains(&self, scope: &Scope) -> bool {
+        self.scopes
+            .iter()
+            .any(|(kind, id)| *kind == scope.kind() && id == scope.id())
+    }
+}
+
+/// ADR-0068 D1: what one retention pass did, split so the reaper can report
+/// pinned-scope pressure separately from ordinary eviction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainOutcome {
+    /// Rows evicted in total (pinned ceiling evictions included).
+    pub evicted: u64,
+    /// Rows evicted from INSIDE a pinned scope because that scope exceeded
+    /// its own ceiling. Never includes another scope's rows: a flooder can
+    /// burn only its own group's ceiling.
+    pub pinned_evicted: u64,
+    /// Scopes pinned during this pass (`G`), reported so an operator can see
+    /// the disk bound `max_bytes * (1 + G/16)` they are running under.
+    pub pinned_scopes: u64,
 }
 
 /// Synchronous SQLite-backed history store.
@@ -462,74 +577,153 @@ impl Store {
         Ok(out)
     }
 
-    /// Enforce retention (ADR-0023 §6). Returns rows evicted.
+    /// Enforce retention (ADR-0023 §6) with nothing pinned. Returns rows
+    /// evicted.
     ///
     /// Replaceable rows are exempt from age eviction and from byte-pressure
     /// eviction (they are current state) but their size counts toward the
     /// byte measure.
     pub fn retain(&self, policy: &RetentionPolicy) -> HistoryResult<u64> {
-        let mut evicted: u64 = 0;
+        self.retain_with_pins(policy, &PinnedScopes::none())
+            .map(|outcome| outcome.evicted)
+    }
+
+    /// Enforce retention (ADR-0023 §6), pinning fork-quarantined scopes
+    /// (ADR-0068 D1).
+    ///
+    /// A pinned scope is excluded from all three ordinary eviction phases —
+    /// the age bound, the per-scope byte budgets and the whole-database byte
+    /// budget — so a quarantined group's forensic record survives pressure
+    /// that a flooder can manufacture, which is the destruction ADR-0066 R3
+    /// and row 14 already forbid through the ingest and purge doors.
+    ///
+    /// Pinning is not unbounded. Each pinned scope carries its own ceiling
+    /// ([`Self::pinned_ceiling`]); above it, the oldest rows **inside that
+    /// scope only** are evicted and reported in
+    /// [`RetainOutcome::pinned_evicted`]. No other scope's rows are ever
+    /// chosen to pay for a pinned scope's overshoot, and every unpinned scope
+    /// keeps its bounds exactly as before.
+    ///
+    /// Cost: O(pinned scopes) inserts into a connection-local `TEMP` table
+    /// plus one indexed lookup per eviction candidate — never
+    /// O(rows × groups). With nothing pinned the table is never created and
+    /// the original statements run unchanged.
+    pub fn retain_with_pins(
+        &self,
+        policy: &RetentionPolicy,
+        pinned: &PinnedScopes,
+    ) -> HistoryResult<RetainOutcome> {
+        let mut outcome = RetainOutcome {
+            pinned_scopes: pinned.len() as u64,
+            ..RetainOutcome::default()
+        };
         let guard = lock_conn(&self.conn)?;
+
+        // 0. Materialize the pinned set for this pass. `exclude` is the
+        //    predicate every ordinary phase below ANDs in; it is the empty
+        //    string when nothing is pinned, so the unquarantined node runs
+        //    the pre-ADR-0068 SQL verbatim.
+        let exclude = if pinned.is_empty() {
+            String::new()
+        } else {
+            materialize_pinned_scopes(&guard, pinned)?;
+            format!(
+                " AND NOT EXISTS (SELECT 1 FROM {PINNED_SCOPES_TEMP_TABLE} p \
+                   WHERE p.scope_kind = history.scope_kind AND p.scope_id = history.scope_id)"
+            )
+        };
 
         // 1. Age bound.
         if policy.max_age_days > 0 {
             let cutoff =
                 now_ms().saturating_sub((policy.max_age_days as i64).saturating_mul(86_400_000));
-            evicted += guard.execute(
-                "DELETE FROM history WHERE replace_key IS NULL AND seen_at_ms < ?1",
+            outcome.evicted += guard.execute(
+                &format!(
+                    "DELETE FROM history WHERE replace_key IS NULL AND seen_at_ms < ?1{exclude}"
+                ),
                 rusqlite::params![cutoff],
             )? as u64;
         }
 
-        // 2. Per-scope byte budgets.
-        for limit in &policy.scope_limits {
-            let scope = Scope::parse(&limit.scope)?;
-            loop {
-                let used: i64 = guard.query_row(
-                    "SELECT COALESCE(SUM(LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))), 0) \
-                     FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
-                    rusqlite::params![scope.kind(), scope.id()],
-                    |r| r.get(0),
-                )?;
-                if used as u64 <= limit.max_bytes {
-                    break;
-                }
-                let n = guard.execute(
-                    "DELETE FROM history WHERE id IN (\
-                       SELECT id FROM history \
-                       WHERE scope_kind = ?1 AND scope_id = ?2 AND replace_key IS NULL \
-                       ORDER BY seen_at_ms ASC LIMIT ?3)",
-                    rusqlite::params![scope.kind(), scope.id(), RETAIN_EVICT_BATCH as i64],
-                )?;
-                if n == 0 {
-                    break; // only replaceable rows remain in this scope
-                }
-                evicted += n as u64;
-            }
+        // 2. Pinned ceilings, per pinned scope, oldest-first WITHIN the scope.
+        //
+        //    BEFORE the budget phases, not after: a pinned scope's overshoot
+        //    must be cut back before the whole-database budget is measured,
+        //    or phase 4 — which cannot touch pinned rows — would evict
+        //    HEALTHY scopes to pay for it. Getting this order wrong is
+        //    exactly the "a flooder can burn only its own group's ceiling"
+        //    promise inverted, and the flood fixture fails on it.
+        for (kind, id) in &pinned.scopes {
+            let scope = Scope::from_columns(*kind, id.clone())?;
+            let ceiling = Self::pinned_ceiling(policy, &scope);
+            let evicted = evict_pinned_scope_to_ceiling(&guard, &scope, ceiling)?;
+            outcome.evicted += evicted;
+            outcome.pinned_evicted += evicted;
+        }
+        if outcome.pinned_evicted > 0 {
+            // Return the pages now, so phase 4 measures the database as the
+            // pinned cut-back left it rather than as it was.
+            guard.execute_batch("PRAGMA incremental_vacuum;")?;
         }
 
-        // 3. Whole-database byte budget.
+        // 3. Per-scope byte budgets. A pinned scope is governed by its
+        //    ceiling in phase 2 instead, never by both.
+        for limit in &policy.scope_limits {
+            let scope = Scope::parse(&limit.scope)?;
+            if pinned.contains(&scope) {
+                continue;
+            }
+            outcome.evicted += evict_scope_to_budget(&guard, &scope, limit.max_bytes)?;
+        }
+
+        // 4. Whole-database byte budget.
         loop {
             if db_bytes(&guard)? as u64 <= policy.max_bytes {
                 break;
             }
             let n = guard.execute(
-                "DELETE FROM history WHERE id IN (\
-                   SELECT id FROM history WHERE replace_key IS NULL \
-                   ORDER BY seen_at_ms ASC LIMIT ?1)",
+                &format!(
+                    "DELETE FROM history WHERE id IN (\
+                       SELECT id FROM history WHERE replace_key IS NULL{exclude} \
+                       ORDER BY seen_at_ms ASC LIMIT ?1)"
+                ),
                 rusqlite::params![RETAIN_EVICT_BATCH as i64],
             )?;
             if n == 0 {
                 break;
             }
-            evicted += n as u64;
+            outcome.evicted += n as u64;
             guard.execute_batch("PRAGMA incremental_vacuum;")?;
         }
-        if evicted > 0 {
+
+        if outcome.evicted > 0 {
             guard.execute_batch("PRAGMA incremental_vacuum;")?;
         }
         cleanup_canonical_ids(&guard)?;
-        Ok(evicted)
+        Ok(outcome)
+    }
+
+    /// ADR-0068 D1: the byte ceiling for one pinned scope.
+    ///
+    /// `min(MULTIPLIER * base, max_bytes / ABSOLUTE_DIVISOR)` where `base` is
+    /// the operator's own [`ScopeLimit`] for the scope when they configured
+    /// one, else `max_bytes / BASE_DIVISOR`. See the ADR for why these
+    /// numbers: the multiplier is the ratified "4× the normal per-scope
+    /// bound", the base divisor synthesises a per-scope bound for a scope
+    /// that has none, and the absolute divisor caps a large explicit limit.
+    #[must_use]
+    pub fn pinned_ceiling(policy: &RetentionPolicy, scope: &Scope) -> u64 {
+        let canonical = scope.canonical();
+        let base = policy
+            .scope_limits
+            .iter()
+            .find(|limit| limit.scope == canonical)
+            .map_or_else(
+                || policy.max_bytes / HISTORY_QUARANTINE_PIN_BASE_DIVISOR,
+                |limit| limit.max_bytes,
+            );
+        base.saturating_mul(HISTORY_QUARANTINE_PIN_MULTIPLIER)
+            .min(policy.max_bytes / HISTORY_QUARANTINE_PIN_ABSOLUTE_DIVISOR)
     }
 
     /// Delete every row in `scope`. Returns rows removed. Local-only.
@@ -576,6 +770,115 @@ fn db_bytes(conn: &Connection) -> HistoryResult<i64> {
     let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
     let size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     Ok(pages.saturating_mul(size))
+}
+
+/// ADR-0068 D1: load this pass's pinned scopes into the connection-local
+/// `TEMP` table the eviction phases join against.
+///
+/// Recreated (and emptied) every pass: the pinned set is derived live from the
+/// marker state, so a stale row here would pin a group whose quarantine has
+/// been cleared.
+fn materialize_pinned_scopes(conn: &Connection, pinned: &PinnedScopes) -> HistoryResult<()> {
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE IF NOT EXISTS {PINNED_SCOPES_TEMP_TABLE} (\
+           scope_kind INTEGER NOT NULL, scope_id TEXT NOT NULL, \
+           PRIMARY KEY (scope_kind, scope_id)); \
+         DELETE FROM {PINNED_SCOPES_TEMP_TABLE};"
+    ))?;
+    let mut stmt = conn.prepare(&format!(
+        "INSERT OR IGNORE INTO {PINNED_SCOPES_TEMP_TABLE} (scope_kind, scope_id) VALUES (?1, ?2)"
+    ))?;
+    for (kind, id) in &pinned.scopes {
+        stmt.execute(rusqlite::params![kind, id])?;
+    }
+    Ok(())
+}
+
+/// ADR-0068 D1: bring ONE pinned scope back to its ceiling, oldest-first,
+/// deleting no more than the overshoot requires. Returns rows evicted.
+///
+/// WHY this is not [`evict_scope_to_budget`]. That helper deletes a whole
+/// `RETAIN_EVICT_BATCH` (256 rows) per step, so a scope one row over its budget
+/// can lose 256 — acceptable for an ordinary budget, wrong for a *ceiling* on a
+/// forensic record that ADR-0066 R3 and row 14 exist to keep. The running-total
+/// window picks exactly the oldest rows whose bytes cover the excess, and the
+/// batch cap still bounds one statement.
+fn evict_pinned_scope_to_ceiling(
+    conn: &Connection,
+    scope: &Scope,
+    ceiling: u64,
+) -> HistoryResult<u64> {
+    let mut evicted = 0u64;
+    loop {
+        let used: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))), 0) \
+             FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
+            rusqlite::params![scope.kind(), scope.id()],
+            |r| r.get(0),
+        )?;
+        let excess = (used as u64).saturating_sub(ceiling);
+        if excess == 0 {
+            return Ok(evicted);
+        }
+        let n = conn.execute(
+            "DELETE FROM history WHERE id IN (\
+               SELECT id FROM (\
+                 SELECT id, SUM(LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))) \
+                   OVER (ORDER BY seen_at_ms ASC, id ASC) AS running \
+                 FROM history \
+                 WHERE scope_kind = ?1 AND scope_id = ?2 AND replace_key IS NULL) \
+               WHERE running <= ?3 LIMIT ?4)",
+            rusqlite::params![
+                scope.kind(),
+                scope.id(),
+                excess as i64,
+                RETAIN_EVICT_BATCH as i64
+            ],
+        )?;
+        if n == 0 {
+            // Either only replaceable rows remain, or the single oldest
+            // durable row is itself larger than the excess — deleting it
+            // would take the scope further below its ceiling than needed, so
+            // leave it and accept the overshoot (bounded by one row).
+            return Ok(evicted);
+        }
+        evicted += n as u64;
+    }
+}
+
+/// Evict oldest-first inside ONE scope until its measured bytes fit
+/// `max_bytes`. Returns rows evicted.
+///
+/// Shared by the per-scope budget phase and the ADR-0068 pinned-ceiling
+/// phase so the two cannot drift in what they measure (payload +
+/// `signed_artifact`) or in what they are willing to delete (durable rows
+/// only — a replaceable row is current state and counts toward the measure
+/// without being evictable).
+fn evict_scope_to_budget(conn: &Connection, scope: &Scope, max_bytes: u64) -> HistoryResult<u64> {
+    let mut evicted = 0u64;
+    loop {
+        let used: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(payload) + LENGTH(COALESCE(signed_artifact, x''))), 0) \
+             FROM history WHERE scope_kind = ?1 AND scope_id = ?2",
+            rusqlite::params![scope.kind(), scope.id()],
+            |r| r.get(0),
+        )?;
+        if used as u64 <= max_bytes {
+            return Ok(evicted);
+        }
+        let n = conn.execute(
+            "DELETE FROM history WHERE id IN (\
+               SELECT id FROM history \
+               WHERE scope_kind = ?1 AND scope_id = ?2 AND replace_key IS NULL \
+               ORDER BY seen_at_ms ASC LIMIT ?3)",
+            rusqlite::params![scope.kind(), scope.id(), RETAIN_EVICT_BATCH as i64],
+        )?;
+        if n == 0 {
+            // Only replaceable rows remain in this scope.
+            return Ok(evicted);
+        }
+        evicted += n as u64;
+    }
 }
 
 fn push_common_filters(

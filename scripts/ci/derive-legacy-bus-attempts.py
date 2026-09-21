@@ -38,6 +38,25 @@ def integer(value):
     return value
 
 
+def validate_source_premise(cargo_bytes, rust_bytes):
+    """Bind this evidence premise to the workspace pin and Rust producer check."""
+    dependencies = tomllib.loads(cargo_bytes.decode()).get("dependencies", {})
+    require(
+        dependencies.get("saorsa-gossip-pubsub") == f"={PUBSUB_VERSION}",
+        "WORKSPACE_PUBSUB_PIN_MISMATCH",
+    )
+    rust = rust_bytes.decode()
+    versions = re.findall(
+        r'pinned\[0\]\["version"\]\.as_str\(\) != Some\("([^"]+)"\)', rust
+    )
+    checksums = re.findall(
+        r'pinned\[0\]\["checksum"\]\.as_str\(\)\s*!= Some\("([0-9a-f]{64})"\)',
+        rust,
+    )
+    require(versions == [PUBSUB_VERSION], "RUST_PUBSUB_VERSION_MISMATCH")
+    require(checksums == [PUBSUB_SHA], "RUST_PUBSUB_SHA_MISMATCH")
+
+
 LABELS = ("G5", "D5", "O5", "W5")
 EXPECTED = {"G5": ["D5", "O5"], "D5": ["G5", "W5"], "O5": ["G5", "W5"], "W5": ["D5", "O5"]}
 EDGES = ("G5|W5", "W5|G5", "D5|O5", "O5|D5")

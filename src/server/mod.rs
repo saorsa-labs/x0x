@@ -976,7 +976,20 @@ pub async fn serve_with_options(
         connect_diagnostics,
         forward_service,
         owner_sync,
+        #[cfg(test)]
+        named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
     });
+
+    // ADR-0068 D1: teach the history retention reaper which scopes are
+    // fork-quarantined. Installed HERE because this is the first point at
+    // which an `Arc<AppState>` exists — the reaper is spawned by the Agent,
+    // which knows nothing about named groups — and the source holds only a
+    // `Weak`, so it cannot form a cycle with the Agent that owns the store
+    // (#661 drop ordering). Absent when history is disabled, in which case
+    // there is no reaper to inform.
+    if routes::history::ReaperQuarantinePins::install(&state) {
+        tracing::debug!("[history] fork-quarantine pin source installed (ADR-0068 D1)");
+    }
 
     // Review r2 (#451): a store written by a pre-#451 Home-Suite binary
     // still holds owner-certified entries in named_groups.json — v0.40.x
@@ -2447,6 +2460,55 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(MachineId(arr))
+}
+
+/// ADR-0066/ADR-0067: resolve one named-group record under **both
+/// spellings**, over a borrowed roster map.
+///
+/// The roster map is keyed by whichever alias this daemon learned the group
+/// under, while callers routinely arrive with the STABLE id (a delegation
+/// envelope signs `info.stable_group_id()`; an epoch token is captured
+/// against it). A bare `groups.get(id)` therefore misses the record whenever
+/// key ≠ stable id — and for a quarantine gate that does not degrade
+/// gracefully, it serves the contested roster. Direct key hit first, then a
+/// scan by `stable_group_id()`, exactly as the metadata apply path
+/// (`resolved_group_key`, `named_groups.rs:9124`) does.
+///
+/// **Synchronous and map-level on purpose.** ADR-0067's re-check runs INSIDE
+/// the `state.named_groups` write critical section that performs the
+/// mutation, so it cannot await a lock it is already holding. The async,
+/// `&AppState`-taking `delegations::fork_quarantine_marker` is now a thin
+/// wrapper over this, so the two cannot drift.
+///
+/// **The single resolver (#732).** Slices 3, 4, 6 and 7 each grew their own
+/// copy of this two-line rule and cross-model review found the same
+/// single-spelling defect three times independently, so the copies are now
+/// gone: `delegations::fork_quarantine_marker`, `history`'s scope markers and
+/// purge gate, `ws`'s frame annotation, the public-group bootstrap install
+/// check, `stores`' TreeKEM protector and the manual clear route all resolve
+/// here. A quarantine-relevant lookup that spells this rule out again is a
+/// defect the `adr0066_lookup_guard` fixture is there to catch.
+pub(in crate::server) fn resolve_group_entry_locked<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<(&'a str, &'a x0x::groups::GroupInfo)> {
+    if let Some((key, info)) = groups.get_key_value(group_id) {
+        return Some((key.as_str(), info));
+    }
+    groups
+        .iter()
+        .find(|(_, info)| info.stable_group_id() == group_id)
+        .map(|(key, info)| (key.as_str(), info))
+}
+
+/// ADR-0067: the lifecycle epoch token for one group, resolved under both
+/// spellings. `None` when this node holds no record for the id — a caller
+/// re-checking a token MUST treat that as a mismatch, never as "unchanged".
+pub(in crate::server) fn lifecycle_epoch_token_locked(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<x0x::groups::LifecycleEpochToken> {
+    resolve_group_entry_locked(groups, group_id).map(|(_, info)| info.lifecycle_epoch_token())
 }
 
 /// Build a uniform `{ "ok": false, "error": <msg> }` JSON error response paired

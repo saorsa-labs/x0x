@@ -695,9 +695,23 @@ async fn diamond_observations_with_recorder(
         let end = diamond_now(clock);
         // Full, unfiltered returned IDs: an unknown peer is not silently lost.
         let admitted = peers.iter().map(|p| hex::encode(p.0)).collect::<Vec<_>>();
+        // Embed peer_scores_by_topic so capture_ready_diamond can run the
+        // #611 eager-role oracle beside diamond_peer_sets in the same retry loop.
+        // Null when the gossip runtime has not yet started; the eager check
+        // skips gracefully on null (scores lag plane admission by at most one
+        // iteration during the initial bring-up).
+        let peer_scores_by_topic = agent
+            .gossip_pubsub_stage_stats()
+            .and_then(|s| serde_json::to_value(&s.peer_scores_by_topic).ok())
+            .unwrap_or(serde_json::Value::Null);
         observations.insert(
             (*label).into(),
-            serde_json::json!({"admitted":admitted,"begin_ns":begin,"end_ns":end}),
+            serde_json::json!({
+                "admitted": admitted,
+                "begin_ns": begin,
+                "end_ns": end,
+                "peer_scores_by_topic": peer_scores_by_topic,
+            }),
         );
     }
     observations.into()
@@ -911,10 +925,101 @@ struct RejectedReadiness {
     diagnostics: Box<ReadinessDiagnostics>,
 }
 
+/// Run [`check_eager_mesh_recovered`] for every node in the diamond topology,
+/// using the `peer_scores_by_topic` embedded in `observed` by
+/// [`diamond_observations_with_recorder`].
+///
+/// Chained with [`diamond_peer_sets`] inside [`capture_ready_diamond`]'s
+/// bounded retry loop so that the eager-role check retries under the SETUP
+/// deadline alongside plane-admission validation.  This means a transient
+/// PlumTree set still at 1 (the #611 collapse shape) causes the loop to keep
+/// polling — no extra sleep or outer retry is needed.
+///
+/// Returns `Ok(())` when all four nodes have their two expected neighbors
+/// as eager peers.  Returns `Err(String)` naming the first failing node.
+///
+/// Skips gracefully when:
+/// - `identities` is `None` (peer IDs not yet resolved), or
+/// - a node's `peer_scores_by_topic` is `null` (gossip runtime not yet started;
+///   scores lag plane admission by at most one iteration during bring-up).
+///
+/// The subscription decision is **configuration-driven** via
+/// `non_subscriber_indices` (DIAMOND_LABELS indices of nodes built with
+/// `with_skip_legacy_dm_bus(true)` or otherwise not subscribed to DM bus):
+///
+/// - **Declared non-subscriber**: the DM bus topic MUST be absent from its
+///   `peer_scores_by_topic`.  If it is present, the function returns `Err` —
+///   the opt-out flag had no effect, a configuration invariant violation.
+/// - **Subscriber** (all other nodes): a missing topic entry is a **retryable
+///   failure** — the retry loop revisits in 10 ms.  This prevents the oracle
+///   from passing vacuously when a subscriber's topic entry is transiently
+///   absent from the snapshot.
+///
+/// `non_subscriber_indices` is passed directly to `capture_ready_diamond` by
+/// `shape_diamond` (not embedded in the topology JSON, which must carry exactly
+/// the 8 canonical keys checked by `validate_topology` → `diamond_keys`).
+///
+/// # Degree note
+/// Harness agents are built with `Agent::builder()` which produces Leaf
+/// nodes; the default `leaf_max_eager_degree = 2` is the right ceiling here.
+/// Full or relay nodes would need `FULL_EAGER_DEGREE_CEILING = 6`.
+fn check_eager_mesh_for_diamond(
+    observed: &serde_json::Value,
+    identities: Option<[[u8; 32]; 4]>,
+    non_subscriber_indices: &[usize],
+) -> Result<(), String> {
+    let Some(ids) = identities else {
+        return Ok(());
+    };
+    let bus_topic = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
+    // Expected neighbor indices per DIAMOND_LABELS order:
+    //   G5→{D5,O5}, D5→{G5,W5}, O5→{G5,W5}, W5→{D5,O5}
+    const NEIGHBOR_INDICES: [[usize; 2]; 4] = [[1, 2], [0, 3], [0, 3], [1, 2]];
+    for (i, label) in DIAMOND_LABELS.iter().enumerate() {
+        let scores = &observed[*label]["peer_scores_by_topic"];
+        if scores.is_null() {
+            // Gossip runtime not yet started; skip, the retry loop will revisit.
+            continue;
+        }
+        let topic_present = scores
+            .get(&bus_topic)
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if non_subscriber_indices.contains(&i) {
+            // Declared non-subscriber: assert the DM bus topic is absent.
+            // Topic present means the opt-out flag had no effect — config error.
+            if topic_present {
+                return Err(format!(
+                    "node {label}: declared non-subscriber has DM bus topic {bus_topic:?} \
+                     in peer_scores_by_topic — with_skip_legacy_dm_bus flag had no effect"
+                ));
+            }
+            continue; // Correctly absent; nothing to check.
+        }
+        // Subscriber: topic absent is retryable (scores not yet populated),
+        // not a silent pass.  The retry loop revisits in 10 ms.
+        if !topic_present {
+            return Err(format!(
+                "node {label}: subscribes to DM bus but topic {bus_topic:?} absent from \
+                 peer_scores_by_topic — scores not yet populated (retryable)"
+            ));
+        }
+        let neighbor_hex8: Vec<String> = NEIGHBOR_INDICES[i]
+            .iter()
+            .map(|&j| hex::encode(ids[j])[..16].to_string())
+            .collect();
+        let neighbor_refs: Vec<&str> = neighbor_hex8.iter().map(String::as_str).collect();
+        check_eager_mesh_recovered(scores, &bus_topic, &neighbor_refs, 2)
+            .map_err(|e| format!("node {label}: {e}"))?;
+    }
+    Ok(())
+}
+
 // One absolute deadline owns acquisition and polling. Only the full object
 // validated here can become pre_cut; timed-out partial acquisitions are dropped.
 async fn capture_ready_diamond<F, Fut>(
     topology: &serde_json::Value,
+    non_subscriber_indices: &[usize],
     start: tokio::time::Instant,
     deadline: tokio::time::Instant,
     mut observe: F,
@@ -977,7 +1082,9 @@ where
                 return Err(rejected);
             }
         };
-        let validation = diamond_peer_sets(topology, &observed);
+        let validation = diamond_peer_sets(topology, &observed).and_then(|()| {
+            check_eager_mesh_for_diamond(&observed, identities, non_subscriber_indices)
+        });
         attempt.validation_end_ns = readiness_offset(start, tokio::time::Instant::now());
         rejected.diagnostics.clock_incomplete |= attempt.validation_end_ns.is_none();
         match validation {
@@ -1036,6 +1143,7 @@ async fn shape_diamond(
     agents: &[Agent],
     raw: &mut serde_json::Value,
     clock: std::time::Instant,
+    dm_bus_non_subscriber_label_indices: &[usize],
 ) -> Result<Vec<std::time::Instant>, RejectedReadiness> {
     let expected = diamond_expected();
     let peer_ids: serde_json::Map<String, serde_json::Value> = DIAMOND_LABELS
@@ -1090,6 +1198,7 @@ async fn shape_diamond(
     let start = tokio::time::Instant::now();
     let pre_cut = capture_ready_diamond(
         &raw["topology"],
+        dm_bus_non_subscriber_label_indices,
         start,
         start + SETUP,
         |attempt| async move {
@@ -1097,7 +1206,7 @@ async fn shape_diamond(
         },
     )
     .await?;
-    raw["topology"]["observations"]["pre_cut"] = pre_cut;
+    raw["topology"]["observations"]["pre_cut"] = strip_peer_scores(pre_cut);
     for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(&originals) {
         let (check, _) = bounded(
             "pre-cut directed suppression check",
@@ -1111,6 +1220,21 @@ async fn shape_diamond(
             "ttl_ns":DIAMOND_TTL_NS,"margin_ns":DIAMOND_MARGIN_NS});
     }
     Ok(originals)
+}
+
+/// Remove the `peer_scores_by_topic` field that `diamond_observations_with_recorder`
+/// embeds in every per-label observation for oracle use.  The topology-contract
+/// checker (`validate_topology` → `diamond_keys`) expects exactly
+/// {"admitted", "begin_ns", "end_ns"} per observation; strip before storing.
+fn strip_peer_scores(mut observations: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = observations.as_object_mut() {
+        for obs in map.values_mut() {
+            if let Some(obj) = obs.as_object_mut() {
+                obj.remove("peer_scores_by_topic");
+            }
+        }
+    }
+    observations
 }
 
 fn diamond_keys(value: &serde_json::Value, expected: &[&str]) -> Result<(), String> {
@@ -1944,7 +2068,8 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     // Provenance preparation ran before Agent construction; agent-dependent
     // universe/identity work and witness setup remain before shaping.
     // Only this fifth case now shapes the already prepared full mesh.
-    let originals = match shape_diamond(agents, &mut raw, clock).await {
+    // O5 = DIAMOND_LABELS index 2, built with with_skip_legacy_dm_bus(true).
+    let originals = match shape_diamond(agents, &mut raw, clock, &[2]).await {
         Ok(originals) => originals,
         Err(rejected) => {
             retain_rejected_readiness(&mut raw, &rejected);
@@ -2038,12 +2163,14 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
     raw["load"] = json!({"quiescence":quiescence,"sent":sent,"payload_bytes":4096,"period_ms":50,"elapsed_ns":load_elapsed.as_nanos() as u64,"elapsed_excludes":"post-load drain barrier (see load.quiescence.waited_ms)","fanouts":fanouts,"witness_observed_during_load":observed.len(),"witness_attribution":"none"});
     raw["generator_diagnostics"]["cuts"]["t1"] = generator_cut(&agents[0], clock);
     attach_generator_load(&mut raw, &load_returns);
-    raw["topology"]["observations"]["t1"] = bounded(
-        "final diamond observation",
-        SETUP,
-        diamond_observations(agents, clock),
-    )
-    .await;
+    raw["topology"]["observations"]["t1"] = strip_peer_scores(
+        bounded(
+            "final diamond observation",
+            SETUP,
+            diamond_observations(agents, clock),
+        )
+        .await,
+    );
     for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(&originals) {
         let (check, returned) = bounded(
             "final directed suppression check",
@@ -2257,11 +2384,12 @@ async fn diamond_readiness_returns_exact_validated_post_refresh_observation() {
     valid["W5"]["end_ns"] = serde_json::json!(12346);
     let mut observations = std::collections::VecDeque::from([missing, valid.clone()]);
     let start = tokio::time::Instant::now();
-    let observed = capture_ready_diamond(topology, start, start + Duration::from_secs(1), |_| {
-        std::future::ready(Ok(observations.pop_front().expect("two acquisitions")))
-    })
-    .await
-    .expect("second full observation is exact");
+    let observed =
+        capture_ready_diamond(topology, &[], start, start + Duration::from_secs(1), |_| {
+            std::future::ready(Ok(observations.pop_front().expect("two acquisitions")))
+        })
+        .await
+        .expect("second full observation is exact");
     assert_eq!(
         observed, valid,
         "retain every field and interval of the admitted object"
@@ -2290,6 +2418,7 @@ async fn diamond_readiness_retains_rejection_on_absolute_deadline() {
         let start = tokio::time::Instant::now();
         let result = capture_ready_diamond(
             &raw["topology"],
+            &[],
             start,
             start + Duration::from_millis(30),
             |_| {
@@ -2334,6 +2463,7 @@ async fn diamond_readiness_reports_no_completed_observation() {
     let start = tokio::time::Instant::now();
     let rejected = capture_ready_diamond(
         &raw["topology"],
+        &[],
         start,
         start + Duration::from_millis(10),
         |_| std::future::pending::<Result<serde_json::Value, String>>(),
@@ -2363,6 +2493,7 @@ async fn diamond_readiness_retains_last_rejection_on_acquisition_error() {
     let start = tokio::time::Instant::now();
     let rejected = capture_ready_diamond(
         &raw["topology"],
+        &[],
         start,
         start + Duration::from_secs(1),
         |_| std::future::ready(observations.pop_front().expect("two acquisitions")),
@@ -2392,18 +2523,19 @@ async fn readiness_diagnostic_distinguishes_terminal_branches_and_counts() {
             } else {
                 Duration::from_millis(5)
             };
-        let result = capture_ready_diamond(&raw["topology"], start, deadline, |_| async move {
-            match stage {
-                ReadinessTerminal::BeforeAcquireDeadline => {
-                    panic!("must not acquire after deadline")
+        let result =
+            capture_ready_diamond(&raw["topology"], &[], start, deadline, |_| async move {
+                match stage {
+                    ReadinessTerminal::BeforeAcquireDeadline => {
+                        panic!("must not acquire after deadline")
+                    }
+                    ReadinessTerminal::AcquireTimedOut => std::future::pending().await,
+                    ReadinessTerminal::AcquireError => Err("inert acquisition".to_owned()),
+                    _ => Ok(serde_json::json!({})),
                 }
-                ReadinessTerminal::AcquireTimedOut => std::future::pending().await,
-                ReadinessTerminal::AcquireError => Err("inert acquisition".to_owned()),
-                _ => Ok(serde_json::json!({})),
-            }
-        })
-        .await
-        .expect_err("every terminal branch remains nonpass");
+            })
+            .await
+            .expect_err("every terminal branch remains nonpass");
         let diag = result.diagnostics;
         assert_eq!(diag.terminal_stage, Some(stage));
         assert_eq!(diag.start_ns, 0);
@@ -2446,6 +2578,7 @@ async fn readiness_diagnostic_labels_late_valid_without_retaining_graph() {
     // arrive at the deadline and must still fail the separate validation-time check.
     let rejected = capture_ready_diamond(
         &raw["topology"],
+        &[],
         start,
         start + Duration::from_millis(1),
         |_| {
@@ -2478,6 +2611,7 @@ async fn readiness_diagnostic_keeps_distinct_rejected_and_partial_actual_core_at
     let start = tokio::time::Instant::now();
     let rejected = capture_ready_diamond(
         &raw["topology"],
+        &[],
         start,
         start + Duration::from_millis(30),
         |attempt| {
@@ -2808,4 +2942,664 @@ fn ingress_facts_separate_non_arrival_from_local_shedding() {
     // An absent per-peer row must degrade to "?" rather than reading as zero
     // frames from the generator, which would invert the conclusion.
     assert!(ingress_facts(&sample(4, 0, 0, 4), "bb").contains("from_generator=?"));
+}
+
+// ── #611 eager-mesh oracle ────────────────────────────────────────────────────
+
+/// Check that every named peer on `topic` holds `role:"eager"` in a
+/// `peer_scores_by_topic` snapshot and that no peer carries an active cooldown.
+///
+/// # Why this matters (#611)
+///
+/// The existing oracle in this file observes **plane admission** only
+/// (`shape_diamond`): it checks that peers are connected and admitted to the
+/// gossip plane.  A mesh can look "admitted" while the PlumTree eager set has
+/// permanently collapsed to 1.  The failure mode is:
+///
+/// 1. Under sustained load a local CPU stall blows the per-peer 2500 ms send
+///    budget; five timeouts in 30 s book the peer as slow and apply a ≥120 s
+///    cooldown (`PEER_SUPPRESSION_COOLDOWN`, saorsa-gossip-pubsub).
+/// 2. The 1 Hz `refresh_topic_peers` re-adds the returning peer as **lazy**
+///    (by design, to avoid overriding a demotion) then runs `maintain_degree_at`,
+///    whose candidate filter (`can_graft_peer_at`) drops any cooled peer.
+/// 3. The issue-#32 cooling floor forbids suppressing the **last** eligible eager
+///    peer, so with `leaf_max_eager_degree = 2` the set pins at exactly 1 — never
+///    0, never back to 2 — for the remainder of the cooldown window (≥120 s).
+/// 4. Delivery continues via the pull path (IHAVE/IWANT) so the plane looks
+///    healthy, but every publication now incurs pull-path latency instead of
+///    eager push, silently degrading throughput without tripping the plane
+///    admission gate.
+///
+/// This predicate closes that gap.  It fails when any named peer is lazy,
+/// missing, or has a non-zero `cooldown_ms` — the exact signal that cooling is
+/// blocking re-promotion.
+///
+/// # Arguments
+///
+/// * `peer_scores_by_topic` — the value at key `"peer_scores_by_topic"` from
+///   `GET /diagnostics/gossip` (or an equivalent in-process snapshot).
+///   Shape: `{ "<topic>": { "<peer_id>": { "role": "eager"|"lazy",
+///   "cooling_events": u64, "cooldown_ms": u64|null, ... } } }`.
+/// * `topic` — the topic key as it appears in the map (named or hex8).
+/// * `peer_ids` — peer IDs expected to be present and eager on this topic.
+/// * `expected_degree` — `leaf_max_eager_degree` configured for this node
+///   (default **2** on a Leaf; confirmed in `src/gossip/config.rs`).
+///
+/// # Returns
+///
+/// `Ok(())` when all invariants hold.  `Err(String)` with a diagnostic message
+/// suitable for `assert!(…, "{}", err)` when any peer is lazy, absent, or
+/// has `cooldown_ms > 0`.
+///
+/// # Integration note
+///
+/// To assert recovery rather than just a snapshot, call this function on two
+/// consecutive observations taken after the load window and compare
+/// `last_cool_at_unix_ms` between them.  Use [`check_eager_mesh_stable`] for that
+/// two-snapshot form.  Never use a fixed sleep between observations: poll up to
+/// a bounded iteration count so optimised builds cannot beat the wait
+/// (repo lesson from the race-test evidence trap).
+fn check_eager_mesh_recovered(
+    peer_scores_by_topic: &serde_json::Value,
+    topic: &str,
+    peer_ids: &[&str],
+    expected_degree: usize,
+) -> Result<(), String> {
+    let topic_map = match peer_scores_by_topic.get(topic) {
+        Some(serde_json::Value::Object(m)) => m,
+        Some(other) => {
+            return Err(format!(
+                "#611 eager-mesh oracle: topic {topic:?} is not an object in \
+                 peer_scores_by_topic: {other}"
+            ))
+        }
+        None => {
+            return Err(format!(
+                "#611 eager-mesh oracle: topic {topic:?} absent from peer_scores_by_topic \
+                 (present topics: {:?})",
+                peer_scores_by_topic
+                    .as_object()
+                    .map(|m| m.keys().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            ))
+        }
+    };
+
+    let mut eager_count = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for &peer_id in peer_ids {
+        let peer = match topic_map.get(peer_id) {
+            Some(v) => v,
+            None => {
+                errors.push(format!(
+                    "  peer {peer_id}: absent from topic {topic:?} \
+                     (present peers: {:?})",
+                    topic_map.keys().collect::<Vec<_>>()
+                ));
+                continue;
+            }
+        };
+
+        let role = peer
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(missing)");
+        let cooldown_ms = peer.get("cooldown_ms").and_then(|v| v.as_u64());
+        let suppression_state = peer
+            .get("suppression_state")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        // cooling_events is f64 in PeerScoreBreakdownSnapshot; use as_f64() not as_u64().
+        let cooling_events = peer.get("cooling_events").and_then(|v| v.as_f64());
+
+        if role == "eager" {
+            eager_count += 1;
+        } else {
+            errors.push(format!(
+                "  peer {peer_id}: role={role:?} want \"eager\" \
+                 [cooldown_ms={cooldown_ms:?} suppression_state={suppression_state:?} \
+                 cooling_events={cooling_events:?}] — peer is demoted, #611 collapse active"
+            ));
+        }
+
+        // An eager peer that still carries an active cooldown is in a recovery-probe
+        // state and can re-enter suppression under renewed load.  Flag it regardless
+        // of role so callers can assert full stability, not just momentary promotion.
+        if cooldown_ms.map(|ms| ms > 0).unwrap_or(false) {
+            errors.push(format!(
+                "  peer {peer_id}: cooldown_ms={cooldown_ms:?} > 0 \
+                 (suppression_state={suppression_state:?}) — recovery not complete"
+            ));
+        }
+    }
+
+    // Degree check: the count of eager peers must equal the configured ceiling.
+    // A count below expected_degree means the cool floor has pinned the set at a
+    // degraded value without the peer-level errors above catching it (e.g. a peer
+    // that was pruned entirely from the map and is therefore absent).
+    if eager_count != expected_degree {
+        // Prepend so the degree mismatch is the first line of the error.
+        errors.insert(
+            0,
+            format!(
+                "#611 eager-mesh oracle: eager_count={eager_count} want {expected_degree} \
+                 on topic {topic:?} — the cooling floor has degraded the eager set"
+            ),
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Two-snapshot stability check: verify that the eager mesh is not only
+/// recovered (`snapshot_after` passes [`check_eager_mesh_recovered`]) but also
+/// **stable** — the peer was not re-cooled between the two observations.
+///
+/// Uses `last_cool_at_unix_ms` (monotonic `Option<u64>`) rather than
+/// `cooling_events` to detect re-cooling.  `cooling_events` is an **f64
+/// decayed counter** in `PeerScoreBreakdownSnapshot`; `serde_json`'s
+/// `Value::as_u64()` returns `None` for float JSON values, so a comparison
+/// on `cooling_events` can **never fire** on real saorsa-gossip-pubsub
+/// snapshots.  `last_cool_at_unix_ms` is `Option<u64>` and monotonically
+/// increases whenever the peer is cooled: if `after > before` the peer was
+/// re-cooled between observations.
+///
+/// A re-cooled peer will produce another 2→1 collapse under the next load
+/// spike even though the single-snapshot check passed.
+///
+/// Call this after a bounded polling loop, never after a fixed sleep:
+/// `snapshot_before` is taken immediately after load completes;
+/// `snapshot_after` is taken after the same number of iterations that
+/// `check_eager_mesh_recovered` used to observe a passing state.
+fn check_eager_mesh_stable(
+    peer_scores_by_topic_before: &serde_json::Value,
+    peer_scores_by_topic_after: &serde_json::Value,
+    topic: &str,
+    peer_ids: &[&str],
+    expected_degree: usize,
+) -> Result<(), String> {
+    // The after snapshot must pass the single-snapshot check first.
+    check_eager_mesh_recovered(peer_scores_by_topic_after, topic, peer_ids, expected_degree)?;
+
+    // Verify last_cool_at_unix_ms did not advance between snapshots.
+    // cooling_events is an f64 decayed counter; as_u64() is always None for
+    // float JSON values, making any cooling_events comparison silently vacuous.
+    // last_cool_at_unix_ms is monotonic Option<u64> and is safe to compare.
+    let before_map = peer_scores_by_topic_before.get(topic);
+    let after_map = peer_scores_by_topic_after
+        .get(topic)
+        .and_then(|v| v.as_object());
+
+    let Some(after_map) = after_map else {
+        return Err(format!(
+            "#611 stability oracle: topic {topic:?} absent from after-snapshot"
+        ));
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+    for &peer_id in peer_ids {
+        let before_ts = before_map
+            .and_then(|m| m.get(peer_id))
+            .and_then(|p| p.get("last_cool_at_unix_ms"))
+            .and_then(|v| v.as_u64());
+        let after_ts = after_map
+            .get(peer_id)
+            .and_then(|p| p.get("last_cool_at_unix_ms"))
+            .and_then(|v| v.as_u64());
+
+        // (before=None, after=Some) = first cooling appeared during window.
+        // (Some(b), Some(a)) with a > b = timestamp advanced = re-cooled.
+        // (_, None) = no cooling recorded at all = stable.
+        let recooled = match (before_ts, after_ts) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(b), Some(a)) => a > b,
+        };
+        if recooled {
+            errors.push(format!(
+                "  peer {peer_id}: last_cool_at_unix_ms advanced {before_ts:?}→{after_ts:?} \
+                 — peer was re-cooled after eager promotion, unstable recovery (#611)"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "#611 stability oracle: re-cooling detected on topic {topic:?}:\n{}",
+            errors.join("\n")
+        ))
+    }
+}
+
+// ── Unit tests for the #611 oracle predicates ─────────────────────────────────
+//
+// These tests operate against **synthetic** peer_scores_by_topic JSON.
+// No daemon is spawned; no network I/O occurs.
+//
+// Induction of cooling deterministically end-to-end belongs in
+// saorsa-gossip's paused-clock test
+// `cooling_does_not_demote_when_no_graft_eligible_replacement_exists`
+// (sg#62/#65 PR #67).  The x0x layer only supplies the degree ceiling and the
+// diagnostic surface; the predicate logic below is what x0x owns.
+
+/// Happy path: both peers eager, no cooldown, degree == 2.
+/// This is the shape the diamond topology requires after load.
+///
+/// Fixtures use **float** `cooling_events` (e.g. `2.0`) to match the real
+/// `PeerScoreBreakdownSnapshot` shape from saorsa-gossip-pubsub 0.5.82.
+/// `cooling_events` is an f64 decayed counter; integer JSON literals like `2`
+/// would silently pass `as_u64()` in the old code but float values never do.
+#[test]
+fn eager_mesh_oracle_passes_on_fully_recovered_shape() {
+    let snapshot = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": {
+                "role": "eager",
+                "score": 1.0,
+                "cooling_events": 2.0,
+                "last_cool_at_unix_ms": null,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            },
+            "peer_bbbb": {
+                "role": "eager",
+                "score": 0.9,
+                "cooling_events": 1.0,
+                "last_cool_at_unix_ms": null,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            }
+        }
+    });
+    check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2)
+        .expect("fully-recovered shape must pass the #611 oracle");
+}
+
+/// **Negative control** — the oracle MUST fail on the exact #611 collapse shape:
+/// peer_bbbb demoted to lazy, cooldown_ms=120000, eager_count=1 while
+/// expected_degree=2.  Without this the oracle cannot be claimed "able to fail".
+///
+/// This is the synthetic version of what a degraded run's `peer_scores_by_topic`
+/// snapshot would show: peer was suppressed for 120 s and pinned the mesh at 1.
+#[test]
+fn eager_mesh_oracle_fails_on_611_collapse_shape() {
+    let snapshot = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": {
+                "role": "eager",
+                "score": 1.0,
+                "cooling_events": 5.0,
+                "last_cool_at_unix_ms": 1_700_000_000_000u64,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            },
+            "peer_bbbb": {
+                "role": "lazy",
+                "score": 0.1,
+                "cooling_events": 5.0,
+                "last_cool_at_unix_ms": 1_700_000_120_000u64,
+                "eager_eligible": false,
+                "suppression_state": "cooled",
+                "cooldown_ms": 120000
+            }
+        }
+    });
+    let result = check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "degraded shape (eager_count=1, peer_bbbb role=lazy cooldown=120s) must fail the \
+         #611 oracle; got Ok — the predicate is blind to the collapse"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("peer_bbbb"),
+        "#611 oracle error must name the demoted peer; got: {msg}"
+    );
+    assert!(
+        msg.contains("lazy") || msg.contains("eager_count"),
+        "#611 oracle error must explain the demotion; got: {msg}"
+    );
+}
+
+/// **Negative control** — a peer eager but carrying `cooldown_ms > 0` is in a
+/// recovery-probe window and can re-enter suppression under the next load spike.
+/// The oracle must flag this even though `role == "eager"`.
+#[test]
+fn eager_mesh_oracle_fails_on_eager_peer_with_active_cooldown() {
+    let snapshot = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": {
+                "role": "eager",
+                "score": 1.0,
+                "cooling_events": 0.0,
+                "last_cool_at_unix_ms": null,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            },
+            "peer_bbbb": {
+                "role": "eager",
+                "score": 0.6,
+                "cooling_events": 3.0,
+                "last_cool_at_unix_ms": 1_700_000_045_000u64,
+                "eager_eligible": true,
+                "suppression_state": "recovery_probe",
+                "cooldown_ms": 45000
+            }
+        }
+    });
+    let result = check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "eager peer with cooldown_ms=45000 (recovery_probe) must fail the #611 oracle; \
+         a recovery-probe peer can re-enter suppression under renewed load"
+    );
+}
+
+/// **Negative control** — illustrates the gate/measure mismatch the old oracle
+/// suffered: asserting degree=1 would let a 2→1 collapse pass silently.
+/// The same snapshot must FAIL once we correctly assert degree=2.
+#[test]
+fn eager_mesh_oracle_degree_mismatch_is_detectable() {
+    // Only one peer is present and eager — the collapsed-mesh shape.
+    let snapshot = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": {
+                "role": "eager",
+                "score": 1.0,
+                "cooling_events": 0.0,
+                "last_cool_at_unix_ms": null,
+                "eager_eligible": true,
+                "suppression_state": null,
+                "cooldown_ms": null
+            }
+        }
+    });
+    // Wrong assertion (degree=1): silently passes — this is what the old
+    // oracle effectively did by not checking the eager set at all.
+    assert!(
+        check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa"], 1).is_ok(),
+        "degree=1 assertion passes on a single eager peer (illustrating old oracle blindness)"
+    );
+    // Correct assertion (degree=2): fails because peer_bbbb is absent.
+    // The degree check + absent-peer error together surface the collapse.
+    let result = check_eager_mesh_recovered(&snapshot, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "degree=2 assertion must fail when peer_bbbb is absent — \
+         the #611 collapse is now visible"
+    );
+}
+
+/// Stability oracle: `last_cool_at_unix_ms` must not advance between two
+/// observations.  If it does, the peer was re-cooled after promotion — a
+/// transient recovery.
+///
+/// Fixtures use float `cooling_events` (the real shape from saorsa-gossip-pubsub)
+/// to guard against any regression that re-introduces `cooling_events.as_u64()`.
+#[test]
+fn eager_mesh_stability_oracle_passes_when_ts_stable() {
+    let make_snap = |ts_a: Option<u64>, ts_b: Option<u64>| {
+        serde_json::json!({
+            "dm_bus": {
+                "peer_aaaa": { "role": "eager", "cooling_events": 3.0,
+                               "last_cool_at_unix_ms": ts_a,
+                               "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+                "peer_bbbb": { "role": "eager", "cooling_events": 2.0,
+                               "last_cool_at_unix_ms": ts_b,
+                               "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
+            }
+        })
+    };
+    // Same last_cool_at_unix_ms before and after — stable recovery.
+    let before = make_snap(Some(1_700_000_000_000), Some(1_700_000_010_000));
+    let after = make_snap(Some(1_700_000_000_000), Some(1_700_000_010_000));
+    check_eager_mesh_stable(&before, &after, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2)
+        .expect("stable last_cool_at_unix_ms must pass the stability oracle");
+}
+
+/// **Negative control** — stability oracle must fail when `last_cool_at_unix_ms`
+/// advanced (peer was re-cooled after eager promotion).
+///
+/// Uses float `cooling_events` so that any attempt to re-introduce
+/// `cooling_events.as_u64()` would silently fail to detect re-cooling — this
+/// test would then incorrectly pass, making the regression visible.
+#[test]
+fn eager_mesh_stability_oracle_fails_when_ts_advances() {
+    let before = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": { "role": "eager", "cooling_events": 3.0,
+                           "last_cool_at_unix_ms": 1_700_000_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 2.0,
+                           "last_cool_at_unix_ms": 1_700_000_010_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
+        }
+    });
+    // peer_bbbb was re-cooled: last_cool_at_unix_ms advanced.
+    let after = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": { "role": "eager", "cooling_events": 3.0,
+                           "last_cool_at_unix_ms": 1_700_000_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 2.4,
+                           "last_cool_at_unix_ms": 1_700_000_130_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
+        }
+    });
+    let result = check_eager_mesh_stable(&before, &after, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "advancing last_cool_at_unix_ms must fail the stability oracle"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("peer_bbbb"),
+        "stability error must name the re-cooled peer; got: {msg}"
+    );
+}
+
+/// **Negative control** for the `cooling_events` f64 / `as_u64()` trap.
+///
+/// `PeerScoreBreakdownSnapshot.cooling_events` is an **f64 decayed counter**;
+/// `serde_json::Value::as_u64()` always returns `None` for float JSON values.
+/// Any stability oracle that compares `cooling_events` via `as_u64()` would
+/// silently pass even when `cooling_events` advanced — invisible re-cooling.
+///
+/// This test uses float `cooling_events` (the real snapshot shape) and verifies
+/// that the oracle correctly detects re-cooling through `last_cool_at_unix_ms`
+/// even though `cooling_events.as_u64()` would return `None` for both values.
+#[test]
+fn eager_mesh_stability_oracle_not_fooled_by_float_cooling_events() {
+    // cooling_events is f64: as_u64() is always None, so the old oracle
+    // could never fire on this shape, even when cooling_events clearly advanced.
+    let before = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": { "role": "eager", "cooling_events": 2.0,
+                           "last_cool_at_unix_ms": 1_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 1.5,
+                           "last_cool_at_unix_ms": 2_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
+        }
+    });
+    // peer_bbbb was re-cooled: cooling_events advanced (f64, as_u64=None) AND
+    // last_cool_at_unix_ms advanced (u64, reliably detectable).
+    let after = serde_json::json!({
+        "dm_bus": {
+            "peer_aaaa": { "role": "eager", "cooling_events": 2.0,
+                           "last_cool_at_unix_ms": 1_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null },
+            "peer_bbbb": { "role": "eager", "cooling_events": 2.4,
+                           "last_cool_at_unix_ms": 3_000_000u64,
+                           "eager_eligible": true, "suppression_state": null, "cooldown_ms": null }
+        }
+    });
+    let result = check_eager_mesh_stable(&before, &after, "dm_bus", &["peer_aaaa", "peer_bbbb"], 2);
+    assert!(
+        result.is_err(),
+        "re-cooling must be detected via last_cool_at_unix_ms even when cooling_events is f64; \
+         if this passes, the oracle is silently blind to re-cooling on real snapshots (#611)"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("peer_bbbb"),
+        "stability error must name the re-cooled peer; got: {msg}"
+    );
+}
+
+// ── Unit tests for check_eager_mesh_for_diamond subscription semantics ────────
+//
+// These tests validate the configuration-driven subscriber/non-subscriber
+// distinction.  The subscription decision is driven by `non_subscriber_indices`
+// (passed directly to `capture_ready_diamond` by shape_diamond, NOT embedded
+// in topology JSON), NOT by observing whether the topic is absent in the snapshot.
+//
+// All tests use synthetic observations; no daemon or network I/O is needed.
+
+/// **Negative control** — subscriber with topic absent: oracle must return Err
+/// (retryable), NOT silently pass.  Guards against the vacuous-pass scenario
+/// where a subscriber's scores haven't populated yet and the oracle passes.
+#[test]
+fn eager_mesh_for_diamond_subscriber_absent_topic_is_retryable_err() {
+    // G5 (index 0) has peer_scores_by_topic populated with another topic but
+    // NOT the DM bus topic — scores present but not yet populated for DM bus.
+    let other_topic = "cafebabe12345678";
+    let observed = serde_json::json!({
+        "G5": {
+            "admitted": [],
+            "peer_scores_by_topic": { other_topic: {} }
+        },
+        "D5": { "admitted": [], "peer_scores_by_topic": null },
+        "O5": { "admitted": [], "peer_scores_by_topic": null },
+        "W5": { "admitted": [], "peer_scores_by_topic": null },
+    });
+    // Non-zero fake identities so neighbor_hex8 is computable if the check
+    // ever reaches the peer lookup (it should not — topic check fires first).
+    let fake_ids = Some([[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
+    let result = check_eager_mesh_for_diamond(&observed, fake_ids, &[]);
+    assert!(
+        result.is_err(),
+        "subscriber (G5) with DM bus topic absent must return Err (retryable); \
+         a silent Ok would let the oracle pass vacuously before scores populate"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("G5"),
+        "retryable error must name the failing node; got: {msg}"
+    );
+    assert!(
+        msg.contains("retryable") || msg.contains("absent"),
+        "error must describe the retryable condition; got: {msg}"
+    );
+}
+
+/// Declared non-subscriber with topic absent: oracle must return Ok.
+/// This is the opt-out arm: O5 (index 2) is declared as non-subscriber and
+/// its `peer_scores_by_topic` correctly lacks the DM bus topic.
+#[test]
+fn eager_mesh_for_diamond_declared_non_subscriber_absent_topic_is_ok() {
+    let other_topic = "cafebabe12345678";
+    let observed = serde_json::json!({
+        "G5": { "admitted": [], "peer_scores_by_topic": null },
+        "D5": { "admitted": [], "peer_scores_by_topic": null },
+        // O5 has scores for other topics but not DM bus — correct opt-out shape.
+        "O5": {
+            "admitted": [],
+            "peer_scores_by_topic": { other_topic: {} }
+        },
+        "W5": { "admitted": [], "peer_scores_by_topic": null },
+    });
+    let fake_ids = Some([[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
+    // O5 = index 2 in DIAMOND_LABELS order.
+    check_eager_mesh_for_diamond(&observed, fake_ids, &[2])
+        .expect("declared non-subscriber (O5) with topic correctly absent must pass");
+}
+
+/// **Negative control** — declared non-subscriber WITH the DM bus topic present:
+/// oracle must return Err (opt-out flag had no effect — configuration violation).
+#[test]
+fn eager_mesh_for_diamond_declared_non_subscriber_with_topic_is_err() {
+    let dm_topic = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
+    // O5 declared non-subscriber but has the DM bus topic in its scores.
+    let mut o5_scores = serde_json::json!({});
+    o5_scores[&dm_topic] = serde_json::json!({
+        "peer_aaaa": {
+            "role": "eager", "cooling_events": 0.0,
+            "last_cool_at_unix_ms": null,
+            "eager_eligible": true, "suppression_state": null, "cooldown_ms": null
+        }
+    });
+    let observed = serde_json::json!({
+        "G5": { "admitted": [], "peer_scores_by_topic": null },
+        "D5": { "admitted": [], "peer_scores_by_topic": null },
+        "O5": { "admitted": [], "peer_scores_by_topic": o5_scores },
+        "W5": { "admitted": [], "peer_scores_by_topic": null },
+    });
+    let fake_ids = Some([[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
+    let result = check_eager_mesh_for_diamond(&observed, fake_ids, &[2]);
+    assert!(
+        result.is_err(),
+        "declared non-subscriber (O5) WITH the DM bus topic must return Err \
+         — the opt-out flag had no effect, a configuration invariant violation"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("O5"),
+        "error must name the violating node; got: {msg}"
+    );
+}
+
+// validate_topology rejects observations that still carry peer_scores_by_topic
+// (the field added by diamond_observations_with_recorder for oracle use), and
+// accepts observations where strip_peer_scores has removed it.  This pins the
+// topology-contract invariant so a regression surfaces inertly in CI rather
+// than through a live integration test panic.
+#[test]
+fn validate_topology_rejects_observation_with_extra_key() {
+    let mut evidence = synthetic_diamond_evidence();
+    // Inject the oracle field into one pre_cut observation, simulating the
+    // storage bug that existed before strip_peer_scores was applied.
+    evidence["topology"]["observations"]["pre_cut"]["G5"]["peer_scores_by_topic"] =
+        serde_json::Value::Null;
+    let result = validate_measurement(&evidence);
+    assert!(
+        result.is_err(),
+        "validate_topology must reject an observation carrying peer_scores_by_topic"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("topology keys mismatch"),
+        "expected 'topology keys mismatch'; got: {msg}"
+    );
+}
+
+#[test]
+fn validate_topology_accepts_stripped_observations() {
+    // synthetic_diamond_evidence already produces clean observations
+    // ({"admitted","begin_ns","end_ns"} only), so validate_measurement must pass
+    // the topology-contract portion of its checks.
+    let evidence = synthetic_diamond_evidence();
+    // validate_measurement may fail for reasons beyond topology keys (e.g. load
+    // counters not present in synthetic data), but the topology-key check must
+    // NOT be among them.
+    match validate_measurement(&evidence) {
+        Ok(()) => {} // clean pass — fine
+        Err(e) => {
+            assert!(
+                !e.contains("topology keys mismatch"),
+                "stripped observations must not trigger topology-key check; got: {e}"
+            );
+        }
+    }
 }

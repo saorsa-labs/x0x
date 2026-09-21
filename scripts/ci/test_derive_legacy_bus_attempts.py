@@ -69,6 +69,29 @@ def output(record):
 
 
 class DerivationControls(unittest.TestCase):
+    def test_workspace_and_rust_premises_match_independently(self):
+        workspace = Path(__file__).resolve().parents[2]
+        module.validate_source_premise(
+            (workspace / "Cargo.toml").read_bytes(),
+            (workspace / "src/legacy_bus_interop_tests.rs").read_bytes(),
+        )
+
+    def test_source_premise_drift_is_rejected(self):
+        cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.83"\n'
+        rust = (
+            b'pinned[0]["version"].as_str() != Some("0.5.83")\n'
+            b' || pinned[0]["checksum"].as_str()\n'
+            b' != Some("7886ce7293eecce58e59be0fa48f1fee5262af7a9e4e02be305dc12e94166912")'
+        )
+        module.validate_source_premise(cargo, rust)
+        for cargo_input, rust_input, code in (
+            (cargo.replace(b"=0.5.83", b"0.5.83"), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (cargo, rust.replace(b"0.5.83", b"0.5.82", 1), "RUST_PUBSUB_VERSION_MISMATCH"),
+            (cargo, rust.replace(b"7886ce", b"0886ce", 1), "RUST_PUBSUB_SHA_MISMATCH"),
+        ):
+            with self.subTest(code=code), self.assertRaisesRegex(module.Inconclusive, code):
+                module.validate_source_premise(cargo_input, rust_input)
+
     def test_actual_positive_arithmetic_and_absent_zero(self):
         result = module.derive(module.parse(output(fixture())), LOCK)
         self.assertEqual(result["derivation"], "CONSISTENT")

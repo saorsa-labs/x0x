@@ -1504,12 +1504,10 @@ async fn fork_quarantine_gate_parity_with_reverify_gate() -> Result<()> {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "quarantined encrypt must 409");
-    assert_eq!(
-        json.0["error"].as_str(),
-        Some("fork_quarantined"),
-        "typed fork-quarantine error: {}",
-        json.0
-    );
+    // ADR-0066 §5 (slice 1): the machine code moved from `error` to
+    // `reason`, and `error` now carries the mandatory informational
+    // sentence. The whole contract is asserted in one shared place.
+    super::fork_quarantine::assert_fork_quarantine_refusal_body(&json.0);
 
     // The evidence-bearing seal clears BOTH containment kinds.
     let response = seal_group_state(
@@ -1808,7 +1806,7 @@ async fn adr0064_s4_eviction_arm_non_durable_clear_keeps_marker_and_503s() -> Re
     // persist; the asserted contract — non-durable never 200s and the
     // marker survives — is the same transaction surface either way.)
     persist_named_groups_mutation(&state, |_| true).await?;
-    let _fault = set_save_fault(SaveFault::Error);
+    let _fault = set_save_fault(&state, SaveFault::Error);
     let response = seal_group_state(
         State(Arc::clone(&state)),
         axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),

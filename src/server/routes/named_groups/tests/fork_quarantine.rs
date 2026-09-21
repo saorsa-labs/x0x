@@ -173,28 +173,46 @@ async fn diag_row(state: &AppState, group_id: &str) -> crate::groups::diagnostic
         .expect("diagnostics row")
 }
 
-/// WHY (ADR-0064 slice-1 scope restriction): the quarantine marker is a
-/// David-decision boundary — set and gated ONLY for owner-axis groups.
-/// An ordinary invite-only group records fork EVIDENCE exactly as before
-/// (ADR-0059 semantics are untouched) but must remain byte-for-byte
-/// unchanged with respect to the marker: no marker, no
-/// `fork_quarantine_set` counter, and the gate predicate inert.
+/// Two validly-signed sibling commits at revision 2 over the same parent,
+/// signed with the plain (non-owner-certified) seal.
+fn plain_seal_variant(
+    state: &AppState,
+    base: &x0x::groups::GroupInfo,
+    description: &str,
+) -> Result<x0x::groups::state_commit::GroupStateCommit> {
+    let mut v = base.clone();
+    v.description = description.to_string();
+    v.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    Ok(v.commit_log.last().expect("sealed commit").commit.clone())
+}
+
+/// WHY (ADR-0066 §2 — the single largest finding of the §1 census, and the
+/// behaviour this slice exists to change). ADR-0064 shipped the marker for
+/// owner-axis groups only, so for ORDINARY groups the gated count was 0 of
+/// 26: every data-plane route served both branches of a fork, indefinitely,
+/// while ADR-0064's own text claimed `quarantine_no_anchor` semantics for
+/// exactly that population. This test pins the repair end to end.
+///
+/// The `no_anchor: true` flag is not decoration: it is what the three
+/// owner-anchored clear arms consult to DECLINE, and what the §5 message
+/// reads to name the only remedy that can work (`--force --reason`). A
+/// marker installed on an ordinary group without it would be handed an
+/// automatic clear by the mandate arm and the user would be told to wait
+/// for an anchor that can never arrive.
+///
+/// This test supersedes `adr0064_non_owner_axis_conflict_never_sets_marker`,
+/// which asserted the inverse. The old assertion was correct for ADR-0064's
+/// deliberate slice boundary and is wrong under ADR-0066 §2; it is replaced
+/// rather than relaxed so the change of contract is visible in the diff.
 #[tokio::test]
-async fn adr0064_non_owner_axis_conflict_never_sets_marker() -> Result<()> {
+async fn adr0066_ordinary_group_conflict_sets_a_no_anchor_marker() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
     let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group_id = "b0".repeat(32);
     let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
 
-    // Two different validly-signed commits at revision 2 (same prev).
-    let seal_variant = |description: &str| -> Result<x0x::groups::state_commit::GroupStateCommit> {
-        let mut v = base.clone();
-        v.description = description.to_string();
-        v.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
-        Ok(v.commit_log.last().expect("sealed commit").commit.clone())
-    };
-    let fork_a = seal_variant("fork-a")?;
-    let fork_b = seal_variant("fork-b")?;
+    let fork_a = plain_seal_variant(&state, &base, "fork-a")?;
+    let fork_b = plain_seal_variant(&state, &base, "fork-b")?;
 
     let first = apply_commit(&state, &group_id, fork_a, "fork-a").await?;
     assert!(first.is_ok(), "first fork applies: {first:?}");
@@ -204,7 +222,7 @@ async fn adr0064_non_owner_axis_conflict_never_sets_marker() -> Result<()> {
     assert!(second.is_err(), "conflicting twin must be refused");
 
     let record = live_record(&state, &group_id).await;
-    // Evidence IS recorded (pre-existing ADR-0059 behaviour)…
+    // Evidence is recorded exactly as before — ADR-0059 semantics untouched.
     assert!(
         record
             .invite_lineage
@@ -213,16 +231,254 @@ async fn adr0064_non_owner_axis_conflict_never_sets_marker() -> Result<()> {
             .is_some_and(
                 |evidence| evidence.revision == 2 && evidence.committed_by == authority_hex
             ),
-        "evidence still lands on non-owner-axis groups (unchanged)"
+        "evidence still lands on ordinary groups (unchanged)"
     );
-    // …but the quarantine marker is NEVER set and nothing counted.
+    let marker = record.fork_quarantine.as_ref().expect(
+        "ADR-0066 §2: authenticated conflicting evidence now quarantines an ORDINARY group too",
+    );
+    assert!(
+        marker.no_anchor,
+        "an ordinary group has no owner axis, so the marker must say so — this flag is what \
+         makes every automatic clear decline and what picks the only workable remedy in the \
+         §5 message"
+    );
+    assert_eq!(marker.revision, 2, "the marker names the evidenced fork");
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_set,
+        1,
+        "operators upgrading should expect fork_quarantine_set to rise for this population"
+    );
+
+    // Rows 1–6 are now REACHABLE for this population, and each refusal
+    // carries the slice-1 message with the `no_anchor` branch: the R5
+    // override removed the warn-only window only on condition that the
+    // user is told why, and for a marker that never auto-clears a bare
+    // code would be a permanent mystery.
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a data-plane route on a quarantined ordinary group refuses: {}",
+        json.0
+    );
+    assert_fork_quarantine_refusal_body(&json.0);
+    assert_eq!(
+        json.0["fork_quarantine"]["no_anchor"].as_bool(),
+        Some(true),
+        "§5: the body says plainly that nothing will clear this automatically"
+    );
+    let message = json.0["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("--force") && message.contains("--reason"),
+        "the remedy named must be the one that can actually succeed for a group with no \
+         owner axis: {message}"
+    );
+
+    // ADR-0066 §2 "Clear is manual and only manual": a perfectly valid
+    // commit at a HIGHER revision on our own ancestry advances the group
+    // and leaves the marker exactly where it is.
+    let head = live_record(&state, &group_id).await;
+    let advance = plain_seal_variant(&state, &head, "valid-advance")?;
+    let advanced = apply_commit(&state, &group_id, advance, "valid-advance").await?;
+    let advanced = advanced.expect("a valid successor applies");
+    assert_eq!(advanced.state_revision, 3, "the group did advance");
+    persist_applied(&state, &group_id, advanced).await?;
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        record
+            .fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.no_anchor && marker.revision == 2),
+        "no commit, of any revision, on any ancestry clears a `no_anchor` marker"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0066 R2 — the widened `invite_lineage` fence): before this
+/// slice the evidence path was reached only for INVITE-DERIVED groups,
+/// because the evidence record lives on `invite_lineage`. An ordinary group
+/// created locally, with no invite in its history, recorded nothing at all
+/// — so "ordinary group" silently meant two populations with different
+/// containment. R2 ratified widening the fence, and for a lineage-less
+/// group the MARKER is the durable record.
+///
+/// This is the fixture that fails if the widening is reverted to
+/// `invite_lineage.is_some()`, or if `install_fork_evidence` keeps its old
+/// "no lineage, no install" early return — in which case the group would
+/// look contained (the conflict is still refused) while nothing was
+/// recorded and every other route kept serving.
+#[tokio::test]
+async fn adr0066_ordinary_group_without_invite_lineage_is_covered() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "b9".repeat(32);
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "no-lineage-under-test".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.clone(),
+        invite_only_policy(),
+    );
+    info.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    assert!(
+        info.invite_lineage.is_none(),
+        "the fixture's whole point: this group never held an invite record"
+    );
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info.clone());
+
+    let fork_a = plain_seal_variant(&state, &info, "fork-a")?;
+    let fork_b = plain_seal_variant(&state, &info, "fork-b")?;
+    let first = apply_commit(&state, &group_id, fork_a, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+    let second = apply_commit(&state, &group_id, fork_b, "fork-b").await?;
+    assert!(second.is_err(), "the conflicting twin is refused");
+
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        record.invite_lineage.is_none(),
+        "no lineage record is fabricated — provenance is not invented to hold evidence"
+    );
+    assert!(
+        record
+            .fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.no_anchor),
+        "R2: a group formed without an invite is quarantined too, with no anchor"
+    );
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_set,
+        1
+    );
+
+    // The marker doubles as the first-complete-wins silence gate for this
+    // population: a SECOND, different authenticated conflict must not
+    // re-install, re-count or re-warn on an already-contained group.
+    let mut third_meta = info.public_meta();
+    third_meta.description = "fork-c".to_string();
+    let fork_c = x0x::groups::GroupStateCommit::sign(
+        info.stable_group_id().to_string(),
+        2,
+        Some(info.state_hash.clone()),
+        x0x::groups::compute_roster_root(&info.members_v2),
+        x0x::groups::compute_policy_hash(&info.policy),
+        x0x::groups::compute_public_meta_hash(&third_meta),
+        info.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        state.agent.identity().agent_keypair(),
+    )?;
+    let third = apply_commit(&state, &group_id, fork_c, "fork-c").await?;
+    assert!(third.is_err(), "the third commit also conflicts");
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        record
+            .fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.revision == 2 && marker.no_anchor),
+        "first complete evidence wins — the original marker is kept"
+    );
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_set,
+        1,
+        "an already-contained group does not re-count on every later conflict"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0066 §2 "Trigger is unchanged" + ADR-0064 Attack matrix "false
+/// quarantine"): widening the marker to ordinary groups widens the blast
+/// radius of a FALSE positive from 0 routes to 12, so the authentication of
+/// evidence is the security boundary of this whole slice. If an
+/// unauthenticated conflicting commit could install a marker, any stranger
+/// who can reach the metadata topic could take an ordinary group's data
+/// plane offline until a human intervened — a remote denial of service with
+/// no automatic recovery, because a `no_anchor` marker never auto-clears.
+///
+/// The gate is `fork_candidate_authenticated`: the commit's own signature
+/// must verify AND its committer must have been an ACTIVE ADMIN in the
+/// retained predecessor roster. This fixture is the ordinary-group twin of
+/// `adr0064_unauthenticated_conflict_never_sets_marker`.
+#[tokio::test]
+async fn adr0066_unauthenticated_conflict_never_quarantines_an_ordinary_group() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "ba".repeat(32);
+    let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
+
+    let fork_a = plain_seal_variant(&state, &base, "fork-a")?;
+    let first = apply_commit(&state, &group_id, fork_a, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+
+    // Genuinely signed — by a key that holds no seat in the retained
+    // roster. Structure verification passes; authority does not.
+    let stranger = AgentKeypair::generate()?;
+    let stranger_commit = x0x::groups::GroupStateCommit::sign(
+        base.stable_group_id().to_string(),
+        2,
+        Some(base.state_hash.clone()),
+        x0x::groups::compute_roster_root(&base.members_v2),
+        x0x::groups::compute_policy_hash(&base.policy),
+        x0x::groups::compute_public_meta_hash(&base.public_meta()),
+        base.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &stranger,
+    )?;
+    let refused = apply_commit(&state, &group_id, stranger_commit, "stranger-fork").await?;
+    assert!(refused.is_err(), "the stranger's commit is refused");
+
+    let record = live_record(&state, &group_id).await;
     assert!(
         !record.is_fork_quarantined(),
-        "slice-1 scope: non-owner-axis groups never receive the marker"
+        "ADR-0066 §2: extending the marker to ordinary groups must NOT relax authentication — \
+         an unauthenticated conflict is a remote DoS if it can quarantine"
+    );
+    assert!(
+        record
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.as_ref())
+            .is_none(),
+        "and no evidence is recorded either"
     );
     let row = diag_row(&state, &group_id).await;
     assert_eq!(row.counters.fork_quarantine_set, 0);
-    assert_eq!(row.counters.fork_quarantine_refusals, 0);
+    assert!(
+        row.counters.conflict_unauthenticated >= 1,
+        "the unauthenticated-conflict counter fires instead"
+    );
+
+    // A FORGED commit — one whose signature does not verify at all — is
+    // refused a step earlier, and likewise quarantines nothing.
+    let mut forged = plain_seal_variant(&state, &base, "forged")?;
+    forged.signature = "not-a-signature".to_string();
+    let forged_refused = apply_commit(&state, &group_id, forged, "forged").await?;
+    assert!(forged_refused.is_err(), "the forged commit is refused");
+    assert!(
+        !live_record(&state, &group_id).await.is_fork_quarantined(),
+        "a commit whose signature does not verify is never evidence"
+    );
     Ok(())
 }
 
@@ -566,7 +822,7 @@ async fn adr0064_forced_persist_failure_leaves_marker_retryable() -> Result<()> 
     // Force the roster save itself to fail (the #470 fault cell compiled
     // into the production persist path).
     {
-        let _fault = set_save_fault(SaveFault::Error);
+        let _fault = set_save_fault(&state, SaveFault::Error);
         let second = apply_commit(&state, &group_id, fork_b_commit.clone(), "fork-b").await?;
         assert!(second.is_err(), "the conflicting twin is still refused");
         let record = live_record(&state, &group_id).await;
@@ -1816,5 +2072,562 @@ async fn adr0064_owner_anchored_conflict_label_lands_on_fresh_evidence() -> Resu
         row.counters.fork_quarantine_owner_anchored_clears, 0,
         "r2/ADR §3: the conflict path never clears"
     );
+    Ok(())
+}
+
+/// ADR-0066 §5 acceptance bar, asserted in ONE place so the three
+/// pre-existing refusal sites and every future refusing row check the
+/// same contract instead of each re-deriving it (§3e: one helper builds
+/// the refusal, so one helper should assert it).
+///
+/// WHY each clause matters, not just what it checks:
+/// - `reason` is the stable machine code. R5 moved it out of `error`
+///   precisely so that `error` is free to be prose; if `reason` is
+///   missing, every client that migrated has silently lost its match.
+/// - `error` must NOT equal the code. This is the clause that fails if
+///   someone reverts to `api_error(CONFLICT, "fork_quarantined")` — the
+///   exact regression §5 exists to prevent, and one a "409 is returned"
+///   test cannot see.
+/// - `error` must name the quarantine, the reason operations are
+///   refused, and the clearing path. R5 removed the warn-only window on
+///   the condition that a user always learns why; a marker that never
+///   auto-clears turns a bare code into a permanent mystery, so
+///   "mentions quarantine" alone is not the bar — "actionable" is.
+/// - `fork_quarantine.clear_with` carries the remedy machine-readably so
+///   a GUI or script can offer it without parsing prose.
+pub(super) fn assert_fork_quarantine_refusal_body(body: &serde_json::Value) {
+    assert_eq!(
+        body["ok"].as_bool(),
+        Some(false),
+        "ADR-0066 §5: `ok: false` is unchanged — the envelope shape is compatible: {body}"
+    );
+    assert_eq!(
+        body["reason"].as_str(),
+        Some("fork_quarantined"),
+        "ADR-0066 §5: the stable machine code lives in `reason`: {body}"
+    );
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        !message.is_empty(),
+        "ADR-0066 §5: a refusal without a message is a failing test, not a cosmetic gap: {body}"
+    );
+    assert_ne!(
+        message, "fork_quarantined",
+        "ADR-0066 §5 regression guard: `error` must be prose, never the bare machine code — \
+         this assertion is what fails if the refusal reverts to `api_error`: {body}"
+    );
+    assert!(
+        message.contains("fork-quarantined"),
+        "ADR-0066 §5: the sentence must name the condition: {message}"
+    );
+    assert!(
+        message.contains("contested") && message.contains("refused"),
+        "ADR-0066 §5: the sentence must say WHY the operation was refused: {message}"
+    );
+    assert!(
+        message.contains("/quarantine/clear") && message.contains("x0x groups quarantine clear"),
+        "ADR-0066 §5: a message that names the condition but not the remedy does not satisfy \
+         R5 — the CLI command is named for CLI users: {message}"
+    );
+    let marker = &body["fork_quarantine"];
+    assert!(
+        marker["revision"].is_u64(),
+        "ADR-0066 §5: which divergence: {body}"
+    );
+    assert!(
+        marker["observed_at_ms"].is_u64(),
+        "ADR-0066 §5: when this node saw it: {body}"
+    );
+    assert!(
+        marker["no_anchor"].is_boolean(),
+        "ADR-0066 §5: whether anything will clear this automatically: {body}"
+    );
+    assert_eq!(
+        marker["clear_with"].as_str(),
+        Some("POST /groups/:id/quarantine/clear"),
+        "ADR-0066 §5: the remedy, machine-readable: {body}"
+    );
+}
+
+/// A marker built without a daemon, for the inert payload-contract test.
+fn synthetic_marker(no_anchor: bool) -> Result<x0x::groups::ForkQuarantine> {
+    let kp = AgentKeypair::generate()?;
+    let info = x0x::groups::GroupInfo::with_policy(
+        "payload-contract".to_string(),
+        String::new(),
+        crate::identity::AgentId::from_public_key(kp.public_key()),
+        "aa".repeat(32),
+        invite_only_policy(),
+    );
+    let header = info.terminal_commit_header();
+    Ok(x0x::groups::ForkQuarantine {
+        revision: 7,
+        state_hash: "0".repeat(64),
+        committed_by: "ff".repeat(32),
+        observed_at_ms: 1_700_000_000_123,
+        snapshot: x0x::groups::ForkSnapshot {
+            terminal_commit: header.clone(),
+            conflicting_commit: header,
+            classification: None,
+        },
+        no_anchor,
+    })
+}
+
+/// WHY (ADR-0066 §5, slice 1): the refusal must explain itself. R5
+/// removed the warn-only window *on the condition* that a user always
+/// learns why an operation was refused, so the message is part of the
+/// containment contract, not presentation polish.
+///
+/// Both marker shapes are asserted because the remedy differs and a
+/// wrong remedy is worse than none: an owner-axis marker also clears
+/// when the owner anchor advances, while a `no_anchor` marker never
+/// auto-clears and its manual clear has no owner axis to attest with, so
+/// it can only be cleared with the operator override
+/// (`clear_group_quarantine` path (b)). A message that told an ordinary
+/// group's operator to "wait for the owner anchor", or told them to run
+/// the clear without `--force`, would send them down a path that cannot
+/// succeed.
+///
+/// Inert by construction: no AppState, no Agent, no sockets — the §5
+/// bar is a property of the body, and a payload test that needs a node
+/// stood up is a payload test nobody runs.
+#[test]
+fn adr0066_refusal_body_carries_the_machine_code_and_an_actionable_message() -> Result<()> {
+    let group_id = "c1".repeat(32);
+
+    let owner_axis = fork_quarantine_refusal_body(&group_id, &synthetic_marker(false)?);
+    assert_fork_quarantine_refusal_body(&owner_axis);
+    let owner_message = owner_axis["error"].as_str().unwrap_or_default();
+    assert!(
+        owner_message.contains("owner-anchored commit advances past revision 7"),
+        "an owner-axis marker's exit includes the anchored advance, named with the \
+         evidenced revision: {owner_message}"
+    );
+    assert_eq!(
+        owner_axis["fork_quarantine"]["no_anchor"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(owner_axis["fork_quarantine"]["revision"].as_u64(), Some(7));
+    assert_eq!(
+        owner_axis["fork_quarantine"]["observed_at_ms"].as_u64(),
+        Some(1_700_000_000_123)
+    );
+
+    let no_anchor = fork_quarantine_refusal_body(&group_id, &synthetic_marker(true)?);
+    assert_fork_quarantine_refusal_body(&no_anchor);
+    let no_anchor_message = no_anchor["error"].as_str().unwrap_or_default();
+    assert!(
+        no_anchor_message.contains("nothing clears the marker automatically"),
+        "a `no_anchor` marker must say plainly that no advance will lift it: {no_anchor_message}"
+    );
+    assert!(
+        no_anchor_message.contains("--force") && no_anchor_message.contains("--reason"),
+        "the only clear available to a group with no owner axis is the operator override: \
+         {no_anchor_message}"
+    );
+    assert!(
+        !no_anchor_message.contains("owner-anchored commit advances"),
+        "a `no_anchor` marker must NOT offer the anchored advance — it cannot happen: \
+         {no_anchor_message}"
+    );
+    assert_eq!(
+        no_anchor["fork_quarantine"]["no_anchor"].as_bool(),
+        Some(true)
+    );
+
+    // The group id is in the CLI hint so the remedy is copy-pasteable
+    // rather than a template the operator has to fill in under
+    // incident pressure.
+    assert!(
+        owner_message.contains(&group_id) && no_anchor_message.contains(&group_id),
+        "the printed remedy names the group"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0066 §5 + R5 no-grace): the message must arrive on the
+/// FIRST refused request after the marker installs. R5 rejected the
+/// warn-only window, so there is no request budget, counter threshold or
+/// elapsed-time window that lets one operation through unexplained; this
+/// is the regression test for that rejected design, so a future
+/// re-introduction of grace fails loudly instead of silently weakening
+/// containment.
+#[tokio::test]
+async fn adr0066_first_request_after_install_is_refused_with_the_message() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "c3".repeat(32);
+    let base =
+        sealed_group_with_lineage(&state, &group_id, owner_certified_policy(&owner_kp)).await?;
+    let fork_a = owner_seal_variant(&state, &base, "fork-a").await?;
+    let fork_b = owner_seal_variant(&state, &base, "fork-b").await?;
+    let first = apply_commit(
+        &state,
+        &group_id,
+        fork_a.commit_log.last().expect("sealed").commit.clone(),
+        "fork-a",
+    )
+    .await?;
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+    let second = apply_commit(
+        &state,
+        &group_id,
+        fork_b.commit_log.last().expect("sealed").commit.clone(),
+        "fork-b",
+    )
+    .await?;
+    assert!(second.is_err(), "the twin conflicts");
+    let marker_revision = live_record(&state, &group_id)
+        .await
+        .fork_quarantine
+        .as_ref()
+        .expect("marker installed")
+        .revision;
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_refusals,
+        0,
+        "no request has been refused yet — the first one below is the first"
+    );
+
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the very first request after the install is refused — no grace: {}",
+        json.0
+    );
+    assert_fork_quarantine_refusal_body(&json.0);
+    assert_eq!(
+        json.0["fork_quarantine"]["revision"].as_u64(),
+        Some(marker_revision),
+        "the body names the divergence the live marker recorded, not a placeholder"
+    );
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_refusals,
+        1,
+        "§3e: one refusal, one increment — the message did not change the diagnostic contract"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0066 §2 table, the OPPOSITE direction — the trap this slice
+/// had to avoid): `rollback_live_fork_evidence` looks identical to a clear
+/// at the call site (`info.fork_quarantine = None`) and differs only in
+/// provenance. A *clear* asserts the fork was resolved; a *rollback*
+/// asserts the install never durably happened. Gating the rollback on
+/// `no_anchor` — the intuitive "be consistent" move — would strand a
+/// marker whose evidence was retracted by a benign persist retry, turning a
+/// transient failure into an UNCLEARABLE quarantine on a group that never
+/// forked as far as disk is concerned.
+///
+/// So this fixture asserts the rollback arm was NOT gated: a `no_anchor`
+/// marker installed by a non-durable mutation IS rolled back on the exact
+/// identity match, and the identical conflict then re-installs it durably.
+#[tokio::test]
+async fn adr0066_non_durable_install_rolls_back_a_no_anchor_marker() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "bb".repeat(32);
+    let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
+    let fork_a = plain_seal_variant(&state, &base, "fork-a")?;
+    let fork_b = plain_seal_variant(&state, &base, "fork-b")?;
+    let first = apply_commit(&state, &group_id, fork_a, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+
+    {
+        // The install is visible in memory but never confirmed durable.
+        let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
+        let second = apply_commit(&state, &group_id, fork_b.clone(), "fork-b").await?;
+        assert!(second.is_err(), "the conflicting twin is still refused");
+        let record = live_record(&state, &group_id).await;
+        assert!(
+            !record.is_fork_quarantined(),
+            "the `no_anchor` marker is rolled back with its evidence — an undo of an install is \
+             NOT a clear, and leaving it would need a human to clear a quarantine that only ever \
+             existed in memory"
+        );
+        assert!(
+            record
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref())
+                .is_none(),
+            "the evidence record rolls back with it, so the conflict stays retryable"
+        );
+        assert_eq!(
+            diag_row(&state, &group_id)
+                .await
+                .counters
+                .fork_quarantine_set,
+            0,
+            "nothing is counted for an install that never reached durability"
+        );
+    }
+
+    let retry = apply_commit(&state, &group_id, fork_b, "fork-b").await?;
+    assert!(retry.is_err());
+    assert!(
+        live_record(&state, &group_id)
+            .await
+            .fork_quarantine
+            .as_ref()
+            .is_some_and(|marker| marker.no_anchor),
+        "the identical conflict re-installs the `no_anchor` marker durably"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0066 §2 "Clear is manual and only manual"): the manual
+/// endpoint is the ONLY exit for an ordinary group, which makes it
+/// load-bearing rather than a niche override. Two things must hold, and
+/// both are easy to get wrong:
+///
+/// - the clear must WORK for a `no_anchor` marker — if the endpoint refused
+///   it (for instance by demanding an owner attestation it can never mint),
+///   an ordinary group's quarantine would be permanent and the §5 message
+///   would name a remedy that does not exist;
+/// - path (a) must still be unavailable: with no owner axis there is
+///   nothing to attest with, so the endpoint must say `force_required`
+///   rather than silently falling back.
+#[tokio::test]
+async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "bd".repeat(32);
+    let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
+    let fork_a = plain_seal_variant(&state, &base, "fork-a")?;
+    let fork_b = plain_seal_variant(&state, &base, "fork-b")?;
+    let first = apply_commit(&state, &group_id, fork_a, "fork-a").await?;
+    assert!(first.is_ok());
+    persist_applied(&state, &group_id, first.expect("applied")).await?;
+    let second = apply_commit(&state, &group_id, fork_b, "fork-b").await?;
+    assert!(second.is_err());
+    assert!(live_record(&state, &group_id)
+        .await
+        .fork_quarantine
+        .as_ref()
+        .is_some_and(|marker| marker.no_anchor));
+
+    // Path (a) is unreachable for this population, and says so.
+    let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
+    let response =
+        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("force_required"),
+        "an ordinary group has no owner axis to attest with: {body}"
+    );
+    assert!(
+        live_record(&state, &group_id).await.is_fork_quarantined(),
+        "a refused clear leaves the marker in place"
+    );
+
+    // Path (b): the operator override, with the audit reason the §5
+    // message asks for.
+    let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({
+        "force": true,
+        "reason": "benign split confirmed by both operators",
+    }))?;
+    let response =
+        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "the override clears: {body}");
+    assert_eq!(body["cleared_by"].as_str(), Some("force"));
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        !record.is_fork_quarantined(),
+        "the manual clear is the exit ADR-0066 §2 promises"
+    );
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .fork_quarantine_manual_clears,
+        1,
+        "the clear is attributable — this counter is what an operator's audit reads"
+    );
+
+    // The data plane serves again immediately.
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "after the clear the route no longer refuses on quarantine grounds: {}",
+        json.0
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0066 §2 clear-arm table, asserted as a PREDICATE): the three
+/// owner-anchored clear arms differ in their surroundings — one is fenced
+/// by policy, one is not fenced at all, one lives on `GroupInfo` — but they
+/// must agree on the decision. Sharing
+/// [`x0x::groups::ForkQuarantine::owner_anchored_clear_permitted`] is what
+/// makes drift impossible; this test pins the shared decision itself, so
+/// the per-arm fixtures only have to prove each arm consults it.
+///
+/// The `no_anchor` clause is the load-bearing one: the ADR's own first
+/// draft named the wrong arm, and the arm it missed
+/// (`apply_named_group_metadata_event_inner`) has no owner-axis fence of
+/// its own — it relied on the marker only ever existing for owner-axis
+/// groups, which §2 invalidates. Without the flag test, extending the
+/// marker to ordinary groups would hand them an automatic clear.
+#[test]
+fn adr0066_owner_anchored_clear_predicate_declines_no_anchor_markers() -> Result<()> {
+    let anchored = synthetic_marker(false)?;
+    let no_anchor = synthetic_marker(true)?;
+    assert_eq!(anchored.revision, 7, "fixture precondition");
+
+    assert!(
+        anchored.owner_anchored_clear_permitted(8),
+        "an owner-anchored advance PAST the evidenced revision clears an owner-axis marker"
+    );
+    assert!(
+        !anchored.owner_anchored_clear_permitted(7),
+        "ADR-0064 r2: a same-revision sibling — the contested branch itself — never clears"
+    );
+    assert!(
+        !anchored.owner_anchored_clear_permitted(6),
+        "nor does anything below the evidence"
+    );
+
+    for revision in [0, 6, 7, 8, u64::MAX] {
+        assert!(
+            !no_anchor.owner_anchored_clear_permitted(revision),
+            "ADR-0066 §2: a `no_anchor` marker is never cleared by a commit, of ANY revision, \
+             on any ancestry — only the manual clear lifts it (revision {revision})"
+        );
+    }
+    Ok(())
+}
+
+/// WHY (ADR-0066 §2 table, site 3 — `clear_fork_quarantine_on_explicit_
+/// owner_seal`): the explicit owner-key seal is unreachable for an ordinary
+/// group in practice (it has no owner key), so this fixture documents the
+/// invariant rather than a behaviour change. It is worth having anyway: the
+/// arm's own fence is a test of the POLICY, and a `no_anchor` marker on an
+/// owner-axis record — a group whose policy changed, or a marker restored
+/// from a peer-era record — would otherwise clear through a route §2 says
+/// nothing may clear.
+///
+/// Inert: `GroupInfo` plus a user keypair, no daemon.
+#[test]
+fn adr0066_explicit_owner_seal_declines_a_no_anchor_marker() -> Result<()> {
+    let owner_kp = UserKeypair::from_seed(&[0x5Au8; 32])?;
+    let agent_kp = AgentKeypair::generate()?;
+    let seeded = |no_anchor: bool| -> Result<x0x::groups::GroupInfo> {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "explicit-seal-decline".to_string(),
+            String::new(),
+            crate::identity::AgentId::from_public_key(agent_kp.public_key()),
+            "ab".repeat(32),
+            owner_certified_policy(&owner_kp),
+        );
+        // The seal itself is not under test here (an owner-certified seal
+        // needs ADR-0038 certificate evidence and an AppState); the clear
+        // reads only the head revision, the policy and the marker, so the
+        // post-seal head is set directly to keep the fixture inert.
+        info.state_revision = 5;
+        let header = info.terminal_commit_header();
+        // The marker sits strictly BELOW the sealed revision, so the
+        // strictly-greater fence is satisfied and `no_anchor` is the only
+        // thing that can decide the outcome.
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: info.state_revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: "ff".repeat(32),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor,
+        });
+        Ok(info)
+    };
+
+    let mut owner_axis = seeded(false)?;
+    owner_axis.clear_fork_quarantine_on_explicit_owner_seal(Some(&owner_kp));
+    assert!(
+        !owner_axis.is_fork_quarantined(),
+        "control: the owner-key seal DOES clear an anchored marker above the evidence — \
+         otherwise this test could pass with the route simply broken"
+    );
+
+    let mut no_anchor = seeded(true)?;
+    no_anchor.clear_fork_quarantine_on_explicit_owner_seal(Some(&owner_kp));
+    assert!(
+        no_anchor.is_fork_quarantined(),
+        "ADR-0066 §2: the marker's own claim is authoritative over the policy's owner axis"
+    );
+    Ok(())
+}
+
+/// WHY (ADR-0066 Validation "Mixed-version serde fixtures both
+/// directions"): the marker is persisted JSON, and `no_anchor` is the field
+/// this slice starts writing. A marker written before ADR-0066 has no
+/// `no_anchor` key at all, and it MUST decode as `false` — i.e. as the
+/// owner-axis marker it was. If it decoded as `true`, every previously
+/// quarantined owner-axis group would silently lose its automatic clear on
+/// upgrade and need a human; if the field were not `#[serde(default)]` at
+/// all, the whole record would fail to load and the group would come back
+/// UNQUARANTINED, which is worse.
+#[test]
+fn adr0066_marker_persisted_before_the_field_decodes_as_owner_axis() -> Result<()> {
+    let marker = synthetic_marker(true)?;
+    let mut encoded = serde_json::to_value(&marker)?;
+    // The pre-ADR-0066 on-disk shape: the key is simply absent.
+    assert!(encoded
+        .as_object_mut()
+        .expect("marker encodes as an object")
+        .remove("no_anchor")
+        .is_some());
+    let decoded: x0x::groups::ForkQuarantine = serde_json::from_value(encoded)?;
+    assert!(
+        !decoded.no_anchor,
+        "an old persisted marker is an owner-axis marker and keeps its anchored clear path"
+    );
+    assert_eq!(
+        decoded.revision, marker.revision,
+        "and nothing else shifted"
+    );
+
+    // Forward direction: a `no_anchor` marker written by this binary
+    // round-trips, so a restart does not quietly re-anchor an ordinary
+    // group's quarantine.
+    let round_tripped: x0x::groups::ForkQuarantine =
+        serde_json::from_str(&serde_json::to_string(&marker)?)?;
+    assert!(round_tripped.no_anchor, "the flag survives a restart");
+    assert_eq!(round_tripped, marker, "and the record is byte-equal");
     Ok(())
 }

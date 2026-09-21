@@ -242,7 +242,15 @@ While set, the
 membership-gated routes — public send, TreeKEM encrypt/decrypt, and the
 secure encrypt/open/reseal family — refuse with the typed HTTP **409
 `fork_quarantined`** (counted per group in `/diagnostics/groups` as
-`fork_quarantine_set` / `fork_quarantine_refusals`). The marker carries a
+`fork_quarantine_set` / `fork_quarantine_refusals`). ADR-0066 §5 makes that
+refusal explain itself: the machine code `fork_quarantined` is carried in the
+body's `reason` field — **the field clients match** — while `error` holds a
+human sentence naming the condition, why the operation is refused and the
+clearing path, alongside a `fork_quarantine` object with `revision`,
+`observed_at_ms`, `no_anchor` and a machine-readable `clear_with`. A client
+matching the old literal `error == "fork_quarantined"` sees a one-time break
+(HTTP 409 and `ok: false` are unchanged); see
+[the runbook](runbooks/fork-quarantine.md) §5 (Upgrade notes). The marker carries a
 forensic snapshot of both conflicting commit headers (no shared secrets, no
 TreeKEM material). The clear rule (round-2 maintainer decision, ADR-0064 §3
 "owner anchor = owner key") is deliberately narrow — the marker clears ONLY
@@ -270,12 +278,12 @@ automated eviction (ADR-0064 Decision 2). The marker is strictly local
 containment state: stripped from outbound signed-public bootstrap snapshots
 and rejected inbound, exactly like `invite_lineage` — a member that never
 received the authenticated evidence is not contained (per-node scope,
-ADR-0064 Decision 3). **Non-owner-axis groups are out of scope for this
-slice**: they never receive a marker and their behaviour is byte-for-byte
-unchanged; their quarantine/recovery semantics (indefinite
-`quarantine_no_anchor` quarantine and the manual operator runbook) are
-deferred to the ADR follow-up (#472); the operator procedure that DID land
-— ordinary groups ungated, evidence and diagnostics only — is documented in
+ADR-0064 Decision 3). **Ordinary (non-owner-axis) groups are contained too
+since ADR-0066 §2**: authenticated conflicting evidence installs a marker with
+`no_anchor: true`, the same data-plane rows refuse, and — because such a group
+has no owner key to anchor anything — **no commit ever clears it**. All three
+owner-anchored clear arms test `no_anchor` and decline; the only exit is the
+manual clear with `force` plus a reason. The operator procedure is
 [docs/runbooks/fork-quarantine.md](runbooks/fork-quarantine.md) §5.
 Mixed-fleet note: the marker is a
 serde-default JSON field, so v0.41.4 binaries ignore it (and silently drop
@@ -379,8 +387,9 @@ Remote-owner attestation submission is OUT of scope for this endpoint:
 an attestation minted on another node cannot be supplied in the body. A
 keyless node asking without force gets a typed 409
 (`owner_key_unavailable`); a group with no owner axis gets
-`force_required`. A group with no marker (including every non-owner-axis
-group, which never sets one) answers 409. Every successful clear
+`force_required` — which is the NORMAL path for an ordinary group under
+ADR-0066 §2, since the force arm is the only exit a `no_anchor` marker has. A
+group with no marker answers 409. Every successful clear
 increments `fork_quarantine_manual_clears` and logs at info with the
 reason (the audit trail; the logged reason is capped at 256 chars) and
 returns the updated `fork_quarantine: null` view. The owner-key path is

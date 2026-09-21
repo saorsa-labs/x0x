@@ -953,7 +953,12 @@ impl PubSubManager {
         })
     }
 
-    /// Apply the validated Leaf byte budget before starting the runtime.
+    /// Apply the validated Leaf byte budget before starting pub/sub traffic.
+    ///
+    /// Standalone users of the public constructors must call this method to
+    /// install accounting or opt-in shedding. The manager's resolved
+    /// participation mode is authoritative: a Full manager ignores a
+    /// `shed_normal` request and reports the effective observe-only policy.
     ///
     /// # Errors
     ///
@@ -961,7 +966,7 @@ impl PubSubManager {
     /// budget this node just normalized. That is an x0x/sg contract
     /// disagreement, not operator error, so it must fail loudly rather than
     /// leave the daemon running with silently absent accounting.
-    pub(crate) async fn configure_egress(&mut self, config: &GossipConfig) -> NetworkResult<()> {
+    pub async fn configure_egress(&mut self, config: &GossipConfig) -> NetworkResult<()> {
         self.egress_config = config.clone();
         self.egress_config.participation = self.participation;
         if let Some(warning) = self.egress_config.normalize_egress_budget() {

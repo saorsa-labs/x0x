@@ -3283,11 +3283,7 @@ fn evaluate_fork_evidence_candidate(
     // r4 (addendum item 7): after the first STORED evidence, silence ALL
     // diagnostics for this group's conflicts — a different post-first
     // conflict must not warn either (first COMPLETE evidence wins).
-    if current
-        .invite_lineage
-        .as_ref()
-        .is_some_and(|lineage| lineage.fork_evidence.is_some())
-    {
+    if fork_evidence_already_recorded(current) {
         return ForkEvidenceOutcome::NotEvidence;
     }
 
@@ -3378,6 +3374,23 @@ fn evaluate_fork_evidence_candidate(
             }
             evidence(None)
         }
+    }
+}
+
+/// The r4 "first COMPLETE evidence wins" silence gate: has this group
+/// already recorded fork evidence?
+///
+/// The stored record lives on `invite_lineage.fork_evidence`, so a group
+/// formed WITHOUT an invite has nowhere to keep one. ADR-0066 R2 widened
+/// the evidence path to those groups, and for them the installed
+/// quarantine marker IS the record — without this arm every later
+/// conflict on an already-contained ordinary group would re-evaluate,
+/// re-install and re-warn. Lineage-bearing groups keep the pre-ADR-0066
+/// test exactly (the marker is not consulted for them).
+fn fork_evidence_already_recorded(current: &x0x::groups::GroupInfo) -> bool {
+    match current.invite_lineage.as_ref() {
+        Some(lineage) => lineage.fork_evidence.is_some(),
+        None => current.fork_quarantine.is_some(),
     }
 }
 
@@ -3516,30 +3529,40 @@ async fn rollback_live_fork_evidence(
     let hash = evidence.state_hash.clone();
     let by = evidence.committed_by.clone();
     let mut groups = state.named_groups.write().await;
+    // ADR0066-LOOKUP-WAIVER: `group_key` is the resolved key the caller (`install_fork_evidence`'s
+    // rollback arm) already mutated under; a miss is a no-op that leaves the
+    // evidence in place, which the retry semantics already tolerate.
     let Some(info) = groups.get_mut(group_key) else {
         return;
     };
-    let Some(lineage) = info.invite_lineage.as_mut() else {
-        return;
-    };
-    let matches = lineage.fork_evidence.as_ref().is_some_and(|existing| {
-        existing.revision == rev
-            && existing.state_hash == hash
-            && existing.committed_by.eq_ignore_ascii_case(&by)
-    });
-    if matches {
-        lineage.fork_evidence = None;
-        // ADR-0064: the quarantine marker was installed by the SAME
-        // (non-durable) mutation — roll it back on the same identity
-        // match so "retryable" covers the marker too, not just the
-        // lineage record.
-        if info.fork_quarantine.as_ref().is_some_and(|marker| {
-            marker.revision == rev
-                && marker.state_hash == hash
-                && marker.committed_by.eq_ignore_ascii_case(&by)
-        }) {
-            info.fork_quarantine = None;
+    // ADR-0066 R2: a lineage-less ordinary group keeps the record in the
+    // MARKER (see `install_fork_evidence`), so the marker's own identity
+    // match is what makes the install retryable there. Rolling back an
+    // install is NOT a clear and deliberately does NOT consult
+    // `no_anchor` (ADR-0066 §2 table): a `no_anchor` marker whose evidence
+    // was retracted by a benign persist retry must go, or a transient
+    // failure leaves an unclearable quarantine behind.
+    if let Some(lineage) = info.invite_lineage.as_mut() {
+        let matches = lineage.fork_evidence.as_ref().is_some_and(|existing| {
+            existing.revision == rev
+                && existing.state_hash == hash
+                && existing.committed_by.eq_ignore_ascii_case(&by)
+        });
+        if !matches {
+            return;
         }
+        lineage.fork_evidence = None;
+    }
+    // ADR-0064: the quarantine marker was installed by the SAME
+    // (non-durable) mutation — roll it back on the same identity
+    // match so "retryable" covers the marker too, not just the
+    // lineage record.
+    if info.fork_quarantine.as_ref().is_some_and(|marker| {
+        marker.revision == rev
+            && marker.state_hash == hash
+            && marker.committed_by.eq_ignore_ascii_case(&by)
+    }) {
+        info.fork_quarantine = None;
     }
 }
 
@@ -3553,20 +3576,39 @@ async fn install_fork_evidence(
     let install_key = group_key.to_string();
     let marker_was_carried = quarantine.is_some();
     let install = |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
+        // ADR0066-LOOKUP-WAIVER: `install_key` is the map key this function was CALLED with — the apply
+        // path's already-resolved record (`resolved_group_key`). Resolving again
+        // here could name a different record than the caller decided about, and
+        // a miss refuses the install rather than installing on a guess.
         let Some(info) = groups.get_mut(&install_key) else {
             return false;
         };
-        let Some(lineage) = info.invite_lineage.as_mut() else {
-            return false;
-        };
-        // ADR-0064: evidence and quarantine marker land in ONE
-        // first-complete-wins mutation — the marker is exactly as
-        // durable (and as retryable on failure) as the evidence record
-        // that justifies it.
-        if !fork_evidence_first_complete_wins(lineage, &evidence) {
-            return false;
+        match info.invite_lineage.as_mut() {
+            // ADR-0064: evidence and quarantine marker land in ONE
+            // first-complete-wins mutation — the marker is exactly as
+            // durable (and as retryable on failure) as the evidence record
+            // that justifies it.
+            Some(lineage) => {
+                if !fork_evidence_first_complete_wins(lineage, &evidence) {
+                    return false;
+                }
+            }
+            // ADR-0066 R2: an ordinary group formed without an invite has
+            // no lineage record to hold the evidence, so the MARKER is the
+            // durable record and carries the same first-complete-wins
+            // rule. Without a marker there is nothing to install at all
+            // (the pre-ADR-0066 no-op), and a group already carrying one
+            // keeps it.
+            None => {
+                if quarantine.is_none() || info.fork_quarantine.is_some() {
+                    return false;
+                }
+            }
         }
         if let Some(marker) = quarantine {
+            // ADR0066-LOOKUP-WAIVER: `install_key` is the map key this function was CALLED with and already
+            // used for the decision above — not a caller-supplied id. Re-resolving
+            // would pick a different record than the one just inspected.
             if let Some(info) = groups.get_mut(&install_key) {
                 info.fork_quarantine.get_or_insert(marker);
             }
@@ -3717,20 +3759,32 @@ async fn apply_terminal_stateful_event_with_evidence(
     }
 }
 
-/// ADR-0064 slice 1 (Guard A): the persistent quarantine marker for ONE
-/// authenticated conflict — OWNER-AXIS groups ONLY (the deliberate slice
-/// scope: Home-suite / owner-certified groups; every non-owner-axis group
-/// is byte-for-byte unchanged and never receives a marker). The marker
-/// carries the forensic [`x0x::groups::ForkSnapshot`] of both competing
-/// commit headers and never carries TreeKEM/shared-secret material (the
-/// snapshot type excludes it by construction).
+/// ADR-0064 slice 1 (Guard A) → ADR-0066 §2 (slice 2): the persistent
+/// quarantine marker for ONE authenticated conflict, for EVERY group.
+///
+/// ADR-0064 confined the marker to owner-axis groups, which left the
+/// majority population (ordinary, non-owner-axis groups) completely
+/// uncontained — 0 of 26 data-plane paths gated — while the ADR's own text
+/// described `quarantine_no_anchor` semantics for exactly that case.
+/// ADR-0066 §2 closes it: an ordinary group receives the marker with
+/// `no_anchor: true`, which says plainly that nothing will clear it
+/// automatically (manual clear only). The authentication of the evidence
+/// is unchanged — only evidence that already passed
+/// [`evaluate_fork_evidence_candidate`] reaches here, so an
+/// unauthenticated or forged conflict still quarantines nothing.
+///
+/// The marker carries the forensic [`x0x::groups::ForkSnapshot`] of both
+/// competing commit headers and never carries TreeKEM/shared-secret
+/// material (the snapshot type excludes it by construction).
 fn fork_quarantine_for_evidence(
     current: &x0x::groups::GroupInfo,
     evidence: &x0x::groups::ForkEvidence,
     conflicting_commit: &x0x::groups::state_commit::GroupStateCommit,
     classification: Option<&'static str>,
 ) -> Option<x0x::groups::ForkQuarantine> {
-    current.policy.admission.owner_certified_user_id()?;
+    // ADR-0066 §2: no owner axis ⇒ no anchor ⇒ the marker says so and
+    // only the manual clear lifts it.
+    let no_anchor = current.policy.admission.owner_certified_user_id().is_none();
     Some(x0x::groups::ForkQuarantine {
         revision: evidence.revision,
         state_hash: evidence.state_hash.clone(),
@@ -3741,8 +3795,27 @@ fn fork_quarantine_for_evidence(
             conflicting_commit: conflicting_commit.clone(),
             classification: classification.map(str::to_string),
         },
-        no_anchor: false,
+        no_anchor,
     })
+}
+
+/// ADR-0066 R2: may a rejected commit on this group be evaluated as fork
+/// evidence at all?
+///
+/// Before ADR-0066 the answer was "only invite-derived groups"
+/// (`invite_lineage.is_some()`), because the evidence record has nowhere
+/// else to live. R2 ratified widening that fence so "ordinary group" is
+/// ONE population rather than two: an ordinary group formed without an
+/// invite recorded nothing at all, which is precisely the silent gap
+/// §2 exists to close. For those groups the marker is the record (see
+/// [`fork_evidence_already_recorded`]).
+///
+/// The widening is deliberately scoped to NON-owner-axis groups: ADR-0066's
+/// Migration table promises owner-axis groups an unchanged trigger, and an
+/// owner-axis group without lineage is an authority-side record, not a
+/// joiner stub. Its evaluation therefore stays exactly as it shipped.
+fn fork_evidence_path_open(current: &x0x::groups::GroupInfo) -> bool {
+    current.invite_lineage.is_some() || current.policy.admission.owner_certified_user_id().is_none()
 }
 
 /// The shared error arm of the two central apply hooks: evaluate the
@@ -3762,7 +3835,7 @@ async fn record_fork_evidence_on_apply_error(
     persistence_lock_already_held: bool,
     error: &x0x::groups::state_commit::ApplyError,
 ) {
-    if current.invite_lineage.is_some() {
+    if fork_evidence_path_open(current) {
         match evaluate_fork_evidence_candidate(
             state,
             group_key,
@@ -3837,7 +3910,8 @@ async fn record_fork_evidence_on_apply_error(
 /// joiner's own base exactly like the adoption path; when every link
 /// authenticates but no owner anchor was reached, the fork is
 /// walk-authenticated evidence: install it with the `signer_only`
-/// classification and (owner-axis) the quarantine marker. A forged or
+/// classification and the quarantine marker (ADR-0066 §2: `no_anchor` for
+/// an ordinary group, anchored for an owner-axis one). A forged or
 /// self-inconsistent chain fails the walk and records nothing — the
 /// pre-slice-4 behaviour. A mandate that ANCHORS the refused terminal
 /// was already classified by the single-commit evaluation in the apply
@@ -4129,15 +4203,19 @@ async fn try_adopt_member_added_across_gap(
             // CAS against the terminal — which is one of the TWO
             // owner-anchored clears of the fork-quarantine marker (the
             // contested branch can never produce that attestation).
-            // Tier-2 adoptions (no owner axis) never carry a marker.
             // r2: the terminal revision must be STRICTLY greater than the
             // evidenced revision — an attested commit at or below the
             // evidence revision never clears.
+            // ADR-0066 §2: and a `no_anchor` marker declines outright. The
+            // owner-axis policy fence below already excludes ordinary
+            // groups, but that is a test of the POLICY while `no_anchor` is
+            // the MARKER's own claim — §2 makes the marker's claim
+            // authoritative, so both are asserted here.
             if current.policy.admission.owner_certified_user_id().is_some()
                 && adopted
                     .fork_quarantine
                     .as_ref()
-                    .is_some_and(|marker| commit.revision > marker.revision)
+                    .is_some_and(|marker| marker.owner_anchored_clear_permitted(commit.revision))
             {
                 adopted.fork_quarantine = None;
                 // Slice 4: every clear re-arms the evidence gate — the
@@ -4371,6 +4449,242 @@ where
     outcome
 }
 
+/// ADR-0067: what an epoch-checked roster mutation did.
+#[derive(Debug)]
+pub(in crate::server) enum EpochCheckedPersist {
+    /// The captured token still matched under the persist lock, so the
+    /// mutation ran; this is the underlying persist result, unchanged.
+    Applied(std::io::Result<AtomicWriteOutcome>),
+    /// The group's lifecycle epoch moved between capture and the persist
+    /// lock. The mutation closure was **never called**, nothing was
+    /// serialized and nothing was written — the act aborted before its
+    /// irreversible step, leaving state byte-identical.
+    EpochMoved {
+        /// The token observed under the lock, or `None` when this node no
+        /// longer holds a record for the id (also a mismatch, never
+        /// "unchanged").
+        observed: Option<x0x::groups::LifecycleEpochToken>,
+    },
+}
+
+/// ADR-0067: which halves of the lifecycle epoch token a re-check compares.
+///
+/// Two modes, because the sites genuinely differ and conflating them would
+/// either refuse every legitimate write or miss the hazard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum EpochScope {
+    /// Full `(state_revision, marker_identity)` equality — the default, and
+    /// what a site should use unless it can justify otherwise. Any lifecycle
+    /// movement at all aborts the act.
+    Full,
+    /// Marker identity only, ignoring `state_revision`.
+    ///
+    /// For a site whose whole PURPOSE is to persist an advanced state — a
+    /// seal bumps `state_revision` by construction, so `Full` would refuse
+    /// every legitimate write there. The marker half still has to match
+    /// exactly, in BOTH directions:
+    ///
+    /// - live has a marker, the record being written does not ⇒ the write
+    ///   would ERASE containment. Refuse.
+    /// - live has none, the record being written has one ⇒ the write would
+    ///   RESURRECT a marker cleared during the window. Refuse.
+    ///
+    /// Both directions matter: erasure drops containment silently, and
+    /// resurrection re-quarantines a group an operator just released.
+    MarkerOnly,
+}
+
+impl EpochScope {
+    /// Does the token observed under the lock still match what the caller
+    /// captured? A `None` on either side is a real state ("no record here"),
+    /// never a wildcard.
+    fn matches(
+        self,
+        live: Option<&x0x::groups::LifecycleEpochToken>,
+        expected: Option<&x0x::groups::LifecycleEpochToken>,
+    ) -> bool {
+        match self {
+            Self::Full => live == expected,
+            Self::MarkerOnly => match (live, expected) {
+                (Some(live), Some(expected)) => live.same_marker(expected),
+                (None, None) => true,
+                // A record appearing or vanishing mid-operation is a
+                // mismatch under every scope.
+                _ => false,
+            },
+        }
+    }
+}
+
+/// ADR-0066 §4 / ADR-0067: run a roster mutation only if the group's
+/// lifecycle epoch token is still the one the caller captured at its
+/// authorization check.
+///
+/// **The window this closes.** Every ADR-0066 gate consults the
+/// `fork_quarantine` marker at the START of an operation. Between that check
+/// and the persist, a marker can be installed (a fork observation lands), or
+/// cleared, or advanced to a new evidence revision. Without a re-check the
+/// operation persists on an authorization that is no longer true.
+///
+/// **Where the re-check runs.** Inside the closure
+/// [`persist_named_groups_mutation_unlocked`] invokes while holding the
+/// `state.named_groups` write guard — the SAME critical section as the
+/// mutation, so nothing can move the epoch between the comparison and the
+/// mutation. It adds no lock and performs no I/O: the established order
+/// (membership → roster → persistence → outbox) is unchanged, and no await
+/// is newly held under a lock.
+///
+/// **Why a mismatch aborts even when the marker was CLEARED.** ADR-0066 §4
+/// says "a mismatch aborts the act before the irreversible step", without
+/// qualification, and ADR-0067 keeps that: the captured authorization was
+/// computed against a record that no longer exists, so re-deriving it is the
+/// caller's job, not this helper's. A clear is not a hazard, so the refusal
+/// is immediately retryable — a retry captures the post-clear token and
+/// succeeds on its first attempt. There is no backoff, no request budget and
+/// no retry loop here: this returns once, the caller answers its request, and
+/// nothing is left queued or parked, so a refusal can neither freeze a queue
+/// head nor spin.
+///
+/// `group_id` is resolved under BOTH spellings
+/// ([`crate::server::resolve_group_entry_locked`]) because the roster map is
+/// keyed by whichever alias this daemon learned the group under, while the
+/// token was captured against whatever spelling the caller holds.
+///
+/// **`expected` is an `Option` on purpose.** `None` means "this node held no
+/// record for the id when I captured", which is the normal state of a first
+/// join. Comparing `Option` to `Option` therefore gets all four cases right:
+/// absent→absent matches (the operation proceeds), absent→present refuses (a
+/// marker landed on a group this operation was about to seat),
+/// present→present matches only on the same identity, and present→absent
+/// refuses. Treating a missing record as "unchanged" would be the fail-open
+/// reading, so it is never done.
+/// `scope` picks which halves of the token must match — see [`EpochScope`].
+///
+/// Named `_unlocked` for the same reason
+/// [`persist_named_groups_mutation_unlocked`] is (#457 r10 item 10.1: taking
+/// `named_groups_persistence_lock` again under the guard self-deadlocks). Use
+/// [`persist_named_groups_mutation_epoch_checked`] when you do NOT already
+/// hold it.
+pub(in crate::server) async fn persist_named_groups_mutation_epoch_checked_unlocked<F>(
+    state: &AppState,
+    group_id: &str,
+    expected: Option<&x0x::groups::LifecycleEpochToken>,
+    scope: EpochScope,
+    mutate: F,
+) -> EpochCheckedPersist
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    // `Some(observed)` iff the re-check fired. Distinguishing that from the
+    // mutation's own `false` (which also yields `NotReplaced`) is the whole
+    // point: a caller must not report "nothing to do" when it was refused.
+    let mut moved: Option<Option<x0x::groups::LifecycleEpochToken>> = None;
+    let outcome = persist_named_groups_mutation_unlocked(state, |groups| {
+        // ADR-0067 test barrier: the injected lifecycle event lands HERE,
+        // inside the write guard and immediately before the re-check — the
+        // tightest interleaving a concurrent writer could achieve. Compiled
+        // only under `cfg(test)`; see `epoch_recheck_barrier`.
+        #[cfg(test)]
+        epoch_recheck_barrier::before_recheck(group_id, groups);
+        let live = crate::server::lifecycle_epoch_token_locked(groups, group_id);
+        if !scope.matches(live.as_ref(), expected) {
+            moved = Some(live);
+            // Returning false leaves the map untouched AND skips the save,
+            // so the abort costs nothing and writes nothing.
+            return false;
+        }
+        mutate(groups)
+    })
+    .await;
+    match moved {
+        Some(observed) => EpochCheckedPersist::EpochMoved { observed },
+        None => EpochCheckedPersist::Applied(outcome),
+    }
+}
+
+/// [`persist_named_groups_mutation_epoch_checked_unlocked`] for callers that do
+/// NOT already hold `named_groups_persistence_lock` — the same relationship
+/// [`persist_named_groups_mutation`] has to its unlocked variant, and the same
+/// lock order (persistence lock, then the roster map).
+pub(in crate::server) async fn persist_named_groups_mutation_epoch_checked<F>(
+    state: &AppState,
+    group_id: &str,
+    expected: Option<&x0x::groups::LifecycleEpochToken>,
+    scope: EpochScope,
+    mutate: F,
+) -> EpochCheckedPersist
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    persist_named_groups_mutation_epoch_checked_unlocked(state, group_id, expected, scope, mutate)
+        .await
+}
+
+/// ADR-0067 deterministic race harness — `cfg(test)` END TO END.
+///
+/// The §4 fixtures must interleave a marker install/clear/advance between an
+/// authorization capture and the persist, and must do so WITHOUT a sleep. A
+/// production hook (a field, a parameter, a branch) would be a permanent
+/// surface for a test-only need, so the hook exists only under `cfg(test)`:
+/// a release build compiles neither this module nor its call site, and
+/// `cargo build` sees no new code at all.
+///
+/// A test installs a callback, runs the operation, and the callback mutates
+/// the very map the persist is about to write — proving the re-check is
+/// load-bearing. Removing the re-check must make those tests fail; that is
+/// each fixture's negative control.
+#[cfg(test)]
+pub(in crate::server) mod epoch_recheck_barrier {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnMut(&mut HashMap<String, crate::groups::GroupInfo>) + Send>;
+
+    /// Keyed by the group id the hook is armed for.
+    ///
+    /// KEYED, not a single slot, and this is load-bearing: the test binary
+    /// runs these in PARALLEL in one process. A single global slot lets one
+    /// test's `install` overwrite another's, and one test's guard drop clear
+    /// another's — which shows up as a re-check that mysteriously did not
+    /// fire. Keying by group id gives each test its own arm/disarm, the same
+    /// way `TREEKEM_CACHE_WRITER_HOOKS` keys by on-disk path so temp-dir
+    /// tests cannot cross-talk.
+    static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Removes this test's hook on drop, and only this test's.
+    pub(in crate::server) struct BarrierGuard(String);
+
+    impl Drop for BarrierGuard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.remove(&self.0);
+            }
+        }
+    }
+
+    /// Arm a callback to run immediately before the epoch re-check for
+    /// `group_id`, inside the roster write guard.
+    pub(in crate::server) fn install(group_id: &str, hook: Hook) -> BarrierGuard {
+        if let Ok(mut hooks) = HOOKS.lock() {
+            hooks.insert(group_id.to_string(), hook);
+        }
+        BarrierGuard(group_id.to_string())
+    }
+
+    pub(in crate::server) fn before_recheck(
+        group_id: &str,
+        groups: &mut HashMap<String, crate::groups::GroupInfo>,
+    ) {
+        if let Ok(mut hooks) = HOOKS.lock() {
+            if let Some(hook) = hooks.get_mut(group_id) {
+                hook(groups);
+            }
+        }
+    }
+}
+
 /// #470 compare-and-restore rollback (see
 /// [`persist_named_groups_mutation_unlocked`]): for every key the failed
 /// transaction touched (`before.get(k) != after.get(k)`), roll the live map
@@ -4450,45 +4764,51 @@ pub(in crate::server) enum SaveFault {
     PreflightOkThenReplacedNotDurableAfterWriteThenError = 6,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-static SAVE_FAULT_INJECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg_attr(not(test), allow(dead_code))]
-fn save_fault_short_circuit() -> Option<AtomicWriteOutcome> {
-    if !cfg!(test) {
-        return None;
-    }
-    match SAVE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
+// #470 — per-instance fault helpers; all `#[cfg(test)]` so no trace in
+// release builds. The storage cell lives on `AppState.named_groups_save_fault`
+// (also `#[cfg(test)]`) so parallel tests with independent `AppState`
+// instances cannot observe each other's injected faults (#732/#673).
+
+#[cfg(test)]
+fn save_fault_short_circuit(state: &AppState) -> Option<AtomicWriteOutcome> {
+    match state
+        .named_groups_save_fault
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
         1 => Some(AtomicWriteOutcome::NotReplaced),
         3 => Some(AtomicWriteOutcome::ReplacedNotDurable),
         _ => None,
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn save_fault_legacy_write_fails() -> bool {
-    cfg!(test) && SAVE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) == 2
+#[cfg(test)]
+fn save_fault_legacy_write_fails(state: &AppState) -> bool {
+    state
+        .named_groups_save_fault
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == 2
 }
 
 /// #477 (r8 item 1): one-shot post-rename fault — fires once, then clears
 /// (variant 4) or degrades to the legacy-write error (variant 5).
-#[cfg_attr(not(test), allow(dead_code))]
-fn save_fault_after_write_not_durable() -> bool {
-    if !cfg!(test) {
-        return false;
-    }
+#[cfg(test)]
+fn save_fault_after_write_not_durable(state: &AppState) -> bool {
     let ordering = std::sync::atomic::Ordering::SeqCst;
     // Variant 6: consume this (unfaulted) write and arm variant 5 for the
     // next one.
-    if SAVE_FAULT_INJECT
+    if state
+        .named_groups_save_fault
         .compare_exchange(6, 5, ordering, ordering)
         .is_ok()
     {
         return false;
     }
-    SAVE_FAULT_INJECT
+    state
+        .named_groups_save_fault
         .compare_exchange(4, 0, ordering, ordering)
         .is_ok()
-        || SAVE_FAULT_INJECT
+        || state
+            .named_groups_save_fault
             .compare_exchange(5, 2, ordering, ordering)
             .is_ok()
 }
@@ -4579,20 +4899,24 @@ async fn clear_join_install_pending_markers(named_groups_path: &FsPath) {
     }
 }
 
-/// #470 — RAII fault guard (see [`DeleteFaultGuard`]).
+/// #470 — RAII fault guard: holds a clone of the per-instance cell and
+/// clears it on drop, so a failing or panicking test cannot leak the fault
+/// into another test's `AppState` instance (see [`DeleteFaultGuard`]).
 #[cfg(test)]
-pub(in crate::server) struct SaveFaultGuard;
+pub(in crate::server) struct SaveFaultGuard(std::sync::Arc<std::sync::atomic::AtomicU8>);
 #[cfg(test)]
 impl Drop for SaveFaultGuard {
     fn drop(&mut self) {
-        SAVE_FAULT_INJECT.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.0.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 #[cfg(test)]
-pub(in crate::server) fn set_save_fault(fault: SaveFault) -> SaveFaultGuard {
-    SAVE_FAULT_INJECT.store(fault as u8, std::sync::atomic::Ordering::SeqCst);
-    SaveFaultGuard
+pub(in crate::server) fn set_save_fault(state: &AppState, fault: SaveFault) -> SaveFaultGuard {
+    state
+        .named_groups_save_fault
+        .store(fault as u8, std::sync::atomic::Ordering::SeqCst);
+    SaveFaultGuard(std::sync::Arc::clone(&state.named_groups_save_fault))
 }
 
 /// Re-establish directory durability for a previously visible roster
@@ -9550,11 +9874,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 // is STRICTLY GREATER than the evidenced
                                 // one, clear the marker and re-arm the
                                 // evidence gate.
-                                if next
-                                    .fork_quarantine
-                                    .as_ref()
-                                    .is_some_and(|marker| commit.revision > marker.revision)
-                                {
+                                // ADR-0066 §2 (the load-bearing change):
+                                // this arm has NO owner-axis policy fence
+                                // of its own — it relied on the marker
+                                // only ever existing for owner-axis
+                                // groups, which §2 invalidates. Without
+                                // the `no_anchor` test an ordinary group
+                                // would get an automatic clear and
+                                // silently contradict the manual-only
+                                // rule.
+                                if next.fork_quarantine.as_ref().is_some_and(|marker| {
+                                    marker.owner_anchored_clear_permitted(commit.revision)
+                                }) {
                                     next.fork_quarantine = None;
                                     next.reset_fork_evidence_after_quarantine_clear();
                                     state
@@ -12504,9 +12835,22 @@ pub(in crate::server) async fn get_named_group(
 /// Without the owner key and without force the endpoint answers 409 with
 /// a typed reason: `owner_key_unavailable` (owner-axis group, keyless
 /// local install — use the force path deliberately) or `force_required`
-/// (no owner axis to attest with). A group without a marker (including
-/// every non-owner-axis group, which never sets one) answers 409 —
-/// nothing to clear. Requires the local API token (same auth layer as
+/// (no owner axis to attest with). A group without a marker answers 409 —
+/// nothing to clear.
+///
+/// ADR-0066 §2: this endpoint is now LOAD-BEARING rather than a niche
+/// override. An ordinary (non-owner-axis) group receives a `no_anchor`
+/// marker that NO commit ever clears, and such a group has no owner axis
+/// to attest with, so path (b) — `force: true` plus a non-empty reason —
+/// is its ONLY exit. Path (b) is deliberately not gated on `no_anchor`:
+/// the operator override is the remedy the §5 refusal message names.
+///
+/// `:id` accepts EITHER spelling (#732): the roster map key or the group's
+/// stable id. It used to accept the map key alone, which made the one exit
+/// ADR-0066 §2 promises unreachable from the stable id every other surface
+/// shows the operator. Refusal bodies may still name the map key — that is
+/// the spelling the roster is filed under — but both now clear.
+/// Requires the local API token (same auth layer as
 /// every `/groups` route). Increments `fork_quarantine_manual_clears`
 /// and returns the updated `fork_quarantine: null` view.
 pub(in crate::server) async fn clear_group_quarantine(
@@ -12520,12 +12864,22 @@ pub(in crate::server) async fn clear_group_quarantine(
             Json(serde_json::json!({ "ok": false, "error": reason })),
         )
     };
-    let (stable_group_id, head_revision, head_state_hash, owner, marker_present) = {
+    // #732: BOTH SPELLINGS. The roster map is keyed by whichever alias this
+    // daemon learned the group under, while every id an operator can actually
+    // SEE elsewhere — a history scope, a WS/SSE `fork_quarantine` annotation,
+    // a delegation envelope, `GET /history/scopes` — is the STABLE id. A bare
+    // `groups.get(&id)` answered 404 for exactly that id, so the only exit
+    // ADR-0066 §2 promises an ordinary (`no_anchor`) group was unreachable
+    // from the spelling the refusal messages had taught the operator. The
+    // resolved MAP KEY is carried forward so the mutation below writes to the
+    // record this read decided about.
+    let (map_key, stable_group_id, head_revision, head_state_hash, owner, marker_present) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
+        let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, &id) else {
             return not_found("group not found");
         };
         (
+            key.to_string(),
             info.stable_group_id().to_string(),
             info.state_revision,
             info.state_hash.clone(),
@@ -12604,7 +12958,13 @@ pub(in crate::server) async fn clear_group_quarantine(
     }
     let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
     let outcome = persist_named_groups_mutation(&state, |groups| {
-        if let Some(info) = groups.get_mut(&id) {
+        // ADR0066-LOOKUP-WAIVER: `map_key` is what the shared resolver returned
+        // for EITHER spelling above, so this writes to the record that read
+        // decided about; re-resolving here would be a second, racier lookup of
+        // the same group. A concurrent rename of the key is the only way it
+        // misses, and then it is a no-op that leaves the marker in place —
+        // never a clear of the wrong group.
+        if let Some(info) = groups.get_mut(&map_key) {
             info.fork_quarantine = None;
             // ADR-0064 slice 4: the manual clear also re-arms the
             // evidence gate — the next authenticated conflict
@@ -12623,9 +12983,19 @@ pub(in crate::server) async fn clear_group_quarantine(
     state
         .groups_diagnostics
         .record_fork_quarantine_manual_clear(&stable_group_id);
+    // ADR-0068 D2: the marker is gone and durable, so the task deltas held
+    // under it can apply NOW rather than at the listener's next poll. Run
+    // after `persist_named_groups_mutation` has released the roster lock: the
+    // drain awaits each list's CRDT write lock and the ingest gate reads
+    // `named_groups` inside that lock, so the order is `TaskList` →
+    // `named_groups` and holding the roster lock here would invert it. The
+    // listener's poll still covers every other way a marker clears.
+    let task_deltas_resumed =
+        super::tasks::resume_group_task_ingest(&state, &stable_group_id).await;
     tracing::info!(
         group_id = %LogHexId::group(&stable_group_id),
         cleared_by,
+        task_deltas_resumed,
         reason = %req.reason.chars().take(256).collect::<String>(),
         "ADR-0064: fork quarantine manually cleared (local node only)"
     );
@@ -13167,8 +13537,11 @@ pub(in crate::server) async fn send_group_public_message(
 
     // Build + endpoint-side authz + sign under the write lock so
     // concurrent role changes can't race the check.
-    let (msg, direct_recipients) = {
+    let (msg, direct_recipients, captured_epoch) = {
         let groups = state.named_groups.read().await;
+        // ADR0066-LOOKUP-WAIVER: the route's own group lookup (404 on a miss, so no contested roster is
+        // ever served); the §3 gate two lines down consumes the `info` it found.
+        // Widening the route's id semantics is out of #732's scope.
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
@@ -13178,6 +13551,19 @@ pub(in crate::server) async fn send_group_public_message(
         if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
             return resp;
         }
+        // ADR-0066 §1 row 1 / §4 (slice 9): capture the lifecycle epoch token
+        // under the SAME read guard as the gate above, so nothing can move
+        // between the authorization and the capture. It is re-checked
+        // immediately before the gossip publish below.
+        //
+        // #732: through the SHARED resolver, so capture and re-check use one
+        // both-spellings rule. Behaviour-identical today — the route 404s a
+        // spelling `groups.get(&id)` misses (the waiver at that lookup), so the
+        // resolver's first branch returns the very entry the gate just used —
+        // and that is the point: if the route's id semantics are ever widened
+        // (lifting that waiver), capture and re-check widen together instead of
+        // one being left on the old rule. Cost is one extra hash hit.
+        let captured_epoch = crate::server::lifecycle_epoch_token_locked(&groups, &id);
 
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
@@ -13328,7 +13714,7 @@ pub(in crate::server) async fn send_group_public_message(
             req.delegation_digest,
             rider_provenance,
         ) {
-            Ok(m) => (m, direct_recipients),
+            Ok(m) => (m, direct_recipients, captured_epoch),
             Err(e) => {
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -13353,6 +13739,23 @@ pub(in crate::server) async fn send_group_public_message(
             );
         }
     };
+    // ADR-0066 §1 row 1 / §4 (slice 9): THE EFFECT POINT. The publish below
+    // is the irreversible step — once the bytes are handed to gossip they are
+    // on the wire and the contested state has been exported. So the marker is
+    // re-checked HERE, after the last await on this path
+    // (`spawn_public_message_listener` above; the serialization between them
+    // is pure), leaving no suspension point between the check and the publish.
+    //
+    // Nothing has been exported or written yet when this refuses: signing is
+    // pure, the local cache write (`cache_public_message`) and the direct-DM
+    // fan-out race both happen AFTER the publish returns, and this path has no
+    // ratchet, so a refusal burns no generation and leaves the message cache,
+    // the outbox and the roster byte-identical.
+    if let Some(resp) =
+        reject_fork_quarantine_installed_before_effect(&state, &id, captured_epoch.as_ref()).await
+    {
+        return resp;
+    }
     let fan_out = match state.agent.publish_with_fanout(&topic, bytes.clone()).await {
         Ok(n) => n,
         Err(e) => {
@@ -13590,9 +13993,30 @@ pub(in crate::server) async fn get_group_public_messages(
         })
         .collect();
 
+    // ADR-0066 §3a (slice 4): this is the group plane's own ADR-0023 read —
+    // the §1 map gap slice 2's coverage fixture recorded as
+    // `GET /groups/:id/messages`. It is an ANNOTATE-class read, never
+    // refused, and it reuses the history surface's annotation verbatim so
+    // the two cannot drift. Envelope-level only: the payload here is
+    // `GroupPublicMessage` objects rather than store rows, so there is no
+    // per-row `seen_at_ms` to carry the R3 ingest tag — `GET /history` is
+    // where a reader gets that.
+    //
+    // `stable_id` is deliberately the lookup key: `markers_for_scopes`
+    // resolves BOTH spellings (map key or stable id — review r1), so this
+    // annotates whether the URL named the alias this daemon keys the group
+    // under or the stable id the rows carry.
+    let markers = crate::server::routes::history::markers_for_scopes(
+        &state,
+        std::iter::once(&x0x::history::Scope::Group(stable_id.clone())),
+    )
+    .await;
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "messages": messages_with_id })),
+        Json(crate::server::routes::history::annotate(
+            serde_json::json!({ "ok": true, "messages": messages_with_id }),
+            &markers,
+        )),
     )
 }
 
@@ -14331,7 +14755,15 @@ pub(in crate::server) async fn ingest_public_message(
             // drop — never cache an unauthorized attribution.
             if let Some(digest) = msg.delegation_digest.clone() {
                 let author = parse_agent_id_hex(&msg.author_agent_id);
-                let authorized = match author {
+                // ADR-0066 §3b row 18: carry the refusal REASON into the log
+                // instead of discarding it with `.is_ok()`. On this path the
+                // reason may be the §5 sentence (the group is
+                // fork-quarantined here), and §5's whole point is that a
+                // refusal explains itself — a generic "not effective for
+                // author" line would leave an operator debugging a delegation
+                // that is perfectly valid and simply not honoured on this
+                // node.
+                let refusal = match author {
                     Ok(actor) => crate::server::delegations::authorize_send_as(
                         state,
                         &stable_id,
@@ -14340,15 +14772,15 @@ pub(in crate::server) async fn ingest_public_message(
                         now_millis_u64(),
                     )
                     .await
-                    .is_ok(),
-                    Err(_) => false,
+                    .err(),
+                    Err(e) => Some(format!("unparseable author agent id: {e}")),
                 };
-                if !authorized {
+                if let Some(why) = refusal {
                     state.groups_diagnostics.record_other_drop(&stable_id);
                     tracing::warn!(
                         group_id = %group_id_for_log,
                         digest = %digest,
-                        "E: dropped send-as message: delegation not effective for author"
+                        "E: dropped send-as message: {why}"
                     );
                     return;
                 }
@@ -15801,6 +16233,33 @@ pub(in crate::server) async fn join_group_via_invite(
                     // covers a post-rename failure whose corrective save
                     // fails. A preflight that cannot confirm durability
                     // aborts the install before any roster write.
+                    // ADR-0066 §4 / ADR-0067: capture the group's lifecycle
+                    // epoch token BEFORE the two I/O awaits below, for
+                    // re-validation inside the persist's critical section.
+                    //
+                    // The window this closes is real and measured in disk
+                    // I/O, not instructions: `confirm_named_groups_durability_unlocked`
+                    // and `write_join_install_pending_marker` both fsync
+                    // before the insert. An `install_fork_evidence` for this
+                    // same group can land in that window (the metadata apply
+                    // path runs concurrently), and the insert below writes a
+                    // WHOLE record captured earlier — so without the re-check
+                    // it would not merely seat on a stale authorization, it
+                    // would ERASE the marker that arrived meanwhile.
+                    //
+                    // `None` here is the normal first-join case (no local
+                    // record yet) and matches an unchanged absent record; see
+                    // `persist_named_groups_mutation_epoch_checked`.
+                    //
+                    // SCOPE, stated plainly: this covers capture→persist. The
+                    // earlier part of the join flow (invite verification and
+                    // lineage checks) is NOT inside this token's window;
+                    // extending the capture upstream is follow-up work, not a
+                    // claim this slice makes.
+                    let joining_epoch_token = {
+                        let groups = state.named_groups.read().await;
+                        crate::server::lifecycle_epoch_token_locked(&groups, &group_id_hex)
+                    };
                     if state
                         .named_groups_requires_durability_confirmation
                         .load(Ordering::Acquire)
@@ -15822,11 +16281,54 @@ pub(in crate::server) async fn join_group_via_invite(
                             "named-group state is not directory-durable",
                         );
                     }
-                    let outcome = persist_named_groups_mutation_unlocked(&state, |groups| {
-                        groups.insert(group_id_hex.clone(), info.clone());
-                        true
-                    })
-                    .await;
+                    let outcome = match persist_named_groups_mutation_epoch_checked_unlocked(
+                        &state,
+                        &group_id_hex,
+                        joining_epoch_token.as_ref(),
+                        EpochScope::Full,
+                        |groups| {
+                            groups.insert(group_id_hex.clone(), info.clone());
+                            true
+                        },
+                    )
+                    .await
+                    {
+                        EpochCheckedPersist::Applied(outcome) => outcome,
+                        EpochCheckedPersist::EpochMoved { observed } => {
+                            // Fail closed with nothing persisted: the mutation
+                            // closure never ran, so the live roster and every
+                            // durable file are byte-identical.
+                            //
+                            // The install marker written just above is
+                            // deliberately LEFT in place. It is the safe
+                            // direction and needs no new rollback path: the
+                            // marker excludes a group the roster does not
+                            // contain (no insert happened, no save happened),
+                            // and `clear_join_install_pending_markers` removes
+                            // it after the next durable save — the same
+                            // lifecycle #477 already defines for a marker
+                            // whose install aborted before any roster write.
+                            //
+                            // No queue head is frozen and nothing retries in a
+                            // loop: the caller gets exactly one answer.
+                            tracing::warn!(
+                                group_id = %group_id_hex,
+                                now_quarantined = observed
+                                    .as_ref()
+                                    .is_some_and(x0x::groups::LifecycleEpochToken::is_fork_quarantined),
+                                "ADR-0066 §4: refusing join install — the group's lifecycle \
+                                 epoch moved between authorization and the persist lock"
+                            );
+                            return api_error_with_reason(
+                                StatusCode::CONFLICT,
+                                "the group's fork-quarantine state changed while this join was \
+                                 being installed, so the seating was refused rather than \
+                                 overwriting it; re-read the group and retry (an operator \
+                                 clears a marker with POST /groups/:id/quarantine/clear)",
+                                "fork_quarantined",
+                            );
+                        }
+                    };
                     if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
                         // ROLLBACK (r7 item 1 → r8 item 1): `NotReplaced`/
                         // `Err` were already compare-and-restored by the
@@ -18430,6 +18932,8 @@ async fn owner_certified_seal_with_eviction(
                     let owner_user_key = state.agent.identity().user_keypair();
                     let clear_key = id.to_string();
                     let persist_outcome = persist_named_groups_mutation(state, |groups| {
+                        // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
+                        // a miss leaves the marker set on disk AND in memory, so it fails closed.
                         if let Some(info) = groups.get_mut(&clear_key) {
                             info.owner_cert_reverify_required = false;
                             // ADR-0064 slice 4 (slice-1 review non-blocking
@@ -18489,6 +18993,8 @@ async fn owner_certified_seal_with_eviction(
             // quarantine.
             let commit = {
                 let groups = state.named_groups.read().await;
+                // ADR0066-LOOKUP-WAIVER: `id` was already resolved by `seal_group_state`'s own 404-first lookup;
+                // a miss here returns 404 without sealing, so it fails closed.
                 let Some(info) = groups.get(id) else {
                     return Some(Err(not_found("group not found")));
                 };
@@ -19903,21 +20409,344 @@ fn reject_unverified_owner_certified_restore(
 /// the ADR-0038 restore gate covers, plus outbound public sends).
 /// Inbound metadata events are deliberately NOT gated: the anchored
 /// clearing commit must still be able to arrive and apply. Owner-axis
-/// groups clear through the verified head attestation on adoption or a
-/// local owner-certified seal; non-owner-axis groups never receive a
-/// marker in this slice. Each refusal bumps the
-/// `fork_quarantine_refusals` diagnostic.
-fn reject_fork_quarantined(
+/// groups clear through the verified head attestation on adoption, a
+/// mandate-carrying `MemberAdded`, or a local owner-certified seal;
+/// ordinary groups (ADR-0066 §2) carry a `no_anchor` marker that only the
+/// manual clear lifts. Each refusal bumps the `fork_quarantine_refusals`
+/// diagnostic.
+///
+/// ADR-0066 §5 (slice 1): the machine code moved from `error` to
+/// `reason`, and `error` now carries the informational sentence R5 made
+/// mandatory when it removed the warn-only window. A bare code is a
+/// permanent, unexplained refusal for a marker that never auto-clears,
+/// so this helper is the single place the message is built — no route
+/// can refuse without explaining itself and no two routes can drift in
+/// wording (§3e).
+pub(in crate::server) fn reject_fork_quarantined(
     state: &AppState,
     group_id: &str,
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    info.is_fork_quarantined().then(|| {
-        state
-            .groups_diagnostics
-            .record_fork_quarantine_refusal(group_id);
-        api_error(StatusCode::CONFLICT, "fork_quarantined")
+    let marker = info.fork_quarantine.as_ref()?;
+    Some(reject_fork_quarantined_marker(state, group_id, marker))
+}
+
+/// ADR-0066 §3e (slice 3): the same single refusal, for a caller that
+/// already holds the marker rather than the whole [`GroupInfo`].
+///
+/// WHY a second entry point and not a second builder: the delegation
+/// paths (§3b rows 15–19) take the roster lock once, clone the marker out
+/// and then release it — they never hold a `&GroupInfo` across the
+/// refusal. Routing them through this function keeps §3e's promise that
+/// one helper owns the status, the body and the single
+/// `fork_quarantine_refusals` increment, so no route can refuse without
+/// explaining itself and none can double-count.
+pub(in crate::server) fn reject_fork_quarantined_marker(
+    state: &AppState,
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+) -> (StatusCode, Json<serde_json::Value>) {
+    state
+        .groups_diagnostics
+        .record_fork_quarantine_refusal(group_id);
+    (
+        StatusCode::CONFLICT,
+        Json(fork_quarantine_refusal_body(group_id, marker)),
+    )
+}
+
+/// ADR-0066 §1 rows 1, 2, 4 and 6 + §4 (slice 9): the re-check the four
+/// OUTBOUND paths run immediately before their irreversible effect.
+///
+/// **The window this closes.** Every row above is gated at request start
+/// ([`reject_fork_quarantined`]), so an operation is only admitted when the
+/// group carried NO marker at that moment. The residual window is a marker
+/// installed AFTER the entry gate and BEFORE the effect leaves the node —
+/// the gossip publish (row 1), the ratchet advance and ciphertext (row 2),
+/// the GSS ciphertext and its history row (row 4), the sealed envelope
+/// (row 6). Between the gate and the effect these handlers await on the
+/// rider-token mutex, a revocation-record read, the TreeKEM group mutex and
+/// the pubsub listener spawn, so the window is not theoretical: a fork
+/// observation landing at any of those suspension points would otherwise
+/// export contested state on an authorization that is no longer true.
+///
+/// **Why these rows could not use §4's own site.** ADR-0066 §4 puts the
+/// re-check "inside the same critical section as the mutation"
+/// ([`persist_named_groups_mutation_epoch_checked_unlocked`]). These four
+/// paths perform no roster mutation and take no persistence lock, so that
+/// sentence names no site for them (ADR-0067, "Deferral"), and ADR-0066
+/// defines no critical section for an outbound publish. What this helper
+/// applies is §4's *rule* — capture at the authorization check, re-validate
+/// before the irreversible step — at the only site these rows have: the last
+/// suspension-free point before the effect. It is an implementation of §1's
+/// Decision column, not a new decision.
+///
+/// **Only the marker half is compared, deliberately.** The caller's
+/// `state_revision` is expected to move under a concurrent legitimate roster
+/// advance, and a signed public message carries the `state_hash` /
+/// `state_revision` it was built against, so refusing every send that raced a
+/// rename would be an availability regression on the hot path with no
+/// containment benefit. The containment fact §4 exists to protect is the
+/// marker, and [`x0x::groups::LifecycleEpochToken::same_marker`] names that
+/// weaker comparison so it cannot be mistaken for the full one — the same
+/// discipline [`EpochScope::MarkerOnly`] applies at the persist sites.
+///
+/// **Asymmetry: a marker CLEARED mid-operation does not refuse, and cannot
+/// even occur.** The operation was admitted only because there was no marker
+/// at the entry gate, so the captured marker identity is always `None` for an
+/// admitted operation and `Some(identity) -> None` is unreachable here. The
+/// live-side test is therefore the whole rule: a marker present under the
+/// re-check that the capture did not carry — newly installed, or advanced to
+/// a different evidence identity — refuses; no marker means proceed, which is
+/// byte-identical to the behaviour before this slice for every unquarantined
+/// group. Stating this is the point: the persist-lock re-check refuses on a
+/// clear too (the captured authorization was computed against a record that no
+/// longer exists), and a reader must not conclude the two sites disagree by
+/// accident.
+///
+/// **A record that VANISHED is not a marker.** `None` from the resolver means
+/// this node no longer holds a record for the id, which is a terminality
+/// question the existing withdrawn / not-found paths already answer; inventing
+/// a quarantine refusal for it would change behaviour where no marker is
+/// involved. So the resolver miss falls through, and the fail-closed reading
+/// that matters — "a marker appeared" — is the one this helper enforces.
+///
+/// **Residual window (honest statement).** Between this re-check and the
+/// bytes actually reaching the wire or the caller, nothing holds the roster
+/// lock, so a marker installed in that last stretch does not stop the effect.
+/// The window is **one message wide** and is irreducible without a send-path
+/// critical section — a lock held from the authorization check until the
+/// client has the bytes — which ADR-0066 does not define and which would
+/// serialize the hot path behind a network write. It is acceptable because
+/// containment is about stopping the flow, not about the instant of the
+/// install: the re-check shrinks the exposure from the whole request duration
+/// (including every await above) to a tail with no suspension point, the very
+/// next request on the path refuses, and nothing about a local marker is
+/// atomic across the network anyway.
+///
+/// `group_id` is resolved under BOTH spellings
+/// ([`crate::server::resolve_group_entry_locked`]), because the roster map is
+/// keyed by whichever alias this daemon learned the group under while the
+/// caller holds whatever spelling the route gave it.
+///
+/// Cost on the hot path: one uncontended `state.named_groups` read
+/// acquisition, one resolver lookup and a scalar/identity compare. No I/O, no
+/// allocation on the success path, and no other lock is held across it — see
+/// the per-site comments for the one place (row 2) where an EXISTING nesting
+/// is reused rather than a new one introduced.
+pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect(
+    state: &AppState,
+    group_id: &str,
+    captured: Option<&x0x::groups::LifecycleEpochToken>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    // Slice-9 test barrier: an injected install lands HERE, immediately
+    // before the re-check takes its read guard — the tightest interleaving a
+    // concurrent writer can achieve against a read-lock re-check. `cfg(test)`
+    // end to end; a release build compiles neither the module nor this call.
+    #[cfg(test)]
+    send_recheck_barrier::before_recheck(group_id, state).await;
+
+    let groups = state.named_groups.read().await;
+    let (_, live) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
+    let marker = live.fork_quarantine.as_ref()?;
+    if captured.is_some_and(|captured| live.lifecycle_epoch_token().same_marker(captured)) {
+        // Same marker the operation was authorized with. Unreachable for an
+        // admitted operation (the entry gate refuses a group that already
+        // carries one), and kept as an equality rather than an
+        // `is_fork_quarantined()` shortcut so the comparison stays the
+        // ADR-0067 one if a future caller ever admits with a marker.
+        return None;
+    }
+    Some(reject_fork_quarantined_marker(state, group_id, marker))
+}
+
+/// ADR-0066 §1 rows 1/2/4/6 deterministic race harness — `cfg(test)` END TO
+/// END, and the sibling of [`epoch_recheck_barrier`] for the read-lock
+/// re-check.
+///
+/// The slice-9 fixtures must interleave a marker install between an entry gate
+/// and an outbound effect WITHOUT a sleep. [`epoch_recheck_barrier`] cannot
+/// serve them: it fires inside a roster WRITE guard the persist helper already
+/// holds, while these sites hold only a read guard and so can hand a hook no
+/// `&mut` map. This barrier therefore fires immediately before the re-check
+/// acquires its read guard and takes the write lock itself, which is the
+/// tightest interleaving a concurrent writer could achieve against a read-lock
+/// re-check — and it is exactly the interleaving the rule has to survive.
+///
+/// A production hook would be a permanent surface for a test-only need, so the
+/// module and its call site are both `cfg(test)`: a release build compiles
+/// neither. Removing a re-check must make the corresponding fixture fail; that
+/// is each row's negative control.
+#[cfg(test)]
+pub(in crate::server) mod send_recheck_barrier {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnMut(&mut HashMap<String, crate::groups::GroupInfo>) + Send>;
+
+    /// Keyed by the group id the hook is armed for.
+    ///
+    /// KEYED, not a single slot, and this is load-bearing for the same reason
+    /// [`super::epoch_recheck_barrier`] is keyed: the test binary runs these in
+    /// PARALLEL in one process, so a single global slot would let one test's
+    /// `install` overwrite another's and one test's guard drop clear
+    /// another's — showing up as a re-check that mysteriously did not fire.
+    static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Removes this test's hook on drop, and only this test's.
+    pub(in crate::server) struct BarrierGuard(String);
+
+    impl Drop for BarrierGuard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.remove(&self.0);
+            }
+        }
+    }
+
+    /// Arm a callback to run immediately before the send-path re-check for
+    /// `group_id`. The callback receives the live roster map under its write
+    /// guard, so it can install, advance or clear a marker.
+    pub(in crate::server) fn install(group_id: &str, hook: Hook) -> BarrierGuard {
+        if let Ok(mut hooks) = HOOKS.lock() {
+            hooks.insert(group_id.to_string(), hook);
+        }
+        BarrierGuard(group_id.to_string())
+    }
+
+    pub(in crate::server) async fn before_recheck(group_id: &str, state: &crate::server::AppState) {
+        // Armed test first, so an unarmed call (every call in every other
+        // test) takes no roster WRITE lock and cannot perturb the very
+        // interleaving the rest of the suite is measuring.
+        let armed = HOOKS
+            .lock()
+            .map(|hooks| hooks.contains_key(group_id))
+            .unwrap_or(false);
+        if !armed {
+            return;
+        }
+        // The write guard is acquired BEFORE the std mutex, so no `.await`
+        // ever happens while `HOOKS` is held.
+        let mut groups = state.named_groups.write().await;
+        if let Ok(mut hooks) = HOOKS.lock() {
+            if let Some(hook) = hooks.get_mut(group_id) {
+                hook(&mut groups);
+            }
+        }
+    }
+}
+
+/// ADR-0066 §3b/§3e (slice 3): the refusal where there is no HTTP
+/// response to carry it — a gossip-ingest honour path or an internal
+/// authority predicate whose only channel is `Err(String)`.
+///
+/// It is the SAME refusal: the same §5 sentence and the same single
+/// `fork_quarantine_refusals` increment. Only the envelope differs,
+/// because a delegation honoured over gossip has no status code to
+/// return. Callers must surface the returned reason (log it, or hand it
+/// back as the predicate's error) rather than dropping silently — a
+/// delegation that stops working with no recorded reason is exactly the
+/// unexplained outage R5 forbids.
+pub(in crate::server) fn fork_quarantine_refusal_reason(
+    state: &AppState,
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+) -> String {
+    state
+        .groups_diagnostics
+        .record_fork_quarantine_refusal(group_id);
+    fork_quarantine_refusal_message(group_id, marker)
+}
+
+/// ADR-0066 §3a/§3b: the marker as it appears on a path that ANNOTATES
+/// rather than refuses (row 16 today; rows 13, 25, 26 in later slices).
+///
+/// Deliberately the same object the refusal body carries under
+/// `fork_quarantine`, so a client parses one shape whether the operation
+/// was served-with-a-warning or refused outright.
+pub(in crate::server) fn fork_quarantine_annotation(
+    marker: &x0x::groups::ForkQuarantine,
+) -> serde_json::Value {
+    serde_json::json!({
+        "revision": marker.revision,
+        "observed_at_ms": marker.observed_at_ms,
+        "no_anchor": marker.no_anchor,
+        "clear_with": FORK_QUARANTINE_CLEAR_ROUTE,
     })
+}
+
+/// ADR-0066 §5: the refusal body, built from the marker alone.
+///
+/// Split out from [`reject_fork_quarantined`] (which additionally owns
+/// the diagnostics increment and needs an `AppState`) so the payload
+/// contract is testable without a daemon fixture: the §5 acceptance bar
+/// is a property of the body, and a test that has to stand a node up to
+/// check it is a test nobody runs.
+pub(in crate::server) fn fork_quarantine_refusal_body(
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+) -> serde_json::Value {
+    let (_, Json(mut body)) = api_error_with_reason(
+        StatusCode::CONFLICT,
+        fork_quarantine_refusal_message(group_id, marker),
+        FORK_QUARANTINED_REASON,
+    );
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "fork_quarantine".to_string(),
+            fork_quarantine_annotation(marker),
+        );
+    }
+    body
+}
+
+/// ADR-0066 §5: the stable machine code clients match on. It lives in
+/// the `reason` field; `error` is prose and is NOT a matchable contract.
+const FORK_QUARANTINED_REASON: &str = "fork_quarantined";
+
+/// ADR-0066 §5: the machine-readable remedy carried in
+/// `fork_quarantine.clear_with`.
+pub(in crate::server) const FORK_QUARANTINE_CLEAR_ROUTE: &str = "POST /groups/:id/quarantine/clear";
+
+/// ADR-0066 §5: the informational sentence. It must state all three of
+/// the condition (this node holds authenticated fork evidence), why the
+/// operation is refused (the roster is contested), and the exit — and
+/// the exit it names has to be the one that actually works for the
+/// group's own shape, so the wording branches on `no_anchor`:
+///
+/// - owner-axis marker (`no_anchor == false`): an owner-anchored commit
+///   advancing past the evidence revision clears it, and the manual
+///   route clears it now; on a node holding the owner user key the CLI
+///   needs no flags (`clear_group_quarantine` path (a)).
+/// - `no_anchor` marker: nothing clears it automatically, and the manual
+///   route has no owner axis to attest with, so the operator override
+///   (`--force` plus a reason) is the only exit (path (b)).
+pub(in crate::server) fn fork_quarantine_refusal_message(
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+) -> String {
+    let revision = marker.revision;
+    if marker.no_anchor {
+        format!(
+            "group is fork-quarantined on this node: authenticated fork evidence at \
+             revision {revision} means the roster is contested, so this operation is \
+             refused here. This group has no owner axis, so nothing clears the marker \
+             automatically — the only exit is the manual clear \
+             {FORK_QUARANTINE_CLEAR_ROUTE} (CLI: `x0x groups quarantine clear \
+             {group_id} --force --reason \"<why>\"`)."
+        )
+    } else {
+        format!(
+            "group is fork-quarantined on this node: authenticated fork evidence at \
+             revision {revision} means the roster is contested, so this operation is \
+             refused here. It clears when an owner-anchored commit advances past \
+             revision {revision}, or immediately with the manual clear \
+             {FORK_QUARANTINE_CLEAR_ROUTE} (CLI: `x0x groups quarantine clear \
+             {group_id}`, which needs `--force --reason \"<why>\"` unless this install \
+             holds the group's owner user key)."
+        )
+    }
 }
 
 #[cfg(test)]
@@ -22790,9 +23619,29 @@ async fn treekem_group_encrypt(
         }
     };
     // ADR-0038 restore quarantine: refuse before touching ratchet state.
-    {
+    //
+    // ADR-0066 §1 row 2 / §4 (slice 9): the lifecycle epoch token is captured
+    // under the SAME read guard as the gate, so nothing can move between the
+    // authorization and the capture. Resolved under both spellings, because a
+    // caller may hold the stable id while the map is keyed by an alias.
+    let captured_epoch = {
         let groups = state.named_groups.read().await;
-        if let Some(info) = groups.get(group_id_hex) {
+        // #732: BOTH SPELLINGS, through the one shared resolver. Unlike the
+        // GSS family below, this arm FAILS OPEN on a miss: no record found
+        // means neither gate runs — not the ADR-0038 restore gate and not the
+        // ADR-0066 §3 quarantine gate, since both sit inside this one
+        // `if let` — and the ratchet advances.
+        //
+        // This is defence in depth, not the repair of a known remote bypass
+        // (cross-model review of #750). The only callers,
+        // `secure_group_encrypt`/`_decrypt`, 404 an unresolvable spelling at
+        // route level first and run both gates on the map-key spelling under
+        // the same lock hold, so pre-#732 the fail-open was reachable only as
+        // a TOCTOU: the roster re-keyed between the route's `drop(groups)` and
+        // this inner re-acquire while `treekem_groups` still held the old
+        // spelling. Resolving both spellings closes that race and stops the
+        // helper depending on its caller's lookup for its own safety.
+        if let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
@@ -22800,7 +23649,8 @@ async fn treekem_group_encrypt(
                 return resp;
             }
         }
-    }
+        crate::server::lifecycle_epoch_token_locked(&groups, group_id_hex)
+    };
     let group = {
         let map = state.treekem_groups.read().await;
         match map.get(group_id_hex) {
@@ -22814,6 +23664,28 @@ async fn treekem_group_encrypt(
         }
     };
     let mut guard = group.lock().await;
+    // ADR-0066 §1 row 2 / §4 (slice 9): THE EFFECT POINT. `encrypt_message`
+    // ADVANCES THE SEND RATCHET, and the advanced state is then persisted ten
+    // lines below — a refusal after it would have burned a generation that no
+    // message ever used. So the re-check runs here, while the SAME `guard` is
+    // held, with NO await and no suspension point between it and the advance:
+    // on a refusal the ratchet epoch is provably unmoved, the snapshot persist
+    // is never reached and no history row is recorded.
+    //
+    // Lock order is unchanged. Holding the per-group TreeKEM mutex across a
+    // `state.named_groups` read acquisition is not a new nesting: the very next
+    // step, `persist_treekem_snapshot_bound`, is already called with this same
+    // `guard` alive and takes that same read lock as its first act. The order
+    // (membership → roster → persistence → outbox) and the cycle-free shape
+    // are therefore exactly main's, and taking the re-check BEFORE the
+    // `group.lock().await` instead would have been strictly worse: a contended
+    // mutex would then sit inside the window.
+    if let Some(resp) =
+        reject_fork_quarantine_installed_before_effect(state, group_id_hex, captured_epoch.as_ref())
+            .await
+    {
+        return resp;
+    }
     let ciphertext = match guard.encrypt_message(&plaintext) {
         Ok(c) => c,
         Err(e) => {
@@ -22898,7 +23770,22 @@ async fn treekem_group_decrypt(
     // ADR-0038 restore quarantine: refuse before touching ratchet state.
     {
         let groups = state.named_groups.read().await;
-        if let Some(info) = groups.get(group_id_hex) {
+        // #732: BOTH SPELLINGS, through the one shared resolver. Unlike the
+        // GSS family below, this arm FAILS OPEN on a miss: no record found
+        // means neither gate runs — not the ADR-0038 restore gate and not the
+        // ADR-0066 §3 quarantine gate, since both sit inside this one
+        // `if let` — and the ratchet advances.
+        //
+        // This is defence in depth, not the repair of a known remote bypass
+        // (cross-model review of #750). The only callers,
+        // `secure_group_encrypt`/`_decrypt`, 404 an unresolvable spelling at
+        // route level first and run both gates on the map-key spelling under
+        // the same lock hold, so pre-#732 the fail-open was reachable only as
+        // a TOCTOU: the roster re-keyed between the route's `drop(groups)` and
+        // this inner re-acquire while `treekem_groups` still held the old
+        // spelling. Resolving both spellings closes that race and stops the
+        // helper depending on its caller's lookup for its own safety.
+        if let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
@@ -22974,6 +23861,8 @@ pub(in crate::server) async fn secure_group_encrypt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
+    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
+    // and the §3 gate below consumes this same `info`. Out of #732's scope.
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
@@ -22986,6 +23875,19 @@ pub(in crate::server) async fn secure_group_encrypt(
     if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
         return resp;
     }
+    // ADR-0066 §1 row 4 / §4 (slice 9): capture under the SAME read guard as
+    // the gate. Re-checked immediately before the effect below. The TreeKEM
+    // branch of this handler does its own capture and re-check inside
+    // `treekem_group_encrypt` (row 2), where the ratchet lives.
+    //
+    // #732: through the SHARED resolver, so capture and re-check use one
+    // both-spellings rule. Behaviour-identical today — the route 404s a
+    // spelling `groups.get(&id)` misses (the waiver at that lookup), so the
+    // resolver's first branch returns the very entry the gate just used —
+    // and that is the point: if the route's id semantics are ever widened
+    // (lifting that waiver), capture and re-check widen together instead of
+    // one being left on the old rule. Cost is one extra hash hit.
+    let captured_epoch = crate::server::lifecycle_epoch_token_locked(&groups, &id);
 
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
@@ -23145,6 +24047,26 @@ pub(in crate::server) async fn secure_group_encrypt(
         Ok(attribution) => attribution,
         Err(resp) => return resp,
     };
+    // ADR-0066 §1 row 4 / §4 (slice 9): THE EFFECT POINT. The two
+    // irreversible steps on this path are the durable history row immediately
+    // below and the ciphertext returned to the caller; both are stopped by
+    // refusing here. The GSS plane has NO ratchet — the key is the group's
+    // epoch-keyed shared secret and every message carries a fresh random
+    // nonce — so there is no generation to burn and the computed ciphertext is
+    // simply discarded, leaving `secret_epoch`, the roster and the history
+    // store byte-identical.
+    //
+    // This is the last point on the path with no suspension between it and the
+    // effect: after `drop(groups)` above nothing awaits, so the re-check's own
+    // read acquisition is placed as late as the effect allows. It holds no
+    // other lock, and the terminality re-check below takes its read guard
+    // sequentially rather than nested.
+    if let Some(resp) =
+        reject_fork_quarantine_installed_before_effect(state.as_ref(), &id, captured_epoch.as_ref())
+            .await
+    {
+        return resp;
+    }
     record_mls_history(
         state.as_ref(),
         &group_id_clone,
@@ -23181,6 +24103,8 @@ pub(in crate::server) async fn secure_group_decrypt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
+    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
+    // and the §3 gate below consumes this same `info`. Out of #732's scope.
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
@@ -23341,6 +24265,8 @@ pub(in crate::server) async fn secure_group_reseal(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
+    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
+    // and the §3 gate below consumes this same `info`. Out of #732's scope.
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
@@ -23356,6 +24282,17 @@ pub(in crate::server) async fn secure_group_reseal(
     if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
         return resp;
     }
+    // ADR-0066 §1 row 6 / §4 (slice 9): capture under the SAME read guard as
+    // the gate. Re-checked immediately before the sealed envelope is returned.
+    //
+    // #732: through the SHARED resolver, so capture and re-check use one
+    // both-spellings rule. Behaviour-identical today — the route 404s a
+    // spelling `groups.get(&id)` misses (the waiver at that lookup), so the
+    // resolver's first branch returns the very entry the gate just used —
+    // and that is the point: if the route's id semantics are ever widened
+    // (lifting that waiver), capture and re-check widen together instead of
+    // one being left on the old rule. Cost is one extra hash hit.
+    let captured_epoch = crate::server::lifecycle_epoch_token_locked(&groups, &id);
 
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
@@ -23423,6 +24360,21 @@ pub(in crate::server) async fn secure_group_reseal(
             }
         };
 
+    // ADR-0066 §1 row 6 / §4 (slice 9): THE EFFECT POINT. This route persists
+    // nothing and advances no ratchet — its effect is that the group's shared
+    // secret, sealed to a recipient's ML-KEM key, LEAVES THE NODE in the
+    // response. Refusing here means the envelope is discarded before it is
+    // handed out, so a contested group cannot hand its key material onward,
+    // and `secret_epoch`, the roster and every durable file are untouched.
+    //
+    // As on row 4, nothing awaits between `drop(groups)` above and here, so
+    // this is the last suspension-free point before the effect.
+    if let Some(resp) =
+        reject_fork_quarantine_installed_before_effect(state.as_ref(), &id, captured_epoch.as_ref())
+            .await
+    {
+        return resp;
+    }
     secure_group_effect_response_after_terminality_recheck(
         state.as_ref(),
         &id,
@@ -23635,6 +24587,28 @@ async fn persist_treekem_snapshot_bytes(
 }
 
 /// Persist a TreeKEM snapshot bound to the currently durable named-group state.
+///
+/// The roster entry is resolved under BOTH spellings
+/// ([`crate::server::resolve_group_entry_locked`]) so the envelope binds to the
+/// same entry the caller's gates resolved.
+///
+/// #732 known gap (g), found by cross-model review of PR #751. This was a bare
+/// `groups.get(group_id_hex)`, and every caller is a post-crypto step: the two
+/// `secure_group_encrypt`/`_decrypt` helpers above and
+/// `TreeKemGroupStoreProtector::{seal_record, open_record}` all advance the
+/// ratchet and only then call this. In the TOCTOU end state slice 9 already
+/// tests for — roster filed under a local ALIAS while `treekem_groups` is still
+/// keyed by the stable id — the gates resolved the group fine, the CLEAN
+/// (non-quarantined) encrypt advanced the send ratchet, and then this lookup
+/// missed and the request 500'd. That burned a send generation whose ciphertext
+/// was discarded. Availability only: a burned generation is never reused, so
+/// there is no nonce reuse, and the path self-heals on the alias spelling or a
+/// reseal. Resolving both spellings here removes the burn entirely and stops
+/// this helper depending on its caller's lookup for its own success.
+///
+/// The snapshot FILE is still written under `group_id_hex`, the spelling the
+/// caller asked for and the one the restore path reads: only the roster
+/// resolution widens, so no persisted layout changes.
 pub(super) async fn persist_treekem_snapshot_bound(
     state: &AppState,
     group_id_hex: &str,
@@ -23642,9 +24616,8 @@ pub(super) async fn persist_treekem_snapshot_bound(
 ) -> anyhow::Result<()> {
     let info = {
         let groups = state.named_groups.read().await;
-        groups
-            .get(group_id_hex)
-            .cloned()
+        crate::server::resolve_group_entry_locked(&groups, group_id_hex)
+            .map(|(_, info)| info.clone())
             .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM snapshot"))?
     };
     ensure_treekem_persistence_allowed(
@@ -23710,6 +24683,75 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     // with a stale/absent snapshot and nothing on disk could repair it.
     let (named_groups_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
+        // ADR-0066 §4 / ADR-0067 — the epoch re-check, under the persistence
+        // lock this function already holds (`:24101`), before ANY journal or
+        // live-file write.
+        //
+        // The hazard is specific and destructive. `info` is the caller's
+        // snapshot, captured at its authorization check (for the store paths,
+        // `TreeKemGroupStoreProtector::current_info`, whose gate consults
+        // `is_fork_quarantined()`). The insert below makes that snapshot the
+        // durable record for `group_id_hex`. So if a fork-quarantine marker
+        // was installed on the LIVE record after the caller cloned it, this
+        // write does not merely proceed on a stale authorization — it
+        // ERASES the containment marker, because `info` predates it and
+        // carries `fork_quarantine: None`. The next operation then sees an
+        // unquarantined group and the containment is silently gone.
+        //
+        // `ensure_treekem_persistence_allowed` does NOT cover this: it
+        // resolves to `ensure_named_group_key_material_install_allowed`,
+        // which checks `withdrawn` only.
+        //
+        // Only the MARKER half of the token is compared here, and this is the
+        // one site where that is correct: this function exists to persist an
+        // ADVANCED state, so the caller's `state_revision` is expected to
+        // differ from the live one and comparing it would refuse every
+        // legitimate persist. `LifecycleEpochToken::same_marker` names that
+        // choice so it cannot be mistaken for a full-token comparison.
+        //
+        // ASYMMETRIC, and this is the ADR-0066 §2 trap restated: the test
+        // fires only when the LIVE record already carries a marker. An
+        // incoming `info` that ADDS one is the install path itself
+        // (`install_fork_evidence`, which uses `get_or_insert` and so never
+        // replaces an existing marker) — gating that would make the marker
+        // unsettable, exactly as §2 warns that gating the retry-rollback would
+        // make a marker unclearable. Nothing needs protecting when the live
+        // record has no marker; everything does once it has one.
+        //
+        // ACCEPTED CONSEQUENCE, asserted by
+        // `treekem_stale_snapshot_may_resurrect_a_cleared_marker`: because
+        // "adds a marker" is indistinguishable HERE from "is the install", a
+        // snapshot captured before a clear can re-assert a just-cleared
+        // marker. That direction fails CLOSED — the group is re-contained,
+        // not released — so the operator clears again, which is strictly
+        // safer than the erasure this gate exists to stop. Unlike this site,
+        // `EpochScope::MarkerOnly` (used by the Home seal paths, which never
+        // install) refuses BOTH directions, because there the ambiguity does
+        // not exist.
+        if let Some((_, live)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) {
+            let live_token = live.lifecycle_epoch_token();
+            let captured = info.lifecycle_epoch_token();
+            if live_token.is_fork_quarantined() && !live_token.same_marker(&captured) {
+                // Fail closed BEFORE the irreversible step, leaving every
+                // durable file byte-identical. Retryable by construction: a
+                // retry re-reads the live record, so a legitimate clear costs
+                // one refused attempt and no spin — nothing is queued or
+                // parked here.
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    live_quarantined = live_token.is_fork_quarantined(),
+                    captured_quarantined = captured.is_fork_quarantined(),
+                    "ADR-0066 §4: refusing TreeKEM atomic persist — the group's \
+                     fork-quarantine marker changed between authorization and the \
+                     persist lock"
+                );
+                anyhow::bail!(
+                    "fork_quarantined: the group's fork-quarantine marker changed \
+                     between authorization and the persist lock; re-read the group \
+                     and retry (see docs/runbooks for the manual clear)"
+                );
+            }
+        }
         let mut next_groups = groups.clone();
         next_groups.insert(group_id_hex.to_string(), info.clone());
         // #458 r3: never durably capture OTHER groups' unconfirmed join
@@ -23942,9 +24984,12 @@ async fn record_recovery_fork_evidence(
         committed_by: journal_commit.committed_by.clone(),
         observed_at_ms: now_millis_u64(),
     };
-    // ADR-0064: same owner-axis-only rule as the live path — the
-    // recovery install writes the quarantine marker in the SAME store
-    // mutation as the evidence record.
+    // ADR-0064 → ADR-0066 §2: the recovery install writes the quarantine
+    // marker in the SAME store mutation as the evidence record, with the
+    // same per-population `no_anchor` rule as the live path. This path
+    // stays fenced to lineage-bearing groups: the store loop below needs a
+    // lineage record to hold the evidence, and ADR-0066 slice 2 widens the
+    // LIVE apply fence only.
     let quarantine = fork_quarantine_for_evidence(live, &evidence, &journal_commit, None);
     for store_path in [named_groups_path, home_suite_groups_path] {
         let Ok(json) = tokio::fs::read_to_string(store_path).await else {
@@ -28511,10 +29556,11 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
         }
     }
     // #470 test fault cell: force a chosen save outcome through the
-    // production path (constant-false outside test builds). Checked after
-    // the hook above so every fault variant shares the deterministic
-    // interleave point; before any durable write.
-    if let Some(outcome) = save_fault_short_circuit() {
+    // production path (cfg(test) only). Checked after the hook above so
+    // every fault variant shares the deterministic interleave point; before
+    // any durable write.
+    #[cfg(test)]
+    if let Some(outcome) = save_fault_short_circuit(state) {
         return Ok(outcome);
     }
     // A non-empty sidecar body must reach disk before the roster view
@@ -28542,7 +29588,12 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     // failing HERE reproduces the documented #471 split outcome
     // (sidecar new / named old) through the production path — which the
     // rollback after the write must now undo.
-    let outcome = if save_fault_legacy_write_fails() {
+    //
+    // `#[cfg(test)]` / `#[cfg(not(test))]` are mutually exclusive; the
+    // test path adds fault injection (per-instance, never a global static),
+    // the production path is the bare write with no extra branches.
+    #[cfg(test)]
+    let outcome = if save_fault_legacy_write_fails(state) {
         Err(std::io::Error::other(
             "injected legacy roster write failure (#470/#471 test)",
         ))
@@ -28554,15 +29605,24 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
                 e
             })
             // #477 (r8 item 1) test fault: the rename happened; report the
-            // parent-dir fsync as failed (constant-false outside test builds).
+            // parent-dir fsync as failed.
             .map(|written| {
-                if written == AtomicWriteOutcome::Durable && save_fault_after_write_not_durable() {
+                if written == AtomicWriteOutcome::Durable
+                    && save_fault_after_write_not_durable(state)
+                {
                     AtomicWriteOutcome::ReplacedNotDurable
                 } else {
                     written
                 }
             })
     };
+    #[cfg(not(test))]
+    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &legacy_json)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to save named groups: {e}");
+            e
+        });
     // #471: the named write did NOT land (pre-rename failure or no
     // replacement) while the sidecar above already did — the split this
     // ordinary save path has no journal to repair. Undo the sidecar half
@@ -31449,6 +32509,16 @@ pub(in crate::server) mod tests {
     #[cfg(unix)]
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
+    mod adr0066_clear_route;
+    mod adr0066_coverage_map;
+    mod adr0066_delegations;
+    mod adr0066_epoch_token;
+    mod adr0066_lookup_guard;
+    mod adr0066_send_path;
+    mod adr0066_tasks;
+    mod adr0066_treekem_gates;
+    mod adr0068_quarantine_pin;
+    mod adr0068_task_buffer;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod hs_f2_membership_cluster;
@@ -32237,6 +33307,7 @@ pub(in crate::server) mod tests {
             )),
             forward_service: None,
             owner_sync,
+            named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
 
         // Review r2 (#451): mirror daemon startup — migrate a pre-#451
@@ -35420,8 +36491,10 @@ pub(in crate::server) mod tests {
             // NEXT write (the candidate install) is `ReplacedNotDurable`
             // after the rename, and its corrective re-save then fails.
             let (code, body) = {
-                let _fault =
-                    set_save_fault(SaveFault::PreflightOkThenReplacedNotDurableAfterWriteThenError);
+                let _fault = set_save_fault(
+                    &joiner_state,
+                    SaveFault::PreflightOkThenReplacedNotDurableAfterWriteThenError,
+                );
                 route_join(&joiner_state, link).await
             };
             assert_eq!(
@@ -35528,7 +36601,7 @@ pub(in crate::server) mod tests {
                 }
                 let (_inviter, link) = mint_real_invite(&authority_state, &group).await;
                 let (code, body) = {
-                    let _fault = set_save_fault(fault);
+                    let _fault = set_save_fault(&joiner_state, fault);
                     route_join(&joiner_state, link).await
                 };
                 assert_eq!(
@@ -51011,7 +52084,7 @@ mod cas_rollback_470 {
         *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
             .lock()
             .expect("hook lock") = Some((Arc::clone(&reached), Arc::clone(&release)));
-        let _fault_guard = set_save_fault(fault);
+        let _fault_guard = set_save_fault(state, fault);
         let task_state = Arc::clone(state);
         let join = tokio::spawn(async move {
             persist_named_groups_mutation(&task_state, |groups| {
@@ -51218,7 +52291,7 @@ mod cas_rollback_470 {
         *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
             .lock()
             .expect("hook lock") = Some((Arc::clone(&reached), Arc::clone(&release)));
-        let _fault_guard = set_save_fault(SaveFault::NotReplaced);
+        let _fault_guard = set_save_fault(&case.state, SaveFault::NotReplaced);
         let task_state = Arc::clone(&case.state);
         let join = tokio::spawn(async move {
             // Returns true (a "successful" mutation) but changes nothing:

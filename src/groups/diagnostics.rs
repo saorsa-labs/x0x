@@ -148,6 +148,18 @@ pub struct GroupCounters {
     /// TreeKEM encrypt/decrypt, secure encrypt/open/reseal) while the
     /// marker is set.
     pub fork_quarantine_refusals: u64,
+    /// ADR-0068 D2: inbound peer task-CRDT deltas HELD (not applied) because
+    /// this group's fork-quarantine marker is live. The CRDT stays
+    /// byte-identical while this climbs.
+    pub task_deltas_quarantine_buffered: u64,
+    /// ADR-0068 D2: buffered task deltas DROPPED because the per-list bound
+    /// (1024 deltas / 1 MiB) was reached — oldest first. Not silent loss:
+    /// CRDT merges are idempotent and anti-entropy refills after the clear,
+    /// but a climbing value means the quarantine is outlasting the buffer.
+    pub task_deltas_quarantine_dropped: u64,
+    /// ADR-0068 D2: buffered task deltas APPLIED, in arrival order, after the
+    /// marker cleared.
+    pub task_deltas_quarantine_applied: u64,
     /// ADR-0064 slice 2: owner USER-key mandates minted by THIS install
     /// at the pre-mutation point of an invite-derived seat (owner-axis
     /// groups where the local agent holds the owner user key).
@@ -373,6 +385,15 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.fork_quarantine_refusals = dst
         .fork_quarantine_refusals
         .saturating_add(src.fork_quarantine_refusals);
+    dst.task_deltas_quarantine_buffered = dst
+        .task_deltas_quarantine_buffered
+        .saturating_add(src.task_deltas_quarantine_buffered);
+    dst.task_deltas_quarantine_dropped = dst
+        .task_deltas_quarantine_dropped
+        .saturating_add(src.task_deltas_quarantine_dropped);
+    dst.task_deltas_quarantine_applied = dst
+        .task_deltas_quarantine_applied
+        .saturating_add(src.task_deltas_quarantine_applied);
     dst.owner_mandate_minted = dst
         .owner_mandate_minted
         .saturating_add(src.owner_mandate_minted);
@@ -584,6 +605,32 @@ impl GroupsDiagnostics {
     pub fn record_fork_quarantine_refusal(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.fork_quarantine_refusals = c.fork_quarantine_refusals.saturating_add(1);
+        });
+    }
+
+    /// ADR-0068 D2: an inbound peer task-CRDT delta was HELD rather than
+    /// applied, because this group's marker is live.
+    pub fn record_task_delta_quarantine_buffered(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.task_deltas_quarantine_buffered = c.task_deltas_quarantine_buffered.saturating_add(1);
+        });
+    }
+
+    /// ADR-0068 D2: `count` held task deltas were dropped (oldest first)
+    /// because the per-list buffer bound was reached.
+    pub fn record_task_deltas_quarantine_dropped(&self, group_id: &str, count: u64) {
+        self.with_counters(group_id, |c| {
+            c.task_deltas_quarantine_dropped =
+                c.task_deltas_quarantine_dropped.saturating_add(count);
+        });
+    }
+
+    /// ADR-0068 D2: `count` held task deltas were applied, in arrival order,
+    /// after the marker cleared.
+    pub fn record_task_deltas_quarantine_applied(&self, group_id: &str, count: u64) {
+        self.with_counters(group_id, |c| {
+            c.task_deltas_quarantine_applied =
+                c.task_deltas_quarantine_applied.saturating_add(count);
         });
     }
 
@@ -1340,6 +1387,9 @@ mod tests {
             fork_evidence_unauthorized_signer: base + 44,
             fork_quarantine_owner_anchored_clears: base + 45,
             fork_quarantine_owner_anchored_refusals: base + 46,
+            task_deltas_quarantine_buffered: base + 47,
+            task_deltas_quarantine_dropped: base + 48,
+            task_deltas_quarantine_applied: base + 49,
         };
         let src = counters_with(1_000);
         let dst = counters_with(7);
@@ -1486,6 +1536,18 @@ mod tests {
         assert_eq!(
             merged.fork_quarantine_set,
             dst.fork_quarantine_set + src.fork_quarantine_set
+        );
+        assert_eq!(
+            merged.task_deltas_quarantine_buffered,
+            dst.task_deltas_quarantine_buffered + src.task_deltas_quarantine_buffered
+        );
+        assert_eq!(
+            merged.task_deltas_quarantine_dropped,
+            dst.task_deltas_quarantine_dropped + src.task_deltas_quarantine_dropped
+        );
+        assert_eq!(
+            merged.task_deltas_quarantine_applied,
+            dst.task_deltas_quarantine_applied + src.task_deltas_quarantine_applied
         );
         assert_eq!(
             merged.fork_quarantine_refusals,

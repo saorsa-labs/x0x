@@ -245,19 +245,22 @@ pub struct ForkSnapshot {
     pub classification: Option<String>,
 }
 
-/// ADR-0064 (Guard A): persistent per-node fork-quarantine marker for
-/// owner-axis (OwnerCertified / Home) groups. Set only from fork evidence
-/// that passed the authenticated-candidate gate
+/// ADR-0064 (Guard A): persistent per-node fork-quarantine marker. Set
+/// only from fork evidence that passed the authenticated-candidate gate
 /// (`evaluate_fork_evidence_candidate`); membership-gated routes refuse
-/// with `fork_quarantined` (409) while it is set. Clears ONLY through an
-/// owner-anchored path (verified head attestation on adoption, or a local
-/// owner-certified seal) — never by a contested branch's own commits.
+/// with `fork_quarantined` (409) while it is set.
 ///
-/// Slice-1 scope (deliberate boundary): set and gated ONLY for groups
-/// whose policy has an owner axis; non-owner-axis groups never receive a
-/// marker and are byte-for-byte unchanged. `no_anchor` is reserved for
-/// the documented non-owner-axis indefinite-quarantine semantics
-/// (`quarantine_no_anchor`) and is always `false` in this slice.
+/// Two populations, distinguished by [`ForkQuarantine::no_anchor`]:
+/// - **owner-axis** (OwnerCertified / Home, `no_anchor == false`) — clears
+///   through an owner-anchored path (verified head attestation on
+///   adoption, a mandate-carrying `MemberAdded` that verifies, or a local
+///   owner-certified seal), never by a contested branch's own commits;
+/// - **ordinary / non-owner-axis** (ADR-0066 §2, `no_anchor == true`) —
+///   there is no anchor to wait for, so NO commit on ANY ancestry ever
+///   clears it: the only exit is the manual
+///   `POST /groups/:id/quarantine/clear`. Every owner-anchored clear arm
+///   therefore consults
+///   [`ForkQuarantine::owner_anchored_clear_permitted`] and declines.
 ///
 /// Persistence: a serde-default `GroupInfo` field — old v0.41.4 binaries
 /// ignore the unknown field (JSON, not bincode; no wire enum grows a
@@ -276,10 +279,165 @@ pub struct ForkQuarantine {
     pub observed_at_ms: u64,
     /// Forensic snapshot of both competing commit headers.
     pub snapshot: ForkSnapshot,
-    /// True when the marker can never auto-clear (non-owner-axis
-    /// runbook case; slice 1 never sets it).
+    /// True when the marker can never auto-clear: the group's policy has
+    /// no owner axis, so there is no anchor any commit could carry
+    /// (ADR-0066 §2 — manual clear only). `#[serde(default)]` so a marker
+    /// persisted before ADR-0066 (which never set the field) decodes as
+    /// `false`, i.e. as the owner-axis marker it was.
     #[serde(default)]
     pub no_anchor: bool,
+}
+
+impl ForkQuarantine {
+    /// ADR-0066 §2: may an owner-anchored advance to `revision` clear this
+    /// marker? Both fences, in one predicate so the three owner-anchored
+    /// clear arms cannot drift:
+    ///
+    /// - a `no_anchor` marker is NEVER cleared by a commit, of any
+    ///   revision, on any ancestry — extending the marker to ordinary
+    ///   groups without this test would hand them an automatic clear and
+    ///   silently contradict the manual-only rule;
+    /// - the anchored revision must be STRICTLY greater than the evidenced
+    ///   one (ADR-0064 r2), so a same-revision sibling — the contested
+    ///   branch itself — can never buy a clear.
+    ///
+    /// This is a *clear* predicate only. The retry-rollback of a
+    /// non-durable install is NOT a clear and deliberately does not
+    /// consult it (ADR-0066 §2 table): gating an undo would strand a
+    /// marker whose evidence was retracted, turning a transient persist
+    /// failure into an unclearable quarantine.
+    #[must_use]
+    pub fn owner_anchored_clear_permitted(&self, revision: u64) -> bool {
+        !self.no_anchor && revision > self.revision
+    }
+}
+
+/// ADR-0067: which marker a group carries, as an identity.
+///
+/// The five fields that say *which fork observation* installed this marker.
+/// [`ForkQuarantine::snapshot`] is deliberately excluded: it is forensic
+/// detail derived from the same evidence, so it cannot differ between two
+/// markers whose identity fields agree, and carrying it would make every
+/// token clone a deep copy of two commit headers for no decision value.
+///
+/// **The destructuring in this type's `from_marker` constructor is exhaustive
+/// on purpose.** A field added to [`ForkQuarantine`] that this type should
+/// consider fails the BUILD there rather than silently widening the set of
+/// marker changes the epoch token cannot see. That is a stronger guarantee
+/// than a test, and it is why no `..` appears in that pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkQuarantineIdentity {
+    revision: u64,
+    state_hash: String,
+    committed_by: String,
+    observed_at_ms: u64,
+    no_anchor: bool,
+}
+
+impl ForkQuarantineIdentity {
+    fn from_marker(marker: &ForkQuarantine) -> Self {
+        // Exhaustive — see the type doc. Do NOT add `..`.
+        let ForkQuarantine {
+            revision,
+            state_hash,
+            committed_by,
+            observed_at_ms,
+            snapshot: _,
+            no_anchor,
+        } = marker;
+        Self {
+            revision: *revision,
+            state_hash: state_hash.clone(),
+            committed_by: committed_by.clone(),
+            observed_at_ms: *observed_at_ms,
+            no_anchor: *no_anchor,
+        }
+    }
+
+    /// The evidenced revision this marker names.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+/// ADR-0067: the lifecycle epoch token, captured at an authorization check
+/// and re-validated inside the critical section that performs the
+/// irreversible act.
+///
+/// **Why this exists.** Every ADR-0066 gate (slices 1–6) consults the
+/// marker at the START of an operation. A marker installed — or cleared, or
+/// advanced to a new evidence revision — BETWEEN that check and the persist
+/// lets a contested write through, or wrongly refuses a permitted one.
+/// ADR-0066 §4 closes that window with a token; ADR-0067 settles what the
+/// token is.
+///
+/// **Why it is derived and not counted.** ADR-0066 §4 specified a
+/// `quarantine_generation` counter "on the group entry" while its own
+/// ratified R4 forbade "no new #470 full-equality participant" — and
+/// [`GroupInfo`] derives [`PartialEq`] with that full equality deliberately
+/// load-bearing for `persist_named_groups_mutation_unlocked`'s
+/// compare-and-restore rollback. The two cannot both hold. Worse, a census
+/// found three marker writers no process-local counter reaches: the on-disk
+/// recovery install, and the two clears that mutate the roster under a raw
+/// `named_groups.write()` without the persistence lock. A counter's
+/// completeness would rest on an enumeration whose failure mode is
+/// **fail-open**.
+///
+/// So the token is DERIVED from the live record on demand:
+/// `(state_revision, marker identity)`. Nothing is stored, so nothing can go
+/// stale, and every lifecycle event is visible without a hook at its site:
+///
+/// - install — `None` → `Some(identity)`;
+/// - clear — `Some(identity)` → `None`;
+/// - revision advance — `Some(a)` → `Some(b)`;
+/// - roster/lifecycle advance with no marker change — `state_revision` moves.
+///
+/// **Accepted weakness (ADR-0067 Consequences).** This is an identity, not a
+/// clock: it answers "same or different", never "newer". ABA is possible
+/// only if a byte-identical marker identity recurs while `state_revision`
+/// returns to its captured value within one operation's window — which needs
+/// an active coincidence, where a counter needs only a forgotten line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleEpochToken {
+    state_revision: u64,
+    marker: Option<ForkQuarantineIdentity>,
+}
+
+impl LifecycleEpochToken {
+    /// The state-commit revision this token was captured at.
+    #[must_use]
+    pub fn state_revision(&self) -> u64 {
+        self.state_revision
+    }
+
+    /// The marker identity this token was captured with, if the group
+    /// carried one.
+    #[must_use]
+    pub fn marker(&self) -> Option<&ForkQuarantineIdentity> {
+        self.marker.as_ref()
+    }
+
+    /// Was the group fork-quarantined when this token was captured?
+    #[must_use]
+    pub fn is_fork_quarantined(&self) -> bool {
+        self.marker.is_some()
+    }
+
+    /// Do these two tokens describe the same quarantine marker, ignoring
+    /// `state_revision`?
+    ///
+    /// **Use `==` unless you can justify this instead.** The full token is
+    /// the default comparison; this partial one exists for the single site
+    /// whose whole purpose is to persist an ADVANCED state — the TreeKEM
+    /// roster+snapshot atomic persist — where the captured and live
+    /// revisions are *expected* to differ and a full comparison would refuse
+    /// every legitimate write. Naming the weaker comparison keeps it from
+    /// being mistaken for the full one in review.
+    #[must_use]
+    pub fn same_marker(&self, other: &Self) -> bool {
+        self.marker == other.marker
+    }
 }
 
 /// Metadata for a group.
@@ -630,8 +788,27 @@ impl std::fmt::Display for SetMemberCertificateError {
 impl GroupInfo {
     /// ADR-0064 (Guard A): whether this node currently refuses
     /// membership-gated routes for the group because authenticated fork
-    /// evidence is outstanding. Slice-1 scope: only ever true on
-    /// owner-axis groups.
+    /// evidence is outstanding. ADR-0066 §2: true for ordinary groups too
+    /// (the marker then carries `no_anchor`).
+    /// ADR-0067: this group's lifecycle epoch token, derived from the live
+    /// record.
+    ///
+    /// Capture this at an authorization check and re-validate it inside the
+    /// critical section that performs the irreversible act — see
+    /// [`LifecycleEpochToken`] for why it is derived rather than counted.
+    /// Cheap: two `u64`s and (only when quarantined) two small `String`
+    /// clones, with the forensic snapshot deliberately not copied.
+    #[must_use]
+    pub fn lifecycle_epoch_token(&self) -> LifecycleEpochToken {
+        LifecycleEpochToken {
+            state_revision: self.state_revision,
+            marker: self
+                .fork_quarantine
+                .as_ref()
+                .map(ForkQuarantineIdentity::from_marker),
+        }
+    }
+
     #[must_use]
     pub fn is_fork_quarantined(&self) -> bool {
         self.fork_quarantine.is_some()
@@ -988,8 +1165,11 @@ impl GroupInfo {
     /// [`Self::seal_commit_with_owner_certs`] wrapper that ~22 routine
     /// mutation sites (rename, policy, add/ban/promote, …) seal through.
     /// All three conditions must hold:
-    /// - the group has an owner axis (non-owner-axis groups never carry
-    ///   a marker in this slice);
+    /// - the group has an owner axis, AND the marker itself does not claim
+    ///   `no_anchor` (ADR-0066 §2: the policy test and the marker's own
+    ///   claim are separate facts, and the marker's claim is
+    ///   authoritative — see
+    ///   [`ForkQuarantine::owner_anchored_clear_permitted`]);
     /// - the local install holds the OWNER USER KEY, fenced exactly like
     ///   the #469 A1b invite fence (`owner_key_unavailable`): the key is
     ///   loaded AND its derived user id EQUALS the policy owner — an
@@ -1011,7 +1191,7 @@ impl GroupInfo {
         let owner_key_held = owner_user_key.is_some_and(|kp| {
             crate::identity::UserId::from_public_key(kp.public_key()) == *owner_id
         });
-        if !owner_key_held || self.state_revision <= marker.revision {
+        if !owner_key_held || !marker.owner_anchored_clear_permitted(self.state_revision) {
             return;
         }
         self.fork_quarantine = None;

@@ -27,8 +27,9 @@ use crate::error::HistoryResult;
 
 pub use record::{Direction, HistoryRecord, MessageClass, Provenance, Scope};
 pub use store::{
-    HistoryQuery, HistoryStats, InsertOutcome, RetentionPolicy, ScopeLimit, ScopeSummary, Store,
-    StoredRecord, MAX_QUERY_LIMIT,
+    HistoryQuery, HistoryStats, InsertOutcome, PinnedScopes, RetainOutcome, RetentionPolicy,
+    ScopeLimit, ScopeSummary, Store, StoredRecord, HISTORY_QUARANTINE_PIN_ABSOLUTE_DIVISOR,
+    HISTORY_QUARANTINE_PIN_BASE_DIVISOR, HISTORY_QUARANTINE_PIN_MULTIPLIER, MAX_QUERY_LIMIT,
 };
 pub use writer::{HistoryCounters, WriterHandle, WRITER_QUEUE_CAPACITY};
 
@@ -102,11 +103,67 @@ impl HistoryConfig {
     }
 }
 
+/// ADR-0068 D1: where the retention reaper learns which scopes are
+/// fork-quarantined.
+///
+/// The history module deliberately knows nothing about named groups, so the
+/// marker lookup stays in the daemon (one resolver, both spellings) and is
+/// injected through [`QuarantinePinSlot`]. Called once per retention pass,
+/// BEFORE the blocking `retain`, so an implementation may take async locks —
+/// but it must not hold one across the return.
+pub trait QuarantinePins: Send + Sync + 'static {
+    /// Canonical scope strings (`group:<id>`) that currently hold a live
+    /// fork-quarantine marker, in both spellings where a group's map key
+    /// differs from its stable id. An empty vector pins nothing.
+    fn pinned_scopes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + '_>>;
+}
+
+/// Set-once slot holding the [`QuarantinePins`] source for this store's
+/// reaper.
+///
+/// Set-once because the daemon installs exactly one source, after `AppState`
+/// exists (the store is created by the `Agent`, which `AppState` owns). Never
+/// set ⇒ nothing is pinned and retention behaves exactly as it did before
+/// ADR-0068, which is the library-embedding contract: an embedder has no
+/// marker to honour.
+#[derive(Default)]
+pub struct QuarantinePinSlot(std::sync::OnceLock<Arc<dyn QuarantinePins>>);
+
+impl std::fmt::Debug for QuarantinePinSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuarantinePinSlot")
+            .field("installed", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+impl QuarantinePinSlot {
+    /// Install the pin source. Returns `false` if one was already installed
+    /// (the existing source is kept).
+    pub fn install(&self, pins: Arc<dyn QuarantinePins>) -> bool {
+        self.0.set(pins).is_ok()
+    }
+
+    /// The pinned scopes for the pass about to run, or none when no source is
+    /// installed.
+    pub async fn pinned(&self) -> store::PinnedScopes {
+        match self.0.get() {
+            Some(pins) => store::PinnedScopes::from_canonical(pins.pinned_scopes().await),
+            None => store::PinnedScopes::none(),
+        }
+    }
+}
+
 /// Cheap-to-clone handle producers and readers hold.
 #[derive(Clone, Debug)]
 pub struct HistoryHandle {
     writer: WriterHandle,
     store: Arc<Store>,
+    /// ADR-0068 D1: shared with the reaper, so the daemon can install the
+    /// pin source through any handle after `AppState` is built.
+    quarantine_pins: Arc<QuarantinePinSlot>,
 }
 
 impl HistoryHandle {
@@ -135,6 +192,12 @@ impl HistoryHandle {
     pub fn counters(&self) -> Arc<HistoryCounters> {
         self.writer.counters()
     }
+
+    /// ADR-0068 D1: install the fork-quarantine pin source the reaper
+    /// consults. Returns `false` if one is already installed.
+    pub fn install_quarantine_pins(&self, pins: Arc<dyn QuarantinePins>) -> bool {
+        self.quarantine_pins.install(pins)
+    }
 }
 
 /// Owns the store, the writer thread, and the reaper task.
@@ -158,15 +221,18 @@ impl HistoryService {
             .unwrap_or_else(|| data_dir.join("history.db"));
         let store = Arc::new(Store::open(&db_path)?);
         let writer = writer::Writer::spawn(Arc::clone(&store));
+        let quarantine_pins = Arc::new(QuarantinePinSlot::default());
         let handle = HistoryHandle {
             writer: writer.handle(),
             store: Arc::clone(&store),
+            quarantine_pins: Arc::clone(&quarantine_pins),
         };
         let reaper = reaper::spawn(
             store,
             config.retention_policy(),
             handle.counters(),
             HISTORY_REAPER_INTERVAL_SECS,
+            quarantine_pins,
         );
         Ok(Self {
             handle,

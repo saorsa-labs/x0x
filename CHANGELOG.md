@@ -48,6 +48,592 @@ All notable changes to this project will be documented in this file.
   the default policy the only signal the budget is being exceeded at all; it
   is a lower bound, not a shed-count forecast. Also adds
   `egress_budget.leaf_egress_burst_bytes` and `max_serialized_frame_bytes`.
+### Changed
+
+- **A fork-quarantined group's history is no longer evicted by the retention
+  reaper, and inbound peer task-CRDT deltas for it are held instead of applied
+  (ADR-0068, D1 and D2; #732).** Both paths sat outside ADR-0066's §1 census, so
+  neither was a regression of a row — they were gaps in the enumeration itself,
+  found by cross-model review. Closes runbook known gaps (b) and (c).
+  - **Retention (D1).** `src/history/reaper.rs` ran ADR-0023 §6 age and byte
+    eviction against every scope unconditionally, so a quarantined group's
+    forensic record could be destroyed — and a flooder could *drive* that
+    destruction by raising byte pressure, which is the same deletion slice 4
+    already refuses at the explicit purge (row 14). The reaper now skips rows
+    whose `group:<id>` scope holds a live marker, under **both spellings**
+    (derived live from `named_groups` through the one resolver; no schema
+    change — `history.db` stays at v4), bounded by a per-group ceiling
+    `min(4 × base, max_bytes/16)` where `base` is the configured per-scope limit
+    or `max_bytes/64`, i.e. **64 MiB at the 1 GiB default**. Beyond the ceiling
+    the oldest rows **inside that group only** are evicted and counted in
+    `history_quarantine_pinned_evictions`;
+    `history_quarantine_pinned_scopes` reports how many scopes are pinned.
+    Worst-case disk `max_bytes × (1 + G/16)`, where `G` is the number of groups
+    this node has joined that are simultaneously forked — a flooder can inflate
+    rows (bounded by the ceiling) but cannot inflate `G`. On clear the scope
+    returns to normal retention on the next pass. Both counters are on
+    `GET /diagnostics/history`. **Residual:** that bound is payload-measured
+    while the whole-database phase measures the SQLite *file*, whose footprint is
+    ~4× the payload here (the FTS5 projection), so healthy-history displacement
+    under global saturation reaches 100 % at about `G≈4–5`, not 16 — watch
+    `history_quarantine_pinned_scopes` and raise `max_bytes` past 4. A global
+    pinned cap (total pinned ≤ `max_bytes/4`, evicting oldest pinned across
+    groups) is the recommended follow-up and needs its own ADR, since it trades
+    away "a flooder can burn only its own group's ceiling".
+  - **Task lists (D2).** Row 20 refused *local* task mutations while a group was
+    quarantined, but deltas from peers still merged — admitted by the
+    `authorized_agents` set derived from **the contested roster itself** — so a
+    peer seated by the disputed roster could keep claiming and completing, and
+    move the CRDT's winner, while the local operator was refused. Inbound deltas
+    for a quarantined group's list are now **held in arrival order** (1024
+    deltas / 1 MiB per list; oldest dropped and counted) with the CRDT left
+    byte-identical from the first delta that observes the marker (the unpinned live
+    path leaves an accepted residual of one already-admitted delta per listener —
+    see below), and applied in order once the marker is gone. Reads keep
+    serving the frozen state with the existing `fork_quarantined` annotation.
+    The buffer is process-local: a restart converges by anti-entropy instead.
+    Group **metadata** ingest (row 24) is untouched, so the clearing commit still
+    arrives. Per-group counters `task_deltas_quarantine_buffered`,
+    `task_deltas_quarantine_dropped` and `task_deltas_quarantine_applied` are on
+    `GET /diagnostics/groups`. A manual clear drains immediately; every other
+    clear path is picked up by the listener within 5 s. The drain re-checks the
+    ADR-0067 token (marker half) in the same critical section as the merge, so a
+    marker re-installing mid-drain abandons it with the deltas still buffered in
+    order, and the admission decision is taken under the list write lock, so no
+    other task-list writer can interleave between deciding and merging — though the
+    gate's roster read is released before the verdict, which is the one-delta
+    residual named below. A single delta larger
+    than 1 MiB is dropped rather than held, so the per-list bound is the stated
+    one and not the transport's 4 MiB frame cap.
+- **Three task-sync defects in that quarantine hold, found by an independent
+  third-model audit (GPT-6 Astra via Codex CLI) of the merged work; #732.** All
+  three are fixes that make the code match ADR-0068 D2, which is unchanged.
+  - **The gate is now installed before replication starts (finding 3).**
+    `Agent::{create,join}_task_list_persistent` start the delta listener before
+    they return a handle, and the daemon applied group authorization and the D2
+    gate to that returned handle — so on a restart with a quarantined group a
+    peer delta arriving during list restoration merged **and persisted** into a
+    list the marker says is frozen. The named-group binding (live authorized
+    writers + the gate) is now gathered by `tasks.rs::group_task_list_binding`
+    and handed to new `create_task_list_persistent_bound` /
+    `join_task_list_persistent_bound` constructors, which install it before the
+    listener exists. Both paths that produce a live handle — subscription
+    rehydration and `POST /task-lists` — use them. The authorization read also
+    goes through `server::resolve_group_entry_locked` now, so an **alias-keyed**
+    group's list is authorized and gated instead of silently getting neither
+    (the previous single-spelling `named_groups.get()` returned early, before the
+    gate install).
+  - **The drain re-authorizes against the roster the clearing commit left behind
+    (finding 4).** `authorized_agents` was snapshotted at create/rehydration, so
+    buffered deltas from a member the *clearing* commit removed were merged
+    against the contested roster. `TaskIngestGate` gains `with_pinned_roster`;
+    `drain_quarantine_buffer` refreshes the set from the live roster inside the
+    same critical section as the merge (before the ADR-0067 re-check, so that
+    re-check is still the last thing before the first merge) and skips entries
+    whose writer the refreshed roster no longer seats, counting them in
+    `task_deltas_quarantine_dropped` with the reason logged. Cross-model review of
+    that fix found the refresh still racy — the gate releases the roster lock
+    before the later awaits and `same_marker` ignores `state_revision`, so a
+    commit landing in that window was accepted — so the member set now travels
+    with the token it was derived at (`crdt::AuthorizedRoster`) — and, after a second
+    review round, the refresh and the merge now happen under **one pinned roster
+    read**: `crdt::TaskIngestGate::with_pinned_roster` takes the `named_groups`
+    read guard, derives set and token from it, and the drain installs, filters and
+    merges synchronously while that guard is held, so a roster writer cannot commit
+    mid-drain (it waits one bounded batch: ≤ 1024 merges, no I/O, no persistence).
+    That replaced a derive-release-compare-retry design which closed the window
+    only probabilistically and could be starved indefinitely by roster revision
+    churn — with admission coupled to the buffer that would have frozen the list —
+    so the retry budget is gone. A marker live at the pinned read abandons the
+    drain with the buffer intact. A clear that finds an EMPTY buffer refreshes the
+    cached roster too. **Residuals:** the two owner-anchored clears
+    (`named_groups.rs::try_adopt_member_added_across_gap`,
+    `apply_named_group_metadata_event_inner_serialized`) do not run the resume
+    hook, so after such a clear a removed member's NEW live deltas keep being
+    admitted until the next drain, manual clear or restart (their buffered deltas
+    are still re-authorized; the follow-up is to propagate a durable-clear
+    notification to those callers and run the resume hook after their locks
+    release, replay paths included); and a group with no resolvable record gets a
+    gate but
+    keeps **open** live admission, because installing an empty set on a failed
+    lookup would discard a seated member's work.
+  - **Incoming traffic can no longer starve the drain (finding 5).** The 5 s
+    drain poll was a fresh `sleep` created inside `select!` on every iteration,
+    so every received message cancelled it: with messages arriving less than 5 s
+    apart the buffer never drained, and post-clear deltas applied ahead of older
+    held ones. The deadline is now a pinned sleep that survives receives and is
+    reset only after it fires, and an inbound delta drains the buffer **before**
+    it is admitted — so under traffic the catch-up happens on the next delta
+    rather than on a timer, and arrival order is preserved. **Accepted residual:**
+    the live admission path is deliberately not roster-pinned (that would put a
+    roster read on every inbound delta), so a delta already admitted when a marker
+    installs still merges — at most **one per task-list listener**, after which
+    every delta observes the marker and is held. The freeze is therefore
+    "byte-identical from the first delta that observes the marker". The runbook's
+    "picked up within 5 s" is true again, including under a flood of undecodable
+    payloads, which never reach admission. Cross-model review found ordering still
+    breakable when a drain attempt was **abandoned** — the clear could land between
+    the attempt and the admission check, letting the newer delta merge past the
+    pending ones — so admission is now coupled to the buffer: a delta is applied
+    only when the buffer is empty, otherwise it queues behind what is pending
+    (same bounds, same drop counter). **Consequence:** a buffer that cannot be
+    drained at all (a group record that never returns) holds newer deltas behind
+    it; bounded, counted, and cleared by a restart.
+- **Outbound sends and secure-crypto routes now re-check the fork-quarantine
+  marker immediately before their effect, not only at request start (ADR-0066
+  §1 rows 1/2/4/6 and §4, slice 9; ADR-0067; #732).** These four paths were
+  gated at request start, so they were admitted only when the group carried no
+  marker at that instant — but between that gate and the effect they await on
+  the rider-token mutex, a revocation-record read, delegation verification, the
+  TreeKEM per-group mutex and a pubsub listener spawn. A fork observation
+  landing at any of those suspension points would have exported contested state
+  on an authorization that was no longer true. All four now capture the
+  ADR-0067 lifecycle epoch token under the same read guard as the gate and
+  re-check its marker half at the last point before the effect with no
+  suspension in between, refusing with the existing 409 `fork_quarantined` §5
+  body:
+  - `POST /groups/:id/send` (row 1) re-checks before the gossip publish. No
+    message reaches the wire, the local hot-tail cache is not written and the
+    direct-DM fan-out never starts.
+  - TreeKEM encrypt (row 2) re-checks while holding the same group mutex, with
+    no await before `encrypt_message`, so **no send-ratchet generation is
+    burned** on a refusal and the advanced-state snapshot persist is never
+    reached.
+  - `POST /groups/:id/secure/encrypt` (row 4) re-checks before the durable
+    history row and the returned ciphertext. The GSS plane has no ratchet, so
+    there is no generation to burn and none is.
+  - `POST /groups/:id/secure/reseal` (row 6) re-checks before the response, so
+    the group's shared secret sealed to a member's ML-KEM key never leaves the
+    node.
+
+  A marker CLEARED mid-operation does not refuse, and cannot occur: the
+  operation was admitted only because the gate saw no marker. Only the marker
+  half of the token is compared, so a concurrent legitimate roster advance does
+  not refuse a send. The residual window between the re-check and the bytes
+  reaching the wire is one message wide and irreducible without a send-path
+  critical section ADR-0066 does not define; it is documented as such in
+  `docs/runbooks/fork-quarantine.md`. This empties the ADR-0067 deferral
+  ledger: `PENDING_RECHECK` is now asserted empty alongside `OPEN_ROWS`, so
+  ADR-0066 §1 and §4 are both discharged across the censused surface.
+- **The manual fork-quarantine clear now accepts the group's stable id as well
+  as its roster map key, and one shared resolver owns the two-spelling rule
+  (#732).** `named_groups` is keyed by whichever alias a daemon learned a group
+  under, while every id an operator can actually see — a history scope, a
+  WS/SSE `fork_quarantine` annotation, a delegation envelope — is the STABLE
+  id. `POST /groups/:id/quarantine/clear` (CLI `x0x groups quarantine clear`)
+  looked the group up under one spelling only, so for an alias-keyed group it
+  answered 404 to exactly the id its own refusal messages had taught the
+  operator to use: the single exit ADR-0066 §2 promises an ordinary
+  (`no_anchor`) group was unreachable. Both spellings now clear, with every
+  precondition (owner-key path (a) vs `force` + `reason` path (b)), the audit
+  log and the `fork_quarantine_manual_clears` counter unchanged; an unknown id
+  is still 404. Cross-model review had found the same single-spelling defect
+  independently in slices 3, 4 and 6, so the per-slice copies of the rule are
+  replaced by the one `resolve_group_entry_locked` resolver (history scope
+  markers and the purge gate, WS/SSE annotations, the public-group bootstrap
+  install check, the TreeKEM protector, the delegation gates), and a
+  source-scanning fixture fails the build if a quarantine-relevant lookup
+  spells the rule out for itself again without a waiver naming why.
+  Defence in depth in the same change: `treekem_group_encrypt`/`_decrypt` held
+  BOTH of their pre-crypto gates (ADR-0038 restore re-verification and the
+  ADR-0066 §3 quarantine gate) inside one single-spelling lookup, so a miss
+  skipped both and let the ratchet advance — the only arm in that family that
+  failed open rather than answering 404. This was not a known remote bypass:
+  their only callers 404 an unresolvable spelling at route level first and run
+  both gates on the map-key spelling under the same lock hold, leaving the
+  fail-open reachable only as a TOCTOU (the roster re-keyed between the
+  route's lock release and the helper's re-acquire while the live TreeKEM map
+  kept the old spelling). Both helpers now resolve both spellings, which also
+  closes that race.
+- **Fork quarantine operator runbook restructured (ADR-0066 slice 8; #732).** The
+  per-slice patchwork in `docs/runbooks/fork-quarantine.md` (accumulated across
+  slices 1–7) is replaced by a single coherent operator runbook. Coverage: what
+  fork quarantine is; how a marker installs (install path, `no_anchor`, ADR-0067
+  epoch token); the full 26-surface behaviour table with §5 refusal body and both
+  annotation shapes (single-group and multi-scope); diagnose → decide → clear
+  procedure; upgrade notes; and six known gaps with file:line
+  citations (send-path §4 re-check deferred rows 1/2/4/6, history reaper ignores
+  quarantine, inbound task-CRDT deltas apply ungated, the alias-key clear
+  limitation and the three pending marker resolvers — both closed by the
+  resolver-unification entry above — and the fault-injection test parallel flake
+  under plain `cargo test`). All 26 ADR-0066 §1 rows have landed
+  (`OPEN_ROWS == &[]`); rows 1, 2, 4 and 6 carried `PENDING_RECHECK` for their §4
+  re-check before effect until slice 9 landed it (known gap (a) is now closed). **FALSE statement removed:** old runbook intro claimed
+  slice 7 (row 22, lifecycle epoch token) had not yet shipped — it has.
+
+- **A fork-quarantine marker that lands mid-operation now aborts the operation
+  instead of being overwritten by it (ADR-0066 §4, slice 7; ADR-0067; #732).**
+  Every gate slices 1–6 added checks the marker at the START of an operation.
+  Between that check and the persist, a marker can be installed, cleared, or
+  advanced to a new evidence revision — and the two roster-persisting paths
+  covered here write a WHOLE `GroupInfo` captured earlier, so a marker
+  arriving in that window was not merely ignored, it was **erased**, silently
+  ending containment. Both paths now re-derive the group's lifecycle epoch
+  token inside the same critical section that performs the mutation and fail
+  closed on a mismatch, before the irreversible step, leaving state
+  byte-identical:
+  - the invite-join roster install re-checks across the two fsyncs that sit
+    between its decision and its insert, and answers 409 `fork_quarantined`
+    (§5 body) rather than seating over a marker;
+  - the TreeKEM roster+snapshot atomic persist re-checks the marker under the
+    persistence lock it already holds, before any journal or live-file write.
+    The check is deliberately asymmetric — it fires only when the LIVE record
+    already carries a marker, so the marker remains settable (an incoming
+    record that ADDS one is the install path itself, the mirror of ADR-0066
+    §2's rule that gating the retry-rollback would make a marker unclearable).
+- **Home provisioning and reseal no longer erase a marker installed mid-seal
+  (found in cross-model security review of #748).** `stamp_and_seal_home` and
+  `reseal_home` clone the Home record under a read guard, DROP that guard,
+  await `seal_commit_owner_certified`, then write the WHOLE record back. A
+  forked sibling device landing authenticated fork evidence on the Home group
+  inside that window had its marker **erased** by the write — containment
+  dropped silently, on the group where the owner axis matters most. Both sites
+  now capture the lifecycle epoch token in the same read guard as the clone and
+  re-check it under the write guard before the insert; on a mismatch the seal
+  is refused, nothing is written and **the marker survives**. Provisioning is
+  retried on the next pass, not looped. The comparison is `MarkerOnly` (a seal
+  bumps `state_revision` by construction) and refuses in BOTH directions —
+  erasure and resurrection — because unlike the TreeKEM persist this path never
+  installs a marker, so there is no install to mistake a new marker for.
+- **Encrypted (GSS) KvStore access fails closed under fork quarantine
+  (ADR-0066 §1 rows 10–12, the bind-time gap; #732).** `GssKvSecureContext`
+  was the one cached KV authorization context blind to the marker —
+  `PublicGroupKvContext` folds it into `valid` and the TreeKEM context clears
+  its roster, but the GSS snapshot had no notion of quarantine and neither did
+  the refresh validator that feeds it. A marker installed AFTER an encrypted
+  store bound was therefore invisible to work already in flight, and the
+  cached roster kept authorizing writers on an authorization taken before the
+  fork was observed. Now a refresh that sees the marker suspends the context
+  (secret dropped, roster emptied) so sealing, opening and membership all fail
+  closed, and `validate_gss_store_group` refuses with the §5 message naming
+  the manual-clear remedy. **This is recoverable, unlike a withdrawal:** the
+  next refresh after `POST /groups/:id/quarantine/clear` re-arms the context.
+- The lifecycle epoch token is `(state_revision, marker_identity)`, **derived
+  on demand** from the live record rather than counted — no new field on
+  `GroupInfo`, so no new serde surface and no new #470 full-equality
+  participant. ADR-0067 supersedes ADR-0066 §4's token composition and R4 for
+  this reason: §4 asked for a counter "on the group entry" while R4 forbade
+  exactly that participant, and a census found three marker writers no
+  process-local counter reaches (the on-disk recovery install and the two
+  clears that bypass the persistence lock), whose failure mode would have been
+  **fail-open**.
+- Both-spellings group resolution is now one shared helper
+  (`resolve_group_entry_locked`): `delegations::fork_quarantine_marker`
+  delegates to it, and the TreeKEM store protector's `current_info` — which
+  used a bare single-spelling `get` — resolves through it too, so a protector
+  bound under one alias no longer reports a live group as unavailable.
+- **Group task-list mutations now REFUSE, and a contested group's bootstrap
+  snapshot is no longer published, while the group is fork-quarantined
+  (ADR-0066 §3c, rows 20 and 21, slice 5; #732) — an availability change,
+  deliberate.** Two effects an operator will notice. First, a task list whose
+  id is group-scoped (`x0x.group.<group_id>.symphony.<list_id>`) stops
+  accepting writes while this node holds a marker for that group: `POST
+  /task-lists`, `POST /task-lists/:id/tasks` and `PATCH
+  /task-lists/:id/tasks/:tid` return the 409 `fork_quarantined` body (§5) on
+  the **first** attempt after the marker installs, with no warn-only window —
+  ADR-0066 R5 rejected one for this row specifically, on the grounds that
+  "recoverable" describes the cleanup of a CRDT task mutation and not the
+  exposure: a claim accepted on a contested roster is still an act taken under
+  disputed membership. The refusal lands **before** anything happens: before
+  the task-list handle is resolved, before the fence token is parsed, before
+  any CRDT mutation, before the `task-lists/<id>.bin` snapshot write and before
+  any delta publish, so a refused request leaves the CRDT and the on-disk state
+  byte-identical and publishes nothing. A refused `POST /task-lists` leaves no
+  handle, no durable subscription registration and no sync listener. Reads are
+  **not** refused: `GET /task-lists` and `GET /task-lists/:id/tasks` keep
+  serving and gain `fork_quarantined: true` plus a `fork_quarantine` object
+  (`revision`, `observed_at_ms`, `no_anchor`, `clear_with`) — the same shape the
+  refusal body and the annotated WS envelopes use — because losing the read
+  would remove the only view of what the contested roster has been doing. Both
+  keys are **absent entirely**, never `null` and never `false`, when there is no
+  marker, so unquarantined responses are byte-identical. Task lists that are not
+  group-scoped are untouched, and so are group-scoped lists for any other group.
+  Second, the signed-public **bootstrap outbox no longer publishes a quarantined
+  group's snapshot** — the one enumerated path that *exports* contested state,
+  since a recipient installs the snapshot as a whole roster/state frontier.
+  Suppression is non-destructive and needs no operator action beyond the clear:
+  the obligation and its retry schedule are left untouched (reconciliation
+  retains it rather than refreshing it from the contested frontier), so delivery
+  resumes by itself on the first worker pass after `POST
+  /groups/:id/quarantine/clear` — the poll interval, with no backoff to wait out.
+  Dropping the debt instead would strand a member on the roster that nobody
+  remembers to bootstrap — permanently, because a `no_anchor` marker never
+  auto-clears. **One quarantined group does not delay any other group's
+  bootstrap:** a pass sends at most one obligation and picks the oldest due one,
+  so quarantined groups are excluded when that choice is *made* rather than
+  refused after it — gating after the choice would make a contested group the
+  permanent head of the line and stall the whole outbox for as long as the marker
+  stood. The periodic worker and the REST nudge a member-add fires funnel through
+  one gate, so no background job can publish a contested snapshot; the withheld
+  publication has no HTTP response to carry the §5 message, so it logs that
+  sentence at WARN and records one `fork_quarantine_refusals` increment
+  **deduplicated per (group, marker revision, observation time)** — a polling
+  worker counting every poll would turn that fleet-health signal into a measure
+  of uptime, while keying on the revision alone would hide a re-quarantine after
+  a clear. An obligation whose stored
+  payload carries a marker at all is now refused outright at write and at
+  startup load, so per-node containment state cannot reach the wire even if the
+  outbound stripping list is later edited. Every marker lookup this slice adds
+  resolves **both spellings** of a group id — the roster map key and
+  `stable_group_id()` — through the one shared resolver, because a task-list id
+  carries whichever spelling its creator used and a bootstrap obligation always
+  carries the stable id, while `named_groups` is keyed by whichever alias this
+  daemon learned the group under; a single-spelling lookup would admit mutations
+  and publish snapshots for exactly the contested groups whose two names differ.
+
+  **Known gap, recorded rather than silently closed (found in cross-model review
+  of this slice).** Row 20 gates the LOCAL REST mutations. Inbound task-CRDT
+  deltas from peers still apply ungated: admission is
+  `TaskList::is_authorized_content_writer` (`src/crdt/task_list.rs:214`), which
+  tests the `authorized_agents` set that `apply_group_authorization`
+  (`src/server/routes/tasks.rs:213`) derived from the group's active members —
+  the contested roster itself. So while a quarantined group's own agent is
+  refused locally, a peer's claim signed by a member of the disputed roster still
+  merges and can move the deterministic winner. ADR-0066 §1 enumerates no
+  task-ingest row (it is not row 20, and row 24's deliberate "keep ungated" is
+  about metadata/state-commit apply, not task content), so closing it needs a
+  superseding decision about whether it is refuse-class or, like history ingest
+  under R3, tag-and-retain. Nothing here changes that behaviour.
+
+- **Durable history under fork quarantine: the purge is REFUSED, every read
+  keeps serving and says so (ADR-0066 §3a / R3, slice 4; #732).** While this
+  node holds a fork-quarantine marker for a group,
+  `DELETE /history?scope=group:<ID>` answers the 409 `fork_quarantined` body
+  (§5 shape, from the one shared refusal helper) **before it deletes
+  anything**, so a refused purge leaves the store unchanged. A purge is the
+  irreversible destruction of the ADR-0023 durable record — the primary
+  post-hoc artefact for a fork — and nobody, operator or attacker, should be
+  able to delete the evidence mid-incident. Reads are the exact opposite and
+  are **never** refused, because containment must not blind the operator:
+  `GET /history`, `/history/message/:msg_id`, `/history/search`,
+  `/history/scopes`, `/history/stats`, `GET /diagnostics/history` and
+  `GET /groups/:id/messages` keep serving the same rows and add
+  `"fork_quarantined": true` plus `"fork_quarantine": { "clear_with": …,
+  "scopes": [{ "scope", "revision", "observed_at_ms", "no_anchor" }] }` to the
+  envelope. The per-scope object mirrors the §5 refusal body; the list exists
+  because these surfaces are not single-group — a cross-scope search, scope
+  enumeration and the two node-wide surfaces can each have several quarantined
+  groups in view. **Both keys are ABSENT — not `false`, not `null` — when
+  nothing in view is quarantined, so a client that ignores ADR-0066 sees a
+  byte-identical body.** Ingest is **tag-and-retain, never refused** (R3): rows
+  arriving while the marker is set are stored and served like any other, and a
+  row of a quarantined group whose `seen_at_ms` is at or after the marker's
+  `observed_at_ms` additionally carries `"fork_quarantined_at_ingest": true`,
+  so the incident window is distinguishable from the group's pre-fork traffic.
+  That tag is **derived from the marker, not persisted**: no `HistoryRecord`
+  field and no SQLite schema bump, so old rows need no migration and an older
+  binary still opens the same `history.db` after a rollback — the trade is that
+  a manual clear (the operator asserting the fork is resolved) drops the label
+  while keeping every row. Persisting it is a superseding-ADR decision.
+  `GET /groups/:id/messages` — the one gap slice 2's coverage fixture found in
+  the ADR's own §1 map — is folded in here as part of row 13 and annotated at
+  the envelope only (its payload is signed messages, not store rows, so it
+  carries no per-row ingest tag). **The marker is found under either spelling
+  of the group id** (cross-model review r1): history rows are scoped by the
+  group's *stable* id while the roster map — and therefore the marker — is
+  keyed by whichever alias this daemon learned the group under, so the purge
+  gate and every annotation resolve direct-key-then-stable-id, the way the
+  metadata apply path does. A single-spelling lookup would have let
+  `DELETE /history?scope=group:<stable id>` delete an alias-keyed quarantined
+  group's forensic record — the exact failure row 14 exists to prevent. The
+  refusal names the map key, because that is the id the manual clear route
+  accepts, and `/history/stats` + `/diagnostics/history` list both spellings so
+  an operator can match the scope their rows carry as well as the id they must
+  clear. Rows closed: **13, 14, 26**. Docs: `docs/api-reference.md`,
+  `docs/runbooks/fork-quarantine.md`.
+
+- **WebSocket group frames are annotated while a group is fork-quarantined
+  (ADR-0066 §3d, row 25, slice 6; #732) — labelled, never refused.** The WS
+  plane consulted the marker nowhere (`grep -c quarantin src/server/ws.rs` →
+  0), so a client watching a contested group saw its traffic exactly as it
+  saw uncontested traffic. It is the live mirror of the annotated history
+  reads and is therefore annotate-class: nothing is refused, no frame is
+  dropped and no subscription is cut — an operator watching a live incident
+  must not lose the stream at the moment it matters. Two frame classes now
+  carry `"fork_quarantined": true` plus a `fork_quarantine` object
+  (`clear_with` and a one-entry `scopes` array of `scope`, `revision`,
+  `observed_at_ms`, `no_anchor`): ADR-0040 `mention` frames on the group's
+  topic channel, and ADR-0023 `subscribe` backfill frames for a group topic,
+  including the `live` boundary frame that closes the backfill. The shape is
+  deliberately the one the 409 `fork_quarantined` body and the annotated
+  `/history` envelopes use, so a client parses one dialect; the machine code
+  rides the annotation because the WS `error` frame has only a `message`
+  field with nowhere to put it. **Both keys are absent entirely — never
+  `null`, never `false` — for an unquarantined group**, so unaffected
+  groups, every non-group topic and the `/ws/direct` DM backfill stay
+  byte-identical. The marker is read when each frame is emitted, not when
+  the subscription is created, so a session that subscribed before the
+  marker was installed starts annotating on its next frame and stops on the
+  next frame after a manual clear — no reconnect, and no per-subscription
+  cache to go stale. The per-frame live gossip forwarder takes no marker
+  lock at all: the lookup happens once per routed mention and once per
+  subscribed topic at backfill. A label on a `reason: "delegation"` mention
+  describes what was OBSERVED, not what was authorized — the grant itself is
+  refused independently (§3b). The marker lookup matches **both spellings** of
+  a group id — the map key and `stable_group_id()` — because WS frames always
+  name the stable id while `named_groups` is keyed by whichever alias this
+  daemon learned the group under; a single-spelling lookup would leave an
+  alias-keyed group streaming entirely unlabelled through its whole incident
+  while every other group looked correct.
+
+- **Delegations on a fork-quarantined group now REFUSE until the marker is
+  cleared (ADR-0066 §3b, slice 3; #732) — an availability change, deliberate.**
+  Delegation is an authority transfer, and a quarantined group's roster is
+  precisely what is in dispute, so minting authority from it or honouring
+  authority derived from it fails closed. `POST /groups/:id/delegate` returns
+  the 409 `fork_quarantined` body (§5) **before** anything irreversible
+  happens: no envelope is signed, no carrier row reaches durable history, the
+  effectiveness index is untouched and nothing is published to the group bus.
+  Already-issued delegations stop being honoured for that group: delegated
+  task-execute (a `POST /task-lists/:id/tasks/:tid` citing `delegation`)
+  refuses with the same body before the claim/complete mutation; send-as
+  authorization fails closed, so a peer's gossiped send-as message for the
+  group is dropped at ingest; and the delegation index and global delegation-id
+  registry refuse to be seeded from the group, including at daemon start where
+  `rebuild_global_delegation_registry` skips it entirely — an unregistered
+  grant cannot authorize. The **non-REST** paths (gossip ingest, boot rebuild)
+  have no response to carry the message, so they record the same single
+  `fork_quarantine_refusals` increment and log the §5 sentence rather than
+  dropping silently. Carrier history rows are still committed and retained
+  (R3: ingest is tag-and-retain) — refusing to honour a delegation never blanks
+  the forensic record. `GET /groups/:id/delegations` **keeps serving**, now
+  annotated with `fork_quarantined: true` and a `fork_quarantine` object in the
+  same shape the refusal carries: an operator auditing who holds authority
+  during a fork must not lose the list at the moment it matters. Refusals are
+  effective from the FIRST request after the marker installs (R5 — no
+  warn-only window, no grace); the only exit is
+  `POST /groups/:id/quarantine/clear` (CLI: `x0x groups quarantine clear <ID>`,
+  with `--force --reason "…"` for an ordinary `no_anchor` group), after which
+  the index re-derives from durable history and service resumes with no
+  re-issuance. Groups with no marker, and delegations for any other group, are
+  byte-for-byte unaffected. Runbook: `docs/runbooks/fork-quarantine.md` §1.
+
+- **Ordinary (non-owner-axis) groups now receive the fork-quarantine marker
+  (ADR-0066 §2, slice 2; #732) — a NEW availability failure mode with no
+  automatic exit.** ADR-0064 set the marker only for owner-axis groups, so for
+  ordinary groups — the majority population — the gated count was **0 of the 26
+  enumerated data-plane paths**: every route served both branches of an
+  authenticated fork, indefinitely, while ADR-0064's own text claimed
+  `quarantine_no_anchor` semantics for exactly that case. Authenticated
+  conflicting evidence on an ordinary group now installs a marker with
+  `no_anchor: true`, which makes rows 1–12 reachable for that population:
+  `POST /groups/:id/send`, TreeKEM encrypt/decrypt, the
+  `secure/encrypt|decrypt|reseal` family and the group KV/store gates refuse
+  with the 409 `fork_quarantined` body below, from the FIRST request after the
+  marker installs (R5 — no warn-only window). **A `no_anchor` marker is never
+  cleared by any commit, on any ancestry**: all three owner-anchored clear arms
+  (attestation-verified adoption, the mandate-carrying `MemberAdded`, and the
+  explicit owner seal) now share one predicate and decline it, so the only exit
+  is `POST /groups/:id/quarantine/clear` with `force: true` and a reason (CLI:
+  `x0x groups quarantine clear <ID> --force --reason "…"`). The retry-rollback
+  of a non-durable install is deliberately NOT gated on the flag — an undo of
+  an install is not a clear, and gating it would turn a transient persist
+  failure into an unclearable quarantine. ADR-0066 R2 also widens the evidence
+  path to ordinary groups formed without an invite, so "ordinary group" is one
+  population rather than two; for those the marker itself is the durable
+  evidence record. **Evidence authentication is unchanged** — only a
+  conflicting commit whose signature verifies and whose committer was an active
+  admin in the retained predecessor roster installs a marker, so an
+  unauthenticated or forged conflict still quarantines nothing.
+  **Operators: expect `fork_quarantine_set` to rise on the upgrade wave** for
+  groups that were already silently forked. Nothing is quarantined
+  retroactively (there is no startup scan), but the first authenticated
+  conflicting commit after the upgrade contains the group at once. Mixed-fleet
+  safe: `no_anchor` is `#[serde(default)]`, so a marker persisted before this
+  release decodes as the owner-axis marker it was. Docs:
+  `docs/runbooks/fork-quarantine.md` §5, `docs/api-reference.md`.
+
+- **BREAKING (one-time, for literal matchers): the 409 `fork_quarantined`
+  refusal now explains itself (ADR-0066 §5, slice 1; #732).** The stable
+  machine code moved from `error` to a new `reason` field, and `error` became a
+  human sentence naming the condition, why the operation was refused, and the
+  clearing path. The body also gains a `fork_quarantine` object with
+  `revision`, `observed_at_ms`, `no_anchor` and a machine-readable
+  `clear_with`. **HTTP 409 and `ok: false` are unchanged**; any out-of-tree
+  client matching the literal `error == "fork_quarantined"` must move to
+  `reason` — `error` is prose from now on and its wording is not a contract.
+  Why: ADR-0066 R5 removed the warn-only window on the condition that a user
+  always learns why an operation was refused. The whole user-visible payload
+  used to be the string `fork_quarantined`, which for a marker that never
+  auto-clears is a permanent, unexplained refusal. The sentence branches on
+  `no_anchor` so the remedy it names is the one that can actually succeed for
+  that group (an owner-axis marker also clears when the owner anchor advances;
+  a `no_anchor` marker only clears with `force` plus a reason).
+  `reject_fork_quarantined` remains the single refusal helper (§3e) and the
+  diagnostics contract is unchanged (one `fork_quarantine_refusals` increment
+  per refusal). Docs: `docs/api-reference.md` (Error handling),
+  `docs/runbooks/fork-quarantine.md` §1, `docs/trust-and-connectivity.md`,
+  `SKILL.md`.
+- **The `x0x` CLI now prints a response's `reason` alongside the message**, as
+  `<message> (HTTP <code>, reason: <reason>)`. Errors with no `reason` render
+  byte-identically to before, so this affects exactly the reason-bearing
+  responses — which today means the new 409 `fork_quarantined` above **and the
+  pre-existing 409 `recipient_not_active`** (ADR-0028 active-recipient group key
+  sealing), whose CLI output gains `, reason: recipient_not_active`. The change
+  is in the shared `error_from_body` path rather than per-command, so any future
+  `api_error_with_reason` response inherits it: a human reads the sentence, a
+  script matching CLI output keeps the stable code. Anything parsing the CLI's
+  error line positionally should match on the `reason:` key, not on trailing
+  text.
+
+### Fixed
+
+- **A retired KV store sync stops merging, and retirement can be drained
+  (#757).** The `KvStoreSync` listener and responder selected between
+  cancellation and the next message without `biased`, so after
+  `retire()`/`cancel_sync()` a queued delta was still merged — and its snapshot
+  written — about half the time; a merge admitted just before the cancel could
+  also start its snapshot write arbitrarily late. The listener (whole
+  iteration) and the responder's owner-announce arm now hold a per-sync
+  lifecycle lock across `cancel check -> merge / ownership update -> persist`,
+  never across a network await; all loop selects are cancel-first; and no
+  receive future is dropped mid-flight, so an opened TreeKEM record always
+  reaches its merge and persist. New `KvStoreSync::cancel_sync_and_drain` /
+  `KvStoreHandle::retire_and_drain` cancel and then take that lock once: on
+  return no background merge, ownership update or snapshot write is in flight
+  or can start (read-only state serves and the requester publish are outside
+  the fence).
+  - **Drains:** the cached-binding-mismatch arms of `open_bound_*_store`,
+    before the handle is unregistered — when the CACHED sync is GSS or public.
+    The choice follows the cached sync, not the requested plane: a TreeKEM ->
+    SignedPublic policy change keeps the topic, so any arm can find any sync.
+  - **Cannot drain (deadlock), still `retire()`:** a cached TreeKEM sync in any
+    mismatch arm (callers hold the group membership guard that the protector's
+    `open_record` / `merge_main_record` take inside a section); the
+    secure-refresh hooks (they run inside a section: listener holds lifecycle
+    -> hook takes `kv_stores`); `retire_group_kv_stores` and the registration
+    rollback (hold `kv_stores` / the membership guard).
+  - An owner announce is validated BEFORE the responder enters its section
+    (`KvStore::check_ownership_announce`), so a rejected or stale announce
+    never queues behind the listener's merge + snapshot write and cannot stall
+    the state requests behind it.
+  - **Residual (#760):** after a non-draining `retire()`, one already-admitted
+    section may still land its snapshot write, and can race a later re-open of
+    the same snapshot path.
+
+  This was the mechanism behind the intermittent Coverage Gate failure of
+  `legacy_import_unloaded_preview_ambiguity_and_receipt_retry_preserve_state`
+  (`Is a directory (os error 21)`).
+
+- **TreeKEM snapshot persist now resolves alias-keyed groups, so a stable-id
+  send no longer burns a ratchet generation (#732, runbook known gap (g)).**
+  `persist_treekem_snapshot_bound` — the post-crypto step of
+  `treekem_group_encrypt`/`_decrypt` and of both TreeKEM group-store protector
+  paths — looked the roster entry up under one spelling. `named_groups` is keyed
+  by whichever alias a daemon learned a group under, so in the same TOCTOU end
+  state the gates above were taught to handle (roster re-keyed to an alias while
+  the live `treekem_groups` entry still answers to the stable id) a CLEAN,
+  non-quarantined encrypt passed both gates, advanced the send ratchet, and then
+  failed its persist with a 500 `failed to persist secure group state`. That
+  burned a send generation whose ciphertext was discarded. **Availability only:**
+  a burned generation is never reissued, so there was no nonce reuse, and the
+  path self-healed as soon as the alias spelling or a reseal caught up; it was
+  also not deterministically inducible by a remote peer. The lookup now goes
+  through the same `resolve_group_entry_locked` resolver as the gates, so the
+  persisted envelope binds to the entry those gates resolved. The snapshot FILE
+  is still written under the caller's spelling — only the roster resolution
+  widened, so no persisted or wire format changed, and the ADR-0067 epoch
+  re-check in the atomic persist is untouched.
 
 ### CI
 

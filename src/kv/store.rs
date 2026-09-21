@@ -817,6 +817,21 @@ fn default_policy() -> AccessPolicy {
     AccessPolicy::Signed
 }
 
+/// What an ownership announce would do to a store — see
+/// [`KvStore::check_ownership_announce`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnershipAnnounceEffect {
+    /// A different owner is anchored: the conflict gets recorded (mutation).
+    Conflict {
+        /// The anchored owner.
+        anchored: AgentId,
+    },
+    /// Owner matches and the policy version is current or newer (mutation).
+    Refresh,
+    /// Owner matches but the policy version is older: nothing changes.
+    Stale,
+}
+
 impl KvStore {
     /// Create a new empty KvStore with the given access policy.
     /// Create a new empty KvStore owned by `owner` with the given access
@@ -1567,6 +1582,49 @@ impl KvStore {
         policy_version: u64,
         verified_sender: &AgentId,
     ) -> Result<()> {
+        match self.check_ownership_announce(
+            claimed_owner,
+            &policy,
+            policy_version,
+            verified_sender,
+        )? {
+            OwnershipAnnounceEffect::Conflict { anchored } => {
+                // Immutable owner: record the conflict for auditability and reject.
+                self.ownership_conflict = Some((anchored, claimed_owner));
+                self.version += 1;
+                Err(KvError::OwnershipConflict {
+                    anchored,
+                    claimed: claimed_owner,
+                })
+            }
+            OwnershipAnnounceEffect::Refresh => {
+                self.policy = policy;
+                self.policy_version = policy_version;
+                self.ownership_conflict = None;
+                self.version += 1;
+                Ok(())
+            }
+            OwnershipAnnounceEffect::Stale => Ok(()),
+        }
+    }
+
+    /// Read-only half of [`learn_ownership`](Self::learn_ownership): every
+    /// validation it performs, and what it WOULD do, without mutating. Lets
+    /// the sync responder reject or skip an announce without entering its
+    /// receive section (#757).
+    ///
+    /// # Errors
+    ///
+    /// The same rejections as `learn_ownership`, except an owner conflict,
+    /// which is reported as [`OwnershipAnnounceEffect::Conflict`] because
+    /// recording it is a mutation.
+    pub(crate) fn check_ownership_announce(
+        &self,
+        claimed_owner: AgentId,
+        policy: &AccessPolicy,
+        policy_version: u64,
+        verified_sender: &AgentId,
+    ) -> Result<OwnershipAnnounceEffect> {
         if *verified_sender != claimed_owner {
             return Err(KvError::OwnerTokenInvalid(
                 "ownership announcement sender does not match claimed owner".to_string(),
@@ -1581,13 +1639,8 @@ impl KvStore {
             ));
         };
         if existing != claimed_owner {
-            // Immutable owner: record the conflict for auditability and reject.
-            self.ownership_conflict = Some((existing, claimed_owner));
-            self.version += 1;
-            return Err(KvError::OwnershipConflict {
-                anchored: existing,
-                claimed: claimed_owner,
-            });
+            // Immutable owner: the caller records the conflict and rejects.
+            return Ok(OwnershipAnnounceEffect::Conflict { anchored: existing });
         }
         // Anchored owner matches. Apply the policy refresh when it is at least
         // as fresh as the last applied one. `>=` (not strict `>`) is required
@@ -1622,7 +1675,7 @@ impl KvStore {
             group_id: anchored_group,
         } = &self.policy
         {
-            match &policy {
+            match policy {
                 AccessPolicy::Encrypted {
                     group_id: announce_group,
                 } if announce_group == anchored_group => {}
@@ -1638,7 +1691,7 @@ impl KvStore {
             group_id: anchored_group,
         } = &self.policy
         {
-            match &policy {
+            match policy {
                 AccessPolicy::TreeKemEncrypted {
                     group_id: announce_group,
                 } if announce_group == anchored_group => {}
@@ -1651,12 +1704,10 @@ impl KvStore {
             }
         }
         if policy_version >= self.policy_version {
-            self.policy = policy;
-            self.policy_version = policy_version;
-            self.ownership_conflict = None;
-            self.version += 1;
+            Ok(OwnershipAnnounceEffect::Refresh)
+        } else {
+            Ok(OwnershipAnnounceEffect::Stale)
         }
-        Ok(())
     }
 
     /// Add an agent to the allowlist (owner-only operation).

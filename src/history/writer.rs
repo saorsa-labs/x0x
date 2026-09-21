@@ -49,6 +49,15 @@ pub struct HistoryCounters {
     pub abandoned_at_shutdown: AtomicU64,
     /// Rows evicted by the retention reaper.
     pub reaper_evicted_total: AtomicU64,
+    /// ADR-0068 D1: rows evicted from INSIDE a fork-quarantine-pinned scope
+    /// because that scope exceeded its own ceiling. Cumulative. A non-zero
+    /// value tells the operator a pinned group is at its ceiling and shedding
+    /// its oldest rows — no other scope ever pays for that overshoot.
+    pub quarantine_pinned_evictions: AtomicU64,
+    /// ADR-0068 D1: scopes pinned by the most recent retention pass (`G` in
+    /// the ADR's `max_bytes * (1 + G/16)` disk bound). A GAUGE overwritten
+    /// each pass, not a total.
+    pub quarantine_pinned_scopes: AtomicU64,
     /// Write-transaction failures (batch lost, logged).
     pub write_errors: AtomicU64,
 }

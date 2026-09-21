@@ -441,12 +441,22 @@ fn json_str(v: &str) -> serde_json::Value {
 ///
 /// Reads the `error` field from the body when present, falling back to
 /// `"unknown error"`, and appends the numeric status code.
+///
+/// ADR-0066 §5: when the body also carries a machine-readable `reason`
+/// (e.g. the 409 `fork_quarantined` refusal), print it alongside the
+/// human sentence. A CLI user needs the explanation and the remedy, and
+/// an operator scripting against the CLI needs the stable code — showing
+/// only one of the two loses information the response deliberately
+/// separated.
 fn error_from_body(status: reqwest::StatusCode, body: &serde_json::Value) -> anyhow::Error {
     let msg = body
         .get("error")
         .and_then(|e| e.as_str())
         .unwrap_or("unknown error");
-    anyhow::anyhow!("{} (HTTP {})", msg, status.as_u16())
+    match body.get("reason").and_then(|r| r.as_str()) {
+        Some(reason) => anyhow::anyhow!("{} (HTTP {}, reason: {})", msg, status.as_u16(), reason),
+        None => anyhow::anyhow!("{} (HTTP {})", msg, status.as_u16()),
+    }
 }
 
 /// Print a JSON value according to the output format.
@@ -509,6 +519,54 @@ pub fn print_error(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WHY (ADR-0066 §5, CLI surface): a CLI user's only view of a
+    /// refusal is this line. R5 removed the warn-only window on the
+    /// condition that the user learns why and what to do, so the printed
+    /// text must carry the prose sentence and its remedy — a raw status
+    /// code, or the bare machine code, leaves an operator with a
+    /// permanent unexplained failure. The `reason` is printed alongside
+    /// rather than instead: scripts match the code, humans read the
+    /// sentence, and showing one without the other loses information the
+    /// response body deliberately separated.
+    #[test]
+    fn fork_quarantine_refusal_prints_the_sentence_the_remedy_and_the_code() {
+        let body = serde_json::json!({
+            "ok": false,
+            "reason": "fork_quarantined",
+            "error": "group is fork-quarantined on this node: authenticated fork evidence at \
+                      revision 7 means the roster is contested, so this operation is refused \
+                      here. It clears when an owner-anchored commit advances past revision 7, \
+                      or immediately with the manual clear POST /groups/:id/quarantine/clear \
+                      (CLI: `x0x groups quarantine clear abcd`).",
+            "fork_quarantine": { "clear_with": "POST /groups/:id/quarantine/clear" },
+        });
+        let rendered = error_from_body(reqwest::StatusCode::CONFLICT, &body).to_string();
+        assert!(
+            rendered.contains("fork-quarantined") && rendered.contains("contested"),
+            "the human sentence reaches the terminal: {rendered}"
+        );
+        assert!(
+            rendered.contains("x0x groups quarantine clear"),
+            "the remedy reaches the terminal, not just a status code: {rendered}"
+        );
+        assert!(
+            rendered.contains("reason: fork_quarantined"),
+            "the stable machine code is still visible for scripted callers: {rendered}"
+        );
+    }
+
+    /// A body without a `reason` keeps the pre-ADR-0066 single-clause
+    /// rendering — the new clause is additive, so every other error the
+    /// CLI prints is byte-identical.
+    #[test]
+    fn error_without_reason_renders_unchanged() {
+        let body = serde_json::json!({ "ok": false, "error": "group not found" });
+        assert_eq!(
+            error_from_body(reqwest::StatusCode::NOT_FOUND, &body).to_string(),
+            "group not found (HTTP 404)"
+        );
+    }
 
     #[test]
     fn format_scalar_string() {
