@@ -1469,7 +1469,11 @@ async fn open_bound_gss_store(
             .await
             .is_err()
         {
-            handle.retire();
+            // Drain before unregistering (#757): no map/store guard is held
+            // here, and a GSS receive section takes only `named_groups` /
+            // `kv_stores` (refresh hook) — never the membership guard our
+            // callers hold — so waiting out its admitted persist is safe.
+            handle.retire_and_drain().await;
             state.kv_stores.write().await.remove(&expected.topic);
             return Err(api_error(
                 StatusCode::CONFLICT,
@@ -1547,6 +1551,10 @@ async fn open_bound_treekem_store(
         {
             return Ok((handle, epoch, false));
         }
+        // NOT drained (#757, residual tracked in #760): every caller holds
+        // this group's membership guard, and a TreeKEM receive section takes
+        // that same guard in `merge_main_record` while holding the sync's
+        // lifecycle lock — a drain here would deadlock against it.
         handle.retire();
         state.kv_stores.write().await.remove(&expected.topic);
         return Err(api_error(
@@ -1627,7 +1635,11 @@ async fn open_bound_public_store(
         {
             return Ok((handle, context, false));
         }
-        handle.retire();
+        // Drain before unregistering (#757): no map/store guard is held
+        // here, and a public receive section takes only `named_groups` /
+        // `kv_stores` (refresh hook) — never the membership guard our
+        // callers hold — so waiting out its admitted persist is safe.
+        handle.retire_and_drain().await;
         state.kv_stores.write().await.remove(&expected.topic);
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -5269,6 +5281,112 @@ mod tests {
         .await
         .expect("mismatch cleanup must not deadlock");
         assert!(result.is_err(), "mismatched cached handle must fail closed");
+        assert!(!state.kv_stores.read().await.contains_key(&binding.topic));
+    }
+
+    #[tokio::test]
+    async fn cached_binding_mismatch_drains_in_flight_persist_before_unregistering() {
+        // WHY (#757): the mismatch path unregisters the cached handle, after
+        // which a later open may start a NEW sync over the same snapshot
+        // path. A receive section the old sync already admitted still owes
+        // its snapshot write, so the handle must not be unregistered — and
+        // this call must not return — until that write has landed.
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "35".repeat(16);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.policy.read_access = crate::groups::GroupReadAccess::Public;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_public_group_store(&groups, &group_key, "Wiki", &state.agent.agent_id())
+                .expect("binding")
+        };
+        let snapshots = tempfile::tempdir().expect("snapshot dir");
+        let wrong = state
+            .agent
+            .create_kv_store_persistent(
+                "wrong",
+                "wrong/topic-757",
+                x0x::kv::AccessPolicy::Signed,
+                snapshots.path(),
+            )
+            .await
+            .expect("wrong cached handle");
+        let snapshot_bytes = || {
+            std::fs::read_dir(snapshots.path())
+                .expect("snapshot dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
+                .map(|entry| std::fs::read(entry.path()).expect("snapshot bytes"))
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot_bytes();
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), wrong.clone());
+
+        let bound = std::time::Duration::from_secs(10);
+        let mut delta = x0x::kv::KvStoreDelta::new(1);
+        let entry = x0x::kv::KvEntry::new(
+            "late-key".to_string(),
+            b"late".to_vec(),
+            "text/plain".to_string(),
+        );
+        delta.added.insert(
+            "late-key".to_string(),
+            (entry, (saorsa_gossip_types::PeerId::new([7; 32]), 1)),
+        );
+        let (open,) = wrong
+            .with_persist_gate_held_for_test(async {
+                wrong.publish_delta_for_test(delta).await;
+                // Barrier: merged in memory, so its snapshot write is now
+                // parked on the gate — a receive section in flight.
+                tokio::time::timeout(bound, async {
+                    while !matches!(wrong.get("late-key").await, Ok(Some(_))) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("listener must merge the delta");
+                let mut open = Box::pin(open_bound_public_store(&state, &binding));
+                for _ in 0..64 {
+                    assert!(
+                        futures::poll!(open.as_mut()).is_pending(),
+                        "mismatch cleanup returned with a snapshot write still in flight"
+                    );
+                    assert!(
+                        state.kv_stores.read().await.contains_key(&binding.topic),
+                        "handle unregistered before its in-flight write drained"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(snapshot_bytes(), before);
+                // Tuple: hand the still-pending future back un-awaited.
+                (open,)
+            })
+            .await;
+        let result = tokio::time::timeout(bound, open)
+            .await
+            .expect("mismatch cleanup must finish once the write lands");
+        assert!(result.is_err(), "mismatched cached handle must fail closed");
+        assert_ne!(
+            snapshot_bytes(),
+            before,
+            "cleanup returned before the admitted snapshot write landed"
+        );
         assert!(!state.kv_stores.read().await.contains_key(&binding.topic));
     }
 

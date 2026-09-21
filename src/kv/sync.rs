@@ -378,18 +378,24 @@ pub struct KvStoreSync {
     /// live responder until daemon shutdown).
     cancel: tokio_util::sync::CancellationToken,
 
-    /// Receive-path lifecycle fence (#757). The listener and the responder
-    /// hold it across one whole `[cancel check -> merge / ownership update
-    /// -> persist]` section, and
-    /// [`cancel_sync_and_drain`](Self::cancel_sync_and_drain) takes it once
-    /// AFTER cancelling, so when that returns no background merge, ownership
-    /// update or snapshot write is in flight or can start.
+    /// Receive-path lifecycle fence (#757). The listener holds it across one
+    /// whole `[cancel check -> merge -> persist]` iteration and the responder
+    /// across its owner-announce arm `[cancel check -> learn_ownership ->
+    /// persist]`. [`cancel_sync_and_drain`](Self::cancel_sync_and_drain)
+    /// takes it once AFTER cancelling, so when that returns none of those
+    /// sections is in flight or can start.
     ///
-    /// Lock order: this is the OUTERMOST lock of the background loops —
-    /// `lifecycle` -> locks taken by the secure-refresh hook / TreeKEM
-    /// protector (group membership, `named_groups`, `kv_stores`) -> `store`
-    /// -> `PersistCtx::gate`. It is never held across a network await (the
-    /// responder's state serve and the requester publish outside it).
+    /// NOT covered: the responder's state-serve arms and the bootstrap
+    /// requester. They only read the store and publish, run outside this
+    /// lock (it is never held across a network await), and may still be
+    /// finishing when a drain returns.
+    ///
+    /// Lock order — `lifecycle` is the OUTERMOST lock of a section:
+    /// `lifecycle` -> `named_groups` / `kv_stores` (secure-refresh hook) ->
+    /// TreeKEM protector (group membership guard, live ratchet) -> `store`
+    /// write guard (the mutation). The mutation guard is RELEASED before
+    /// persisting; `persist_snapshot` then takes `PersistCtx::gate` ->
+    /// `store` read guard, in that order.
     lifecycle: Arc<tokio::sync::Mutex<()>>,
 
     /// Group secure context for an [`AccessPolicy::Encrypted`] store
@@ -2358,16 +2364,17 @@ impl KvStoreSync {
     /// section already running (#757).
     ///
     /// When this returns, no background merge, ownership update or snapshot
-    /// write for this store is in flight, and none can start. Use it before
-    /// replacing or removing the snapshot path, or before opening another
-    /// sync over it. `cancel_sync` alone is only a request: a section that
-    /// already passed its cancel check still completes, including its write.
+    /// write for this store is in flight, and none can start. (Read-only
+    /// state serves and the requester's publish are outside the fence — see
+    /// the `lifecycle` field.) `cancel_sync` alone is only a request: ONE
+    /// section that already passed its cancel check still completes,
+    /// including its snapshot write, possibly after `cancel_sync` returned.
     ///
-    /// Must NOT be awaited while holding any lock a receive section takes —
-    /// the group membership lock, `named_groups`, `kv_stores`, or this
-    /// store's own lock — nor from inside the secure-refresh hook (which
-    /// runs within a section); either deadlocks. Those callers use
-    /// `cancel_sync`.
+    /// Must NOT be awaited while holding any lock a section takes — the
+    /// group membership guard (TreeKEM stores), `named_groups`, `kv_stores`,
+    /// this store's own guard, or its persist gate — nor from inside the
+    /// secure-refresh hook, which runs within a section. Either deadlocks;
+    /// those callers use `cancel_sync` and accept the residual (#760).
     pub async fn cancel_sync_and_drain(&self) {
         self.cancel.cancel();
         drop(self.lifecycle.lock().await);
@@ -2529,6 +2536,21 @@ impl KvStoreSync {
             &retained,
         )
         .await
+    }
+
+    /// Run `during` while this store's snapshot gate is held, so any
+    /// receive-path persist that starts meanwhile parks in flight (#757).
+    #[cfg(test)]
+    pub(crate) async fn with_persist_gate_held_for_test<F: std::future::Future>(
+        &self,
+        during: F,
+    ) -> F::Output {
+        let ctx = self.persist_ctx();
+        let _gate = match ctx.as_ref() {
+            Some(ctx) => Some(ctx.gate.lock().await),
+            None => None,
+        };
+        during.await
     }
 
     #[cfg(test)]
@@ -4168,18 +4190,40 @@ mod tests {
         // that across threads — the check has to sit under the lifecycle
         // lock the draining retire takes. Holding that lock here parks the
         // listener after its recv and before its check, then cancels.
+        // (With the loops held and hand-polled, the queued message cannot be
+        // dropped by the cancel-first select instead: the cancel is set only
+        // after the listener has consumed it.)
         let fx = retire_fixture("store/757-pulled").await;
-        let loops = start_joinable(&fx.sync).await;
+        let held: HeldLoops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&held);
+        fx.sync
+            .start_with_spawner(move |fut| {
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(fut);
+            })
+            .await
+            .expect("start_with_spawner");
         let parked = fx.sync.lifecycle.clone().lock_owned().await;
         publish_late_delta(&fx).await;
-        // The send woke the listener; on this current-thread runtime a few
-        // yields run it up to the lifecycle lock we hold.
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
+        let mut loops = std::mem::take(
+            &mut *held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        // Barrier by construction: the delta is in the channel and no cancel
+        // is set, so ONE poll takes the listener through `recv` and leaves
+        // it Pending on the lifecycle lock held above.
+        for fut in &mut loops {
+            assert!(futures::poll!(fut.as_mut()).is_pending());
         }
         fx.sync.cancel_sync();
         drop(parked);
-        join_loops(loops).await;
+        for fut in loops {
+            tokio::time::timeout(Duration::from_secs(10), fut)
+                .await
+                .expect("a cancelled loop must exit");
+        }
         assert!(
             fx.sync.read().await.get("late-key").is_none(),
             "a delta pulled before the cancel was merged after it"
@@ -4847,6 +4891,227 @@ mod tests {
             .get("secret-key")
             .map(|e| e.value.clone());
         assert_eq!(value, Some(b"hush".to_vec()));
+    }
+
+    /// Delegating protector whose `merge_main_record` parks on a gate AFTER
+    /// `open_record` has already advanced the real receive ratchet (#757).
+    struct GatedTreeKemProtector {
+        inner: Arc<TestTreeKemProtector>,
+        gate: tokio::sync::Semaphore,
+        entered: std::sync::atomic::AtomicUsize,
+        settled: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kv::TreeKemKvProtector for GatedTreeKemProtector {
+        fn group_id(&self) -> Vec<u8> {
+            self.inner.group_id()
+        }
+
+        async fn seal_record(
+            &self,
+            signing: &AuthorSigning,
+            kind: KvMutationKind,
+            store_id: &KvStoreId,
+            payload: &[u8],
+            reader_only: bool,
+        ) -> Result<TreeKemKvStoreRecordV1> {
+            self.inner
+                .seal_record(signing, kind, store_id, payload, reader_only)
+                .await
+        }
+
+        async fn open_record(
+            &self,
+            store_id: &KvStoreId,
+            record: &TreeKemKvStoreRecordV1,
+        ) -> Result<crate::kv::treekem::OpenedTreeKemKvRecord> {
+            self.inner.open_record(store_id, record).await
+        }
+
+        async fn is_authorized_reader(&self, agent: &AgentId) -> bool {
+            self.inner.is_authorized_reader(agent).await
+        }
+
+        async fn is_authorized_writer(&self, agent: &AgentId) -> bool {
+            self.inner.is_authorized_writer(agent).await
+        }
+
+        async fn merge_main_record(
+            &self,
+            opened: crate::kv::treekem::OpenedTreeKemKvRecord,
+            sender_peer: PeerId,
+            local_peer: PeerId,
+            store: &Arc<RwLock<KvStore>>,
+            retained_image: Option<Vec<u8>>,
+        ) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.entered.fetch_add(1, SeqCst);
+            self.gate
+                .acquire()
+                .await
+                .map_err(|e| KvError::Gossip(format!("test gate closed: {e}")))?
+                .forget();
+            let merged = self
+                .inner
+                .merge_main_record(opened, sender_peer, local_peer, store, retained_image)
+                .await;
+            self.settled.fetch_add(1, SeqCst);
+            merged
+        }
+
+        fn invalidate(&self) {
+            self.inner.invalidate();
+        }
+    }
+
+    #[tokio::test]
+    async fn draining_retire_lets_an_opened_treekem_record_settle() {
+        // WHY (#757 r2, Codex P2): `open_record` advances the shared TreeKEM
+        // receive ratchet. A retire that cancelled the receive future after
+        // that point (r1's `unless_cancelled`) stranded the ratchet ahead of
+        // the store and its snapshot. A record that has been opened must run
+        // through merge AND persist, and a draining retire must wait for it.
+        use std::sync::atomic::Ordering::SeqCst;
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let owner_kp = AgentKeypair::generate().expect("owner kp");
+        let reader_kp = AgentKeypair::generate().expect("reader kp");
+        let owner = owner_kp.agent_id();
+        let reader = reader_kp.agent_id();
+        let (_info, mut contexts, group_id) = encrypted_group(&[owner, reader]);
+        let reader_ctx = contexts.pop().expect("reader context");
+        let owner_ctx = contexts.pop().expect("owner context");
+        let mut owner_group =
+            crate::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[1; 32])
+                .expect("owner group");
+        let prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(reader, &[2; 32]).expect("reader kp");
+        let add = owner_group
+            .add_member(reader, prepared.key_package_bytes())
+            .expect("add reader");
+        let reader_group = crate::mls::TreeKemMlsGroup::join_from_welcome(prepared, &add.welcome)
+            .expect("reader join");
+        let members = std::collections::HashSet::from([owner, reader]);
+        let authorization = *blake3::hash(b"757 roster").as_bytes();
+        let owner_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(owner_group),
+            readers: members.clone(),
+            writers: std::sync::Mutex::new(members.clone()),
+            authorization,
+        });
+        let gated = Arc::new(GatedTreeKemProtector {
+            inner: Arc::new(TestTreeKemProtector {
+                group_id: group_id.clone(),
+                group: tokio::sync::Mutex::new(reader_group),
+                readers: members.clone(),
+                writers: std::sync::Mutex::new(members),
+                authorization,
+            }),
+            gate: tokio::sync::Semaphore::new(0),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            settled: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let source = KvStore::new_treekem_encrypted(
+            store_id(57),
+            "Home".to_string(),
+            owner,
+            group_id,
+            owner_ctx,
+        )
+        .expect("owner store");
+        let mut target = source.clone();
+        target
+            .set_secure_context(reader_ctx)
+            .expect("reader context");
+
+        let topic = "store/757-treekem";
+        let mut owner_sync = KvStoreSync::new(
+            source,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+            Some(owner),
+        )
+        .expect("owner sync");
+        owner_sync.set_treekem_context(owner_protector);
+        owner_sync
+            .set_author_signing(AuthorSigning::from_keypair(&owner_kp).expect("owner signing"));
+        let mut reader_sync = KvStoreSync::new(
+            target,
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+            Some(reader),
+        )
+        .expect("reader sync");
+        reader_sync.set_treekem_context(gated.clone());
+        reader_sync
+            .set_author_signing(AuthorSigning::from_keypair(&reader_kp).expect("reader signing"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = dir.path().join("store.bin");
+        reader_sync.set_persist_path(snapshot.clone());
+        reader_sync.persist().await.expect("baseline snapshot");
+        let before = std::fs::read(&snapshot).expect("baseline bytes");
+        let loops = start_joinable(&reader_sync).await;
+
+        let delta = {
+            let mut s = owner_sync.write().await;
+            s.put(
+                "sealed-key".to_string(),
+                b"hush".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+            let entry = s.get("sealed-key").cloned().expect("entry");
+            KvStoreDelta::for_put(
+                "sealed-key".to_string(),
+                entry,
+                (peer(1), s.next_seq().expect("sequence")),
+                s.current_version(),
+            )
+        };
+        owner_sync
+            .publish_delta(peer(1), delta)
+            .await
+            .expect("publish");
+        // Barrier: the record is OPENED (ratchet advanced) and its merge is
+        // parked on the gate, inside the listener's section.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while gated.entered.load(SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader must open the sealed record");
+
+        let mut drain = Box::pin(reader_sync.cancel_sync_and_drain());
+        for _ in 0..64 {
+            assert!(
+                futures::poll!(drain.as_mut()).is_pending(),
+                "retire completed with an opened TreeKEM record unsettled"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gated.settled.load(SeqCst), 0);
+        gated.gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain must complete once the record settles");
+        assert_eq!(
+            (gated.entered.load(SeqCst), gated.settled.load(SeqCst)),
+            (1, 1),
+            "an opened record was abandoned mid-flight"
+        );
+        assert!(reader_sync.read().await.get("sealed-key").is_some());
+        assert_ne!(
+            std::fs::read(&snapshot).expect("snapshot bytes"),
+            before,
+            "ratchet and store advanced but the snapshot did not"
+        );
+        join_loops(loops).await;
     }
 
     #[tokio::test]
