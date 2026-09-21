@@ -421,6 +421,10 @@ pub struct KvStoreSync {
     retained_pages: Arc<std::sync::Mutex<RetainedPagePool>>,
     #[cfg(test)]
     retained_publish_test: Arc<std::sync::Mutex<RetainedPublishTestState>>,
+    /// Deterministic barrier fired after a plaintext remote merge and before
+    /// its snapshot write. Tests use the stored permit; production has no hook.
+    #[cfg(test)]
+    receive_merged_test: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
@@ -444,8 +448,10 @@ impl Drop for KvStoreSync {
 
 /// Shared persistence context for one store's snapshot file.
 struct PersistCtx {
-    /// Snapshot file path.
-    path: PathBuf,
+    /// Snapshot-fence ownership retained for this context's whole lifetime.
+    /// A write only renames while this generation still owns the path; the
+    /// retained path entry also prevents registry pruning before first use.
+    owner: super::snapshot_fence::PersistOwner,
     /// Serializes snapshot commits AND records the last durably-persisted
     /// store version. `(version, bytes)` are captured under this lock, so
     /// commit order equals capture order — a concurrent persist burst can
@@ -498,6 +504,8 @@ impl KvStoreSync {
             retained_publish_test: Arc::new(std::sync::Mutex::new(
                 RetainedPublishTestState::default(),
             )),
+            #[cfg(test)]
+            receive_merged_test: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -1187,15 +1195,40 @@ impl KvStoreSync {
     /// Call before [`start`](Self::start) so no merged delta can land
     /// unpersisted. The caller is responsible for loading any existing
     /// snapshot BEFORE constructing this sync (see
-    /// [`load_snapshot`]); this method only arms writes.
+    /// [`load_snapshot`]); this method only arms writes — and claims the
+    /// path's youngest persist generation for THIS sync (#760): any older
+    /// sync's still-admitted write over the same file is fenced out from
+    /// this moment on.
     pub fn set_persist_path(&self, path: PathBuf) {
         if let Ok(mut guard) = self.persist.lock() {
+            let owner = super::snapshot_fence::arm_persist(&path);
             *guard = Some(Arc::new(PersistCtx {
-                path,
+                owner,
                 gate: tokio::sync::Mutex::new(None),
                 degraded: std::sync::atomic::AtomicBool::new(false),
             }));
         }
+    }
+
+    /// Arm persistence through the lifecycle lease held by a high-level
+    /// persistent-store constructor. A predecessor-backed or trampled lease
+    /// is refused before it can supersede the current file owner.
+    pub(crate) fn set_persist_path_for_open(
+        &self,
+        lease: &super::snapshot_fence::StoreOpenLease,
+    ) -> Result<()> {
+        let mut guard = self.persist.lock().map_err(|_| {
+            KvError::Io(std::io::Error::other(
+                "kv persistence context lock poisoned",
+            ))
+        })?;
+        let owner = lease.arm_persist().ok_or(KvError::SnapshotSuperseded)?;
+        *guard = Some(Arc::new(PersistCtx {
+            owner,
+            gate: tokio::sync::Mutex::new(None),
+            degraded: std::sync::atomic::AtomicBool::new(false),
+        }));
+        Ok(())
     }
 
     /// Refresh and enforce the current group read policy before exposing
@@ -1264,13 +1297,31 @@ impl KvStoreSync {
     ///   peers hold the data; only this node's disk is behind).
     /// - The next successful persist (including via
     ///   [`ensure_durable`](Self::ensure_durable)) clears the flag.
+    /// - #760: if a YOUNGER generation owns the snapshot path (this sync was
+    ///   retired and the store re-opened), the write is refused with
+    ///   [`KvError::SnapshotSuperseded`] and the degraded flag is set —
+    ///   success would acknowledge bytes that were never made durable.
     ///
     /// # Errors
     ///
-    /// I/O or serialization failure writing the snapshot.
+    /// I/O or serialization failure writing the snapshot, or
+    /// [`KvError::SnapshotSuperseded`] when a younger generation owns the
+    /// path.
     pub async fn persist(&self) -> Result<()> {
         match self.persist_ctx() {
-            Some(ctx) => persist_snapshot(&self.store, &ctx).await,
+            Some(ctx) => match persist_snapshot(&self.store, &ctx).await {
+                Ok(PersistOutcome::Superseded) => {
+                    // Caller-driven durability: fail closed (#760). The
+                    // receive-path callers of `persist_snapshot` suppress
+                    // this outcome instead (their merge belongs to a
+                    // discarded generation).
+                    ctx.degraded
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Err(KvError::SnapshotSuperseded)
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
             None => Ok(()),
         }
     }
@@ -1288,11 +1339,13 @@ impl KvStoreSync {
     ///
     /// # Errors
     ///
-    /// The retry failed — the caller must refuse the local write.
+    /// The retry failed — the caller must refuse the local write —
+    /// including [`KvError::SnapshotSuperseded`] when a younger generation
+    /// owns the path (#760).
     pub async fn ensure_durable(&self) -> Result<()> {
         match self.persist_ctx() {
             Some(ctx) if ctx.degraded.load(std::sync::atomic::Ordering::Relaxed) => {
-                persist_snapshot(&self.store, &ctx).await
+                self.persist().await
             }
             _ => Ok(()),
         }
@@ -1400,6 +1453,8 @@ impl KvStoreSync {
         let loop_persist_ctx = persist_ctx.clone();
         let listener_cancel = self.cancel.clone();
         let listener_lifecycle = Arc::clone(&self.lifecycle);
+        #[cfg(test)]
+        let listener_receive_merged_test = Arc::clone(&self.receive_merged_test);
         let listener_local_peer_id = self.local_peer_id;
         // Store id snapshot for the encrypted receive path (static for the
         // store's life).
@@ -1618,6 +1673,8 @@ impl KvStoreSync {
                         // remote merges continue — replication must not
                         // wedge on this node's disk.
                         if merged {
+                            #[cfg(test)]
+                            listener_receive_merged_test.notify_one();
                             if let Some(ctx) = loop_persist_ctx.as_ref() {
                                 let _ = persist_snapshot(&store, ctx).await;
                             }
@@ -2411,6 +2468,14 @@ impl KvStoreSync {
         drop(self.lifecycle.lock().await);
     }
 
+    /// Wait until the plaintext listener has merged one remote delta and is
+    /// about to persist it. `Notify` retains one permit, so the test cannot
+    /// miss the barrier if the merge wins the race to this call.
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_merged_for_test(&self) {
+        self.receive_merged_test.notified().await;
+    }
+
     /// Stop background synchronization.
     ///
     /// Topic-wide: unsubscribes the main and state-sync topics for the
@@ -2676,21 +2741,43 @@ fn encode_snapshot(store: &KvStore) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Outcome of one snapshot commit attempt.
+enum PersistOutcome {
+    /// Bytes captured and renamed into place.
+    Written,
+    /// Skipped: durable state is already at (or beyond) the captured
+    /// version.
+    Current,
+    /// Suppressed: a younger generation owns the snapshot path (#760).
+    /// Policy is caller-dependent — receive paths skip (the merge belongs
+    /// to a discarded generation), caller-driven persistence escalates to
+    /// [`KvError::SnapshotSuperseded`] + durability-degraded.
+    Superseded,
+}
+
 /// Snapshot the store to the persistence context's path.
 ///
 /// Serialized per store via `ctx.gate`: `(version, bytes)` are captured
 /// under the gate, so commit order equals capture order and a slow persist
 /// can never rename an older snapshot over a newer one; the recorded
 /// last-persisted version additionally skips writes that would not advance
-/// durable state. Success clears the degraded flag; failure sets it and is
-/// error-logged here (callers decide whether to propagate — local writes
-/// must, remote merges must not).
+/// durable state. The rename itself runs under the snapshot path's fence
+/// mutex with an ownership check on `ctx.owner` (#760): once a younger
+/// sync arms the same path, this ctx's writes are suppressed —
+/// [`PersistOutcome::Superseded`] — so an older admitted write can never
+/// land after a younger generation's. Success clears the degraded flag;
+/// failure sets it and is error-logged here (callers decide whether to
+/// propagate — local writes must, remote merges must not); a superseded
+/// write touches neither the flag nor the file.
 ///
 /// # Errors
 ///
 /// Serialization or I/O failure writing the snapshot.
-async fn persist_snapshot(store: &Arc<RwLock<KvStore>>, ctx: &PersistCtx) -> Result<()> {
-    let result = async {
+async fn persist_snapshot(
+    store: &Arc<RwLock<KvStore>>,
+    ctx: &PersistCtx,
+) -> Result<PersistOutcome> {
+    let result: Result<PersistOutcome> = async {
         let mut last = ctx.gate.lock().await;
         let (version, bytes) = {
             let s = store.read().await;
@@ -2698,21 +2785,41 @@ async fn persist_snapshot(store: &Arc<RwLock<KvStore>>, ctx: &PersistCtx) -> Res
         };
         if last.is_some_and(|l| l >= version) {
             // Durable state already at (or beyond) this version.
-            return Ok(());
+            return Ok(PersistOutcome::Current);
         }
-        write_snapshot_atomic(&ctx.path, &bytes)?;
-        *last = Some(version);
-        Ok(())
+        match super::snapshot_fence::write_if_owner(&ctx.owner, &bytes, write_snapshot_atomic)? {
+            true => {
+                *last = Some(version);
+                Ok(PersistOutcome::Written)
+            }
+            false => {
+                tracing::debug!(
+                    "kv snapshot persist suppressed for {}: superseded generation {} (#760)",
+                    ctx.owner.path().display(),
+                    ctx.owner.generation()
+                );
+                Ok(PersistOutcome::Superseded)
+            }
+        }
     }
     .await;
-    ctx.degraded
-        .store(result.is_err(), std::sync::atomic::Ordering::Relaxed);
-    if let Err(e) = &result {
-        tracing::error!(
-            "kv snapshot persist failed for {}: {e} — store is durability-degraded; \
-             local writes are refused until a snapshot succeeds",
-            ctx.path.display()
-        );
+    match &result {
+        Ok(PersistOutcome::Written) | Ok(PersistOutcome::Current) => {
+            ctx.degraded
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Suppressed is the retire protocol working, not a disk failure:
+        // neither clear nor set the flag here.
+        Ok(PersistOutcome::Superseded) => {}
+        Err(e) => {
+            ctx.degraded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                "kv snapshot persist failed for {}: {e} — store is durability-degraded; \
+                 local writes are refused until a snapshot succeeds",
+                ctx.owner.path().display()
+            );
+        }
     }
     result
 }
@@ -4087,6 +4194,220 @@ mod tests {
             snapshot,
             before,
         }
+    }
+
+    #[tokio::test]
+    async fn superseded_local_persist_is_typed_and_never_reports_durable() {
+        let fx = retire_fixture("store/760-stale-local").await;
+        let owner = fx.sync.local_agent_id.expect("owner identity");
+        fx.sync
+            .authorize_local_write(&owner)
+            .await
+            .expect("local authorization passes before mutation");
+        fx.sync
+            .write()
+            .await
+            .put(
+                "stale-local".to_string(),
+                b"must-not-land".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("in-memory mutation");
+
+        // A direct replacement sync retains the new path owner even though
+        // no lifecycle handle owns it. This is the low-level call path that
+        // motivated PersistOwner retaining the exact registry entry.
+        let replacement_store = KvStore::new(
+            store_id(1),
+            "replacement".into(),
+            owner,
+            AccessPolicy::Signed,
+        )
+        .expect("replacement store");
+        let replacement = KvStoreSync::new(
+            replacement_store,
+            Arc::clone(&fx.pubsub),
+            "store/760-replacement".into(),
+            peer(3),
+            Some(owner),
+        )
+        .expect("replacement sync");
+        replacement.set_persist_path(fx.snapshot.clone());
+
+        let error = fx
+            .sync
+            .persist()
+            .await
+            .expect_err("old owner must fail closed");
+        assert!(matches!(error, KvError::SnapshotSuperseded));
+        assert!(fx.sync.durability_degraded());
+        assert_eq!(
+            std::fs::read(&fx.snapshot).expect("snapshot remains readable"),
+            fx.before,
+            "superseded caller must not touch the snapshot or report success"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_waits_for_admitted_delta_then_preserves_it_with_new_write() {
+        let fx = retire_fixture("store/760-admitted-reopen").await;
+        let lease = crate::kv::snapshot_fence::claim_open(&fx.snapshot).await;
+        assert!(lease.commit());
+        let loops = start_joinable(&fx.sync).await;
+        let ctx = fx.sync.persist_ctx().expect("persist armed");
+        let gate = ctx.gate.lock().await;
+
+        publish_late_delta(&fx).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fx.sync.wait_receive_merged_for_test(),
+        )
+        .await
+        .expect("A merged before its persist");
+
+        let retirement = lease.begin_retire().expect("old handle marks retirement");
+        let mut drain = Box::pin(fx.sync.cancel_sync_and_drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        let mut reopen = Box::pin(crate::kv::snapshot_fence::claim_open(&fx.snapshot));
+        assert!(
+            futures::poll!(reopen.as_mut()).is_pending(),
+            "reopen must wait while A's admitted persist is outstanding"
+        );
+
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("old receive section drains");
+        retirement.complete();
+        let successor = tokio::time::timeout(Duration::from_secs(10), reopen)
+            .await
+            .expect("reopen proceeds after drain");
+
+        let restored = load_snapshot(&fx.snapshot)
+            .expect("snapshot decodes")
+            .expect("snapshot exists");
+        assert!(restored.get("late-key").is_some(), "raw snapshot retains A");
+        let successor_sync = KvStoreSync::new(
+            restored,
+            Arc::clone(&fx.pubsub),
+            "store/760-successor".into(),
+            peer(3),
+            fx.sync.local_agent_id,
+        )
+        .expect("successor sync");
+        successor_sync.set_persist_path(fx.snapshot.clone());
+        successor_sync
+            .write()
+            .await
+            .put(
+                "successor-x".into(),
+                b"x".to_vec(),
+                "text/plain".into(),
+                peer(3),
+            )
+            .expect("successor writes X");
+        successor_sync.persist().await.expect("X persists");
+        assert!(successor.commit());
+
+        let raw = load_snapshot(&fx.snapshot)
+            .expect("final snapshot decodes")
+            .expect("final snapshot exists");
+        assert!(raw.get("late-key").is_some(), "A survives reopen");
+        assert!(raw.get("successor-x").is_some(), "X lands after reopen");
+        join_loops(loops).await;
+    }
+
+    #[tokio::test]
+    async fn trampled_predecessor_open_cannot_suppress_or_clobber_admitted_delta() {
+        let fx = retire_fixture("store/760-trampled-open").await;
+        let old = crate::kv::snapshot_fence::claim_open(&fx.snapshot).await;
+        assert!(old.commit());
+        // Selector: B claims while old is Active, before retirement begins.
+        let stale_open = crate::kv::snapshot_fence::claim_open(&fx.snapshot).await;
+        let loops = start_joinable(&fx.sync).await;
+        let ctx = fx.sync.persist_ctx().expect("old persist armed");
+        let gate = ctx.gate.lock().await;
+        publish_late_delta(&fx).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fx.sync.wait_receive_merged_for_test(),
+        )
+        .await
+        .expect("A is admitted and parked before persist");
+
+        // B loaded the pre-A snapshot. If it can arm, it can either suppress
+        // A or later overwrite A with this stale image.
+        let stale_image = load_snapshot(&fx.snapshot)
+            .expect("baseline snapshot decodes")
+            .expect("baseline snapshot exists");
+        assert!(stale_image.get("late-key").is_none());
+        let stale_sync = KvStoreSync::new(
+            stale_image,
+            Arc::clone(&fx.pubsub),
+            "store/760-trampled-successor".into(),
+            peer(3),
+            fx.sync.local_agent_id,
+        )
+        .expect("stale successor sync");
+
+        let retirement = old.begin_retire().expect("predecessor tramples B");
+        let mut drain = Box::pin(fx.sync.cancel_sync_and_drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        let error = stale_sync
+            .set_persist_path_for_open(&stale_open)
+            .expect_err("trampled B cannot arm or write its stale image");
+        assert!(matches!(error, KvError::SnapshotSuperseded));
+
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("old admitted A drains");
+        retirement.complete();
+        assert!(
+            !stale_open.commit(),
+            "trampled B cannot become the active successor"
+        );
+        let after_a = load_snapshot(&fx.snapshot)
+            .expect("A snapshot decodes")
+            .expect("A snapshot exists");
+        assert!(after_a.get("late-key").is_some(), "A was not suppressed");
+
+        // Positive control: a retry claimed from Idle can arm, preserve A,
+        // and persist X. This also proves the failed B left no ownership.
+        let retry = crate::kv::snapshot_fence::claim_open(&fx.snapshot).await;
+        let restored = load_snapshot(&fx.snapshot)
+            .expect("retry snapshot decodes")
+            .expect("retry snapshot exists");
+        let retry_sync = KvStoreSync::new(
+            restored,
+            Arc::clone(&fx.pubsub),
+            "store/760-retry".into(),
+            peer(4),
+            fx.sync.local_agent_id,
+        )
+        .expect("retry sync");
+        retry_sync
+            .set_persist_path_for_open(&retry)
+            .expect("fresh retry owns persistence");
+        retry_sync
+            .write()
+            .await
+            .put(
+                "successor-x".into(),
+                b"x".to_vec(),
+                "text/plain".into(),
+                peer(4),
+            )
+            .expect("retry writes X");
+        retry_sync.persist().await.expect("retry persists A plus X");
+        assert!(retry.commit());
+        let final_image = load_snapshot(&fx.snapshot)
+            .expect("final snapshot decodes")
+            .expect("final snapshot exists");
+        assert!(final_image.get("late-key").is_some());
+        assert!(final_image.get("successor-x").is_some());
+        join_loops(loops).await;
     }
 
     /// Publish one admissible delta and wait (barrier, not oracle) until it

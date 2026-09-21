@@ -378,8 +378,9 @@ pub(in crate::server) async fn create_kv_store(
                 // infinite while unconverged (issue #238) and would otherwise
                 // chatter until daemon shutdown.
                 tracing::error!("failed to persist kv store registration {id}: {e}");
-                if let Some(h) = state.kv_stores.write().await.remove(&id) {
-                    h.cancel_sync();
+                let removed = { state.kv_stores.write().await.remove(&id) };
+                if let Some(h) = removed {
+                    h.retire_and_drain().await;
                 }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -487,8 +488,9 @@ pub(in crate::server) async fn join_kv_store(
                 // infinite while unconverged (issue #238) and would otherwise
                 // chatter until daemon shutdown.
                 tracing::error!("failed to persist kv store join {id}: {e}");
-                if let Some(h) = state.kv_stores.write().await.remove(&id) {
-                    h.cancel_sync();
+                let removed = { state.kv_stores.write().await.remove(&id) };
+                if let Some(h) = removed {
+                    h.retire_and_drain().await;
                 }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -551,8 +553,9 @@ async fn join_self_keyed_store(
             .await
             {
                 tracing::error!("failed to persist kv store join {id}: {e}");
-                if let Some(h) = state.kv_stores.write().await.remove(&id) {
-                    h.cancel_sync();
+                let removed = { state.kv_stores.write().await.remove(&id) };
+                if let Some(h) = removed {
+                    h.retire_and_drain().await;
                 }
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1326,8 +1329,10 @@ fn public_kv_refresh(
             };
             if !valid {
                 tracing::warn!(target: "x0x::kv", "retiring public group store {topic}: group binding is no longer eligible");
-                if let Some(handle) = state.kv_stores.write().await.remove(&topic) {
+                let mut stores = state.kv_stores.write().await;
+                if let Some(handle) = stores.get(&topic).cloned() {
                     handle.retire();
+                    stores.remove(&topic);
                 }
             }
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -1384,8 +1389,10 @@ pub(in crate::server) fn gss_kv_refresh(
             };
             if !valid {
                 tracing::warn!(target: "x0x::kv", "retiring encrypted store {topic}: group binding is no longer eligible");
-                if let Some(h) = state.kv_stores.write().await.remove(&topic) {
+                let mut stores = state.kv_stores.write().await;
+                if let Some(h) = stores.get(&topic).cloned() {
                     h.retire();
+                    stores.remove(&topic);
                 }
             }
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -1412,12 +1419,13 @@ pub(in crate::server) async fn retire_group_kv_stores(state: &AppState, stable_g
         .cloned()
         .collect();
     for topic in &doomed {
-        if let Some(h) = stores.remove(topic) {
+        if let Some(h) = stores.get(topic).cloned() {
             tracing::info!(
                 target: "x0x::kv",
                 "retiring encrypted store {topic}: group {stable_group_id} left/removed/withdrawn"
             );
             h.retire();
+            stores.remove(topic);
         }
     }
 }
@@ -1431,9 +1439,10 @@ pub(in crate::server) async fn retire_group_kv_stores(state: &AppState, stable_g
 /// mismatch arm can find any kind of sync. A TreeKEM sync's receive section
 /// takes that same membership guard (`TreeKemGroupStoreProtector::open_record`
 /// / `merge_main_record`) while holding its lifecycle lock, so draining it
-/// here would deadlock; it gets the non-blocking `retire` and the re-open
-/// residual tracked in #760. GSS and public sections take only `named_groups`
-/// / `kv_stores` (refresh hook), which are not held here, so they are drained.
+/// here would deadlock, so it gets non-blocking `retire`; its detached drain
+/// retains the path fence until the receive section settles. GSS and public
+/// sections take only `named_groups` / `kv_stores` (refresh hook), which are
+/// not held here, so they are drained inline.
 async fn retire_mismatched_cached_store(handle: &x0x::KvStoreHandle) {
     if handle.is_treekem_protected() {
         handle.retire();
@@ -1442,11 +1451,27 @@ async fn retire_mismatched_cached_store(handle: &x0x::KvStoreHandle) {
     }
 }
 
-/// Called only while the canonical store reservation and group membership
-/// guard are held. Re-resolve before touching a cached handle or starting sync.
+async fn claim_bound_store_open(
+    state: &Arc<AppState>,
+    expected: &GssGroupStoreBinding,
+) -> x0x::KvStoreOpenLease {
+    state
+        .agent
+        .claim_group_kv_store_open(
+            &expected.name,
+            &expected.stable_group_id,
+            &state.kv_store_state_dir,
+        )
+        .await
+}
+
+/// Called only after the snapshot-path lease has been claimed and while the
+/// canonical store reservation and group membership guard are held. Re-resolve
+/// before touching a cached handle or starting sync.
 async fn open_bound_gss_store(
     state: &Arc<AppState>,
     expected: &GssGroupStoreBinding,
+    snapshot_lease: x0x::KvStoreOpenLease,
 ) -> Result<
     (
         x0x::KvStoreHandle,
@@ -1513,7 +1538,7 @@ async fn open_bound_gss_store(
             expected.creator,
             Arc::clone(&secure) as Arc<dyn KvSecureContext>,
             refresh,
-            &state.kv_store_state_dir,
+            snapshot_lease,
         )
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
@@ -1523,6 +1548,7 @@ async fn open_bound_gss_store(
 async fn open_bound_treekem_store(
     state: &Arc<AppState>,
     expected: &GssGroupStoreBinding,
+    snapshot_lease: x0x::KvStoreOpenLease,
 ) -> Result<(x0x::KvStoreHandle, u64, bool), GroupStoreResponse> {
     let authorization = {
         let groups = state.named_groups.read().await;
@@ -1587,7 +1613,7 @@ async fn open_bound_treekem_store(
             expected.creator,
             authorization,
             protector,
-            &state.kv_store_state_dir,
+            snapshot_lease,
         )
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
@@ -1597,6 +1623,7 @@ async fn open_bound_treekem_store(
 async fn open_bound_public_store(
     state: &Arc<AppState>,
     expected: &GssGroupStoreBinding,
+    snapshot_lease: x0x::KvStoreOpenLease,
 ) -> Result<
     (
         x0x::KvStoreHandle,
@@ -1669,7 +1696,7 @@ async fn open_bound_public_store(
             expected.creator,
             Arc::clone(&context) as Arc<dyn KvSecureContext>,
             refresh,
-            &state.kv_store_state_dir,
+            snapshot_lease,
         )
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
@@ -1761,6 +1788,7 @@ pub(in crate::server) async fn create_group_kv_store(
     if !actor.rider_allows_group(&binding.stable_group_id) {
         return forbidden("rider token is not granted this group");
     }
+    let snapshot_lease = claim_bound_store_open(&state, &binding).await;
     let reservation = crdt_subscriptions::handle_reservation(
         &state,
         crdt_subscriptions::KIND_KV_STORE,
@@ -1772,15 +1800,18 @@ pub(in crate::server) async fn create_group_kv_store(
     let membership = super::named_groups::group_membership_lock(&state, &binding.group_key).await;
     let _membership_guard = membership.lock().await;
     let (handle, epoch, created) = match plane {
-        StorePlane::Public => match open_bound_public_store(&state, &binding).await {
+        StorePlane::Public => match open_bound_public_store(&state, &binding, snapshot_lease).await
+        {
             Ok((handle, context, created)) => (handle, context.current_epoch(), created),
             Err(response) => return response,
         },
-        StorePlane::TreeKem => match open_bound_treekem_store(&state, &binding).await {
-            Ok(opened) => opened,
-            Err(response) => return response,
-        },
-        StorePlane::Gss => match open_bound_gss_store(&state, &binding).await {
+        StorePlane::TreeKem => {
+            match open_bound_treekem_store(&state, &binding, snapshot_lease).await {
+                Ok(opened) => opened,
+                Err(response) => return response,
+            }
+        }
+        StorePlane::Gss => match open_bound_gss_store(&state, &binding, snapshot_lease).await {
             Ok((handle, context, created)) => (handle, context.current_epoch(), created),
             Err(response) => return response,
         },
@@ -1949,16 +1980,18 @@ pub(in crate::server) async fn restore_bound_gss_store(
             Some("gss")
         },
     )?;
+    let snapshot_lease = claim_bound_store_open(state, &binding).await;
     let membership = super::named_groups::group_membership_lock(state, &binding.group_key).await;
     let _membership_guard = membership.lock().await;
     let (handle, created) = if public {
-        let (handle, _, created) = open_bound_public_store(state, &binding).await?;
+        let (handle, _, created) = open_bound_public_store(state, &binding, snapshot_lease).await?;
         (handle, created)
     } else if treekem {
-        let (handle, _, created) = open_bound_treekem_store(state, &binding).await?;
+        let (handle, _, created) =
+            open_bound_treekem_store(state, &binding, snapshot_lease).await?;
         (handle, created)
     } else {
-        let (handle, _, created) = open_bound_gss_store(state, &binding).await?;
+        let (handle, _, created) = open_bound_gss_store(state, &binding, snapshot_lease).await?;
         (handle, created)
     };
     if created {
@@ -2530,6 +2563,10 @@ pub(in crate::server) async fn import_legacy_page_store(
     )
     .await;
     let _reservation_guard = reservation.lock().await;
+    let snapshot_lease = state
+        .agent
+        .claim_group_kv_store_open(app, &id, &state.kv_store_state_dir)
+        .await;
     let membership = super::named_groups::group_membership_lock(&state, &id).await;
     let membership_guard = membership.lock().await;
     let (binding, authority_binding, public, treekem) = {
@@ -2739,17 +2776,17 @@ pub(in crate::server) async fn import_legacy_page_store(
         }
     }
     let (handle, created) = if public {
-        match open_bound_public_store(&state, &binding).await {
+        match open_bound_public_store(&state, &binding, snapshot_lease).await {
             Ok((handle, _, created)) => (handle, created),
             Err(response) => return response,
         }
     } else if treekem {
-        match open_bound_treekem_store(&state, &binding).await {
+        match open_bound_treekem_store(&state, &binding, snapshot_lease).await {
             Ok((handle, _, created)) => (handle, created),
             Err(response) => return response,
         }
     } else {
-        match open_bound_gss_store(&state, &binding).await {
+        match open_bound_gss_store(&state, &binding, snapshot_lease).await {
             Ok((handle, _, created)) => (handle, created),
             Err(response) => return response,
         }
@@ -5231,7 +5268,8 @@ mod tests {
             resolve_treekem_group_store(&groups, &treekem_key, "n", &state.agent.agent_id())
                 .expect("restart binding")
         };
-        let (restored, _, _) = open_bound_treekem_store(&state, &binding)
+        let snapshot_lease = claim_bound_store_open(&state, &binding).await;
+        let (restored, _, _) = open_bound_treekem_store(&state, &binding, snapshot_lease)
             .await
             .expect("restore TreeKEM store snapshot");
         assert_eq!(
@@ -5282,9 +5320,10 @@ mod tests {
             .await
             .insert(binding.topic.clone(), wrong);
 
+        let snapshot_lease = claim_bound_store_open(&state, &binding).await;
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            open_bound_public_store(&state, &binding),
+            open_bound_public_store(&state, &binding, snapshot_lease),
         )
         .await
         .expect("mismatch cleanup must not deadlock");
@@ -5357,6 +5396,7 @@ mod tests {
             "late-key".to_string(),
             (entry, (saorsa_gossip_types::PeerId::new([7; 32]), 1)),
         );
+        let snapshot_lease = claim_bound_store_open(&state, &binding).await;
         let (open,) = wrong
             .with_persist_gate_held_for_test(async {
                 wrong.publish_delta_for_test(delta).await;
@@ -5369,7 +5409,7 @@ mod tests {
                 })
                 .await
                 .expect("listener must merge the delta");
-                let mut open = Box::pin(open_bound_public_store(&state, &binding));
+                let mut open = Box::pin(open_bound_public_store(&state, &binding, snapshot_lease));
                 for _ in 0..64 {
                     assert!(
                         futures::poll!(open.as_mut()).is_pending(),
@@ -5431,6 +5471,13 @@ mod tests {
             .expect("TreeKEM handle");
         assert!(handle.is_treekem_protected());
 
+        // #760: claim before taking the membership guard that the parked
+        // TreeKEM receive section also needs.
+        let snapshot_lease = state
+            .agent
+            .claim_group_kv_store_open("n", &group_key, &state.kv_store_state_dir)
+            .await;
+
         // Park the TreeKEM listener inside a receive section: each write's
         // self-echo makes it take the lifecycle lock and then wait on the
         // membership guard we grab right after the write returns. Retry
@@ -5473,7 +5520,7 @@ mod tests {
         // Safety net, not an oracle: it only turns the deadlock into a FAIL.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            open_bound_public_store(&state, &binding),
+            open_bound_public_store(&state, &binding, snapshot_lease),
         )
         .await
         .expect("mismatch cleanup deadlocked against the parked TreeKEM section");
@@ -5511,7 +5558,8 @@ mod tests {
             let groups = state.named_groups.read().await;
             resolve_public_group_store(&groups, &group_key, "Wiki", &local).expect("binding")
         };
-        let (handle, _, _) = open_bound_public_store(&state, &binding)
+        let snapshot_lease = claim_bound_store_open(&state, &binding).await;
+        let (handle, _, _) = open_bound_public_store(&state, &binding, snapshot_lease)
             .await
             .expect("open member store");
         state

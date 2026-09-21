@@ -27,6 +27,7 @@ pub mod encrypted;
 pub mod entry;
 pub mod error;
 pub(crate) mod retained_paging;
+pub(crate) mod snapshot_fence;
 pub mod store;
 pub mod sync;
 pub mod treekem;

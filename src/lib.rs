@@ -16245,6 +16245,10 @@ impl Agent {
             kv::KvStoreId::for_topic_owner(topic, &self.agent_id())
         };
         let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
+        // #760: claim the snapshot path BEFORE loading it, so a concurrent
+        // retirement's drain completes (its admitted write lands) before
+        // this open's load reads the file.
+        let snapshot_lease = claim_snapshot_lease(persist_path.as_deref()).await;
         let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
             Some(Ok(Some(snap))) => {
                 if snap.id() != &store_id {
@@ -16309,7 +16313,9 @@ impl Agent {
             }
         };
 
-        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
+        let (sync, peer_id) = self
+            .spawn_kv_sync(store, topic, persist_path, snapshot_lease.as_ref())
+            .await?;
 
         // The creator is the owner: capture signing material so each write
         // produces an owner-signed content checkpoint (cold-recovery provenance).
@@ -16323,11 +16329,13 @@ impl Agent {
                 secret_key_bytes: sk_bytes,
             }))
         };
+        commit_snapshot_lease(snapshot_lease.as_ref(), "create")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
             peer_id,
             owner_signing,
+            snapshot_lease,
         })
     }
 
@@ -16337,8 +16345,9 @@ impl Agent {
         store: kv::KvStore,
         topic: &str,
         persist_path: Option<std::path::PathBuf>,
+        snapshot_lease: Option<&kv::snapshot_fence::StoreOpenLease>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
-        self.spawn_kv_sync_inner(store, topic, persist_path, None, None, None)
+        self.spawn_kv_sync_inner(store, topic, persist_path, snapshot_lease, None, None, None)
             .await
     }
 
@@ -16354,6 +16363,7 @@ impl Agent {
         store: kv::KvStore,
         topic: &str,
         persist_path: Option<std::path::PathBuf>,
+        snapshot_lease: Option<&kv::snapshot_fence::StoreOpenLease>,
         secure: Option<std::sync::Arc<dyn kv::encrypted::KvSecureContext>>,
         secure_refresh: Option<kv::sync::SecureRefreshFn>,
         treekem_secure: Option<kv::SharedTreeKemKvProtector>,
@@ -16391,7 +16401,18 @@ impl Agent {
         // the first moment the store does.
         let persistent = persist_path.is_some();
         if let Some(path) = persist_path {
-            sync.set_persist_path(path);
+            match snapshot_lease {
+                Some(lease) => sync.set_persist_path_for_open(lease),
+                None => {
+                    sync.set_persist_path(path);
+                    Ok(())
+                }
+            }
+            .map_err(|e| {
+                kv_storage_err(format!(
+                    "kv snapshot path cannot be armed for this open ({e}); retry after the prior handle retires"
+                ))
+            })?;
         }
         let sync = std::sync::Arc::new(sync);
         if persistent {
@@ -16408,6 +16429,22 @@ impl Agent {
             .await
             .map_err(|e| kv_storage_err(format!("kv store sync start failed: {e}")))?;
         Ok((sync, peer_id))
+    }
+
+    /// Claim a persistent group store's snapshot path before taking any
+    /// membership or store-registry guard (#760).
+    pub async fn claim_group_kv_store_open(
+        &self,
+        name: &str,
+        stable_group_id: &str,
+        state_dir: &std::path::Path,
+    ) -> KvStoreOpenLease {
+        let (store_id, _) = kv::encrypted::group_store_identity(stable_group_id, name);
+        let path = kv_snapshot_path(state_dir, &store_id);
+        KvStoreOpenLease {
+            inner: kv::snapshot_fence::claim_open(&path).await,
+            store_id,
+        }
     }
 
     /// Open (create or restore) a group-scoped encrypted KvStore
@@ -16442,7 +16479,7 @@ impl Agent {
         creator: identity::AgentId,
         secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
         secure_refresh: kv::sync::SecureRefreshFn,
-        state_dir: &std::path::Path,
+        snapshot_lease: KvStoreOpenLease,
     ) -> error::Result<KvStoreHandle> {
         if name.is_empty() {
             return Err(kv_storage_err(
@@ -16450,7 +16487,15 @@ impl Agent {
             ));
         }
         let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
-        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        if snapshot_lease.store_id != store_id {
+            return Err(kv_storage_err(
+                "group kv store open lease was claimed for a different binding".to_string(),
+            ));
+        }
+        let snapshot_lease = snapshot_lease.inner;
+        // The opaque lease was minted by `claim_group_kv_store_open` from
+        // this binding and carries the sole authoritative snapshot path.
+        let persist_path = snapshot_lease.path().to_path_buf();
         let store = load_group_kv_store(
             &persist_path,
             name,
@@ -16465,12 +16510,13 @@ impl Agent {
                 store,
                 &topic,
                 Some(persist_path),
+                Some(&snapshot_lease),
                 Some(secure),
                 Some(secure_refresh),
                 None,
             )
             .await?;
-
+        commit_snapshot_lease(Some(&snapshot_lease), "group store open")?;
         // Only the GROUP CREATOR (the store's anchored owner) produces
         // owner-signed checkpoints; other members never do.
         let owner_signing = if self.agent_id() == creator {
@@ -16487,6 +16533,7 @@ impl Agent {
             agent_id: self.agent_id(),
             peer_id,
             owner_signing,
+            snapshot_lease: Some(snapshot_lease),
         })
     }
 
@@ -16501,7 +16548,7 @@ impl Agent {
         creator: identity::AgentId,
         authorization: std::sync::Arc<groups::TreeKemKvAuthorizationContext>,
         protector: kv::SharedTreeKemKvProtector,
-        state_dir: &std::path::Path,
+        snapshot_lease: KvStoreOpenLease,
     ) -> error::Result<KvStoreHandle> {
         if name.is_empty() {
             return Err(kv_storage_err(
@@ -16509,7 +16556,13 @@ impl Agent {
             ));
         }
         let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
-        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        if snapshot_lease.store_id != store_id {
+            return Err(kv_storage_err(
+                "TreeKEM group open lease was claimed for a different binding".to_string(),
+            ));
+        }
+        let snapshot_lease = snapshot_lease.inner;
+        let persist_path = snapshot_lease.path().to_path_buf();
         let secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext> = authorization;
         if secure.group_id() != stable_group_id.as_bytes()
             || !secure.is_active_member(&self.agent_id())
@@ -16552,16 +16605,19 @@ impl Agent {
                 store,
                 &topic,
                 Some(persist_path),
+                Some(&snapshot_lease),
                 None,
                 None,
                 Some(protector),
             )
             .await?;
+        commit_snapshot_lease(Some(&snapshot_lease), "TreeKEM group store open")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
             peer_id,
             owner_signing: None,
+            snapshot_lease: Some(snapshot_lease),
         })
     }
 
@@ -16573,7 +16629,7 @@ impl Agent {
         creator: identity::AgentId,
         context: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
         refresh: kv::sync::SecureRefreshFn,
-        state_dir: &std::path::Path,
+        snapshot_lease: KvStoreOpenLease,
     ) -> error::Result<KvStoreHandle> {
         if name.is_empty() || context.group_id() != stable_group_id.as_bytes() {
             return Err(kv_storage_err(
@@ -16581,7 +16637,13 @@ impl Agent {
             ));
         }
         let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
-        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        if snapshot_lease.store_id != store_id {
+            return Err(kv_storage_err(
+                "public group open lease was claimed for a different binding".to_string(),
+            ));
+        }
+        let snapshot_lease = snapshot_lease.inner;
+        let persist_path = snapshot_lease.path().to_path_buf();
         let mut store = match kv::sync::load_snapshot(&persist_path) {
             Ok(Some(store)) => {
                 validate_group_kv_store_binding(
@@ -16616,16 +16678,19 @@ impl Agent {
                 store,
                 &topic,
                 Some(persist_path),
+                Some(&snapshot_lease),
                 Some(context),
                 Some(refresh),
                 None,
             )
             .await?;
+        commit_snapshot_lease(Some(&snapshot_lease), "public group store open")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
             peer_id,
             owner_signing: None,
+            snapshot_lease: Some(snapshot_lease),
         })
     }
 
@@ -16707,6 +16772,8 @@ impl Agent {
     ) -> error::Result<KvStoreHandle> {
         let store_id = kv::KvStoreId::for_self_keyed_topic(topic);
         let persist_path = Some(kv_snapshot_path(state_dir, &store_id));
+        // #760: claim before load — see create_kv_store_inner.
+        let snapshot_lease = claim_snapshot_lease(persist_path.as_deref()).await;
         let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
             Some(Ok(Some(snap))) => {
                 if snap.id() != &store_id {
@@ -16729,8 +16796,11 @@ impl Agent {
             }
         };
 
-        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
+        let (sync, peer_id) = self
+            .spawn_kv_sync(store, topic, persist_path, snapshot_lease.as_ref())
+            .await?;
 
+        commit_snapshot_lease(snapshot_lease.as_ref(), "self_keyed join")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
@@ -16738,6 +16808,7 @@ impl Agent {
             // No owner exists on a SelfKeyed store; nobody produces
             // checkpoints.
             owner_signing: None,
+            snapshot_lease,
         })
     }
 
@@ -16752,6 +16823,8 @@ impl Agent {
         // the creator's id (both derive for_topic_owner(topic, owner)).
         let store_id = kv::KvStoreId::for_topic_owner(topic, &owner);
         let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
+        // #760: claim before load — see create_kv_store_inner.
+        let snapshot_lease = claim_snapshot_lease(persist_path.as_deref()).await;
         let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
             Some(Ok(Some(snap))) => {
                 if snap.id() != &store_id {
@@ -16778,8 +16851,10 @@ impl Agent {
             }
         };
 
-        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
-
+        let (sync, peer_id) = self
+            .spawn_kv_sync(store, topic, persist_path, snapshot_lease.as_ref())
+            .await?;
+        commit_snapshot_lease(snapshot_lease.as_ref(), "join")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
@@ -16787,6 +16862,7 @@ impl Agent {
             // A joiner is not the owner and never produces checkpoints; it
             // only caches + relays owner-produced ones.
             owner_signing: None,
+            snapshot_lease,
         })
     }
 }
@@ -17066,8 +17142,57 @@ mod issue565_group_binding_tests {
 }
 
 /// Snapshot file path for a store: `<dir>/<store-id-hex>.bin`.
-fn kv_snapshot_path(dir: &std::path::Path, id: &kv::KvStoreId) -> std::path::PathBuf {
+///
+/// Canonical within one daemon's `kv_store_state_dir`; the #760 snapshot
+/// fence keys its open/retire lifecycle on exactly this path.
+pub(crate) fn kv_snapshot_path(dir: &std::path::Path, id: &kv::KvStoreId) -> std::path::PathBuf {
     dir.join(format!("{}.bin", hex::encode(id.as_bytes())))
+}
+
+/// Opaque reservation spanning a persistent group store's snapshot load,
+/// persistence arming, registration, and rollback window (#760). It also
+/// carries the derived store identity and canonical path, so constructors do
+/// not accept a separately supplied directory/path that could disagree.
+///
+/// Server callers claim this before taking group-membership or store-registry
+/// guards, then pass it to exactly one matching group-store constructor.
+#[must_use]
+pub struct KvStoreOpenLease {
+    inner: kv::snapshot_fence::StoreOpenLease,
+    store_id: kv::KvStoreId,
+}
+
+/// Claim the #760 open lease for a persistent store's snapshot path.
+///
+/// MUST run BEFORE `load_snapshot` (the opener's load must observe the
+/// retired sync's final write) and, in callers that take group-membership /
+/// registry guards, BEFORE those guards — the lease wait is exactly what
+/// must never happen under a lock a receive section takes. The plain
+/// create/join constructors run under no such guard (only the per-topic
+/// reservation, which no receive section takes), so they claim here.
+async fn claim_snapshot_lease(
+    persist_path: Option<&std::path::Path>,
+) -> Option<kv::snapshot_fence::StoreOpenLease> {
+    match persist_path {
+        Some(path) => Some(kv::snapshot_fence::claim_open(path).await),
+        None => None,
+    }
+}
+
+/// Commit a claimed lease after successful construction. A retirement that
+/// trampled the claim mid-open (secure-refresh hook or a rollback racing
+/// the construction) fails the open closed — the constructed sync is
+/// dropped, which structurally cancels it (#760).
+fn commit_snapshot_lease(
+    lease: Option<&kv::snapshot_fence::StoreOpenLease>,
+    what: &str,
+) -> error::Result<()> {
+    match lease {
+        Some(lease) if !lease.commit() => Err(kv_storage_err(format!(
+            "kv snapshot path was retired while opening ({what}); retry the open"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Shorthand for the storage-flavoured [`error::IdentityError`].
@@ -17088,6 +17213,11 @@ pub struct KvStoreHandle {
     /// (creator path). Used to produce owner-signed content checkpoints on
     /// each write so replicas can cold-recover while the owner is offline.
     owner_signing: Option<std::sync::Arc<OwnerSigningMaterial>>,
+    /// #760 lease over the canonical snapshot path (`None` for
+    /// non-persistent stores). Shared by every clone: retirement marking
+    /// is idempotent across clones, and the drain obligation completes
+    /// exactly once per retirement.
+    snapshot_lease: Option<kv::snapshot_fence::StoreOpenLease>,
 }
 
 /// Serialized owner keypair for checkpoint signing (held only by the owner's
@@ -17133,6 +17263,11 @@ impl KvStoreHandle {
         during: F,
     ) -> F::Output {
         self.sync.with_persist_gate_held_for_test(during).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_merged_for_test(&self) {
+        self.sync.wait_receive_merged_for_test().await;
     }
 
     #[cfg(test)]
@@ -17254,40 +17389,74 @@ impl KvStoreHandle {
         self.sync.read().await.latest_checkpoint.is_some()
     }
 
-    /// Fully retire this handle: invalidate the secure context (group
-    /// lifecycle — local authorization fails closed immediately) AND cancel
-    /// the background sync loops.
+    /// Fully retire this handle: synchronously mark the snapshot-path fence
+    /// `Retiring` (#760), invalidate the secure context (group lifecycle —
+    /// local authorization fails closed immediately), and cancel the
+    /// background sync loops.
     ///
     /// Called when the bound group disappears locally (leave, removal,
-    /// withdrawal). Even a clone of this handle held elsewhere afterwards
-    /// refuses local writes (membership is gone) and every seal/open — a
-    /// departed member cannot keep operating a group store on a stale
-    /// secret/roster snapshot.
+    /// withdrawal; rollback paths). Even a clone of this handle held
+    /// elsewhere afterwards refuses local writes (membership is gone) and
+    /// every seal/open — a departed member cannot keep operating a group
+    /// store on a stale secret/roster snapshot.
     ///
-    /// Non-blocking, so it is a REQUEST: one receive section already past its
-    /// cancel check may still finish — merge and snapshot write — after this
-    /// returns, and can race a later re-open of the same snapshot path
-    /// (#757; residual tracked in #760). Use
-    /// [`retire_and_drain`](Self::retire_and_drain) where that matters and no
-    /// section-internal lock is held.
+    /// Safe under ANY lock (registry, membership, `named_groups`) and from
+    /// inside a receive section (the secure-refresh hooks): the fence mark,
+    /// the invalidation, and the cancel are all synchronous, and the drain
+    /// is deferred to a detached task that holds nothing. The drain — and
+    /// with it the fence completion that un-blocks a re-open of the same
+    /// snapshot path — therefore happens only after this caller's guards
+    /// release; a receive section already past its cancel check finishes
+    /// (merge + snapshot write, #757) before any re-open can load the file.
+    /// Caller-driven persistence that was already in flight is fenced out
+    /// by the re-open's younger persist generation and fails closed
+    /// ([`kv::KvError::SnapshotSuperseded`]).
     pub fn retire(&self) {
+        let retirement = self
+            .snapshot_lease
+            .as_ref()
+            .and_then(kv::snapshot_fence::StoreOpenLease::begin_retire);
         self.sync.invalidate_secure_context();
         self.sync.cancel_sync();
+        if let Some(retirement) = retirement {
+            let sync = std::sync::Arc::clone(&self.sync);
+            // Deferred drain + fence completion (#760): `retire()` is
+            // callable under locks a receive section takes, so the drain
+            // must run detached. No runtime means no background loops can
+            // exist (they were spawned on one), so there is nothing to
+            // drain — the Retiring mark stands for the process lifetime.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    sync.cancel_sync_and_drain().await;
+                    retirement.complete();
+                });
+            }
+        }
     }
 
     /// [`retire`](Self::retire), then wait until no background merge,
-    /// ownership update or snapshot write for this store is in flight (#757);
-    /// none can start afterwards. Read-only state serves and the bootstrap
-    /// requester's publish are outside that fence and may still be finishing.
+    /// ownership update or snapshot write for this store is in flight
+    /// (#757) — none can start afterwards — and complete the snapshot-path
+    /// fence so a re-open of the same path may proceed immediately (#760).
+    /// Read-only state serves and the bootstrap requester's publish are
+    /// outside that fence and may still be finishing.
     ///
-    /// Must not be awaited while holding a lock a receive section takes: the
-    /// named-groups map or the store registry (secure-refresh hook), and for
-    /// TreeKEM stores the group membership guard (`merge_main_record`). The
-    /// refresh hooks themselves run inside a section. Those callers keep
-    /// `retire`; the re-open race that leaves is tracked in #760.
+    /// Must not be awaited while holding a lock a receive section takes:
+    /// the named-groups map or the store registry (secure-refresh hook),
+    /// and for TreeKEM stores the group membership guard
+    /// (`merge_main_record`). The refresh hooks themselves run inside a
+    /// section. Those callers use [`retire`](Self::retire), whose deferred
+    /// drain performs the same completion.
     pub async fn retire_and_drain(&self) {
+        let retirement = self
+            .snapshot_lease
+            .as_ref()
+            .and_then(kv::snapshot_fence::StoreOpenLease::begin_retire);
         self.sync.invalidate_secure_context();
         self.sync.cancel_sync_and_drain().await;
+        if let Some(retirement) = retirement {
+            retirement.complete();
+        }
     }
 
     /// Whether this store's background receive sections run a TreeKEM
@@ -19801,6 +19970,92 @@ mod tests {
             "append_only requested over a Signed snapshot must fail closed"
         );
         agent3.shutdown().await;
+    }
+
+    /// Constructor-layer #760 selector: a lease claimed while the old handle
+    /// is active, then trampled by its retirement, must be refused by the
+    /// actual Agent constructor before it can arm or write a stale snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_constructor_refuses_trampled_snapshot_lease_and_preserves_admitted_delta() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let topic = "760-constructor-trample";
+        let old = agent
+            .create_kv_store_persistent("old", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect("old store");
+        let store_id = kv::KvStoreId::for_topic_owner(topic, &agent.agent_id());
+        let path = kv_snapshot_path(&state_dir, &store_id);
+        // Claim B before old retires: this is the predecessor-backed lease
+        // that production wiring must pass to lease-aware arming.
+        let stale_lease = claim_snapshot_lease(Some(&path))
+            .await
+            .expect("persistent lease");
+
+        let mut delta = kv::KvStoreDelta::new(1);
+        delta.added.insert(
+            "admitted-a".to_string(),
+            (
+                kv::KvEntry::new(
+                    "admitted-a".to_string(),
+                    b"a".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (old.peer_id(), 1),
+            ),
+        );
+        old.with_persist_gate_held_for_test(async {
+            old.publish_delta_for_test(delta).await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                old.wait_receive_merged_for_test(),
+            )
+            .await
+            .expect("A admitted before persist");
+            let stale_image = kv::sync::load_snapshot(&path)
+                .expect("baseline decodes")
+                .expect("baseline exists");
+            assert!(stale_image.get("admitted-a").is_none());
+
+            old.retire();
+            let result = agent
+                .spawn_kv_sync(stale_image, topic, Some(path.clone()), Some(&stale_lease))
+                .await;
+            let error = match result {
+                Ok(_) => panic!("trampled lease must fail in the Agent constructor"),
+                Err(error) => error,
+            };
+            assert!(format!("{error}").contains("snapshot superseded"));
+        })
+        .await;
+
+        // Waiting for the next claim is the deterministic detached-drain
+        // barrier. No membership or registry lock is held here.
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            claim_snapshot_lease(Some(&path)),
+        )
+        .await
+        .expect("retirement drain completes")
+        .expect("persistent retry lease");
+        let raw = kv::sync::load_snapshot(&path)
+            .expect("final snapshot decodes")
+            .expect("final snapshot exists");
+        assert!(
+            raw.get("admitted-a").is_some(),
+            "constructor did not suppress A"
+        );
+        drop(retry);
+        agent.shutdown().await;
     }
 
     /// SelfKeyed directories end-to-end at the handle layer (issue #340):

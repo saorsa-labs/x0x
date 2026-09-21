@@ -775,3 +775,155 @@ async fn treekem_stale_snapshot_may_resurrect_a_cleared_marker() -> Result<()> {
     );
     Ok(())
 }
+
+/// #732 r8 (boundary review, Sol P1): the TreeKEM atomic writer used to
+/// insert its `info` into ONE map key, encode that divergent candidate
+/// durably, and install the same single slot into memory — so the
+/// documented stale-marker resurrection (the test above) wrote a MARKED
+/// exact alias beside a CLEAN sibling of the same stable id, and a caller
+/// resolving by the clean spelling bypassed containment while the writer's
+/// own spelling was contained. The durable candidate and both memory
+/// installs now converge, so the resurrection reaches EVERY spelling, in
+/// memory and on disk.
+#[tokio::test]
+async fn treekem_stale_marker_resurrection_spreads_to_every_alias_spelling() -> Result<()> {
+    let (state, _dir, owner) = owner_axis_state().await?;
+    let (id, mut stale, group) = seed_treekem_group(&state, &owner, 0x63).await?;
+    stale.fork_quarantine = Some(marker(11, false));
+
+    // The legitimate alias shape: a second, differently keyed record for the
+    // same stable id, clean like the live one.
+    let alias_key = format!("issue732-treekem-alias-{id}");
+    let mut alias = stale.clone();
+    alias.fork_quarantine = None;
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(alias_key.clone(), alias);
+
+    persist_treekem_and_named_groups_atomic_with_info(&state, &id, stale, &group)
+        .await
+        .expect("the install direction must NOT be gated — see the test above");
+
+    // Memory: BOTH spellings contained, byte-identical marker, and an exact
+    // key still resolves to itself (the resolver prefers exact keys, which is
+    // exactly why a clean duplicate was a silent bypass).
+    {
+        let groups = state.named_groups.read().await;
+        for key in [id.as_str(), alias_key.as_str()] {
+            let (resolved_key, info) = crate::server::resolve_group_entry_locked(&groups, key)
+                .ok_or_else(|| anyhow::anyhow!("resolver lost {key}"))?;
+            assert_eq!(resolved_key, key, "an exact key must resolve to itself");
+            assert!(
+                info.is_fork_quarantined(),
+                "#732 r8: the resurrection reached the `{key}` spelling"
+            );
+        }
+        let marked = groups[&id]
+            .fork_quarantine
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("marker missing on the writer's spelling"))?;
+        assert_eq!(
+            groups[&alias_key].fork_quarantine.as_ref(),
+            Some(&marked),
+            "both spellings carry the SAME marker — no divergence survives the writer"
+        );
+    }
+    // Disk: the converged candidate is what was encoded, so the merged
+    // reload carries the same whole containment on every spelling.
+    let merged =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert!(
+        merged[&alias_key].fork_quarantine.is_some(),
+        "the durable candidate was converged BEFORE encoding"
+    );
+    assert_eq!(
+        merged[&alias_key].fork_quarantine, merged[&id].fork_quarantine,
+        "the disk bytes agree across spellings"
+    );
+    Ok(())
+}
+
+/// #732 r8: the token is a property of the GROUP, not the spelling. Two
+/// spellings of one stable id must answer the SAME token — and, the review
+/// constraint that rejected a `max` fold, a LAGGING spelling's advance must
+/// MOVE it: with spellings at 4 and 9, `max` stays 9 when the 4 advances to
+/// 5, and this token's contract is that a lifecycle advance is DETECTED.
+/// Equalizing the spelling must never weaken the change detector.
+#[test]
+fn group_wide_token_is_identical_across_spellings_and_detects_a_lagging_advance() -> Result<()> {
+    let creator = x0x::identity::AgentId([7u8; 32]);
+    let stable = "71".repeat(32);
+    let alias_key = format!("{stable}-alias");
+    let seeded = |revision: u64| {
+        let mut info = group(creator, &stable);
+        info.state_revision = revision;
+        info.fork_quarantine = Some(marker(3, false));
+        info
+    };
+
+    let mut groups = std::collections::HashMap::new();
+    groups.insert(alias_key.clone(), seeded(4));
+    groups.insert(stable.clone(), seeded(9));
+
+    let by_alias = crate::server::lifecycle_epoch_token_locked(&groups, &alias_key)
+        .ok_or_else(|| anyhow::anyhow!("token missing for the alias spelling"))?;
+    let by_stable = crate::server::lifecycle_epoch_token_locked(&groups, &stable)
+        .ok_or_else(|| anyhow::anyhow!("token missing for the stable spelling"))?;
+    assert_eq!(
+        by_alias, by_stable,
+        "the token cannot depend on the spelling"
+    );
+
+    // Permuting the SAME revision multiset across alias keys must not move the
+    // token. The former binary reducer kept the first revision raw and mixed
+    // only later operands, so this content swap changed the result despite no
+    // group-wide lifecycle change.
+    groups.insert(alias_key.clone(), seeded(9));
+    groups.insert(stable.clone(), seeded(4));
+    let after_permutation = crate::server::lifecycle_epoch_token_locked(&groups, &stable)
+        .ok_or_else(|| anyhow::anyhow!("token missing after alias content permutation"))?;
+    assert_eq!(
+        after_permutation, by_stable,
+        "the alias revision fold must be symmetric, not dependent on which key holds a revision"
+    );
+
+    // Restore the original placement, then advance the LAGGING spelling: 4 ->
+    // 5. A `max` fold would not move.
+    groups.insert(alias_key.clone(), seeded(5));
+    groups.insert(stable.clone(), seeded(9));
+    let after_lagging_alias = crate::server::lifecycle_epoch_token_locked(&groups, &stable)
+        .ok_or_else(|| anyhow::anyhow!("token missing after the lagging advance"))?;
+    assert_ne!(
+        by_stable, after_lagging_alias,
+        "a lagging spelling's advance must be DETECTED — max would hide it"
+    );
+    assert_eq!(
+        after_lagging_alias,
+        crate::server::lifecycle_epoch_token_locked(&groups, &alias_key)
+            .ok_or_else(|| anyhow::anyhow!("token missing"))?,
+        "and both spellings still agree on the moved token"
+    );
+
+    // The LEADING spelling advances too: 9 -> 10. Also detected.
+    groups.insert(stable.clone(), seeded(10));
+    let after_leading = crate::server::lifecycle_epoch_token_locked(&groups, &alias_key)
+        .ok_or_else(|| anyhow::anyhow!("token missing after the leading advance"))?;
+    assert_ne!(
+        after_leading, after_lagging_alias,
+        "the leading spelling's advance is detected too"
+    );
+
+    // A single-spelling group keeps the identity fold: one entry, one token.
+    let single = seeded(6);
+    let expected = single.lifecycle_epoch_token();
+    let mut solo = std::collections::HashMap::new();
+    solo.insert(stable.clone(), single);
+    assert_eq!(
+        crate::server::lifecycle_epoch_token_locked(&solo, &stable),
+        Some(expected),
+        "the fold of one spelling is that spelling's token, unchanged"
+    );
+    Ok(())
+}

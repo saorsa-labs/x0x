@@ -3385,11 +3385,19 @@ fn evaluate_fork_evidence_candidate(
 /// the evidence path to those groups, and for them the installed
 /// quarantine marker IS the record — without this arm every later
 /// conflict on an already-contained ordinary group would re-evaluate,
-/// re-install and re-warn. Lineage-bearing groups keep the pre-ADR-0066
-/// test exactly (the marker is not consulted for them).
+/// re-install and re-warn. #732 r8 (Sol, mixed-lineage aliases): a
+/// LINEAGE-BEARING spelling counts the marker too — otherwise a group
+/// whose convergence carried the marker but whose lineage slot holds no
+/// evidence (a TreeKEM resurrection write, or convergence from a
+/// lineage-less authoritative sibling) would let an IDENTICAL conflict
+/// re-install, and the non-durable rollback of that retry would then
+/// identity-match and delete the pre-existing marker — the exact erasure
+/// the gate exists to prevent. Clears remove marker and evidence together
+/// (`reset_fork_evidence_after_quarantine_clear`), so re-arming after a
+/// genuine clear is unchanged.
 fn fork_evidence_already_recorded(current: &x0x::groups::GroupInfo) -> bool {
     match current.invite_lineage.as_ref() {
-        Some(lineage) => lineage.fork_evidence.is_some(),
+        Some(lineage) => lineage.fork_evidence.is_some() || current.fork_quarantine.is_some(),
         None => current.fork_quarantine.is_some(),
     }
 }
@@ -3487,6 +3495,48 @@ fn fork_candidate_authenticated(
         })
 }
 
+// #732 r4 (cross-model review, P1 — twice) — WHY RECOVERY NEVER HONOURS A
+// CLEAR, and the predicate that used to live here.
+//
+// An earlier round let a forward journal replay clear a marker if its terminal
+// commit verified, bound its outer claim,
+// chained from the live head, satisfied
+// [`x0x::groups::ForkQuarantine::owner_anchored_clear_permitted`] at the
+// signed revision, and was signed by an agent the LIVE roster certified
+// under the policy owner. Both reviewers then showed independently that the
+// last of those is NOT owner authorization:
+//
+// - in an OwnerCertified group EVERY seated member's certificate binds the
+//   owner key, so "certified under the owner" degenerates to "any live-seated
+//   Active+Admin" — and quarantine evicts nobody, so the FORKER is still
+//   seated. Holding only its own agent key it can sign a fresh higher-revision
+//   DESCENDANT of the contested live head and satisfy every check. Ancestry
+//   only excludes the other existing branch; it cannot stop this branch being
+//   extended;
+// - and the check read only the certificate's owner public key — neither the
+//   certificate's own signature nor its binding to `committed_by`.
+//
+// [`x0x::groups::GroupInfo::clear_fork_quarantine_on_explicit_owner_seal`]
+// makes the distinction explicit: an ADR-0038 certificate VERDICT is not an
+// owner anchor; that arm requires the OWNER USER KEY in hand. The other two
+// live arms require a verified mandate-carrying commit
+// ([`apply_named_group_metadata_event_inner_serialized`]) or the adoption
+// walk's terminal verification ([`try_adopt_member_added_across_gap`]).
+//
+// Neither the owner user key nor an [`x0x::groups::OwnerMandate`] is persisted
+// with a group record: `RetainedCommit` carries the commit, its roster
+// projection and its public meta, and `GroupInfo` keeps only the OBSERVATIONAL
+// `mandate_capability` map. So there is NO material on disk from which
+// recovery could establish owner authorization of equal strength, and #732
+// deliberately does not add any — persisting owner-signed clear provenance is
+// a schema change that belongs to its own ADR, not to a containment fix.
+//
+// Therefore a forward replay NEVER lifts containment. The cost is a liveness
+// edge, stated in the runbook: a crash between staging an owner-anchored clear
+// and saving it leaves the marker in place, and the operator clears it once by
+// hand. The alternative is a silent containment bypass reachable by the very
+// adversary the marker exists to contain.
+
 /// #468 A5 (r3 Fable 2 + Codex 9): install one evaluated fork-evidence
 /// record on the group's lineage DURABLY, through the standard mutation
 /// helper, SYNCHRONOUSLY — the caller awaits it; nothing is spawned and
@@ -3529,9 +3579,19 @@ async fn rollback_live_fork_evidence(
     let hash = evidence.state_hash.clone();
     let by = evidence.committed_by.clone();
     let mut groups = state.named_groups.write().await;
+    // #732 r8: the rollback is the ONE containment mutation that deliberately
+    // does not persist (it undoes an install that reached memory but not
+    // durability), so it is also the one site that applies the invariant itself.
+    // `before` is this map as it stands, so the rolled-back slot becomes the
+    // authoritative one and its restored value — evidence and marker together —
+    // is copied to every sibling. Codex's r7 case is closed by construction: a
+    // sibling's "pre-existing identical" evidence cannot exist independently,
+    // because siblings are never independent.
+    let before = groups.clone();
     // ADR0066-LOOKUP-WAIVER: `group_key` is the resolved key the caller (`install_fork_evidence`'s
     // rollback arm) already mutated under; a miss is a no-op that leaves the
-    // evidence in place, which the retry semantics already tolerate.
+    // evidence in place, which the retry semantics already tolerate, and the
+    // invariant at the end spreads whatever this slot ends up holding.
     let Some(info) = groups.get_mut(group_key) else {
         return;
     };
@@ -3564,6 +3624,14 @@ async fn rollback_live_fork_evidence(
     }) {
         info.fork_quarantine = None;
     }
+    // #732 r8: the rollback is the ONE containment mutation that deliberately
+    // does not persist (it undoes an install that reached memory but not
+    // durability), so it applies the invariant itself. The rolled-back slot is
+    // the authoritative one and its restored value is copied to every sibling.
+    // Codex's r7 case closes by construction: a sibling's "pre-existing
+    // identical" evidence cannot exist independently, because under INV siblings
+    // are never independent.
+    enforce_containment_invariant(&mut groups, &before);
 }
 
 async fn install_fork_evidence(
@@ -3578,11 +3646,25 @@ async fn install_fork_evidence(
     let install = |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
         // ADR0066-LOOKUP-WAIVER: `install_key` is the map key this function was CALLED with — the apply
         // path's already-resolved record (`resolved_group_key`). Resolving again
-        // here could name a different record than the caller decided about, and
-        // a miss refuses the install rather than installing on a guess.
         let Some(info) = groups.get_mut(&install_key) else {
             return false;
         };
+        // #732 r8 (root review, atomic admission): a marker ALREADY
+        // present means this group is already contained — first-complete-
+        // wins — so the install refuses HERE, inside the locked mutation,
+        // not only at the earlier `fork_evidence_already_recorded` check.
+        // That early gate reads a `current` cloned before the persistence
+        // lock was taken, so a marker that lands in between (a concurrent
+        // install, or convergence from a sibling spelling) would otherwise
+        // slip a stale observation through: the lineage arm below would
+        // fill an EMPTY evidence slot, `get_or_insert` would retain the
+        // pre-existing marker, and a non-durable rollback of this install
+        // would then identity-match and DELETE that pre-existing marker.
+        // Refusing on marker presence keeps marker and evidence one
+        // first-complete-wins decision at the only point both are written.
+        if info.fork_quarantine.is_some() {
+            return false;
+        }
         match info.invite_lineage.as_mut() {
             // ADR-0064: evidence and quarantine marker land in ONE
             // first-complete-wins mutation — the marker is exactly as
@@ -3597,15 +3679,18 @@ async fn install_fork_evidence(
             // no lineage record to hold the evidence, so the MARKER is the
             // durable record and carries the same first-complete-wins
             // rule. Without a marker there is nothing to install at all
-            // (the pre-ADR-0066 no-op), and a group already carrying one
-            // keeps it.
+            // (the pre-ADR-0066 no-op); the marker-presence refusal above
+            // is what keeps an already-carried one.
             None => {
-                if quarantine.is_none() || info.fork_quarantine.is_some() {
+                if quarantine.is_none() {
                     return false;
                 }
             }
         }
         if let Some(marker) = quarantine {
+            // #732 r8: one slot is enough — `enforce_containment_invariant` copies
+            // this slot's containment to every spelling before the persist.
+            //
             // ADR0066-LOOKUP-WAIVER: `install_key` is the map key this function was CALLED with and already
             // used for the decision above — not a caller-supplied id. Re-resolving
             // would pick a different record than the one just inspected.
@@ -4351,7 +4436,20 @@ pub(in crate::server) async fn store_named_group_info(
     info: x0x::groups::GroupInfo,
 ) -> bool {
     let mut groups = state.named_groups.write().await;
-    store_named_group_info_locked(&mut groups, group_id, info)
+    // ADR0066-LOOKUP-WAIVER: `group_id` is the exact map key the caller is
+    // about to replace below — not a quarantine lookup at all. The scoped
+    // #732 r8 invariant afterwards spreads whatever containment this one
+    // record ends up carrying to every alias spelling of its stable id, so
+    // this non-persisting store cannot release the write lock on a map that
+    // disagrees about containment (the next save carries the spread).
+    let before = groups
+        .get(group_id)
+        .map(|info| (info.stable_group_id().to_string(), containment_of(info)));
+    if !store_named_group_info_locked(&mut groups, group_id, info) {
+        return false;
+    }
+    enforce_containment_invariant_for_store(&mut groups, group_id, before);
+    true
 }
 
 /// Apply one shared-roster mutation as a persistence transaction.
@@ -4429,6 +4527,16 @@ where
         if !mutate(&mut groups) {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
+        // #732 r8: ONE of the FOUR containment chokepoints. The others are
+        // `persist_named_group_info`'s transaction, the TreeKEM atomic
+        // writer's durable candidate, and the scoped entry in
+        // `store_named_group_info` — none of which pass through here.
+        // Together the four cover every map write that can carry
+        // containment, and the `before` clone the compare-and-restore already
+        // needs IS the pre-mutation snapshot the invariant wants — so
+        // enforcing INV here costs nothing and removes every per-site alias
+        // loop.
+        enforce_containment_invariant(&mut groups, &before);
         let after = groups.clone();
         (before, after)
     };
@@ -5016,6 +5124,16 @@ pub(in crate::server) async fn persist_named_group_info(
         {
             confirmed_stub = true;
         }
+        // #732 r8: the SECOND containment chokepoint. This transaction does
+        // NOT pass through `persist_named_groups_mutation_unlocked`, so the
+        // invariant is enforced HERE, against the same pre-mutation snapshot
+        // the pre-durable rollback below restores. The owner-anchored clear
+        // arms that persist a cleared record through this function —
+        // adoption, the mandate-carrying apply, both explicit-seal arms —
+        // thereby reach EVERY alias spelling, and a clear survives reload
+        // because the journal and save below serialize the post-invariant
+        // map.
+        enforce_containment_invariant(&mut groups, &snapshot);
         snapshot
     };
     // Journal-first (TreeKEM-plane groups only; NotApplicable otherwise).
@@ -12958,12 +13076,16 @@ pub(in crate::server) async fn clear_group_quarantine(
     }
     let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
     let outcome = persist_named_groups_mutation(&state, |groups| {
+        // #732 r8: one slot is enough. An alias sibling used to stay quarantined
+        // after a successful clear; `enforce_containment_invariant` now copies
+        // this slot's containment — ABSENCE included — to every spelling before
+        // the persist, so the r7 alias loop here is redundant.
+        //
         // ADR0066-LOOKUP-WAIVER: `map_key` is what the shared resolver returned
         // for EITHER spelling above, so this writes to the record that read
-        // decided about; re-resolving here would be a second, racier lookup of
-        // the same group. A concurrent rename of the key is the only way it
-        // misses, and then it is a no-op that leaves the marker in place —
-        // never a clear of the wrong group.
+        // decided about, and the invariant above spreads it. A concurrent rename
+        // of the key is the only way it misses, and then it is a no-op that
+        // leaves the marker in place — never a clear of the wrong group.
         if let Some(info) = groups.get_mut(&map_key) {
             info.fork_quarantine = None;
             // ADR-0064 slice 4: the manual clear also re-arms the
@@ -24766,6 +24888,18 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
                 next_groups.retain(|key, _| key == group_id_hex || !pending.contains(key));
             }
         }
+        // #732 r8 (boundary review, Sol P1): the FOURTH containment
+        // chokepoint. This whole-map writer bypasses the persist helpers, so
+        // the durable candidate itself is converged HERE — the inserted slot
+        // is the authoritative one (Rule 1), which is what makes the
+        // documented stale-marker resurrection SPREAD to every alias
+        // spelling instead of writing a marked exact alias beside a clean
+        // sibling that `resolve_group_entry_locked` would then serve
+        // uncontained. Both memory installs below re-derive the same
+        // convergence on the live map rather than swapping this candidate in
+        // whole, because some map writers do not take the persistence lock;
+        // containment cannot have moved under it, so the results agree.
+        enforce_containment_invariant(&mut next_groups, &groups);
         // #451 (merged main): the two-file split encoder.
         encode_named_groups_store(&next_groups)
             .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
@@ -24841,11 +24975,17 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
             // The destination is visible with this exact candidate. Install
             // the same view in memory and fence every later roster transition
             // until an identical replacement reaches directory durability.
-            state
-                .named_groups
-                .write()
-                .await
-                .insert(group_id_hex.to_string(), info);
+            // #732 r8: the install CONVERGES (the encoded candidate did) —
+            // re-derived on the live map rather than swapped whole, because
+            // some map writers do not take this persistence lock; containment
+            // cannot have moved under it, so the alias group lands on exactly
+            // the encoded bytes.
+            {
+                let mut groups = state.named_groups.write().await;
+                let before = groups.clone();
+                groups.insert(group_id_hex.to_string(), info);
+                enforce_containment_invariant(&mut groups, &before);
+            }
             state
                 .named_groups_requires_durability_confirmation
                 .store(true, Ordering::Release);
@@ -24855,11 +24995,14 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
             anyhow::bail!("named groups replacement did not occur");
         }
     }
-    state
-        .named_groups
-        .write()
-        .await
-        .insert(group_id_hex.to_string(), info);
+    // #732 r8: the durable install converges the same way (see the
+    // ReplacedNotDurable arm).
+    {
+        let mut groups = state.named_groups.write().await;
+        let before = groups.clone();
+        groups.insert(group_id_hex.to_string(), info);
+        enforce_containment_invariant(&mut groups, &before);
+    }
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
@@ -24952,8 +25095,17 @@ async fn record_recovery_fork_evidence(
     let Some(live) = live else {
         return;
     };
-    if live.invite_lineage.is_none() {
-        // No lineage to carry evidence — nothing to install.
+    // #732 (Codex audit finding 2) — the recovery trigger now uses the SAME
+    // population predicate as the live apply hook
+    // ([`fork_evidence_path_open`]): an ordinary group formed without an
+    // invite has no lineage record to hold evidence, but ADR-0066 §2 gives
+    // it the MARKER as the durable record. The pre-#732 shape returned here
+    // for every lineage-free group, so an authenticated equal-revision
+    // conflict found at STARTUP quarantined the journals aside and left the
+    // live group's data plane wide open — the one population §2 exists to
+    // contain. An owner-axis group without lineage stays fenced exactly as
+    // it shipped (it is an authority-side record, not a joiner stub).
+    if !fork_evidence_path_open(live) {
         return;
     }
     let journal_commit =
@@ -24978,6 +25130,58 @@ async fn record_recovery_fork_evidence(
         );
         return;
     }
+    // #732 r2 (cross-model review, P1) — BIND THE CLAIMED CONFLICT TO THE
+    // VERIFIED COMMIT. `fork_candidate_authenticated` proves the journal's
+    // terminal commit is genuine and its committer held an Active+Admin seat,
+    // but the record's OUTER `state_revision`/`state_hash` are plain fields
+    // beside it: a local journal writer could copy the live record, alter
+    // ONLY the outer hash, keep the untouched valid commit, and the
+    // paired-replay verdict — which compares those outer scalars — would call
+    // it a fork. That installed a permanent `no_anchor` marker with no
+    // authenticated CONFLICTING commit behind it, and a `no_anchor` marker
+    // never auto-clears. So two bindings, both cheap:
+    //
+    // (a) the frontier the journal CLAIMS must be the one the verified commit
+    //     signs — same group, same revision, same state hash. Any of the
+    //     three differing means the claim is not what was signed.
+    // (b) that verified commit must genuinely CONFLICT with the live
+    //     committed state at the same revision, which is the live hook's own
+    //     definition of a fork (two different commits at one revision). The
+    //     live terminal header is the comparison, and it is always available:
+    //     the log trims oldest-first, so the terminal is retained, and
+    //     `terminal_commit_header` recomputes it from live state otherwise.
+    //
+    // A journal whose outer fields were edited fails (a). Check (b) is NOT
+    // redundant behind it, as #732 r2 claimed: the MIRROR forgery edits the
+    // LIVE record's outer `state_hash` and leaves its signed log intact, so
+    // `terminal_commit_header` returns the log's hash, (a) passes on a
+    // perfectly consistent journal, and only (b) stops the install. Recovery
+    // establishes no live outer/header invariant, so both checks are
+    // load-bearing. Neither installs anything, and both leave the journals to
+    // the quarantine-aside the caller performs.
+    if journal_commit.group_id != live.stable_group_id()
+        || journal_commit.revision != journal_revision
+        || journal_commit.state_hash != journal_state_hash
+    {
+        tracing::warn!(
+            group_id = %journal.group_id_hex,
+            claimed = ?(journal_revision, journal_state_hash),
+            signed = ?(journal_commit.revision, journal_commit.state_hash.clone()),
+            "#732: journal record's claimed frontier is not the one its verified commit signs — no evidence, no marker"
+        );
+        return;
+    }
+    if live.state_revision != journal_commit.revision
+        || live.terminal_commit_header().state_hash == journal_commit.state_hash
+    {
+        tracing::debug!(
+            group_id = %journal.group_id_hex,
+            live_revision = live.state_revision,
+            commit_revision = journal_commit.revision,
+            "#732: the verified journal commit does not conflict with the live committed state at its revision — no evidence, no marker"
+        );
+        return;
+    }
     let evidence = x0x::groups::ForkEvidence {
         revision: journal_revision,
         state_hash: journal_state_hash.to_string(),
@@ -24986,11 +25190,12 @@ async fn record_recovery_fork_evidence(
     };
     // ADR-0064 → ADR-0066 §2: the recovery install writes the quarantine
     // marker in the SAME store mutation as the evidence record, with the
-    // same per-population `no_anchor` rule as the live path. This path
-    // stays fenced to lineage-bearing groups: the store loop below needs a
-    // lineage record to hold the evidence, and ADR-0066 slice 2 widens the
-    // LIVE apply fence only.
+    // same per-population `no_anchor` rule as the live path — so an
+    // ordinary group gets `no_anchor: true` here for the same reason it
+    // does there (no owner axis ⇒ nothing can clear it automatically).
     let quarantine = fork_quarantine_for_evidence(live, &evidence, &journal_commit, None);
+    let live_stable = live.stable_group_id().to_string();
+    let live_is_lineage_free = live.invite_lineage.is_none();
     for store_path in [named_groups_path, home_suite_groups_path] {
         let Ok(json) = tokio::fs::read_to_string(store_path).await else {
             continue;
@@ -24999,15 +25204,46 @@ async fn record_recovery_fork_evidence(
         else {
             continue;
         };
-        let Some(record) = store.get_mut(&journal.group_id_hex) else {
+        // #732 — both spellings at file level (no live map exists this
+        // early in startup to resolve through): the direct key, then a scan
+        // by `stable_group_id()` for an alias-keyed store. A single-spelling
+        // lookup here silently installed nothing on an alias-keyed store.
+        let Some(record_key) = store
+            .get(&journal.group_id_hex)
+            .filter(|info| info.stable_group_id() == live_stable)
+            .map(|_| journal.group_id_hex.clone())
+            .or_else(|| {
+                store
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == live_stable)
+                    .map(|(key, _)| key.clone())
+            })
+        else {
             continue;
         };
-        let Some(lineage) = record.invite_lineage.as_mut() else {
-            // Legacy-store sentinel for a sidecar record — skip.
+        let Some(record) = store.get_mut(&record_key) else {
             continue;
         };
-        if !fork_evidence_first_complete_wins(lineage, &evidence) {
-            continue;
+        match record.invite_lineage.as_mut() {
+            Some(lineage) => {
+                if !fork_evidence_first_complete_wins(lineage, &evidence) {
+                    continue;
+                }
+            }
+            // ADR-0066 §2/R2 — the lineage-free ordinary group: the MARKER
+            // is the durable record and carries the same
+            // first-complete-wins rule as the live install
+            // ([`install_fork_evidence`]'s `None` arm). Without a marker
+            // there is nothing to install; a group already contained keeps
+            // the marker it has.
+            None if live_is_lineage_free => {
+                if quarantine.is_none() || record.fork_quarantine.is_some() {
+                    continue;
+                }
+            }
+            // Legacy-store sentinel for a sidecar record of a
+            // lineage-BEARING group — skip, exactly as before #732.
+            None => continue,
         }
         // ADR-0064: install the marker with the evidence in the same
         // store re-encode — one write, one rollback surface.
@@ -25028,7 +25264,8 @@ async fn record_recovery_fork_evidence(
                     revision = evidence.revision,
                     state_hash = %evidence.state_hash,
                     committed_by = %LogHexId::agent(&evidence.committed_by),
-                    "#468 recovery: journal-recovery fork evidence recorded on the live lineage (no eviction; #472 owns the protocol response)"
+                    lineage_free = live_is_lineage_free,
+                    "#468 recovery / #732: journal-recovery fork evidence recorded (on the live lineage, or as the marker alone for a lineage-free ordinary group) — no eviction; #472 owns the protocol response"
                 );
                 return;
             }
@@ -26477,7 +26714,7 @@ async fn merge_group_record_into_store_file(
     let mut journal_view: HashMap<String, x0x::groups::GroupInfo> =
         serde_json::from_str(journal_image_json)
             .with_context(|| format!("parse {label} journal image"))?;
-    let Some(record) = journal_view.remove(group_id_hex) else {
+    let Some(mut record) = journal_view.remove(group_id_hex) else {
         // The journal predates this group's presence in that half —
         // nothing to merge for it.
         return Ok(());
@@ -26493,6 +26730,140 @@ async fn merge_group_record_into_store_file(
         };
     // Remove stale aliases (the record's stable id supersedes them).
     let stable = record.stable_group_id().to_string();
+    // #732 (Codex audit finding 1) — A QUARANTINE MARKER IS LOCAL
+    // CONTAINMENT STATE, NOT JOURNAL STATE. The journal image is a
+    // whole-file snapshot captured at stage time; an ADR-0066 marker (and
+    // the lineage `fork_evidence` record that justifies it) is installed
+    // AFTERWARDS by a mutation that deliberately does NOT advance
+    // `state_revision`/`state_hash`. So a pair retained by a post-commit
+    // failure (see `persist_named_group_info`, which leaves both journals
+    // in place once the named save is durable) replays at the SAME
+    // committed frontier the verdict calls `Apply` — and the wholesale
+    // record replacement below would silently erase a durable containment
+    // decision that never auto-clears. So the containment PAIR (the marker
+    // and the lineage `fork_evidence` record that justifies it — the two
+    // fields every clear arm removes together, see
+    // `GroupInfo::reset_fork_evidence_after_quarantine_clear`) is decided
+    // from the LIVE half, by frontier. Everything else about the replay
+    // (roster, keys, policy, the alias `retain` below) still comes from the
+    // journal, so a group that has never forked replays byte-identically.
+    // Both spellings are consulted — the map key AND `stable_group_id()` —
+    // because an alias-keyed store holds the record under the alias
+    // (ADR-0066's both-spellings rule at file level, where no live map
+    // exists to resolve through).
+    //
+    // THREE frontier cases (#732 r2/r3 — cross-model review found the first
+    // shape, "fill an empty journal slot", wrong in both directions, and then
+    // found the second shape trusting an UNSIGNED revision):
+    //
+    // 1. EQUAL journal frontier ⇒ the live pair wins UNCONDITIONALLY, its
+    //    ABSENCE included. A manual clear advances no revision either, so
+    //    "fill only an empty slot" let an equal-frontier journal whose own
+    //    image still carried the pre-clear marker RESURRECT a quarantine the
+    //    operator had durably cleared — and let a different journal marker
+    //    replace the live one. At ONE frontier there is exactly one
+    //    containment truth and it is the local one.
+    // 2. FORWARD journal frontier ⇒ containment is never lifted AND never
+    //    weakened: the STRONGER of the two markers survives
+    //    (`challenger_containment_is_stronger`), and since a live marker always beats none
+    //    this arm cannot lift. NO replayed advance clears: nothing on disk carries owner authorization
+    //    of the strength every live clear arm demands (the owner user key and
+    //    an `OwnerMandate` are simply not persisted), and the certificate test
+    //    r3 reached for is satisfiable by the FORKER — still seated, holding
+    //    only its agent key, signing a descendant of the contested head. The
+    //    cost is a liveness edge (a clear interrupted by a crash is re-applied
+    //    by hand, once); the alternative was a silent bypass by the very
+    //    adversary the marker contains. See the note above
+    //    `install_fork_evidence`.
+    // 3. OLDER journal frontier AT THIS FILE ⇒ union: the live pair fills only
+    //    what the journal record lacks, and NOTHING is cleared. This is not "a
+    //    stale replay" — the verdict consumes a journal that is stale against
+    //    the MERGED store before any write. It is the individual-FILE
+    //    divergence `merge_home_suite_groups` creates, where the authoritative
+    //    sidecar record intentionally supersedes a NEWER legacy placeholder in
+    //    `named_groups.json`. Taking that placeholder's pair verbatim (case
+    //    1's rule) could DROP a marker the authoritative record carries, so
+    //    containment is unioned across the halves instead — the one case where
+    //    the live half is not the authority on this group's state.
+    let live_half = live
+        .get(group_id_hex)
+        .filter(|info| info.stable_group_id() == stable)
+        .or_else(|| live.values().find(|info| info.stable_group_id() == stable))
+        .map(|info| {
+            (
+                info.state_revision,
+                info.fork_quarantine.clone(),
+                info.invite_lineage
+                    .as_ref()
+                    .and_then(|lineage| lineage.fork_evidence.clone()),
+            )
+        });
+    if let Some((live_revision, live_marker, live_evidence)) = live_half {
+        let journal_revision = record.state_revision;
+        if journal_revision < live_revision {
+            // Case 3 — individual-file divergence: union, never clear.
+            // #732 r4/r5: the union is over containment STRENGTH, not merely
+            // presence — see `challenger_containment_is_stronger` for the total order and
+            // why a lower `revision` is a real weakening (it lowers the
+            // `owner_anchored_clear_permitted` threshold).
+            if challenger_containment_is_stronger(
+                record.fork_quarantine.as_ref(),
+                live_marker.as_ref(),
+            ) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    store = %label,
+                    journal_revision,
+                    live_revision,
+                    no_anchor = ?live_marker.as_ref().map(|marker| marker.no_anchor),
+                    "#732: this file's live half is NEWER than the journalled record (placeholder supersession) — containment is unioned at its STRONGER form, never lifted"
+                );
+            }
+            union_containment_into(&mut record, live_marker, live_evidence);
+        } else if journal_revision > live_revision {
+            // Case 2 — forward replay: the live marker is ALWAYS carried.
+            // #732 r4: see the note above `install_fork_evidence` for why no
+            // replayed advance can clear. Nothing on disk carries owner
+            // authorization of the strength every live clear arm demands, and
+            // the weaker certificate test r3 tried is satisfiable by the forker
+            // itself — still seated, holding only its agent key, signing a
+            // descendant of the contested head. Fail closed.
+            // #732 r5/r6: "never lifted" is also "never WEAKENED" — one total
+            // order decides, and marker + evidence move together
+            // (`union_containment_into`). A live marker always beats none, which
+            // is what makes this arm fail closed.
+            if challenger_containment_is_stronger(
+                record.fork_quarantine.as_ref(),
+                live_marker.as_ref(),
+            ) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    store = %label,
+                    marker_revision = ?live_marker.as_ref().map(|marker| marker.revision),
+                    no_anchor = ?live_marker.as_ref().map(|marker| marker.no_anchor),
+                    journal_revision,
+                    live_revision,
+                    "#732: forward journal replay preserved the live fork-quarantine marker — the journalled advance does not clear it"
+                );
+            }
+            union_containment_into(&mut record, live_marker, live_evidence);
+        } else {
+            // Case 1 — EQUAL frontier: the live pair verbatim.
+            if record.fork_quarantine != live_marker {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id_hex),
+                    store = %label,
+                    live_marker_revision = ?live_marker.as_ref().map(|marker| marker.revision),
+                    journal_marker_revision = ?record.fork_quarantine.as_ref().map(|marker| marker.revision),
+                    "#732: same-frontier journal replay took the LIVE containment state — journal equality is not equality of containment"
+                );
+            }
+            record.fork_quarantine = live_marker;
+            if let Some(lineage) = record.invite_lineage.as_mut() {
+                lineage.fork_evidence = live_evidence;
+            }
+        }
+    }
     live.retain(|_key, info| info.stable_group_id() != stable);
     live.insert(group_id_hex.to_string(), record);
     let merged =
@@ -26504,6 +26875,394 @@ async fn merge_group_record_into_store_file(
         anyhow::bail!("replayed {label} journal was not directory-durable");
     }
     Ok(())
+}
+
+/// #732 r5 (cross-model review, P2) — the ONE total order over containment
+/// STRENGTH, so no replay can weaken a marker in any dimension.
+///
+/// r4 ordered by `no_anchor` alone, which left the anchored-versus-anchored case
+/// unordered: a live marker at revision 7 could be replaced by a journalled one
+/// at revision 2, and that REGRESSES the clear threshold, because
+/// [`x0x::groups::ForkQuarantine::owner_anchored_clear_permitted`] demands a
+/// revision strictly past the evidenced one — so an advance at revision 3, which
+/// the live marker refused, would suddenly clear. A marker's revision is not
+/// bookkeeping; it is half the predicate.
+///
+/// The order, total and used at every union site:
+/// 1. `no_anchor` wins — a manual-only quarantine outranks a clearable one;
+/// 2. then the HIGHER evidenced `revision` — the higher clear threshold;
+/// 3. then keep the INCUMBENT — the marker already on the record being written.
+///    At equal strength the two contain equally, so there is nothing to gain by
+///    replacing one with the other.
+///
+/// Returns whether `challenger` should REPLACE `incumbent`. The caller installs
+/// the WHOLE marker it chooses and never mixes fields across the two:
+/// `revision`, `state_hash`, `committed_by`, `observed_at_ms` and `snapshot`
+/// describe ONE fork observation, and ADR-0067 builds `ForkQuarantineIdentity`
+/// out of exactly those, so a franken-marker would carry an identity that never
+/// existed. Use [`union_containment_into`] rather than calling this directly, so
+/// the evidence record stays coherent with the marker that won.
+fn challenger_containment_is_stronger(
+    incumbent: Option<&x0x::groups::ForkQuarantine>,
+    challenger: Option<&x0x::groups::ForkQuarantine>,
+) -> bool {
+    match (incumbent, challenger) {
+        // Nothing to take, or nothing to beat.
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(incumbent), Some(challenger)) => match (challenger.no_anchor, incumbent.no_anchor) {
+            (true, false) => true,
+            (false, true) => false,
+            // Same anchor class: the STRICTLY higher clear threshold wins, so
+            // ties go to the INCUMBENT — the r4 contract, stated once here and
+            // repeated nowhere. At equal strength the two markers contain
+            // equally, so keeping the record's own avoids a pointless rewrite
+            // (and the churn its `observed_at_ms` would cause in diagnostics).
+            _ => challenger.revision > incumbent.revision,
+        },
+    }
+}
+
+/// #732 r6 — apply the STRONGER containment of two halves to `target`,
+/// COHERENTLY.
+///
+/// omp's r5 nit: the marker and the lineage `fork_evidence` record are one
+/// containment decision (every clear arm removes them together, see
+/// `GroupInfo::reset_fork_evidence_after_quarantine_clear`), so the evidence must
+/// follow the marker that WINS. r5 applied the evidence outside the strength
+/// gate, which let the losing half's evidence replace the winner's — a record
+/// pairing one observation's marker with another's evidence. Here the winner's
+/// own evidence comes with it, and the loser's may only FILL an empty slot.
+///
+/// Used by every union site: the forward-replay arm, the older-frontier arm, and
+/// the sidecar/named merge. The EQUAL-frontier arm deliberately does not use it
+/// — there, one frontier means one containment truth and it is the live one,
+/// absence included.
+fn union_containment_into(
+    target: &mut x0x::groups::GroupInfo,
+    challenger_marker: Option<x0x::groups::ForkQuarantine>,
+    challenger_evidence: Option<x0x::groups::ForkEvidence>,
+) {
+    if challenger_containment_is_stronger(
+        target.fork_quarantine.as_ref(),
+        challenger_marker.as_ref(),
+    ) {
+        target.fork_quarantine = challenger_marker;
+        if let Some(lineage) = target.invite_lineage.as_mut() {
+            // The winning marker's evidence; the target's own survives only
+            // where the winner has none.
+            lineage.fork_evidence = challenger_evidence.or(lineage.fork_evidence.take());
+        }
+    } else if let Some(lineage) = target.invite_lineage.as_mut() {
+        // The target's marker won: the challenger's evidence may only fill an
+        // empty slot, never replace the winner's.
+        if lineage.fork_evidence.is_none() {
+            lineage.fork_evidence = challenger_evidence;
+        }
+    }
+}
+
+/// One entry's containment, as the pair that moves together.
+type ContainmentPair = (
+    Option<x0x::groups::ForkQuarantine>,
+    Option<x0x::groups::ForkEvidence>,
+);
+
+fn containment_of(info: &x0x::groups::GroupInfo) -> ContainmentPair {
+    (
+        info.fork_quarantine.clone(),
+        info.invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.fork_evidence.clone()),
+    )
+}
+
+/// Returns whether the STORED containment actually moved — the mixed-lineage
+/// projection can be a no-op (same marker, retained matching evidence kept),
+/// and callers warn on real changes only.
+fn write_containment(info: &mut x0x::groups::GroupInfo, pair: &ContainmentPair) -> bool {
+    let marker_moved = info.fork_quarantine != pair.0;
+    info.fork_quarantine = pair.0.clone();
+    let mut evidence_moved = false;
+    if let Some(lineage) = info.invite_lineage.as_mut() {
+        // #732 r8 (Sol, mixed-lineage aliases): the MARKER converges onto
+        // every spelling, but EVIDENCE only has a destination on a
+        // lineage-bearing record. When the winning pair carries no evidence
+        // (its authoritative slot was lineage-less), a retained record that
+        // MATCHES the marker being written is coherent with the converged
+        // containment and must NOT be silently erased — erasing it would
+        // leave the group contained with no durable justification record,
+        // and would re-open the dedup gate to an identical retry. Provenance
+        // is never invented in the other direction either: a lineage-less
+        // record simply has nowhere to store the evidence half.
+        let keep_retained = pair.1.is_none()
+            && pair.0.as_ref().is_some_and(|marker| {
+                lineage
+                    .fork_evidence
+                    .as_ref()
+                    .is_some_and(|existing| evidence_matches_marker(existing, marker))
+            });
+        if !keep_retained {
+            evidence_moved = lineage.fork_evidence != pair.1;
+            lineage.fork_evidence = pair.1.clone();
+        }
+    }
+    marker_moved || evidence_moved
+}
+
+/// #732 r8: does this retained evidence record describe the SAME fork
+/// observation as this marker? The identity triple the rollback arm and the
+/// ADR-0059 dedup already key on — `revision`, `state_hash`, `committed_by`.
+fn evidence_matches_marker(
+    evidence: &x0x::groups::ForkEvidence,
+    marker: &x0x::groups::ForkQuarantine,
+) -> bool {
+    evidence.revision == marker.revision
+        && evidence.state_hash == marker.state_hash
+        && evidence
+            .committed_by
+            .eq_ignore_ascii_case(&marker.committed_by)
+}
+
+/// Every map key, grouped by `stable_group_id`, in deterministic order.
+///
+/// `BTreeMap` plus sorted keys on purpose: the folds below break ties by "first
+/// candidate wins", so a `HashMap` iteration order would make the converged
+/// marker depend on hashing.
+fn alias_groups_by_stable_id(
+    roster: &HashMap<String, x0x::groups::GroupInfo>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut by_stable: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (key, info) in roster {
+        by_stable
+            .entry(info.stable_group_id().to_string())
+            .or_default()
+            .push(key.clone());
+    }
+    for keys in by_stable.values_mut() {
+        keys.sort();
+    }
+    by_stable
+}
+
+fn strongest_containment(candidates: Vec<ContainmentPair>) -> Option<ContainmentPair> {
+    candidates.into_iter().reduce(|incumbent, challenger| {
+        if challenger_containment_is_stronger(incumbent.0.as_ref(), challenger.0.as_ref()) {
+            challenger
+        } else {
+            incumbent
+        }
+    })
+}
+
+/// #732 r8 — THE INVARIANT, enforced in one place instead of at every mutation
+/// site.
+///
+/// > **INV: at every point the `named_groups` write lock is released, every
+/// > map entry sharing a `stable_group_id` carries the SAME `fork_quarantine`
+/// > marker, and — on entries that HAVE an `invite_lineage` — an evidence
+/// > record coherent with it: a retained record matching the converged
+/// > marker is preserved, never silently erased. Entries without lineage
+/// > carry the marker alone; provenance is never invented to store evidence
+/// > where no lineage exists.**
+///
+/// The marker half is byte-identical across ALL aliases. The evidence half is
+/// defined per-destination: only a lineage-bearing record can hold it, so
+/// "identical containment pairs" is not the contract — "same marker, and
+/// matching retained evidence kept wherever it can live" is.
+///
+/// WHY an invariant and not another per-site fix. A roster may legitimately hold
+/// two entries for one group ([`merge_home_suite_groups`] inserts the sidecar
+/// record under ITS key without removing a differently-keyed named entry — the
+/// shape [`collect_same_stable_group_aliases`] exists for), and
+/// [`crate::server::resolve_group_entry_locked`] answers an EXACT key match
+/// first. Earlier rounds fixed the merge, then the install, then the manual
+/// clear, and review still found the four owner-anchored clear arms and the
+/// non-durable rollback each writing a single slot. They are all the same bug,
+/// so it is stated once, here, at the chokepoint every containment mutation
+/// already passes through.
+///
+/// TWO RULES, and the pre-mutation snapshot is what tells them apart:
+///
+/// 1. **A mutation has an authoritative slot.** An entry that EXISTED before,
+///    in this stable-id group, whose containment CHANGED is the decision, and
+///    its value — **including ABSENCE** — is projected onto every sibling.
+///    This is what makes a clear work: a clear that spread only "the
+///    strongest" would be undone by the sibling it had not reached. A NEWLY
+///    INSERTED entry is never authoritative — insertion is not a containment
+///    mutation (`import_group_card`'s discovered stub and the base-seated
+///    join insert clean records under stable keys), and a key rebound from a
+///    different stable group does not speak for this one.
+/// 2. **Nothing changed but siblings disagree** ⇒ spread the group-wide
+///    strongest. That never invents a clear, so it is the safe rule where no
+///    slot is authoritative (the load path uses it too, see
+///    [`reconcile_containment_across_aliases`]), it is how a NEW alias JOINS
+///    its group's containment, and it self-heals divergence written by a
+///    binary predating this invariant.
+///
+/// The receiver is named `roster`, not `groups`: this function IS the
+/// both-spellings rule, so the single-spelling lookup guard could only flag it
+/// as a false positive. It reads each entry once and writes through `get_mut` on
+/// keys the collector produced, so there is no caller-supplied id to resolve.
+fn enforce_containment_invariant(
+    roster: &mut HashMap<String, x0x::groups::GroupInfo>,
+    before: &HashMap<String, x0x::groups::GroupInfo>,
+) {
+    for (stable, keys) in alias_groups_by_stable_id(roster) {
+        if keys.len() < 2 {
+            continue;
+        }
+        // Rule 1: the entry whose containment changed is authoritative.
+        // Sorted keys make "the first one that changed" deterministic.
+        // #732 r8 (Sol, new-alias authority): ONLY an entry that existed
+        // BEFORE, in THIS stable-id group, may authoritatively spread a
+        // change — ABSENCE included. A NEWLY INSERTED alias (absent from
+        // `before`) is not a containment mutation: `import_group_card`'s
+        // discovered stub and the base-seated join insert clean records
+        // under stable keys while a quarantined record may live under an
+        // alias, and treating the insertion's `None → Some((None, None))`
+        // as authority performed an unauthorized CLEAR of that record. A
+        // new alias instead JOINS the group's containment via Rule 2, and
+        // an existing key rebound to a different stable group does not
+        // speak for this one (cross-group authority).
+        let authoritative = keys
+            .iter()
+            .find(|key| {
+                roster.get(*key).map(containment_of).is_some_and(|now| {
+                    before.get(*key).is_some_and(|prior| {
+                        prior.stable_group_id() == stable && now != containment_of(prior)
+                    })
+                })
+            })
+            .map(String::as_str);
+        converge_alias_group(roster, &keys, authoritative);
+    }
+}
+
+/// #732 r8 — the scoped entry point for the one write path that replaces a
+/// KNOWN key and does not pass through either full-snapshot chokepoint:
+/// [`store_named_group_info`]. The caller supplies the replaced key and the
+/// containment that key held before the write (with the prior record's
+/// stable id), which is the same information the full `before` map provides
+/// for exactly one slot — so the two INV rules apply unchanged without
+/// cloning the whole roster on a non-persisting store.
+///
+/// The receiver is named `roster` for the same reason as
+/// [`enforce_containment_invariant`]: this IS the both-spellings rule.
+fn enforce_containment_invariant_for_store(
+    roster: &mut HashMap<String, x0x::groups::GroupInfo>,
+    changed_key: &str,
+    before: Option<(String, ContainmentPair)>,
+) {
+    let Some(stable) = roster
+        .get(changed_key)
+        .map(x0x::groups::GroupInfo::stable_group_id)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let mut keys: Vec<String> = roster
+        .keys()
+        .filter(|key| {
+            roster
+                .get(*key)
+                .is_some_and(|info| info.stable_group_id() == stable)
+        })
+        .cloned()
+        .collect();
+    keys.sort();
+    if keys.len() < 2 {
+        return;
+    }
+    // #732 r8 (Sol, new-alias authority): the same predicate as the full
+    // snapshot, one slot at a time — the replaced key is authoritative only
+    // if it EXISTED before (a first insert under this key is a new alias,
+    // which joins the group's containment rather than clearing it), the
+    // prior record belonged to THIS stable-id group (no cross-group
+    // authority through a rebind), and its containment actually moved.
+    let authoritative = before
+        .filter(|(prior_stable, _)| prior_stable.as_str() == stable)
+        .filter(|(_, prior_pair)| {
+            Some(prior_pair) != roster.get(changed_key).map(containment_of).as_ref()
+        })
+        .map(|_| changed_key);
+    converge_alias_group(roster, &keys, authoritative);
+}
+
+/// One alias group's convergence under the two INV rules: an authoritative
+/// slot's containment — ABSENCE included — is projected onto every sibling;
+/// with no authoritative slot, siblings that disagree converge on the
+/// group-wide strongest (which never invents a clear). The warning fires
+/// only when the PROJECTION actually moved stored state — the
+/// mixed-lineage projection (same marker, retained matching evidence kept)
+/// is a no-op and must not warn on every persist.
+fn converge_alias_group(
+    roster: &mut HashMap<String, x0x::groups::GroupInfo>,
+    keys: &[String],
+    authoritative: Option<&str>,
+) {
+    let target = match authoritative.and_then(|key| roster.get(key)) {
+        Some(info) => Some(containment_of(info)),
+        None => {
+            // Rule 2: nothing changed. Converge only if they disagree.
+            let current: Vec<ContainmentPair> = keys
+                .iter()
+                .filter_map(|key| roster.get(key).map(containment_of))
+                .collect();
+            if current.windows(2).all(|pair| pair[0] == pair[1]) {
+                return;
+            }
+            strongest_containment(current)
+        }
+    };
+    let Some(target) = target else {
+        return;
+    };
+    for key in keys {
+        if let Some(info) = roster.get_mut(key) {
+            if write_containment(info, &target) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(key),
+                    no_anchor = ?target.0.as_ref().map(|marker| marker.no_anchor),
+                    marker_revision = ?target.0.as_ref().map(|marker| marker.revision),
+                    "#732: containment synchronised onto an alias spelling of the same group"
+                );
+            }
+        }
+    }
+}
+
+/// #732 r8 — the LOAD-side half of the invariant: no slot is authoritative, so
+/// the group-wide STRONGEST containment wins and is written to every sibling
+/// whole. Deterministic — candidates are folded in sorted-key order and
+/// [`challenger_containment_is_stronger`] breaks ties to the incumbent — so two
+/// equal-strength markers differing in `state_hash` or `observed_at_ms` converge
+/// on ONE of them, which is what makes
+/// [`crate::server::lifecycle_epoch_token_locked`]'s marker half identical for
+/// every spelling.
+///
+/// ABSENCE is never spread here: a load has no authority to invent a clear, so a
+/// group whose siblings are all unmarked is simply left alone.
+fn reconcile_containment_across_aliases(roster: &mut HashMap<String, x0x::groups::GroupInfo>) {
+    for (_stable, keys) in alias_groups_by_stable_id(roster) {
+        if keys.len() < 2 {
+            continue;
+        }
+        let target = strongest_containment(
+            keys.iter()
+                .filter_map(|key| roster.get(key).map(containment_of))
+                .collect(),
+        );
+        let Some(target) = target.filter(|pair| pair.0.is_some()) else {
+            continue;
+        };
+        for key in &keys {
+            if let Some(info) = roster.get_mut(key) {
+                write_containment(info, &target);
+            }
+        }
+    }
 }
 
 /// #457 r14 item 14.2 — does a QUARANTINED legacy journal exist for this
@@ -27068,16 +27827,88 @@ pub(in crate::server) fn merge_home_suite_groups(
         if info.policy.admission.owner_certified_user_id().is_some() {
             info.owner_cert_reverify_required = true;
         }
-        if let Some(placeholder) = merged.get(&id) {
+        // #732 r6 (cross-model review, P1) — SIDECAR-WINS IS WRONG FOR
+        // CONTAINMENT, and the discrepancy is reachable, not theoretical.
+        //
+        // #451 makes the sidecar record authoritative and replaces the named
+        // placeholder wholesale, and `server::serve_with_options` loads THIS
+        // merged view. But two recovery paths write containment to the NAMED
+        // half alone:
+        //
+        // - `record_recovery_fork_evidence` walks `[named, sidecar]` and
+        //   RETURNS after the first successful write. A Home-Suite group's named
+        //   entry is a `legacy_safe_placeholder`, which keeps the record's
+        //   identity AND its `invite_lineage` (it strips policy, roster,
+        //   commit log and home only), so the named iteration finds it, installs
+        //   marker + evidence there, and returns — the sidecar never sees it.
+        // - `recover_treekem_named_journals`' Apply arm writes the sidecar half
+        //   only when a decodable `.hsjournal` is present; the named write is
+        //   unconditional. A legacy-only journal therefore updates named alone.
+        //
+        // Replacing the record wholesale then discarded that containment before
+        // the daemon ever saw it — a marker recovery had deliberately preserved,
+        // invisible to every ADR-0066 gate. So the sidecar still wins every
+        // other field, and containment is UNIONED under the same total order the
+        // replay uses, taking the whole stronger marker with its own evidence.
+        // The authoritative view is then never weaker than either half.
+        //
+        // Both spellings are consulted: the sidecar's key, then a scan by
+        // `stable_group_id()` for a named half filed under an alias.
+        let named_containment = merged
+            .get(&id)
+            .filter(|placeholder| placeholder.stable_group_id() == info.stable_group_id())
+            .or_else(|| {
+                merged
+                    .values()
+                    .find(|placeholder| placeholder.stable_group_id() == info.stable_group_id())
+            })
+            .map(|placeholder| {
+                (
+                    placeholder.state_revision,
+                    placeholder.fork_quarantine.clone(),
+                    placeholder
+                        .invite_lineage
+                        .as_ref()
+                        .and_then(|lineage| lineage.fork_evidence.clone()),
+                )
+            });
+        if let Some((placeholder_revision, placeholder_marker, placeholder_evidence)) =
+            named_containment
+        {
             tracing::debug!(
                 group_id = %id,
                 "restored Home-Suite group from sidecar over placeholder \
                  (legacy state_revision {})",
-                placeholder.state_revision
+                placeholder_revision
             );
+            let had_marker = info.fork_quarantine.is_some();
+            union_containment_into(&mut info, placeholder_marker, placeholder_evidence);
+            if !had_marker && info.fork_quarantine.is_some() {
+                tracing::warn!(
+                    group_id = %id,
+                    "#732: the authoritative Home-Suite record adopted the fork-quarantine \
+                     marker held only by its legacy half — recovery writes containment there"
+                );
+            }
         }
+        // #732 r7 (cross-model review, P1): the insert below does NOT remove a
+        // differently-keyed named entry for the same group, so the merged view
+        // can legitimately hold TWO entries with one `stable_group_id` — the
+        // shape `collect_same_stable_group_aliases` exists for. Unioning
+        // containment into the sidecar record alone therefore still left an
+        // alias entry unmarked, and `server::resolve_group_entry_locked` returns
+        // an exact key match FIRST, so a gate asked by that spelling saw no
+        // containment at all. Every spelling now carries the same, strongest
+        // containment. Entries are NOT canonicalised or deleted here: that is a
+        // separate change, and losing a record is worse than keeping a duplicate.
         merged.insert(id, info);
     }
+    // #732 r8: ONE group-wide pass instead of the r7 per-insert spread — no slot
+    // is authoritative at load, so the STRONGEST containment converges onto every
+    // spelling, deterministically and whole. The same-key union above is still
+    // needed: that insert replaces a same-keyed placeholder before any
+    // reconciliation could see its marker.
+    reconcile_containment_across_aliases(&mut merged);
     merged
 }
 

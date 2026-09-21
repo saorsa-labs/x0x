@@ -4,6 +4,122 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Startup journal recovery no longer lifts a fork quarantine, and now contains
+  lineage-free ordinary groups (#732; found by a third-model static audit).** Two
+  HIGH defects on the file-level recovery path, which runs before the in-memory
+  roster loads and before any listener starts.
+  - **A replay could erase a durable marker.** When a TreeKEM transaction's
+    snapshot/cleanup step fails after the named save reached durability, both
+    journals are deliberately retained for forward replay
+    (`named_groups.rs::persist_named_group_info`). The live record is then
+    byte-equal to the journalled one, so the paired-replay verdict applies — and
+    an ADR-0066 marker installed in the meantime is not part of that frontier
+    (installing one advances neither `state_revision` nor `state_hash`), so
+    `named_groups.rs::merge_group_record_into_store_file`'s wholesale record
+    replacement silently deleted a `no_anchor` quarantine nothing re-installs
+    automatically: a restart lifted containment. The replay now carries the live
+    marker, and the lineage `fork_evidence` record that justifies it, forward —
+    resolved under **both spellings**, because no live map exists to resolve
+    through this early. First-complete-wins is unchanged and every other field
+    still comes from the journal, so a group with no marker replays byte-identically.
+  - **Lineage-free ordinary groups stayed open.**
+    `named_groups.rs::record_recovery_fork_evidence` returned immediately whenever
+    invite lineage was absent — a named residual of ADR-0066 slice 2, which
+    widened the LIVE apply fence only — so an authenticated equal-revision
+    conflicting journal for a locally created ordinary group left the data plane
+    serving both branches of a fork with no marker. Recovery now uses the same
+    population predicate as the live apply hook
+    (`named_groups.rs::fork_evidence_path_open`) and the same marker-only,
+    first-complete-wins install as `named_groups.rs::install_fork_evidence`'s
+    lineage-less arm, with `no_anchor: true`, behind the unchanged
+    `named_groups.rs::fork_candidate_authenticated` gate — so a forged or
+    stranger-signed journal still installs nothing (a never-auto-clearing marker
+    from unauthenticated content would be a denial of service). Owner-axis groups
+    without lineage keep the trigger ADR-0066 promised unchanged, and the store
+    loop resolves the record under both spellings so an alias-keyed store is no
+    longer silently skipped.
+  - **Which containment state a replay writes.** The containment PAIR (the
+    marker and the lineage `fork_evidence` record every clear arm removes with
+    it) is decided by FRONTIER, and never from the journal alone. At the EQUAL
+    frontier the live pair wins verbatim, **its absence included** — a manual
+    clear advances no revision, so a journal staged before a clear must not
+    resurrect the marker after it, and a differing journal marker must not
+    replace the live one. On a FORWARD frontier containment is never lifted and
+    never weakened (see the round-4 entry below). At an OLDER frontier *at one
+    file* — the `merge_home_suite_groups` divergence, where the authoritative
+    sidecar record supersedes a newer legacy placeholder — the two halves are
+    UNIONED, because the placeholder is not authoritative about containment
+    either. Every union uses one total strength order
+    (`named_groups.rs::challenger_containment_is_stronger`): `no_anchor` first, then the
+    higher evidenced `revision` — which is half of
+    `ForkQuarantine::owner_anchored_clear_permitted`, so a lower one would
+    silently lower the clear threshold — then keep the INCUMBENT on a tie. The whole
+    stronger marker is installed, never a mix of fields from both.
+  - **NO replayed advance clears a quarantine (round 4, final).** Rounds 2 and 3
+    each tried to honour a clear a staged advance had granted — first on the
+    journal's unsigned outer revision, then on a verified commit signed by an
+    agent the live roster certifies under the policy owner. Review broke both:
+    in an OwnerCertified group *every* seated certificate binds the owner key
+    and quarantine evicts nobody, so the FORKER itself (Active, Admin, holding
+    only its agent key) can sign a valid higher-revision **descendant of the
+    contested head** and satisfy the second. Every live clear arm needs the
+    owner user key, a verified mandate, or the adoption walk's terminal
+    verification, and none of that material is persisted with a group record —
+    so recovery now carries the STRONGER of the live and journalled markers and
+    never clears, and #732 adds no clear provenance to the on-disk format (a
+    schema change owed its own ADR). The
+    liveness cost is named in the runbook: a clear interrupted between staging
+    and saving is re-applied by hand, once.
+  - **An OLDER journal frontier at one file unions containment (round 3).** The
+    merged-view verdict consumes journals stale against the merged store, but an
+    individual file can still be newer: `named_groups.rs::merge_home_suite_groups`
+    lets the authoritative sidecar record supersede a newer legacy placeholder in
+    `named_groups.json`. Taking that placeholder's pair verbatim could drop a
+    marker, so containment is unioned across the halves and never cleared, while
+    the authoritative record still supersedes the placeholder everywhere else.
+    The union is over containment STRENGTH: if either half is `no_anchor`, the
+    survivor is `no_anchor`, so a supersession cannot downgrade a manual-only
+    quarantine.
+  - **The claimed conflict is bound to the verified commit (round 2).** A
+    record's outer `state_revision`/`state_hash` sit beside its commit log and
+    are what the replay verdict compares, so a local writer could copy the
+    live record, alter only the outer hash, keep the valid terminal commit, and
+    have `named_groups.rs::record_recovery_fork_evidence` install permanent
+    `no_anchor` containment with no authenticated *conflicting* commit. It now
+    requires the claimed frontier to be the one the verified commit signs, and
+    that commit to genuinely differ from the live committed state at that
+    revision. Both checks are load-bearing (round 3): the mirror forgery edits
+    the LIVE record's outer hash and leaves its signed log intact, so the first
+    check passes on a consistent journal and only the second refuses.
+  - **The authoritative merged view can no longer lose containment (round 6).**
+    `named_groups.rs::merge_home_suite_groups` replaced a named placeholder with
+    the sidecar record wholesale (#451 sidecar-wins), and two recovery paths
+    write containment to the NAMED half alone —
+    `named_groups.rs::record_recovery_fork_evidence` returns after its first
+    successful store write, and the replay's sidecar write needs a decodable
+    `.hsjournal`. A marker recovery preserved was therefore discarded before
+    `server/mod.rs::serve_with_options` loaded the view every ADR-0066 gate
+    consults. The sidecar still wins every other field; containment is now
+    unioned under the same total order, whole marker plus its own evidence, so
+    the authoritative view is never weaker than either half.
+  - **Duplicate alias entries can no longer disagree about containment (round
+    7).** A roster can legitimately hold TWO entries for one group —
+    `named_groups.rs::merge_home_suite_groups` inserts the sidecar record under
+    its key without removing a differently-keyed named entry, the shape
+    `named_groups.rs::collect_same_stable_group_aliases` exists for. Because
+    `server/mod.rs::resolve_group_entry_locked` returns an exact key match
+    first, an unmarked duplicate was a silent bypass, and a successful durable
+    clear left the other spelling quarantined with no remaining exit. The merge
+    now gives every entry sharing a stable id the same strongest containment,
+    and `named_groups.rs::install_fork_evidence`, its rollback arm and
+    `named_groups.rs::clear_group_quarantine` all apply to every spelling.
+    Entries are deliberately NOT canonicalised or deleted — losing a record is
+    worse than keeping a duplicate.
+  - No schema or wire change (the marker's fields already carry
+    `#[serde(default)]`). Closes runbook known gap (h).
+
 ### Changed
 
 - **A fork-quarantined group's history is no longer evicted by the retention
