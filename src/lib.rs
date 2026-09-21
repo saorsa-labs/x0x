@@ -17128,6 +17128,27 @@ impl KvStoreHandle {
     }
 
     #[cfg(test)]
+    pub(crate) async fn with_persist_gate_held_for_test<F: std::future::Future>(
+        &self,
+        during: F,
+    ) -> F::Output {
+        self.sync.with_persist_gate_held_for_test(during).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receive_section_active_for_test(&self) -> bool {
+        self.sync.receive_section_active_for_test()
+    }
+
+    /// Publish `delta` on the store topic as if a peer had (test trigger for
+    /// a receive-path merge that does not go through a local write).
+    #[cfg(test)]
+    pub(crate) async fn publish_delta_for_test(&self, delta: kv::KvStoreDelta) {
+        let published = self.sync.publish_delta(self.peer_id, delta).await;
+        assert!(published.is_ok(), "test delta publish: {published:?}");
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_retained_publish_after_for_test(&self, accepted_frames: usize) {
         self.sync
             .fail_retained_publish_after_for_test(accepted_frames);
@@ -17242,9 +17263,42 @@ impl KvStoreHandle {
     /// refuses local writes (membership is gone) and every seal/open — a
     /// departed member cannot keep operating a group store on a stale
     /// secret/roster snapshot.
+    ///
+    /// Non-blocking, so it is a REQUEST: one receive section already past its
+    /// cancel check may still finish — merge and snapshot write — after this
+    /// returns, and can race a later re-open of the same snapshot path
+    /// (#757; residual tracked in #760). Use
+    /// [`retire_and_drain`](Self::retire_and_drain) where that matters and no
+    /// section-internal lock is held.
     pub fn retire(&self) {
         self.sync.invalidate_secure_context();
         self.sync.cancel_sync();
+    }
+
+    /// [`retire`](Self::retire), then wait until no background merge,
+    /// ownership update or snapshot write for this store is in flight (#757);
+    /// none can start afterwards. Read-only state serves and the bootstrap
+    /// requester's publish are outside that fence and may still be finishing.
+    ///
+    /// Must not be awaited while holding a lock a receive section takes: the
+    /// named-groups map or the store registry (secure-refresh hook), and for
+    /// TreeKEM stores the group membership guard (`merge_main_record`). The
+    /// refresh hooks themselves run inside a section. Those callers keep
+    /// `retire`; the re-open race that leaves is tracked in #760.
+    pub async fn retire_and_drain(&self) {
+        self.sync.invalidate_secure_context();
+        self.sync.cancel_sync_and_drain().await;
+    }
+
+    /// Whether this store's background receive sections run a TreeKEM
+    /// protector — a property of the ACTUAL sync, not of the plane a caller
+    /// is asking for. Those sections can wait on the group membership guard
+    /// while holding the lifecycle lock, so a caller holding that guard must
+    /// use [`retire`](Self::retire), never
+    /// [`retire_and_drain`](Self::retire_and_drain) (#757).
+    #[must_use]
+    pub fn is_treekem_protected(&self) -> bool {
+        self.sync.has_treekem_protector()
     }
 
     /// Tear down this replica's background sync loops (delta listener,

@@ -269,3 +269,103 @@ async fn issue732_unknown_group_id_is_still_not_found() -> Result<()> {
     );
     Ok(())
 }
+
+/// WHY (#732 r7 — cross-model review, Codex P1 side b). A roster can
+/// legitimately hold TWO entries for one group: `merge_home_suite_groups`
+/// inserts the sidecar record under ITS key while a differently-keyed named
+/// entry stays in place, which is the shape
+/// `collect_same_stable_group_aliases` exists for and which a dozen other
+/// mutations already spread across.
+///
+/// The clear route mutated only the resolver's `map_key`, so a successful,
+/// durable clear left the OTHER spelling quarantined. The endpoint reported
+/// `ok: true`; `server::resolve_group_entry_locked` returns an exact key match
+/// FIRST, so any gate asked by that spelling still refused, with no remaining
+/// exit — the route had already said it was cleared.
+///
+/// The claim: install and clear are decisions about a GROUP, not about a map
+/// key, so both apply to every entry sharing the stable id, and the clear
+/// survives a reload from disk.
+#[tokio::test]
+async fn issue732_manual_clear_clears_every_spelling_and_survives_reload() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let alias_key = "issue732-duplicate-alias";
+    let (_alias, stable_id) =
+        seed_alias_keyed_group(&state, alias_key, &"c7".repeat(32), ordinary_policy()).await?;
+
+    // The duplicate: the SAME group filed a second time under its stable id,
+    // exactly as the sidecar/named merge leaves it.
+    let duplicate = state
+        .named_groups
+        .read()
+        .await
+        .get(alias_key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("seeded record"))?;
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(stable_id.clone(), duplicate);
+    {
+        let groups = state.named_groups.read().await;
+        assert_eq!(
+            groups
+                .values()
+                .filter(|info| info.stable_group_id() == stable_id)
+                .count(),
+            2,
+            "fixture precondition: two entries, one stable id"
+        );
+        assert!(
+            groups.values().all(|info| info.is_fork_quarantined()),
+            "both spellings start contained"
+        );
+    }
+
+    let (status, body) = call_clear(
+        &state,
+        alias_key,
+        serde_json::json!({ "force": true, "reason": "duplicate-alias clear" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "the clear succeeds: {body}");
+
+    {
+        let groups = state.named_groups.read().await;
+        assert!(
+            groups.values().all(|info| !info.is_fork_quarantined()),
+            "#732 r7: EVERY spelling is cleared — a clear is about the group, not the map key"
+        );
+        // The resolver's own answer, by BOTH spellings, is what the gates ask.
+        for spelling in [alias_key, stable_id.as_str()] {
+            let (_key, info) = crate::server::resolve_group_entry_locked(&groups, spelling)
+                .ok_or_else(|| anyhow::anyhow!("resolver lost {spelling}"))?;
+            assert!(
+                !info.is_fork_quarantined(),
+                "the spelling `{spelling}` must resolve to a CLEARED record"
+            );
+        }
+        assert!(
+            groups.values().all(|info| info
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.fork_evidence.as_ref())
+                .is_none()),
+            "and the evidence gate is re-armed on every spelling, not just one"
+        );
+    }
+
+    // And it is DURABLE on every spelling: a reload from the store files must
+    // not bring either one back.
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert!(
+        reloaded
+            .values()
+            .filter(|info| info.stable_group_id() == stable_id)
+            .all(|info| !info.is_fork_quarantined()),
+        "#732 r7: the clear survives a reload — no spelling resurrects the marker"
+    );
+    Ok(())
+}

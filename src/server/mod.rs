@@ -2501,14 +2501,39 @@ pub(in crate::server) fn resolve_group_entry_locked<'a>(
         .map(|(key, info)| (key.as_str(), info))
 }
 
-/// ADR-0067: the lifecycle epoch token for one group, resolved under both
-/// spellings. `None` when this node holds no record for the id — a caller
-/// re-checking a token MUST treat that as a mismatch, never as "unchanged".
+/// ADR-0067 + #732 r8: the lifecycle epoch token for one group, IDENTICAL for
+/// every spelling of it. `None` when this node holds no record for the id — a
+/// caller re-checking a token MUST treat that as a mismatch, never as
+/// "unchanged".
+///
+/// `resolve_group_entry_locked` answers an exact key match first, so a
+/// per-entry token could disagree across alias spellings and make an
+/// epoch-checked persist succeed or abort depending on which spelling asked.
+/// The token is therefore folded over EVERY entry sharing the resolved
+/// record's stable id, in sorted-key order:
+///
+/// - the marker half converges (under the #732 containment invariant every
+///   spelling carries the same marker; [`x0x::groups::LifecycleEpochToken::spanning_aliases`]
+///   picks deterministically for a pre-invariant divergent record);
+/// - the revision half is an order-independent MIX of every spelling's
+///   revision, so ANY one spelling's advance moves the whole token — a `max`
+///   fold would hide a lagging spelling's advance (4 and 9: the 4 advancing
+///   to 5 leaves `max` at 9), and this token's contract is that a lifecycle
+///   advance is DETECTED.
 pub(in crate::server) fn lifecycle_epoch_token_locked(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
 ) -> Option<x0x::groups::LifecycleEpochToken> {
-    resolve_group_entry_locked(groups, group_id).map(|(_, info)| info.lifecycle_epoch_token())
+    let (_, resolved) = resolve_group_entry_locked(groups, group_id)?;
+    let stable = resolved.stable_group_id().to_string();
+    // BTreeMap: the fold must visit spellings in a deterministic key order
+    // (ties on the marker keep the incumbent, so hash order would leak in).
+    let tokens: std::collections::BTreeMap<String, x0x::groups::LifecycleEpochToken> = groups
+        .iter()
+        .filter(|(_, info)| info.stable_group_id() == stable)
+        .map(|(key, info)| (key.clone(), info.lifecycle_epoch_token()))
+        .collect();
+    x0x::groups::LifecycleEpochToken::spanning_aliases(tokens.into_values())
 }
 
 /// Build a uniform `{ "ok": false, "error": <msg> }` JSON error response paired

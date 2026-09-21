@@ -1422,6 +1422,26 @@ pub(in crate::server) async fn retire_group_kv_stores(state: &AppState, stable_g
     }
 }
 
+/// Retire a cached handle whose binding no longer matches, before it is
+/// unregistered (#757). Callers hold the group membership guard and no
+/// map/store guard.
+///
+/// The decision follows the CACHED sync, not the plane being opened: a policy
+/// change (e.g. TreeKEM -> SignedPublic) keeps the topic, so any plane's
+/// mismatch arm can find any kind of sync. A TreeKEM sync's receive section
+/// takes that same membership guard (`TreeKemGroupStoreProtector::open_record`
+/// / `merge_main_record`) while holding its lifecycle lock, so draining it
+/// here would deadlock; it gets the non-blocking `retire` and the re-open
+/// residual tracked in #760. GSS and public sections take only `named_groups`
+/// / `kv_stores` (refresh hook), which are not held here, so they are drained.
+async fn retire_mismatched_cached_store(handle: &x0x::KvStoreHandle) {
+    if handle.is_treekem_protected() {
+        handle.retire();
+    } else {
+        handle.retire_and_drain().await;
+    }
+}
+
 /// Called only while the canonical store reservation and group membership
 /// guard are held. Re-resolve before touching a cached handle or starting sync.
 async fn open_bound_gss_store(
@@ -1469,7 +1489,7 @@ async fn open_bound_gss_store(
             .await
             .is_err()
         {
-            handle.retire();
+            retire_mismatched_cached_store(&handle).await;
             state.kv_stores.write().await.remove(&expected.topic);
             return Err(api_error(
                 StatusCode::CONFLICT,
@@ -1547,7 +1567,7 @@ async fn open_bound_treekem_store(
         {
             return Ok((handle, epoch, false));
         }
-        handle.retire();
+        retire_mismatched_cached_store(&handle).await;
         state.kv_stores.write().await.remove(&expected.topic);
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -1627,7 +1647,7 @@ async fn open_bound_public_store(
         {
             return Ok((handle, context, false));
         }
-        handle.retire();
+        retire_mismatched_cached_store(&handle).await;
         state.kv_stores.write().await.remove(&expected.topic);
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -4438,7 +4458,10 @@ mod tests {
             )
             .await
             .expect("destination conflict");
-        handle.retire();
+        // Drained, not just cancelled (#757): this test replaces the
+        // snapshot path with a directory below, so no listener section —
+        // e.g. the self-echo of the put above — may still be writing it.
+        handle.retire_and_drain().await;
         state.kv_stores.write().await.remove(&topic);
 
         seed_public_migration_group(&state, &colliding_id).await;
@@ -5267,6 +5290,195 @@ mod tests {
         .expect("mismatch cleanup must not deadlock");
         assert!(result.is_err(), "mismatched cached handle must fail closed");
         assert!(!state.kv_stores.read().await.contains_key(&binding.topic));
+    }
+
+    #[tokio::test]
+    async fn cached_binding_mismatch_drains_in_flight_persist_before_unregistering() {
+        // WHY (#757): the mismatch path unregisters the cached handle, after
+        // which a later open may start a NEW sync over the same snapshot
+        // path. A receive section the old sync already admitted still owes
+        // its snapshot write, so the handle must not be unregistered — and
+        // this call must not return — until that write has landed.
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "35".repeat(16);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.policy.read_access = crate::groups::GroupReadAccess::Public;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_public_group_store(&groups, &group_key, "Wiki", &state.agent.agent_id())
+                .expect("binding")
+        };
+        let snapshots = tempfile::tempdir().expect("snapshot dir");
+        let wrong = state
+            .agent
+            .create_kv_store_persistent(
+                "wrong",
+                "wrong/topic-757",
+                x0x::kv::AccessPolicy::Signed,
+                snapshots.path(),
+            )
+            .await
+            .expect("wrong cached handle");
+        let snapshot_bytes = || {
+            std::fs::read_dir(snapshots.path())
+                .expect("snapshot dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
+                .map(|entry| std::fs::read(entry.path()).expect("snapshot bytes"))
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot_bytes();
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), wrong.clone());
+
+        let bound = std::time::Duration::from_secs(10);
+        let mut delta = x0x::kv::KvStoreDelta::new(1);
+        let entry = x0x::kv::KvEntry::new(
+            "late-key".to_string(),
+            b"late".to_vec(),
+            "text/plain".to_string(),
+        );
+        delta.added.insert(
+            "late-key".to_string(),
+            (entry, (saorsa_gossip_types::PeerId::new([7; 32]), 1)),
+        );
+        let (open,) = wrong
+            .with_persist_gate_held_for_test(async {
+                wrong.publish_delta_for_test(delta).await;
+                // Barrier: merged in memory, so its snapshot write is now
+                // parked on the gate — a receive section in flight.
+                tokio::time::timeout(bound, async {
+                    while !matches!(wrong.get("late-key").await, Ok(Some(_))) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("listener must merge the delta");
+                let mut open = Box::pin(open_bound_public_store(&state, &binding));
+                for _ in 0..64 {
+                    assert!(
+                        futures::poll!(open.as_mut()).is_pending(),
+                        "mismatch cleanup returned with a snapshot write still in flight"
+                    );
+                    assert!(
+                        state.kv_stores.read().await.contains_key(&binding.topic),
+                        "handle unregistered before its in-flight write drained"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(snapshot_bytes(), before);
+                // Tuple: hand the still-pending future back un-awaited.
+                (open,)
+            })
+            .await;
+        let result = tokio::time::timeout(bound, open)
+            .await
+            .expect("mismatch cleanup must finish once the write lands");
+        assert!(result.is_err(), "mismatched cached handle must fail closed");
+        assert_ne!(
+            snapshot_bytes(),
+            before,
+            "cleanup returned before the admitted snapshot write landed"
+        );
+        assert!(!state.kv_stores.read().await.contains_key(&binding.topic));
+    }
+
+    #[tokio::test]
+    async fn public_mismatch_cleanup_never_drains_a_cached_treekem_sync() {
+        // WHY (#757 r3, Codex P1): `update_group_policy` lets a group go
+        // TreeKEM -> SignedPublic without retiring cached stores, and the
+        // topic does not change, so the PUBLIC mismatch arm can find a
+        // TreeKEM sync. Its receive section waits on the group membership
+        // guard (protector `open_record`) while holding the lifecycle lock —
+        // and every caller of `open_bound_public_store` holds that guard.
+        // Draining there deadlocks the request forever; the cleanup must
+        // pick plain `retire` from the cached sync, not the requested plane.
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "13".repeat(16);
+        seed_treekem_group(&state, &group_key).await;
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_key.clone()),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Json(CreateGroupStoreRequest {
+                name: "n".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+        let topic = resp.0["topic"].as_str().expect("topic").to_string();
+        let handle = state
+            .kv_stores
+            .read()
+            .await
+            .get(&topic)
+            .cloned()
+            .expect("TreeKEM handle");
+        assert!(handle.is_treekem_protected());
+
+        // Park the TreeKEM listener inside a receive section: each write's
+        // self-echo makes it take the lifecycle lock and then wait on the
+        // membership guard we grab right after the write returns. Retry
+        // until that ordering is observed (an echo handled before we hold
+        // the guard parks nothing).
+        let membership =
+            crate::server::routes::named_groups::group_membership_lock(&state, &group_key).await;
+        let mut held = None;
+        for round in 0..64 {
+            handle
+                .put_with_delta(format!("k{round}"), b"v".to_vec(), "text/plain".into())
+                .await
+                .expect("TreeKEM store write");
+            let guard = Arc::clone(&membership).lock_owned().await;
+            for _ in 0..64 {
+                if handle.receive_section_active_for_test() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            if handle.receive_section_active_for_test() {
+                held = Some(guard);
+                break;
+            }
+        }
+        let _membership_guard =
+            held.expect("TreeKEM listener must park on the membership guard in a section");
+
+        // The policy transition: same group, same topic, now SignedPublic.
+        let binding = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_key).expect("group");
+            info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+            info.policy.read_access = crate::groups::GroupReadAccess::Public;
+            resolve_public_group_store(&groups, &group_key, "n", &state.agent.agent_id())
+                .expect("public binding after the policy change")
+        };
+        assert_eq!(binding.topic, topic, "policy change must keep the topic");
+
+        // Safety net, not an oracle: it only turns the deadlock into a FAIL.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            open_bound_public_store(&state, &binding),
+        )
+        .await
+        .expect("mismatch cleanup deadlocked against the parked TreeKEM section");
+        assert!(result.is_err(), "mismatched cached handle must fail closed");
+        assert!(!state.kv_stores.read().await.contains_key(&topic));
     }
 
     #[tokio::test]
