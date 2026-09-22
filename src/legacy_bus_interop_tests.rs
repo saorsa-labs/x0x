@@ -1026,6 +1026,14 @@ async fn issue613_application_delivery(cut: bool) {
         // The load clock intentionally excludes diagnostic acquisition.
         let started = std::time::Instant::now();
         let outer_t0 = generator_cut(sender, clock);
+        // #774 diagnostic-only: arm the bounded per-edge send-verdict trace
+        // and first-per-peer close-reason capture immediately before load.
+        // Zero behaviour change; read only on failure, before teardown.
+        for agent in &agents {
+            if let Some(network) = agent.network() {
+                network.arm_issue774_diagnostics();
+            }
+        }
 
         let publisher = async {
             let mut timer = tokio::time::interval_at(
@@ -1177,6 +1185,19 @@ async fn issue613_application_delivery(cut: bool) {
                     let outer_messages = outer_counter(&failure_t1, "msgs")
                         .zip(outer_counter(&outer_t0, "msgs"))
                         .and_then(|(end, begin)| end.checked_sub(begin));
+                    let issue774_edges = serde_json::json!(
+                        DIAMOND_LABELS
+                            .iter()
+                            .zip(&agents)
+                            .map(|(label, agent)| {
+                                let snapshot = agent
+                                    .network()
+                                    .map(|network| network.issue774_diagnostics_snapshot())
+                                    .unwrap_or(serde_json::Value::Null);
+                                ((*label).to_owned(), snapshot)
+                            })
+                            .collect::<serde_json::Map<_, _>>()
+                    );
                     let outer_bytes = outer_counter(&failure_t1, "bytes")
                         .zip(outer_counter(&outer_t0, "bytes"))
                         .and_then(|(end, begin)| end.checked_sub(begin));
@@ -1185,6 +1206,7 @@ async fn issue613_application_delivery(cut: bool) {
                         "diagnostic_status":"complete",
                         "outer_load_cuts": {"t0":outer_t0,"t1":failure_t1},
                         "outer_eager_messages":outer_messages,
+                        "issue774_edge_trace": issue774_edges,
                         "outer_eager_bytes":outer_bytes,
                         "outer_eager_average_bytes":outer_messages.zip(outer_bytes)
                             .and_then(|(messages, bytes)| bytes.checked_div(messages)),
