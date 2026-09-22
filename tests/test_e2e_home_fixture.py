@@ -34,20 +34,46 @@ class HomeFixtureTests(unittest.TestCase):
         return self.h.Node(label, "192.0.2.1", 14600, 7483,
                            "/var/tmp/x0x-home-e2e-" + "a" * 32)
 
-    def run_join_offline(self, evidence, responses, *, join_state="pending_authority_commit"):
-        """Drive the real Home seat poll against fake APIs and a virtual clock."""
+    def run_join_offline(self, evidence, responses, *, join_state="pending_authority_commit",
+                         local_responses=None, local_join_status=(200, {}), request_advance=0.0,
+                         owner_error_at=(), local_error_at=(), terminal_error=None):
+        """Drive the real Home readiness barrier against fake APIs and a virtual clock."""
         owner, member = mock.Mock(), mock.Mock()
-        member.request.return_value = (200, {"ok": True, "group_id": "home-gid",
-                                             "join_state": join_state})
+        local_responses = local_responses or [(200, {"ok": True, "group_id": "home-gid",
+                                                       "membership_state": "active"})]
         member.agent_id.return_value = "a" * 64
         samples = []
-        def roster(method, path):
-            self.assertEqual(("GET", "/groups/home-gid/members"), (method, path))
-            response = responses[min(len(samples), len(responses) - 1)]
-            samples.append(response)
-            return response
-        owner.request.side_effect = roster
+        local_samples = []
         clock = types.SimpleNamespace(now=1000.0)
+        def owner_roster(method, path):
+            self.assertEqual(("GET", "/groups/home-gid/members"), (method, path))
+            index = len(samples)
+            samples.append(None)
+            clock.now += request_advance
+            if index in owner_error_at:
+                raise RuntimeError("synthetic owner request failure")
+            response = responses[min(index, len(responses) - 1)]
+            samples[-1] = response
+            return response
+        def member_api(method, path, body=None):
+            if method == "POST":
+                return (200, {"ok": True, "group_id": "home-gid", "join_state": join_state})
+            if path == "/groups/home-gid":
+                index = len(local_samples)
+                local_samples.append(None)
+                clock.now += request_advance
+                if index in local_error_at:
+                    raise RuntimeError("synthetic local request failure")
+                response = local_responses[min(index, len(local_responses) - 1)]
+                local_samples[-1] = response
+                return response
+            if path == "/groups/home-gid/join-status":
+                if terminal_error is not None:
+                    raise RuntimeError(terminal_error)
+                return local_join_status
+            raise AssertionError((method, path))
+        owner.request.side_effect = owner_roster
+        member.request.side_effect = member_api
         def sleep(seconds): clock.now += seconds
         poll_time = self.h.Scenario.join_home.__globals__["poll"].__globals__["time"]
         with mock.patch.object(poll_time, "monotonic", side_effect=lambda: clock.now), \
@@ -274,6 +300,9 @@ esac
                     if me not in world["announced"]: return 403, {"ok": False}
                     if online(world["invites"][body["invite"]]): seats[me] = "member"
                     return 200, {"ok": True, "group_id": gid}
+                if path == f"/groups/{gid}":
+                    return 200, {"ok": True, "group_id": gid,
+                                 "membership_state": "active" if me in seats else "pending_authority_commit"}
                 members = f"/groups/{gid}/members"
                 if path == members:
                     return 200, {"members": [{"agent_id": ids[n], "role": r} for n, r in seats.items()]}
@@ -500,10 +529,12 @@ esac
         self.assertEqual("pending_authority_commit", delayed.assertions[0]["join_state"])
         self.assertTrue(delayed.assertions[0]["passed"])
         accepted = delayed.polls[0]
-        self.assertEqual(("member Home seat reaches owner", "accepted", 120, 2.0, 200, 2, True),
+        self.assertEqual(("member Home seat reaches owner and local readiness", "accepted", 120, 2.0, 200, 2, True),
                          (accepted["label"], accepted["outcome"], accepted["deadline_seconds"],
                           accepted["elapsed_seconds"], accepted["last_http_status"],
                           accepted["observed_member_count"], accepted["expected_member_present"]))
+        self.assertEqual("active", accepted["local_membership_state"])
+        self.assertEqual(3, accepted["local_probe_count"])
         self.assertNotIn(secret, json.dumps(delayed.polls))
 
         for label, response, expected_status, expected_count, expected_present in (
@@ -512,7 +543,7 @@ esac
         ):
             with self.subTest(label=label):
                 evidence = self.h.Evidence()
-                with self.assertRaisesRegex(AssertionError, "member Home seat reaches owner"):
+                with self.assertRaisesRegex(AssertionError, "member Home seat reaches owner and local readiness"):
                     self.run_join_offline(evidence, [response], join_state=secret)
                 self.assertEqual("other", evidence.assertions[0]["join_state"])
                 receipt = evidence.polls[0]
@@ -525,6 +556,120 @@ esac
                 self.assertEqual(120, receipt["probe_count"])
                 self.assertNotIn(secret, json.dumps({"polls": evidence.polls,
                                                     "assertions": evidence.assertions}))
+
+    def test_home_join_waits_for_local_active_after_owner_roster(self):
+        evidence = self.h.Evidence()
+        samples = self.run_join_offline(
+            evidence,
+            [(200, {"members": [{"agent_id": "a" * 64}]})],
+            local_responses=[
+                (200, {"ok": True, "group_id": "home-gid", "membership_state": "pending_authority_commit"}),
+                (200, {"ok": True, "group_id": "home-gid", "membership_state": "active"}),
+            ],
+        )
+        self.assertEqual(2, len(samples))
+        receipt = evidence.polls[0]
+        self.assertEqual("accepted", receipt["outcome"])
+        self.assertEqual("active", receipt["local_membership_state"])
+        self.assertEqual(2, receipt["local_probe_count"])
+        self.assertEqual(1, receipt["observed_member_count"])
+
+    def test_home_join_local_pending_timeout_records_terminal_status(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                local_responses=[(200, {"ok": True, "group_id": "home-gid",
+                                        "membership_state": "pending_authority_commit"})],
+                local_join_status=(404, {"error": "group_not_found",
+                                         "last_join_outcome": {"outcome": "timed_out",
+                                                                "reason": "synthetic"}}),
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual(120, receipt["elapsed_seconds"])
+        self.assertEqual(404, receipt["terminal_join_status"])
+        self.assertEqual("timed_out", receipt["terminal_join_outcome"])
+        self.assertEqual("pending_authority_commit", receipt["local_membership_state"])
+        self.assertNotIn("synthetic", json.dumps(evidence.polls))
+
+    def test_home_join_local_http_error_fails_without_claiming_active(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                local_responses=[(503, {"error": "synthetic-secret"})],
+                local_join_status=(503, {"error": "join status unavailable"}),
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual(503, receipt["local_last_status"])
+        self.assertIsNone(receipt["local_membership_state"])
+        self.assertNotIn("synthetic-secret", json.dumps(evidence.polls))
+
+    def test_home_join_shared_deadline_does_not_double_owner_and_local_waits(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "c" * 64}]})],
+                local_responses=[(200, {"ok": True, "group_id": "wrong-group",
+                                        "membership_state": "active"})],
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual(120, receipt["elapsed_seconds"])
+        self.assertEqual(120, receipt["probe_count"])
+        self.assertEqual(120, receipt["local_probe_count"])
+
+    def test_home_join_request_and_terminal_errors_still_emit_bounded_receipt(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                local_responses=[(200, {"group_id": "home-gid", "membership_state": "pending_authority_commit"})],
+                owner_error_at=tuple(range(200)),
+                terminal_error="secret-terminal-error",
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual("RuntimeError", receipt["last_error_class"])
+        self.assertEqual("RuntimeError", receipt["terminal_join_status_error_class"])
+        self.assertIsNone(receipt["terminal_join_status"])
+        self.assertNotIn("secret-terminal-error", json.dumps(evidence.polls))
+
+    def test_home_join_unknown_state_and_terminal_outcome_are_redacted_to_other(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                local_responses=[(200, {"ok": True, "group_id": "home-gid",
+                                        "membership_state": ["SECRET_STATE"]})],
+                local_join_status=(404, {"last_join_outcome": {"outcome": ["SECRET_OUTCOME"]}}),
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("other", receipt["local_membership_state"])
+        self.assertEqual("other", receipt["terminal_join_outcome"])
+        self.assertNotIn("SECRET_STATE", json.dumps(evidence.polls))
+        self.assertNotIn("SECRET_OUTCOME", json.dumps(evidence.polls))
+
+    def test_home_join_rejects_readiness_that_crosses_shared_deadline(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                request_advance=61.0,
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertTrue(receipt["deadline_reached_before_acceptance"])
+        self.assertEqual(1, receipt["probe_count"])
+        self.assertEqual(1, receipt["local_probe_count"])
+        self.assertGreaterEqual(receipt["elapsed_seconds"], 120)
 
     def test_failed_home_seat_poll_still_reports_and_cleans_up(self):
         custody = mock.Mock(); custody.restore.return_value = []
