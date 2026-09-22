@@ -2528,6 +2528,19 @@ async fn issue613_node_diagnostics(
     agents: &[Agent],
     clock: std::time::Instant,
 ) -> serde_json::Value {
+    // #774 (d83 repeat): every projection below is aggregate, so the t0/t1
+    // cuts cannot separate "D5 absent from G5's DM-bus topic overlay" from
+    // "present but never selected" — both leave admission, transport and
+    // egress counters looking healthy. raw_sample already serializes the
+    // full stage_stats() snapshot, so project the DM-bus entry of
+    // peer_scores_by_topic (per-peer role, eager eligibility, cooling
+    // state) and the DM-bus rows of the flat peer_scores (adding decayed
+    // outbound-send evidence) with no second stats fetch, lock, or await.
+    // Null marks the topic absent from the scores map; peer rows are never
+    // invented. outbound_send_successes/_timeouts, cooling_events and
+    // recovery_* are decayed evidence, not exact attempt counts.
+    let dm_bus_topic =
+        saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
     let mut nodes = serde_json::Map::new();
     for (label, agent) in DIAMOND_LABELS.iter().zip(agents) {
         let begin_ns = diamond_now(clock);
@@ -2543,6 +2556,20 @@ async fn issue613_node_diagnostics(
         let sample = raw_sample(agent, clock);
         let bus_subscribed = pubsub(agent).is_topic_subscribed(DM_BUS_TOPIC).await;
         let end_ns = diamond_now(clock);
+        // Topic absence stays explicit: null, never a fabricated empty peer
+        // map (the snapshot builder only inserts a peer under a live topic).
+        let dm_bus_scores_by_topic = sample["stages"]["peer_scores_by_topic"]
+            .get(&dm_bus_topic)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let dm_bus_flat_scores: Vec<serde_json::Value> = sample["stages"]["peer_scores"]
+            .as_array()
+            .map_or_else(Vec::new, |rows| {
+                rows.iter()
+                    .filter(|row| row["topic"].as_str() == Some(dm_bus_topic.as_str()))
+                    .cloned()
+                    .collect()
+            });
         nodes.insert(
             (*label).to_owned(),
             serde_json::json!({
@@ -2556,6 +2583,9 @@ async fn issue613_node_diagnostics(
                 "peers_evicted_not_connected": sample["stages"]["peers_evicted_not_connected"],
                 "suppressed_peers": sample["stages"]["suppressed_peers"],
                 "outbound_by_topic_named": sample["egress"]["outbound_by_topic_named"],
+                "dm_bus_topic_key": dm_bus_topic.as_str(),
+                "dm_bus_peer_scores_by_topic": dm_bus_scores_by_topic,
+                "dm_bus_peer_scores": dm_bus_flat_scores,
             }),
         );
     }
