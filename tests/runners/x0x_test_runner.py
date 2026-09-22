@@ -109,6 +109,10 @@ RESULT_HTTP_TASKS_MAX = 16
 COMMAND_REPLAY_MAX_ENTRIES = 256
 COMMAND_REPLAY_MAX_BYTES = 4 * 1024 * 1024
 COMMAND_REPLAY_TTL_SECS = 300
+# Bound on commands admitted-but-not-yet-executing. Enforced with a
+# non-blocking enqueue: a full queue rejects the command explicitly
+# instead of blocking an event reader or buffering without limit.
+COMMAND_QUEUE_MAX = 64
 
 
 def now_ms() -> int:
@@ -387,8 +391,10 @@ class TestRunner:
         # fresh discover.
         self._last_known_anchor_aid: Optional[str] = None
         self._subscription_ids: Dict[str, str] = {}
-        # Both control listeners can dispatch concurrently. Entries remain in
-        # this table while their action is running, so pressure never evicts an
+        # Both control listeners admit commands concurrently; the single
+        # command worker then executes them FIFO/serially (see
+        # _start_command_worker). Entries remain in this table from
+        # admission until execution finishes, so pressure never evicts an
         # in-flight mutation and permits a duplicate to run it again.
         self._replay_lock = threading.Lock()
         self._replay: "collections.OrderedDict[Tuple[str, str], Dict[str, Any]]" = (
@@ -406,6 +412,20 @@ class TestRunner:
             maxsize=RESULT_HTTP_TASKS_MAX,
         )
         self._http_workers: List[threading.Thread] = []
+        # Bounded FIFO of admitted-but-not-yet-executing commands,
+        # drained by the single command worker. None until run() starts
+        # the worker: without it, _dispatch_command keeps its original
+        # synchronous execute-on-calling-thread contract (unit tests
+        # and direct callers rely on it).
+        self._command_q: Optional[
+            "queue.Queue[Tuple[Dict[str, Any], Optional[str], Optional[Tuple[str, str]]]]"
+        ] = None
+        # Serializes worker-mode admission (the _stop check plus the
+        # put in _enqueue_command) against the shutdown drain in
+        # _stop_command_worker, so a reader still finishing an event
+        # after the drain cannot enqueue a command that no one would
+        # execute, roll back, or count.
+        self._command_admission_lock = threading.Lock()
 
     # ─── lifecycle ─────────────────────────────────────────────────────
     def run(self) -> int:
@@ -415,6 +435,9 @@ class TestRunner:
             self.log.error("bootstrap failed: %s", exc)
             return 2
 
+        # Command worker first: once the listeners are live they hand
+        # commands to it, so it must exist before any event arrives.
+        command_worker = self._start_command_worker()
         threads = [
             threading.Thread(target=self._control_listener_loop, daemon=True),
             threading.Thread(target=self._direct_listener_loop, daemon=True),
@@ -431,6 +454,10 @@ class TestRunner:
         except KeyboardInterrupt:
             pass
         self._stop.set()
+        # Stop the command worker while publishers are still alive so a
+        # command still executing inside the shutdown bound can enqueue
+        # its result for the publisher drain that follows.
+        self._stop_command_worker(command_worker)
         self._stop_publisher_workers(publisher_threads)
         return 0
 
@@ -604,6 +631,82 @@ class TestRunner:
                 "result HTTP shutdown left %d bounded running tasks to finish",
                 surviving,
             )
+
+    # ─── command execution worker ─────────────────────────────────────
+    def _start_command_worker(self) -> threading.Thread:
+        # One worker = strict FIFO, serial command execution across both
+        # control inputs. Before this existed each reader thread executed
+        # its own commands inline, so one slow send_dm (3x15s HTTP plus
+        # backoff) blocked that reader's SSE stream for its whole retry
+        # budget, stalling incoming receipts and later commands.
+        self._command_q = queue.Queue(maxsize=COMMAND_QUEUE_MAX)
+        worker = threading.Thread(
+            target=self._command_worker_loop,
+            name="x0x-command-worker",
+            daemon=True,
+        )
+        worker.start()
+        return worker
+
+    def _stop_command_worker(self, worker: threading.Thread) -> None:
+        # self._stop is already set. The worker finishes its active
+        # command (blocking HTTP cannot be aborted mid-read) inside the
+        # existing result budget, then exits at its next loop check. A
+        # get() already waiting when _stop was set can still return one
+        # last admitted item, which then executes — that item was
+        # admitted, so running it is correct. Admission racing this
+        # shutdown is serialized by _command_admission_lock (shared
+        # with the drain below): an enqueue either lands in the queue
+        # before the drain — the worker executes it, or it is rolled
+        # back and counted below — or observes _stop in
+        # _enqueue_command and is rejected explicitly there.
+        worker.join(timeout=RESULT_TOTAL_BUDGET_SECS)
+        if worker.is_alive():
+            self.log.warning(
+                "command shutdown left a bounded active command running; "
+                "daemon worker dies with the process"
+            )
+        # Items still queued will never execute. Roll each replay entry
+        # back so an orchestrator retransmit of the same request_id is
+        # executed fresh instead of coalescing into a dead entry, and
+        # report the count honestly rather than dropping silently. The
+        # admission lock also guarantees nothing can be enqueued after
+        # this drain: a late admission observes _stop and is rejected
+        # in _enqueue_command instead of lingering unexecuted.
+        aborted = 0
+        with self._command_admission_lock:
+            while True:
+                try:
+                    _cmd, _source_aid, replay_key = self._command_q.get_nowait()
+                except queue.Empty:
+                    break
+                self._abort_replay(replay_key)
+                aborted += 1
+        if aborted:
+            self.log.warning(
+                "aborted %d queued commands at shutdown (never executed; "
+                "retransmit re-executes them)",
+                aborted,
+            )
+
+    def _command_worker_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                cmd, source_aid, replay_key = self._command_q.get(
+                    timeout=0.5,
+                )
+            except queue.Empty:
+                continue
+            try:
+                self._run_command(cmd, source_aid, replay_key)
+            except Exception as exc:
+                # _execute_command already converts action failures into
+                # error results; this guard only stops one poisoned item
+                # from killing serial execution for everything queued
+                # behind it. _run_command's finally already finished the
+                # replay entry; re-finishing only refreshes its stamp.
+                self.log.error("command worker item failed: %s", exc)
+                self._finish_replay(replay_key)
 
     def _publisher_loop(self) -> None:
         while not self._stop.is_set():
@@ -1274,7 +1377,27 @@ class TestRunner:
                 entry["result_unavailable"] = True
             entry["state"] = "complete"
             entry["completed_at"] = time.monotonic()
+            # Finish-time sweep: _begin_replay and
+            # _mark_replay_delivery_finished prune only on their own
+            # activity, so without this a completed, delivered entry
+            # could linger through an idle period until the next
+            # command arrives. Never touches in-flight entries.
             self._prune_replay_locked(entry["completed_at"])
+
+    def _abort_replay(self, key: Optional[Tuple[str, str]]) -> None:
+        """Roll back an admitted-but-never-executed command's replay entry.
+
+        Only called for commands proven never to run (queue-full reject
+        before enqueue, or still queued at shutdown): a retransmit of
+        the same request_id must be admitted fresh rather than
+        coalescing into an entry whose command will never execute.
+        """
+        if key is None:
+            return
+        with self._replay_lock:
+            entry = self._replay.pop(key, None)
+            if entry is not None:
+                self._replay_bytes -= entry["result_bytes"]
 
     def _prune_stale_results(self, now_ms_value: int) -> None:
         cutoff_ms = now_ms_value - (RESULT_QUEUE_MAX_AGE_SECS * 1000)
@@ -1578,12 +1701,89 @@ class TestRunner:
                 coalesce=False,
             )
             return
+        if self._command_q is not None:
+            # Worker mode (run() lifecycle): admission stays on the
+            # calling reader thread so dedup/conflict/replay decisions
+            # are made promptly; execution hands off to the FIFO worker
+            # so this reader keeps consuming events (received_dm,
+            # discovery, further commands) while the command runs.
+            self._enqueue_command(cmd, source_aid, replay_key)
+            return
+        self._run_command(cmd, source_aid, replay_key)
+
+    def _run_command(
+        self,
+        cmd: Dict[str, Any],
+        source_aid: Optional[str],
+        replay_key: Optional[Tuple[str, str]],
+    ) -> None:
+        """Execute one admitted command on the calling thread.
+
+        The replay entry stays in_flight for the whole execution so
+        duplicates coalesce instead of re-running the mutation, and the
+        dispatch-context key keeps every result this command enqueues
+        causally pinned to it.
+        """
         self._dispatch_context.replay_key = replay_key
         try:
             self._execute_command(cmd, source_aid)
         finally:
             self._dispatch_context.replay_key = None
             self._finish_replay(replay_key)
+
+    def _enqueue_command(
+        self,
+        cmd: Dict[str, Any],
+        source_aid: Optional[str],
+        replay_key: Optional[Tuple[str, str]],
+    ) -> None:
+        """Hand an admitted command to the worker without blocking.
+
+        put_nowait keeps the event reader responsive even under
+        backlog. A full queue — or admission after the stop flag, when
+        no worker will ever execute the command — rejects explicitly
+        instead of blocking or dropping silently: the sender gets an
+        error result, and the replay entry is rolled back so a
+        retransmit of the same request_id executes fresh once the
+        backlog drains (or the runner restarts). The _stop check and
+        the put run under _command_admission_lock, which the shutdown
+        drain in _stop_command_worker also holds, so admission racing
+        shutdown either lands in the queue before the drain (executed,
+        or aborted and counted there) or is rejected here — never
+        enqueued past the drain to sit unexecuted and uncounted.
+        """
+        with self._command_admission_lock:
+            shutting_down = self._stop.is_set()
+            if not shutting_down:
+                try:
+                    self._command_q.put_nowait((cmd, source_aid, replay_key))
+                    return
+                except queue.Full:
+                    pass
+        reason = (
+            "runner is shutting down"
+            if shutting_down
+            else "runner command queue is full"
+        )
+        self._abort_replay(replay_key)
+        request_id = (cmd.get("params") or {}).get("request_id")
+        self.log.warning(
+            "rejecting command action=%s request_id=%s: %s",
+            cmd.get("action"),
+            request_id,
+            reason,
+        )
+        self._enqueue_result(
+            {
+                "kind": "error",
+                "command_id": cmd.get("command_id"),
+                "request_id": request_id,
+                "outcome": {"error": reason},
+            },
+            target_aid=source_aid,
+            result_chunks_v2=cmd.get("result_chunks_v2") is True,
+            coalesce=False,
+        )
 
     def _execute_command(
         self,
