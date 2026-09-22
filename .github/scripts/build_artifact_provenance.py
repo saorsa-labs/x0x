@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,11 @@ from typing import NoReturn
 
 STATE = ".provenance-state.json"
 MANIFEST = "build-provenance.json"
+ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+RUSTUP_CROSS_PREAMBLE = re.compile(
+    r"  (?P<version>[0-9]+\.[0-9]+\.[0-9]+)-x86_64-unknown-linux-gnu unchanged - "
+    r"rustc (?P=version) \([0-9a-f]{9,40} [0-9]{4}-[0-9]{2}-[0-9]{2}\)"
+)
 
 
 def fail(message: str) -> NoReturn:
@@ -136,6 +142,7 @@ def required_binary_names(target: str) -> set[str]:
 def current_build_binaries(messages_path: Path, release_dir: Path, target: str) -> list[Path]:
     observed: set[str] = set()
     build_finished = False
+    cargo_records_started = False
     try:
         lines = messages_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
@@ -146,9 +153,21 @@ def current_build_binaries(messages_path: Path, release_dir: Path, target: str) 
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            # `cross` invokes the pinned host rustup toolchain before Cargo.
+            # Rustup writes this one status line to stdout (optionally with
+            # SGR colour), so it is captured by the workflow's `tee` ahead of
+            # Cargo's JSON stream. Accept only that exact pinned status and
+            # only before the first Cargo record; every other non-JSON line
+            # remains fatal.
+            if (
+                not cargo_records_started
+                and RUSTUP_CROSS_PREAMBLE.fullmatch(ANSI_SGR.sub("", line)) is not None
+            ):
+                continue
             fail(f"invalid Cargo build record at line {line_number}")
         if not isinstance(record, dict):
             fail(f"invalid Cargo build record at line {line_number}")
+        cargo_records_started = True
         reason = record.get("reason")
         if reason == "build-finished":
             if build_finished or record.get("success") is not True:

@@ -145,6 +145,67 @@ class ProvenanceFixture(unittest.TestCase):
         PROVENANCE.finalize(self.repo, self.artifact, self.release, self.messages)
         self.assertNotIn("x0x-stale-feature", {path.name for path in self.artifact.iterdir()})
 
+    def test_exact_cross_rustup_preamble_before_cargo_is_accepted(self) -> None:
+        self.messages.write_text(
+            "\n\x1b[1m  1.95.0-x86_64-unknown-linux-gnu unchanged - "
+            "rustc 1.95.0 (59807616e 2026-04-14)\x1b[0m\n\n"
+            + self.messages.read_text()
+        )
+        self.prepare()
+        PROVENANCE.finalize(self.repo, self.artifact, self.release, self.messages)
+        self.assertEqual(
+            PROVENANCE.sha256(self.messages),
+            PROVENANCE.read_json(self.artifact / PROVENANCE.MANIFEST)[
+                "cargo_build_messages_sha256"
+            ],
+        )
+
+    def test_next_version_cross_rustup_preamble_is_accepted(self) -> None:
+        self.messages.write_text(
+            "  1.96.0-x86_64-unknown-linux-gnu unchanged - "
+            "rustc 1.96.0 (abcdef123 2026-06-01)\n"
+            + self.messages.read_text()
+        )
+        self.prepare()
+        PROVENANCE.finalize(self.repo, self.artifact, self.release, self.messages)
+
+    def test_inconsistent_cross_rustup_versions_are_rejected(self) -> None:
+        self.messages.write_text(
+            "  1.96.0-x86_64-unknown-linux-gnu unchanged - "
+            "rustc 1.95.0 (abcdef123 2026-06-01)\n"
+            + self.messages.read_text()
+        )
+        self.prepare()
+        with self.assertRaisesRegex(RuntimeError, "invalid Cargo build record at line 1"):
+            PROVENANCE.finalize(self.repo, self.artifact, self.release, self.messages)
+
+    def test_unknown_or_malformed_build_record_is_rejected(self) -> None:
+        original = self.messages.read_text()
+        for label, prefix in (
+            ("unknown", "cross emitted an unknown status\n"),
+            ("malformed-json", '{"reason":"compiler-artifact"\n'),
+        ):
+            with self.subTest(label=label):
+                artifact = self.root / f"artifact-{label}"
+                self.messages.write_text(prefix + original)
+                PROVENANCE.prepare(
+                    self.repo, artifact, "linux-x64-gnu", "x86_64-unknown-linux-gnu"
+                )
+                with self.assertRaisesRegex(RuntimeError, "invalid Cargo build record at line 1"):
+                    PROVENANCE.finalize(self.repo, artifact, self.release, self.messages)
+
+    def test_cross_rustup_preamble_after_cargo_starts_is_rejected(self) -> None:
+        lines = self.messages.read_text().splitlines()
+        lines.insert(
+            1,
+            "  1.95.0-x86_64-unknown-linux-gnu unchanged - "
+            "rustc 1.95.0 (59807616e 2026-04-14)",
+        )
+        self.messages.write_text("\n".join(lines) + "\n")
+        self.prepare()
+        with self.assertRaisesRegex(RuntimeError, "invalid Cargo build record at line 2"):
+            PROVENANCE.finalize(self.repo, self.artifact, self.release, self.messages)
+
     def test_failed_or_missing_build_completion_is_rejected(self) -> None:
         for label, records in (
             ("failed", (("x0x", False), ("x0xd", False))),
