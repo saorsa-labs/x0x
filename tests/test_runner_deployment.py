@@ -70,6 +70,7 @@ esac
                 ["bash", "tests/e2e_deploy.sh", "--network", "test"],
                 cwd=root,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 check=False,
