@@ -342,10 +342,14 @@ jobs:
         run: |
           STAGING="x0x-${{ matrix.platform }}"
           mkdir -p "$STAGING"
-          cp "${RUNNER_TEMP}/release-${{ matrix.platform }}-custody/"* "$STAGING/"
+          CUSTODY="${RUNNER_TEMP}/release-${{ matrix.platform }}-custody"
+          for bin in x0xd x0x; do
+            cp "$CUSTODY/$bin" "$STAGING/$bin"
+          done
+          cp "$CUSTODY/Cargo.lock" "$CUSTODY/build-provenance.json" "$STAGING/"
           cp LICENSE* "$STAGING/" 2>/dev/null || true
           cp README.md "$STAGING/" 2>/dev/null || true
-          tar czf "x0x-${{ matrix.platform }}.tar.gz" "$STAGING"
+          COPYFILE_DISABLE=1 tar czf "x0x-${{ matrix.platform }}.tar.gz" "$STAGING"
           echo "ASSET=x0x-${{ matrix.platform }}.tar.gz" >> $GITHUB_ENV
 
       - name: Package (zip)
@@ -354,7 +358,11 @@ jobs:
         run: |
           $staging = "x0x-${{ matrix.platform }}"
           New-Item -ItemType Directory -Path $staging -Force
-          Copy-Item "$env:RUNNER_TEMP/release-${{ matrix.platform }}-custody/*" -Destination $staging
+          $custody = "$env:RUNNER_TEMP/release-${{ matrix.platform }}-custody"
+          foreach ($bin in @("x0xd.exe", "x0x.exe")) {
+            Copy-Item "$custody/$bin" -Destination "$staging/$bin"
+          }
+          Copy-Item "$custody/Cargo.lock", "$custody/build-provenance.json" -Destination $staging
           if (Test-Path "LICENSE*") { Copy-Item LICENSE* -Destination $staging }
           if (Test-Path "README.md") { Copy-Item README.md -Destination $staging }
           Compress-Archive -Path "$staging/*" -DestinationPath "x0x-${{ matrix.platform }}.zip"
