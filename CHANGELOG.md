@@ -66,6 +66,64 @@ All notable changes to this project will be documented in this file.
   `docs/diagnostics.md`.
 ### Fixed
 
+- **`Agent::shutdown` now retires persistent kv snapshot paths, so an owner
+  restart re-opens them instead of being fenced off (#765, follow-up to
+  #760).** The #760 snapshot fence refuses to arm persistence for any open
+  claimed while a predecessor generation still owns the path. Retirement —
+  the only transition back to `Idle` — existed solely on
+  `KvStoreHandle::retire`/`retire_and_drain`, which only the daemon routes
+  call. A library restart sequence (`Agent::shutdown` → new `Agent` →
+  `create_kv_store_persistent` on the same state dir) therefore failed
+  deterministically with `SnapshotSuperseded` ("kv snapshot path cannot be
+  armed for this open") whenever the old handle was still referenced — the
+  #765 Test Suite regression. Every committed persistent open is now
+  tracked on the agent by canonical snapshot path through a weak sync
+  reference only — the committed #760 open lease is owned by the
+  `KvStoreSync` itself, so dropping the last `KvStoreHandle` still cancels
+  the loops structurally and frees the fence entry for a re-open, with no
+  agent shutdown and no `retire()` call required. Commit and shutdown are
+  atomically ordered through the registry's closed flag (one lock hold
+  covers the closed check, the fence commit, the lease adoption, and the
+  insert): a commit racing the shutdown sweep either lands inside the
+  retired set or fails the open closed — it can never escape retirement and
+  wedge the next restart. `shutdown` marks each still-owned path `Retiring`
+  and cancels its sync loops before the tracked-task drain, then completes
+  the retirements after it — the in-process equivalent of process death,
+  and the exact point where the old generation provably can no longer admit
+  writes. Concurrent `shutdown` calls are now serialized whole-call: the
+  retirement-token custody and the tracked-task drain can never split
+  across two callers (one sweeping the tokens while another drains the
+  tasks), so a path returns to `Idle` only after the caller that drained
+  it completes the retirement — covered by a two-caller barrier test that
+  parks an admitted receive/persist section, proves BOTH callers were
+  actually polled into `shutdown`, proves their bodies never overlap
+  (the serialized high-water count stays at 1 — removing the
+  serialization pushes it to 2 and fails the test), and shows the path
+  stays un-openable until the drain ends and the admitted write lands.
+  Cancelling a shutdown caller is now custody-safe: the swept retirement
+  tokens and the exact taken tracked-task handles move — synchronously,
+  before that caller can first suspend past the sweep — into a spawned
+  custody task that performs the bounded drain, completes the retirements
+  after it, and publishes one shared completion signal that EVERY later
+  or concurrent shutdown awaits before any teardown step or return. An
+  aborted leader can therefore no longer drop the tokens uncompleted
+  (which permanently wedged the retained path in `Retiring`) or detach
+  the taken handles (which let a follower find empty registries and
+  return success while the old writer was still being drained) — a
+  regression aborts a real leader mid-drain, polls a real follower until
+  it is provably suspended on the same outstanding custody, and re-opens
+  with the admitted data only after the custody finishes. A re-open
+  while the owning agent is still running stays refused (trample window
+  unchanged), and stale caller-driven persists on the old handle stay
+  fenced by the successor's younger persist generation. Last-handle-drop
+  teardown is staged honestly: the drop releases the sync-owned lease and
+  cancels the loops synchronously, while the fence entry becomes prunable
+  only once the cancelled loop futures drop their captured persist
+  contexts — each loop future is wrapped whole, so its loop-exit record
+  fires only after the future and all captured persist contexts are
+  destroyed, including a future dropped before its first poll; the reopen
+  control asserts the weak-reference release and then awaits those exact
+  (now strictly terminal) loop exits instead of racing the executor.
 - **Startup journal recovery no longer lifts a fork quarantine, and now contains
   lineage-free ordinary groups (#732; found by a third-model static audit).** Two
   HIGH defects on the file-level recovery path, which runs before the in-memory

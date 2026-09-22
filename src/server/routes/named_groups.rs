@@ -8642,9 +8642,20 @@ async fn try_queue_causal_approval(
 /// receiver's then-current frontier. Group state is persisted before removing
 /// an applied queue entry so a crash between the two leaves the entry stale
 /// rather than lost.
+///
+/// #759 item 1: `cleared_quarantine` accumulates the group spellings whose
+/// fork-quarantine marker a replayed event's apply transitioned Some→None,
+/// but ONLY when this loop's own checked persist came back Durable — a
+/// rolled-back or non-durable candidate is NOT a clear (the rollback above
+/// restores the marker). The caller MUST consume the set only after this
+/// function returns and its membership/persistence guards drop, by calling
+/// [`super::tasks::resume_group_task_ingest`] for each spelling: the drain
+/// takes `TaskList` write then `named_groups` read, so running it under
+/// this function's guards would invert the documented lock order.
 pub(in crate::server) async fn replay_pending_causal_approvals(
     state: &Arc<AppState>,
     group_id: &str,
+    cleared_quarantine: &mut std::collections::BTreeSet<String>,
 ) {
     // Global lock order M→P→Q: admission already holds the per-group
     // membership lock before it enters the causal queue writer, so replay
@@ -8797,6 +8808,11 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         // AND to avoid stack overflow — _inner_serialized is a large async
         // function whose future state machine is too big for the stack.
         let mut replay_group_id: Option<String> = None;
+        // #759 item 1: per-iteration durable-clear accumulator — only
+        // promoted into the caller's set when the checked persist below is
+        // Durable (a rolled-back candidate restored its marker, so a clear
+        // that did not stick must not notify).
+        let mut iteration_cleared = std::collections::BTreeSet::new();
         let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
             state,
             pending.event.clone(),
@@ -8806,6 +8822,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             None,  // no envelope bytes on replay (event is already decoded)
             None,
             &mut replay_group_id,
+            &mut iteration_cleared,
             true, // lock_already_held
             true, // roster_lock_already_held
         ))
@@ -8851,6 +8868,12 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             (false, false)
         };
         if applied.accepted && group_persisted {
+            // #759 item 1: the candidate is DURABLE, so a marker clear it
+            // carried is real — promote it to the caller's notification set.
+            // (Rolled-back and visible-but-not-durable candidates keep their
+            // marker, per the Watson ruling that withholds post-persist
+            // effects, so they must not notify.)
+            cleared_quarantine.append(&mut iteration_cleared);
             // B5: persist succeeded — now refresh the card cache and
             // record the membership event. These were deferred from the
             // inner apply (allow_queue=false) so a failed write leaves no
@@ -9342,6 +9365,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     // Calling replay inside _serialized while the non-reentrant guard is held
     // re-enters the same mutex → deadlock (Kimi blocker 1).
     let mut replay_group_id: Option<String> = None;
+    // #759 item 1: durable-clear spellings from the apply (and, below, from
+    // the causal replay it drains) — consumed strictly after the replay
+    // call returns, i.e. with every membership/roster/persistence guard
+    // dropped, because the task-ingest drain takes `TaskList` write then
+    // `named_groups` read.
+    let mut cleared_quarantine = std::collections::BTreeSet::new();
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -9351,13 +9380,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
         envelope_bytes,
         None,
         &mut replay_group_id,
+        &mut cleared_quarantine,
         false,
         false,
     ))
     .await;
     if let Some(gid) = replay_group_id {
-        replay_pending_causal_approvals(state, &gid).await;
+        replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
+    resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
     applied
 }
 
@@ -9373,6 +9404,9 @@ async fn apply_named_group_metadata_event_inner(
     // Only when allow_queue is true (suppressed during replay itself to
     // prevent recursion).
     let mut replay_group_id: Option<String> = None;
+    // #759 item 1: as in `apply_named_group_metadata_event` above — the
+    // notification is consumed only after the (guard-free) replay call.
+    let mut cleared_quarantine = std::collections::BTreeSet::new();
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -9382,18 +9416,47 @@ async fn apply_named_group_metadata_event_inner(
         envelope_bytes,
         None,
         &mut replay_group_id,
+        &mut cleared_quarantine,
         false,
         false,
     ))
     .await;
     if allow_queue {
         if let Some(gid) = replay_group_id {
-            replay_pending_causal_approvals(state, &gid).await;
+            replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
         }
     }
+    resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
     applied
 }
 
+/// #759 item 1: consume a durable-clear notification. MUST be called with
+/// no membership, `named_groups`, or persistence guard held — every caller
+/// site sits after the apply/replay machinery has returned and dropped its
+/// guards, because the drain this triggers takes each list's `TaskList`
+/// write lock and then `named_groups.read()` inside it (the documented
+/// `TaskList` → `named_groups` order; see
+/// `super::tasks::resume_group_task_ingest`). Spurious entries are safe —
+/// the drain re-checks suspension and marker identity under the pinned
+/// roster — which is why the late/re-quarantined window needs no extra
+/// fencing; a MISSED durable clear is the defect this closes.
+pub(in crate::server) async fn resume_task_ingest_after_durable_clear(
+    state: &Arc<AppState>,
+    cleared: &std::collections::BTreeSet<String>,
+) {
+    for group_id in cleared {
+        super::tasks::resume_group_task_ingest(state, group_id).await;
+    }
+}
+
+/// #759 item 1 out-param: `cleared_quarantine` accumulates the group
+/// spellings whose fork-quarantine marker this apply transitioned
+/// Some→None on a path whose own durability gate already passed (the
+/// MemberAdded arm inserts only after its `Durable` persist). The caller
+/// MUST drain it into
+/// [`super::tasks::resume_group_task_ingest`] only AFTER every
+/// membership/`named_groups`/persistence guard has dropped — see the
+/// wrapper `apply_named_group_metadata_event`, which is the pattern.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized(
     state: &Arc<AppState>,
@@ -9404,6 +9467,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     envelope_bytes: Option<&[u8]>,
     predecessor_first_seen_ms: Option<u64>,
     replay_group_id: &mut Option<String>,
+    cleared_quarantine: &mut std::collections::BTreeSet<String>,
     lock_already_held: bool,
     roster_lock_already_held: bool,
 ) -> ApplyMetadataResult {
@@ -10017,6 +10081,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                         "ADR-0064: mandate-carrying MemberAdded cleared the fork quarantine (owner-anchored commit)"
                                     );
                                 }
+                                // #759 item 1: this clear (and the tier-1
+                                // adoption's) does NOT resume task ingest
+                                // here — this arm runs under the membership
+                                // and roster guards, and the drain takes
+                                // `TaskList` write then `named_groups` read.
+                                // The durable-clear notification is recorded
+                                // after the arm's Durable persist (the
+                                // Some→None check further below) and consumed
+                                // by the guard-free wrappers, which call
+                                // `tasks::resume_group_task_ingest` AFTER
+                                // every lock releases — including the replay
+                                // paths that reach this arm.
                             }
                             Err(reason) => {
                                 state
@@ -10316,6 +10392,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 Ok(AtomicWriteOutcome::Durable)
             ) {
                 return ApplyMetadataResult::REJECTED;
+            }
+            // #759 item 1: a Some→None fork-quarantine transition here is
+            // an owner-anchored clear (the mandate-valid arm above, or the
+            // tier-1 adoption inside `try_adopt_member_added_across_gap` —
+            // no other writer in this arm removes a marker), and the Durable
+            // check above is what makes it REAL. Record both spellings so
+            // the resume's alias-robust matcher cannot lose the group to
+            // exact-string filtering. The resume itself runs LATER, in the
+            // guard-free wrappers (`apply_named_group_metadata_event` /
+            // `_inner`) via `resume_task_ingest_after_durable_clear`: it
+            // awaits `TaskList` write then `named_groups` read, which this
+            // arm's membership and roster guards forbid.
+            if current.fork_quarantine.is_some() && next.fork_quarantine.is_none() {
+                cleared_quarantine.insert(resolved_group_key.clone());
+                cleared_quarantine.insert(current.stable_group_id().to_string());
             }
             // #477 C5 (r6 item 2 → r7): this commit SEATED the local agent
             // durably — finalize its pending join attempt HERE, while this
@@ -19000,6 +19091,16 @@ pub(in crate::server) async fn get_group_state_commits(
 /// unchanged on any gap). Returns `None` for non-OwnerCertified groups so
 /// the caller keeps its existing path.
 ///
+/// #759 item 1: the `Ok` tuple's third element is the durable-clear
+/// notification — `true` iff an arm of this helper durably cleared the fork
+/// quarantine marker. Both clearing arms (the eviction persist transaction
+/// and the all-clean seal) compute it only after their `Durable` outcome is
+/// known, so a rolled-back or non-durable clear never notifies. The route
+/// consumes it AFTER this helper returns (membership guard dropped) by
+/// calling `super::tasks::resume_group_task_ingest`, which awaits
+/// `TaskList` write then `named_groups` read — forbidden under this
+/// helper's guards.
+///
 /// TreeKEM groups: the roster prune + commit still run here, but ratchet
 /// rekey stays with the TreeKEM remove/ban handlers
 /// (`remove_member_verified`) — there is no GSS secret to rotate and the
@@ -19010,7 +19111,10 @@ async fn owner_certified_seal_with_eviction(
     id: &str,
     local_hex: &str,
 ) -> Option<
-    Result<(x0x::groups::GroupStateCommit, Vec<String>), (StatusCode, Json<serde_json::Value>)>,
+    Result<
+        (x0x::groups::GroupStateCommit, Vec<String>, bool),
+        (StatusCode, Json<serde_json::Value>),
+    >,
 > {
     use base64::Engine as _;
 
@@ -19086,11 +19190,22 @@ async fn owner_certified_seal_with_eviction(
                     // quarantined.
                     let owner_user_key = state.agent.identity().user_keypair();
                     let clear_key = id.to_string();
+                    // #759 item 1: the durable-clear notification for this
+                    // arm is decided INSIDE the persist transaction (the
+                    // closure sees the live record, so no pre-transaction
+                    // TOCTOU read can disagree with what was actually
+                    // cleared) and surfaces only when the Durable check
+                    // below passes. The resume runs in `seal_group_state`,
+                    // AFTER this helper returns and drops its membership
+                    // guard: the drain takes `TaskList` write then
+                    // `named_groups` read, which this guard forbids.
+                    let mut fork_marker_cleared = false;
                     let persist_outcome = persist_named_groups_mutation(state, |groups| {
                         // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
                         // a miss leaves the marker set on disk AND in memory, so it fails closed.
                         if let Some(info) = groups.get_mut(&clear_key) {
                             info.owner_cert_reverify_required = false;
+                            let had_marker = info.fork_quarantine.is_some();
                             // ADR-0064 slice 4 (slice-1 review non-blocking
                             // (1)): the EVICTION arm of the explicit seal
                             // route clears the fork marker under the SAME
@@ -19100,6 +19215,7 @@ async fn owner_certified_seal_with_eviction(
                             // the eviction seals) is strictly greater
                             // than the evidenced one.
                             info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
+                            fork_marker_cleared = had_marker && info.fork_quarantine.is_none();
                         }
                         true
                     })
@@ -19115,7 +19231,7 @@ async fn owner_certified_seal_with_eviction(
                             "named-group state is not directory-durable",
                         )));
                     }
-                    return Some(Ok((commit, evicted_total.clone())));
+                    return Some(Ok((commit, evicted_total.clone(), fork_marker_cleared)));
                 }
                 // InGrace members remain (they were NOT evicted — not in
                 // this operation's Failed set): typed, retryable refusal;
@@ -19146,6 +19262,17 @@ async fn owner_certified_seal_with_eviction(
             // consuming the SAME verdict instance (single evaluation; the
             // seal re-derives nothing) — this legitimately lifts the
             // quarantine.
+            //
+            // #759 item 1: same durable-clear notification as the eviction
+            // arm — computed against the pre-clear record the read guard
+            // still holds, surfaced only after the Durable check inside the
+            // block below, consumed by the route after this helper's
+            // membership guard drops. Declared OUTSIDE the `commit` block so
+            // the `Ok` return below can carry it.
+            // Deferred initialization: every path that falls through the
+            // `commit` block below has assigned the flag (the block's early
+            // returns diverge), so there is no dead initializer to read.
+            let fork_marker_cleared;
             let commit = {
                 let groups = state.named_groups.read().await;
                 // ADR0066-LOOKUP-WAIVER: `id` was already resolved by `seal_group_state`'s own 404-first lookup;
@@ -19173,6 +19300,8 @@ async fn owner_certified_seal_with_eviction(
                 next.clear_fork_quarantine_on_explicit_owner_seal(
                     state.agent.identity().user_keypair(),
                 );
+                fork_marker_cleared =
+                    info.fork_quarantine.is_some() && next.fork_quarantine.is_none();
                 drop(groups);
                 if !matches!(
                     persist_named_group_info(state, id, next).await,
@@ -19185,7 +19314,7 @@ async fn owner_certified_seal_with_eviction(
                 }
                 commit
             };
-            return Some(Ok((commit, evicted_total)));
+            return Some(Ok((commit, evicted_total, fork_marker_cleared)));
         }
 
         // Review B3/B4: evictions happen ONE MEMBER PER SEALED TRANSITION so
@@ -19498,14 +19627,28 @@ pub(in crate::server) async fn seal_group_state(
     // admission axes keep the plain reseal path.
     if let Some(result) = owner_certified_seal_with_eviction(&state, &id, &local_hex).await {
         return match result {
-            Ok((commit, evicted)) => (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "commit": commit,
-                    "evicted": evicted,
-                })),
-            ),
+            Ok((commit, evicted, fork_marker_cleared)) => {
+                // #759 item 1: consume the durable-clear notification here,
+                // AFTER the helper returned and dropped its membership
+                // guard — the same shape as the manual clear route. The
+                // drain takes `TaskList` write then `named_groups` read
+                // (the documented order), which the helper's guards forbid;
+                // a spurious notification would be a counted no-op (the
+                // drain re-checks the marker under the pinned roster), but
+                // the helper only reports clears its own Durable gate
+                // passed, so this fires on real clears.
+                if fork_marker_cleared {
+                    super::tasks::resume_group_task_ingest(&state, &id).await;
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "commit": commit,
+                        "evicted": evicted,
+                    })),
+                )
+            }
             Err(resp) => resp,
         };
     }

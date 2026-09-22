@@ -116,6 +116,20 @@ pub enum KvError {
     #[error("encrypted kv record rejected: {0}")]
     SecureRecord(String),
 
+    /// A snapshot write was refused because a younger store generation owns
+    /// the snapshot path (#760).
+    ///
+    /// Raised ONLY on caller-driven persistence (`KvStoreSync::persist`,
+    /// `ensure_durable`): the handle was retired — or another open armed a
+    /// younger generation over the same path — after this caller passed
+    /// authorization. The bytes were NOT made durable, so returning success
+    /// would be a false acknowledgement; the store is also flagged
+    /// durability-degraded. Receive-path persists suppress the same
+    /// condition silently (the retired store's merge is being discarded,
+    /// and a younger owner persists its own state).
+    #[error("snapshot superseded: a younger generation owns the snapshot path; this handle's persistence is fenced off (#760)")]
+    SnapshotSuperseded,
+
     /// A `SelfKeyed` writer's per-agent quota would be exceeded (issue #340).
     ///
     /// The quota is a deterministic admission rule (lowest-N in lexicographic

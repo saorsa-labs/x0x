@@ -363,6 +363,21 @@ pub struct KvStoreSync {
     /// rewrites of keys it no longer remembers holding.
     persist: std::sync::Mutex<Option<Arc<PersistCtx>>>,
 
+    /// The #760 open lease of the open that committed THIS sync (#765).
+    /// Adopted by the agent's commit step (see
+    /// [`KvStoreSync::adopt_committed_open_lease`]) so the lease is owned
+    /// by the sync itself, never by a registry: it is released exactly when
+    /// the last strong `KvStoreSync` reference drops, which is what keeps
+    /// last-handle-drop semantics intact (structural loop-cancellation
+    /// request via [`Drop`]) while an agent shutdown can still reach the
+    /// retirement path through a weak reference. Note the two stages of
+    /// that teardown: the LEASE drops synchronously with the sync, but the
+    /// fence entry only becomes prunable once the cancelled loop futures
+    /// drop their captured `PersistCtx` (its `PersistOwner` is the last
+    /// `PathFence` reference) as the executor polls them to termination —
+    /// see the `loop_exits` test instrument. A leaf lock, like `persist`.
+    open_lease: std::sync::Mutex<Option<super::snapshot_fence::StoreOpenLease>>,
+
     /// Set by [`silence_bootstrap`](Self::silence_bootstrap). The bootstrap
     /// requester checks it every iteration: its schedule is infinite (issue
     /// #238), so a sync that should stop generating traffic — but keep
@@ -421,6 +436,24 @@ pub struct KvStoreSync {
     retained_pages: Arc<std::sync::Mutex<RetainedPagePool>>,
     #[cfg(test)]
     retained_publish_test: Arc<std::sync::Mutex<RetainedPublishTestState>>,
+    /// Deterministic barrier fired after a plaintext remote merge and before
+    /// its snapshot write. Tests use the stored permit; production has no hook.
+    #[cfg(test)]
+    receive_merged_test: Arc<tokio::sync::Notify>,
+    /// #765 test instrument: termination counter for the background loop
+    /// futures `start_with_spawner` spawns for this sync. Dropping the
+    /// last `KvStoreSync` reference (or a shutdown sweep's `cancel_sync`)
+    /// only REQUESTS loop exit; each future still holds its captured
+    /// `Arc<PersistCtx>` — and with it the fence's `PersistOwner` — until
+    /// the executor polls it to termination (or drops it whole). Every
+    /// spawned loop is wrapped in `TrackedLoopFuture`, which records an
+    /// exit only AFTER the whole inner future is destroyed, so awaiting a
+    /// count here is a terminal resource-release proof. Tests that must
+    /// observe a prunable fence entry, or prove the sweep's cancel already
+    /// ran, await the exact loop-exit count here instead of sleeping or
+    /// racing the executor.
+    #[cfg(test)]
+    loop_exits: Arc<LoopExitTracker>,
 }
 
 #[cfg(test)]
@@ -428,6 +461,103 @@ pub struct KvStoreSync {
 struct RetainedPublishTestState {
     fail_after: Option<usize>,
     accepted: usize,
+}
+
+/// #765: counts terminated background-loop futures of one sync (see
+/// `KvStoreSync::loop_exits`). A future "terminates" when it returns OR is
+/// dropped — including a drop that never polled it (the drop-spawner
+/// tests) — because the count is recorded by the `TrackedLoopFuture`
+/// WRAPPER, which exists from construction. An exit is recorded only
+/// after the whole inner future (and every capture it holds) is
+/// destroyed, so the count is exact per `start_with_spawner` call AND
+/// terminal: reaching `n` proves those `n` futures' resources are
+/// released. `wait_for` needs no missable-wakeup reasoning:
+/// `notify_one` stores a permit when no waiter is registered, and the
+/// count is re-checked after every wake.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct LoopExitTracker {
+    exited: std::sync::atomic::AtomicUsize,
+    progressed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl LoopExitTracker {
+    fn record_exit(&self) {
+        self.exited
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.progressed.notify_one();
+    }
+
+    /// Wait until at least `n` of this sync's loop futures terminated.
+    pub(crate) async fn wait_for(&self, n: usize) {
+        loop {
+            if self.exited.load(std::sync::atomic::Ordering::SeqCst) >= n {
+                return;
+            }
+            self.progressed.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+use std::future::Future;
+/// #765 r4: wraps one WHOLE background-loop future so the sync's
+/// [`LoopExitTracker`] counts its termination — return, cancellation, or a
+/// drop that never polled it — only AFTER the inner future is destroyed.
+///
+/// The r3 instrument was a guard constructed INSIDE the async body, so a
+/// future dropped before its first poll never created one (undercounting),
+/// and its `Drop` fired while the future's remaining fields — including
+/// the captured `Arc<PersistCtx>` and its fence `PersistOwner` — were
+/// still alive: `wait_for` was therefore not a terminal resource-release
+/// barrier. Owning the inner future here makes the record strictly
+/// terminal for every exit path, polled or not.
+#[cfg(test)]
+struct TrackedLoopFuture<F> {
+    /// Pre-pinned so the wrapper is unconditionally `Unpin` and `poll`
+    /// needs no structural pinning of its own.
+    inner: Option<std::pin::Pin<Box<F>>>,
+    tracker: Arc<LoopExitTracker>,
+}
+
+#[cfg(test)]
+impl<F> TrackedLoopFuture<F> {
+    fn wrap(tracker: Arc<LoopExitTracker>, inner: F) -> Self {
+        Self {
+            inner: Some(Box::pin(inner)),
+            tracker,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<F: Future<Output = ()>> Future for TrackedLoopFuture<F> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        match this.inner.as_mut() {
+            // `None` is constructed only by this wrapper's own `Drop`,
+            // which never polls.
+            Some(inner) => inner.as_mut().poll(cx),
+            None => std::task::Poll::Ready(()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<F> Drop for TrackedLoopFuture<F> {
+    fn drop(&mut self) {
+        // Destroy the inner future FIRST — releasing its captured persist
+        // contexts — then record. A `Drop` body runs before the struct's
+        // fields drop, so the sequencing has to be this explicit.
+        self.inner.take();
+        self.tracker.record_exit();
+    }
 }
 
 /// Structural teardown (parallel-review finding): the background loops hold
@@ -444,8 +574,10 @@ impl Drop for KvStoreSync {
 
 /// Shared persistence context for one store's snapshot file.
 struct PersistCtx {
-    /// Snapshot file path.
-    path: PathBuf,
+    /// Snapshot-fence ownership retained for this context's whole lifetime.
+    /// A write only renames while this generation still owns the path; the
+    /// retained path entry also prevents registry pruning before first use.
+    owner: super::snapshot_fence::PersistOwner,
     /// Serializes snapshot commits AND records the last durably-persisted
     /// store version. `(version, bytes)` are captured under this lock, so
     /// commit order equals capture order — a concurrent persist burst can
@@ -486,6 +618,7 @@ impl KvStoreSync {
             local_peer_id,
             local_agent_id,
             persist: std::sync::Mutex::new(None),
+            open_lease: std::sync::Mutex::new(None),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: tokio_util::sync::CancellationToken::new(),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
@@ -498,6 +631,10 @@ impl KvStoreSync {
             retained_publish_test: Arc::new(std::sync::Mutex::new(
                 RetainedPublishTestState::default(),
             )),
+            #[cfg(test)]
+            receive_merged_test: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            loop_exits: Arc::new(LoopExitTracker::default()),
         })
     }
 
@@ -1187,15 +1324,81 @@ impl KvStoreSync {
     /// Call before [`start`](Self::start) so no merged delta can land
     /// unpersisted. The caller is responsible for loading any existing
     /// snapshot BEFORE constructing this sync (see
-    /// [`load_snapshot`]); this method only arms writes.
+    /// [`load_snapshot`]); this method only arms writes — and claims the
+    /// path's youngest persist generation for THIS sync (#760): any older
+    /// sync's still-admitted write over the same file is fenced out from
+    /// this moment on.
     pub fn set_persist_path(&self, path: PathBuf) {
         if let Ok(mut guard) = self.persist.lock() {
+            let owner = super::snapshot_fence::arm_persist(&path);
             *guard = Some(Arc::new(PersistCtx {
-                path,
+                owner,
                 gate: tokio::sync::Mutex::new(None),
                 degraded: std::sync::atomic::AtomicBool::new(false),
             }));
         }
+    }
+
+    /// Arm persistence through the lifecycle lease held by a high-level
+    /// persistent-store constructor. A predecessor-backed or trampled lease
+    /// is refused before it can supersede the current file owner.
+    pub(crate) fn set_persist_path_for_open(
+        &self,
+        lease: &super::snapshot_fence::StoreOpenLease,
+    ) -> Result<()> {
+        let mut guard = self.persist.lock().map_err(|_| {
+            KvError::Io(std::io::Error::other(
+                "kv persistence context lock poisoned",
+            ))
+        })?;
+        let owner = lease.arm_persist().ok_or(KvError::SnapshotSuperseded)?;
+        *guard = Some(Arc::new(PersistCtx {
+            owner,
+            gate: tokio::sync::Mutex::new(None),
+            degraded: std::sync::atomic::AtomicBool::new(false),
+        }));
+        Ok(())
+    }
+
+    /// Adopt the #760 open lease of a CONSTRUCTED and COMMITTED open (#765).
+    ///
+    /// Called by the agent's commit step — under its snapshot-lease registry
+    /// lock and only after the lease's fence commit succeeded — so a sync
+    /// never owns a lease whose open did not commit. Ownership lives HERE,
+    /// not in any registry: the lease is released exactly when the last
+    /// strong `KvStoreSync` reference drops, keeping last-handle-drop
+    /// semantics intact — the [`Drop`] impl cancels the loops, and the
+    /// fence entry becomes prunable once those cancelled futures drop
+    /// their captured persist contexts (an asynchronous stage; the r3
+    /// tests await the sync's loop exits before asserting a re-open) —
+    /// while a later agent shutdown can still reach the retirement path
+    /// through a weak reference to this sync.
+    pub(crate) fn adopt_committed_open_lease(&self, lease: super::snapshot_fence::StoreOpenLease) {
+        *self
+            .open_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lease);
+    }
+
+    /// #765 agent-shutdown retirement for this sync's snapshot path: mark it
+    /// `Retiring` through the adopted open lease and invalidate the secure
+    /// context — both synchronous leaf calls, safe under any lock. The
+    /// caller still cancels the loops ([`cancel_sync`](Self::cancel_sync))
+    /// and completes the returned token only after its drain. `None` means
+    /// there is nothing this sync may retire: an in-memory store never
+    /// adopted a lease, and a lease whose lineage a successor already owns
+    /// can never retire it.
+    pub(crate) fn begin_shutdown_retirement(
+        &self,
+    ) -> Option<super::snapshot_fence::RetirementToken> {
+        let lease = self
+            .open_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let token = lease.begin_retire();
+        self.invalidate_secure_context();
+        token
     }
 
     /// Refresh and enforce the current group read policy before exposing
@@ -1264,13 +1467,31 @@ impl KvStoreSync {
     ///   peers hold the data; only this node's disk is behind).
     /// - The next successful persist (including via
     ///   [`ensure_durable`](Self::ensure_durable)) clears the flag.
+    /// - #760: if a YOUNGER generation owns the snapshot path (this sync was
+    ///   retired and the store re-opened), the write is refused with
+    ///   [`KvError::SnapshotSuperseded`] and the degraded flag is set —
+    ///   success would acknowledge bytes that were never made durable.
     ///
     /// # Errors
     ///
-    /// I/O or serialization failure writing the snapshot.
+    /// I/O or serialization failure writing the snapshot, or
+    /// [`KvError::SnapshotSuperseded`] when a younger generation owns the
+    /// path.
     pub async fn persist(&self) -> Result<()> {
         match self.persist_ctx() {
-            Some(ctx) => persist_snapshot(&self.store, &ctx).await,
+            Some(ctx) => match persist_snapshot(&self.store, &ctx).await {
+                Ok(PersistOutcome::Superseded) => {
+                    // Caller-driven durability: fail closed (#760). The
+                    // receive-path callers of `persist_snapshot` suppress
+                    // this outcome instead (their merge belongs to a
+                    // discarded generation).
+                    ctx.degraded
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Err(KvError::SnapshotSuperseded)
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
             None => Ok(()),
         }
     }
@@ -1288,11 +1509,13 @@ impl KvStoreSync {
     ///
     /// # Errors
     ///
-    /// The retry failed — the caller must refuse the local write.
+    /// The retry failed — the caller must refuse the local write —
+    /// including [`KvError::SnapshotSuperseded`] when a younger generation
+    /// owns the path (#760).
     pub async fn ensure_durable(&self) -> Result<()> {
         match self.persist_ctx() {
             Some(ctx) if ctx.degraded.load(std::sync::atomic::Ordering::Relaxed) => {
-                persist_snapshot(&self.store, &ctx).await
+                self.persist().await
             }
             _ => Ok(()),
         }
@@ -1400,6 +1623,10 @@ impl KvStoreSync {
         let loop_persist_ctx = persist_ctx.clone();
         let listener_cancel = self.cancel.clone();
         let listener_lifecycle = Arc::clone(&self.lifecycle);
+        #[cfg(test)]
+        let listener_receive_merged_test = Arc::clone(&self.receive_merged_test);
+        #[cfg(test)]
+        let listener_loop_exits = Arc::clone(&self.loop_exits);
         let listener_local_peer_id = self.local_peer_id;
         // Store id snapshot for the encrypted receive path (static for the
         // store's life).
@@ -1416,7 +1643,11 @@ impl KvStoreSync {
         let bootstrap_active = Arc::new(std::sync::atomic::AtomicBool::new(bootstrap_needed));
         let listener_served = Arc::clone(&served_evidence);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
-        spawn(Box::pin(async move {
+        // #765 r4: the loop-exit tracker wraps the WHOLE loop future, so
+        // termination is recorded only after this future — and every
+        // capture it holds, including the persist context — is destroyed
+        // (see `TrackedLoopFuture`).
+        let listener_loop = async move {
             loop {
                 let msg = tokio::select! {
                     // Cancel-first (#757): an unbiased select picks at
@@ -1618,6 +1849,8 @@ impl KvStoreSync {
                         // remote merges continue — replication must not
                         // wedge on this node's disk.
                         if merged {
+                            #[cfg(test)]
+                            listener_receive_merged_test.notify_one();
                             if let Some(ctx) = loop_persist_ctx.as_ref() {
                                 let _ = persist_snapshot(&store, ctx).await;
                             }
@@ -1628,7 +1861,10 @@ impl KvStoreSync {
                     }
                 }
             }
-        }));
+        };
+        #[cfg(test)]
+        let listener_loop = TrackedLoopFuture::wrap(listener_loop_exits, listener_loop);
+        spawn(Box::pin(listener_loop));
 
         // Responder + ownership listener on the state-sync side topic.
         //
@@ -1664,7 +1900,13 @@ impl KvStoreSync {
         let responder_is_group_signed = store_is_group_signed;
         let responder_uses_retained = responder_is_encrypted || responder_is_group_signed;
         let responder_store_id = { *self.store.read().await.id() };
-        spawn(Box::pin(async move {
+        #[cfg(test)]
+        let responder_loop_exits = Arc::clone(&self.loop_exits);
+        // #765 r4: the loop-exit tracker wraps the WHOLE loop future, so
+        // termination is recorded only after this future — and every
+        // capture it holds, including the persist context — is destroyed
+        // (see `TrackedLoopFuture`).
+        let responder_loop = async move {
             // Response-storm damping (issue #238 review): one full-state
             // response per cooldown window, regardless of how many replicas
             // are requesting — the response is a broadcast, so it serves
@@ -2217,7 +2459,10 @@ impl KvStoreSync {
                     }
                 }
             }
-        }));
+        };
+        #[cfg(test)]
+        let responder_loop = TrackedLoopFuture::wrap(responder_loop_exits, responder_loop);
+        spawn(Box::pin(responder_loop));
 
         // Bootstrap requester: a first-time joiner starts with an empty
         // store and has no other way to learn keys written before it
@@ -2255,7 +2500,13 @@ impl KvStoreSync {
             let requester_signing = self.author_signing.clone();
             let requester_store_id = { *self.store.read().await.id() };
             let requester_is_encrypted = store_is_encrypted;
-            spawn(Box::pin(async move {
+            #[cfg(test)]
+            let requester_loop_exits = Arc::clone(&self.loop_exits);
+            // #765 r4: the loop-exit tracker wraps the WHOLE loop future,
+            // so termination is recorded only after this future — and
+            // every capture it holds — is destroyed (see
+            // `TrackedLoopFuture`).
+            let requester_loop = async move {
                 // Disarms the adopt window on ANY exit (converged, silenced,
                 // cancelled, torn down) — the listener's verified
                 // full-replace adopt must never fire outside bootstrap.
@@ -2351,7 +2602,10 @@ impl KvStoreSync {
                         tracing::debug!("KvStore state-request publish failed: {e}");
                     }
                 }
-            }));
+            };
+            #[cfg(test)]
+            let requester_loop = TrackedLoopFuture::wrap(requester_loop_exits, requester_loop);
+            spawn(Box::pin(requester_loop));
         }
 
         Ok(())
@@ -2409,6 +2663,26 @@ impl KvStoreSync {
     pub async fn cancel_sync_and_drain(&self) {
         self.cancel.cancel();
         drop(self.lifecycle.lock().await);
+    }
+
+    /// Wait until the plaintext listener has merged one remote delta and is
+    /// about to persist it. `Notify` retains one permit, so the test cannot
+    /// miss the barrier if the merge wins the race to this call.
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_merged_for_test(&self) {
+        self.receive_merged_test.notified().await;
+    }
+
+    /// This sync's background-loop termination counter (#765): the
+    /// deterministic signal that every loop future `start_with_spawner`
+    /// spawned has been DESTROYED — each exit is recorded only after the
+    /// whole wrapped future (captured persist context included) drops, so
+    /// reaching the full count means the fence entry is prunable — or, at
+    /// a lower count, that a shutdown sweep's `cancel_sync` already ended
+    /// the sibling loops.
+    #[cfg(test)]
+    pub(crate) fn loop_exit_tracker(&self) -> Arc<LoopExitTracker> {
+        Arc::clone(&self.loop_exits)
     }
 
     /// Stop background synchronization.
@@ -2676,43 +2950,101 @@ fn encode_snapshot(store: &KvStore) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Outcome of one snapshot commit attempt.
+enum PersistOutcome {
+    /// Bytes captured and renamed into place.
+    Written,
+    /// Skipped: durable state is already at (or beyond) the captured
+    /// version AND this generation still owns the snapshot path (#760) —
+    /// a stale equal-version handle reports [`PersistOutcome::Superseded`]
+    /// instead.
+    Current,
+    /// Suppressed: a younger generation owns the snapshot path (#760).
+    /// Policy is caller-dependent — receive paths skip (the merge belongs
+    /// to a discarded generation), caller-driven persistence escalates to
+    /// [`KvError::SnapshotSuperseded`] + durability-degraded.
+    Superseded,
+}
+
 /// Snapshot the store to the persistence context's path.
 ///
 /// Serialized per store via `ctx.gate`: `(version, bytes)` are captured
 /// under the gate, so commit order equals capture order and a slow persist
 /// can never rename an older snapshot over a newer one; the recorded
 /// last-persisted version additionally skips writes that would not advance
-/// durable state. Success clears the degraded flag; failure sets it and is
-/// error-logged here (callers decide whether to propagate — local writes
-/// must, remote merges must not).
+/// durable state — and that skip is ownership-fenced like the write itself
+/// (#760): `Current` is answered only while this generation still owns the
+/// path, so a stale handle at an unchanged version reports
+/// [`PersistOutcome::Superseded`] instead of success. The rename itself
+/// runs under the snapshot path's fence
+/// mutex with an ownership check on `ctx.owner` (#760): once a younger
+/// sync arms the same path, this ctx's writes are suppressed —
+/// [`PersistOutcome::Superseded`] — so an older admitted write can never
+/// land after a younger generation's. Success clears the degraded flag;
+/// failure sets it and is error-logged here (callers decide whether to
+/// propagate — local writes must, remote merges must not); a superseded
+/// write touches neither the flag nor the file.
 ///
 /// # Errors
 ///
 /// Serialization or I/O failure writing the snapshot.
-async fn persist_snapshot(store: &Arc<RwLock<KvStore>>, ctx: &PersistCtx) -> Result<()> {
-    let result = async {
+async fn persist_snapshot(
+    store: &Arc<RwLock<KvStore>>,
+    ctx: &PersistCtx,
+) -> Result<PersistOutcome> {
+    let result: Result<PersistOutcome> = async {
         let mut last = ctx.gate.lock().await;
         let (version, bytes) = {
             let s = store.read().await;
             (s.current_version(), encode_snapshot(&s)?)
         };
         if last.is_some_and(|l| l >= version) {
-            // Durable state already at (or beyond) this version.
-            return Ok(());
+            // Durable state already at (or beyond) this version. The skip
+            // is ownership-fenced (#760): the query takes the same leaf
+            // mutex `arm_persist` uses, so it linearizes exactly like a
+            // write — a pre-arm residual stays `Current`, while a handle
+            // whose successor has already armed is typed `Superseded` and
+            // must not clear the degraded flag on bytes it no longer owns.
+            // Neither path rewrites the file.
+            return Ok(if ctx.owner.is_current_owner() {
+                PersistOutcome::Current
+            } else {
+                PersistOutcome::Superseded
+            });
         }
-        write_snapshot_atomic(&ctx.path, &bytes)?;
-        *last = Some(version);
-        Ok(())
+        match super::snapshot_fence::write_if_owner(&ctx.owner, &bytes, write_snapshot_atomic)? {
+            true => {
+                *last = Some(version);
+                Ok(PersistOutcome::Written)
+            }
+            false => {
+                tracing::debug!(
+                    "kv snapshot persist suppressed for {}: superseded generation {} (#760)",
+                    ctx.owner.path().display(),
+                    ctx.owner.generation()
+                );
+                Ok(PersistOutcome::Superseded)
+            }
+        }
     }
     .await;
-    ctx.degraded
-        .store(result.is_err(), std::sync::atomic::Ordering::Relaxed);
-    if let Err(e) = &result {
-        tracing::error!(
-            "kv snapshot persist failed for {}: {e} — store is durability-degraded; \
-             local writes are refused until a snapshot succeeds",
-            ctx.path.display()
-        );
+    match &result {
+        Ok(PersistOutcome::Written) | Ok(PersistOutcome::Current) => {
+            ctx.degraded
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Suppressed is the retire protocol working, not a disk failure:
+        // neither clear nor set the flag here.
+        Ok(PersistOutcome::Superseded) => {}
+        Err(e) => {
+            ctx.degraded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                "kv snapshot persist failed for {}: {e} — store is durability-degraded; \
+                 local writes are refused until a snapshot succeeds",
+                ctx.owner.path().display()
+            );
+        }
     }
     result
 }
@@ -3978,6 +4310,121 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // #765 r4: TrackedLoopFuture — exit recorded only after inner
+    // destruction (structural, inert control)
+    // ------------------------------------------------------------------
+
+    /// Inert inner future whose `Drop` proves it was destroyed while the
+    /// tracker had NOT yet recorded this wrapper's exit.
+    struct InnerProbe {
+        tracker: Arc<LoopExitTracker>,
+        dropped: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl Future for InnerProbe {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for InnerProbe {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.tracker
+                    .exited
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "exit recorded before the inner future was destroyed"
+            );
+            self.dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("inner");
+        }
+    }
+
+    fn inner_probe(
+        tracker: &Arc<LoopExitTracker>,
+        dropped: &Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> InnerProbe {
+        InnerProbe {
+            tracker: Arc::clone(tracker),
+            dropped: Arc::clone(dropped),
+        }
+    }
+
+    #[tokio::test]
+    async fn tracked_loop_records_exit_only_after_inner_future_destruction() {
+        // Case 1 — dropped WITHOUT EVER BEING POLLED: the r3 guard was
+        // constructed inside the async body and never existed here, so an
+        // unpolled drop recorded nothing. The wrapper exists from
+        // construction and must record exactly one exit, strictly after
+        // the inner future is destroyed (InnerProbe::drop asserts the
+        // not-yet-recorded half of that ordering).
+        let tracker = Arc::new(LoopExitTracker::default());
+        let dropped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let wrapper =
+            TrackedLoopFuture::wrap(Arc::clone(&tracker), inner_probe(&tracker, &dropped));
+        drop(wrapper);
+        assert_eq!(
+            tracker.exited.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a never-polled dropped wrapper records exactly one exit"
+        );
+        assert_eq!(
+            *dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["inner"],
+            "the inner future was destroyed exactly once"
+        );
+
+        // Case 2 — polled once (Pending), then dropped: same ordering.
+        let tracker = Arc::new(LoopExitTracker::default());
+        let dropped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut wrapper = Box::pin(TrackedLoopFuture::wrap(
+            Arc::clone(&tracker),
+            inner_probe(&tracker, &dropped),
+        ));
+        assert!(
+            futures::poll!(&mut wrapper).is_pending(),
+            "the probe future never completes"
+        );
+        drop(wrapper);
+        assert_eq!(
+            tracker.exited.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a polled-then-dropped wrapper records exactly one exit"
+        );
+        assert_eq!(
+            *dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["inner"]
+        );
+
+        // Case 3 — inner completes: the wrapper returns Ready, and the
+        // exit is still recorded exactly once on drop.
+        let tracker = Arc::new(LoopExitTracker::default());
+        let mut wrapper = Box::pin(TrackedLoopFuture::wrap(
+            Arc::clone(&tracker),
+            futures::future::ready(()),
+        ));
+        assert!(futures::poll!(&mut wrapper).is_ready());
+        drop(wrapper);
+        assert_eq!(
+            tracker.exited.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a completed wrapper records exactly one exit"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // start(): default spawner merges a remotely-published delta
     // ------------------------------------------------------------------
 
@@ -4087,6 +4534,304 @@ mod tests {
             snapshot,
             before,
         }
+    }
+
+    #[tokio::test]
+    async fn superseded_local_persist_is_typed_and_never_reports_durable() {
+        let fx = retire_fixture("store/760-stale-local").await;
+        let owner = fx.sync.local_agent_id.expect("owner identity");
+        fx.sync
+            .authorize_local_write(&owner)
+            .await
+            .expect("local authorization passes before mutation");
+        fx.sync
+            .write()
+            .await
+            .put(
+                "stale-local".to_string(),
+                b"must-not-land".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("in-memory mutation");
+
+        // A direct replacement sync retains the new path owner even though
+        // no lifecycle handle owns it. This is the low-level call path that
+        // motivated PersistOwner retaining the exact registry entry.
+        let replacement_store = KvStore::new(
+            store_id(1),
+            "replacement".into(),
+            owner,
+            AccessPolicy::Signed,
+        )
+        .expect("replacement store");
+        let replacement = KvStoreSync::new(
+            replacement_store,
+            Arc::clone(&fx.pubsub),
+            "store/760-replacement".into(),
+            peer(3),
+            Some(owner),
+        )
+        .expect("replacement sync");
+        replacement.set_persist_path(fx.snapshot.clone());
+
+        let error = fx
+            .sync
+            .persist()
+            .await
+            .expect_err("old owner must fail closed");
+        assert!(matches!(error, KvError::SnapshotSuperseded));
+        assert!(fx.sync.durability_degraded());
+        assert_eq!(
+            std::fs::read(&fx.snapshot).expect("snapshot remains readable"),
+            fx.before,
+            "superseded caller must not touch the snapshot or report success"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_equal_version_persist_is_typed_and_keeps_degraded() {
+        // WHY (#760): the version-gated `Current` fast path must be
+        // ownership-fenced like the write path. A stale handle whose
+        // durable version already matches the store (no mutation since
+        // its own last successful persist) must not report durable — or
+        // clear the degraded flag — once a successor has armed the same
+        // canonical path.
+        let fx = retire_fixture("store/760-stale-equal").await;
+        let owner = fx.sync.local_agent_id.expect("owner identity");
+        let ctx = fx.sync.persist_ctx().expect("persist armed");
+        let set_degraded = |v: bool| ctx.degraded.store(v, std::sync::atomic::Ordering::Relaxed);
+
+        // Transient snapshot failure at the unchanged version: degraded,
+        // but durable bytes and store version are untouched.
+        set_degraded(true);
+
+        // Pre-arm control: while this generation owns the path, the
+        // residual no-op is legitimately `Current` — it succeeds,
+        // repairs the flag, and does not rewrite the file.
+        fx.sync
+            .persist()
+            .await
+            .expect("pre-arm unchanged-version persist is current");
+        assert!(
+            !fx.sync.durability_degraded(),
+            "legitimately current persist clears the degraded flag"
+        );
+        assert_eq!(
+            std::fs::read(&fx.snapshot).expect("snapshot remains readable"),
+            fx.before,
+            "current fast path must not rewrite the snapshot"
+        );
+
+        // Re-degrade, then arm a replacement owner on the exact same path.
+        set_degraded(true);
+        let replacement_store = KvStore::new(
+            store_id(1),
+            "replacement".into(),
+            owner,
+            AccessPolicy::Signed,
+        )
+        .expect("replacement store");
+        let replacement = KvStoreSync::new(
+            replacement_store,
+            Arc::clone(&fx.pubsub),
+            "store/760-replacement-equal".into(),
+            peer(4),
+            Some(owner),
+        )
+        .expect("replacement sync");
+        replacement.set_persist_path(fx.snapshot.clone());
+
+        // The discriminator: unchanged version, stale generation.
+        let error = fx
+            .sync
+            .persist()
+            .await
+            .expect_err("stale equal-version persist must fail closed");
+        assert!(matches!(error, KvError::SnapshotSuperseded));
+        assert!(
+            fx.sync.durability_degraded(),
+            "superseded must not clear the degraded flag"
+        );
+        assert_eq!(
+            std::fs::read(&fx.snapshot).expect("snapshot remains readable"),
+            fx.before,
+            "superseded equal-version persist must not touch the file"
+        );
+
+        // Repeat: the failure is stable — never a degraded reset.
+        let again = fx
+            .sync
+            .persist()
+            .await
+            .expect_err("repeat stays typed-superseded");
+        assert!(matches!(again, KvError::SnapshotSuperseded));
+        assert!(fx.sync.durability_degraded());
+        assert_eq!(
+            std::fs::read(&fx.snapshot).expect("snapshot remains readable"),
+            fx.before
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_waits_for_admitted_delta_then_preserves_it_with_new_write() {
+        let fx = retire_fixture("store/760-admitted-reopen").await;
+        let lease = crate::kv::snapshot_fence::claim_open(&fx.snapshot).await;
+        assert!(lease.commit());
+        let loops = start_joinable(&fx.sync).await;
+        let ctx = fx.sync.persist_ctx().expect("persist armed");
+        let gate = ctx.gate.lock().await;
+
+        publish_late_delta(&fx).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fx.sync.wait_receive_merged_for_test(),
+        )
+        .await
+        .expect("A merged before its persist");
+
+        let retirement = lease.begin_retire().expect("old handle marks retirement");
+        let mut drain = Box::pin(fx.sync.cancel_sync_and_drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        let mut reopen = Box::pin(crate::kv::snapshot_fence::claim_open(&fx.snapshot));
+        assert!(
+            futures::poll!(reopen.as_mut()).is_pending(),
+            "reopen must wait while A's admitted persist is outstanding"
+        );
+
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("old receive section drains");
+        retirement.complete();
+        let successor = tokio::time::timeout(Duration::from_secs(10), reopen)
+            .await
+            .expect("reopen proceeds after drain");
+
+        let restored = load_snapshot(&fx.snapshot)
+            .expect("snapshot decodes")
+            .expect("snapshot exists");
+        assert!(restored.get("late-key").is_some(), "raw snapshot retains A");
+        let successor_sync = KvStoreSync::new(
+            restored,
+            Arc::clone(&fx.pubsub),
+            "store/760-successor".into(),
+            peer(3),
+            fx.sync.local_agent_id,
+        )
+        .expect("successor sync");
+        successor_sync.set_persist_path(fx.snapshot.clone());
+        successor_sync
+            .write()
+            .await
+            .put(
+                "successor-x".into(),
+                b"x".to_vec(),
+                "text/plain".into(),
+                peer(3),
+            )
+            .expect("successor writes X");
+        successor_sync.persist().await.expect("X persists");
+        assert!(successor.commit());
+
+        let raw = load_snapshot(&fx.snapshot)
+            .expect("final snapshot decodes")
+            .expect("final snapshot exists");
+        assert!(raw.get("late-key").is_some(), "A survives reopen");
+        assert!(raw.get("successor-x").is_some(), "X lands after reopen");
+        join_loops(loops).await;
+    }
+
+    #[tokio::test]
+    async fn trampled_predecessor_open_cannot_suppress_or_clobber_admitted_delta() {
+        let fx = retire_fixture("store/760-trampled-open").await;
+        let old = crate::kv::snapshot_fence::claim_open(&fx.snapshot).await;
+        assert!(old.commit());
+        // Selector: B claims while old is Active, before retirement begins.
+        let stale_open = crate::kv::snapshot_fence::claim_open(&fx.snapshot).await;
+        let loops = start_joinable(&fx.sync).await;
+        let ctx = fx.sync.persist_ctx().expect("old persist armed");
+        let gate = ctx.gate.lock().await;
+        publish_late_delta(&fx).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fx.sync.wait_receive_merged_for_test(),
+        )
+        .await
+        .expect("A is admitted and parked before persist");
+
+        // B loaded the pre-A snapshot. If it can arm, it can either suppress
+        // A or later overwrite A with this stale image.
+        let stale_image = load_snapshot(&fx.snapshot)
+            .expect("baseline snapshot decodes")
+            .expect("baseline snapshot exists");
+        assert!(stale_image.get("late-key").is_none());
+        let stale_sync = KvStoreSync::new(
+            stale_image,
+            Arc::clone(&fx.pubsub),
+            "store/760-trampled-successor".into(),
+            peer(3),
+            fx.sync.local_agent_id,
+        )
+        .expect("stale successor sync");
+
+        let retirement = old.begin_retire().expect("predecessor tramples B");
+        let mut drain = Box::pin(fx.sync.cancel_sync_and_drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        let error = stale_sync
+            .set_persist_path_for_open(&stale_open)
+            .expect_err("trampled B cannot arm or write its stale image");
+        assert!(matches!(error, KvError::SnapshotSuperseded));
+
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("old admitted A drains");
+        retirement.complete();
+        assert!(
+            !stale_open.commit(),
+            "trampled B cannot become the active successor"
+        );
+        let after_a = load_snapshot(&fx.snapshot)
+            .expect("A snapshot decodes")
+            .expect("A snapshot exists");
+        assert!(after_a.get("late-key").is_some(), "A was not suppressed");
+
+        // Positive control: a retry claimed from Idle can arm, preserve A,
+        // and persist X. This also proves the failed B left no ownership.
+        let retry = crate::kv::snapshot_fence::claim_open(&fx.snapshot).await;
+        let restored = load_snapshot(&fx.snapshot)
+            .expect("retry snapshot decodes")
+            .expect("retry snapshot exists");
+        let retry_sync = KvStoreSync::new(
+            restored,
+            Arc::clone(&fx.pubsub),
+            "store/760-retry".into(),
+            peer(4),
+            fx.sync.local_agent_id,
+        )
+        .expect("retry sync");
+        retry_sync
+            .set_persist_path_for_open(&retry)
+            .expect("fresh retry owns persistence");
+        retry_sync
+            .write()
+            .await
+            .put(
+                "successor-x".into(),
+                b"x".to_vec(),
+                "text/plain".into(),
+                peer(4),
+            )
+            .expect("retry writes X");
+        retry_sync.persist().await.expect("retry persists A plus X");
+        assert!(retry.commit());
+        let final_image = load_snapshot(&fx.snapshot)
+            .expect("final snapshot decodes")
+            .expect("final snapshot exists");
+        assert!(final_image.get("late-key").is_some());
+        assert!(final_image.get("successor-x").is_some());
+        join_loops(loops).await;
     }
 
     /// Publish one admissible delta and wait (barrier, not oracle) until it

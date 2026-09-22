@@ -411,6 +411,51 @@ pub struct Agent {
     /// began. A plain `std::sync::Mutex` (not tokio) keeps lock holds trivially
     /// short: never await while holding it.
     tracked_tasks: std::sync::Arc<std::sync::Mutex<TrackedTasks>>,
+    /// #765: this agent's committed persistent-store opens, keyed by
+    /// canonical snapshot path, so [`Agent::shutdown`] can retire each
+    /// path even when the caller never drops or retires the handle. The
+    /// registry owns nothing strongly — one weak sync reference per path
+    /// plus the closed flag that makes commit-vs-shutdown atomic (see
+    /// [`KvSnapshotRegistry`]).
+    kv_snapshot_leases: std::sync::Mutex<KvSnapshotRegistry>,
+    /// #765 r3: whole-call serialization for [`Agent::shutdown`]. The
+    /// retirement tokens (step 3c's sweep) and the tracked-task drain
+    /// custody (step 4) live in separate registries, so two concurrent
+    /// shutdown callers could otherwise split them: caller A sweeps and
+    /// owns the tokens, caller B takes the task handles and blocks
+    /// draining an admitted receive/persist section, then A resumes to
+    /// an EMPTY task registry, skips its drain, and completes the
+    /// tokens — returning snapshot paths to `Idle` (re-openable) while
+    /// the old writer is still being drained. Holding this guard across
+    /// the entire body makes every shutdown strictly ordered: only the
+    /// caller that actually performed the drain completes the
+    /// retirements it swept; a concurrent caller waits and then finds
+    /// both registries closed and empty. An async mutex because the
+    /// guard is held across the body's awaits; it is acquired before
+    /// anything else `shutdown` touches.
+    shutdown_serialize: tokio::sync::Mutex<()>,
+    /// #765 r4: durable custody for the shutdown drain (the swept
+    /// retirement tokens + the exact taken tracked-task handles). The r3
+    /// design held both on the shutdown caller's future: cancelling that
+    /// caller between the sweep and the token completion dropped the
+    /// tokens uncompleted — wedging the retained snapshot path in
+    /// `Retiring` forever — and detached the taken `JoinHandle`s, so a
+    /// later caller found empty registries and could return while the
+    /// old writer still ran. The sweep, the handle take, and the custody
+    /// spawn inside `shutdown` are ONE synchronous stretch, so by the
+    /// time that caller first suspends both live in an independently
+    /// running task; this cell holds that task's completion signal.
+    /// Every shutdown caller — the leader itself or any later or
+    /// concurrent follower — awaits the signal before any teardown step,
+    /// so all of them observe the same outstanding drain. Set once,
+    /// never reset: after the drain completes the signal is already
+    /// cancelled and later callers pass through immediately. A std mutex
+    /// leaf; never held across an await.
+    kv_shutdown_drain: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    /// #765 r4 test instruments for `Agent::shutdown` (read-only
+    /// observations; see `ShutdownTestInstrument`).
+    #[cfg(test)]
+    shutdown_test: std::sync::Arc<ShutdownTestInstrument>,
     /// X0X-0070b: application-level peer-relay engine. Records direct-DM
     /// successes and failures so [`peer_relay::PeerRelay::needs_relay`] can
     /// drive the fallback decision. The engine is disabled by default
@@ -469,6 +514,107 @@ pub struct Agent {
 struct TrackedTasks {
     closed: bool,
     handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// #765 r4 test instruments for `Agent::shutdown` — counters the shutdown
+/// regressions read instead of trusting task scheduling:
+/// - `entered` (cumulative): futures that polled into `shutdown` at all.
+///   A caller increments it at the body's first statement.
+/// - `in_body` / `max_in_body`: callers currently between (high-water
+///   mark of callers that ever were between) the whole-call serialize
+///   lock and the end of the body. Serialization keeps the high-water
+///   mark at 1; removing the mutex lets concurrent callers overlap and
+///   pushes it to 2, which is exactly what the two-caller regression
+///   asserts against.
+/// - `drain_observers` (cumulative): callers that reached the durable
+///   custody observation. The cancellation regression polls the follower
+///   until it is provably suspended on the SAME outstanding drain.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ShutdownTestInstrument {
+    entered: std::sync::atomic::AtomicUsize,
+    in_body: std::sync::atomic::AtomicUsize,
+    max_in_body: std::sync::atomic::AtomicUsize,
+    drain_observers: std::sync::atomic::AtomicUsize,
+    progressed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ShutdownTestInstrument {
+    fn bump(counter: &std::sync::atomic::AtomicUsize, progressed: &tokio::sync::Notify) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        progressed.notify_one();
+    }
+
+    /// Wait until at least `n` shutdown futures reached the durable
+    /// custody observation.
+    async fn wait_drain_observers(&self, n: usize) {
+        loop {
+            let progressed = self.progressed.notified();
+            if self
+                .drain_observers
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= n
+            {
+                return;
+            }
+            progressed.await;
+        }
+    }
+}
+
+/// #765 r4 test instrument: RAII membership in the serialized-body
+/// high-water count above. Held from just after the serialize lock to the
+/// end of `shutdown` — cancellation drops it too, which is the point: a
+/// cancelled caller stops counting as in-body.
+#[cfg(test)]
+struct ShutdownBodyGuard(std::sync::Arc<ShutdownTestInstrument>);
+
+#[cfg(test)]
+impl ShutdownBodyGuard {
+    fn new(instrument: std::sync::Arc<ShutdownTestInstrument>) -> Self {
+        let now = instrument
+            .in_body
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        instrument
+            .max_in_body
+            .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        Self(instrument)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShutdownBodyGuard {
+    fn drop(&mut self) {
+        self.0
+            .in_body
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// #765 registry of one agent's committed persistent-store opens.
+///
+/// Ownership discipline (narrow by design): the registry holds one WEAK
+/// `KvStoreSync` reference per canonical snapshot path — never the lease,
+/// never a strong sync. The committed #760 open lease is owned by the sync
+/// itself (`KvStoreSync::adopt_committed_open_lease`), so dropping the last
+/// `KvStoreHandle` drops the sync, cancels its loops structurally, and
+/// releases the fence entry exactly as before this registry existed: the
+/// registry exists to enable retirement at shutdown, not to extend a
+/// discarded store's lifetime.
+///
+/// `closed` is the commit-vs-shutdown arbiter: every commit checks it under
+/// the same lock hold as its fence commit and registry insert, and the
+/// shutdown sweep sets it before taking the entries. A commit therefore
+/// either lands inside the swept retirement set or fails the open closed —
+/// its still-uncommitted lease drops on the constructor's error path
+/// (restoring `Idle`) and its already-spawned sync drops with it, cancelling
+/// the loops. No committed open can escape retirement.
+#[derive(Default)]
+struct KvSnapshotRegistry {
+    closed: bool,
+    entries: std::collections::HashMap<std::path::PathBuf, std::sync::Weak<kv::KvStoreSync>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -5603,7 +5749,41 @@ impl Agent {
     /// a listener blocks on a transport that is concurrently shutting down.
     /// Idempotent: `cancel()` is idempotent, the registry drains empty on a
     /// second call, and the `stop_*` helpers use `Option::take`.
+    /// Concurrent calls are serialized WHOLE-CALL (#765 r3): a second
+    /// caller waits on `shutdown_serialize` and then finds the snapshot
+    /// registry already swept and the tracked tasks already drained, so
+    /// the retirement tokens can never be completed by a caller that did
+    /// not perform the drain that protects them. Cancelling a caller is
+    /// custody-safe (#765 r4): the swept retirement tokens and the exact
+    /// taken drain handles are moved — synchronously, before that caller
+    /// first suspends past the sweep — into a spawned custody task whose
+    /// completion every later or concurrent shutdown awaits before any
+    /// teardown step, so an aborted leader can neither wedge a snapshot
+    /// path in `Retiring` nor let a follower return while the drained
+    /// writer is still running.
     pub async fn shutdown(&self) {
+        // #765 r4 test instrument: this future was polled. Counted before
+        // anything else so a caller parked on the serialize lock below
+        // still counts as entered.
+        #[cfg(test)]
+        ShutdownTestInstrument::bump(&self.shutdown_test.entered, &self.shutdown_test.progressed);
+
+        // 0. #765 r3: serialize the ENTIRE shutdown call. Without this,
+        //    two concurrent callers could split custody — A sweeps and
+        //    owns the retirement tokens, B takes the tracked-task handles
+        //    and blocks draining an admitted receive section, and A then
+        //    resumes to an empty task registry and completes the tokens,
+        //    re-opening snapshot paths while B's drain is still in flight.
+        //    The guard is held to the end of the body, so "swept the
+        //    tokens" and "drained the tasks" are one caller's custody.
+        //    (An `await`-free stretch between steps 3c and 4 does NOT
+        //    prevent this on a multithreaded executor.)
+        let _shutdown_order = self.shutdown_serialize.lock().await;
+        // #765 r4 test instrument: RAII membership in the serialized-body
+        // high-water count (see `ShutdownTestInstrument`).
+        #[cfg(test)]
+        let _in_body = ShutdownBodyGuard::new(std::sync::Arc::clone(&self.shutdown_test));
+
         // 1. Signal every token-aware loop to break. Inert until now, so this
         //    is the first thing that changes steady-state behavior.
         self.shutdown_token.cancel();
@@ -5640,6 +5820,21 @@ impl Agent {
             }
         }
 
+        // 3c. #765: retire this agent's persistent kv snapshot paths. Mark
+        // each still-owned path `Retiring` and cancel its sync loops NOW,
+        // before the tracked-task drain, so the loops exit through their
+        // cancel-first select and an admitted merge finishes its snapshot
+        // write inside the #757 section fence. The retirement tokens are
+        // completed only after the drain below: the path returns to `Idle`
+        // exactly when no receive section of this agent can still write,
+        // which is what makes an owner restart (a new `Agent` re-opening
+        // the same snapshot path) a legitimate reopen rather than a stale
+        // handle fenced off by #760. Closing the registry here is also what
+        // orders commit vs shutdown: a commit racing this step either
+        // lands inside the swept set or fails the open closed (see
+        // [`Agent::sweep_kv_snapshot_registry`]).
+        let kv_retirements = self.sweep_kv_snapshot_registry();
+
         // 4. Drain the tracked-task registry: mark closed (so any in-flight
         //    spawn_tracked is refused), take the handles, grace-await them all
         //    under a SINGLE bounded budget (not per-task — keeps shutdown
@@ -5653,29 +5848,63 @@ impl Agent {
             guard.closed = true;
             std::mem::take(&mut guard.handles)
         };
-        if !handles.is_empty() {
-            // Grace-await all tracked tasks under a SINGLE bounded budget (not
-            // per-task — keeps shutdown prompt regardless of task count). On
-            // timeout, abort the stragglers and await the aborts so none
-            // outlives shutdown(). The select! keeps the JoinHandles owned by
-            // the awaiting future so the post-abort join can still observe each
-            // task's terminal JoinError (cancelled tasks → Err — never
-            // unwrapped).
-            let abort_handles: Vec<tokio::task::AbortHandle> =
-                handles.iter().map(|h| h.abort_handle()).collect();
-            let mut join = futures::future::join_all(handles);
-            tokio::select! {
-                _results = &mut join => {}
-                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {
-                    tracing::warn!(
-                        "Agent background tasks did not stop within grace; aborting stragglers"
-                    );
-                    for handle in &abort_handles {
-                        handle.abort();
-                    }
-                    let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
-                }
+
+        // 4b. #765 r4: hand the retirement tokens and the EXACT taken
+        //     handles to durable custody before this caller first
+        //     suspends past the sweep. Steps 3c → 4 → this spawn are one
+        //     synchronous stretch (no await between them), so a shutdown
+        //     future cancelled at ANY await point either has not swept
+        //     yet — a later caller sweeps fresh — or has already moved
+        //     both into the independently running `kv_shutdown_drain_task`:
+        //     the tokens can never be dropped uncompleted by cancelling
+        //     the leader, and the taken handles are joined (never
+        //     detached) by the task that owns them. Bare `tokio::spawn`,
+        //     deliberately NOT `spawn_tracked`: the registry is closed by
+        //     now, and this custody must outlive the caller that created
+        //     it. The completion signal parks in the shared cell so every
+        //     later or concurrent shutdown observes the same drain.
+        if !kv_retirements.is_empty() || !handles.is_empty() {
+            let done = tokio_util::sync::CancellationToken::new();
+            let custody_done = done.clone();
+            {
+                let mut cell = self
+                    .kv_shutdown_drain
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Set once, never reset: the whole-call serialize lock
+                // means the only writer is the caller that performed the
+                // sweep + take above.
+                *cell = Some(done);
             }
+            tokio::spawn(kv_shutdown_drain_task(
+                custody_done,
+                kv_retirements,
+                handles,
+            ));
+        }
+
+        // 4c. #765 r4: observe the outstanding drain before ANY teardown
+        //     step or return. For an uncancelled leader this is its own
+        //     custody from 4b and resumes right after the drain; for a
+        //     caller whose predecessor was cancelled mid-drain it is the
+        //     SAME signal — no shutdown can reach network teardown or
+        //     report success while the old writer's drain is outstanding.
+        //     The cell is never reset, so this is also the fast path for
+        //     every later call: a completed custody's signal is already
+        //     cancelled and `cancelled()` resolves immediately.
+        let drain_done = {
+            self.kv_shutdown_drain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        if let Some(done) = drain_done {
+            #[cfg(test)]
+            ShutdownTestInstrument::bump(
+                &self.shutdown_test.drain_observers,
+                &self.shutdown_test.progressed,
+            );
+            done.cancelled().await;
         }
 
         // Shut down presence beacons.
@@ -15460,6 +15689,11 @@ impl AgentBuilder {
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             selection_skew: std::sync::Arc::new(SelectionSkew::default()),
+            kv_snapshot_leases: std::sync::Mutex::new(KvSnapshotRegistry::default()),
+            shutdown_serialize: tokio::sync::Mutex::new(()),
+            kv_shutdown_drain: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            shutdown_test: std::sync::Arc::new(ShutdownTestInstrument::default()),
             announce_blob_cache: std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(
                 self.identity_dir
                     .clone()
@@ -15623,6 +15857,16 @@ impl TaskListHandle {
         self.sync.cancel_sync();
     }
 
+    /// #759: [`cancel_sync`](Self::cancel_sync) plus a wait for every
+    /// in-flight receive section (merge and snapshot persist) to finish —
+    /// the draining retire. Callers that can await and hold no lock a
+    /// receive section takes (no `TaskList` guard, no persist gate, no
+    /// `named_groups` guard) should prefer this when they remove the handle;
+    /// plain `cancel_sync` leaves the documented one-section residual.
+    pub async fn cancel_sync_and_drain(&self) {
+        self.sync.cancel_sync_and_drain().await;
+    }
+
     /// Generate a fresh per-replica epoch at handle construction.
     ///
     /// Uses a CSPRNG incarnation nonce (64-bit random from `OsRng`) so a
@@ -15718,13 +15962,19 @@ impl TaskListHandle {
     ///
     /// Called by the manual clear route
     /// (`server::routes::tasks::resume_group_task_ingest`) so an operator's
-    /// clear takes effect at once, and by the deterministic fixtures. The
+    /// clear takes effect at once; by the #759 durable-clear notification
+    /// after the OWNER-ANCHORED clears that live inside locks the resume
+    /// helper must not be called under (the metadata-apply machinery and the
+    /// explicit owner seal route); and by the deterministic fixtures. The
     /// listener's own poll is the GUARANTEE — it covers every other way a
     /// marker clears — so this is an accelerator, never the only trigger.
     ///
     /// Applies nothing if a marker is live again, or if the ADR-0067 marker
     /// identity moved since the drain decided: the deltas stay buffered, in
     /// order, for the next observation.
+    ///
+    /// #759: fenced like the listener's receive sections — a retired list
+    /// answers 0 and applies nothing.
     pub async fn resume_quarantined_ingest(&self) -> usize {
         self.sync.resume_quarantined_ingest().await
     }
@@ -15734,6 +15984,37 @@ impl TaskListHandle {
     #[must_use]
     pub fn quarantined_buffer_len(&self) -> usize {
         self.sync.quarantined_buffer_len()
+    }
+
+    /// Test-only: park this list's ADR-0068 drain poll far out so a fixture
+    /// can prove a drain came from the explicit resume path, never the
+    /// timer (#759 notification fixtures).
+    #[cfg(test)]
+    pub fn set_drain_poll_millis_for_testing(&self, millis: u64) {
+        self.sync.set_drain_poll_millis(millis);
+    }
+
+    /// Test-only: wrap an explicitly constructed
+    /// [`TaskListSync`](crdt::TaskListSync) as a live handle. The #759
+    /// behavioural fixtures build the sync over a loopback-only pub/sub (no
+    /// seeds, no discovery) and register the handle in the test
+    /// `AppState`'s task-list registry, so the production
+    /// resume/notification wiring runs against a real group-scoped list
+    /// without the daemon's gossip runtime.
+    #[cfg(test)]
+    pub fn task_list_handle_for_testing(
+        sync: std::sync::Arc<crdt::TaskListSync>,
+        agent_id: identity::AgentId,
+        peer_id: saorsa_gossip_types::PeerId,
+        signing: std::sync::Arc<crate::gossip::SigningContext>,
+    ) -> Self {
+        Self {
+            sync,
+            agent_id,
+            peer_id,
+            replica_epoch: Self::fresh_epoch(),
+            signing,
+        }
     }
 
     /// Test-only: override the per-replica epoch so a pre-restart fence token
@@ -16245,6 +16526,10 @@ impl Agent {
             kv::KvStoreId::for_topic_owner(topic, &self.agent_id())
         };
         let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
+        // #760: claim the snapshot path BEFORE loading it, so a concurrent
+        // retirement's drain completes (its admitted write lands) before
+        // this open's load reads the file.
+        let snapshot_lease = claim_snapshot_lease(persist_path.as_deref()).await;
         let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
             Some(Ok(Some(snap))) => {
                 if snap.id() != &store_id {
@@ -16309,7 +16594,9 @@ impl Agent {
             }
         };
 
-        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
+        let (sync, peer_id) = self
+            .spawn_kv_sync(store, topic, persist_path, snapshot_lease.as_ref())
+            .await?;
 
         // The creator is the owner: capture signing material so each write
         // produces an owner-signed content checkpoint (cold-recovery provenance).
@@ -16323,11 +16610,13 @@ impl Agent {
                 secret_key_bytes: sk_bytes,
             }))
         };
+        self.commit_snapshot_lease(snapshot_lease.as_ref(), &sync, "create")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
             peer_id,
             owner_signing,
+            snapshot_lease,
         })
     }
 
@@ -16337,8 +16626,9 @@ impl Agent {
         store: kv::KvStore,
         topic: &str,
         persist_path: Option<std::path::PathBuf>,
+        snapshot_lease: Option<&kv::snapshot_fence::StoreOpenLease>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
-        self.spawn_kv_sync_inner(store, topic, persist_path, None, None, None)
+        self.spawn_kv_sync_inner(store, topic, persist_path, snapshot_lease, None, None, None)
             .await
     }
 
@@ -16354,6 +16644,7 @@ impl Agent {
         store: kv::KvStore,
         topic: &str,
         persist_path: Option<std::path::PathBuf>,
+        snapshot_lease: Option<&kv::snapshot_fence::StoreOpenLease>,
         secure: Option<std::sync::Arc<dyn kv::encrypted::KvSecureContext>>,
         secure_refresh: Option<kv::sync::SecureRefreshFn>,
         treekem_secure: Option<kv::SharedTreeKemKvProtector>,
@@ -16391,7 +16682,18 @@ impl Agent {
         // the first moment the store does.
         let persistent = persist_path.is_some();
         if let Some(path) = persist_path {
-            sync.set_persist_path(path);
+            match snapshot_lease {
+                Some(lease) => sync.set_persist_path_for_open(lease),
+                None => {
+                    sync.set_persist_path(path);
+                    Ok(())
+                }
+            }
+            .map_err(|e| {
+                kv_storage_err(format!(
+                    "kv snapshot path cannot be armed for this open ({e}); retry after the prior handle retires"
+                ))
+            })?;
         }
         let sync = std::sync::Arc::new(sync);
         if persistent {
@@ -16408,6 +16710,22 @@ impl Agent {
             .await
             .map_err(|e| kv_storage_err(format!("kv store sync start failed: {e}")))?;
         Ok((sync, peer_id))
+    }
+
+    /// Claim a persistent group store's snapshot path before taking any
+    /// membership or store-registry guard (#760).
+    pub async fn claim_group_kv_store_open(
+        &self,
+        name: &str,
+        stable_group_id: &str,
+        state_dir: &std::path::Path,
+    ) -> KvStoreOpenLease {
+        let (store_id, _) = kv::encrypted::group_store_identity(stable_group_id, name);
+        let path = kv_snapshot_path(state_dir, &store_id);
+        KvStoreOpenLease {
+            inner: kv::snapshot_fence::claim_open(&path).await,
+            store_id,
+        }
     }
 
     /// Open (create or restore) a group-scoped encrypted KvStore
@@ -16442,7 +16760,7 @@ impl Agent {
         creator: identity::AgentId,
         secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
         secure_refresh: kv::sync::SecureRefreshFn,
-        state_dir: &std::path::Path,
+        snapshot_lease: KvStoreOpenLease,
     ) -> error::Result<KvStoreHandle> {
         if name.is_empty() {
             return Err(kv_storage_err(
@@ -16450,7 +16768,15 @@ impl Agent {
             ));
         }
         let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
-        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        if snapshot_lease.store_id != store_id {
+            return Err(kv_storage_err(
+                "group kv store open lease was claimed for a different binding".to_string(),
+            ));
+        }
+        let snapshot_lease = snapshot_lease.inner;
+        // The opaque lease was minted by `claim_group_kv_store_open` from
+        // this binding and carries the sole authoritative snapshot path.
+        let persist_path = snapshot_lease.path().to_path_buf();
         let store = load_group_kv_store(
             &persist_path,
             name,
@@ -16465,12 +16791,13 @@ impl Agent {
                 store,
                 &topic,
                 Some(persist_path),
+                Some(&snapshot_lease),
                 Some(secure),
                 Some(secure_refresh),
                 None,
             )
             .await?;
-
+        self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "group store open")?;
         // Only the GROUP CREATOR (the store's anchored owner) produces
         // owner-signed checkpoints; other members never do.
         let owner_signing = if self.agent_id() == creator {
@@ -16487,6 +16814,7 @@ impl Agent {
             agent_id: self.agent_id(),
             peer_id,
             owner_signing,
+            snapshot_lease: Some(snapshot_lease),
         })
     }
 
@@ -16501,7 +16829,7 @@ impl Agent {
         creator: identity::AgentId,
         authorization: std::sync::Arc<groups::TreeKemKvAuthorizationContext>,
         protector: kv::SharedTreeKemKvProtector,
-        state_dir: &std::path::Path,
+        snapshot_lease: KvStoreOpenLease,
     ) -> error::Result<KvStoreHandle> {
         if name.is_empty() {
             return Err(kv_storage_err(
@@ -16509,7 +16837,13 @@ impl Agent {
             ));
         }
         let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
-        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        if snapshot_lease.store_id != store_id {
+            return Err(kv_storage_err(
+                "TreeKEM group open lease was claimed for a different binding".to_string(),
+            ));
+        }
+        let snapshot_lease = snapshot_lease.inner;
+        let persist_path = snapshot_lease.path().to_path_buf();
         let secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext> = authorization;
         if secure.group_id() != stable_group_id.as_bytes()
             || !secure.is_active_member(&self.agent_id())
@@ -16552,16 +16886,19 @@ impl Agent {
                 store,
                 &topic,
                 Some(persist_path),
+                Some(&snapshot_lease),
                 None,
                 None,
                 Some(protector),
             )
             .await?;
+        self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "TreeKEM group store open")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
             peer_id,
             owner_signing: None,
+            snapshot_lease: Some(snapshot_lease),
         })
     }
 
@@ -16573,7 +16910,7 @@ impl Agent {
         creator: identity::AgentId,
         context: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
         refresh: kv::sync::SecureRefreshFn,
-        state_dir: &std::path::Path,
+        snapshot_lease: KvStoreOpenLease,
     ) -> error::Result<KvStoreHandle> {
         if name.is_empty() || context.group_id() != stable_group_id.as_bytes() {
             return Err(kv_storage_err(
@@ -16581,7 +16918,13 @@ impl Agent {
             ));
         }
         let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
-        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        if snapshot_lease.store_id != store_id {
+            return Err(kv_storage_err(
+                "public group open lease was claimed for a different binding".to_string(),
+            ));
+        }
+        let snapshot_lease = snapshot_lease.inner;
+        let persist_path = snapshot_lease.path().to_path_buf();
         let mut store = match kv::sync::load_snapshot(&persist_path) {
             Ok(Some(store)) => {
                 validate_group_kv_store_binding(
@@ -16616,16 +16959,19 @@ impl Agent {
                 store,
                 &topic,
                 Some(persist_path),
+                Some(&snapshot_lease),
                 Some(context),
                 Some(refresh),
                 None,
             )
             .await?;
+        self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "public group store open")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
             peer_id,
             owner_signing: None,
+            snapshot_lease: Some(snapshot_lease),
         })
     }
 
@@ -16707,6 +17053,8 @@ impl Agent {
     ) -> error::Result<KvStoreHandle> {
         let store_id = kv::KvStoreId::for_self_keyed_topic(topic);
         let persist_path = Some(kv_snapshot_path(state_dir, &store_id));
+        // #760: claim before load — see create_kv_store_inner.
+        let snapshot_lease = claim_snapshot_lease(persist_path.as_deref()).await;
         let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
             Some(Ok(Some(snap))) => {
                 if snap.id() != &store_id {
@@ -16729,8 +17077,11 @@ impl Agent {
             }
         };
 
-        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
+        let (sync, peer_id) = self
+            .spawn_kv_sync(store, topic, persist_path, snapshot_lease.as_ref())
+            .await?;
 
+        self.commit_snapshot_lease(snapshot_lease.as_ref(), &sync, "self_keyed join")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
@@ -16738,6 +17089,7 @@ impl Agent {
             // No owner exists on a SelfKeyed store; nobody produces
             // checkpoints.
             owner_signing: None,
+            snapshot_lease,
         })
     }
 
@@ -16752,6 +17104,8 @@ impl Agent {
         // the creator's id (both derive for_topic_owner(topic, owner)).
         let store_id = kv::KvStoreId::for_topic_owner(topic, &owner);
         let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
+        // #760: claim before load — see create_kv_store_inner.
+        let snapshot_lease = claim_snapshot_lease(persist_path.as_deref()).await;
         let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
             Some(Ok(Some(snap))) => {
                 if snap.id() != &store_id {
@@ -16778,8 +17132,10 @@ impl Agent {
             }
         };
 
-        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
-
+        let (sync, peer_id) = self
+            .spawn_kv_sync(store, topic, persist_path, snapshot_lease.as_ref())
+            .await?;
+        self.commit_snapshot_lease(snapshot_lease.as_ref(), &sync, "join")?;
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
@@ -16787,10 +17143,175 @@ impl Agent {
             // A joiner is not the owner and never produces checkpoints; it
             // only caches + relays owner-produced ones.
             owner_signing: None,
+            snapshot_lease,
         })
+    }
+
+    /// Commit a claimed lease after successful construction and record the
+    /// open for snapshot-fence retirement at [`Agent::shutdown`] (#765). A
+    /// retirement that trampled the claim mid-open (secure-refresh hook or
+    /// a rollback racing the construction) fails the open closed — the
+    /// constructed sync is dropped, which structurally cancels it (#760).
+    ///
+    /// The closed-check, the fence commit, the lease adoption, and the
+    /// registry insert run under ONE lock hold — the same lock
+    /// [`Agent::sweep_kv_snapshot_registry`] takes — so a commit either
+    /// lands inside the swept retirement set or observes `closed` and fails
+    /// the open without committing: the constructor's error path then drops
+    /// the still-unclaimed lease (restoring `Idle`) and the spawned sync
+    /// (cancelling its loops). There is no ordering in which a committed
+    /// open escapes the sweep.
+    fn commit_snapshot_lease(
+        &self,
+        lease: Option<&kv::snapshot_fence::StoreOpenLease>,
+        sync: &std::sync::Arc<kv::KvStoreSync>,
+        what: &str,
+    ) -> error::Result<()> {
+        let Some(lease) = lease else {
+            return Ok(());
+        };
+        let mut tracked = self
+            .kv_snapshot_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tracked.closed {
+            // The shutdown sweep already took the retirement set: fail the
+            // open closed instead of inserting into the post-sweep
+            // registry (an escaped `Active` lease is exactly what wedges
+            // the next restart with `SnapshotSuperseded`).
+            return Err(kv_storage_err(format!(
+                "kv snapshot lease cannot be committed for this open ({what}); \
+                 the agent is shutting down"
+            )));
+        }
+        if !lease.commit() {
+            return Err(kv_storage_err(format!(
+                "kv snapshot path was retired while opening ({what}); retry the open"
+            )));
+        }
+        // A committed open is a tracked open (#765): shutdown must be able
+        // to retire this snapshot path (mark `Retiring`, cancel the loops,
+        // complete after the drain) even when the caller never drops or
+        // retires the handle. The sync owns the committed lease and the
+        // registry keeps only a weak reference to the sync, so tracking
+        // extends no lifetime: dropping the last handle drops the last
+        // strong sync reference (lease released, loops structurally
+        // cancelled) — the fence entry becomes prunable only once those
+        // cancelled loop futures drop their captured persist contexts,
+        // which is why the reopen controls await the sync's loop exits —
+        // recorded only after each whole loop future (captured persist
+        // context included) is destroyed — instead of racing the executor.
+        // A later committed open of the same path replaces the (by then
+        // dead) weak entry.
+        sync.adopt_committed_open_lease(lease.clone());
+        tracked
+            .entries
+            .insert(lease.path().to_path_buf(), std::sync::Arc::downgrade(sync));
+        Ok(())
+    }
+
+    /// #765 shutdown step 3c: close the snapshot-lease registry and begin
+    /// retiring every still-live tracked open, returning the tokens to
+    /// complete after the tracked-task drain. Setting `closed` and taking
+    /// the entries is one lock hold — the same hold
+    /// [`Agent::commit_snapshot_lease`] commits under — which is what makes
+    /// commit-vs-shutdown atomic.
+    ///
+    /// A dead weak reference is an open whose last handle already dropped:
+    /// its lease died with the sync and there is nothing left to retire —
+    /// its fence entry becomes prunable once the sync's cancelled loop
+    /// futures drop their captured persist contexts (an asynchronous tail
+    /// of the drop, not something this synchronous sweep waits for; the
+    /// tests observe it through the sync's loop-exit tracker, whose record
+    /// is strictly post-destruction). A live weak is marked `Retiring` and
+    /// its loops cancelled NOW (before the drain) so an admitted merge
+    /// finishes its snapshot write inside the #757 section fence; only the
+    /// post-drain token completion returns the path to `Idle`. Everything
+    /// here is a synchronous leaf call — no await, no lock a receive
+    /// section takes.
+    fn sweep_kv_snapshot_registry(&self) -> Vec<kv::snapshot_fence::RetirementToken> {
+        let mut tracked = self
+            .kv_snapshot_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tracked.closed = true;
+        std::mem::take(&mut tracked.entries)
+            .into_values()
+            .filter_map(|weak| {
+                let sync = weak.upgrade()?;
+                let retirement = sync.begin_shutdown_retirement();
+                sync.cancel_sync();
+                retirement
+            })
+            .collect()
+    }
+
+    /// #765 r4 test instrument: the durable shutdown-drain custody signal,
+    /// `None` until a shutdown sweeps (and parks its custody), cancelled
+    /// once the custody task finished the drain and completed its
+    /// retirements. Reading this under the same leaf lock the shutdown
+    /// body parks it under makes `Some && !is_cancelled` a precise
+    /// "outstanding drain" probe for the cancellation regression.
+    #[cfg(test)]
+    fn kv_shutdown_drain_for_test(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.kv_shutdown_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
+/// #765 r4: the durable shutdown-drain custody task. Owns the retirement
+/// tokens swept by one [`Agent::shutdown`] and the exact tracked-task
+/// handles that caller took, and is the ONLY completer of those tokens —
+/// the non-cancelled r3 ordering, verbatim: one bounded grace budget
+/// across ALL handles (abort + join the stragglers on timeout), then —
+/// and only then — complete the retirements, then cancel `done` so the
+/// leader, every follower, and every replacement caller parked in the
+/// custody observation resumes.
+///
+/// Because the tokens and handles live here rather than on any caller's
+/// future, cancelling a leader mid-drain neither drops the tokens
+/// uncompleted (which would wedge the path in `Retiring` forever) nor
+/// detaches the taken handles (which would let a follower return while
+/// the old writer still ran): the drain simply continues, and every later
+/// or concurrent shutdown observes the same signal before its own
+/// teardown. Cancelling THIS task is only possible by tearing down the
+/// executor itself — a process that is exiting anyway.
+async fn kv_shutdown_drain_task(
+    done: tokio_util::sync::CancellationToken,
+    retirements: Vec<kv::snapshot_fence::RetirementToken>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+) {
+    if !handles.is_empty() {
+        // Grace-await all tracked tasks under a SINGLE bounded budget
+        // (not per-task — keeps shutdown prompt regardless of task
+        // count). On timeout, abort the stragglers and await the aborts
+        // so none outlives the drain. The select! keeps the JoinHandles
+        // owned by this task so the post-abort join can still observe
+        // each task's terminal JoinError (cancelled tasks → Err — never
+        // unwrapped).
+        let abort_handles: Vec<tokio::task::AbortHandle> =
+            handles.iter().map(|h| h.abort_handle()).collect();
+        let mut join = futures::future::join_all(handles);
+        tokio::select! {
+            _results = &mut join => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {
+                tracing::warn!(
+                    "Agent background tasks did not stop within grace; aborting stragglers"
+                );
+                for handle in &abort_handles {
+                    handle.abort();
+                }
+                let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+            }
+        }
+    }
+    for retirement in retirements {
+        retirement.complete();
+    }
+    done.cancel();
+}
 /// Validate the immutable binding shared by cached and restored group stores.
 /// A snapshot deliberately has no context; a cached handle must have a live one.
 pub(crate) fn validate_group_kv_store_binding(
@@ -17066,8 +17587,41 @@ mod issue565_group_binding_tests {
 }
 
 /// Snapshot file path for a store: `<dir>/<store-id-hex>.bin`.
-fn kv_snapshot_path(dir: &std::path::Path, id: &kv::KvStoreId) -> std::path::PathBuf {
+///
+/// Canonical within one daemon's `kv_store_state_dir`; the #760 snapshot
+/// fence keys its open/retire lifecycle on exactly this path.
+pub(crate) fn kv_snapshot_path(dir: &std::path::Path, id: &kv::KvStoreId) -> std::path::PathBuf {
     dir.join(format!("{}.bin", hex::encode(id.as_bytes())))
+}
+
+/// Opaque reservation spanning a persistent group store's snapshot load,
+/// persistence arming, registration, and rollback window (#760). It also
+/// carries the derived store identity and canonical path, so constructors do
+/// not accept a separately supplied directory/path that could disagree.
+///
+/// Server callers claim this before taking group-membership or store-registry
+/// guards, then pass it to exactly one matching group-store constructor.
+#[must_use]
+pub struct KvStoreOpenLease {
+    inner: kv::snapshot_fence::StoreOpenLease,
+    store_id: kv::KvStoreId,
+}
+
+/// Claim the #760 open lease for a persistent store's snapshot path.
+///
+/// MUST run BEFORE `load_snapshot` (the opener's load must observe the
+/// retired sync's final write) and, in callers that take group-membership /
+/// registry guards, BEFORE those guards — the lease wait is exactly what
+/// must never happen under a lock a receive section takes. The plain
+/// create/join constructors run under no such guard (only the per-topic
+/// reservation, which no receive section takes), so they claim here.
+async fn claim_snapshot_lease(
+    persist_path: Option<&std::path::Path>,
+) -> Option<kv::snapshot_fence::StoreOpenLease> {
+    match persist_path {
+        Some(path) => Some(kv::snapshot_fence::claim_open(path).await),
+        None => None,
+    }
 }
 
 /// Shorthand for the storage-flavoured [`error::IdentityError`].
@@ -17088,6 +17642,11 @@ pub struct KvStoreHandle {
     /// (creator path). Used to produce owner-signed content checkpoints on
     /// each write so replicas can cold-recover while the owner is offline.
     owner_signing: Option<std::sync::Arc<OwnerSigningMaterial>>,
+    /// #760 lease over the canonical snapshot path (`None` for
+    /// non-persistent stores). Shared by every clone: retirement marking
+    /// is idempotent across clones, and the drain obligation completes
+    /// exactly once per retirement.
+    snapshot_lease: Option<kv::snapshot_fence::StoreOpenLease>,
 }
 
 /// Serialized owner keypair for checkpoint signing (held only by the owner's
@@ -17133,6 +17692,11 @@ impl KvStoreHandle {
         during: F,
     ) -> F::Output {
         self.sync.with_persist_gate_held_for_test(during).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_receive_merged_for_test(&self) {
+        self.sync.wait_receive_merged_for_test().await;
     }
 
     #[cfg(test)]
@@ -17254,40 +17818,74 @@ impl KvStoreHandle {
         self.sync.read().await.latest_checkpoint.is_some()
     }
 
-    /// Fully retire this handle: invalidate the secure context (group
-    /// lifecycle — local authorization fails closed immediately) AND cancel
-    /// the background sync loops.
+    /// Fully retire this handle: synchronously mark the snapshot-path fence
+    /// `Retiring` (#760), invalidate the secure context (group lifecycle —
+    /// local authorization fails closed immediately), and cancel the
+    /// background sync loops.
     ///
     /// Called when the bound group disappears locally (leave, removal,
-    /// withdrawal). Even a clone of this handle held elsewhere afterwards
-    /// refuses local writes (membership is gone) and every seal/open — a
-    /// departed member cannot keep operating a group store on a stale
-    /// secret/roster snapshot.
+    /// withdrawal; rollback paths). Even a clone of this handle held
+    /// elsewhere afterwards refuses local writes (membership is gone) and
+    /// every seal/open — a departed member cannot keep operating a group
+    /// store on a stale secret/roster snapshot.
     ///
-    /// Non-blocking, so it is a REQUEST: one receive section already past its
-    /// cancel check may still finish — merge and snapshot write — after this
-    /// returns, and can race a later re-open of the same snapshot path
-    /// (#757; residual tracked in #760). Use
-    /// [`retire_and_drain`](Self::retire_and_drain) where that matters and no
-    /// section-internal lock is held.
+    /// Safe under ANY lock (registry, membership, `named_groups`) and from
+    /// inside a receive section (the secure-refresh hooks): the fence mark,
+    /// the invalidation, and the cancel are all synchronous, and the drain
+    /// is deferred to a detached task that holds nothing. The drain — and
+    /// with it the fence completion that un-blocks a re-open of the same
+    /// snapshot path — therefore happens only after this caller's guards
+    /// release; a receive section already past its cancel check finishes
+    /// (merge + snapshot write, #757) before any re-open can load the file.
+    /// Caller-driven persistence that was already in flight is fenced out
+    /// by the re-open's younger persist generation and fails closed
+    /// ([`kv::KvError::SnapshotSuperseded`]).
     pub fn retire(&self) {
+        let retirement = self
+            .snapshot_lease
+            .as_ref()
+            .and_then(kv::snapshot_fence::StoreOpenLease::begin_retire);
         self.sync.invalidate_secure_context();
         self.sync.cancel_sync();
+        if let Some(retirement) = retirement {
+            let sync = std::sync::Arc::clone(&self.sync);
+            // Deferred drain + fence completion (#760): `retire()` is
+            // callable under locks a receive section takes, so the drain
+            // must run detached. No runtime means no background loops can
+            // exist (they were spawned on one), so there is nothing to
+            // drain — the Retiring mark stands for the process lifetime.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    sync.cancel_sync_and_drain().await;
+                    retirement.complete();
+                });
+            }
+        }
     }
 
     /// [`retire`](Self::retire), then wait until no background merge,
-    /// ownership update or snapshot write for this store is in flight (#757);
-    /// none can start afterwards. Read-only state serves and the bootstrap
-    /// requester's publish are outside that fence and may still be finishing.
+    /// ownership update or snapshot write for this store is in flight
+    /// (#757) — none can start afterwards — and complete the snapshot-path
+    /// fence so a re-open of the same path may proceed immediately (#760).
+    /// Read-only state serves and the bootstrap requester's publish are
+    /// outside that fence and may still be finishing.
     ///
-    /// Must not be awaited while holding a lock a receive section takes: the
-    /// named-groups map or the store registry (secure-refresh hook), and for
-    /// TreeKEM stores the group membership guard (`merge_main_record`). The
-    /// refresh hooks themselves run inside a section. Those callers keep
-    /// `retire`; the re-open race that leaves is tracked in #760.
+    /// Must not be awaited while holding a lock a receive section takes:
+    /// the named-groups map or the store registry (secure-refresh hook),
+    /// and for TreeKEM stores the group membership guard
+    /// (`merge_main_record`). The refresh hooks themselves run inside a
+    /// section. Those callers use [`retire`](Self::retire), whose deferred
+    /// drain performs the same completion.
     pub async fn retire_and_drain(&self) {
+        let retirement = self
+            .snapshot_lease
+            .as_ref()
+            .and_then(kv::snapshot_fence::StoreOpenLease::begin_retire);
         self.sync.invalidate_secure_context();
         self.sync.cancel_sync_and_drain().await;
+        if let Some(retirement) = retirement {
+            retirement.complete();
+        }
     }
 
     /// Whether this store's background receive sections run a TreeKEM
@@ -19801,6 +20399,778 @@ mod tests {
             "append_only requested over a Signed snapshot must fail closed"
         );
         agent3.shutdown().await;
+    }
+
+    /// Constructor-layer #760 selector: a lease claimed while the old handle
+    /// is active, then trampled by its retirement, must be refused by the
+    /// actual Agent constructor before it can arm or write a stale snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_constructor_refuses_trampled_snapshot_lease_and_preserves_admitted_delta() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let topic = "760-constructor-trample";
+        let old = agent
+            .create_kv_store_persistent("old", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect("old store");
+        let store_id = kv::KvStoreId::for_topic_owner(topic, &agent.agent_id());
+        let path = kv_snapshot_path(&state_dir, &store_id);
+        // Claim B before old retires: this is the predecessor-backed lease
+        // that production wiring must pass to lease-aware arming.
+        let stale_lease = claim_snapshot_lease(Some(&path))
+            .await
+            .expect("persistent lease");
+
+        let mut delta = kv::KvStoreDelta::new(1);
+        delta.added.insert(
+            "admitted-a".to_string(),
+            (
+                kv::KvEntry::new(
+                    "admitted-a".to_string(),
+                    b"a".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (old.peer_id(), 1),
+            ),
+        );
+        old.with_persist_gate_held_for_test(async {
+            old.publish_delta_for_test(delta).await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                old.wait_receive_merged_for_test(),
+            )
+            .await
+            .expect("A admitted before persist");
+            let stale_image = kv::sync::load_snapshot(&path)
+                .expect("baseline decodes")
+                .expect("baseline exists");
+            assert!(stale_image.get("admitted-a").is_none());
+
+            old.retire();
+            let result = agent
+                .spawn_kv_sync(stale_image, topic, Some(path.clone()), Some(&stale_lease))
+                .await;
+            let error = match result {
+                Ok(_) => panic!("trampled lease must fail in the Agent constructor"),
+                Err(error) => error,
+            };
+            assert!(format!("{error}").contains("snapshot superseded"));
+        })
+        .await;
+
+        // Waiting for the next claim is the deterministic detached-drain
+        // barrier. No membership or registry lock is held here.
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            claim_snapshot_lease(Some(&path)),
+        )
+        .await
+        .expect("retirement drain completes")
+        .expect("persistent retry lease");
+        let raw = kv::sync::load_snapshot(&path)
+            .expect("final snapshot decodes")
+            .expect("final snapshot exists");
+        assert!(
+            raw.get("admitted-a").is_some(),
+            "constructor did not suppress A"
+        );
+        drop(retry);
+        agent.shutdown().await;
+    }
+
+    /// #765 regression (the CI-failing interleaving): an owner restart
+    /// keeps the OLD handle alive — never dropped, never retired — across
+    /// `Agent::shutdown`, then a new `Agent` with the same identity
+    /// re-opens the same snapshot path. While the owning agent is still
+    /// running, that re-open is a trampling open and must stay refused
+    /// (stale-handle control: #760's old-generation write prevention).
+    /// After shutdown the old generation can no longer admit writes, so
+    /// the re-open must succeed and restore the persisted state, and the
+    /// old handle's caller-driven persist must stay fenced by the
+    /// successor's younger persist generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn owner_restart_after_shutdown_reopens_snapshot_path_with_live_old_handle() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let build_agent = || async {
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("agent")
+        };
+
+        let agent = build_agent().await;
+        let topic = "765-owner-restart";
+        let store = agent
+            .create_kv_store_persistent("log", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect("persistent store");
+        store
+            .put("k".to_string(), b"v1".to_vec(), "text/plain".to_string())
+            .await
+            .expect("append");
+
+        // Stale-handle control: with the owning agent running and the old
+        // handle alive, a second open of the same snapshot path must be
+        // refused by the fence — typed, not a silent second writer.
+        let err = agent
+            .create_kv_store_persistent("log", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect_err("re-open while the old handle is live must be fenced");
+        assert!(
+            format!("{err}").contains("snapshot superseded"),
+            "live-handle re-open must fail with the typed fence error, got: {err}"
+        );
+
+        // Owner restart: shutdown retires the snapshot path even though the
+        // old handle is still referenced (never dropped, never retired).
+        agent.shutdown().await;
+
+        let agent2 = build_agent().await;
+        let restored = agent2
+            .create_kv_store_persistent("log", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect("owner restart re-opens the snapshot path");
+        assert!(
+            restored.sync.read().await.get("k").is_some(),
+            "persisted entry survives the restart"
+        );
+
+        // The fence survives the restart: the old handle's caller-driven
+        // persist is fenced off by the successor's younger generation and
+        // must fail typed instead of clobbering the successor's file.
+        let err = store
+            .sync
+            .persist()
+            .await
+            .expect_err("stale caller-driven persist must be fenced");
+        assert!(
+            format!("{err}").contains("superseded"),
+            "stale persist must fail with the typed superseded error, got: {err}"
+        );
+        agent2.shutdown().await;
+    }
+
+    /// #765 round-2 review control (commit racing the shutdown sweep): the
+    /// LOSING interleaving, forced deterministically. The sweep sets
+    /// `closed` and takes the registry in one synchronous lock hold —
+    /// exactly what `shutdown` step 3c runs — so a constructor whose commit
+    /// arrives AFTER the sweep must fail the open closed instead of
+    /// inserting into the post-sweep registry and escaping retirement (the
+    /// round-2 P2: an escaped `Active` lease then fences the next restart
+    /// off with `SnapshotSuperseded`). The refused open commits nothing:
+    /// its lease drops unclaimed, so after the real shutdown's drain and
+    /// the sweep tokens' post-drain completion, a successor agent re-opens
+    /// BOTH paths — the swept one restored, the refused one fresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_after_shutdown_sweep_fails_closed_and_leaves_no_active_lease() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let build_agent = || async {
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("agent")
+        };
+
+        let agent = build_agent().await;
+        let store = agent
+            .create_kv_store_persistent(
+                "log",
+                "765-sweep-race",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("persistent store");
+        store
+            .put(
+                "tracked".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("append");
+
+        // The sweep, isolated exactly as shutdown step 3c runs it: close +
+        // take + begin-retire, all synchronous, no drain yet.
+        let tokens = agent.sweep_kv_snapshot_registry();
+
+        // The racing commit (a fresh open of a SECOND path) arrives after
+        // the sweep took the registry: it must fail closed, typed.
+        let err = agent
+            .create_kv_store_persistent(
+                "log",
+                "765-sweep-race-loser",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect_err("a commit after the sweep must not land");
+        assert!(
+            format!("{err}").contains("the agent is shutting down"),
+            "post-sweep open must fail with the shutdown refusal, got: {err}"
+        );
+
+        // Production ordering for the swept retirements: complete only
+        // after the drain a real shutdown performs.
+        agent.shutdown().await;
+        for token in tokens {
+            token.complete();
+        }
+
+        let agent2 = build_agent().await;
+        let loser = agent2
+            .create_kv_store_persistent(
+                "log",
+                "765-sweep-race-loser",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("the refused open left its snapshot path Idle");
+        loser
+            .put("k".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect("successor writes the refused path");
+        let swept = agent2
+            .create_kv_store_persistent(
+                "log",
+                "765-sweep-race",
+                kv::AccessPolicy::Signed,
+                &state_dir,
+            )
+            .await
+            .expect("the swept path retired to Idle");
+        assert!(
+            swept.sync.read().await.get("tracked").is_some(),
+            "the swept path restored its persisted entry"
+        );
+        agent2.shutdown().await;
+    }
+
+    /// #765 round-3 review control (concurrent shutdown callers): the
+    /// retirement-token custody and the tracked-task drain custody must
+    /// stay with ONE caller. Two real `Agent::shutdown` callers run
+    /// concurrently on separate tasks while a remote merge sits admitted
+    /// INSIDE its receive section (merge done, snapshot write parked on
+    /// the persist gate). The round-2 flaw this controls: caller A sweeps
+    /// and owns the retirement tokens, caller B takes the task handles
+    /// and blocks draining the parked section, then A resumes to an empty
+    /// task registry, skips its drain, and completes the tokens — the
+    /// path would return to `Idle` (re-openable) while the old writer is
+    /// still being drained. The whole-call serialization makes that split
+    /// unreachable, so the controls here prove the externally visible
+    /// invariant rather than the interleaving: while the admitted section
+    /// is parked, the retirement cannot complete (a successor open stays
+    /// parked on the fence's claim), and once the gate opens, the section
+    /// finishes its write, BOTH callers return, and the successor
+    /// re-opens with the admitted delta durably present.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_shutdowns_complete_retirement_only_after_admitted_receive_drains() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let build_agent = || async {
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("agent")
+        };
+
+        let agent = std::sync::Arc::new(build_agent().await);
+        // Pre-built so the parked phase below stays well inside the
+        // shutdown drain's grace budget.
+        let successor = build_agent().await;
+        let topic = "765-two-caller-drain";
+        let store = agent
+            .create_kv_store_persistent("log", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect("persistent store");
+        store
+            .put(
+                "local".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("local append");
+
+        // The loops this open spawned (fresh empty store → listener,
+        // responder, bootstrap requester): two of them exiting is the
+        // deterministic observation that the sweep's `cancel_sync` ran.
+        let loops = store.sync.loop_exit_tracker();
+
+        // The remote delta the listener will admit (distinct OR-set tag;
+        // tags are per-key, so it cannot collide with the local append).
+        let mut delta = kv::KvStoreDelta::new(1);
+        delta.added.insert(
+            "remote".to_string(),
+            (
+                kv::KvEntry::new(
+                    "remote".to_string(),
+                    b"r1".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (store.peer_id(), 7),
+            ),
+        );
+
+        let mut caller_a = None;
+        let mut caller_b = Box::pin(agent.shutdown());
+        store
+            .with_persist_gate_held_for_test(async {
+                // Admit the remote merge and park its section between the
+                // merge and the snapshot write (the gate this helper holds
+                // is the one `persist_snapshot` takes first).
+                store.publish_delta_for_test(delta).await;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    store.wait_receive_merged_for_test(),
+                )
+                .await
+                .expect("remote delta admitted before its persist");
+                assert!(
+                    store.receive_section_active_for_test(),
+                    "the parked receive section holds the lifecycle fence"
+                );
+
+                // Two concurrent callers of the REAL shutdown, on separate
+                // tasks. Neither can return while the parked section
+                // holds the tracked-task drain.
+                caller_a = Some(tokio::spawn({
+                    let agent = std::sync::Arc::clone(&agent);
+                    async move {
+                        agent.shutdown().await;
+                    }
+                }));
+                // Deterministic anchor that the sweep already ran: its
+                // cancel ends the two sibling loops (the listener cannot
+                // exit — it is parked inside its section), so at this
+                // point the path is `Retiring` and stays so until the
+                // drain completes.
+                tokio::time::timeout(std::time::Duration::from_secs(10), loops.wait_for(2))
+                    .await
+                    .expect("the shutdown sweep cancelled the sibling loops");
+
+                // Poll the actual second shutdown future once while A is
+                // held in-body. With serialization it must return Pending
+                // on the whole-call lock before constructing its body
+                // guard. Removing the lock lets this same poll construct
+                // the guard before reaching any later await, driving the
+                // high-water to 2 before this task can inspect it.
+                assert!(
+                    futures::poll!(&mut caller_b).is_pending(),
+                    "the second shutdown caller must wait while A is in-body"
+                );
+                assert_eq!(
+                    agent
+                        .shutdown_test
+                        .entered
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "the actual second shutdown future was polled"
+                );
+                assert_eq!(
+                    agent
+                        .shutdown_test
+                        .max_in_body
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "concurrent shutdown callers must never overlap inside the body"
+                );
+
+                // No premature reopen: a successor open parks inside the
+                // fence's claim while the drain is outstanding. It cannot
+                // complete while the gate is held — the retirement token
+                // cannot be completed before the drain, and the drain
+                // cannot finish while the section is parked — which is
+                // what makes this bounded observation deterministic
+                // rather than a timing hope.
+                let mut reopen = Box::pin(successor.create_kv_store_persistent(
+                    "log",
+                    topic,
+                    kv::AccessPolicy::Signed,
+                    &state_dir,
+                ));
+                let premature =
+                    tokio::time::timeout(std::time::Duration::from_millis(250), &mut reopen).await;
+                assert!(
+                    premature.is_err(),
+                    "the snapshot path must stay un-openable until the drain completes"
+                );
+
+                // End of the held gate releases the barrier: the parked
+                // section finishes its snapshot write and exits; the
+                // drain then completes and the retirement with it.
+            })
+            .await;
+
+        // Both callers return only after the drain — comfortably inside
+        // the grace budget, because the barrier was released above.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            caller_a.expect("spawned"),
+        )
+        .await
+        .expect("first shutdown caller completes after the barrier opens")
+        .expect("first shutdown caller task finished cleanly");
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut caller_b)
+            .await
+            .expect("second shutdown caller completes after the barrier opens");
+
+        // The successor re-opens from `Idle` and the ADMITTED delta is
+        // durable: the drained section's write landed inside the fence.
+        let reopened = successor
+            .create_kv_store_persistent("log", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect("reopen after the retirement completed");
+        {
+            let s = reopened.sync.read().await;
+            assert!(s.get("local").is_some(), "local entry survives");
+            assert!(
+                s.get("remote").is_some(),
+                "the admitted remote merge finished its snapshot write before \
+                 the retirement completed"
+            );
+        }
+        drop(reopened);
+        successor.shutdown().await;
+    }
+
+    /// #765 round-4 review control (cancelled shutdown leader): the
+    /// retirement tokens and the exact taken drain handles must survive
+    /// cancellation of the shutdown future that swept them. The r3 design
+    /// held both on the leader's stack: aborting it after the sweep
+    /// dropped the `RetirementToken`s uncompleted — wedging the retained
+    /// snapshot path in `Retiring` forever — and detached the taken
+    /// `JoinHandle`s, so a follower found empty registries, skipped the
+    /// drain entirely, and could return SUCCESS while the parked old
+    /// writer was still mid-section. The r4 custody moves tokens + handles
+    /// into a spawned task (synchronously, before the leader can suspend
+    /// past the sweep); this control aborts a REAL leader mid-drain, runs
+    /// a REAL follower until it is provably suspended on the SAME
+    /// outstanding custody, and re-opens only after the custody — not the
+    /// cancelled leader — finished the drain and completed the retirement.
+    /// Without the custody repair the follower completes under the held
+    /// gate (early-success assert fires) and the path stays `Retiring`
+    /// (reopen assert fires): both failure modes are caught.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_shutdown_leader_keeps_drain_custody_for_follower() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let build_agent = || async {
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("agent")
+        };
+
+        let agent = std::sync::Arc::new(build_agent().await);
+        // Pre-built so the parked phase below stays well inside the
+        // shutdown drain's grace budget.
+        let successor = build_agent().await;
+        let topic = "765-cancelled-leader";
+        let store = agent
+            .create_kv_store_persistent("log", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect("persistent store");
+        store
+            .put(
+                "local".to_string(),
+                b"v1".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("local append");
+
+        // The remote delta the listener will admit (distinct OR-set tag).
+        let mut delta = kv::KvStoreDelta::new(1);
+        delta.added.insert(
+            "remote".to_string(),
+            (
+                kv::KvEntry::new(
+                    "remote".to_string(),
+                    b"r1".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (store.peer_id(), 7),
+            ),
+        );
+
+        let mut follower = None;
+
+        store
+            .with_persist_gate_held_for_test(async {
+                // Admit the remote merge and park its section between the
+                // merge and the snapshot write, exactly as in the
+                // two-caller control.
+                store.publish_delta_for_test(delta).await;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    store.wait_receive_merged_for_test(),
+                )
+                .await
+                .expect("remote delta admitted before its persist");
+                assert!(
+                    store.receive_section_active_for_test(),
+                    "the parked receive section holds the lifecycle fence"
+                );
+
+                // The leader: a REAL shutdown task.
+                let leader = tokio::spawn({
+                    let agent = std::sync::Arc::clone(&agent);
+                    async move {
+                        agent.shutdown().await;
+                    }
+                });
+
+                // Anchor AFTER the sweep AND the handle take: the leader's
+                // drain-observer count reaching 1 proves its synchronous
+                // stretch (sweep → take → custody spawn → observation)
+                // completed — the observation is the stretch's first
+                // await — so the custody signal exists in the shared cell
+                // and the drain is outstanding (it cannot finish while
+                // the gate is held).
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    agent.shutdown_test.wait_drain_observers(1),
+                )
+                .await
+                .expect("the leader parked on its outstanding custody drain");
+                let custody = agent
+                    .kv_shutdown_drain_for_test()
+                    .expect("the custody signal is parked in the shared cell");
+                assert!(
+                    !custody.is_cancelled(),
+                    "the drain is outstanding while the section is parked"
+                );
+
+                // Cancel the leader mid-drain — a genuine abort of a real
+                // shutdown task, the r4 review's exact scenario.
+                leader.abort();
+                let joined = leader
+                    .await
+                    .expect_err("the aborted leader must join as cancelled");
+                assert!(joined.is_cancelled(), "the leader was cancelled mid-drain");
+
+                // The custody survived the cancellation: the same signal,
+                // still outstanding. (r3 behaviour: the tokens died with
+                // the leader here and the path wedged in `Retiring`.)
+                assert!(
+                    !custody.is_cancelled(),
+                    "the custody drain outlives the cancelled leader"
+                );
+
+                // Spawn the real follower and wait on the instrument's
+                // notification instead of repeatedly polling it with a
+                // noop waker. Observer 2 proves it reached the same shared
+                // custody, and the task must still be incomplete while the
+                // receive section keeps that custody outstanding.
+                follower = Some(tokio::spawn({
+                    let agent = std::sync::Arc::clone(&agent);
+                    async move {
+                        agent.shutdown().await;
+                    }
+                }));
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    agent.shutdown_test.wait_drain_observers(2),
+                )
+                .await
+                .expect("the follower reached the outstanding custody drain");
+                assert!(
+                    !follower.as_ref().expect("spawned follower").is_finished(),
+                    "the follower may not complete while the parked section holds the drain"
+                );
+                assert!(
+                    !custody.is_cancelled(),
+                    "the follower is parked on the same still-outstanding drain"
+                );
+
+                // No premature reopen: the successor's claim parks while
+                // the retirement is outstanding — bounded and determined
+                // by the fence, not by scheduling.
+                let mut reopen = Box::pin(successor.create_kv_store_persistent(
+                    "log",
+                    topic,
+                    kv::AccessPolicy::Signed,
+                    &state_dir,
+                ));
+                let premature =
+                    tokio::time::timeout(std::time::Duration::from_millis(250), &mut reopen).await;
+                assert!(
+                    premature.is_err(),
+                    "the snapshot path must stay un-openable until the custody \
+                     drain completes"
+                );
+
+                // End of the held gate: the parked section finishes its
+                // snapshot write, the custody drain joins it and completes
+                // the retirement, and only then does the follower resume.
+            })
+            .await;
+
+        // The follower finishes ONLY through the custody the cancelled
+        // leader left behind.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            follower.expect("spawned follower"),
+        )
+        .await
+        .expect("the follower completes once the custody drain completes")
+        .expect("follower shutdown task finished cleanly");
+
+        // The successor re-opens from `Idle` and the ADMITTED delta is
+        // durable — the custody, not any single caller, owns that proof.
+        let reopened = successor
+            .create_kv_store_persistent("log", topic, kv::AccessPolicy::Signed, &state_dir)
+            .await
+            .expect("reopen after the custody-completed retirement");
+        {
+            let s = reopened.sync.read().await;
+            assert!(s.get("local").is_some(), "local entry survives");
+            assert!(
+                s.get("remote").is_some(),
+                "the admitted remote merge finished its snapshot write before \
+                 the retirement completed"
+            );
+        }
+        drop(reopened);
+        successor.shutdown().await;
+    }
+
+    /// #765 round-3 review control (last-handle drop / reopen): dropping
+    /// the last handle must release the snapshot path again — the registry
+    /// tracks the open through a weak sync reference and the committed
+    /// lease is owned by the sync, so the pre-registry drop semantics
+    /// survive. The proof is deliberately TWO-STAGE because the teardown
+    /// is: (1) the strong-reference stage is synchronous — the last handle
+    /// drop drops the last strong `KvStoreSync`, releasing its lease and
+    /// requesting loop cancellation, which is asserted directly through a
+    /// weak reference that must now fail to upgrade (exactly the
+    /// discriminator for round-1's strong-registry leak); (2) the
+    /// fence-pruning stage is asynchronous — the cancelled loop futures
+    /// hold their captured `Arc<PersistCtx>` (and with it the fence's
+    /// `PersistOwner`) until the executor polls them to termination, so
+    /// the test awaits THIS sync's exact loop-exit count before
+    /// re-opening instead of racing the executor. Since r4 that count is
+    /// recorded only after each WHOLE loop future is destroyed
+    /// (`TrackedLoopFuture`), so the await is a genuine terminal-release
+    /// barrier — the same-agent reopen below cannot race a persist
+    /// context that is still alive inside a dropped-but-not-destroyed
+    /// loop future. While any strong reference is still alive (a cloned
+    /// handle), the fence must keep refusing the re-open — the pin is the
+    /// sync's lifetime, not agent shutdown or a leaked registry entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn last_handle_drop_releases_snapshot_path_for_same_agent_reopen() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state_dir = dir.path().join("kv-stores");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        let topic = "765-last-handle-drop";
+        let open = || async {
+            agent
+                .create_kv_store_persistent("log", topic, kv::AccessPolicy::Signed, &state_dir)
+                .await
+        };
+
+        let store = open().await.expect("persistent store");
+        store
+            .put("k".to_string(), b"v1".to_vec(), "text/plain".to_string())
+            .await
+            .expect("append");
+
+        // The exact loops this open spawned (fresh empty store → listener,
+        // responder, bootstrap requester) and the leak discriminator,
+        // captured while the handle is alive.
+        let loops = store.sync.loop_exit_tracker();
+        let weak = std::sync::Arc::downgrade(&store.sync);
+
+        // Control: while the handle is alive, a same-path re-open on this
+        // agent stays refused (the #760 trample window is unchanged).
+        let err = open().await.expect_err("a live handle pins the path");
+        assert!(
+            format!("{err}").contains("snapshot superseded"),
+            "live-handle re-open must fail with the typed fence error, got: {err}"
+        );
+
+        // A retained clone keeps the sync (and with it the lease it owns)
+        // alive across the original handle's drop: the re-open must STILL
+        // be refused — the fence tracks the sync's lifetime, nothing
+        // weaker.
+        let retained = store.clone();
+        drop(store);
+        let err = open()
+            .await
+            .expect_err("a retained handle clone still pins the path");
+        assert!(
+            format!("{err}").contains("snapshot superseded"),
+            "retained-clone re-open must fail with the typed fence error, got: {err}"
+        );
+
+        // Stage 1 (synchronous): the last handle drop released every
+        // strong `KvStoreSync` reference — the registry's weak entry is
+        // the only remnant, which is precisely what round-1's
+        // strong-tracking leak broke. The sync's `Drop` has already
+        // cancelled the loops; their futures have not necessarily
+        // terminated yet.
+        drop(retained);
+        assert!(
+            weak.upgrade().is_none(),
+            "no strong KvStoreSync reference may outlive the handles"
+        );
+
+        // Stage 2 (awaited deterministically): the three cancelled loop
+        // futures drop their captured `PersistCtx` — the last
+        // `PathFence` references — as they terminate; only then is the
+        // fence entry prunable and the path claimable from `Idle`.
+        tokio::time::timeout(std::time::Duration::from_secs(10), loops.wait_for(3))
+            .await
+            .expect("the cancelled loops terminate after the last handle drop");
+
+        let reopened = open().await.expect("last handle drop releases the path");
+        assert!(
+            reopened.sync.read().await.get("k").is_some(),
+            "persisted entry survives the drop/reopen cycle"
+        );
+        agent.shutdown().await;
     }
 
     /// SelfKeyed directories end-to-end at the handle layer (issue #340):

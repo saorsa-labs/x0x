@@ -2920,3 +2920,798 @@ async fn adr0066_mandate_carrying_member_added_declines_a_no_anchor_marker() -> 
     drop(dir);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #759 behavioural oracles — a real durable clear must reach a real live
+// group-scoped task list through the production notification wiring.
+//
+// The staging below builds a `TaskListSync` over a loopback-only pub/sub
+// (bind 127.0.0.1:0, no seeds, discovery/port-mapping off — the same shape
+// as the `crdt::sync` fixtures) and registers it in the test state's
+// task-list registry with the PRODUCTION binding (`group_task_list_binding`
+// installs the real `TaskQuarantineIngestGate` and captures the CURRENT
+// roster). No listener is ever started: with the buffer empty the drain poll
+// never arms, and with no loop running the ONLY thing that can drain or
+// refresh the list is `resume_group_task_ingest` — which is exactly what
+// these fixtures assert the notification triggers.
+// ---------------------------------------------------------------------------
+
+/// Loopback-only network config for the task-list fixtures (mirrors
+/// `crdt::sync` tests' `test_network_config`).
+fn task_fixture_network_config() -> crate::network::NetworkConfig {
+    crate::network::NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        mdns_enabled: false,
+        port_mapping_enabled: false,
+        ..crate::network::NetworkConfig::default()
+    }
+}
+
+/// Register a LIVE group-scoped task list for `group_spelling`, bound and
+/// gated exactly as the daemon would (`group_task_list_binding`), with
+/// persistence armed under `root`. Returns the sync (for direct assertions
+/// and buffering), the registered handle, and the snapshot file path.
+/// `id_seed` keeps list ids unique across the sibling fixtures.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stage_live_group_task_list(
+    state: &Arc<AppState>,
+    group_spelling: &str,
+    list_suffix: &str,
+    id_seed: u8,
+    root: &std::path::Path,
+) -> (
+    Arc<x0x::crdt::TaskListSync>,
+    x0x::TaskListHandle,
+    std::path::PathBuf,
+) {
+    use crate::crdt::persistence::TaskListStorage;
+
+    let node = std::sync::Arc::new(
+        crate::network::NetworkNode::new(task_fixture_network_config(), None, None)
+            .await
+            .expect("loopback node"),
+    );
+    let pubsub =
+        std::sync::Arc::new(crate::gossip::PubSubManager::new(node, None).expect("pubsub"));
+    let list_id_str = format!("x0x.group.{group_spelling}.symphony.{list_suffix}");
+    let tid = x0x::crdt::TaskListId::new([id_seed; 32]);
+    let list = x0x::crdt::TaskList::new(
+        tid,
+        "759 fixture".to_string(),
+        saorsa_gossip_types::PeerId::new([9; 32]),
+    );
+    let sync = std::sync::Arc::new(
+        x0x::crdt::TaskListSync::new(
+            list,
+            pubsub,
+            list_id_str.clone(),
+            saorsa_gossip_types::PeerId::new([9; 32]),
+        )
+        .expect("task list sync"),
+    );
+    let snapshot_dir = root.join(format!("tasklist-{list_suffix}"));
+    sync.set_persistence(TaskListStorage::new(snapshot_dir.clone()), tid);
+    let snapshot = snapshot_dir.join(format!("{tid}.bin"));
+
+    // The production binding: real gate + the CURRENT roster (the contested
+    // one while the marker is live — stale by construction, which is the
+    // thing the notification must refresh).
+    let binding = crate::server::routes::group_task_list_binding(state, &list_id_str).await;
+    let signing = std::sync::Arc::new(crate::gossip::SigningContext::from_keypair(
+        state.agent.identity().agent_keypair(),
+    ));
+    let handle = x0x::TaskListHandle::task_list_handle_for_testing(
+        std::sync::Arc::clone(&sync),
+        state.agent.agent_id(),
+        saorsa_gossip_types::PeerId::new([9; 32]),
+        signing,
+    );
+    assert!(
+        binding.ingest_gate.is_some(),
+        "a resolvable group-scoped id must get the production ingest gate"
+    );
+    assert!(
+        handle.install_ingest_gate(binding.ingest_gate.expect("gate")),
+        "set-once gate slot is empty on a fresh sync"
+    );
+    if let Some(agents) = binding.authorized_agents {
+        handle.set_authorized_agents(agents).await;
+    }
+    state
+        .task_lists
+        .write()
+        .await
+        .insert(list_id_str, handle.clone());
+    (sync, handle, snapshot)
+}
+
+/// One admissible delta authored by `writer`, for the buffer fixtures.
+pub(super) fn one_task_delta(
+    id_seed: u8,
+    writer: &crate::identity::AgentId,
+    from: saorsa_gossip_types::PeerId,
+) -> (x0x::crdt::TaskId, x0x::crdt::TaskListDelta) {
+    let task_id = x0x::crdt::TaskId::from_bytes([id_seed; 32]);
+    let item = x0x::crdt::TaskItem::new(
+        task_id,
+        x0x::crdt::TaskMetadata::new(
+            "759 held task".to_string(),
+            "buffered under quarantine".to_string(),
+            128,
+            *writer,
+            1_000,
+        ),
+        from,
+    );
+    let mut delta = x0x::crdt::TaskListDelta::new(1);
+    delta.added_tasks.insert(task_id, (item, (from, 1)));
+    (task_id, delta)
+}
+
+/// Pre-seat the fork marker below the terminal revision, with stored
+/// evidence — the staging `owner_anchored_apply_path_clears_quarantine`
+/// uses, factored out so the #759 fixtures can reuse it verbatim.
+async fn stage_marker_below_terminal(
+    state: &Arc<AppState>,
+    group_id: &str,
+    terminal: &x0x::groups::state_commit::GroupStateCommit,
+    committed_by: &str,
+) {
+    let mut groups = state.named_groups.write().await;
+    let live = groups.get_mut(group_id).expect("receiver group");
+    let terminal_header = live.terminal_commit_header();
+    live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+        revision: terminal.revision.saturating_sub(1),
+        state_hash: "evidenced-conflict-hash".to_string(),
+        committed_by: committed_by.to_string(),
+        observed_at_ms: now_millis_u64(),
+        snapshot: x0x::groups::ForkSnapshot {
+            terminal_commit: terminal_header.clone(),
+            conflicting_commit: terminal_header,
+            classification: None,
+        },
+        no_anchor: false,
+    });
+    if let Some(lineage) = live.invite_lineage.as_mut() {
+        lineage.fork_evidence = Some(x0x::groups::ForkEvidence {
+            revision: terminal.revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: committed_by.to_string(),
+            observed_at_ms: now_millis_u64(),
+        });
+    }
+}
+
+/// #759 P2 regression 1 — EMPTY buffer, live apply: a mandate-bearing
+/// `MemberAdded` that durably clears the marker must refresh the handle's
+/// captured authorized roster IMMEDIATELY (the drain's empty-buffer arm),
+/// even though no poll is armed and no delta ever arrived. With an empty
+/// buffer nothing else can refresh the set — without the notification the
+/// stale roster would persist until rehydrate, which is the defect #759
+/// item 1 closes.
+///
+/// Mutation control (remove the wrapper's `resume_task_ingest_after_durable_clear`
+/// call in `apply_named_group_metadata_event_inner`): the post-apply
+/// `is_authorized_content_writer` assertion below must FAIL — no listener
+/// exists, the poll never armed, so the refresh has no other trigger.
+#[tokio::test]
+async fn durable_live_apply_refreshes_a_stale_empty_buffer_roster_759() -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "759-empty",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    stage_marker_below_terminal(&state, &group_id, &terminal, &actor_hex).await;
+
+    let (sync, _handle, _snapshot) =
+        stage_live_group_task_list(&state, &group_id, "empty", 0x51, dir.path()).await;
+    let joiner = parse_agent_id_hex(&joiner_hex).expect("joiner agent id");
+    assert!(
+        !sync.read().await.is_authorized_content_writer(&joiner),
+        "pre-apply: the captured roster predates the clearing seat — stale by construction"
+    );
+
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    let result = apply_event(&state, event).await;
+    assert!(result.accepted, "the anchored MemberAdded applies");
+
+    // The refresh: the clearing commit's roster is now the writer set. This
+    // is the whole oracle — nothing but the notification can have run.
+    assert!(
+        sync.read().await.is_authorized_content_writer(&joiner),
+        "the durable clear refreshed the captured roster through the resume's \
+         empty-buffer arm — with no listener and an empty buffer there is no \
+         other trigger"
+    );
+    assert_eq!(sync.quarantined_buffer_len(), 0);
+    Ok(())
+}
+
+/// #759 P2 regression 2 — NON-EMPTY buffer, ALIAS spelling: the list id
+/// carries an alias map key, the clearing apply is keyed by the canonical
+/// spelling, and exactly the one held delta is merged and persisted once.
+/// Covers the `BTreeSet` propagation AND `group_task_resume_spellings`
+/// together, end to end.
+///
+/// Mutation controls: (a) remove the wrapper's notification consumption —
+/// the delta stays buffered forever (no listener); (b) revert
+/// `resume_group_task_ingest` to exact-string matching — the alias-spelled
+/// list id no longer matches and the delta stays buffered.
+#[tokio::test]
+async fn durable_apply_drains_an_alias_scoped_buffered_delta_once_759() -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let actor = state.agent.agent_id();
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "759-alias",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    stage_marker_below_terminal(&state, &group_id, &terminal, &actor_hex).await;
+
+    // The alias sibling: a SECOND map key holding the same record (same
+    // stable id), so the task-list id can carry a spelling the clearing
+    // apply never names. `enforce_containment_invariant`-style aliasing,
+    // staged by hand for the fixture.
+    let alias_key = "5a".repeat(32);
+    {
+        let groups = state.named_groups.read().await;
+        let record = groups.get(&group_id).expect("canonical record").clone();
+        drop(groups);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(alias_key.clone(), record);
+    }
+
+    let (sync, _handle, snapshot) =
+        stage_live_group_task_list(&state, &alias_key, "aliased", 0x52, dir.path()).await;
+    let from = saorsa_gossip_types::PeerId::new([7; 32]);
+    let (task_id, delta) = one_task_delta(0x5A, &actor, from);
+    assert!(
+        sync.admit_delta_for_testing(from, delta, Some(&actor), 128)
+            .await,
+        "the live marker holds the delta (arrival order, buffer non-empty)"
+    );
+    assert_eq!(sync.quarantined_buffer_len(), 1);
+
+    // The clear is keyed by the CANONICAL spelling — the event's group id,
+    // the resolved map key, everything but the alias the list id carries.
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    let result = apply_event(&state, event).await;
+    assert!(result.accepted, "the anchored MemberAdded applies");
+
+    assert_eq!(
+        sync.quarantined_buffer_len(),
+        0,
+        "the notification reached the alias-spelled list"
+    );
+    assert!(
+        sync.read().await.get_task(&task_id).is_some(),
+        "the held delta merged once the marker cleared"
+    );
+    let list_id = *sync.read().await.id();
+    let persisted = crate::crdt::persistence::TaskListStorage::new(
+        snapshot
+            .parent()
+            .expect("task-list snapshot directory")
+            .to_path_buf(),
+    )
+    .load_task_list(&list_id)
+    .await
+    .expect("reload durable task-list snapshot");
+    assert!(
+        persisted.get_task(&task_id).is_some(),
+        "the drained delta was committed to the durable task-list snapshot"
+    );
+    // Diagnostics intentionally coalesce every alias spelling onto the
+    // record's stable id. The resume gate records under the list's alias,
+    // but the public snapshot exposes the resulting counter on this row.
+    let row = diag_row(state.as_ref(), &group_id).await;
+    assert_eq!(
+        row.counters.task_deltas_quarantine_applied, 1,
+        "exactly one apply — the resume ran once, not once per spelling (the \
+         gate records under the spelling the LIST carries)"
+    );
+    Ok(())
+}
+
+/// #759 P2 regression 3a — QUEUED replay clear: a mandate-bearing
+/// `MemberAdded` retained in the TreeKEM pending-events queue clears the
+/// marker through the REAL replay entry
+/// (`replay_pending_treekem_events` → `apply_named_group_metadata_event_inner`
+/// → wrapper notification), and the live handle drains.
+///
+/// (The ADR-0028 causal-approval queue only ever holds
+/// `JoinRequestApproved`, whose apply arm never clears a marker — its
+/// notification plumbing is therefore future-proofing and stays covered by
+/// the structural guard; this replay is the queued path that CAN clear
+/// today.)
+///
+/// Mutation control: remove the wrapper's notification consumption — the
+/// delta stays buffered (no listener exists).
+#[tokio::test]
+async fn queued_treekem_replay_clear_notifies_the_live_handle_759() -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let actor = state.agent.agent_id();
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "759-replay",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    stage_marker_below_terminal(&state, &group_id, &terminal, &actor_hex).await;
+
+    let (sync, _handle, _snapshot) =
+        stage_live_group_task_list(&state, &group_id, "replayed", 0x53, dir.path()).await;
+    let from = saorsa_gossip_types::PeerId::new([7; 32]);
+    let (task_id, delta) = one_task_delta(0x5B, &actor, from);
+    assert!(
+        sync.admit_delta_for_testing(from, delta, Some(&actor), 128)
+            .await
+    );
+    assert_eq!(sync.quarantined_buffer_len(), 1);
+
+    // The queued event, staged exactly as the catch-up gap path stores it.
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    state
+        .treekem_pending_events
+        .write()
+        .await
+        .entry(group_id.clone())
+        .or_default()
+        .push_back(PendingTreeKemMetadataEvent {
+            event,
+            sender: actor,
+            queued_at: std::time::Instant::now(),
+        });
+
+    replay_pending_treekem_events(&state, &group_id).await;
+
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the replayed anchored MemberAdded cleared the marker"
+    );
+    assert_eq!(sync.quarantined_buffer_len(), 0, "the notification drained");
+    assert!(sync.read().await.get_task(&task_id).is_some());
+    Ok(())
+}
+
+/// #759 P2 regression 3c — NON-DURABLE queued replay control: the same
+/// retained `MemberAdded` replayed with the roster save injected
+/// `NotReplaced` does not clear durably, does not notify, and the held
+/// delta stays buffered. The replay's notification is promoted only after
+/// its own checked persist comes back Durable.
+///
+/// Mutation control (promote `iteration_cleared` ahead of the
+/// `group_persisted` gate in `replay_pending_causal_approvals`'s TreeKEM
+/// sibling — i.e. drop the durability gate): the drain assertions here
+/// pass and the test fails.
+#[tokio::test]
+async fn non_durable_queued_replay_does_not_notify_759() -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let actor = state.agent.agent_id();
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "759-replay-nd",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    stage_marker_below_terminal(&state, &group_id, &terminal, &actor_hex).await;
+
+    let (sync, _handle, _snapshot) =
+        stage_live_group_task_list(&state, &group_id, "replay-nd", 0x55, dir.path()).await;
+    let from = saorsa_gossip_types::PeerId::new([7; 32]);
+    let (task_id, delta) = one_task_delta(0x5D, &actor, from);
+    assert!(
+        sync.admit_delta_for_testing(from, delta, Some(&actor), 128)
+            .await
+    );
+
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    state
+        .treekem_pending_events
+        .write()
+        .await
+        .entry(group_id.clone())
+        .or_default()
+        .push_back(PendingTreeKemMetadataEvent {
+            event,
+            sender: actor,
+            queued_at: std::time::Instant::now(),
+        });
+
+    let _fault = set_save_fault(&state, SaveFault::NotReplaced);
+    replay_pending_treekem_events(&state, &group_id).await;
+    drop(_fault);
+
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the non-durable replay did not clear (rollback restored the marker)"
+    );
+    assert_eq!(
+        sync.quarantined_buffer_len(),
+        1,
+        "no notification: the delta stays buffered"
+    );
+    assert!(sync.read().await.get_task(&task_id).is_none());
+    Ok(())
+}
+
+/// #759 P2 regression 3b — NON-DURABLE control: the same anchored apply
+/// with the roster save injected `NotReplaced` (nothing reached disk, the
+/// map rolls back) must NOT notify — no refresh, no drain. The notification
+/// is durability-gated, not merely apply-gated.
+///
+/// Mutation control: move the wrapper's notification ahead of the arm's
+/// `Durable` gate (or drop the gate) — the buffered delta merges here and
+/// the assertions fail.
+#[tokio::test]
+async fn non_durable_apply_does_not_notify_the_live_handle_759() -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let actor = state.agent.agent_id();
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "759-nondurable",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    stage_marker_below_terminal(&state, &group_id, &terminal, &actor_hex).await;
+
+    let (sync, _handle, snapshot) =
+        stage_live_group_task_list(&state, &group_id, "nondurable", 0x54, dir.path()).await;
+    let joiner = parse_agent_id_hex(&joiner_hex).expect("joiner agent id");
+    let from = saorsa_gossip_types::PeerId::new([7; 32]);
+    let (task_id, delta) = one_task_delta(0x5C, &actor, from);
+    assert!(
+        sync.admit_delta_for_testing(from, delta, Some(&actor), 128)
+            .await
+    );
+    assert_eq!(sync.quarantined_buffer_len(), 1);
+    let snapshot_before = tokio::fs::read(&snapshot)
+        .await
+        .expect("fixture setup persists the initial task-list snapshot");
+
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    let _fault = set_save_fault(&state, SaveFault::NotReplaced);
+    let result = apply_event(&state, event).await;
+    drop(_fault);
+    assert!(
+        !result.accepted,
+        "the non-durable apply is refused (nothing reached disk)"
+    );
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the rollback restored the marker"
+    );
+    assert_eq!(
+        sync.quarantined_buffer_len(),
+        1,
+        "no notification: the delta stays buffered"
+    );
+    assert!(sync.read().await.get_task(&task_id).is_none());
+    assert_eq!(
+        tokio::fs::read(&snapshot)
+            .await
+            .expect("initial task-list snapshot remains readable"),
+        snapshot_before,
+        "the refused apply neither drains nor changes the durable task-list snapshot"
+    );
+    assert!(
+        !sync.read().await.is_authorized_content_writer(&joiner),
+        "no refresh: the captured roster is still the pre-clear one"
+    );
+    let row = diag_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
+    Ok(())
+}
+
+/// #759 P2 r2 — VISIBLE-BUT-NOT-DURABLE apply control, distinct from the
+/// `NotReplaced` rollback above: `ReplacedNotDurableAfterWriteThenError`
+/// lets the roster write HAPPEN (the candidate — cleared marker, seated
+/// joiner — stays visible in memory and on disk) and then reports the
+/// parent-dir fsync failed, degrading the fault cell so no corrective
+/// re-save can become Durable. The Watson ruling keeps the visible
+/// candidate but withholds every post-persist effect, the durable-clear
+/// notification included: no refresh, no drain, no counter — even though
+/// the live marker is ABSENT and a replacement is VISIBLE.
+///
+/// This is the discriminating half of the durability contract:
+/// - a notification keyed off the LIVE MARKER BEING ABSENT would fire here
+///   (the visible candidate carries no marker) and every withheld-effect
+///   assertion below would fail;
+/// - a notification keyed off A VISIBLE REPLACEMENT ALONE would fire here
+///   (the replacement is on disk) and fail the same assertions.
+/// Only the arm's `AtomicWriteOutcome::Durable` gate draws the line both
+/// this test and its `NotReplaced` sibling hold.
+#[tokio::test]
+async fn replaced_not_durable_apply_keeps_the_visible_candidate_but_does_not_notify_759(
+) -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let actor = state.agent.agent_id();
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "759-rnd-apply",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    stage_marker_below_terminal(&state, &group_id, &terminal, &actor_hex).await;
+
+    let (sync, _handle, snapshot) =
+        stage_live_group_task_list(&state, &group_id, "rnd-apply", 0x56, dir.path()).await;
+    let joiner = parse_agent_id_hex(&joiner_hex).expect("joiner agent id");
+    let from = saorsa_gossip_types::PeerId::new([7; 32]);
+    let (task_id, delta) = one_task_delta(0x5E, &actor, from);
+    assert!(
+        sync.admit_delta_for_testing(from, delta, Some(&actor), 128)
+            .await
+    );
+    assert_eq!(sync.quarantined_buffer_len(), 1);
+    let snapshot_before = tokio::fs::read(&snapshot)
+        .await
+        .expect("fixture setup persists the initial task-list snapshot");
+
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurableAfterWriteThenError);
+    let result = apply_event(&state, event).await;
+    drop(_fault);
+    assert!(
+        !result.accepted,
+        "the visible-but-not-durable apply is refused (no Durable outcome)"
+    );
+
+    // The VISIBLE CANDIDATE — the state contract that distinguishes this
+    // control from the NotReplaced rollback above (which restores the
+    // marker and unseats the joiner).
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert!(
+            live.has_active_member(&joiner_hex),
+            "the Watson ruling keeps the visible replacement: the seat is \
+             there in memory and on disk"
+        );
+        assert!(
+            !live.is_fork_quarantined(),
+            "the visible candidate carries the CLEAR — marker absent"
+        );
+    }
+    assert!(
+        state
+            .named_groups_requires_durability_confirmation
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the durability-confirmation flag is raised: the next roster write \
+         must re-confirm before it proceeds"
+    );
+
+    // Withheld effects — despite the absent marker and visible replacement.
+    assert!(
+        !sync.read().await.is_authorized_content_writer(&joiner),
+        "no refresh: keying the notification off the absent live marker \
+         would have refreshed the roster here"
+    );
+    assert_eq!(
+        sync.quarantined_buffer_len(),
+        1,
+        "no drain: keying the notification off the visible replacement alone \
+         would have applied the held delta here"
+    );
+    assert!(sync.read().await.get_task(&task_id).is_none());
+    assert_eq!(
+        tokio::fs::read(&snapshot)
+            .await
+            .expect("initial task-list snapshot remains readable"),
+        snapshot_before,
+        "the visible roster candidate does not change the durable task-list snapshot"
+    );
+    let row = diag_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
+    Ok(())
+}
+
+/// #759 P2 r2 — VISIBLE-BUT-NOT-DURABLE queued-replay control: the same
+/// `ReplacedNotDurableAfterWriteThenError` shape driven through the REAL
+/// TreeKEM pending-events replay. The replayed candidate stays visible
+/// (marker absent, joiner seated), the durability-confirmation flag is
+/// raised, and the replay's notification is still withheld — the
+/// per-iteration clear set is promoted only on the loop's own Durable
+/// save, which never comes.
+///
+/// Discriminating mutation controls: promote the replay's clear set off
+/// the live marker's absence, or off `applied.accepted` alone (the inner
+/// apply is refused here, but its candidate is visible), or ahead of the
+/// `group_persisted` gate — each would drain the held delta and fail the
+/// withheld-effect assertions below.
+#[tokio::test]
+async fn replaced_not_durable_queued_replay_withholds_the_notification_759() -> Result<()> {
+    let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let actor = state.agent.agent_id();
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "759-rnd-replay",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    stage_marker_below_terminal(&state, &group_id, &terminal, &actor_hex).await;
+
+    let (sync, _handle, _snapshot) =
+        stage_live_group_task_list(&state, &group_id, "rnd-replay", 0x57, dir.path()).await;
+    let from = saorsa_gossip_types::PeerId::new([7; 32]);
+    let (task_id, delta) = one_task_delta(0x5F, &actor, from);
+    assert!(
+        sync.admit_delta_for_testing(from, delta, Some(&actor), 128)
+            .await
+    );
+
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    state
+        .treekem_pending_events
+        .write()
+        .await
+        .entry(group_id.clone())
+        .or_default()
+        .push_back(PendingTreeKemMetadataEvent {
+            event,
+            sender: actor,
+            queued_at: std::time::Instant::now(),
+        });
+
+    let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurableAfterWriteThenError);
+    replay_pending_treekem_events(&state, &group_id).await;
+    drop(_fault);
+
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert!(
+            live.has_active_member(&joiner_hex),
+            "the visible replacement from the replayed apply is kept"
+        );
+        assert!(
+            !live.is_fork_quarantined(),
+            "the visible candidate carries the clear — marker absent"
+        );
+    }
+    assert!(
+        state
+            .named_groups_requires_durability_confirmation
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the durability-confirmation flag is raised"
+    );
+    assert_eq!(
+        sync.quarantined_buffer_len(),
+        1,
+        "no notification: the delta stays buffered despite the absent marker"
+    );
+    assert!(sync.read().await.get_task(&task_id).is_none());
+    let row = diag_row(state.as_ref(), &group_id).await;
+    assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
+    Ok(())
+}

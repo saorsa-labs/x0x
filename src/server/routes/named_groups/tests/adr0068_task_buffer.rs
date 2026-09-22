@@ -1211,6 +1211,82 @@ fn adr0068_f3_structural_guard_handle_producing_call_sites_bind_before_they_star
     }
 }
 
+/// #759 item 1 — STRUCTURAL GUARD, same class as
+/// [`adr0068_f3_structural_guard_handle_producing_call_sites_bind_before_they_start`]:
+/// the durable-clear notification must be produced only after the clearing
+/// path's own `Durable` gate and consumed only at guard-free points (the two
+/// apply wrappers AFTER their causal-replay call, the seal route AFTER the
+/// helper that owns the membership guard, the two extra replay callers in
+/// `server/mod.rs`). A behavioural version needs a live handle under a real
+/// gossip runtime, which this loopback-only family deliberately does without
+/// — the drain's own behaviour (fence, marker re-check, empty-buffer refresh)
+/// is asserted for real in `crdt::sync::tests::*_759` and in the
+/// `resume_group_task_ingest` spellings unit tests in `tasks.rs`. What this
+/// adds is the wiring: revert any notification call site to the pre-#759
+/// shape and this fails.
+#[test]
+fn adr0068_d2_structural_guard_durable_clear_notification_wiring() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let named = std::fs::read_to_string(root.join("src/server/routes/named_groups.rs"))
+        .expect("the named-group routes must exist");
+    let server = std::fs::read_to_string(root.join("src/server/mod.rs"))
+        .expect("the server module must exist");
+    let tasks = std::fs::read_to_string(root.join("src/server/routes/tasks.rs"))
+        .expect("the task routes must exist");
+    let sync = std::fs::read_to_string(root.join("src/crdt/sync.rs"))
+        .expect("the task-list sync must exist");
+
+    // The apply machinery records a clear only on the durable path...
+    assert!(
+        named.contains("current.fork_quarantine.is_some() && next.fork_quarantine.is_none()"),
+        "the MemberAdded arm's notification must be the Some→None durable-clear \
+         predicate, so a rolled-back candidate never notifies"
+    );
+    // ...and both wrappers consume it AFTER the (guard-free) replay call,
+    // never inside `_inner_serialized`'s membership/roster guards.
+    let wrapper = named
+        .find("pub(in crate::server) async fn apply_named_group_metadata_event(")
+        .expect("the outer wrapper must exist");
+    let replay_at = named[wrapper..]
+        .find("replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine)")
+        .expect("the wrapper must drain causal approvals with the cleared set");
+    let resume_at = named[wrapper..]
+        .find("resume_task_ingest_after_durable_clear(state, &cleared_quarantine)")
+        .expect("the wrapper must consume the notification");
+    assert!(
+        replay_at < resume_at,
+        "the resume must run AFTER the replay call returns and its guards drop"
+    );
+    // The seal route owns its consumption outside the helper's guard.
+    assert!(
+        named.contains("if fork_marker_cleared {"),
+        "the seal route must gate its resume on the helper's durable-clear flag"
+    );
+    assert!(
+        named.contains("super::tasks::resume_group_task_ingest(&state, &id).await"),
+        "the seal route must call the resume after owner_certified_seal_with_eviction returns"
+    );
+    // The two extra replay callers (startup drain, relay listener) consume
+    // the notification too — with their guards already released.
+    assert_eq!(
+        server
+            .matches("routes::named_groups::resume_task_ingest_after_durable_clear")
+            .count(),
+        2,
+        "the startup queue drain and the relay listener must each consume the \
+         notification after their replay returns"
+    );
+    // The route-triggered drain is fenced like a receive section (#759).
+    assert!(
+        sync.contains("pub async fn cancel_sync_and_drain"),
+        "TaskListSync must expose the draining retire"
+    );
+    assert!(
+        tasks.contains("h.cancel_sync_and_drain().await"),
+        "the create-route rollback must use the draining retire"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #756 review r2 — the roster is PINNED across the whole re-authorize-then-merge
 // step, so a commit cannot land in the middle of it. (There is no "churn starves

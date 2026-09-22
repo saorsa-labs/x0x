@@ -277,7 +277,9 @@ async fn replay_persistence_excludes_cross_group_roster_transaction() {
     let replay_state = Arc::clone(&state);
     let replay_group = group_a.clone();
     let replay = tokio::spawn(async move {
-        replay_pending_causal_approvals(&replay_state, &replay_group).await;
+        let mut cleared_quarantine = std::collections::BTreeSet::new();
+        replay_pending_causal_approvals(&replay_state, &replay_group, &mut cleared_quarantine)
+            .await;
     });
     timeout(Duration::from_secs(5), snapshot_reached.notified())
         .await

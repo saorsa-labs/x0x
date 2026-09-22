@@ -226,6 +226,31 @@ pub struct TaskListSync {
     /// live responder until daemon shutdown).
     cancel: tokio_util::sync::CancellationToken,
 
+    /// Receive-path lifecycle fence (#759, mirroring #757's KvStoreSync
+    /// fence). The listener holds it across one whole
+    /// `[cancel check -> (drain) -> admit -> merge -> snapshot persist]`
+    /// section, and the route-triggered resume
+    /// ([`resume_quarantined_ingest`](Self::resume_quarantined_ingest))
+    /// across its drain.
+    /// [`cancel_sync_and_drain`](Self::cancel_sync_and_drain) takes it once
+    /// AFTER cancelling, so when that returns none of those sections is in
+    /// flight or can start — a retired listener has merged and persisted its
+    /// last in-flight delta and will never merge another.
+    ///
+    /// The cancel check sits UNDER the lock (not before it): a bare flag
+    /// check cannot fence a section that already pulled its message past
+    /// `recv` when the cancel lands — the pulled delta would still merge.
+    /// Once cancelled under the lock, no new section can start.
+    ///
+    /// Lock order — `lifecycle` is the OUTERMOST lock of a section:
+    /// `lifecycle` -> quarantine buffer `Mutex` (leaf) -> `TaskList` write
+    /// (admission/merge; the ingest gate takes `named_groups` read inside
+    /// it, synchronously) -> guard released -> persist gate `Mutex` ->
+    /// `TaskList` read -> file I/O. Nothing may await
+    /// [`cancel_sync_and_drain`](Self::cancel_sync_and_drain) while holding
+    /// a `TaskList` guard, the persist gate, or a `named_groups` guard.
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
+
     /// ADR-0068 D2: set-once inbound-delta admission gate, installed by the
     /// daemon for a task list bound to a named group. Shared with the listener
     /// loop, which is already running by the time the daemon installs it.
@@ -901,6 +926,16 @@ struct TaskPersistCtx {
     /// node controls); remote-delta merges continue (replication is not
     /// wedged).
     degraded: std::sync::atomic::AtomicBool,
+    /// #759 CI repair, test-only: publishes the list version of every
+    /// snapshot commit as `save_task_list` SUCCEEDS — strictly after the
+    /// durable write, never at merge time — so a test awaiting it observes
+    /// persistence COMPLETION, not in-memory merge visibility (the listener
+    /// releases the TaskList write guard before it persists). Per-instance:
+    /// created with the context in `set_persistence`, never global. The
+    /// version-skip and failure paths of `persist_snapshot` send nothing, so
+    /// a received version means exactly those bytes were committed.
+    #[cfg(test)]
+    persisted: tokio::sync::watch::Sender<u64>,
 }
 
 /// Capture the list's `(version, bytes)` under the list read lock and the
@@ -922,6 +957,12 @@ async fn persist_snapshot(task_list: &RwLock<TaskList>, ctx: &TaskPersistCtx) ->
         }
         ctx.storage.save_task_list(&ctx.list_id, &snapshot).await?;
         *last = Some(version);
+        // Test-only durable-write notification (#759 CI repair): fires
+        // strictly after the snapshot bytes were committed, so a waiter
+        // attributes it to this persist — never to the in-memory merge,
+        // which is already visible here.
+        #[cfg(test)]
+        let _ = ctx.persisted.send(version);
         Ok(())
     }
     .await;
@@ -1006,6 +1047,7 @@ impl TaskListSync {
             persist: std::sync::Mutex::new(None),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: tokio_util::sync::CancellationToken::new(),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             ingest_gate: Arc::new(TaskIngestGateSlot::default()),
             quarantine_buffer: Arc::new(std::sync::Mutex::new(QuarantineDeltaBuffer::default())),
             drain_poll_millis: Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1035,9 +1077,22 @@ impl TaskListSync {
     /// arrival order, and persist once. Returns how many were applied.
     ///
     /// The listener also drains on its own once it observes the marker gone;
-    /// this is the explicit entry point for the clear route and for
-    /// deterministic tests, so neither has to wait for a poll.
+    /// this is the explicit entry point for the clear route (and, via the
+    /// #759 durable-clear notification, for the owner-anchored clear paths)
+    /// and for deterministic tests, so neither has to wait for a poll.
+    ///
+    /// #759: the drain is itself a mutation path, so it runs as a lifecycle
+    /// section — it takes the same `lifecycle` lock the listener's
+    /// admit/merge/persist sections take and re-checks cancellation under
+    /// it. A list that was retired (`cancel_sync`) answers 0 and applies
+    /// nothing: a resume racing a retire can never resurrect a retired
+    /// listener's buffer into a merge. The empty-buffer authorization
+    /// refresh takes the same fence.
     pub async fn resume_quarantined_ingest(&self) -> usize {
+        let _section = self.lifecycle.lock().await;
+        if self.cancel.is_cancelled() {
+            return 0;
+        }
         drain_and_persist(
             &self.ingest_gate,
             &self.quarantine_buffer,
@@ -1045,6 +1100,40 @@ impl TaskListSync {
             self.persist_ctx().as_ref(),
         )
         .await
+    }
+
+    /// #759 test-only: drive the EXACT production admission step
+    /// (`admit_or_buffer`) the listener calls, against this sync's real
+    /// gate/buffer/list. Returns `true` when the delta was HELD (buffered).
+    /// Fixtures must stage a live marker so that is the honest answer — an
+    /// admitted delta is dropped UNMERGED here (the guard would have to
+    /// merge it), so this panics instead of silently losing it. Used by the
+    /// server-layer behavioural fixtures, which cannot reach this module's
+    /// private buffer/list fields.
+    #[cfg(test)]
+    pub(crate) async fn admit_delta_for_testing(
+        &self,
+        peer_id: PeerId,
+        delta: TaskListDelta,
+        writer: Option<&AgentId>,
+        encoded_bytes: usize,
+    ) -> bool {
+        match admit_or_buffer(
+            self.ingest_gate.gate(),
+            &self.quarantine_buffer,
+            &self.task_list,
+            peer_id,
+            delta,
+            writer,
+            encoded_bytes,
+        )
+        .await
+        {
+            Admission::Held => true,
+            Admission::Apply(..) => {
+                panic!("admit_delta_for_testing staged no live marker: the delta was admitted, not held")
+            }
+        }
     }
 
     /// ADR-0068 D2: how many inbound deltas are currently held because the
@@ -1123,6 +1212,7 @@ impl TaskListSync {
         let listener_gate = Arc::clone(&self.ingest_gate);
         let listener_buffer = Arc::clone(&self.quarantine_buffer);
         let listener_poll_millis = Arc::clone(&self.drain_poll_millis);
+        let listener_lifecycle = Arc::clone(&self.lifecycle);
 
         spawn(Box::pin(async move {
             // #732 finding 5: the drain deadline lives ACROSS receives. It used
@@ -1152,7 +1242,14 @@ impl TaskListSync {
                     );
                     poll_armed = true;
                 }
-                let msg = tokio::select! {
+                let (poll_fired, msg) = tokio::select! {
+                    // Cancel-first (#759, mirroring #757): an unbiased select
+                    // picks at random when a queued message and the cancel are
+                    // both ready, so a retired listener could still run a whole
+                    // receive section. The authoritative fence is the
+                    // under-`lifecycle` cancel check below; this ordering
+                    // keeps a merely-queued delta from even being fetched.
+                    biased;
                     // cancel_sync tears down every loop (round-4 review) —
                     // recv alone would keep this listener alive until
                     // daemon shutdown.
@@ -1163,17 +1260,27 @@ impl TaskListSync {
                         // itself re-reads the marker, so there is no separate
                         // suspension pre-check to disagree with it.
                         poll_armed = false;
-                        drain_and_persist(
-                            &listener_gate,
-                            &listener_buffer,
-                            &task_list,
-                            listener_persist.as_ref(),
-                        )
-                        .await;
-                        continue;
+                        (true, None)
                     }
-                    msg = sub.recv() => msg,
+                    msg = sub.recv() => (false, msg),
                 };
+                if poll_fired {
+                    // #759 lifecycle fence: the drain APPLIES held deltas, so
+                    // it is a mutation section like the admit/merge path and
+                    // takes the same fence — a retired listener never drains.
+                    let _section = listener_lifecycle.lock().await;
+                    if listener_cancel.is_cancelled() {
+                        return;
+                    }
+                    drain_and_persist(
+                        &listener_gate,
+                        &listener_buffer,
+                        &task_list,
+                        listener_persist.as_ref(),
+                    )
+                    .await;
+                    continue;
+                }
                 let Some(msg) = msg else {
                     // The main-topic subscription is gone: this sync can no
                     // longer replicate, so it is half-dead — self-cancel so
@@ -1186,6 +1293,21 @@ impl TaskListSync {
                 };
                 match decode_delta::<TaskListDelta>(&msg.payload) {
                     Ok((peer_id, delta)) => {
+                        // #759 lifecycle fence: held to the end of this
+                        // iteration, so the (optional) pre-admission drain,
+                        // the admission decision, the merge under the guard
+                        // it was taken under, AND the snapshot write after
+                        // the guard is released are ONE section a draining
+                        // retire waits out. The cancel check is under the
+                        // lock: a delta this listener already PULLED past
+                        // `recv` when the cancel lands must not merge either,
+                        // and a bare flag check before `recv` cannot fence
+                        // that. Nothing below is ever skipped for an
+                        // in-flight delta that already passed this check.
+                        let _section = listener_lifecycle.lock().await;
+                        if listener_cancel.is_cancelled() {
+                            return;
+                        }
                         // #732 finding 5: older HELD deltas drain before this
                         // newer one is admitted. Two reasons. Ordering: applying
                         // post-clear traffic first would put it ahead of deltas
@@ -1323,6 +1445,13 @@ impl TaskListSync {
             let mut last_full_response: Option<tokio::time::Instant> = None;
             loop {
                 let msg = tokio::select! {
+                    // Cancel-first (#759, as the listener above). This loop's
+                    // arms only PUBLISH (a full-state response and its served
+                    // markers) and never mutate the CRDT, so it takes no
+                    // lifecycle fence — the fence is scoped to mutation
+                    // sections, exactly as #757 scoped the KV responder's
+                    // fence to its mutating owner-announce arm.
+                    biased;
                     // cancel_sync tears down every loop (round-4 review).
                     () = responder_cancel.cancelled() => return,
                     msg = sync_sub.recv() => msg,
@@ -1511,6 +1640,10 @@ impl TaskListSync {
                 let _guard = BootstrapGuard(requester_bootstrap_active);
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
                     tokio::select! {
+                        // Cancel-first (#759): prompt teardown even mid-sleep.
+                        // Publish-only loop — no lifecycle fence (see the
+                        // responder's comment).
+                        biased;
                         // cancel_sync tears down every loop promptly, even
                         // mid-sleep (round-4 review).
                         () = requester_cancel.cancelled() => return,
@@ -1610,6 +1743,36 @@ impl TaskListSync {
         self.cancel.cancel();
     }
 
+    /// #759: retire this sync AND wait out its in-flight receive sections.
+    ///
+    /// `cancel_sync` alone is a REQUEST: one section that already passed its
+    /// under-`lifecycle` cancel check still completes — its merge AND its
+    /// snapshot write — possibly after `cancel_sync` returned. This cancels,
+    /// then takes the `lifecycle` lock once and drops it, so when it returns
+    /// no receive section (listener iteration or route-triggered resume
+    /// drain) is in flight or can start.
+    ///
+    /// Must NOT be awaited while holding any lock a section takes inside
+    /// `lifecycle`: a `TaskList` guard, the persist gate, or a
+    /// `named_groups` guard (the ingest gate reads it synchronously under
+    /// the list write). The `task_lists` registry is NOT taken by a section,
+    /// so it is safe — though pointlessly blocking — to hold it here.
+    ///
+    /// Mirrors [`crate::kv::KvStoreSync::cancel_sync_and_drain`] from #757; callers that
+    /// cannot drain keep [`cancel_sync`](Self::cancel_sync) and accept its
+    /// one-section residual.
+    pub async fn cancel_sync_and_drain(&self) {
+        self.cancel.cancel();
+        drop(self.lifecycle.lock().await);
+    }
+
+    /// True while a background receive section holds the lifecycle lock
+    /// (#759 test hook — the task-side twin of the KV fixture probe).
+    #[cfg(test)]
+    pub(crate) fn receive_section_active_for_test(&self) -> bool {
+        self.lifecycle.try_lock().is_err()
+    }
+
     /// Apply a delta received from a remote peer.
     ///
     /// This is called when a delta is received via the gossip topic.
@@ -1688,6 +1851,10 @@ impl TaskListSync {
                 list_id,
                 gate: tokio::sync::Mutex::new(None),
                 degraded: std::sync::atomic::AtomicBool::new(false),
+                // #759 CI repair: per-instance durable-commit
+                // notification — see `TaskPersistCtx::persisted`.
+                #[cfg(test)]
+                persisted: tokio::sync::watch::Sender::new(0),
             }));
         }
     }
@@ -3788,5 +3955,376 @@ mod tests {
         );
         assert_eq!(sync.quarantined_buffer_len(), 0);
         assert_eq!(ListenerGate::count(&gate.applied), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // #759: the task-list lifecycle fence — a retired listener must not
+    // merge or persist, and a draining retire must wait out an in-flight
+    // merge+persist section
+    // ------------------------------------------------------------------
+
+    use std::future::Future;
+
+    type HeldLoops = Arc<std::sync::Mutex<Vec<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>>>;
+
+    /// One #759 retire fixture: a persisted list whose background loops are
+    /// HELD by a gated spawner (never polled until the test drives them), so
+    /// publish-then-cancel orderings are decided by the test, not by the
+    /// runtime. The snapshot lives under `dir`; persistence is armed so a
+    /// merge's snapshot write is observable as file presence. The pubsub is
+    /// SIGNED (issue #349 Layer A): an unsigned envelope's content fails
+    /// closed, so the control below could not merge — the signer is the
+    /// envelope-verified writer the list's open (unset) admission accepts.
+    async fn retire_list_fixture(
+        topic: &str,
+        dir: &tempfile::TempDir,
+    ) -> (TaskListSync, Arc<PubSubManager>, std::path::PathBuf) {
+        let (pubsub, _signer) = signed_pubsub_with_signer().await;
+        let list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
+        let sync =
+            TaskListSync::new(list, Arc::clone(&pubsub), topic.to_string(), peer(1)).expect("sync");
+        sync.set_persistence(TaskListStorage::new(dir.path().to_path_buf()), list_id(1));
+        let snapshot = dir.path().join(format!("{}.bin", list_id(1)));
+        (sync, pubsub, snapshot)
+    }
+
+    /// Publish one admissible delta and wait (barrier, not oracle) until the
+    /// pub/sub layer reports it delivered to this topic's subscriber — i.e.
+    /// it sits in the listener's channel.
+    async fn publish_queued_task_delta(
+        sync: &TaskListSync,
+        pubsub: &Arc<PubSubManager>,
+        id_byte: u8,
+    ) -> TaskId {
+        let delta = add_delta(1, id_byte, peer(2));
+        let task_id = *delta.added_tasks.keys().next().expect("task id");
+        let delivered_before = pubsub.stats().delivered_to_subscriber;
+        sync.publish_delta(peer(2), delta).await.expect("publish");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pubsub.stats().delivered_to_subscriber == delivered_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delta must reach the listener's channel");
+        task_id
+    }
+
+    /// Start the loops on the runtime, keeping their join handles so a test
+    /// can prove they have fully exited (the kv #757 fixture's shape).
+    async fn start_list_joinable(sync: &TaskListSync) -> Vec<tokio::task::JoinHandle<()>> {
+        // The kv #757 fixture's joinable shape: the spawner spawns on the
+        // runtime and parks the JOIN HANDLES, not the futures.
+        let handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&handles);
+        sync.start_with_spawner(move |fut| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(tokio::spawn(fut));
+        })
+        .await
+        .expect("start_with_spawner");
+        let mut guard = handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *guard)
+    }
+
+    async fn join_list_loops(loops: Vec<tokio::task::JoinHandle<()>>) {
+        for handle in loops {
+            tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .expect("a cancelled loop must exit")
+                .expect("loop must not panic");
+        }
+    }
+
+    /// Control for the retire oracles: the identical queued delta IS merged
+    /// and snapshotted by a live listener, so the retired assertions below
+    /// cannot pass merely because the delta was undeliverable or
+    /// inadmissible.
+    ///
+    /// Oracle (#759 CI repair): the listener releases the TaskList write
+    /// guard BEFORE it persists, so observing the in-memory merge proves
+    /// nothing about the file — the old test did exactly that and raced the
+    /// snapshot write in CI. The wait below is the persist context's
+    /// per-instance commit notification, which `persist_snapshot` sends
+    /// strictly AFTER `save_task_list` succeeds; it is a real notification
+    /// (no polling, no yields) with a bounded failure path (the timeout),
+    /// and the version it carries must advance past the pre-publish durable
+    /// version, so a stale or merge-time signal cannot satisfy it.
+    ///
+    /// Mutation control: delete the listener's `persist_snapshot` call (or
+    /// make the write fail) and the notification never advances — the
+    /// bounded wait fails on its timeout, deterministically, regardless of
+    /// scheduling. Signalling at merge time instead would not help: the
+    /// reload assertion below reads the file the listener committed and
+    /// demands the queued delta's task in it, so an in-memory-only merge
+    /// cannot pass.
+    #[tokio::test]
+    async fn live_control_listener_merges_and_persists_a_queued_delta_759() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sync, pubsub, _snapshot) = retire_list_fixture("tasks/759-live-control", &dir).await;
+        let loops = start_list_joinable(&sync).await;
+        // Subscribe BEFORE the delta exists so no commit can slip past the
+        // wait, and pin the durable version the commit must advance past.
+        let ctx = sync.persist_ctx().expect("persist armed");
+        let mut persisted = ctx.persisted.subscribe();
+        let durable_before = *persisted.borrow();
+        let task_id = publish_queued_task_delta(&sync, &pubsub, 0xB1).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            persisted.wait_for(|&v| v > durable_before),
+        )
+        .await
+        .expect("control: the merged delta's snapshot write landed")
+        .expect("the persist context outlives this wait");
+        assert!(
+            sync.read().await.get_task(&task_id).is_some(),
+            "control: a live listener merges the queued delta"
+        );
+        // File existence alone is not the claim — any snapshot write (even
+        // an empty list's) would satisfy it. Reload the exact bytes the
+        // listener committed and demand the queued delta's task in them.
+        let reloaded = TaskListStorage::new(dir.path().to_path_buf())
+            .load_task_list(&list_id(1))
+            .await
+            .expect("the listener's snapshot must reload");
+        assert!(
+            reloaded.get_task(&task_id).is_some(),
+            "the persisted snapshot contains the queued delta's task"
+        );
+        sync.cancel_sync_and_drain().await;
+        join_list_loops(loops).await;
+    }
+
+    /// A delta still QUEUED in the channel when `cancel_sync` lands never
+    /// merges and never persists. The loop futures are driven to completion
+    /// AFTER the cancel, so both the cancel and the queued message are ready
+    /// in the same poll — the unbiased-select hazard — and the assertion is
+    /// about the exit, not about scheduling.
+    ///
+    /// Mutation control: the protection this exercises is the cancel arm's
+    /// priority PLUS the under-`lifecycle` cancel check — delete the check
+    /// (or move it before `recv`) and a fetched delta merges after the
+    /// cancel; un-`biased`-ing the select alone is NOT a reliable fail
+    /// condition for this oracle, because the check still guards the merge.
+    #[tokio::test]
+    async fn retired_listener_never_merges_or_persists_a_queued_delta_759() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sync, pubsub, snapshot) = retire_list_fixture("tasks/759-queued", &dir).await;
+        let held: HeldLoops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&held);
+        sync.start_with_spawner(move |fut| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(fut);
+        })
+        .await
+        .expect("start_with_spawner");
+
+        let task_id = publish_queued_task_delta(&sync, &pubsub, 0xB2).await;
+
+        sync.cancel_sync();
+        let loops = std::mem::take(
+            &mut *held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for fut in loops {
+            tokio::time::timeout(Duration::from_secs(10), fut)
+                .await
+                .expect("a cancelled loop must exit");
+        }
+        assert!(
+            sync.read().await.get_task(&task_id).is_none(),
+            "a queued delta merged after the retire"
+        );
+        assert!(!snapshot.exists(), "a retired listener wrote the snapshot");
+    }
+
+    /// A delta already PULLED past `recv` when the cancel lands (parked on
+    /// the lifecycle lock) must not merge either — the check has to sit
+    /// under the lock, which is the fence `cancel_sync_and_drain` waits on.
+    /// Barrier by construction: the delta is in the channel and no cancel is
+    /// set, so ONE poll takes the listener through `recv` and leaves it
+    /// Pending on the lifecycle lock held by the test.
+    ///
+    /// Mutation control: remove the under-lock `is_cancelled` check in the
+    /// listener's receive arm and this fixture merges the pulled delta —
+    /// that check, not the select bias, is the protection exercised.
+    #[tokio::test]
+    async fn task_delta_pulled_before_cancel_is_dropped_under_the_lifecycle_lock_759() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sync, pubsub, snapshot) = retire_list_fixture("tasks/759-pulled", &dir).await;
+        let held: HeldLoops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&held);
+        sync.start_with_spawner(move |fut| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(fut);
+        })
+        .await
+        .expect("start_with_spawner");
+        let parked = sync.lifecycle.clone().lock_owned().await;
+        let task_id = publish_queued_task_delta(&sync, &pubsub, 0xB3).await;
+        let mut loops = std::mem::take(
+            &mut *held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for fut in &mut loops {
+            assert!(
+                futures::poll!(fut.as_mut()).is_pending(),
+                "every loop must be parked, none finished"
+            );
+        }
+        sync.cancel_sync();
+        drop(parked);
+        for fut in loops {
+            tokio::time::timeout(Duration::from_secs(10), fut)
+                .await
+                .expect("a cancelled loop must exit");
+        }
+        assert!(
+            sync.read().await.get_task(&task_id).is_none(),
+            "a delta pulled before the cancel was merged after it"
+        );
+        assert!(!snapshot.exists(), "a retired listener wrote the snapshot");
+    }
+
+    /// An already-admitted section still owes its merge AND its snapshot
+    /// write; here the write is parked on the persist gate while the section
+    /// holds the lifecycle lock, so `cancel_sync_and_drain` must stay
+    /// pending until the gate releases and the write finishes. "Retired"
+    /// means the section COMPLETED, not that it was cut in half.
+    #[tokio::test]
+    async fn draining_retire_waits_for_an_in_flight_task_merge_and_persist_759() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sync, pubsub, snapshot) = retire_list_fixture("tasks/759-inflight", &dir).await;
+        let loops = start_list_joinable(&sync).await;
+        // Park the snapshot commit gate: a merged-in-memory delta cannot
+        // finish its persist while this guard is held.
+        let ctx = sync.persist_ctx().expect("persist armed");
+        let persist_gate = ctx.gate.lock().await;
+        let task_id = publish_queued_task_delta(&sync, &pubsub, 0xB4).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sync.read().await.get_task(&task_id).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must merge the delta in memory");
+        assert!(
+            sync.receive_section_active_for_test(),
+            "the listener is inside a receive section, parked on the persist gate"
+        );
+        // Merged in memory, snapshot write parked on the gate: the section
+        // is in flight, so the drain cannot complete.
+        let mut drain = Box::pin(sync.cancel_sync_and_drain());
+        for _ in 0..64 {
+            assert!(
+                futures::poll!(drain.as_mut()).is_pending(),
+                "drain completed while a receive section was still in flight"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !snapshot.exists(),
+            "the parked snapshot write must not have landed yet"
+        );
+        drop(persist_gate);
+        tokio::time::timeout(Duration::from_secs(10), &mut drain)
+            .await
+            .expect("drain must finish once the in-flight section completes");
+        assert!(
+            snapshot.exists(),
+            "the in-flight section's snapshot write completed before the drain returned"
+        );
+        join_list_loops(loops).await;
+    }
+
+    /// Route resume versus retire (#759): a resume that races a retire
+    /// applies nothing — the drain is itself a fenced section, so a retired
+    /// list's buffered deltas stay buffered (in order) for the next
+    /// incarnation; nothing is half-applied.
+    ///
+    /// Mutation control: remove the lifecycle fence (cancel check) from
+    /// `resume_quarantined_ingest` and this fixture applies the buffered
+    /// delta after the cancel.
+    #[tokio::test]
+    async fn resume_after_retire_applies_nothing_and_keeps_the_buffer_759() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sync, _pubsub, snapshot) = retire_list_fixture("tasks/759-resume-retired", &dir).await;
+        let signer = agent(9);
+        let gate = Arc::new(ListenerGate::seating(signer));
+        gate.suspend(true);
+        assert!(sync
+            .ingest_gate()
+            .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
+        // Buffer one delta through the exact admission step the listener
+        // calls, with the writer the clearing roster will seat.
+        let delta = add_delta(1, 0xB5, peer(2));
+        let task_id = *delta.added_tasks.keys().next().expect("task id");
+        match testing::admit_or_buffer(
+            sync.ingest_gate().gate(),
+            &sync.quarantine_buffer,
+            &sync.task_list,
+            peer(2),
+            delta,
+            Some(&signer),
+            64,
+        )
+        .await
+        {
+            Admission::Held => {}
+            Admission::Apply(..) => panic!("a suspended gate must hold the delta"),
+        }
+        assert_eq!(sync.quarantined_buffer_len(), 1);
+        // The marker clears — then the list is retired BEFORE the resume.
+        gate.suspend(false);
+        sync.cancel_sync();
+        let applied = sync.resume_quarantined_ingest().await;
+        assert_eq!(applied, 0, "a retired list must apply nothing");
+        assert_eq!(
+            sync.quarantined_buffer_len(),
+            1,
+            "the buffer stays intact and in order for the next incarnation"
+        );
+        assert!(sync.read().await.get_task(&task_id).is_none());
+        assert!(!snapshot.exists());
+    }
+
+    /// Empty-buffer resume refreshes the captured authorized roster under
+    /// the pin (#756 review P4's arm, now reached through the #759-fenced
+    /// resume): a clear that finds nothing buffered must not leave the
+    /// cached roster stale for the deltas that arrive next.
+    #[tokio::test]
+    async fn empty_buffer_resume_refreshes_the_authorized_roster_759() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sync, _pubsub, _snapshot) = retire_list_fixture("tasks/759-empty-refresh", &dir).await;
+        let seated = agent(9);
+        let gate = Arc::new(ListenerGate::seating(seated));
+        assert!(sync
+            .ingest_gate()
+            .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
+        // The stale captured set — the roster at subscription time, which
+        // the clearing commit is about to replace.
+        sync.write()
+            .await
+            .set_authorized_agents(std::collections::HashSet::from([agent(5)]));
+        assert_eq!(sync.quarantined_buffer_len(), 0);
+        let applied = sync.resume_quarantined_ingest().await;
+        assert_eq!(applied, 0, "nothing buffered — nothing to apply");
+        let list = sync.read().await;
+        assert!(
+            list.is_authorized_content_writer(&seated),
+            "the pinned roster the resume observed is now the writer set"
+        );
+        assert!(
+            !list.is_authorized_content_writer(&agent(5)),
+            "the stale captured set was replaced, not merged"
+        );
     }
 }
