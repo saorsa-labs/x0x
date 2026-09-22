@@ -430,6 +430,8 @@ jobs:
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.144

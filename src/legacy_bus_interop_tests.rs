@@ -8,7 +8,7 @@
 use crate::dm::{self, DmPath, DmSendConfig, DurableSendStages, EnvelopeBuilder, DM_PROTOCOL_V1};
 use crate::dm_inbox::{DmInboxConfig, DmInboxService, DmTypedPayload, DM_BUS_TOPIC};
 use crate::dm_send::{self, DmSendContext};
-use crate::gossip::{PubSubManager, SigningContext, Subscription};
+use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
 use crate::trust::TrustDecision;
 use crate::{network, Agent};
@@ -838,6 +838,120 @@ fn issue613_partial_ledger_from_mutex(
     issue613_partial_ledger(&guard, &witness_guard, run, outcome)
 }
 
+trait Issue613Witness {
+    async fn recv(&mut self) -> Option<PubSubMessage>;
+}
+
+impl Issue613Witness for Subscription {
+    async fn recv(&mut self) -> Option<PubSubMessage> {
+        Subscription::recv(self).await
+    }
+}
+
+impl Issue613Witness for mpsc::Receiver<PubSubMessage> {
+    async fn recv(&mut self) -> Option<PubSubMessage> {
+        mpsc::Receiver::recv(self).await
+    }
+}
+
+struct Issue613Ledgers<'a> {
+    records: &'a Mutex<std::collections::BTreeMap<[u8; 16], Issue613Record>>,
+    delivered_ids: &'a Mutex<std::collections::BTreeSet<[u8; 16]>>,
+    witnessed_ids: &'a Mutex<std::collections::BTreeMap<[u8; 16], u64>>,
+}
+
+async fn issue613_collect_delivery<W: Issue613Witness>(
+    receivers: (&mut Inbox, &mut Inbox, &mut W),
+    ledgers: Issue613Ledgers<'_>,
+    identity: (
+        crate::identity::AgentId,
+        crate::identity::MachineId,
+        [u8; 16],
+    ),
+    started: std::time::Instant,
+    message_count: usize,
+) {
+    let (d5, o5, witness) = receivers;
+    let Issue613Ledgers {
+        records,
+        delivered_ids,
+        witnessed_ids,
+    } = ledgers;
+    let (sender_agent, sender_machine, run) = identity;
+    while delivered_ids.lock().expect("delivered set").len() < message_count
+        || witnessed_ids.lock().expect("witness set").is_empty()
+    {
+        let received = tokio::select! {
+            actual = d5.recv() => Some((actual.expect("D5 typed inbox open"), 1u8)),
+            actual = o5.recv() => Some((actual.expect("O5 typed inbox open"), 2u8)),
+            raw = witness.recv() => {
+                let raw = raw.expect("W5 raw bus witness open");
+                if raw.sender == Some(sender_agent) && raw.verified {
+                    let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
+                        .expect("W5 observed a valid DM envelope");
+                    assert!(records.lock().expect("ledger").contains_key(&envelope.request_id));
+                    let observed_ns = u64::try_from(started.elapsed().as_nanos())
+                        .expect("bounded monotonic offset");
+                    assert!(witnessed_ids.lock().expect("witness set")
+                        .insert(envelope.request_id, observed_ns).is_none(), "duplicate W5 raw frame");
+                }
+                None
+            }
+        };
+        let Some((actual, destination)) = received else {
+            continue;
+        };
+        let now = u64::try_from(started.elapsed().as_nanos()).expect("bounded monotonic offset");
+        let mut ledger = records.lock().expect("ledger");
+        let record = ledger
+            .get_mut(&actual.request_id)
+            .expect("typed delivery must belong to an attempted current-run ID");
+        issue613_credit_delivery(
+            record,
+            &actual,
+            sender_agent,
+            sender_machine,
+            run,
+            destination,
+            now,
+        );
+        assert!(delivered_ids
+            .lock()
+            .expect("delivered set")
+            .insert(actual.request_id));
+    }
+    let deadline = tokio::time::Instant::now() + NEGATIVE_WINDOW;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            actual = d5.recv() => match actual {
+                Some(value) => panic!("unexpected late D5 frame {}", hex::encode(value.request_id)),
+                None => panic!("D5 capture channel closed during stability window"),
+            },
+            actual = o5.recv() => match actual {
+                Some(value) => panic!("unexpected late O5 frame {}", hex::encode(value.request_id)),
+                None => panic!("O5 capture channel closed during stability window"),
+            },
+            raw = witness.recv() => {
+                let raw = raw.expect("W5 capture channel open during stability window");
+                if raw.sender == Some(sender_agent) && raw.verified {
+                    let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
+                        .expect("W5 observed a valid late DM envelope");
+                    assert!(records.lock().expect("ledger").contains_key(&envelope.request_id));
+                    let observed_ns = u64::try_from(started.elapsed().as_nanos())
+                        .expect("bounded monotonic offset");
+                    assert!(witnessed_ids.lock().expect("witness set")
+                        .insert(envelope.request_id, observed_ns).is_none(), "duplicate W5 raw frame");
+                }
+            }
+        }
+    }
+    assert!(
+        !witnessed_ids.lock().expect("witness set").is_empty(),
+        "W5 must positively witness current-run load"
+    );
+}
+
 async fn issue613_application_delivery(cut: bool) {
     use sha2::Digest;
     use std::collections::{BTreeMap, BTreeSet};
@@ -985,72 +1099,57 @@ async fn issue613_application_delivery(cut: bool) {
                 assert!(returned.0 > 0, "publication must attempt a peer");
             }
         };
-        let collector = async {
-            while collect_delivered.lock().expect("delivered set").len()
-                < ISSUE613_MESSAGES as usize
-            {
-                let received = tokio::select! {
-                    actual = d5.recv() => Some((actual.expect("D5 typed inbox open"), 1u8)),
-                    actual = o5.recv() => Some((actual.expect("O5 typed inbox open"), 2u8)),
-                    raw = witness.recv() => {
-                        let raw = raw.expect("W5 raw bus witness open");
-                        if raw.sender == Some(sender.agent_id()) && raw.verified {
-                            let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
-                                .expect("W5 observed a valid DM envelope");
-                            assert!(collect_records.lock().expect("ledger").contains_key(&envelope.request_id));
-                            let observed_ns = u64::try_from(started.elapsed().as_nanos())
-                                .expect("bounded monotonic offset");
-                            assert!(collect_witnessed.lock().expect("witness set")
-                                .insert(envelope.request_id, observed_ns).is_none(), "duplicate W5 raw frame");
-                        }
-                        None
-                    }
-                };
-                let Some((actual, destination)) = received else { continue; };
-                let now = u64::try_from(started.elapsed().as_nanos())
-                    .expect("bounded monotonic offset");
-                let mut ledger = collect_records.lock().expect("ledger");
-                let record = ledger.get_mut(&actual.request_id)
-                    .expect("typed delivery must belong to an attempted current-run ID");
-                issue613_credit_delivery(record, &actual, sender.agent_id(), sender.machine_id(), run, destination, now);
-                assert!(collect_delivered.lock().expect("delivered set").insert(actual.request_id));
-            }
-            let deadline = tokio::time::Instant::now() + NEGATIVE_WINDOW;
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    actual = d5.recv() => match actual {
-                        Some(value) => panic!("unexpected late D5 frame {}", hex::encode(value.request_id)),
-                        None => panic!("D5 capture channel closed during stability window"),
-                    },
-                    actual = o5.recv() => match actual {
-                        Some(value) => panic!("unexpected late O5 frame {}", hex::encode(value.request_id)),
-                        None => panic!("O5 capture channel closed during stability window"),
-                    },
-                    raw = witness.recv() => {
-                        let raw = raw.expect("W5 capture channel open during stability window");
-                        if raw.sender == Some(sender.agent_id()) && raw.verified {
-                            let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
-                                .expect("W5 observed a valid late DM envelope");
-                            assert!(collect_records.lock().expect("ledger").contains_key(&envelope.request_id));
-                            let observed_ns = u64::try_from(started.elapsed().as_nanos())
-                                .expect("bounded monotonic offset");
-                            assert!(collect_witnessed.lock().expect("witness set")
-                                .insert(envelope.request_id, observed_ns).is_none(), "duplicate W5 raw frame");
-                        }
-                    }
-                }
-            }
-            assert!(!collect_witnessed.lock().expect("witness set").is_empty(),
-                "W5 must positively witness current-run load");
-        };
-        let phase = AssertUnwindSafe(bounded(
+        let collector = issue613_collect_delivery(
+            (&mut d5, &mut o5, &mut witness),
+            Issue613Ledgers {
+                records: &collect_records,
+                delivered_ids: &collect_delivered,
+                witnessed_ids: &collect_witnessed,
+            },
+            (sender.agent_id(), sender.machine_id(), run),
+            started,
+            ISSUE613_MESSAGES as usize,
+        );
+        let phase = {
+        let phase_future = AssertUnwindSafe(bounded(
             "#613 publication and typed delivery",
             Duration::from_secs(180),
             async { tokio::join!(publisher, collector) },
         ))
-        .catch_unwind()
-        .await;
+        .catch_unwind();
+        tokio::pin!(phase_future);
+        // Capture the live witness/overlay state before an outer timeout can
+        // cancel collection. This runs beside the phase, under its original
+        // deadline; no diagnostic await consumes collection time.
+        let pre_timeout_w5_diagnostic = async {
+            tokio::time::sleep(Duration::from_secs(165)).await;
+            if witnessed_ids.lock().expect("witness set").is_empty() {
+                let snapshot = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    AssertUnwindSafe(issue613_node_diagnostics(&agents, clock)).catch_unwind(),
+                )
+                .await;
+                let snapshot = match snapshot {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(_)) => serde_json::json!({"diagnostic_status":"panicked"}),
+                    Err(_) => serde_json::json!({"diagnostic_status":"timed_out","budget_secs":5}),
+                };
+                let receipt = serde_json::json!({
+                    "schema": 1,
+                    "phase_elapsed_ms": started.elapsed().as_millis(),
+                    "delivered": delivered_ids.lock().expect("delivered set").len(),
+                    "witnessed": witnessed_ids.lock().expect("witness set").len(),
+                    "nodes_before_phase_timeout": snapshot,
+                });
+                eprintln!("ISSUE613_W5_PRE_TIMEOUT {}", serde_json::to_string(&receipt).expect("pre-timeout diagnostic JSON"));
+            }
+        };
+        let phase = tokio::select! {
+            result = &mut phase_future => result,
+            _ = pre_timeout_w5_diagnostic => phase_future.await,
+        };
+        phase
+        };
         let partial = issue613_partial_ledger_from_mutex(
             &records,
             &witnessed_ids,
@@ -1290,6 +1389,184 @@ fn issue613_synthetic_delivery(
         sender,
         machine,
     )
+}
+
+fn issue613_synthetic_witness(
+    request_id: [u8; 16],
+    sender: crate::identity::AgentId,
+) -> PubSubMessage {
+    let envelope = dm::DmEnvelope {
+        protocol_version: DM_PROTOCOL_V1,
+        request_id,
+        sender_agent_id: sender.0,
+        sender_machine_id: [8; 32],
+        recipient_agent_id: [9; 32],
+        created_at_unix_ms: 1,
+        expires_at_unix_ms: 2,
+        body: EnvelopeBuilder::build_ack_body(request_id, dm::DmAckOutcome::Accepted),
+        signature: vec![0; 64],
+        origin_attestation: None,
+    };
+    PubSubMessage {
+        topic: DM_BUS_TOPIC.to_owned(),
+        payload: Bytes::from(envelope.to_wire_bytes().expect("synthetic wire envelope")),
+        sender: Some(sender),
+        sender_public_key: None,
+        verified: true,
+        trust_level: None,
+        raw_envelope: None,
+    }
+}
+
+#[tokio::test]
+async fn issue613_collector_accepts_w5_after_old_stability_window() {
+    let run = [1; 16];
+    let request_id = [2; 16];
+    let (record, actual, sender, machine) = issue613_synthetic_delivery(request_id, run, 1, 3);
+    let records = Mutex::new([(request_id, record)].into_iter().collect());
+    let delivered = Mutex::new(std::collections::BTreeSet::new());
+    let witnessed = Mutex::new(std::collections::BTreeMap::new());
+    let (d_tx, mut d5) = mpsc::channel(2);
+    let (_o_tx, mut o5) = mpsc::channel(2);
+    let (w_tx, mut w5) = mpsc::channel(2);
+    let _keep_w5_open = w_tx.clone();
+    d_tx.send(actual).await.expect("typed fixture send");
+    let delayed_witness = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        w_tx.send(issue613_synthetic_witness(request_id, sender))
+            .await
+            .expect("witness fixture send");
+    });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        issue613_collect_delivery(
+            (&mut d5, &mut o5, &mut w5),
+            Issue613Ledgers {
+                records: &records,
+                delivered_ids: &delivered,
+                witnessed_ids: &witnessed,
+            },
+            (sender, machine, run),
+            std::time::Instant::now(),
+            1,
+        ),
+    )
+    .await
+    .expect("late current-run W5 must complete within phase");
+    delayed_witness.await.expect("witness sender task");
+    assert_eq!(delivered.lock().expect("delivered set").len(), 1);
+    assert_eq!(witnessed.lock().expect("witness set").len(), 1);
+}
+
+#[tokio::test]
+async fn issue613_collector_requires_w5_and_rejects_bad_typed_while_waiting() {
+    for bad_typed in [None, Some(false), Some(true)] {
+        let run = [1; 16];
+        let request_id = [2; 16];
+        let (record, actual, sender, machine) = issue613_synthetic_delivery(request_id, run, 1, 3);
+        let records = Mutex::new([(request_id, record)].into_iter().collect());
+        let delivered = Mutex::new(std::collections::BTreeSet::new());
+        let witnessed = Mutex::new(std::collections::BTreeMap::new());
+        let (d_tx, mut d5) = mpsc::channel(2);
+        let (_o_tx, mut o5) = mpsc::channel(2);
+        let (_w_tx, mut w5) = mpsc::channel(2);
+        d_tx.send(actual).await.expect("typed fixture send");
+        if let Some(wrong_id) = bad_typed {
+            let id = if wrong_id { [3; 16] } else { request_id };
+            let (_, duplicate, _, _) = issue613_synthetic_delivery(id, run, 1, 3);
+            d_tx.send(duplicate).await.expect("bad typed fixture send");
+        }
+        let collection = issue613_collect_delivery(
+            (&mut d5, &mut o5, &mut w5),
+            Issue613Ledgers {
+                records: &records,
+                delivered_ids: &delivered,
+                witnessed_ids: &witnessed,
+            },
+            (sender, machine, run),
+            std::time::Instant::now(),
+            1,
+        );
+        let failed = AssertUnwindSafe(bounded(
+            "#613 fake-channel phase",
+            Duration::from_millis(100),
+            collection,
+        ))
+        .catch_unwind()
+        .await;
+        let panic = failed.expect_err("missing W5 or invalid typed frame must fail");
+        let reason = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("collector failure message");
+        let expected = match bad_typed {
+            None => "#501 labelled deadline: #613 fake-channel phase",
+            Some(false) => "duplicate typed delivery",
+            Some(true) => "typed delivery must belong to an attempted current-run ID",
+        };
+        assert!(reason.contains(expected), "unexpected failure: {reason}");
+        assert_eq!(delivered.lock().expect("delivered set").len(), 1);
+        assert!(witnessed.lock().expect("witness set").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn issue613_collector_filters_or_rejects_bad_w5_frames() {
+    for case in 0..4 {
+        let run = [1; 16];
+        let request_id = [2; 16];
+        let (record, actual, sender, machine) = issue613_synthetic_delivery(request_id, run, 1, 3);
+        let records = Mutex::new([(request_id, record)].into_iter().collect());
+        let delivered = Mutex::new(std::collections::BTreeSet::new());
+        let witnessed = Mutex::new(std::collections::BTreeMap::new());
+        let (d_tx, mut d5) = mpsc::channel(2);
+        let (_o_tx, mut o5) = mpsc::channel(2);
+        let (w_tx, mut w5) = mpsc::channel(2);
+        d_tx.send(actual).await.expect("typed fixture send");
+        let mut raw =
+            issue613_synthetic_witness(if case == 2 { [3; 16] } else { request_id }, sender);
+        if case == 0 {
+            raw.sender = Some(crate::identity::AgentId([9; 32]));
+        } else if case == 1 {
+            raw.verified = false;
+        }
+        w_tx.send(raw.clone()).await.expect("W5 fixture send");
+        if case == 3 {
+            w_tx.send(raw).await.expect("duplicate W5 fixture send");
+        }
+        let collection = issue613_collect_delivery(
+            (&mut d5, &mut o5, &mut w5),
+            Issue613Ledgers {
+                records: &records,
+                delivered_ids: &delivered,
+                witnessed_ids: &witnessed,
+            },
+            (sender, machine, run),
+            std::time::Instant::now(),
+            1,
+        );
+        let panic = AssertUnwindSafe(bounded(
+            "#613 fake-channel phase",
+            Duration::from_millis(100),
+            collection,
+        ))
+        .catch_unwind()
+        .await
+        .expect_err("bad W5 frame must not complete the collector");
+        let reason = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("collector failure message");
+        let expected = match case {
+            0 | 1 => "#501 labelled deadline: #613 fake-channel phase",
+            2 => "assertion failed",
+            3 => "duplicate W5 raw frame",
+            _ => unreachable!("bounded test cases"),
+        };
+        assert!(reason.contains(expected), "unexpected W5 failure: {reason}");
+    }
 }
 
 #[test]
