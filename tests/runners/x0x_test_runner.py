@@ -254,6 +254,7 @@ class X0xClient:
         stop_fallback_on_raw_error: bool = False,
         require_gossip: bool = False,
         timeout: float = 15.0,
+        require_durable_app_ack: Optional[bool] = None,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent_id": agent_id,
@@ -269,6 +270,8 @@ class X0xClient:
             body["stop_fallback_on_raw_error"] = True
         if require_gossip:
             body["require_gossip"] = True
+        if require_durable_app_ack is not None:
+            body["require_durable_app_ack"] = require_durable_app_ack
         return self._request("POST", "/direct/send", body=body, timeout=timeout)
 
     # ─── contacts ──────────────────────────────────────────────────────
@@ -893,6 +896,12 @@ class TestRunner:
                     prefer_raw_quic_if_connected=True,
                     raw_quic_receive_ack_ms=RESULT_RAW_QUIC_ACK_MS,
                     stop_fallback_on_raw_error=True,
+                    # This control/result plane intentionally tests the
+                    # receive-ACKed raw path. REST is durable by default, which
+                    # would otherwise make every raw option above inert.
+                    require_durable_app_ack=(
+                        False if RESULT_RAW_QUIC_ACK_MS is not None else None
+                    ),
                     timeout=request_timeout,
                 )
                 self.log.info(
@@ -1794,6 +1803,12 @@ class TestRunner:
             raw_ack_ms = int(raw_ack_ms)
         stop_fallback = bool(params.get("stop_fallback_on_raw_error", False))
         require_gossip = bool(params.get("require_gossip", False))
+        raw_receive_acked = (
+            prefer_raw
+            and raw_ack_ms is not None
+            and stop_fallback
+            and not require_gossip
+        )
         for attempt in range(1, TEST_DM_RETRY_MAX + 1):
             try:
                 resp = self.client.direct_send(
@@ -1804,6 +1819,10 @@ class TestRunner:
                     raw_quic_receive_ack_ms=raw_ack_ms,
                     stop_fallback_on_raw_error=stop_fallback,
                     require_gossip=require_gossip,
+                    # Phase-A's exact raw test contract must opt out of the
+                    # REST surface's durable default; otherwise the daemon
+                    # correctly bypasses raw QUIC and waits on gossip ACKs.
+                    require_durable_app_ack=False if raw_receive_acked else None,
                 )
                 elapsed_ms = int((time.time() - t0) * 1000)
                 self._enqueue_result(

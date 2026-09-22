@@ -1148,9 +1148,20 @@ print("stop-returned")
         self.assertFalse(runner._replay[replay_key]["delivery_pending"])
 
     def test_oversized_result_reports_failure_when_pubsub_is_disabled(self) -> None:
+        from unittest.mock import patch
+
         client = FakeClient()
         runner = self.runner_mod.TestRunner("nyc", client)
         runner._pubsub_disabled_after_discover = True
+        fallback_finished = threading.Event()
+        publish_legacy = runner._publish_result_legacy
+
+        def publish_legacy_then_signal(*args, **kwargs):
+            try:
+                return publish_legacy(*args, **kwargs)
+            finally:
+                fallback_finished.set()
+
         result = {
             "kind": "group_messages_result",
             "command_id": "no-pubsub",
@@ -1159,15 +1170,19 @@ print("stop-returned")
             "details": {"body": "x" * 60_000},
         }
 
-        with self.assertLogs(runner.log, level="ERROR") as captured:
+        with self.assertLogs(runner.log, level="ERROR") as captured, patch.object(
+            runner,
+            "_publish_result_legacy",
+            side_effect=publish_legacy_then_signal,
+        ):
             runner._enqueue_result(result, target_aid=None, result_chunks_v2=False)
             publisher = threading.Thread(target=runner._publisher_loop)
             publisher.start()
-            while not runner._send_q.empty():
-                threading.Event().wait(0.01)
+            finished = fallback_finished.wait(timeout=2)
             runner._stop.set()
             publisher.join(timeout=2)
 
+        self.assertTrue(finished, "publisher did not finish the disabled fallback")
         self.assertFalse(publisher.is_alive())
         self.assertFalse(client.direct)
         self.assertFalse(client.published)

@@ -210,6 +210,7 @@ class X0xClient:
         raw_quic_receive_ack_ms: Optional[int] = None,
         stop_fallback_on_raw_error: bool = False,
         require_gossip: bool = False,
+        require_durable_app_ack: Optional[bool] = None,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent_id": agent_id,
@@ -225,6 +226,8 @@ class X0xClient:
             body["stop_fallback_on_raw_error"] = True
         if require_gossip:
             body["require_gossip"] = True
+        if require_durable_app_ack is not None:
+            body["require_durable_app_ack"] = require_durable_app_ack
         return self._req("POST", "/direct/send", body=body)
 
     def open_sse(self, path: str, timeout: float = 3600 * 6):
@@ -514,6 +517,11 @@ def send_command_dm(
             prefer_raw_quic_if_connected=True,
             raw_quic_receive_ack_ms=COMMAND_RAW_QUIC_ACK_MS,
             stop_fallback_on_raw_error=True,
+            # The command plane explicitly measures receive-ACKed raw QUIC.
+            # REST remains durable by default for every other caller.
+            require_durable_app_ack=(
+                False if COMMAND_RAW_QUIC_ACK_MS is not None else None
+            ),
         )
     except urllib.error.HTTPError as exc:
         try:
