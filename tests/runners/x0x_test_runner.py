@@ -448,32 +448,99 @@ class TestRunner:
         )
 
     def _subscribe_control_topics(self) -> None:
+        """(Re)register both required control-topic subscriptions.
+
+        Raises RuntimeError when either topic fails, answers without a
+        usable subscription_id, or cannot cleanly retire its previous
+        tracked subscription, so the control listener retries through
+        its bounded backoff instead of sitting through a six-hour
+        /events session with a missing subscription.
+        """
         if self._pubsub_disabled_after_discover:
             self.log.info("pubsub control disabled after discover; not resubscribing")
             return
+        failures: List[Tuple[str, str]] = []
         for topic in (DISCOVER_TOPIC, LEGACY_CONTROL_TOPIC):
-            old_id = self._subscription_ids.pop(topic, None)
-            if old_id:
+            # Swap lifecycle: /subscribe offers no listing or swap API,
+            # so a replacement is created only after the previous
+            # tracked id is retired. The tracked id is RETAINED until
+            # DELETE /subscribe/:id succeeds (2xx) or the daemon proves
+            # it absent with 404 "subscription not found" (its
+            # subscription map is in-process, so a daemon restart wipes
+            # every id — 404 on a stale id is idempotent success). This
+            # keeps at most one *tracked* subscription per topic and
+            # never loses a live handle. Any other DELETE outcome (5xx,
+            # timeout, auth failure) is ambiguous — the id may still be
+            # live daemon-side — so the topic fails this iteration with
+            # NO replacement created and the bounded retry re-attempts
+            # the same delete; a replacement subscribe now would orphan
+            # the old subscriber on every retry.
+            old_id = self._subscription_ids.get(topic)
+            if old_id is not None:
                 try:
                     self.client.unsubscribe(old_id)
                     self.log.info("unsubscribed stale %s (%s)", topic, old_id)
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 404:
+                        self.log.info(
+                            "stale %s subscription %s already absent (404)",
+                            topic,
+                            old_id,
+                        )
+                    else:
+                        failures.append(
+                            (topic, f"unsubscribe stale {old_id} failed: {exc}")
+                        )
+                        self.log.warning(
+                            "unsubscribe stale %s (%s) failed: %s",
+                            topic,
+                            old_id,
+                            exc,
+                        )
+                        continue
                 except Exception as exc:
-                    self.log.debug(
+                    failures.append(
+                        (topic, f"unsubscribe stale {old_id} failed: {exc}")
+                    )
+                    self.log.warning(
                         "unsubscribe stale %s (%s) failed: %s",
                         topic,
                         old_id,
                         exc,
                     )
+                    continue
+                # Delete succeeded (2xx) or was proven unnecessary
+                # (404): safe to retire the tracked handle only now.
+                self._subscription_ids.pop(topic, None)
             try:
                 resp = self.client.subscribe(topic)
-                sub_id = resp.get("subscription_id")
-                if isinstance(sub_id, str) and sub_id:
-                    self._subscription_ids[topic] = sub_id
-                self.log.info("subscribed to %s", topic)
             except Exception as exc:
+                failures.append((topic, f"request failed: {exc}"))
+                self.log.warning("subscribe %s failed: %s", topic, exc)
+                continue
+            sub_id = (
+                resp.get("subscription_id") if isinstance(resp, dict) else None
+            )
+            if isinstance(sub_id, str) and sub_id:
+                self._subscription_ids[topic] = sub_id
+                self.log.info("subscribed to %s", topic)
+            else:
+                # The daemon mints the id server-side and returns it
+                # only in this body, so a 2xx without a usable id may
+                # still have created a subscription this runner can
+                # neither address nor delete — an untracked server-side
+                # orphan outside the at-most-one-tracked guarantee,
+                # bounded only by retry cadence. Treat the topic as
+                # failed so /events never opens on it.
+                failures.append((topic, f"missing subscription_id: {resp!r}"))
                 self.log.warning(
-                    "subscribe %s failed (continuing): %s", topic, exc
+                    "subscribe %s response unusable: %r", topic, resp
                 )
+        if failures:
+            raise RuntimeError(
+                "control-topic subscription incomplete: "
+                + "; ".join(f"{topic} ({reason})" for topic, reason in failures)
+            )
 
     def _announce_ready(self) -> None:
         # Best-effort: if we already know an anchor from a previous
@@ -1246,7 +1313,9 @@ class TestRunner:
                     label="pubsub-events",
                 )
             except Exception as exc:
-                self.log.warning("pubsub SSE disconnected: %s", exc)
+                self.log.warning(
+                    "pubsub control session failed; retrying after backoff: %s", exc
+                )
                 time.sleep(SSE_RECONNECT_BACKOFF_SECS)
 
     def _direct_listener_loop(self) -> None:
