@@ -34,6 +34,28 @@ class HomeFixtureTests(unittest.TestCase):
         return self.h.Node(label, "192.0.2.1", 14600, 7483,
                            "/var/tmp/x0x-home-e2e-" + "a" * 32)
 
+    def run_join_offline(self, evidence, responses, *, join_state="pending_authority_commit"):
+        """Drive the real Home seat poll against fake APIs and a virtual clock."""
+        owner, member = mock.Mock(), mock.Mock()
+        member.request.return_value = (200, {"ok": True, "group_id": "home-gid",
+                                             "join_state": join_state})
+        member.agent_id.return_value = "a" * 64
+        samples = []
+        def roster(method, path):
+            self.assertEqual(("GET", "/groups/home-gid/members"), (method, path))
+            response = responses[min(len(samples), len(responses) - 1)]
+            samples.append(response)
+            return response
+        owner.request.side_effect = roster
+        clock = types.SimpleNamespace(now=1000.0)
+        def sleep(seconds): clock.now += seconds
+        poll_time = self.h.Scenario.join_home.__globals__["poll"].__globals__["time"]
+        with mock.patch.object(poll_time, "monotonic", side_effect=lambda: clock.now), \
+             mock.patch.object(poll_time, "sleep", side_effect=sleep):
+            self.h.Scenario({"owner": owner, "member": member}, evidence, 120).join_home(
+                "owner", "member", "home-gid", "b" * 64, "x0x://invite/secret-synthetic")
+        return samples
+
     def test_config_is_isolated_and_never_uses_prod_or_testnet_plane(self):
         text = self.h.config_bytes(self.node(), "x0x.home.e2e." + "a" * 32, None).decode()
         self.assertIn('network_id = "x0x.home.e2e.', text)
@@ -464,6 +486,71 @@ esac
                            "outcome": "accepted"}], data["polls"])
         self.assertTrue(data["assertions"])
         self.assertTrue(all(row["passed"] for row in data["assertions"]))
+
+    def test_home_join_seat_receipt_distinguishes_delayed_timeout_and_http_error(self):
+        secret = "DO-NOT-RETAIN-CERT-OR-TOKEN"
+        target = {"agent_id": "a" * 64, "role": "member"}
+        other = {"agent_id": "c" * 64, "role": "owner"}
+        delayed = self.h.Evidence()
+        samples = self.run_join_offline(delayed, [
+            (200, {"members": [other], "token": secret}),
+            (200, {"members": [other], "certificate": secret}),
+            (200, {"members": [other, target], "invite": secret})])
+        self.assertEqual(3, len(samples))
+        self.assertEqual("pending_authority_commit", delayed.assertions[0]["join_state"])
+        self.assertTrue(delayed.assertions[0]["passed"])
+        accepted = delayed.polls[0]
+        self.assertEqual(("member Home seat reaches owner", "accepted", 120, 2.0, 200, 2, True),
+                         (accepted["label"], accepted["outcome"], accepted["deadline_seconds"],
+                          accepted["elapsed_seconds"], accepted["last_http_status"],
+                          accepted["observed_member_count"], accepted["expected_member_present"]))
+        self.assertNotIn(secret, json.dumps(delayed.polls))
+
+        for label, response, expected_status, expected_count, expected_present in (
+            ("unseated", (200, {"members": [other], "certificate": secret}), 200, 1, False),
+            ("http_error", (503, {"members": [target], "error": secret}), 503, None, None),
+        ):
+            with self.subTest(label=label):
+                evidence = self.h.Evidence()
+                with self.assertRaisesRegex(AssertionError, "member Home seat reaches owner"):
+                    self.run_join_offline(evidence, [response], join_state=secret)
+                self.assertEqual("other", evidence.assertions[0]["join_state"])
+                receipt = evidence.polls[0]
+                self.assertEqual("timeout", receipt["outcome"])
+                self.assertEqual(120, receipt["deadline_seconds"])
+                self.assertEqual(120.0, receipt["elapsed_seconds"])
+                self.assertEqual(expected_status, receipt["last_http_status"])
+                self.assertEqual(expected_count, receipt["observed_member_count"])
+                self.assertEqual(expected_present, receipt["expected_member_present"])
+                self.assertEqual(120, receipt["probe_count"])
+                self.assertNotIn(secret, json.dumps({"polls": evidence.polls,
+                                                    "assertions": evidence.assertions}))
+
+    def test_failed_home_seat_poll_still_reports_and_cleans_up(self):
+        custody = mock.Mock(); custody.restore.return_value = []
+        tunnel = mock.Mock()
+        def fail(_args, _remote, evidence, resources):
+            resources["custody"] = custody
+            resources["tunnels"] = [tunnel]
+            resources["manifest"] = {"run_id": "a" * 32}
+            self.run_join_offline(evidence, [(200, {"members": []})])
+        with tempfile.TemporaryDirectory(prefix="home-seat-report-") as root:
+            report = Path(root) / "report.json"
+            argv = ["fixture", "--network", "synthetic-home", "--hosts-file", "hosts",
+                    "--nodes", "a", "b", "c", "d", "e", "--daemon-binary", "/x0xd",
+                    "--cli-binary", "/x0x", "--report", str(report)]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(self.h, "run_fixture", side_effect=fail), \
+                 mock.patch.object(self.h, "stop_ssh_tunnel") as stop:
+                self.assertEqual(1, self.h.main())
+            data = json.loads(report.read_text(encoding="utf-8"))
+        custody.restore.assert_called_once_with()
+        stop.assert_called_once_with(tunnel)
+        self.assertEqual("timeout", data["polls"][0]["outcome"])
+        self.assertEqual(200, data["polls"][0]["last_http_status"])
+        self.assertFalse(data["polls"][0]["expected_member_present"])
+        self.assertEqual("fixture AssertionError", data["assertions"][-1]["label"])
+        self.assertFalse(data["assertions"][-1]["passed"])
 
 
 if __name__ == "__main__": unittest.main()

@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from e2e_tunnel import TunnelHandle, start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import NODES_DEFAULT, load_tokens
-from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll
+from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier
 
 
 class Scenario(SharedScenario):
@@ -56,14 +56,30 @@ class Scenario(SharedScenario):
     def join_home(self, owner: str, member: str, gid: str, owner_id: str, invite: str) -> None:
         status, body = self.c[member].request("POST", "/groups/join", {
             "invite": invite, "mode": "home", "expected_owner_user_id": owner_id})
-        self.e.check(f"{member} joined canonical Home", status in (200, 201)
+        join_state = body.get("join_state")
+        if join_state not in ("active", "pending_authority_commit", "idle", "timed_out"):
+            join_state = "other" if join_state is not None else None
+        self.e.check(f"{member} canonical Home join request accepted", status in (200, 201)
                      and body.get("ok") is not False and body.get("group_id", gid) == gid,
-                     status=status)
+                     status=status, join_state=join_state)
         aid = self.c[member].agent_id()
+        def seat_receipt(facts: dict[str, Any], last: Any) -> None:
+            roster = (last[1] if isinstance(last, tuple) and len(last) > 1
+                      and last[0] == 200 and isinstance(last[1], dict) else {})
+            members = roster.get("members")
+            rows = members if isinstance(members, list) else None
+            self.e.record_poll(
+                facts, operation="home_seat", node=owner, member=member,
+                group_id=safe_identifier(gid), deadline_seconds=self.timeout,
+                last_http_status=facts["last_status"],
+                observed_member_count=len(rows) if rows is not None else None,
+                expected_member_present=(any(isinstance(row, dict) and row.get("agent_id") == aid
+                                             for row in rows) if rows is not None else None))
         poll(f"{member} Home seat reaches owner", self.timeout,
              lambda: self.c[owner].request("GET", f"/groups/{enc(gid)}/members"),
              lambda result: result[0] == 200
-             and any(row.get("agent_id") == aid for row in result[1].get("members", [])))
+             and any(row.get("agent_id") == aid for row in result[1].get("members", [])),
+             seat_receipt)
 
     def exercise(self, label: str, owner: str, writer: str, late: str, admin: str, revoked: str,
                  gid: str, admit_admin: Callable[[], None], mint_late: Callable[[], str],
