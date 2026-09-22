@@ -1019,6 +1019,47 @@ async fn issue613_application_delivery(cut: bool) {
         drop(collect_delivered);
         drop(collect_witnessed);
         if let Err(panic) = phase {
+            let diagnostic = tokio::time::timeout(
+                Duration::from_secs(5),
+                AssertUnwindSafe(async {
+                    let failure_t1 = generator_cut(sender, clock);
+                    let final_admission = diamond_observations(&agents, clock).await;
+                    let outer_counter = |cut: &serde_json::Value, field: &str| {
+                        cut["stages"]["topics"]["bus_outbound"]["eager"][field].as_u64()
+                    };
+                    let outer_messages = outer_counter(&failure_t1, "msgs")
+                        .zip(outer_counter(&outer_t0, "msgs"))
+                        .and_then(|(end, begin)| end.checked_sub(begin));
+                    let outer_bytes = outer_counter(&failure_t1, "bytes")
+                        .zip(outer_counter(&outer_t0, "bytes"))
+                        .and_then(|(end, begin)| end.checked_sub(begin));
+                    serde_json::json!({
+                        "schema": 1,
+                        "diagnostic_status":"complete",
+                        "outer_load_cuts": {"t0":outer_t0,"t1":failure_t1},
+                        "outer_eager_messages":outer_messages,
+                        "outer_eager_bytes":outer_bytes,
+                        "outer_eager_average_bytes":outer_messages.zip(outer_bytes)
+                            .and_then(|(messages, bytes)| bytes.checked_div(messages)),
+                        "final_admission":strip_peer_scores(final_admission),
+                        "w5_bus_subscribed":pubsub(&agents[3]).is_topic_subscribed(DM_BUS_TOPIC).await,
+                        "w5_raw_sample":raw_sample(&agents[3], clock),
+                    })
+                })
+                .catch_unwind(),
+            )
+            .await;
+            let diagnostic = match diagnostic {
+                Ok(Ok(value)) => value,
+                Ok(Err(_)) => serde_json::json!({"schema":1,"diagnostic_status":"panicked"}),
+                Err(_) => serde_json::json!({"schema":1,"diagnostic_status":"timed_out"}),
+            };
+            eprintln!(
+                "ISSUE613_PHASE_FAILURE {}",
+                serde_json::to_string(&diagnostic).unwrap_or_else(|_| {
+                    r#"{"schema":1,"diagnostic_status":"serialization_failed"}"#.to_owned()
+                })
+            );
             std::panic::resume_unwind(panic);
         }
         let outer_t1 = generator_cut(sender, clock);
@@ -1847,6 +1888,14 @@ async fn shape_diamond(
     clock: std::time::Instant,
     dm_bus_non_subscriber_label_indices: &[usize],
 ) -> Result<Vec<std::time::Instant>, RejectedReadiness> {
+    let initial_admission = tokio::time::timeout(
+        Duration::from_secs(5),
+        AssertUnwindSafe(diamond_observations(agents, clock)).catch_unwind(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(strip_peer_scores);
     let expected = diamond_expected();
     let peer_ids: serde_json::Map<String, serde_json::Value> = DIAMOND_LABELS
         .iter()
@@ -1897,6 +1946,83 @@ async fn shape_diamond(
     // seed a forbidden, just-disconnected peer and leave the strict eager
     // oracle polling an immutable stale set for its whole deadline.
     tokio::time::sleep(Duration::from_secs(2)).await;
+    // The two administrative cuts are the only forbidden edges. Re-establish
+    // every allowed edge explicitly instead of assuming the initial full-mesh
+    // connections survived unrelated connection arbitration while the cuts
+    // settled. The reverse suppressions above remain installed, so this cannot
+    // reconnect either forbidden pair.
+    let reconnect_deadline = tokio::time::Instant::now() + SETUP;
+    let mut allowed_reconnects = Vec::new();
+    for (from, to) in [(0, 1), (0, 2), (1, 3), (2, 3)] {
+        let begin = diamond_now(clock);
+        let expected_peer_id = agents[to].machine_id().0;
+        let attempt = AssertUnwindSafe(async {
+            let network = agents[from].network().ok_or("source network unavailable")?;
+            let address = agents[to]
+                .network()
+                .ok_or("target network unavailable")?
+                .bound_addr()
+                .await
+                .ok_or("target bound address unavailable")?;
+            network
+                .connect_addr(address)
+                .await
+                .map(|peer| peer.0)
+                .map_err(|_| "connect returned error")
+        })
+        .catch_unwind();
+        let result = tokio::time::timeout_at(reconnect_deadline, attempt).await;
+        let (connected_peer_id, native_outcome) = match result {
+            Ok(Ok(Ok(peer))) if peer == expected_peer_id => {
+                (Some(hex::encode(peer)), "ConnectedExpectedPeer")
+            }
+            Ok(Ok(Ok(peer))) => (Some(hex::encode(peer)), "ConnectedWrongPeer"),
+            Ok(Ok(Err(reason))) => (None, reason),
+            Ok(Err(_)) => (None, "Panicked"),
+            Err(_) => (None, "TimedOut"),
+        };
+        let row = serde_json::json!({
+            "owner":DIAMOND_LABELS[from],
+            "peer":DIAMOND_LABELS[to],
+            "owner_peer_id":hex::encode(agents[from].machine_id().0),
+            "expected_peer_id":hex::encode(expected_peer_id),
+            "connected_peer_id":connected_peer_id,
+            "begin_ns":begin,
+            "end_ns":diamond_now(clock),
+            "native_outcome":native_outcome,
+        });
+        eprintln!(
+            "ISSUE613_ALLOWED_EDGE_ATTEMPT {}",
+            serde_json::to_string(&row)
+                .unwrap_or_else(|_| { r#"{"native_outcome":"SerializationFailed"}"#.to_owned() })
+        );
+        allowed_reconnects.push(row);
+        assert_eq!(
+            native_outcome, "ConnectedExpectedPeer",
+            "INCONCLUSIVE: allowed diamond edge reconnect did not reach expected peer"
+        );
+    }
+    let after_allowed_reconnect = tokio::time::timeout(
+        Duration::from_secs(5),
+        AssertUnwindSafe(diamond_observations(agents, clock)).catch_unwind(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(strip_peer_scores);
+    eprintln!(
+        "ISSUE613_ALLOWED_EDGE_SETUP {}",
+        serde_json::to_string(&serde_json::json!({
+            "schema":1,
+            "initial_admission":initial_admission,
+            "allowed_reconnects":allowed_reconnects,
+            "after_allowed_reconnect_admission":after_allowed_reconnect,
+            "forbidden_pairs":[["G5","W5"],["D5","O5"]],
+        }))
+        .unwrap_or_else(|_| {
+            r#"{"schema":1,"diagnostic_status":"serialization_failed"}"#.to_owned()
+        })
+    );
     for agent in agents {
         pubsub(agent).refresh_topic_peers().await;
     }
