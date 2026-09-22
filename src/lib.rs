@@ -5761,7 +5761,7 @@ impl Agent {
     /// teardown step, so an aborted leader can neither wedge a snapshot
     /// path in `Retiring` nor let a follower return while the drained
     /// writer is still running.
-    pub async fn shutdown(&self) {
+    pub async fn try_shutdown(&self) -> error::NetworkResult<()> {
         // #765 r4 test instrument: this future was polled. Counted before
         // anything else so a caller parked on the serialize lock below
         // still counts as entered.
@@ -5927,16 +5927,39 @@ impl Agent {
         // keepalive tasks hold the transport (and thus the ant-quic endpoint)
         // alive; the daemon binary survives only by process exit, but an
         // embedded host needs these released to re-`serve()` on the same port.
+        let mut shutdown_errors = Vec::new();
         if let Some(ref runtime) = self.gossip_runtime {
             if let Err(e) = runtime.shutdown().await {
                 tracing::warn!("Gossip runtime shutdown error: {e}");
+                shutdown_errors.push(format!("gossip runtime: {e}"));
             } else {
                 tracing::info!("Gossip runtime shut down");
             }
         }
         if let Some(ref network) = self.network {
-            network.shutdown().await;
-            tracing::info!("Network node shut down");
+            if let Err(e) = network.try_shutdown().await {
+                tracing::warn!("Network node shutdown error: {e}");
+                shutdown_errors.push(format!("network node: {e}"));
+            } else {
+                tracing::info!("Network node shut down");
+            }
+        }
+
+        if shutdown_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(error::NetworkError::NodeError(format!(
+                "agent shutdown incomplete: {}",
+                shutdown_errors.join("; ")
+            )))
+        }
+    }
+
+    /// Compatibility shutdown for callers that cannot consume a typed result.
+    /// Release-sensitive callers must use [`try_shutdown`](Self::try_shutdown).
+    pub async fn shutdown(&self) {
+        if let Err(error) = self.try_shutdown().await {
+            tracing::warn!(%error, "agent shutdown did not fully release its resources");
         }
     }
 
@@ -20014,6 +20037,39 @@ mod tests {
             mdns_enabled: false,
             ..network::NetworkConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn typed_shutdown_returns_and_caches_network_release_failure() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("networked agent");
+        let network = agent.network().expect("network");
+        network.fail_shutdown_for_test("injected socket release failure");
+
+        let first = agent
+            .try_shutdown()
+            .await
+            .expect_err("typed shutdown must propagate the network failure")
+            .to_string();
+        assert!(first.contains("injected socket release failure"));
+        let second = agent
+            .try_shutdown()
+            .await
+            .expect_err("later callers must observe the cached failure")
+            .to_string();
+        assert_eq!(second, first);
+
+        // Source-compatible wrapper remains idempotent and callable after a
+        // typed failure; it logs the same cached outcome.
+        agent.shutdown().await;
     }
 
     #[tokio::test]

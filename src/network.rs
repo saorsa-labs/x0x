@@ -1780,12 +1780,89 @@ pub struct NetworkNode {
     /// in `node.recv()/accept().await` while holding a *read* guard on `node`, so
     /// they must be aborted before `shutdown` can take the *write* lock to drop
     /// the node. Without this, `shutdown` would deadlock on an idle node that
-    /// never receives another packet/connection. (Note: ant-quic frees the bound
-    /// UDP socket only on process exit — saorsa-labs/ant-quic#196.)
+    /// never receives another packet/connection. The typed ant-quic shutdown
+    /// then verifies release of the bound UDP socket before reporting success.
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// One-shot shutdown coordinator shared by every clone. The ant node is
+    /// consumed by shutdown, so both success and failure must remain visible
+    /// after the first caller takes it; concurrent callers wait on this same
+    /// terminal result instead of treating an empty `node` slot as success.
+    shutdown_state: Arc<NetworkShutdownCoordinator>,
+    /// Per-instance typed-shutdown failure injected after real cleanup.
+    #[cfg(test)]
+    shutdown_failure_for_test: Arc<Mutex<Option<String>>>,
     /// Test-only: capture PubSub `send_to_peer` payloads (recording transport).
     #[cfg(test)]
     pubsub_send_capture: Arc<Mutex<Vec<bytes::Bytes>>>,
+}
+
+#[derive(Clone, Debug)]
+enum NetworkShutdownOutcome {
+    Pending,
+    Complete(Result<(), Arc<str>>),
+}
+
+#[derive(Debug)]
+struct NetworkShutdownCoordinator {
+    started: std::sync::atomic::AtomicBool,
+    outcome: tokio::sync::watch::Sender<NetworkShutdownOutcome>,
+}
+
+impl NetworkShutdownCoordinator {
+    fn new() -> Self {
+        let (outcome, _receiver) = tokio::sync::watch::channel(NetworkShutdownOutcome::Pending);
+        Self {
+            started: std::sync::atomic::AtomicBool::new(false),
+            outcome,
+        }
+    }
+
+    async fn run<F>(&self, shutdown: F) -> NetworkResult<()>
+    where
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let mut outcome = self.outcome.subscribe();
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let completion = self.outcome.clone();
+            tokio::spawn(async move {
+                // Keep custody independent of the initiating caller: dropping
+                // or cancelling that caller must not lose the consumed node or
+                // let a later caller manufacture success from an empty slot.
+                let worker = tokio::spawn(shutdown);
+                let result = match worker.await {
+                    Ok(result) => result.map_err(Arc::<str>::from),
+                    Err(error) => Err(Arc::<str>::from(format!(
+                        "network shutdown task failed: {error}"
+                    ))),
+                };
+                completion.send_replace(NetworkShutdownOutcome::Complete(result));
+            });
+        }
+
+        loop {
+            match outcome.borrow_and_update().clone() {
+                NetworkShutdownOutcome::Pending => {}
+                NetworkShutdownOutcome::Complete(Ok(())) => return Ok(()),
+                NetworkShutdownOutcome::Complete(Err(error)) => {
+                    return Err(NetworkError::NodeError(format!(
+                        "network shutdown failed: {error}"
+                    )));
+                }
+            }
+            // The coordinator retains the sender for its whole lifetime, so
+            // closure is not expected. Still fail closed if that invariant is
+            // ever broken rather than spinning or reporting release success.
+            if outcome.changed().await.is_err() {
+                return Err(NetworkError::NodeError(
+                    "network shutdown completion channel closed".to_string(),
+                ));
+            }
+        }
+    }
 }
 
 /// #677 test-only seam: when armed for a node id, THAT node's accept loop
@@ -1975,6 +2052,9 @@ impl NetworkNode {
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
+            shutdown_state: Arc::new(NetworkShutdownCoordinator::new()),
+            #[cfg(test)]
+            shutdown_failure_for_test: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             pubsub_send_capture: Arc::new(Mutex::new(Vec::new())),
         };
@@ -3795,42 +3875,72 @@ impl NetworkNode {
     /// that never receives another packet. After the tasks are aborted (releasing
     /// their read guards and `node` clones), the node is taken and shut down.
     ///
-    /// NOTE: this closes connections but does **not** synchronously free the
-    /// bound UDP socket — ant-quic's endpoint driver releases it only on process
-    /// exit (saorsa-labs/ant-quic#196). In-process callers that restart must bind
-    /// an *ephemeral* QUIC port rather than reuse a fixed one, until that upstream
-    /// fix lands.
+    /// Compatibility wrapper for callers that cannot consume a typed shutdown
+    /// result. Release-sensitive callers must use [`try_shutdown`](Self::try_shutdown).
     pub async fn shutdown(&self) {
-        let handles: Vec<tokio::task::JoinHandle<()>> = match self.background_tasks.lock() {
-            Ok(mut tasks) => tasks.drain(..).collect(),
-            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
-        };
-        for handle in &handles {
-            handle.abort();
+        if let Err(error) = self.try_shutdown().await {
+            warn!(%error, "network shutdown did not fully release its resources");
         }
-        // Await the aborted tasks so their `Node` clones are dropped before we
-        // drop the node here. An aborted task yields `Err(JoinError::Cancelled)`;
-        // that is expected.
-        for handle in handles {
-            let _ = handle.await;
-        }
-        // Take the node out and shut it down explicitly so connections close
-        // deterministically. As of ant-quic 0.27.27 (#196), `Node::shutdown()`
-        // releases the bound endpoint UDP socket in-process (it swaps in a
-        // throwaway ephemeral socket and drops the original), so a same-process
-        // re-bind on the SAME fixed QUIC port works for a single stop→restart
-        // (proven by tests/server_inprocess.rs::serve_tears_down_cleanly_and_rebinds).
-        // The release is NOT perfectly synchronous: the OS FD for the fixed port
-        // closes once the endpoint driver drops its last reference, shortly after
-        // this returns, so a tight zero-gap loop re-binding the same fixed port
-        // may still see "address already in use" — an embedder should retry.
-        let node = {
-            let mut node_guard = self.node.write().await;
-            node_guard.take()
-        };
-        if let Some(node) = node {
-            node.shutdown().await;
-        }
+    }
+
+    /// Gracefully shut down the node and report whether ant-quic released its
+    /// resources. The first call owns the teardown; every concurrent or later
+    /// call observes the same terminal result, including failures.
+    ///
+    /// The teardown worker is detached from the initiating future so caller
+    /// cancellation cannot abandon a consumed ant node or erase its result.
+    pub async fn try_shutdown(&self) -> NetworkResult<()> {
+        let node = Arc::clone(&self.node);
+        let background_tasks = Arc::clone(&self.background_tasks);
+        #[cfg(test)]
+        let shutdown_failure = Arc::clone(&self.shutdown_failure_for_test);
+        self.shutdown_state
+            .run(async move {
+                let handles: Vec<tokio::task::JoinHandle<()>> = match background_tasks.lock() {
+                    Ok(mut tasks) => tasks.drain(..).collect(),
+                    Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+                };
+                for handle in &handles {
+                    handle.abort();
+                }
+                // Await aborted tasks so their Node clones are gone before the
+                // sole owned Node is consumed by ant-quic shutdown.
+                for handle in handles {
+                    let _ = handle.await;
+                }
+
+                let node = {
+                    let mut node_guard = node.write().await;
+                    node_guard.take()
+                };
+                let Some(node) = node else {
+                    return Err(
+                        "network node was absent before shutdown established a result".to_string(),
+                    );
+                };
+                node.try_shutdown()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                #[cfg(test)]
+                if let Some(error) = shutdown_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    return Err(error);
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Inject a terminal failure after the real node teardown completes.
+    #[cfg(test)]
+    pub(crate) fn fail_shutdown_for_test(&self, error: impl Into<String>) {
+        *self
+            .shutdown_failure_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.into());
     }
 
     /// Get a clone of the inner node, returning an error if not initialized.
@@ -5366,8 +5476,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     }
 
     async fn close(&self) -> anyhow::Result<()> {
-        self.shutdown().await;
-        Ok(())
+        self.try_shutdown().await.map_err(anyhow::Error::new)
     }
 
     async fn send_to_peer(
@@ -5812,6 +5921,97 @@ mod tests {
 
     fn test_ant_peer(byte: u8) -> AntPeerId {
         ant_quic::PeerId([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn shutdown_coordinator_runs_once_and_shares_success() {
+        let coordinator = Arc::new(NetworkShutdownCoordinator::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let first_coordinator = Arc::clone(&coordinator);
+        let first_calls = Arc::clone(&calls);
+        let first_release = Arc::clone(&release);
+        let first = tokio::spawn(async move {
+            first_coordinator
+                .run(async move {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    first_release.notified().await;
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.expect("shutdown worker started");
+
+        let second_coordinator = Arc::clone(&coordinator);
+        let second_calls = Arc::clone(&calls);
+        let mut second = Box::pin(second_coordinator.run(async move {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "a second caller that has actually polled must wait for first-call custody"
+        );
+        release.notify_one();
+
+        first
+            .await
+            .expect("first caller joins")
+            .expect("first success");
+        second.await.expect("second caller observes shared success");
+        coordinator
+            .run(async { Err("must not run".to_string()) })
+            .await
+            .expect("later caller observes terminal success");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one shutdown worker");
+    }
+
+    #[tokio::test]
+    async fn shutdown_coordinator_persists_failure_for_every_caller() {
+        let coordinator = NetworkShutdownCoordinator::new();
+        let first = coordinator
+            .run(async { Err("injected release failure".to_string()) })
+            .await
+            .expect_err("first caller receives release failure");
+        let second = coordinator
+            .run(async { Ok(()) })
+            .await
+            .expect_err("consumed node cannot become later success");
+        assert!(first.to_string().contains("injected release failure"));
+        assert_eq!(first.to_string(), second.to_string());
+    }
+
+    #[tokio::test]
+    async fn shutdown_coordinator_keeps_custody_after_initiator_cancellation() {
+        let coordinator = Arc::new(NetworkShutdownCoordinator::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let caller_coordinator = Arc::clone(&coordinator);
+        let caller_release = Arc::clone(&release);
+        let caller = tokio::spawn(async move {
+            caller_coordinator
+                .run(async move {
+                    let _ = started_tx.send(());
+                    caller_release.notified().await;
+                    Err("release failed after caller cancellation".to_string())
+                })
+                .await
+        });
+        started_rx.await.expect("shutdown worker started");
+        caller.abort();
+        let _ = caller.await;
+        release.notify_one();
+
+        let error = coordinator
+            .run(async { Ok(()) })
+            .await
+            .expect_err("later caller receives detached worker result");
+        assert!(error
+            .to_string()
+            .contains("release failed after caller cancellation"));
     }
 
     /// Boundary regression for ant-quic's transport-aware connected snapshot.

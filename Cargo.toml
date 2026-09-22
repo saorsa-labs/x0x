@@ -19,7 +19,7 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
-ant-quic = "0.27.52"
+ant-quic = "=0.27.53"
 # CI pin (2026-09-03): tinyvec 1.13.0 (published 2026-09-03) fails to compile on the
 # pinned rustc 1.95.0 ("cannot find macro `vec`"); Cargo.lock is not committed, so
 # constrain the transitive dep (via ant-quic) until tinyvec or the toolchain moves.
@@ -44,17 +44,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = "=0.5.84"
-saorsa-gossip-crdt-sync = "=0.5.84"
-saorsa-gossip-groups = "=0.5.84"
-saorsa-gossip-identity = "=0.5.84"
-saorsa-gossip-membership = "=0.5.84"
-saorsa-gossip-presence = "=0.5.84"
-saorsa-gossip-pubsub = "=0.5.84"
-saorsa-gossip-rendezvous = "=0.5.84"
-saorsa-gossip-runtime = "=0.5.84"
-saorsa-gossip-transport = "=0.5.84"
-saorsa-gossip-types = "=0.5.84"
+saorsa-gossip-coordinator = "=0.5.85"
+saorsa-gossip-crdt-sync = "=0.5.85"
+saorsa-gossip-groups = "=0.5.85"
+saorsa-gossip-identity = "=0.5.85"
+saorsa-gossip-membership = "=0.5.85"
+saorsa-gossip-presence = "=0.5.85"
+saorsa-gossip-pubsub = "=0.5.85"
+saorsa-gossip-rendezvous = "=0.5.85"
+saorsa-gossip-runtime = "=0.5.85"
+saorsa-gossip-transport = "=0.5.85"
+saorsa-gossip-types = "=0.5.85"
 saorsa-pqc = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -192,6 +192,22 @@ members = [
     ".",
     "tests/harness",
 ]
+
+# Candidate validation only: these exact source revisions are not registry releases.
+# Remove the git patches after the published-crate graph is available and verified.
+[patch.crates-io]
+ant-quic = { git = "https://github.com/saorsa-labs/ant-quic.git", rev = "ca71457b822ba0cd074da4beddda64de8df27962" }
+saorsa-gossip-coordinator = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-crdt-sync = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-groups = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-identity = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-membership = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-presence = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-rendezvous = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-runtime = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-transport = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
+saorsa-gossip-types = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "62eef65f166374d96b33f702a1241fecc6499458" }
 
 # #703: the 100k signing-path test spends most CPU time in Keccak. Optimize
 # only its concrete crypto path and test target; dev and release stay unchanged.
