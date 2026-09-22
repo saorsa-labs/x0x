@@ -262,7 +262,9 @@ LRCONF
             | $SSH root@"$ip" 'cat > /tmp/x0x-result-framing.py.codex && chmod 644 /tmp/x0x-result-framing.py.codex' 2>/dev/null \
            && cat "$RUNNER_INSTALLER" \
             | $SSH root@"$ip" 'cat > /tmp/x0x-install-runner-bundle.sh.codex && chmod 755 /tmp/x0x-install-runner-bundle.sh.codex' 2>/dev/null \
-           && sed -e "s|EnvironmentFile=.*|EnvironmentFile=$RUNNER_ENV_FILE|" \
+           && sed -e "s|^After=x0xd.service$|After=$X0X_SERVICE|" \
+                  -e "s|^Wants=x0xd.service$|Wants=$X0X_SERVICE|" \
+                  -e "s|EnvironmentFile=.*|EnvironmentFile=$RUNNER_ENV_FILE|" \
                   -e "s|ExecStart=.*|ExecStart=/usr/local/bin/x0x-test-runner-$RUNNER_NETWORK.py|" "$RUNNER_UNIT" \
             | $SSH root@"$ip" "cat > /tmp/$RUNNER_UNIT_NAME.codex" 2>/dev/null \
            && $SSH root@"$ip" "
