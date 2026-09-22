@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -131,6 +132,8 @@ class SyntheticProcessCustody:
             raise ValueError("--daemon-binary must be an absolute remote path")
         self.remote, self.binary, self.marker = remote, binary, marker
         self.started: dict[str, Node] = {}
+        # Labels whose recorded daemon identity the stop script proved gone.
+        self.offline: set[str] = set()
 
     @staticmethod
     def validate(node: Node) -> None:
@@ -173,6 +176,7 @@ root=$1 marker=$2 cli=$3
         # The child writes its own durable pid/pgid receipt before exec. If SSH
         # breaks after spawn, finally can still identify and reap this process.
         try:
+            self.offline.discard(node.label)
             self.remote.run(node.host, START_SCRIPT,
                             [node.root, self.marker, self.binary], timeout=15)
         finally:
@@ -182,6 +186,7 @@ root=$1 marker=$2 cli=$3
     def _stop(self, node: Node) -> None:
         self.remote.run(node.host, stop_script(),
                         [node.root, self.marker, self.binary], timeout=15)
+        self.offline.add(node.label)
 
     def stop(self, label: str) -> None:
         node = self.started.get(label)
@@ -206,6 +211,55 @@ root=$1 marker=$2 cli=$3
         self.remote.run(node.host,
                         'set -eu; umask 077; cat >"$1/identity/agent.cert.tmp"; mv "$1/identity/agent.cert.tmp" "$1/identity/agent.cert"',
                         [node.root], input_bytes=certificate)
+
+    def key_fingerprint(self, node: Node) -> str | None:
+        """sha256 of the node's fixture user.key, or None; the key never leaves the host."""
+        self.validate(node)
+        raw = self.remote.run(node.host, r'''set -eu
+root=$1 marker=$2
+[ "$(cat "$root/fixture.marker")" = "$marker" ]
+if [ -e "$root/identity/user.key" ]; then sha256sum "$root/identity/user.key" | awk '{print $1}'; else echo none; fi
+''', [node.root, self.marker], capture=True)
+        value = raw.decode().strip()
+        if value == "none":
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise RuntimeError("invalid synthetic key fingerprint receipt")
+        return value
+
+    def copy_owner_key(self, source: Node, target: Node) -> str:
+        """Install the fixture-generated owner key on a stopped same-owner device.
+
+        The bytes travel only over SSH stdin/stdout; only their sha256 is returned.
+        """
+        self.validate(source); self.validate(target)
+        if source.label == target.label:
+            raise ValueError("owner key copy needs a distinct target device")
+        if target.label in self.started and target.label not in self.offline:
+            raise RuntimeError("owner key may only be installed on a stopped fixture device")
+        key = self.remote.run(source.host, r'''set -eu
+root=$1 marker=$2
+[ "$(cat "$root/fixture.marker")" = "$marker" ]
+[ -s "$root/identity/user.key" ]
+cat "$root/identity/user.key"
+''', [source.root, self.marker], capture=True)
+        if not key:
+            raise RuntimeError("synthetic owner key unavailable")
+        fingerprint = hashlib.sha256(key).hexdigest()
+        try:
+            self.remote.run(target.host, r'''set -eu
+root=$1 marker=$2
+[ "$(cat "$root/fixture.marker")" = "$marker" ]
+[ ! -e "$root/identity/user.key" ]
+umask 077
+cat >"$root/identity/user.key.tmp"
+mv "$root/identity/user.key.tmp" "$root/identity/user.key"
+''', [target.root, self.marker], input_bytes=key)
+        finally:
+            del key
+        if self.key_fingerprint(target) != fingerprint:
+            raise RuntimeError("synthetic owner key copy did not verify")
+        return fingerprint
 
     def token(self, node: Node) -> str:
         raw = self.remote.run(node.host, r'''set -eu
@@ -298,8 +352,14 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
     owner_id = home.get("owner_user_id")
     evidence.check("synthetic Home owner id", isinstance(owner_id, str) and len(owner_id) == 64)
 
-    certified = args.nodes[1:4]
-    for label in certified:
+    # Home admission needs each device's own user-identity announcement, which
+    # requires the owner key on that device; every Home device is therefore a
+    # same-owner device that is ALSO issued its own owner certificate.
+    owner_key_sha = custody.key_fingerprint(nodes[owner])
+    evidence.check("synthetic owner key fingerprint recorded", owner_key_sha is not None,
+                   owner_key_sha256=owner_key_sha)
+
+    def certify_same_owner_device(label: str) -> None:
         card_status, card = clients[label].request("GET", "/agent/card")
         public_key = card.get("agent_public_key")
         evidence.check(f"{label} signed card exposes public key", card_status == 200
@@ -312,6 +372,9 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
         evidence.check(f"owner certifies {label}", issue_status == 200 and isinstance(certificate, str),
                        status=issue_status)
         custody.write_certificate(nodes[label], certificate)
+        fingerprint = custody.copy_owner_key(nodes[owner], nodes[label])
+        evidence.check(f"{label} holds the synthetic owner key", fingerprint == owner_key_sha,
+                       owner_key_sha256=fingerprint)
         custody.start(nodes[label])
         poll(f"{label} restarts certified", args.poll_timeout,
              lambda label=label: clients[label].request("GET", "/health"),
@@ -320,26 +383,43 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
                                                     {"include_user_identity": True, "human_consent": True})
         evidence.check(f"{label} publishes owner certificate", announce_status in (200, 201), status=announce_status)
 
+    for label in args.nodes[1:4]:
+        certify_same_owner_device(label)
+
     writer, late, revoked, outsider = args.nodes[1:5]
+    evidence.check("outsider holds no owner key before denial",
+                   custody.key_fingerprint(nodes[outsider]) is None)
     invite_status, invite_body = owner_api.request("POST", "/home/seat", {"agent_id": clients[outsider].agent_id()})
     evidence.check("owner may address uncertified outsider", invite_status == 200, status=invite_status)
     denied_status, _ = clients[outsider].request("POST", "/groups/join", {
         "invite": invite_body.get("invite"), "mode": "home", "expected_owner_user_id": owner_id})
     evidence.check("uncertified outsider is refused Home", denied_status == 403, status=denied_status)
 
+    # Only after the refusal is proven does the fifth device become the second
+    # owner-key device: it is the promoted Admin that admits the late device
+    # while the original owner device is offline.
+    admin = outsider
+    certify_same_owner_device(admin)
+
     scenario = Scenario(clients, evidence, args.poll_timeout)
     stopped: set[str] = set()
     def stop_owner() -> None: custody.stop(owner); stopped.add(owner)
+    def stop_admin() -> None: custody.stop(admin); stopped.add(admin)
+    def is_offline(label: str) -> bool:
+        # True only after custody's stop script proved the recorded process gone.
+        return label in custody.offline
     def restart_writer(gid: str, expected: set[str]) -> None:
         status, body = clients[writer].request("GET", f"/groups/{enc(gid)}/members")
         active = active_provider_ids(status, body)
         evidence.check("exact synthetic retained providers", active == expected,
                        active_count=len(active), expected_count=len(expected))
+        evidence.check("owner and admin devices stopped before writer restart",
+                       is_offline(owner) and is_offline(admin))
         custody.stop(late); stopped.add(late); custody.restart(writer)
         poll("writer health after isolated restart", 60,
              lambda: clients[writer].request("GET", "/health"),
              lambda result: result[0] == 200 and result[1].get("ok") is True)
-    scenario.run_home(owner, writer, late, revoked, stop_owner, restart_writer)
+    scenario.run_home(owner, writer, late, admin, revoked, stop_owner, stop_admin, is_offline, restart_writer)
     return True
 
 
@@ -373,6 +453,7 @@ def main() -> int:
         try:
             with open(args.report, "w", encoding="utf-8") as output:
                 json.dump({"scenario": "synthetic-home", "custody": resources.get("manifest"),
+                           "stores": evidence.stores, "polls": evidence.polls,
                            "assertions": evidence.assertions}, output, indent=2)
         except Exception: succeeded = False
     return 0 if succeeded and all(row["passed"] for row in evidence.assertions) else 1

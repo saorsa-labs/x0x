@@ -187,11 +187,15 @@ class Scenario:
         aid = self.c[member].agent_id()
         promoted = self.ok(owner, "PATCH", f"/groups/{enc(gid)}/members/{aid}/role", {"role": "admin"})
         self.e.check(f"owner promotes {member} to admin", promoted.get("role") == "admin", role=promoted.get("role"))
-        poll(f"{member} admin role on {member}", self.timeout,
-             lambda: self.c[member].request("GET", f"/groups/{enc(gid)}/members"),
+        self.await_admin(member, member, gid)
+
+    def await_admin(self, observer: str, member: str, gid: str) -> None:
+        aid = self.c[member].agent_id()
+        poll(f"{member} admin role on {observer}", self.timeout,
+             lambda: self.c[observer].request("GET", f"/groups/{enc(gid)}/members"),
              lambda result: result[0] == 200 and any(row.get("agent_id") == aid and row.get("role") == "admin"
                                                      for row in result[1].get("members", [])),
-             lambda facts, _last: self.e.record_poll(facts, operation="role", node=member,
+             lambda facts, _last: self.e.record_poll(facts, operation="role", node=observer,
                                                        group_id=safe_identifier(gid), role="admin"))
 
     def open_store(self, node: str, gid: str, app: str) -> dict[str, Any]:
@@ -247,7 +251,8 @@ class Scenario:
         self.await_absent(observer, sid, forbidden)
 
     def run(self, owner: str, writer: str, late: str, outsider: str, revoked: str,
-            stop_owner: Callable[[], None], restart_writer: Callable[[str], None]) -> None:
+            stop_owner: Callable[[], None], restart_writer: Callable[[str], None], *,
+            stop_admin: Callable[[], None], offline: Callable[[str], bool]) -> None:
         created = self.ok(owner, "POST", "/groups", {"name": f"kv-e2e-{uuid.uuid4().hex[:10]}", "preset": "public_open"})
         gid = created.get("group_id") or (created.get("group") or {}).get("id")
         self.e.check("group id returned", isinstance(gid, str) and bool(gid))
@@ -291,10 +296,20 @@ class Scenario:
         self.e.check("revoked mutation refused", denied[0] in (403, 404), status=denied[0])
         self.e.check("revoked key absent before barrier", before[0] == 404)
         self.prove_denied_did_not_converge(owner, writer, stores["wiki"], "forbidden")
-        self.promote_admin(owner, writer, gid)
-        late_invite = self.invite(writer, late, gid)
+        # Decision B: the writer stays a plain Member throughout. A separate Admin
+        # (the former outsider) is the late invite's inviter, so its signed
+        # MemberAdded can reach the plain-Member writer while the owner is offline.
+        self.join(owner, outsider, gid)
+        self.promote_admin(owner, outsider, gid)
+        self.await_admin(writer, outsider, gid)
+        late_invite = self.invite(outsider, late, gid)
         stop_owner()
         self.join(writer, late, gid, late_invite)
+        # History must now come only from the plain-Member writer.
+        stop_admin()
+        owner_offline, admin_offline = offline(owner), offline(outsider)
+        self.e.check("owner and admin offline before late history", owner_offline and admin_offline,
+                     owner_offline=owner_offline, admin_offline=admin_offline)
         for app, sid in stores.items():
             reopened = self.open_store(late, gid, app)
             self.e.check(f"late deterministic {app} identity", reopened.get("id") == sid)
@@ -397,18 +412,25 @@ def main() -> int:
         actor_ids = {node: clients[node].agent_id() for node in args.nodes}
         if len(set(actor_ids.values())) != 5:
             raise RuntimeError("scenario requires five distinct daemon agent identities")
+        stopped: set[str] = set()
         def stop_owner() -> None:
-            custody.stop(owner)
+            custody.stop(owner); stopped.add(owner)
+        def stop_admin() -> None:
+            custody.stop(outsider); stopped.add(outsider)
+        def offline(node: str) -> bool:
+            return node in stopped and not service(endpoints[node], "is-active")
         def restart_writer(gid: str) -> None:
             status, roster = clients[writer].request("GET", f"/groups/{enc(gid)}/members")
             active = active_provider_ids(status, roster)
-            expected = {actor_ids[owner], actor_ids[writer], actor_ids[late]}
+            expected = {actor_ids[owner], actor_ids[writer], actor_ids[late], actor_ids[outsider]}
             evidence.check("eligible retained providers established", active == expected,
                            active_count=len(active), expected_count=len(expected))
+            evidence.check("owner and admin offline before writer restart", offline(owner) and offline(outsider))
             custody.stop(late)
             custody.restart(writer)
             await_health(writer)
-        Scenario(clients, evidence, args.poll_timeout).run(owner, writer, late, outsider, revoked, stop_owner, restart_writer)
+        Scenario(clients, evidence, args.poll_timeout).run(owner, writer, late, outsider, revoked, stop_owner, restart_writer,
+                                                           stop_admin=stop_admin, offline=offline)
         succeeded = True
     except Exception as error:
         evidence.assertions.append({"label": "harness", "passed": False,

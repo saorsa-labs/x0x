@@ -65,11 +65,16 @@ class Scenario(SharedScenario):
              lambda result: result[0] == 200
              and any(row.get("agent_id") == aid for row in result[1].get("members", [])))
 
-    def exercise(self, label: str, owner: str, writer: str, late: str, revoked: str,
-                 gid: str, late_invite: str, join_late: Callable[[], None],
-                 stop_owner: Callable[[], None], restart_writer: Callable[[str, set[str]], None]) -> None:
+    def exercise(self, label: str, owner: str, writer: str, late: str, admin: str, revoked: str,
+                 gid: str, admit_admin: Callable[[], None], mint_late: Callable[[], str],
+                 join_late: Callable[[str], None], stop_owner: Callable[[], None],
+                 stop_admin: Callable[[], None], is_offline: Callable[[str], bool],
+                 restart_writer: Callable[[str, set[str]], None],
+                 before_admission: Callable[[], None] | None = None,
+                 admission_offline_label: str | None = None,
+                 history_offline_label: str | None = None) -> None:
         stores: dict[str, str] = {}
-        actor_ids = {node: self.c[node].agent_id() for node in (owner, writer, late)}
+        actor_ids = {node: self.c[node].agent_id() for node in (owner, writer, late, admin)}
         key_prefix = f"x0x-e2e-{uuid.uuid4().hex}"
         owner_key, member_key, removed_key, forbidden_key = (
             f"{key_prefix}-owner", f"{key_prefix}-member", f"{key_prefix}-removed",
@@ -100,12 +105,27 @@ class Scenario(SharedScenario):
         self.e.check(f"{label} revoked mutation refused", denied[0] in (403, 404), status=denied[0])
         self.prove_denied_did_not_converge(owner, writer, stores["wiki"], forbidden_key)
 
-        # The late invite is minted before the creator goes offline. The join
-        # and retained encrypted/tombstone recovery must then be served by the
-        # remaining member; no creator request can answer after stop_owner.
+        # Only the invite's online inviter can author the signed MemberAdded, so
+        # the late invite comes from a separately admitted, promoted Admin and is
+        # minted after the removal. The writer stays a plain Member: it witnesses
+        # the Admin's commit while the owner is offline, then the Admin is stopped
+        # too so retained encrypted/tombstone history can only come from the writer.
+        admit_admin()
+        self.promote_admin(owner, admin, gid)
+        # The plain-Member writer must observe the Admin role before the late
+        # invite exists, so its roster witness cannot race permission propagation.
+        self.await_admin(writer, admin, gid)
+        if before_admission is not None:
+            before_admission()
+        late_invite = mint_late()
         self.e.check(f"{label} late invite retained", late_invite.startswith("x0x://invite/"))
         stop_owner()
-        join_late()
+        if admission_offline_label is not None:
+            self.e.check(admission_offline_label, is_offline(owner))
+        join_late(late_invite)
+        stop_admin()
+        self.e.check(history_offline_label or f"{label} owner and admin stopped before late history",
+                     is_offline(owner) and is_offline(admin))
         for app, sid in stores.items():
             reopened = self.open_store(late, gid, app)
             self.e.check(f"{label} late {app} identity", reopened.get("id") == sid)
@@ -121,30 +141,55 @@ class Scenario(SharedScenario):
             self.await_value(writer, sid, member_key, f"{label}-member-{app}")
             self.await_absent(writer, sid, removed_key)
 
-    def run_private(self, owner: str, writer: str, late: str, revoked: str,
-                    stop_owner: Callable[[], None], restart_writer: Callable[[str, set[str]], None]) -> None:
+    def run_private(self, owner: str, writer: str, late: str, admin: str, revoked: str,
+                    stop_owner: Callable[[], None], stop_admin: Callable[[], None],
+                    is_offline: Callable[[str], bool],
+                    restart_writer: Callable[[str, set[str]], None]) -> None:
         created = self.ok(owner, "POST", "/groups", {
             "name": f"private-kv-e2e-{uuid.uuid4().hex[:10]}", "preset": "private_secure"})
         gid = created.get("group_id") or (created.get("group") or {}).get("id")
         self.e.check("private_secure group id returned", isinstance(gid, str) and bool(gid))
         self.join_private(owner, writer, gid)
         self.join_private(owner, revoked, gid)
-        late_invite = self.invite(owner, late, gid)
-        self.exercise("private_secure", owner, writer, late, revoked, gid, late_invite,
-                      lambda: self.join_private(writer, late, gid, late_invite), stop_owner, restart_writer)
+        self.exercise("private_secure", owner, writer, late, admin, revoked, gid,
+                      lambda: self.join_private(owner, admin, gid),
+                      lambda: self.invite(admin, late, gid),
+                      lambda invite: self.join_private(writer, late, gid, invite),
+                      stop_owner, stop_admin, is_offline, restart_writer)
 
-    def run_home(self, owner: str, writer: str, late: str, revoked: str,
-                 stop_owner: Callable[[], None], restart_writer: Callable[[str, set[str]], None]) -> None:
+    def run_home(self, owner: str, writer: str, late: str, admin: str, revoked: str,
+                 stop_owner: Callable[[], None], stop_admin: Callable[[], None],
+                 is_offline: Callable[[str], bool],
+                 restart_writer: Callable[[str, set[str]], None]) -> None:
         gid, owner_id = self.home(owner)
-        for node in (writer, late, revoked):
+        for node in (writer, late, revoked, admin):
             self.require_home_identity(node, owner_id)
         writer_invite = self.home_invite(owner, writer, gid, owner_id)
         revoked_invite = self.home_invite(owner, revoked, gid, owner_id)
-        late_invite = self.home_invite(owner, late, gid, owner_id)
         self.join_home(owner, writer, gid, owner_id, writer_invite)
         self.join_home(owner, revoked, gid, owner_id, revoked_invite)
-        self.exercise("home", owner, writer, late, revoked, gid, late_invite,
-                      lambda: self.join_home(writer, late, gid, owner_id, late_invite), stop_owner, restart_writer)
+
+        # Every Home device holds the owner key (Home admission needs each
+        # device's own user-identity announcement), so the writer's witness
+        # status rests on its role: a Member cannot mint, only the Admin can.
+        def writer_is_member() -> None:
+            writer_id = self.c[writer].agent_id()
+            status, body = self.c[owner].request("GET", f"/groups/{enc(gid)}/members")
+            role = next((row.get("role") for row in body.get("members", [])
+                         if isinstance(row, dict) and row.get("agent_id") == writer_id), None)
+            self.e.check("home writer remains Member role", status == 200 and role == "member",
+                         status=status, role=role)
+
+        self.exercise("home", owner, writer, late, admin, revoked, gid,
+                      lambda: self.join_home(owner, admin, gid, owner_id,
+                                             self.home_invite(owner, admin, gid, owner_id)),
+                      lambda: self.home_invite(admin, late, gid, owner_id),
+                      lambda invite: self.join_home(writer, late, gid, owner_id, invite),
+                      stop_owner, stop_admin, is_offline, restart_writer,
+                      before_admission=writer_is_member,
+                      admission_offline_label="original owner device offline during admission",
+                      history_offline_label=("owner and admin devices offline during history; "
+                                             "history served by same-owner Member-role device"))
 
 
 def main() -> int:
@@ -153,7 +198,7 @@ def main() -> int:
     parser.add_argument("--tokens-file", required=True)
     parser.add_argument("--scenario", action="append", choices=["private_secure", "home"], required=True)
     parser.add_argument("--nodes", nargs=5, default=NODES_DEFAULT[:5],
-                        metavar=("OWNER", "WRITER", "LATE", "OUTSIDER", "REVOKED"))
+                        metavar=("OWNER", "WRITER", "LATE", "ADMIN", "REVOKED"))
     parser.add_argument("--local-port-base", type=int, default=23700)
     parser.add_argument("--poll-timeout", type=float, default=120)
     parser.add_argument("--allow-service-restart", action="store_true")
@@ -192,7 +237,7 @@ def main() -> int:
             tunnel = start_ssh_tunnel(ip, args.local_port_base + index, remote_port=13600)
             tunnels[node] = tunnel
             clients[node] = Api(f"http://127.0.0.1:{tunnel.local_port}", token)
-        owner, writer, late, _outsider, revoked = args.nodes
+        owner, writer, late, admin, revoked = args.nodes
         identities = {node: clients[node].agent_id() for node in args.nodes}
         if len(set(identities.values())) != 5:
             raise RuntimeError("scenario requires five distinct daemon agent identities")
@@ -205,20 +250,31 @@ def main() -> int:
                 custody.stop(owner)
                 stopped.add(owner)
 
+            def stop_admin() -> None:
+                custody.stop(admin)
+                stopped.add(admin)
+
+            def is_offline(node: str) -> bool:
+                return not __import__("e2e_vps_kv").service(endpoints[node], "is-active")
+
             def restart_writer(gid: str, expected: set[str]) -> None:
                 status, roster = clients[writer].request("GET", f"/groups/{enc(gid)}/members")
                 active = active_provider_ids(status, roster)
                 evidence.check(f"{selected} exact retained providers established", active == expected,
                                active_count=len(active), expected_count=len(expected))
+                evidence.check(f"{selected} owner and admin stopped before writer restart",
+                               is_offline(owner) and is_offline(admin))
                 custody.stop(late)
                 stopped.add(late)
                 custody.restart(writer)
                 await_health(writer)
 
             if selected == "private_secure":
-                scenario.run_private(owner, writer, late, revoked, stop_owner, restart_writer)
+                scenario.run_private(owner, writer, late, admin, revoked, stop_owner, stop_admin,
+                                     is_offline, restart_writer)
             else:
-                scenario.run_home(owner, writer, late, revoked, stop_owner, restart_writer)
+                scenario.run_home(owner, writer, late, admin, revoked, stop_owner, stop_admin,
+                                  is_offline, restart_writer)
             # Scenarios are isolated and explicit. Restore their stopped nodes
             # before starting the next scenario on the same five identities.
             for node in sorted(stopped):
@@ -242,7 +298,8 @@ def main() -> int:
                 succeeded = False
         try:
             with open(args.report, "w", encoding="utf-8") as output:
-                json.dump({"scenario": args.scenario, "assertions": evidence.assertions}, output, indent=2)
+                json.dump({"scenario": args.scenario, "stores": evidence.stores, "polls": evidence.polls,
+                           "assertions": evidence.assertions}, output, indent=2)
         except Exception:
             succeeded = False
     return 0 if succeeded and all(item["passed"] for item in evidence.assertions) else 1

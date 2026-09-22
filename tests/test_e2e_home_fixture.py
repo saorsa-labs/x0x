@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -167,56 +171,219 @@ esac
                                   api_port_base=14600, quic_port_base=7483, local_port_base=24700,
                                   poll_timeout=20)
 
-    def test_full_preparation_certifies_only_members_and_proves_outsider_denial(self):
+    def run_model(self, fixture=None, scenario_cls=None):
+        """Run the REAL run_fixture -> run_home -> exercise ordering against a stateful model.
+
+        The model encodes the product facts the harness depends on: a Home join is
+        admitted only by an online inviter, POST /home/seat needs the owner key and an
+        Admin seat, user-identity announce needs the owner key, and an uncertified,
+        keyless device is refused (403).
+        """
+        h = fixture or self.h
         args = self.args(); evidence = self.h.Evidence(); resources = {}
         tokens = {n: (f"192.0.2.{i}", "unused") for i, n in enumerate(args.nodes, 1)}
+        ids = {n: (str(i) * 64) for i, n in enumerate(args.nodes, 1)}
+        owner_user, gid, owner_key = "f" * 64, "home-gid", "k" * 64
+        events: list[tuple] = []
+        world = {"seats": {"owner": "admin"}, "certs": set(), "announced": set(), "invites": {}, "kv": {}}
+
         class Custody:
             instance = None
-            def __init__(self, *_args): self.stopped = set(); self.certs = []; Custody.instance = self
+            def __init__(self, *_args):
+                self.offline, self.keys, self.started = set(), {}, set(); Custody.instance = self
             def prepare(self, *_args): pass
-            def create_owner_key(self, *_args): pass
-            def start(self, node): self.stopped.discard(node.label)
-            def stop(self, label): self.stopped.add(label)
-            def restart(self, label): self.stopped.discard(label)
-            def write_certificate(self, node, cert): self.certs.append((node.label, cert))
+            def create_owner_key(self, node, *_args): self.keys[node.label] = owner_key
+            def start(self, node):
+                self.offline.discard(node.label); self.started.add(node.label); events.append(("start", node.label))
+            def stop(self, label):
+                if label not in self.started: raise RuntimeError("unowned")
+                self.offline.add(label); events.append(("stop", label))
+            def restart(self, label): self.stop(label); self.offline.discard(label); events.append(("start", label))
+            def write_certificate(self, node, _cert): world["certs"].add(node.label)
+            def key_fingerprint(self, node):
+                events.append(("keycheck", node.label)); return self.keys.get(node.label)
+            def copy_owner_key(self, source, target):
+                if target.label in self.keys or target.label not in self.offline:
+                    raise RuntimeError("key copy refused")
+                self.keys[target.label] = self.keys[source.label]; events.append(("copy", target.label))
+                return self.keys[target.label]
             def token(self, _node): return "synthetic-token"
             def hashes(self, node): return (str(args.nodes.index(node.label) + 1) * 64, "f" * 64)
             def restore(self): return []
+
+        def online(label): return label not in Custody.instance.offline
+
         class Client:
-            def __init__(self, label): self.label = label; self.calls = []
+            def __init__(self, label): self.label = label
             def agent_id(self):
-                if self.label in Custody.instance.stopped: raise AssertionError("stopped identity queried")
-                return (str(args.nodes.index(self.label) + 1) * 64)[:64]
+                if not online(self.label): raise AssertionError(f"stopped {self.label} identity queried")
+                return ids[self.label]
             def request(self, method, path, body=None):
-                if self.label in Custody.instance.stopped: raise AssertionError("stopped daemon queried")
-                self.calls.append((method, path, body))
-                if path == "/home": return 200, {"state": "local", "owner_user_id": "f" * 64,
+                me = self.label
+                if not online(me): raise AssertionError(f"stopped {me} daemon queried")
+                events.append(("req", me, method, path))
+                seats = world["seats"]
+                keyed = me in Custody.instance.keys
+                if path == "/home": return 200, {"state": "local", "group_id": gid, "owner_user_id": owner_user,
                                                     "primary_agent": {"verified": True}}
-                if path == "/agent/card": return 200, {"agent_public_key": f"pub-{self.label}"}
+                if path == "/health": return 200, {"ok": True}
+                if path == "/agent/card": return 200, {"agent_public_key": f"pub-{me}"}
+                if path == "/agent/user-id": return 200, {"ok": True, "user_id": owner_user if keyed else None}
                 if path == "/owner/agents/issue": return 200, {"certificate": {"storage_b64": "Y2VydA=="}}
-                if path == "/home/seat": return 200, {"invite": "x0x://invite/outsider"}
-                if path == "/groups/join": return 403, {"ok": False}
-                if path.endswith("/members"):
-                    return 200, {"members": [{"agent_id": (str(i) * 64)[:64]} for i in (1, 2, 3)]}
-                return 200, {"ok": True}
+                if path == "/announce":
+                    if not (keyed and me in world["certs"]): return 400, {"ok": False}
+                    world["announced"].add(me); return 200, {"ok": True}
+                if path == "/home/seat":
+                    target = next(n for n, i in ids.items() if i == body["agent_id"])
+                    if not keyed or seats.get(me) != "admin": return 403, {"ok": False}
+                    invite = f"x0x://invite/{me}-{target}"; world["invites"][invite] = me
+                    return 200, {"ok": True, "group_id": gid, "owner_user_id": owner_user,
+                                 "intended_joiner": ids[target], "seated": False, "invite": invite}
+                if path == "/groups/join":
+                    if me not in world["announced"]: return 403, {"ok": False}
+                    if online(world["invites"][body["invite"]]): seats[me] = "member"
+                    return 200, {"ok": True, "group_id": gid}
+                members = f"/groups/{gid}/members"
+                if path == members:
+                    return 200, {"members": [{"agent_id": ids[n], "role": r} for n, r in seats.items()]}
+                if method == "PATCH" and path.startswith(members + "/"):
+                    target = next(n for n, i in ids.items() if i in path)
+                    seats[target] = body["role"]; return 200, {"ok": True, "role": body["role"]}
+                if method == "DELETE" and path.startswith(members + "/"):
+                    seats.pop(next(n for n, i in ids.items() if i in path)); return 200, {"ok": True}
+                if path == f"/groups/{gid}/stores":
+                    if me not in seats: return 403, {"ok": False}
+                    return 200, {"ok": True, "id": f"sid-{body['name']}", "store_id": "0" * 64}
+                if path.startswith("/stores/"):
+                    if me not in seats: return 403, {"ok": False}
+                    if method == "PUT": world["kv"][path] = body["value"]; return 200, {"ok": True}
+                    if method == "DELETE": world["kv"].pop(path, None); return 200, {"ok": True}
+                    if path in world["kv"]: return 200, {"ok": True, "value": world["kv"][path]}
+                    return 404, {"ok": False}
+                raise AssertionError(f"unmodelled request {method} {path}")
+
+        def fake_poll(label, _timeout, probe, accept, receipt=None):
+            result = probe()
+            if not accept(result): raise AssertionError(f"{label}: condition not met")
+            return result
+
         clients = {n: Client(n) for n in args.nodes}
         tunnels = [mock.Mock(local_port=24700 + i) for i in range(5)]
-        def scenario(_self, owner, writer, late, revoked, stop_owner, restart_writer):
-            self.assertEqual((owner, writer, late, revoked), tuple(args.nodes[:4]))
-            stop_owner(); restart_writer("gid", {clients[n].agent_id() for n in ("writer", "late")}
-                                                  | {("1" * 64)})
-        with mock.patch.object(self.h, "load_tokens", return_value=tokens), \
-             mock.patch.object(self.h, "SyntheticProcessCustody", Custody), \
-             mock.patch.object(self.h, "start_ssh_tunnel", side_effect=tunnels), \
-             mock.patch.object(self.h, "Api", side_effect=[clients[n] for n in args.nodes]), \
-             mock.patch.object(self.h.Scenario, "run_home", autospec=True, side_effect=scenario), \
-             mock.patch.object(self.h.uuid, "uuid4", return_value=mock.Mock(hex="a" * 32)):
-            self.assertTrue(self.h.run_fixture(args, mock.Mock(), evidence, resources))
-        self.assertEqual(["writer", "late", "revoked"], [label for label, _ in Custody.instance.certs])
-        outsider_join = [c for c in clients["outsider"].calls if c[1] == "/groups/join"]
-        self.assertEqual(1, len(outsider_join))
-        self.assertIn("owner", Custody.instance.stopped)
-        self.assertIn("late", Custody.instance.stopped)
+        patches = [mock.patch.object(h, "load_tokens", return_value=tokens),
+                   mock.patch.object(h, "SyntheticProcessCustody", Custody),
+                   mock.patch.object(h, "start_ssh_tunnel", side_effect=tunnels),
+                   mock.patch.object(h, "Api", side_effect=[clients[n] for n in args.nodes]),
+                   mock.patch.object(h, "poll", fake_poll),
+                   mock.patch("e2e_vps_kv.poll", fake_poll),
+                   mock.patch("e2e_vps_private_kv.poll", fake_poll),
+                   mock.patch.object(h.uuid, "uuid4", return_value=mock.Mock(hex="a" * 32))]
+        if scenario_cls is not None:
+            patches.append(mock.patch.object(h, "Scenario", scenario_cls))
+            patches.append(mock.patch.object(sys.modules[scenario_cls.__module__], "poll", fake_poll))
+        error = None
+        with contextlib.ExitStack() as stack:
+            for patch in patches: stack.enter_context(patch)
+            try:
+                h.run_fixture(args, mock.Mock(), evidence, resources)
+            except AssertionError as caught:
+                error = caught
+        return events, Custody.instance, world, evidence, error
+
+    def test_full_preparation_certifies_same_owner_devices_and_proves_outsider_denial(self):
+        events, custody, world, evidence, error = self.run_model()
+        self.assertIsNone(error)
+        self.assertTrue(all(row["passed"] for row in evidence.assertions))
+        # Every Home device holds the SAME fixture owner key and a certificate.
+        self.assertEqual({"owner", "writer", "late", "revoked", "outsider"}, set(custody.keys))
+        self.assertEqual(1, len(set(custody.keys.values())))
+        self.assertEqual({"writer", "late", "revoked", "outsider"}, world["certs"])
+        # The 403 negative happens before any key reaches the fifth node.
+        denial = events.index(("req", "outsider", "POST", "/groups/join"))
+        self.assertLess(events.index(("keycheck", "outsider")), denial)
+        self.assertLess(denial, events.index(("copy", "outsider")))
+        labels = [row["label"] for row in evidence.assertions]
+        self.assertIn("uncertified outsider is refused Home", labels)
+        self.assertIn("original owner device offline during admission", labels)
+        self.assertIn("owner and admin devices offline during history; "
+                      "history served by same-owner Member-role device", labels)
+        self.assertIn("home writer remains Member role", labels)
+        # Writer is never promoted; the outsider-turned-admin is.
+        patches = [e for e in events if e[:3] == ("req", "owner", "PATCH")]
+        self.assertEqual(1, len(patches)); self.assertIn("5" * 64, patches[0][3])
+        self.assertEqual("member", world["seats"]["writer"])
+        # Ordering chain through the real run_home/exercise. Certification also
+        # stops devices, so the admin stop and writer restart are the LAST stops.
+        def last(event): return len(events) - 1 - events[::-1].index(event)
+        late_seat = [i for i, e in enumerate(events) if e[:2] == ("req", "outsider") and e[3] == "/home/seat"][-1]
+        # The plain-Member writer observes the Admin role after promotion and
+        # before the late invite is minted (its roster read in that window).
+        writer_sees_admin = next(i for i in range(events.index(patches[0]), late_seat)
+                                 if events[i][:4] == ("req", "writer", "GET", "/groups/home-gid/members"))
+        chain = [next(i for i, e in enumerate(events) if e[:3] == ("req", "owner", "DELETE")),
+                 events.index(patches[0]), writer_sees_admin, late_seat, events.index(("stop", "owner")),
+                 events.index(("req", "late", "POST", "/groups/join")), last(("stop", "outsider")),
+                 next(i for i, e in enumerate(events) if e[:2] == ("req", "late") and "/stores" in e[3]),
+                 last(("stop", "writer"))]
+        self.assertEqual(sorted(chain), chain)
+        self.assertEqual({"owner", "writer", "late", "outsider"}, set(world["seats"]))
+
+    def test_revert_controls_fail(self):
+        tests = Path(__file__).parent
+        def mutant(path, name, *edits):
+            source = (tests / path).read_text()
+            for old, new in edits:
+                if source.count(old) != 1: raise AssertionError(f"anchor not unique: {old!r}")
+                source = source.replace(old, new)
+            module = types.ModuleType(name); module.__file__ = str(tests / path)
+            sys.modules[name] = module; exec(compile(source, str(tests / path), "exec"), module.__dict__)
+            return module
+        fixture = "e2e_home_fixture.py"; harness = "e2e_vps_private_kv.py"
+        cases = {
+            "announce without owner key": (mutant(fixture, "m_nokey", (
+                "        fingerprint = custody.copy_owner_key(nodes[owner], nodes[label])\n",
+                "        fingerprint = owner_key_sha\n")), None),
+            "outsider keyed before denial": (mutant(fixture, "m_early", (
+                "    admin = outsider\n    certify_same_owner_device(admin)\n", "    admin = outsider\n"), (
+                "    evidence.check(\"outsider holds no owner key before denial\",",
+                "    certify_same_owner_device(outsider)\n    evidence.check(\"outsider holds no owner key before denial\",")),
+                None),
+            "history before admin stop": (None, mutant(harness, "m_hist", (
+                """        stop_admin()
+        self.e.check(history_offline_label""", """        self.e.check(history_offline_label"""), (
+                "        expected = set(actor_ids.values())\n",
+                "        stop_admin()\n        expected = set(actor_ids.values())\n")).Scenario),
+            "late seat minted by owner after stop": (None, mutant(harness, "m_owner", (
+                "lambda: self.home_invite(admin, late, gid, owner_id)",
+                "lambda: self.home_invite(owner, late, gid, owner_id)")).Scenario),
+            "late seat minted by writer": (None, mutant(harness, "m_writer", (
+                "lambda: self.home_invite(admin, late, gid, owner_id)",
+                "lambda: self.home_invite(writer, late, gid, owner_id)")).Scenario),
+        }
+        for name, (fixture_module, scenario_cls) in cases.items():
+            with self.subTest(revert=name):
+                _events, _custody, _world, evidence, error = self.run_model(fixture_module, scenario_cls)
+                failed = error is not None or not all(row["passed"] for row in evidence.assertions)
+                self.assertTrue(failed, f"revert {name} was not detected")
+
+    def test_copy_owner_key_validates_custody_and_never_returns_key_bytes(self):
+        remote = mock.Mock()
+        custody = self.h.SyntheticProcessCustody(remote, "/opt/x0x/x0xd", "m" * 32)
+        owner, target = self.node("owner"), self.node("writer")
+        custody.started["writer"] = target
+        with self.assertRaises(RuntimeError):
+            custody.copy_owner_key(owner, target)  # running device refused
+        custody.offline.add("writer")
+        key = b"synthetic-owner-key"
+        digest = hashlib.sha256(key).hexdigest()
+        remote.run.side_effect = [key, b"", (digest + "\n").encode()]
+        self.assertEqual(digest, custody.copy_owner_key(owner, target))
+        read, write, verify = remote.run.call_args_list
+        self.assertIn("fixture.marker", read.args[1]); self.assertTrue(read.kwargs["capture"])
+        self.assertEqual(key, write.kwargs["input_bytes"])
+        self.assertIn("umask 077", write.args[1]); self.assertIn('[ ! -e "$root/identity/user.key" ]', write.args[1])
+        self.assertIn("user.key.tmp", write.args[1]); self.assertNotIn(key.decode(), " ".join(write.args[2]))
+        with self.assertRaises(ValueError):
+            custody.copy_owner_key(owner, owner)
 
     def test_partial_provision_and_report_failure_still_cleanup_every_resource(self):
         custody = mock.Mock(); custody.restore.return_value = []
@@ -232,6 +399,42 @@ esac
              mock.patch("builtins.open", side_effect=OSError("report")):
             self.assertEqual(1, self.h.main())
         custody.restore.assert_called_once_with(); stop.assert_called_once_with(tunnel)
+
+    def test_main_report_exports_stores_polls_and_custody_for_gui_acceptance(self):
+        # Root GUI acceptance must work from the frozen report alone: group and
+        # store IDs plus page keys from evidence.stores, convergence receipts
+        # from evidence.polls, custody hash receipts from the manifest.
+        manifest = {"run_id": "a" * 32, "network_id": f"x0x.home.e2e.{'a' * 32}",
+                    "binary_sha256": "b" * 64, "config_sha256": {"owner": "c" * 64}}
+        def populate(_args, _remote, evidence, resources):
+            resources["manifest"] = manifest
+            evidence.check("home writer remains Member role", True, role="member")
+            for app in ("wiki", "web"):
+                evidence.record_store("writer", "home-gid", app,
+                                      {"id": f"topic-{app}", "store_id": "0" * 64})
+            evidence.record_poll({"label": "late roster on owner", "outcome": "accepted"},
+                                 operation="role", node="writer", group_id="home-gid", role="admin")
+            return True
+        with tempfile.TemporaryDirectory(prefix="home-fixture-report-") as root:
+            report = Path(root) / "report.json"
+            argv = ["fixture", "--network", "synthetic-home", "--hosts-file", "hosts",
+                    "--nodes", "a", "b", "c", "d", "e", "--daemon-binary", "/x0xd",
+                    "--cli-binary", "/x0x", "--report", str(report)]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(self.h, "run_fixture", side_effect=populate):
+                self.assertEqual(0, self.h.main())
+            data = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual({"scenario", "custody", "stores", "polls", "assertions"}, set(data))
+        self.assertEqual("synthetic-home", data["scenario"])
+        self.assertEqual(manifest, data["custody"])
+        self.assertEqual([{"node": "writer", "group_id": "home-gid", "app": app,
+                           "topic": f"topic-{app}", "store_id": "0" * 64}
+                          for app in ("wiki", "web")], data["stores"])
+        self.assertEqual([{"operation": "role", "node": "writer", "group_id": "home-gid",
+                           "role": "admin", "label": "late roster on owner",
+                           "outcome": "accepted"}], data["polls"])
+        self.assertTrue(data["assertions"])
+        self.assertTrue(all(row["passed"] for row in data["assertions"]))
 
 
 if __name__ == "__main__": unittest.main()

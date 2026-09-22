@@ -108,89 +108,123 @@ class FakeNodeApi:
 
 
 class OnlineInviterOrderingTests(unittest.TestCase):
+    """Decision B: a separate online Admin (the former outsider) mints the late
+    invite; the writer stays a plain Member and is the only history source."""
     NODES = ("owner", "writer", "late", "outsider", "revoked")
-    WRITER_AS_MEMBER_LABELS = ("writer writes wiki", "writer writes web",
-                               "active nonwriter mutation refused", "valid barrier write accepted")
 
     @classmethod
     def setUpClass(cls): cls.kv = load_harness()
 
-    def run_scenario(self, old_owner_minted_late_invite=False):
+    def run_scenario(self, revert=None):
         world = FakeWorld(self.NODES)
+        log = world.timeline
         evidence = self.kv.Evidence()
         scenario = self.kv.Scenario({node: world.client(node) for node in self.NODES}, evidence)
-        polls, events = [], []
-        real_poll, real_invite = self.kv.poll, scenario.invite
+        polls = []
+        real_poll, real_invite, real_promote = self.kv.poll, scenario.invite, scenario.promote_admin
+        real_check, real_record_poll = evidence.check, evidence.record_poll
+        def check(label, condition, **facts):
+            log.append(("@check", label)); real_check(label, condition, **facts)
+        def record_poll(facts, **context):
+            log.append(("@poll", facts["label"], context.get("node"), facts["outcome"]))
+            real_record_poll(facts, **context)
         def spy_poll(label, timeout, *args):
-            polls.append((label, timeout, len(world.timeline)))
+            polls.append((label, timeout))
             return real_poll(label, timeout, *args)
         def invite(owner, member, gid):
-            if old_owner_minted_late_invite and member == "late": owner = "owner"
-            events.append(("invite", owner, member))
+            if revert == "owner_minted" and member == "late": owner = "owner"
             return real_invite(owner, member, gid)
+        def promote_admin(owner, member, gid):
+            return real_promote(owner, "writer" if revert == "writer_promoted" else member, gid)
         def stop_owner():
-            events.append(("stop_owner",)); world.online.discard("owner")
+            log.append(("@stop_owner",)); world.online.discard("owner")
+        def stop_admin():
+            log.append(("@stop_admin",))
+            if revert != "history_before_stop_admin": world.online.discard("outsider")
+        def offline(node): return node not in world.online
         def restart_writer(gid):
-            events.append(("restart_writer",))
+            log.append(("@restart_writer",))
             active = self.kv.active_provider_ids(*world.request("writer", "GET", f"/groups/{gid}/members", None))
             evidence.check("eligible retained providers established",
-                           active == {world.aid(n) for n in ("owner", "writer", "late")})
+                           active == {world.aid(n) for n in ("owner", "writer", "late", "outsider")})
+            evidence.check("owner and admin offline before writer restart", offline("owner") and offline("outsider"))
         clock = FakeClock()
+        error = None
         with mock.patch.object(self.kv, "poll", spy_poll), mock.patch.object(scenario, "invite", invite), \
+             mock.patch.object(scenario, "promote_admin", promote_admin), \
+             mock.patch.object(evidence, "check", check), mock.patch.object(evidence, "record_poll", record_poll), \
              mock.patch.object(self.kv.time, "monotonic", clock.monotonic), \
              mock.patch.object(self.kv.time, "sleep", clock.sleep):
-            error = None
             try:
-                scenario.run(*self.NODES, stop_owner, restart_writer)
+                scenario.run(*self.NODES, stop_owner, restart_writer, stop_admin=stop_admin, offline=offline)
             except AssertionError as caught:
                 error = caught
-        return world, evidence, polls, events, error
+        return world, evidence, polls, error
 
-    def test_promotion_follows_every_writer_as_member_assertion(self):
-        world, evidence, _polls, _events, error = self.run_scenario()
-        self.assertIsNone(error)
-        labels = [item["label"] for item in evidence.assertions]
-        promoted = labels.index("owner promotes writer to admin")
-        for label in self.WRITER_AS_MEMBER_LABELS:
-            self.assertLess(max(i for i, name in enumerate(labels) if name == label), promoted, label)
-        patch = next(i for i, call in enumerate(world.timeline) if call[1] == "PATCH")
-        self.assertEqual(("owner", "PATCH"), world.timeline[patch][:2])
-        writer_puts = [call for call in world.timeline[:patch] if call[0] == "writer" and call[1] == "PUT"]
-        self.assertTrue(writer_puts)
-        self.assertTrue(all(call[3] == "member" for call in writer_puts))
-        role_poll = next(p for p in evidence.polls if p["operation"] == "role")
-        self.assertEqual(("accepted", "writer", "admin"), (role_poll["outcome"], role_poll["node"], role_poll["role"]))
+    @staticmethod
+    def first(log, predicate):
+        return next(i for i, entry in enumerate(log) if predicate(entry))
 
-    def test_late_invite_is_minted_by_promoted_admin_after_promotion(self):
-        world, _evidence, _polls, events, error = self.run_scenario()
-        self.assertIsNone(error)
-        self.assertIn(("invite", "writer", "late"), events)
-        self.assertNotIn(("invite", "owner", "late"), events)
-        patch = next(i for i, call in enumerate(world.timeline) if call[1] == "PATCH")
-        late_invite = next(i for i, call in enumerate(world.timeline)
-                           if call[:2] == ("writer", "POST") and call[2].endswith("/invite"))
-        self.assertLess(patch, late_invite)
-        self.assertEqual("admin", world.timeline[late_invite][3])
+    def ordering(self, log):
+        f = lambda pred: self.first(log, pred)
+        return [
+            ("outsider negatives", f(lambda e: e == ("@check", "outsider mutation refused"))),
+            ("revocation negatives", f(lambda e: e == ("@check", "revoked key absent before barrier"))),
+            ("outsider join", f(lambda e: e[:3] == ("outsider", "POST", "/groups/join"))),
+            ("promote outsider", f(lambda e: e == ("@check", "owner promotes outsider to admin"))),
+            ("promotion on writer", f(lambda e: e[:3] == ("@poll", "outsider admin role on writer", "writer"))),
+            ("admin invite", f(lambda e: e[:2] == ("outsider", "POST") and e[2].endswith("/invite"))),
+            ("stop_owner", f(lambda e: e == ("@stop_owner",))),
+            ("late join", f(lambda e: e[:3] == ("late", "POST", "/groups/join"))),
+            ("writer roster poll", f(lambda e: e == ("@poll", "late roster on owner", "writer", "accepted"))),
+            ("stop_admin", f(lambda e: e == ("@stop_admin",))),
+            ("offline check", f(lambda e: e == ("@check", "owner and admin offline before late history"))),
+            ("first late history read", f(lambda e: e[0] == "late" and "/stores" in e[2])),
+            ("restart", f(lambda e: e == ("@restart_writer",))),
+        ]
 
-    def test_owner_stops_before_late_join_and_roster_poll_uses_unchanged_timeout(self):
-        world, evidence, polls, events, error = self.run_scenario()
+    def test_decision_b_ordering_is_enforced(self):
+        world, _evidence, _polls, error = self.run_scenario()
         self.assertIsNone(error)
-        self.assertLess(events.index(("stop_owner",)), events.index(("restart_writer",)))
-        late_join = next(i for i, call in enumerate(world.timeline) if call[:3] == ("late", "POST", "/groups/join"))
-        self.assertFalse(any(call[0] == "owner" for call in world.timeline[late_join:]))
-        label, timeout, _ = next(p for p in polls if p[0] == "late roster on owner")
-        self.assertEqual(120, timeout)
-        roster = [p for p in evidence.polls if p["label"] == label]
-        self.assertEqual([("writer", "accepted")], [(p["node"], p["outcome"]) for p in roster])
-        self.assertTrue(all(p[1] == 120 for p in polls))
+        steps = self.ordering(world.timeline)
+        for (before, i), (after, j) in zip(steps, steps[1:]):
+            self.assertLess(i, j, f"{before} must precede {after}")
+
+    def test_writer_is_never_promoted_and_outsider_mints_late_invite(self):
+        world, evidence, _polls, error = self.run_scenario()
+        self.assertIsNone(error)
+        self.assertNotIn("owner promotes writer to admin", [a["label"] for a in evidence.assertions])
+        writer_roles = [e[3] for e in world.timeline if not e[0].startswith("@") and e[3] is not None]
+        self.assertTrue(writer_roles)
+        self.assertEqual({"member"}, set(writer_roles))
+        invites = [e for e in world.timeline if len(e) > 2 and e[1] == "POST" and e[2].endswith("/invite")]
+        self.assertEqual("outsider", invites[-1][0])
+        self.assertEqual(("outsider", "g1"), world.invites[max(world.invites)])
+
+    def test_restart_expects_outsider_provider_and_all_polls_keep_timeout(self):
+        _world, evidence, polls, error = self.run_scenario()
+        self.assertIsNone(error)
+        labels = [a["label"] for a in evidence.assertions if a["passed"]]
+        self.assertIn("eligible retained providers established", labels)
+        self.assertIn("owner and admin offline before writer restart", labels)
+        self.assertTrue(polls)
+        self.assertTrue(all(timeout == 120 for _label, timeout in polls))
+
+    def test_revert_history_read_before_stop_admin_fails(self):
+        _world, _evidence, _polls, error = self.run_scenario("history_before_stop_admin")
+        self.assertIsNotNone(error)
+        self.assertIn("owner and admin offline before late history", str(error))
 
     def test_revert_owner_minted_late_invite_times_out_on_writer_roster(self):
-        _world, evidence, _polls, _events, error = self.run_scenario(old_owner_minted_late_invite=True)
+        _world, evidence, _polls, error = self.run_scenario("owner_minted")
         self.assertIsNotNone(error)
         self.assertIn("late roster on owner did not converge in 120s", str(error))
         last = evidence.polls[-1]
-        self.assertEqual(("late roster on owner", "writer", "timeout"), (last["label"], last["node"], last["outcome"]))
+        self.assertEqual(("writer", "timeout"), (last["node"], last["outcome"]))
 
+    def test_revert_writer_promoted_fails(self):
+        _world, _evidence, _polls, error = self.run_scenario("writer_promoted")
+        self.assertIsNotNone(error)
 
 class KvHarnessTests(unittest.TestCase):
     @classmethod
