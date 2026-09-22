@@ -1,0 +1,56 @@
+name: Issue 623 Dial Contention Proof
+
+on:
+  push:
+    branches:
+      - codex/623-dial-contention-proof
+
+permissions:
+  contents: read
+
+jobs:
+  offline-controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 -m unittest scripts/ci/test_issue623_dial_contention.py
+
+  controlled-load:
+    needs: offline-controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [baseline, candidate]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144
+
+      - name: Build once, apply 5x effective CPU load, and run ten isolated trials
+        id: proof
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/issue623-${{ matrix.arm }}"
+          python3 scripts/ci/issue623-dial-contention.py \
+            --arm '${{ matrix.arm }}' \
+            --output "$output"
+
+      - name: Upload closed proof receipt
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue623-${{ matrix.arm }}-receipt
+          path: ${{ runner.temp }}/issue623-${{ matrix.arm }}/receipt.json
+          if-no-files-found: error
+
+      - name: Enforce arm result after artifact upload
+        if: always()
+        run: test '${{ steps.proof.outcome }}' = success
