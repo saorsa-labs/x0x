@@ -1,0 +1,199 @@
+name: Issue 759 plain cargo lib acceptance
+
+on:
+  push:
+    branches: [codex/759-plain-cargo-acceptance]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-759-plain-cargo-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plain-cargo-lib:
+    name: Plain cargo test --lib
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      SOURCE_HEAD: 18fd89e276932237022b09c597b0ab4a49560f71
+      SOURCE_TREE: 2d0aeff9d5402173040d956fbc1e36b26c20c645
+    steps:
+      # The workflow lives on the one-off branch, but the tested checkout is
+      # the immutable current-main object reviewed for #759 closure.
+      - uses: actions/checkout@v5
+        with:
+          ref: 18fd89e276932237022b09c597b0ab4a49560f71
+          fetch-depth: 1
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Bind source and resolve dependencies
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          test -z "$(git status --porcelain)"
+          cargo generate-lockfile
+          lock_sha=$(sha256sum Cargo.lock | awk '{print $1}')
+          printf 'lock_sha=%s\n' "$lock_sha" >> "$GITHUB_OUTPUT"
+          tracked_status=$(git status --porcelain --untracked-files=no)
+          test -z "$tracked_status"
+
+      - name: Cache Cargo inputs and target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: issue759-${{ runner.os }}-rust-1.95.0-${{ steps.source.outputs.lock_sha }}
+
+      - name: Fetch the resolved graph before network isolation
+        run: cargo fetch --locked
+
+      - name: Build and identify the lib-test executable
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_log="$RUNNER_TEMP/issue759-build.jsonl"
+          cargo test --locked --lib --no-run --message-format=json-render-diagnostics \
+            | tee "$build_log"
+          python3 - "$build_log" "$RUNNER_TEMP/issue759-binary.json" <<'PY'
+          import hashlib, json, pathlib, sys
+          candidates = []
+          for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+              try:
+                  row = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              executable = row.get("executable") if isinstance(row, dict) else None
+              target = row.get("target") if isinstance(row, dict) else None
+              profile = row.get("profile") if isinstance(row, dict) else None
+              if (row.get("reason") == "compiler-artifact" and isinstance(executable, str)
+                      and isinstance(target, dict) and target.get("name") == "x0x"
+                      and target.get("kind") == ["lib"] and isinstance(profile, dict)
+                      and profile.get("test") is True):
+                  candidates.append(pathlib.Path(executable))
+          if len(candidates) != 1 or not candidates[0].is_file():
+              raise SystemExit(f"expected one x0x lib-test executable, found {len(candidates)}")
+          binary = candidates[0]
+          receipt = {"binary_name": binary.name,
+                     "sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(receipt, sort_keys=True) + "\n")
+          pathlib.Path(sys.argv[2]).with_suffix(".path").write_text(str(binary.resolve()) + "\n")
+          PY
+
+      - name: Run unfiltered default-parallel plain cargo lib suite
+        id: plain_test
+        shell: bash
+        env:
+          X0X_ISOLATION_ROLE: issue759-plain-cargo-lib
+          X0X_RUNTIME_TIMEOUT_SECONDS: 21600
+        run: |
+          set +e
+          python3 scripts/ci/isolated-runtime.py cargo test --lib \
+            >"$RUNNER_TEMP/issue759-test.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/issue759-test.log"
+          printf 'native_exit=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Collect closed custody receipt
+        if: always()
+        shell: bash
+        env:
+          LOCK_SHA: ${{ steps.source.outputs.lock_sha }}
+          TEST_OUTCOME: ${{ steps.plain_test.outcome }}
+          TEST_NATIVE_EXIT: ${{ steps.plain_test.outputs.native_exit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          out = root / "issue759-plain-cargo-receipt"
+          out.mkdir(mode=0o700)
+          def read_json(path):
+              return json.loads(path.read_text())
+          isolation = sorted(root.glob("x0x-isolation-*"))
+          errors = []
+          admitted = exit_row = supervisor = role = None
+          if len(isolation) == 1:
+              evidence = isolation[0]
+              try:
+                  admitted = read_json(evidence / "admission.json")
+                  exit_row = read_json(evidence / "exit.json")
+                  supervisor = read_json(evidence / "supervisor.json")
+                  role = read_json(evidence / "role.json")
+              except (OSError, ValueError, json.JSONDecodeError):
+                  errors.append("ISOLATION_RECEIPT_INVALID")
+          else:
+              errors.append("ISOLATION_RECEIPT_COUNT")
+          binary_path = root / "issue759-binary.json"
+          binary = read_json(binary_path) if binary_path.is_file() else None
+          if binary is None:
+              errors.append("BINARY_RECEIPT_MISSING")
+          else:
+              private_path_file = binary_path.with_suffix(".path")
+              try:
+                  private_path = pathlib.Path(private_path_file.read_text().strip())
+                  after_sha = hashlib.sha256(private_path.read_bytes()).hexdigest()
+                  binary["post_test_sha256"] = after_sha
+                  if after_sha != binary.get("sha256"):
+                      errors.append("BINARY_CHANGED_DURING_TEST")
+              except OSError:
+                  errors.append("BINARY_POST_TEST_MISSING")
+          native = (int(os.environ["TEST_NATIVE_EXIT"])
+                    if os.environ.get("TEST_NATIVE_EXIT", "").isdigit() else None)
+          if not re.fullmatch(r"[0-9a-f]{64}", os.environ.get("LOCK_SHA", "")):
+              errors.append("LOCK_IDENTITY_INVALID")
+          if not isinstance(admitted, dict) or admitted.get("namespace_changed") is not True:
+              errors.append("ISOLATION_ADMISSION_INVALID")
+          if not isinstance(exit_row, dict) or exit_row.get("exit") != native:
+              errors.append("ISOLATION_EXIT_MISMATCH")
+          if (not isinstance(supervisor, dict) or supervisor.get("reason") is not None
+                  or supervisor.get("child_reaped") is not True
+                  or supervisor.get("child_exit") != native):
+              errors.append("ISOLATION_CLEANUP_INVALID")
+          if not isinstance(role, dict) or role.get("role") != "issue759-plain-cargo-lib":
+              errors.append("ISOLATION_ROLE_INVALID")
+          receipt = {
+              "schema": "x0x.issue759-plain-cargo/1",
+              "workflow_commit": os.environ["GITHUB_SHA"],
+              "source_head": os.environ["SOURCE_HEAD"],
+              "source_tree": os.environ["SOURCE_TREE"],
+              "lock_sha256": os.environ.get("LOCK_SHA", ""),
+              "binary": binary,
+              "test_outcome": os.environ.get("TEST_OUTCOME", ""),
+              "native_exit": native,
+              "isolation": {"admission": admitted, "exit": exit_row,
+                            "supervisor": supervisor, "role": role},
+              "errors": errors,
+          }
+          (out / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          for source, name in ((root / "issue759-test.log", "test.log"),
+                               (root / "issue759-build.jsonl", "build.jsonl")):
+              if source.is_file():
+                  shutil.copyfile(source, out / name)
+          if errors:
+              raise SystemExit(";".join(errors))
+          PY
+
+      - name: Upload acceptance custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue759-plain-cargo-custody
+          path: ${{ runner.temp }}/issue759-plain-cargo-receipt/
+          if-no-files-found: error
+          retention-days: 14
