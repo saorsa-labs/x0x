@@ -20,8 +20,13 @@ KINDS = ("eager", "ihave", "iwant", "anti_entropy")
 BUS = "a746d680e31732d1"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-PUBSUB_VERSION = "0.5.84"
-PUBSUB_SHA = "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"
+REGISTRY_PUBSUB_VERSION = "0.5.84"
+REGISTRY_PUBSUB_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+REGISTRY_PUBSUB_SHA = "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"
+GIT_PUBSUB_VERSION = "0.5.85"
+GIT_PUBSUB_URL = "https://github.com/saorsa-labs/saorsa-gossip.git"
+GIT_PUBSUB_REV = "62eef65f166374d96b33f702a1241fecc6499458"
+GIT_PUBSUB_SOURCE = f"git+{GIT_PUBSUB_URL}?rev={GIT_PUBSUB_REV}#{GIT_PUBSUB_REV}"
 
 
 class Inconclusive(ValueError):
@@ -38,23 +43,41 @@ def integer(value):
     return value
 
 
+def reviewed_producer(package):
+    """Only the two exact source graphs whose meter implementations were compared."""
+    return (
+        package.get("version") == REGISTRY_PUBSUB_VERSION
+        and package.get("source") == REGISTRY_PUBSUB_SOURCE
+        and package.get("checksum") == REGISTRY_PUBSUB_SHA
+    ) or (
+        package.get("version") == GIT_PUBSUB_VERSION
+        and package.get("source") == GIT_PUBSUB_SOURCE
+        and "checksum" not in package
+    )
+
+
 def validate_source_premise(cargo_bytes, rust_bytes):
-    """Bind this evidence premise to the workspace pin and Rust producer check."""
-    dependencies = tomllib.loads(cargo_bytes.decode()).get("dependencies", {})
-    require(
-        dependencies.get("saorsa-gossip-pubsub") == f"={PUBSUB_VERSION}",
-        "WORKSPACE_PUBSUB_PIN_MISMATCH",
-    )
+    """Bind the workspace pin and Rust producer check to the reviewed graphs."""
+    manifest = tomllib.loads(cargo_bytes.decode())
+    pin = manifest.get("dependencies", {}).get("saorsa-gossip-pubsub")
+    patch = manifest.get("patch", {}).get("crates-io", {}).get("saorsa-gossip-pubsub")
+    if pin == f"={REGISTRY_PUBSUB_VERSION}":
+        require(patch is None, "WORKSPACE_PUBSUB_PATCH_MISMATCH")
+    elif pin == f"={GIT_PUBSUB_VERSION}":
+        require(patch == {"git": GIT_PUBSUB_URL, "rev": GIT_PUBSUB_REV}, "WORKSPACE_PUBSUB_PATCH_MISMATCH")
+    else:
+        raise Inconclusive("WORKSPACE_PUBSUB_PIN_MISMATCH")
     rust = rust_bytes.decode()
-    versions = re.findall(
-        r'pinned\[0\]\["version"\]\.as_str\(\) != Some\("([^"]+)"\)', rust
-    )
-    checksums = re.findall(
-        r'pinned\[0\]\["checksum"\]\.as_str\(\)\s*!= Some\("([0-9a-f]{64})"\)',
-        rust,
-    )
-    require(versions == [PUBSUB_VERSION], "RUST_PUBSUB_VERSION_MISMATCH")
-    require(checksums == [PUBSUB_SHA], "RUST_PUBSUB_SHA_MISMATCH")
+    for name, expected in (
+        ("REGISTRY_PUBSUB_VERSION", REGISTRY_PUBSUB_VERSION),
+        ("REGISTRY_PUBSUB_SOURCE", REGISTRY_PUBSUB_SOURCE),
+        ("REGISTRY_PUBSUB_SHA", REGISTRY_PUBSUB_SHA),
+        ("GIT_PUBSUB_VERSION", GIT_PUBSUB_VERSION),
+        ("GIT_PUBSUB_SOURCE", GIT_PUBSUB_SOURCE),
+    ):
+        values = re.findall(rf'const {name}: &str =\s*"([^"]+)";', rust)
+        require(values == [expected], f"RUST_{name}_MISMATCH")
+        require(rust.count(name) >= 2, f"RUST_{name}_UNUSED")
 
 
 LABELS = ("G5", "D5", "O5", "W5")
@@ -208,7 +231,7 @@ def derive(record, lock_bytes):
     require(hashlib.sha256(lock_bytes).hexdigest() == record["build_lock_sha256"], "BUILD_LOCK_MISMATCH")
     require(HEX64.fullmatch(record["binary_sha256"]) is not None, "BINARY_HASH_MISSING")
     packages = [p for p in tomllib.loads(lock_bytes.decode())["package"] if p["name"] == "saorsa-gossip-pubsub"]
-    require(len(packages) == 1 and packages[0]["version"] == PUBSUB_VERSION and packages[0]["checksum"] == PUBSUB_SHA, "PRODUCER_PIN_MISMATCH")
+    require(len(packages) == 1 and reviewed_producer(packages[0]), "PRODUCER_PIN_MISMATCH")
     require(0 < len(record["universe"]) <= 64, "UNIVERSE_BOUND")
     full, allowed = set(), set()
     for topic in record["universe"]:

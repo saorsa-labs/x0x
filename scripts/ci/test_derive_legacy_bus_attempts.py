@@ -10,7 +10,10 @@ import unittest
 spec = importlib.util.spec_from_file_location("derive501", Path(__file__).with_name("derive-legacy-bus-attempts.py"))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.PUBSUB_VERSION + '"\nchecksum="' + module.PUBSUB_SHA + '"\n').encode()
+LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.REGISTRY_PUBSUB_VERSION
+        + '"\nsource="' + module.REGISTRY_PUBSUB_SOURCE + '"\nchecksum="' + module.REGISTRY_PUBSUB_SHA + '"\n').encode()
+GIT_LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.GIT_PUBSUB_VERSION
+            + '"\nsource="' + module.GIT_PUBSUB_SOURCE + '"\n').encode()
 
 
 def fixture():
@@ -77,20 +80,47 @@ class DerivationControls(unittest.TestCase):
         )
 
     def test_source_premise_drift_is_rejected(self):
-        cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.84"\n'
-        rust = (
-            b'pinned[0]["version"].as_str() != Some("0.5.84")\n'
-            b' || pinned[0]["checksum"].as_str()\n'
-            b' != Some("ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3")'
-        )
-        module.validate_source_premise(cargo, rust)
+        workspace = Path(__file__).resolve().parents[2]
+        cargo = (workspace / "Cargo.toml").read_bytes()
+        rust = (workspace / "src/legacy_bus_interop_tests.rs").read_bytes()
+        registry_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.84"\n'
+        module.validate_source_premise(registry_cargo, rust)
         for cargo_input, rust_input, code in (
-            (cargo.replace(b"=0.5.84", b"0.5.84"), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
-            (cargo, rust.replace(b"0.5.84", b"0.5.83", 1), "RUST_PUBSUB_VERSION_MISMATCH"),
-            (cargo, rust.replace(b"ed849e", b"0d849e", 1), "RUST_PUBSUB_SHA_MISMATCH"),
+            (cargo.replace(b'saorsa-gossip-pubsub = "=0.5.85"',
+                           b'saorsa-gossip-pubsub = "=0.5.84"'), rust, "WORKSPACE_PUBSUB_PATCH_MISMATCH"),
+            (cargo.replace(b'saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "'
+                           + module.GIT_PUBSUB_REV.encode() + b'" }',
+                           b'saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "'
+                           + b"0" * 40 + b'" }'), rust, "WORKSPACE_PUBSUB_PATCH_MISMATCH"),
+            (registry_cargo.replace(b'=0.5.84', b'0.5.84'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (cargo, rust.replace(b'const GIT_PUBSUB_VERSION: &str = "0.5.85"',
+                                 b'const GIT_PUBSUB_VERSION: &str = "0.5.86"'), "RUST_GIT_PUBSUB_VERSION_MISMATCH"),
+            (cargo, rust.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64, 1), "RUST_REGISTRY_PUBSUB_SHA_MISMATCH"),
         ):
             with self.subTest(code=code), self.assertRaisesRegex(module.Inconclusive, code):
                 module.validate_source_premise(cargo_input, rust_input)
+
+    def test_exact_registry_and_git_producer_sources(self):
+        for lock in (LOCK, GIT_LOCK):
+            record = fixture()
+            record["build_lock_sha256"] = hashlib.sha256(lock).hexdigest()
+            self.assertEqual(module.derive(record, lock)["derivation"], "CONSISTENT")
+        invalid = (
+            GIT_LOCK.replace(module.GIT_PUBSUB_REV.encode(), b"0" * 40, 1),
+            GIT_LOCK.replace(b'0.5.85', b'0.5.86'),
+            GIT_LOCK + b'checksum="' + module.REGISTRY_PUBSUB_SHA.encode() + b'"\n',
+            GIT_LOCK.replace(b'source="', b'unknown="'),
+            GIT_LOCK + GIT_LOCK,
+            LOCK.replace(module.REGISTRY_PUBSUB_SOURCE.encode(), b'registry+https://example.invalid'),
+            LOCK.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64),
+        )
+        for lock in invalid:
+            record = fixture()
+            record["build_lock_sha256"] = hashlib.sha256(lock).hexdigest()
+            with self.subTest(lock_sha256=record["build_lock_sha256"]), self.assertRaisesRegex(
+                module.Inconclusive, "PRODUCER_PIN_MISMATCH"
+            ):
+                module.derive(record, lock)
 
     def test_actual_positive_arithmetic_and_absent_zero(self):
         result = module.derive(module.parse(output(fixture())), LOCK)
