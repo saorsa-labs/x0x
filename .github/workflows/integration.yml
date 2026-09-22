@@ -409,6 +409,77 @@ jobs:
           path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
           if-no-files-found: error
 
+  # Issue #613: retain exact published IDs versus typed application inbox
+  # deliveries for the full-mesh control and the administratively cut diamond.
+  integration-legacy-bus-application-delivery:
+    name: 'Integration (legacy bus application delivery, #613)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144
+      - name: Build exact library test binary
+        run: cargo test --all-features --lib --no-run
+      - name: Run exact typed-delivery selectors
+        env:
+          X0X_ISOLATION_ROLE: acceptance
+        run: |
+          root="$RUNNER_TEMP/issue613-application-delivery"
+          mkdir -p "$root"
+          set +e
+          RUNNER_TEMP="$root" bash scripts/ci/nextest-isolated.sh --locked --all-features --lib -- \
+            --run-ignored ignored-only --test-threads 1 --no-tests=fail --success-output immediate \
+            -E 'test(=legacy_bus_interop_tests::paired_application_delivery_ids_no_disconnect_control) | test(=legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut)' \
+            > "$root/test.log" 2>&1
+          status=$?
+          set -e
+          cat "$root/test.log"
+          printf '%s\n' "$status" > "$root/test.exit"
+          exit "$status"
+      - name: Validate and retain #613 receipts
+        id: issue613_receipt
+        if: always()
+        run: |
+          root="$RUNNER_TEMP/issue613-application-delivery"
+          python3 scripts/ci/validate-613-application-delivery.py \
+            "$root/test.log" "$root/application-delivery-receipt.json"
+      - name: Collect isolation custody
+        id: issue613_custody
+        if: always()
+        env:
+          X0X_CUSTODY_ROOT: ${{ runner.temp }}/issue613-application-delivery
+          X0X_CUSTODY_EXPECT: success
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: x0x
+        run: RUNNER_TEMP="$X0X_CUSTODY_ROOT" python3 scripts/ci/isolation-custody-collect.py "$X0X_CUSTODY_ROOT/custody"
+      - name: Upload #613 retained evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: issue613-application-delivery
+          path: |
+            ${{ runner.temp }}/issue613-application-delivery/test.log
+            ${{ runner.temp }}/issue613-application-delivery/test.exit
+            ${{ runner.temp }}/issue613-application-delivery/application-delivery-receipt.json
+            ${{ runner.temp }}/issue613-application-delivery/custody/custody-receipt.json
+          if-no-files-found: error
+
   # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
   integration-net:
     name: Integration (net)

@@ -598,6 +598,535 @@ async fn paired_controlled_load_bus_eager_attempts_default_vs_optout() {
     run(Case::Measurement).await;
 }
 
+const ISSUE613_MESSAGES: u64 = 200;
+const ISSUE613_PAYLOAD_BYTES: usize = 4096;
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct Issue613Record {
+    pair: &'static str,
+    destination: u8,
+    sequence: u64,
+    request_id: String,
+    invoked_ns: u64,
+    ack_ns: Option<u64>,
+    delivered_ns: Option<u64>,
+    fanout: Option<u32>,
+    attempted_peer_sends: Option<u64>,
+    wire_bytes: usize,
+}
+
+fn issue613_credit_delivery(
+    record: &mut Issue613Record,
+    actual: &DmTypedPayload,
+    sender_agent: crate::identity::AgentId,
+    sender_machine: crate::identity::MachineId,
+    run: [u8; 16],
+    destination: u8,
+    delivered_ns: u64,
+) {
+    assert_eq!(
+        record.destination, destination,
+        "receiver/pair destination changed"
+    );
+    assert_eq!(
+        record.pair,
+        if destination == 1 { "G5>D5" } else { "G5>O5" }
+    );
+    assert_eq!(hex::encode(actual.request_id), record.request_id);
+    assert_eq!(actual.sender, sender_agent);
+    assert_eq!(actual.machine_id, sender_machine);
+    assert!(actual.verified);
+    assert_eq!(actual.trust_decision, Some(TrustDecision::Accept));
+    issue613_validate_payload(&actual.payload, run, destination, record.sequence);
+    assert!(delivered_ns >= record.invoked_ns);
+    assert!(
+        record.delivered_ns.replace(delivered_ns).is_none(),
+        "duplicate typed delivery"
+    );
+}
+
+fn issue613_payload(run: [u8; 16], destination: u8, sequence: u64) -> Vec<u8> {
+    let mut payload = vec![0x61; ISSUE613_PAYLOAD_BYTES];
+    payload[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut offset = PREFIX.len();
+    payload[offset..offset + 16].copy_from_slice(&run);
+    offset += 16;
+    payload[offset] = destination;
+    offset += 1;
+    payload[offset..offset + 8].copy_from_slice(&sequence.to_be_bytes());
+    payload
+}
+
+fn issue613_validate_payload(payload: &[u8], run: [u8; 16], destination: u8, sequence: u64) {
+    assert_eq!(payload.len(), ISSUE613_PAYLOAD_BYTES);
+    assert_eq!(&payload[..PREFIX.len()], PREFIX);
+    let mut offset = PREFIX.len();
+    assert_eq!(&payload[offset..offset + 16], run.as_slice());
+    offset += 16;
+    assert_eq!(payload[offset], destination);
+    offset += 1;
+    assert_eq!(&payload[offset..offset + 8], &sequence.to_be_bytes());
+    assert!(payload[offset + 8..].iter().all(|byte| *byte == 0x61));
+}
+
+fn issue613_assert_full_mesh(observed: &serde_json::Value, agents: &[Agent]) {
+    use std::collections::BTreeSet;
+    let expected = agents
+        .iter()
+        .map(|agent| hex::encode(agent.machine_id().0))
+        .collect::<BTreeSet<_>>();
+    for (index, label) in DIAMOND_LABELS.iter().enumerate() {
+        let actual = observed[*label]["admitted"]
+            .as_array()
+            .expect("full-mesh peers")
+            .iter()
+            .map(|value| value.as_str().expect("peer ID").to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut wanted = expected.clone();
+        wanted.remove(&hex::encode(agents[index].machine_id().0));
+        assert_eq!(actual, wanted, "control requires full admitted adjacency");
+    }
+}
+
+fn issue613_hash_peer_id(value: &serde_json::Value) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let encoded = value.as_str().expect("peer ID string");
+    let bytes = hex::decode(encoded).expect("peer ID hex");
+    serde_json::json!(hex::encode(Sha256::digest(bytes)))
+}
+
+fn issue613_redact_topology(topology: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = topology.clone();
+    if let Some(peers) = redacted
+        .get_mut("peer_ids")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for peer in peers.values_mut() {
+            *peer = issue613_hash_peer_id(peer);
+        }
+    }
+    if let Some(observations) = redacted
+        .get_mut("observations")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for phase in observations.values_mut() {
+            if let Some(nodes) = phase.as_object_mut() {
+                for node in nodes.values_mut() {
+                    if let Some(admitted) = node
+                        .get_mut("admitted")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for peer in admitted {
+                            *peer = issue613_hash_peer_id(peer);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(operations) = redacted
+        .get_mut("operations")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for operation in operations.values_mut() {
+            for leg in ["reverse_install", "forward_disconnect"] {
+                for field in ["owner_peer_id", "peer_id"] {
+                    if let Some(peer) = operation
+                        .get_mut(leg)
+                        .and_then(|value| value.get_mut(field))
+                    {
+                        *peer = issue613_hash_peer_id(peer);
+                    }
+                }
+            }
+        }
+    }
+    redacted
+}
+
+fn issue613_partial_ledger(
+    records: &std::collections::BTreeMap<[u8; 16], Issue613Record>,
+    run: [u8; 16],
+    outcome: &str,
+) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    serde_json::json!({
+        "schema": 1,
+        "run_nonce_hash": hex::encode(Sha256::digest(run)),
+        "outcome": outcome,
+        "attempted": records.len(),
+        "published": records.values().filter(|record| record.ack_ns.is_some()).count(),
+        "delivered": records.values().filter(|record| record.delivered_ns.is_some()).count(),
+        "records": records.values().collect::<Vec<_>>(),
+    })
+}
+
+fn issue613_partial_ledger_from_mutex(
+    records: &Mutex<std::collections::BTreeMap<[u8; 16], Issue613Record>>,
+    run: [u8; 16],
+    outcome: &str,
+) -> serde_json::Value {
+    // A collector assertion can unwind while holding this test-only ledger.
+    // Recover only to preserve diagnostics, then the caller resumes the
+    // original panic; poison never turns a failed acceptance into success.
+    let guard = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    issue613_partial_ledger(&guard, run, outcome)
+}
+
+async fn issue613_application_delivery(cut: bool) {
+    use sha2::Digest;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let mut agents = Vec::new();
+    let outcome = AssertUnwindSafe(async {
+        for label in DIAMOND_LABELS {
+            agents.push(build(dir.path(), label, false).await);
+        }
+        let keys = agents
+            .iter()
+            .map(|_| Arc::new(AgentKemKeypair::generate().expect("real KEM")))
+            .collect::<Vec<_>>();
+        let (mut receivers, _) = bounded(
+            "#613 services and full-mesh setup",
+            Duration::from_secs(90),
+            prepare(&agents, &keys, None),
+        )
+        .await;
+        let preparation = prepare_measurement();
+        let clock = std::time::Instant::now();
+        let mut evidence = serde_json::json!({});
+        let originals = if cut {
+            Some(shape_diamond(&agents, &mut evidence, clock, &[])
+                .await
+                .unwrap_or_else(|rejected| panic!("INCONCLUSIVE: {}", rejected.reason)))
+        } else {
+            let observed = diamond_observations(&agents, clock).await;
+            issue613_assert_full_mesh(&observed, &agents);
+            evidence["topology"] = serde_json::json!({
+                "configuration":"full admitted mesh; no administrative disconnects",
+                "peer_ids": DIAMOND_LABELS.iter().zip(&agents).map(|(label, agent)| ((*label).to_owned(), serde_json::json!(hex::encode(agent.machine_id().0)))).collect::<serde_json::Map<_, _>>(),
+                "observations":{"t0":observed}
+            });
+            None
+        };
+        let topology_before = evidence["topology"].clone();
+        let run = dm_send::fresh_request_id();
+        // W5 is deliberately only a raw downstream bus witness. Its frames
+        // cannot credit application delivery at D5/O5.
+        let mut witness = pubsub(&agents[3]).subscribe(DM_BUS_TOPIC.to_owned()).await;
+        let records = Arc::new(Mutex::new(BTreeMap::<[u8; 16], Issue613Record>::new()));
+        let delivered_ids = Arc::new(Mutex::new(BTreeSet::<[u8; 16]>::new()));
+        let mut d5 = receivers.remove(1);
+        let mut o5 = receivers.remove(1);
+        let sender = &agents[0];
+        let publish_records = Arc::clone(&records);
+        let collect_records = Arc::clone(&records);
+        let collect_delivered = Arc::clone(&delivered_ids);
+        let started = std::time::Instant::now();
+        let outer_t0 = generator_cut(sender, clock);
+
+        let publisher = async {
+            let mut timer = tokio::time::interval_at(
+                tokio::time::Instant::now(),
+                Duration::from_millis(50),
+            );
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            for sequence in 0..ISSUE613_MESSAGES {
+                timer.tick().await;
+                let destination = if sequence % 2 == 0 { 1 } else { 2 };
+                let recipient = &agents[destination];
+                let request_id = dm_send::fresh_request_id();
+                let payload = issue613_payload(run, destination as u8, sequence);
+                let invoked_ns = u64::try_from(started.elapsed().as_nanos())
+                    .expect("bounded monotonic offset");
+                let pair = if destination == 1 { "G5>D5" } else { "G5>O5" };
+                let wire = envelope(sender, recipient, &keys[destination], request_id, payload);
+                assert!(publish_records
+                    .lock()
+                    .expect("ledger")
+                    .insert(request_id, Issue613Record { pair, destination: destination as u8, sequence, request_id: hex::encode(request_id), invoked_ns, ack_ns: None, delivered_ns: None, fanout: None, attempted_peer_sends: None, wire_bytes: wire.len() })
+                    .is_none());
+                let returned = sender
+                    .publish_with_observed_fanout(DM_BUS_TOPIC, wire)
+                    .await
+                    .expect("#613 signed bus publication");
+                let ack_ns = u64::try_from(started.elapsed().as_nanos())
+                    .expect("bounded monotonic offset");
+                let mut ledger = publish_records.lock().expect("ledger");
+                let record = ledger.get_mut(&request_id).expect("attempted before publish");
+                record.ack_ns = Some(ack_ns);
+                record.fanout = Some(returned.0);
+                record.attempted_peer_sends = returned.1.map(|counts| {
+                    u64::try_from(counts.attempted).expect("bounded fixture peer count")
+                });
+                assert!(returned.0 > 0, "publication must attempt a peer");
+            }
+        };
+        let collector = async {
+            let mut witnessed = BTreeSet::new();
+            while collect_delivered.lock().expect("delivered set").len()
+                < ISSUE613_MESSAGES as usize || witnessed.len() < ISSUE613_MESSAGES as usize
+            {
+                let received = tokio::select! {
+                    actual = d5.recv() => Some((actual.expect("D5 typed inbox open"), 1u8)),
+                    actual = o5.recv() => Some((actual.expect("O5 typed inbox open"), 2u8)),
+                    raw = witness.recv() => {
+                        let raw = raw.expect("W5 raw bus witness open");
+                        if raw.sender == Some(sender.agent_id()) && raw.verified {
+                            let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
+                                .expect("W5 observed a valid DM envelope");
+                            assert!(collect_records.lock().expect("ledger").contains_key(&envelope.request_id));
+                            assert!(witnessed.insert(envelope.request_id), "duplicate W5 raw frame");
+                        }
+                        None
+                    }
+                };
+                let Some((actual, destination)) = received else { continue; };
+                let now = u64::try_from(started.elapsed().as_nanos())
+                    .expect("bounded monotonic offset");
+                let mut ledger = collect_records.lock().expect("ledger");
+                let record = ledger.get_mut(&actual.request_id)
+                    .expect("typed delivery must belong to an attempted current-run ID");
+                issue613_credit_delivery(record, &actual, sender.agent_id(), sender.machine_id(), run, destination, now);
+                assert!(collect_delivered.lock().expect("delivered set").insert(actual.request_id));
+            }
+            let deadline = tokio::time::Instant::now() + NEGATIVE_WINDOW;
+            let late = tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return,
+                actual = d5.recv() => actual.map(|v| ("D5", hex::encode(v.request_id))),
+                actual = o5.recv() => actual.map(|v| ("O5", hex::encode(v.request_id))),
+                raw = witness.recv() => raw.map(|v| ("W5", hex::encode(dm::DmEnvelope::from_wire_bytes(&v.payload).expect("late DM envelope").request_id))),
+            };
+            match late {
+                Some((label, id)) => panic!("unexpected late {label} frame {id}"),
+                None => panic!("capture channel closed during stability window"),
+            }
+        };
+        let phase = AssertUnwindSafe(bounded(
+            "#613 publication and typed delivery",
+            Duration::from_secs(180),
+            async { tokio::join!(publisher, collector) },
+        ))
+        .catch_unwind()
+        .await;
+        let partial = issue613_partial_ledger_from_mutex(
+            &records,
+            run,
+            if phase.is_ok() { "COMPLETE" } else { "FAILED" },
+        );
+        eprintln!(
+            "ISSUE613_APPLICATION_DELIVERY_PARTIAL {}",
+            serde_json::to_string(&partial).expect("partial ledger JSON")
+        );
+        drop(publish_records);
+        drop(collect_records);
+        drop(collect_delivered);
+        if let Err(panic) = phase {
+            std::panic::resume_unwind(panic);
+        }
+        let outer_t1 = generator_cut(sender, clock);
+        if let Some(originals) = &originals {
+            evidence["topology"]["observations"]["t1"] = strip_peer_scores(diamond_observations(&agents, clock).await);
+            diamond_peer_sets(&evidence["topology"], &evidence["topology"]["observations"]["t1"])
+                .expect("final directed adjacency");
+            for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(originals) {
+                let (check, returned) = diamond_suppression_check(&agents[from], agents[to].machine_id().0, clock).await;
+                let edge = format!("{}|{}", DIAMOND_LABELS[from], DIAMOND_LABELS[to]);
+                evidence["topology"]["suppression"][&edge]["set_at_stable"] = serde_json::json!(returned == Some(*original));
+                evidence["topology"]["suppression"][&edge]["final_check"] = check;
+            }
+            validate_topology_capture(&topology_before, &evidence["topology"])
+                .expect("directed topology remained valid through delivery load");
+        } else {
+            evidence["topology"]["observations"]["t1"] = diamond_observations(&agents, clock).await;
+            issue613_assert_full_mesh(&evidence["topology"]["observations"]["t1"], &agents);
+        }
+        let records = Arc::try_unwrap(records).expect("ledger sole owner").into_inner().expect("ledger");
+        assert_eq!(records.len(), ISSUE613_MESSAGES as usize);
+        assert!(records.values().all(|record| record.ack_ns.is_some() && record.delivered_ns.is_some()));
+        assert_eq!(records.values().filter(|record| record.pair == "G5>D5").count(), 100);
+        assert_eq!(records.values().filter(|record| record.pair == "G5>O5").count(), 100);
+        let counter = |cut: &serde_json::Value, field: &str| {
+            cut["stages"]["topics"]["bus_outbound"]["eager"][field].as_u64()
+        };
+        let outer_messages = counter(&outer_t1, "msgs").expect("final bus EAGER message counter")
+            - counter(&outer_t0, "msgs").unwrap_or(0);
+        let outer_bytes = counter(&outer_t1, "bytes").expect("final bus EAGER byte counter")
+            - counter(&outer_t0, "bytes").unwrap_or(0);
+        let attempted = records.values().map(|record| record.attempted_peer_sends.expect("observed attempted sends")).sum::<u64>();
+        assert!(outer_messages >= attempted, "outer EAGER meter cannot undercount initial attempted sends");
+        let recovery_extra_eager = outer_messages - attempted;
+        let outer_average = outer_bytes.checked_div(outer_messages).expect("nonzero outer frames");
+        assert!((12_000..=18_000).contains(&outer_average), "outer frame average preserves diagnosed ~14.8KiB load");
+        let inner_min = records.values().map(|record| record.wire_bytes).min().expect("records");
+        let inner_max = records.values().map(|record| record.wire_bytes).max().expect("records");
+        let receipt = serde_json::json!({
+            "schema": 1,
+            "selector": if cut {"legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut"} else {"legacy_bus_interop_tests::paired_application_delivery_ids_no_disconnect_control"},
+            "topology": if cut {"directed_diamond"} else {"full_mesh"},
+            "topology_evidence": issue613_redact_topology(&evidence["topology"]),
+            "outer_load_cuts": {"t0":outer_t0,"t1":outer_t1},
+            "run_nonce_hash": hex::encode(sha2::Sha256::digest(run)),
+            "binary_sha256": preparation.binary_sha256,
+            "build_lock_sha256": preparation.build_lock_sha256,
+            "identity_hashes": DIAMOND_LABELS.iter().zip(&agents).map(|(label, agent)| {
+                (*label, hex::encode(sha2::Sha256::digest(agent.machine_id().0)))
+            }).collect::<BTreeMap<_, _>>(),
+            "attempted": ISSUE613_MESSAGES,
+            "published": ISSUE613_MESSAGES,
+            "delivered": ISSUE613_MESSAGES,
+            "duplicates": 0,
+            "unexpected": 0,
+            "receiver_closed": 0,
+            "payload_bytes": ISSUE613_PAYLOAD_BYTES,
+            "inner_envelope_bytes_min": inner_min,
+            "inner_envelope_bytes_max": inner_max,
+            "outer_eager_messages": outer_messages,
+            "outer_eager_bytes": outer_bytes,
+            "outer_eager_average_bytes": outer_average,
+            "initial_attempted_peer_sends": attempted,
+            "recovery_extra_eager_messages": recovery_extra_eager,
+            "w5_raw_witnessed": ISSUE613_MESSAGES,
+            "period_ms": 50,
+            "pairs": ["G5>D5", "G5>O5"],
+            "records": records.into_values().collect::<Vec<_>>(),
+            "outcome": "PASS"
+        });
+        eprintln!("ISSUE613_APPLICATION_DELIVERY {}", serde_json::to_string(&receipt).expect("receipt JSON"));
+    }).catch_unwind().await;
+    for agent in &agents {
+        agent.shutdown().await;
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+#[ignore = "real four-agent loopback acceptance; dedicated isolated Linux CI"]
+async fn paired_application_delivery_ids_no_disconnect_control() {
+    issue613_application_delivery(false).await;
+}
+
+#[tokio::test]
+#[ignore = "real four-agent loopback acceptance; dedicated isolated Linux CI"]
+async fn paired_application_delivery_ids_directed_cut() {
+    issue613_application_delivery(true).await;
+}
+
+fn issue613_synthetic_delivery(
+    request_id: [u8; 16],
+    run: [u8; 16],
+    destination: u8,
+    sequence: u64,
+) -> (
+    Issue613Record,
+    DmTypedPayload,
+    crate::identity::AgentId,
+    crate::identity::MachineId,
+) {
+    let sender = crate::identity::AgentId([7; 32]);
+    let machine = crate::identity::MachineId([8; 32]);
+    let pair = if destination == 1 { "G5>D5" } else { "G5>O5" };
+    (
+        Issue613Record {
+            pair,
+            destination,
+            sequence,
+            request_id: hex::encode(request_id),
+            invoked_ns: 10,
+            ack_ns: None,
+            delivered_ns: None,
+            fanout: None,
+            attempted_peer_sends: None,
+            wire_bytes: 5000,
+        },
+        DmTypedPayload {
+            sender,
+            machine_id: machine,
+            payload: issue613_payload(run, destination, sequence),
+            verified: true,
+            trust_decision: Some(TrustDecision::Accept),
+            received_at_unix_ms: 0,
+            request_id,
+            completion: None,
+        },
+        sender,
+        machine,
+    )
+}
+
+#[test]
+fn issue613_collector_accepts_delivery_before_ack() {
+    let run = [1; 16];
+    let (mut record, actual, sender, machine) = issue613_synthetic_delivery([2; 16], run, 1, 3);
+    issue613_credit_delivery(&mut record, &actual, sender, machine, run, 1, 11);
+    assert_eq!(record.ack_ns, None);
+    assert_eq!(record.delivered_ns, Some(11));
+}
+
+#[test]
+fn issue613_collector_rejects_wrong_binding() {
+    type Mutation = Box<dyn Fn(&mut Issue613Record, &mut DmTypedPayload, &mut [u8; 16], &mut u8)>;
+    let cases: [Mutation; 4] = [
+        Box::new(|_, _, run, _| *run = [9; 16]),
+        Box::new(|_, actual, _, _| actual.payload = issue613_payload([1; 16], 1, 99)),
+        Box::new(|_, _, _, destination| *destination = 2),
+        Box::new(|_, actual, _, _| actual.request_id = [6; 16]),
+    ];
+    for mutate in cases {
+        let mut run = [1; 16];
+        let mut destination = 1;
+        let (mut record, mut actual, sender, machine) =
+            issue613_synthetic_delivery([2; 16], run, destination, 3);
+        mutate(&mut record, &mut actual, &mut run, &mut destination);
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            issue613_credit_delivery(&mut record, &actual, sender, machine, run, destination, 11);
+        }))
+        .is_err());
+    }
+}
+
+#[test]
+fn issue613_partial_ledger_retains_missing_ids_without_payload() {
+    let run = [1; 16];
+    let (mut published, _, _, _) = issue613_synthetic_delivery([2; 16], run, 1, 2);
+    published.ack_ns = Some(12);
+    published.delivered_ns = Some(11);
+    let (missing, _, _, _) = issue613_synthetic_delivery([3; 16], run, 2, 3);
+    let records = [([2; 16], published), ([3; 16], missing)]
+        .into_iter()
+        .collect();
+    let receipt = issue613_partial_ledger(&records, run, "FAILED");
+    assert_eq!(receipt["attempted"], 2);
+    assert_eq!(receipt["published"], 1);
+    assert_eq!(receipt["delivered"], 1);
+    assert_eq!(receipt["outcome"], "FAILED");
+    assert!(!serde_json::to_string(&receipt)
+        .expect("partial JSON")
+        .contains("x0x-501-interop"));
+}
+
+#[test]
+fn issue613_partial_ledger_recovers_poison_for_diagnostics() {
+    let records = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let poisoned = Arc::clone(&records);
+    assert!(std::thread::spawn(move || {
+        let mut guard = poisoned.lock().expect("initial healthy ledger");
+        let (record, _, _, _) = issue613_synthetic_delivery([4; 16], [1; 16], 1, 4);
+        guard.insert([4; 16], record);
+        panic!("collector assertion while ledger held");
+    })
+    .join()
+    .is_err());
+    let receipt = issue613_partial_ledger_from_mutex(&records, [1; 16], "FAILED");
+    assert_eq!(receipt["attempted"], 1);
+    assert_eq!(receipt["outcome"], "FAILED");
+}
+
 // Literal source-reviewed lifetime universe, not observed subscriptions. The
 // full Agent fixture starts only identity/machine/user listeners, revocation,
 // move listeners, capability services, blob service and the actual DM inboxes.
