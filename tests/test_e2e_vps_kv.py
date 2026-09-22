@@ -2,6 +2,7 @@
 """Offline controls for the ordinary shared-store VPS harness."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -32,6 +33,163 @@ class FakeApi:
         if method == "PUT": return 200, {"ok": True}
         if method == "GET": return 404, {"ok": False}
         return 200, {"ok": True, "id": "store", "store_id": "digest"}
+
+
+class FakeClock:
+    def __init__(self): self.now = 0.0
+    def monotonic(self): return self.now
+    def sleep(self, seconds): self.now += seconds
+
+
+class FakeWorld:
+    """In-memory group model encoding named_groups.rs MemberJoined rules: only the
+    invite's inviter, while online and Admin, turns a join into a roster entry."""
+
+    def __init__(self, nodes):
+        self.nodes, self.online = nodes, set(nodes)
+        self.groups, self.invites, self.kv, self.timeline = {}, {}, {}, []
+
+    def client(self, node): return FakeNodeApi(self, node)
+    def aid(self, node): return hashlib.sha256(node.encode()).hexdigest()
+
+    def request(self, node, method, path, body):
+        if node not in self.online: raise ConnectionError(f"{node} offline")
+        group = self.groups.get(path.split("/")[2]) if path.startswith("/groups/") else None
+        role = group["members"].get(self.aid(node)) if group else None
+        writer_role = next((g["members"].get(self.aid("writer")) for g in self.groups.values()
+                            if g["preset"] == "public_open"), None)
+        self.timeline.append((node, method, path, writer_role))
+        if path == "/agent": return 200, {"agent_id": self.aid(node)}
+        if method == "POST" and path == "/groups":
+            gid = f"g{len(self.groups) + 1}"
+            self.groups[gid] = {"preset": body["preset"], "members": {self.aid(node): "admin"}}
+            return 200, {"ok": True, "group_id": gid}
+        if method == "POST" and path == "/groups/join":
+            inviter, gid = self.invites[body["invite"]]
+            members = self.groups[gid]["members"]
+            if inviter in self.online and members.get(self.aid(inviter)) == "admin":
+                members[self.aid(node)] = "member"
+            return 200, {"ok": True, "group_id": gid}
+        gid = path.split("/")[2] if group else None
+        if method == "POST" and path.endswith("/invite"):
+            if role != "admin": return 403, {"ok": False}
+            link = f"x0x://invite/{len(self.invites)}"
+            self.invites[link] = (node, gid)
+            return 200, {"ok": True, "invite_link": link}
+        if method == "GET" and path.endswith("/members"):
+            return 200, {"members": [{"agent_id": a, "role": r} for a, r in group["members"].items()]}
+        if method == "PATCH" and path.endswith("/role"):
+            if role != "admin": return 403, {"ok": False}
+            group["members"][path.split("/")[4]] = body["role"]
+            return 200, {"ok": True, "role": body["role"]}
+        if method == "DELETE" and path.startswith("/groups/"):
+            group["members"].pop(path.split("/")[4], None)
+            return 200, {"ok": True}
+        if method == "POST" and path.endswith("/stores"):
+            if role is None: return 403, {"ok": False}
+            return 200, {"ok": True, "id": f"{gid}-{body['name']}", "store_id": f"d-{gid}-{body['name']}"}
+        _, _, sid, key = path.split("/")
+        store_group = self.groups[sid.split("-")[0]]
+        if method == "GET":
+            value = self.kv.get((sid, key))
+            return (200, {"value": value}) if value else (404, {"error": "key not found"})
+        store_role = store_group["members"].get(self.aid(node))
+        if store_role is None or (store_group["preset"] == "public_announce" and store_role != "admin"):
+            return 403, {"ok": False}
+        if method == "DELETE": self.kv.pop((sid, key), None)
+        else: self.kv[(sid, key)] = body["value"]
+        return 200, {"ok": True}
+
+
+class FakeNodeApi:
+    def __init__(self, world, node): self.world, self.node = world, node
+    def request(self, method, path, body=None): return self.world.request(self.node, method, path, body)
+    def agent_id(self): return self.world.aid(self.node)
+
+
+class OnlineInviterOrderingTests(unittest.TestCase):
+    NODES = ("owner", "writer", "late", "outsider", "revoked")
+    WRITER_AS_MEMBER_LABELS = ("writer writes wiki", "writer writes web",
+                               "active nonwriter mutation refused", "valid barrier write accepted")
+
+    @classmethod
+    def setUpClass(cls): cls.kv = load_harness()
+
+    def run_scenario(self, old_owner_minted_late_invite=False):
+        world = FakeWorld(self.NODES)
+        evidence = self.kv.Evidence()
+        scenario = self.kv.Scenario({node: world.client(node) for node in self.NODES}, evidence)
+        polls, events = [], []
+        real_poll, real_invite = self.kv.poll, scenario.invite
+        def spy_poll(label, timeout, *args):
+            polls.append((label, timeout, len(world.timeline)))
+            return real_poll(label, timeout, *args)
+        def invite(owner, member, gid):
+            if old_owner_minted_late_invite and member == "late": owner = "owner"
+            events.append(("invite", owner, member))
+            return real_invite(owner, member, gid)
+        def stop_owner():
+            events.append(("stop_owner",)); world.online.discard("owner")
+        def restart_writer(gid):
+            events.append(("restart_writer",))
+            active = self.kv.active_provider_ids(*world.request("writer", "GET", f"/groups/{gid}/members", None))
+            evidence.check("eligible retained providers established",
+                           active == {world.aid(n) for n in ("owner", "writer", "late")})
+        clock = FakeClock()
+        with mock.patch.object(self.kv, "poll", spy_poll), mock.patch.object(scenario, "invite", invite), \
+             mock.patch.object(self.kv.time, "monotonic", clock.monotonic), \
+             mock.patch.object(self.kv.time, "sleep", clock.sleep):
+            error = None
+            try:
+                scenario.run(*self.NODES, stop_owner, restart_writer)
+            except AssertionError as caught:
+                error = caught
+        return world, evidence, polls, events, error
+
+    def test_promotion_follows_every_writer_as_member_assertion(self):
+        world, evidence, _polls, _events, error = self.run_scenario()
+        self.assertIsNone(error)
+        labels = [item["label"] for item in evidence.assertions]
+        promoted = labels.index("owner promotes writer to admin")
+        for label in self.WRITER_AS_MEMBER_LABELS:
+            self.assertLess(max(i for i, name in enumerate(labels) if name == label), promoted, label)
+        patch = next(i for i, call in enumerate(world.timeline) if call[1] == "PATCH")
+        self.assertEqual(("owner", "PATCH"), world.timeline[patch][:2])
+        writer_puts = [call for call in world.timeline[:patch] if call[0] == "writer" and call[1] == "PUT"]
+        self.assertTrue(writer_puts)
+        self.assertTrue(all(call[3] == "member" for call in writer_puts))
+        role_poll = next(p for p in evidence.polls if p["operation"] == "role")
+        self.assertEqual(("accepted", "writer", "admin"), (role_poll["outcome"], role_poll["node"], role_poll["role"]))
+
+    def test_late_invite_is_minted_by_promoted_admin_after_promotion(self):
+        world, _evidence, _polls, events, error = self.run_scenario()
+        self.assertIsNone(error)
+        self.assertIn(("invite", "writer", "late"), events)
+        self.assertNotIn(("invite", "owner", "late"), events)
+        patch = next(i for i, call in enumerate(world.timeline) if call[1] == "PATCH")
+        late_invite = next(i for i, call in enumerate(world.timeline)
+                           if call[:2] == ("writer", "POST") and call[2].endswith("/invite"))
+        self.assertLess(patch, late_invite)
+        self.assertEqual("admin", world.timeline[late_invite][3])
+
+    def test_owner_stops_before_late_join_and_roster_poll_uses_unchanged_timeout(self):
+        world, evidence, polls, events, error = self.run_scenario()
+        self.assertIsNone(error)
+        self.assertLess(events.index(("stop_owner",)), events.index(("restart_writer",)))
+        late_join = next(i for i, call in enumerate(world.timeline) if call[:3] == ("late", "POST", "/groups/join"))
+        self.assertFalse(any(call[0] == "owner" for call in world.timeline[late_join:]))
+        label, timeout, _ = next(p for p in polls if p[0] == "late roster on owner")
+        self.assertEqual(120, timeout)
+        roster = [p for p in evidence.polls if p["label"] == label]
+        self.assertEqual([("writer", "accepted")], [(p["node"], p["outcome"]) for p in roster])
+        self.assertTrue(all(p[1] == 120 for p in polls))
+
+    def test_revert_owner_minted_late_invite_times_out_on_writer_roster(self):
+        _world, evidence, _polls, _events, error = self.run_scenario(old_owner_minted_late_invite=True)
+        self.assertIsNotNone(error)
+        self.assertIn("late roster on owner did not converge in 120s", str(error))
+        last = evidence.polls[-1]
+        self.assertEqual(("late roster on owner", "writer", "timeout"), (last["label"], last["node"], last["outcome"]))
 
 
 class KvHarnessTests(unittest.TestCase):

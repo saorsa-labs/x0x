@@ -181,6 +181,19 @@ class Scenario:
              lambda facts, _last: self.e.record_poll(facts, operation="roster", node=owner,
                                                        group_id=safe_identifier(gid)))
 
+    def promote_admin(self, owner: str, member: str, gid: str) -> None:
+        # An authority-signed MemberAdded can only come from the invite's online
+        # inviter, so owner-offline admission needs an explicitly promoted Admin.
+        aid = self.c[member].agent_id()
+        promoted = self.ok(owner, "PATCH", f"/groups/{enc(gid)}/members/{aid}/role", {"role": "admin"})
+        self.e.check(f"owner promotes {member} to admin", promoted.get("role") == "admin", role=promoted.get("role"))
+        poll(f"{member} admin role on {member}", self.timeout,
+             lambda: self.c[member].request("GET", f"/groups/{enc(gid)}/members"),
+             lambda result: result[0] == 200 and any(row.get("agent_id") == aid and row.get("role") == "admin"
+                                                     for row in result[1].get("members", [])),
+             lambda facts, _last: self.e.record_poll(facts, operation="role", node=member,
+                                                       group_id=safe_identifier(gid), role="admin"))
+
     def open_store(self, node: str, gid: str, app: str) -> dict[str, Any]:
         payload = self.ok(node, "POST", f"/groups/{enc(gid)}/stores", {"name": app})
         self.e.record_store(node, gid, app, payload)
@@ -239,7 +252,6 @@ class Scenario:
         gid = created.get("group_id") or (created.get("group") or {}).get("id")
         self.e.check("group id returned", isinstance(gid, str) and bool(gid))
         self.join(owner, writer, gid); self.join(owner, revoked, gid)
-        late_invite = self.invite(owner, late, gid)
         stores: dict[str, str] = {}
         for app in ("wiki", "web"):
             a, b = self.open_store(owner, gid, app), self.open_store(writer, gid, app)
@@ -279,6 +291,8 @@ class Scenario:
         self.e.check("revoked mutation refused", denied[0] in (403, 404), status=denied[0])
         self.e.check("revoked key absent before barrier", before[0] == 404)
         self.prove_denied_did_not_converge(owner, writer, stores["wiki"], "forbidden")
+        self.promote_admin(owner, writer, gid)
+        late_invite = self.invite(writer, late, gid)
         stop_owner()
         self.join(writer, late, gid, late_invite)
         for app, sid in stores.items():
