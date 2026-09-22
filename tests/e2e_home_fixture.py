@@ -360,10 +360,15 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
                    owner_key_sha256=owner_key_sha)
 
     def certify_same_owner_device(label: str) -> None:
-        card_status, card = clients[label].request("GET", "/agent/card")
-        public_key = card.get("agent_public_key")
+        card_status, response = clients[label].request("GET", "/agent/card")
+        card = response.get("card") if isinstance(response, dict) else None
+        public_key = card.get("agent_public_key") if isinstance(card, dict) else None
+        signature = card.get("signature") if isinstance(card, dict) else None
         evidence.check(f"{label} signed card exposes public key", card_status == 200
-                       and isinstance(public_key, str) and bool(public_key), status=card_status)
+                       and isinstance(response, dict) and response.get("ok") is True
+                       and isinstance(public_key, str) and re.fullmatch(r"[0-9a-f]{3904}", public_key) is not None
+                       and isinstance(signature, str) and re.fullmatch(r"[0-9a-f]{6618}", signature) is not None,
+                       status=card_status)
         custody.stop(label)
         issue_status, issued = owner_api.request("POST", "/owner/agents/issue",
                                                  {"agent_public_key": public_key, "mode": "acp",
