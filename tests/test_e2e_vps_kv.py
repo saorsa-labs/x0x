@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import subprocess
 import sys
@@ -83,6 +84,72 @@ class KvHarnessTests(unittest.TestCase):
             return value
         with mock.patch.object(self.kv.time, "sleep", return_value=None):
             self.assertEqual((200, {"ok": True}), self.kv.poll("health", 1, probe, lambda value: value[0] == 200))
+
+    def test_timeout_receipt_keeps_store_identity_status_and_bounded_timing(self):
+        evidence = self.kv.Evidence()
+        scenario = self.kv.Scenario({}, evidence, timeout=0.001)
+        scenario.store_context["x0x/group/safe/kv/topic"] = ("group-safe", "web")
+        with mock.patch.object(scenario, "read_value", return_value=(404, None)), \
+             mock.patch.object(self.kv.time, "sleep", return_value=None), \
+             self.assertRaises(AssertionError):
+            scenario.await_value("owner", "x0x/group/safe/kv/topic", "writer-page", "expected")
+        receipt = evidence.polls[-1]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual(404, receipt["last_status"])
+        self.assertEqual("web", receipt["app"])
+        self.assertEqual("group-safe", receipt["group_id"])
+        self.assertEqual("x0x/group/safe/kv/topic", receipt["store_topic"])
+        self.assertGreater(receipt["probe_count"], 0)
+        self.assertIsNotNone(receipt["first_sample_utc"])
+        self.assertIsNotNone(receipt["last_sample_utc"])
+        self.assertEqual(receipt, evidence.report()["polls"][-1])
+
+    def test_real_read_path_distinguishes_closed_404_classes(self):
+        class MissingApi:
+            def __init__(self, error): self.error = error
+            def request(self, method, path, body=None): return 404, {"error": self.error}
+        for error, expected in (("store not found", "store_not_found"),
+                                ("key not found", "key_not_found")):
+            with self.subTest(error=error):
+                evidence = self.kv.Evidence()
+                scenario = self.kv.Scenario({"reader": MissingApi(error)}, evidence, timeout=0.001)
+                scenario.store_context["topic"] = ("group", "web")
+                with mock.patch.object(self.kv.time, "sleep", return_value=None), \
+                     self.assertRaises(AssertionError):
+                    scenario.await_value("reader", "topic", "writer-page", "expected")
+                self.assertEqual(expected, evidence.polls[-1]["response_class"])
+                self.assertEqual(404, evidence.polls[-1]["last_status"])
+
+    def test_success_receipt_keeps_matching_hashes_without_value(self):
+        evidence = self.kv.Evidence()
+        scenario = self.kv.Scenario({}, evidence, timeout=1)
+        scenario.store_context["topic"] = ("group", "wiki")
+        with mock.patch.object(scenario, "read_value", return_value=(200, "sensitive-value")):
+            scenario.await_value("writer", "topic", "owner-page", "sensitive-value")
+        receipt = evidence.polls[-1]
+        self.assertEqual("accepted", receipt["outcome"])
+        self.assertEqual(receipt["expected_value_sha256"], receipt["observed_value_sha256"])
+        self.assertNotIn("sensitive-value", json.dumps(evidence.polls))
+
+    def test_unsafe_server_fields_and_tokens_never_enter_receipt(self):
+        evidence = self.kv.Evidence()
+        secret = "Bearer token-secret-value"
+        evidence.record_store("owner", secret, "web", {"id": secret, "store_id": secret})
+        evidence.assertions.append({"label": "harness", "passed": False,
+                                    "error_class": type(RuntimeError(secret)).__name__})
+        serialized = json.dumps(evidence.report())
+        self.assertNotIn(secret, serialized)
+        self.assertIsNone(evidence.stores[0]["topic"])
+        self.assertIsNone(evidence.stores[0]["store_id"])
+        class SecretErrorApi:
+            def request(self, method, path, body=None): return 404, {"error": secret}
+        scenario = self.kv.Scenario({"reader": SecretErrorApi()}, evidence, timeout=0.001)
+        with mock.patch.object(self.kv.time, "sleep", return_value=None), \
+             self.assertRaises(AssertionError):
+            scenario.await_value("reader", "topic", "key", "expected")
+        serialized = json.dumps(evidence.report())
+        self.assertNotIn(secret, serialized)
+        self.assertEqual("http_error", evidence.polls[-1]["response_class"])
 
     def test_custody_records_restore_before_partial_stop_or_restart_failure(self):
         calls = []
