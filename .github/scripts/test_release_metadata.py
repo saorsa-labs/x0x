@@ -13,15 +13,21 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 VALIDATOR = Path('.github/scripts/validate_release_metadata.py')
 WORKFLOW = Path('.github/workflows/release.yml')
+PROMOTED_WORKFLOW = Path('.github/workflows/publish-promoted-release.yml')
 CARD = Path('.well-known/agent.json')
 
 EXPECTED_RELEASE_JOB_NEEDS = {
     'require-green-ci': ['validate-release-metadata'],
-    'build-release': ['validate-release-metadata', 'require-green-ci'],
+    'resolve-release-lock': ['validate-release-metadata', 'require-green-ci'],
+    'build-release': [
+        'validate-release-metadata', 'require-green-ci', 'resolve-release-lock'],
     'sign-release': ['build-release'],
     'create-release': ['build-release', 'sign-release'],
-    'publish-clawhub': ['create-release'],
-    'publish-crates': ['create-release'],
+}
+
+EXPECTED_PROMOTED_JOB_NEEDS = {
+    'publish-clawhub': ['validate-promoted-release'],
+    'publish-crates': ['validate-promoted-release'],
 }
 
 
@@ -52,13 +58,13 @@ def parse_workflow_needs(text):
     return needs
 
 
-def release_job_needs_violations(text):
-    """Return exact-name gating violations for release.yml jobs."""
+def job_needs_violations(text, expected, workflow_name):
+    """Return exact-name gating violations for one workflow's jobs."""
     needs = parse_workflow_needs(text)
     violations = []
-    for job, dependencies in EXPECTED_RELEASE_JOB_NEEDS.items():
+    for job, dependencies in expected.items():
         if job not in needs:
-            violations.append(f'{job} is missing from release.yml')
+            violations.append(f'{job} is missing from {workflow_name}')
             continue
         for dependency in dependencies:
             if dependency not in needs[job]:
@@ -68,12 +74,24 @@ def release_job_needs_violations(text):
     return violations
 
 
+def release_job_needs_violations(text):
+    return job_needs_violations(
+        text, EXPECTED_RELEASE_JOB_NEEDS, 'release.yml')
+
+
+def promoted_job_needs_violations(text):
+    return job_needs_violations(
+        text, EXPECTED_PROMOTED_JOB_NEEDS,
+        'publish-promoted-release.yml')
+
+
 class ReleaseCardTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for name in [VALIDATOR, WORKFLOW, CARD, Path('Cargo.toml'), Path('SKILL.md'),
+        for name in [VALIDATOR, WORKFLOW, PROMOTED_WORKFLOW, CARD,
+                     Path('Cargo.toml'), Path('SKILL.md'),
                      Path('scripts/bump-version.sh')]:
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -388,6 +406,40 @@ class ReleaseCardTests(unittest.TestCase):
             with self.subTest(violation=violation):
                 self.fail(violation)
 
+        promoted = (ROOT / PROMOTED_WORKFLOW).read_text()
+        self.assertIn('types: [published]', promoted)
+        self.assertIn('RELEASE_TAG: ${{ github.event.release.tag_name }}', promoted)
+        self.assertIn('RELEASE_DRAFT: ${{ github.event.release.draft }}', promoted)
+        self.assertIn('RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}', promoted)
+        self.assertIn('ref: ${{ github.event.release.tag_name }}', promoted)
+        self.assertIn('[ "$RELEASE_DRAFT" = "false" ]', promoted)
+        self.assertIn('[ "$RELEASE_PRERELEASE" = "false" ]', promoted)
+        self.assertIn('--mode release_tag --tag "$RELEASE_TAG" --ref "refs/tags/$RELEASE_TAG"', promoted)
+        for violation in promoted_job_needs_violations(promoted):
+            with self.subTest(violation=violation):
+                self.fail(violation)
+
+        promoted_gate = self.validator.extract_step_run_block(
+            str(PROMOTED_WORKFLOW),
+            'Require the published event to match the tagged source')
+        base_env = dict(os.environ, RELEASE_TAG=f'v{self.version}',
+                        RELEASE_DRAFT='false', RELEASE_PRERELEASE='false')
+        accepted = subprocess.run(
+            ['bash', '-c', promoted_gate], cwd=self.root,
+            capture_output=True, text=True, env=base_env)
+        self.assertEqual(accepted.returncode, 0,
+                         accepted.stdout + accepted.stderr)
+        for overrides in (
+                {'RELEASE_DRAFT': 'true'},
+                {'RELEASE_PRERELEASE': 'true'},
+                {'RELEASE_TAG': 'v999.0.0'}):
+            with self.subTest(overrides=overrides):
+                refused = subprocess.run(
+                    ['bash', '-c', promoted_gate], cwd=self.root,
+                    capture_output=True, text=True,
+                    env={**base_env, **overrides})
+                self.assertNotEqual(refused.returncode, 0)
+
     def test_suffixed_dependency_name_fails_the_gate_check(self):
         # Negative control: the old substring check (assertIn(dependency,
         # raw_needs_string)) passed when a job declared
@@ -399,6 +451,8 @@ class ReleaseCardTests(unittest.TestCase):
              'needs: validate-release-metadata-typo'),
             ('needs: [validate-release-metadata, require-green-ci]',
              'needs: [validate-release-metadata-typo, require-green-ci]'),
+            ('needs: [validate-release-metadata, require-green-ci, resolve-release-lock]',
+             'needs: [validate-release-metadata-typo, require-green-ci, resolve-release-lock]'),
         ]
         for original, tampered in tampers:
             with self.subTest(tampered=tampered):
@@ -406,6 +460,12 @@ class ReleaseCardTests(unittest.TestCase):
                 self.assertTrue(
                     release_job_needs_violations(text.replace(original, tampered, 1)),
                     f'suffixed dependency {tampered!r} must be flagged')
+
+        promoted = (ROOT / PROMOTED_WORKFLOW).read_text()
+        self.assertTrue(promoted_job_needs_violations(
+            promoted.replace(
+                'needs: validate-promoted-release',
+                'needs: validate-promoted-release-typo', 1)))
 
 
 if __name__ == '__main__':

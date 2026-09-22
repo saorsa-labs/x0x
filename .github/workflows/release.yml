@@ -126,7 +126,10 @@ jobs:
   # ============================================================
   build-release:
     name: Build ${{ matrix.platform }}
-    needs: resolve-release-lock
+    # Keep the release safety gates explicit on the side-effecting build job.
+    # The lock job also depends on both, but direct needs make accidental
+    # rewiring of that artifact producer fail closed under the static guard.
+    needs: [validate-release-metadata, require-green-ci, resolve-release-lock]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
