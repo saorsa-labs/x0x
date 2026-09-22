@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use reqwest::StatusCode;
 use saorsa_gossip_types::PeerId;
 use serde_json::Value;
+use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use x0x::kv::encrypted::EncryptedKvStoreRecordV1;
@@ -20,12 +21,93 @@ use cluster::{trio_with_extra_config, AgentInstance};
 
 const PHASE_TIMEOUT: Duration = Duration::from_secs(45);
 const SSE_LAG_MARKER: &str = "SSE client lagged behind broadcast stream";
+const APPROVAL_RETRY_MAX_ATTEMPTS: u32 = 200;
+const APPROVAL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const APPROVAL_RETRY_NO_CLOCK: &str =
+    "predecessor obligation has no durable first-observation time";
+const APPROVAL_RETRY_NOT_RECEIVED: &str =
+    "predecessor obligation not found — JoinRequestCreated not yet received";
 
 #[derive(Debug)]
 struct CapturedFrame {
     topic: String,
     sender: String,
     payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ApprovalReply {
+    status: StatusCode,
+    body: Value,
+}
+
+fn is_transient_approval_precondition(reply: &ApprovalReply) -> bool {
+    reply.status == StatusCode::PRECONDITION_FAILED
+        && reply.body["ok"] == false
+        && matches!(
+            reply.body["error"].as_str(),
+            Some(error)
+                if error == APPROVAL_RETRY_NO_CLOCK
+                    || error == APPROVAL_RETRY_NOT_RECEIVED
+        )
+}
+
+async fn retry_join_approval<F, Fut>(
+    timeout: Duration,
+    max_attempts: u32,
+    retry_interval: Duration,
+    mut attempt: F,
+) -> Result<ApprovalReply, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ApprovalReply>,
+{
+    if max_attempts == 0 {
+        return Err("approval retry attempt cap must be positive".to_string());
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    for attempt_number in 1..=max_attempts {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "approval retry deadline elapsed before attempt {attempt_number}"
+            ));
+        }
+        let reply = tokio::time::timeout_at(deadline, attempt())
+            .await
+            .map_err(|_| {
+                format!("approval retry deadline elapsed during attempt {attempt_number}")
+            })?;
+        if reply.status == StatusCode::OK {
+            if reply.body["ok"] != true || reply.body["revision"].as_u64().is_none() {
+                return Err(format!(
+                    "malformed successful approval response on attempt {attempt_number}: {:?}",
+                    reply.body
+                ));
+            }
+            return Ok(reply);
+        }
+        if !is_transient_approval_precondition(&reply) {
+            return Err(format!(
+                "non-transient approval response on attempt {attempt_number}: status={} body={:?}",
+                reply.status, reply.body
+            ));
+        }
+        if attempt_number == max_attempts {
+            return Err(format!(
+                "approval retry exhausted {max_attempts} attempts: {:?}",
+                reply.body
+            ));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline || retry_interval > deadline.saturating_duration_since(now) {
+            return Err(format!(
+                "approval retry deadline elapsed after {attempt_number} attempts: {:?}",
+                reply.body
+            ));
+        }
+        tokio::time::sleep(retry_interval).await;
+    }
+    unreachable!("positive bounded attempt loop must return")
 }
 
 fn verify_sse_observer_logs(
@@ -153,7 +235,8 @@ async fn admit(
             .await;
             listed["requests"].as_array().is_some_and(|items| {
                 items.iter().any(|item| {
-                    item["requester_agent_id"].as_str() == Some(joiner_id)
+                    item["request_id"].as_str() == Some(request_id.as_str())
+                        && item["requester_agent_id"].as_str() == Some(joiner_id)
                         && item["status"].as_str() == Some("pending")
                 })
             })
@@ -161,14 +244,26 @@ async fn admit(
         .await,
         "owner never observed join request from {joiner_id}"
     );
-    let approved = json(
-        owner,
-        reqwest::Method::POST,
-        &format!("/groups/{owner_group}/requests/{request_id}/approve"),
-        serde_json::json!({}),
+    let approval_path = format!("/groups/{owner_group}/requests/{request_id}/approve");
+    let approved = retry_join_approval(
+        PHASE_TIMEOUT,
+        APPROVAL_RETRY_MAX_ATTEMPTS,
+        APPROVAL_RETRY_INTERVAL,
+        || async {
+            let response = authed_client(owner)
+                .post(owner.url(&approval_path))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .expect("approve join request");
+            let status = response.status();
+            let body = response.json().await.expect("approve join JSON response");
+            ApprovalReply { status, body }
+        },
     )
-    .await;
-    assert_eq!(approved["ok"], true);
+    .await
+    .unwrap_or_else(|error| panic!("join approval did not complete: {error}"));
+    assert_eq!(approved.body["ok"], true);
 }
 
 async fn open_store(d: &AgentInstance, group: &str) -> Value {
@@ -823,4 +918,89 @@ fn sse_log_guard_accepts_clean_logs_and_rejects_lag_or_missing_sink() {
         Ok(String::new()),
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn join_approval_retry_accepts_only_exact_transient_then_success() {
+    let mut replies = std::collections::VecDeque::from([
+        ApprovalReply {
+            status: StatusCode::PRECONDITION_FAILED,
+            body: serde_json::json!({"ok": false, "error": APPROVAL_RETRY_NOT_RECEIVED}),
+        },
+        ApprovalReply {
+            status: StatusCode::PRECONDITION_FAILED,
+            body: serde_json::json!({"ok": false, "error": APPROVAL_RETRY_NO_CLOCK}),
+        },
+        ApprovalReply {
+            status: StatusCode::OK,
+            body: serde_json::json!({"ok": true, "revision": 9}),
+        },
+    ]);
+    let reply = retry_join_approval(Duration::from_secs(1), 3, Duration::ZERO, || {
+        let reply = replies.pop_front().expect("scripted approval response");
+        async move { reply }
+    })
+    .await
+    .expect("exact transient responses may reach success");
+    assert_eq!(reply.body["revision"], 9);
+    assert!(replies.is_empty());
+}
+
+#[tokio::test]
+async fn join_approval_retry_rejects_permanent_fatal_and_malformed_responses() {
+    for reply in [
+        ApprovalReply {
+            status: StatusCode::PRECONDITION_FAILED,
+            body: serde_json::json!({"ok": false, "error": "predecessor obligation expired"}),
+        },
+        ApprovalReply {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: serde_json::json!({"ok": false, "error": APPROVAL_RETRY_NOT_RECEIVED}),
+        },
+        ApprovalReply {
+            status: StatusCode::OK,
+            body: serde_json::json!({"ok": false}),
+        },
+        ApprovalReply {
+            status: StatusCode::OK,
+            body: serde_json::json!({"ok": true}),
+        },
+    ] {
+        let result = retry_join_approval(Duration::from_secs(1), 2, Duration::ZERO, || {
+            let reply = reply.clone();
+            async move { reply }
+        })
+        .await;
+        assert!(result.is_err(), "unexpected approval response must fail");
+    }
+}
+
+#[tokio::test]
+async fn join_approval_retry_exhaustion_cannot_mask_permanent_absence() {
+    let mut attempts = 0;
+    let result = retry_join_approval(Duration::from_secs(1), 3, Duration::ZERO, || {
+        attempts += 1;
+        async {
+            ApprovalReply {
+                status: StatusCode::PRECONDITION_FAILED,
+                body: serde_json::json!({"ok": false, "error": APPROVAL_RETRY_NOT_RECEIVED}),
+            }
+        }
+    })
+    .await;
+    assert!(result
+        .expect_err("permanent transient response must exhaust")
+        .contains("exhausted 3 attempts"));
+    assert_eq!(attempts, 3);
+}
+
+#[tokio::test]
+async fn join_approval_retry_deadline_bounds_a_pending_attempt() {
+    let result = retry_join_approval(Duration::from_millis(10), 3, Duration::ZERO, || async {
+        std::future::pending::<ApprovalReply>().await
+    })
+    .await;
+    assert!(result
+        .expect_err("pending approval request must hit the total deadline")
+        .contains("deadline elapsed during attempt 1"));
 }
