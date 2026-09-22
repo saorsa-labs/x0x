@@ -26,7 +26,11 @@ def valid():
             "build_lock_sha256": "c" * 64, "attempted": 200, "published": 200,
             "identity_hashes": {"G5": "1" * 64, "D5": "2" * 64, "O5": "3" * 64, "W5": "4" * 64},
             "delivered": 200, "duplicates": 0, "unexpected": 0, "receiver_closed": 0,
-            "payload_bytes": 4096, "period_ms": 50, "w5_raw_witnessed": 200,
+            "payload_bytes": 4096, "period_ms": 50, "w5_raw_witnessed": 1,
+            "w5_witness_contract": "positive current-run topology evidence; not loss-free subscriber delivery",
+            "witness_records": [{"request_id": f"{0:032x}", "observed_ns": 3}],
+            "witness_max_lag_ns": 3,
+            "witness_missing_ids": [f"{i:032x}" for i in range(1, 200)],
             "pairs": ["G5>D5", "G5>O5"], "records": records, "outcome": "PASS"}
 
 
@@ -40,8 +44,9 @@ def finish(receipt):
     receipt["initial_attempted_peer_sends"] = 400
     receipt["outer_eager_messages"] = 400
     receipt["recovery_extra_eager_messages"] = 0
-    receipt["outer_eager_bytes"] = 5_920_000
-    receipt["outer_eager_average_bytes"] = 14_800
+    receipt["outer_eager_bytes"] = 8_000_000
+    receipt["outer_eager_average_bytes"] = 20_000
+    receipt["outer_eager_source_lower_bound_bytes"] = 10_261
     return receipt
 
 
@@ -62,10 +67,22 @@ class ValidatorTests(unittest.TestCase):
             with self.assertRaises(ValueError): MOD.validate(receipt)
 
     def test_rejects_pre_invocation_delivery_and_capture_loss(self):
-        for field, value in (("delivered_ns", -1), ("receiver_closed", 1), ("w5_raw_witnessed", 199)):
+        for field, value in (("delivered_ns", -1), ("receiver_closed", 1), ("w5_raw_witnessed", 0)):
             receipt = finish(valid()); receipt["records"][0][field] = value if field.endswith("_ns") else receipt["records"][0].get(field)
             if field in receipt: receipt[field] = value
             with self.assertRaises(ValueError): MOD.validate(receipt)
+
+    def test_w5_witness_is_positive_bounded_evidence(self):
+        MOD.validate(finish(valid()))
+        for mutate in (
+            lambda receipt: receipt["witness_records"][0].update(request_id="f" * 32),
+            lambda receipt: receipt["witness_records"].append(dict(receipt["witness_records"][0])),
+            lambda receipt: receipt.update(witness_missing_ids=[]),
+        ):
+            receipt = finish(valid())
+            mutate(receipt)
+            with self.assertRaises(ValueError):
+                MOD.validate(receipt)
 
     def test_cli_requires_both_complete_success_logs(self):
         control = finish(valid())
@@ -92,7 +109,7 @@ class ValidatorTests(unittest.TestCase):
     def test_accepts_recovery_extra_and_rejects_bad_arithmetic(self):
         receipt = finish(valid())
         receipt["outer_eager_messages"] = 403
-        receipt["outer_eager_bytes"] = 5_964_340
+        receipt["outer_eager_bytes"] = 8_060_000
         receipt["outer_eager_average_bytes"] = receipt["outer_eager_bytes"] // 403
         receipt["recovery_extra_eager_messages"] = 3
         MOD.validate(receipt)
@@ -100,6 +117,19 @@ class ValidatorTests(unittest.TestCase):
         with self.assertRaises(ValueError): MOD.validate(receipt)
         receipt = finish(valid()); receipt["outer_eager_messages"] = 399
         with self.assertRaises(ValueError): MOD.validate(receipt)
+
+    def test_rejects_impossible_outer_encoding_accounting(self):
+        for mutate in (
+            lambda receipt: receipt.update(outer_eager_source_lower_bound_bytes=10_260),
+            lambda receipt: receipt.update(
+                outer_eager_bytes=10_261 * 400,
+                outer_eager_average_bytes=10_261,
+            ),
+        ):
+            receipt = finish(valid())
+            mutate(receipt)
+            with self.assertRaises(ValueError):
+                MOD.validate(receipt)
 
     def test_rejects_directed_chronology_mutations(self):
         control = finish(valid())

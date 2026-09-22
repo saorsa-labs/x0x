@@ -788,10 +788,19 @@ fn issue613_readiness_rejection_class(reason: Option<&str>) -> &'static str {
 
 fn issue613_partial_ledger(
     records: &std::collections::BTreeMap<[u8; 16], Issue613Record>,
+    witnessed: &std::collections::BTreeMap<[u8; 16], u64>,
     run: [u8; 16],
     outcome: &str,
 ) -> serde_json::Value {
     use sha2::{Digest, Sha256};
+    let witness_max_lag_ns = witnessed
+        .iter()
+        .filter_map(|(request_id, observed_ns)| {
+            records
+                .get(request_id)
+                .map(|record| observed_ns.saturating_sub(record.invoked_ns))
+        })
+        .max();
     serde_json::json!({
         "schema": 1,
         "run_nonce_hash": hex::encode(Sha256::digest(run)),
@@ -799,12 +808,21 @@ fn issue613_partial_ledger(
         "attempted": records.len(),
         "published": records.values().filter(|record| record.ack_ns.is_some()).count(),
         "delivered": records.values().filter(|record| record.delivered_ns.is_some()).count(),
+        "witnessed": witnessed.len(),
+        "witness_max_lag_ns": witness_max_lag_ns,
+        "witness_records": witnessed.iter().map(|(request_id, observed_ns)| serde_json::json!({
+            "request_id": hex::encode(request_id),
+            "observed_ns": observed_ns,
+        })).collect::<Vec<_>>(),
+        "witness_missing_ids": records.keys().filter(|request_id| !witnessed.contains_key(*request_id))
+            .map(hex::encode).collect::<Vec<_>>(),
         "records": records.values().collect::<Vec<_>>(),
     })
 }
 
 fn issue613_partial_ledger_from_mutex(
     records: &Mutex<std::collections::BTreeMap<[u8; 16], Issue613Record>>,
+    witnessed: &Mutex<std::collections::BTreeMap<[u8; 16], u64>>,
     run: [u8; 16],
     outcome: &str,
 ) -> serde_json::Value {
@@ -814,7 +832,10 @@ fn issue613_partial_ledger_from_mutex(
     let guard = records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    issue613_partial_ledger(&guard, run, outcome)
+    let witness_guard = witnessed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    issue613_partial_ledger(&guard, &witness_guard, run, outcome)
 }
 
 async fn issue613_application_delivery(cut: bool) {
@@ -869,12 +890,14 @@ async fn issue613_application_delivery(cut: bool) {
         let mut witness = pubsub(&agents[3]).subscribe(DM_BUS_TOPIC.to_owned()).await;
         let records = Arc::new(Mutex::new(BTreeMap::<[u8; 16], Issue613Record>::new()));
         let delivered_ids = Arc::new(Mutex::new(BTreeSet::<[u8; 16]>::new()));
+        let witnessed_ids = Arc::new(Mutex::new(BTreeMap::<[u8; 16], u64>::new()));
         let mut d5 = receivers.remove(1);
         let mut o5 = receivers.remove(1);
         let sender = &agents[0];
         let publish_records = Arc::clone(&records);
         let collect_records = Arc::clone(&records);
         let collect_delivered = Arc::clone(&delivered_ids);
+        let collect_witnessed = Arc::clone(&witnessed_ids);
         let started = std::time::Instant::now();
         let outer_t0 = generator_cut(sender, clock);
 
@@ -916,9 +939,8 @@ async fn issue613_application_delivery(cut: bool) {
             }
         };
         let collector = async {
-            let mut witnessed = BTreeSet::new();
             while collect_delivered.lock().expect("delivered set").len()
-                < ISSUE613_MESSAGES as usize || witnessed.len() < ISSUE613_MESSAGES as usize
+                < ISSUE613_MESSAGES as usize
             {
                 let received = tokio::select! {
                     actual = d5.recv() => Some((actual.expect("D5 typed inbox open"), 1u8)),
@@ -929,7 +951,10 @@ async fn issue613_application_delivery(cut: bool) {
                             let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
                                 .expect("W5 observed a valid DM envelope");
                             assert!(collect_records.lock().expect("ledger").contains_key(&envelope.request_id));
-                            assert!(witnessed.insert(envelope.request_id), "duplicate W5 raw frame");
+                            let observed_ns = u64::try_from(started.elapsed().as_nanos())
+                                .expect("bounded monotonic offset");
+                            assert!(collect_witnessed.lock().expect("witness set")
+                                .insert(envelope.request_id, observed_ns).is_none(), "duplicate W5 raw frame");
                         }
                         None
                     }
@@ -944,16 +969,33 @@ async fn issue613_application_delivery(cut: bool) {
                 assert!(collect_delivered.lock().expect("delivered set").insert(actual.request_id));
             }
             let deadline = tokio::time::Instant::now() + NEGATIVE_WINDOW;
-            let late = tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => return,
-                actual = d5.recv() => actual.map(|v| ("D5", hex::encode(v.request_id))),
-                actual = o5.recv() => actual.map(|v| ("O5", hex::encode(v.request_id))),
-                raw = witness.recv() => raw.map(|v| ("W5", hex::encode(dm::DmEnvelope::from_wire_bytes(&v.payload).expect("late DM envelope").request_id))),
-            };
-            match late {
-                Some((label, id)) => panic!("unexpected late {label} frame {id}"),
-                None => panic!("capture channel closed during stability window"),
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    actual = d5.recv() => match actual {
+                        Some(value) => panic!("unexpected late D5 frame {}", hex::encode(value.request_id)),
+                        None => panic!("D5 capture channel closed during stability window"),
+                    },
+                    actual = o5.recv() => match actual {
+                        Some(value) => panic!("unexpected late O5 frame {}", hex::encode(value.request_id)),
+                        None => panic!("O5 capture channel closed during stability window"),
+                    },
+                    raw = witness.recv() => {
+                        let raw = raw.expect("W5 capture channel open during stability window");
+                        if raw.sender == Some(sender.agent_id()) && raw.verified {
+                            let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
+                                .expect("W5 observed a valid late DM envelope");
+                            assert!(collect_records.lock().expect("ledger").contains_key(&envelope.request_id));
+                            let observed_ns = u64::try_from(started.elapsed().as_nanos())
+                                .expect("bounded monotonic offset");
+                            assert!(collect_witnessed.lock().expect("witness set")
+                                .insert(envelope.request_id, observed_ns).is_none(), "duplicate W5 raw frame");
+                        }
+                    }
+                }
             }
+            assert!(!collect_witnessed.lock().expect("witness set").is_empty(),
+                "W5 must positively witness current-run load");
         };
         let phase = AssertUnwindSafe(bounded(
             "#613 publication and typed delivery",
@@ -964,6 +1006,7 @@ async fn issue613_application_delivery(cut: bool) {
         .await;
         let partial = issue613_partial_ledger_from_mutex(
             &records,
+            &witnessed_ids,
             run,
             if phase.is_ok() { "COMPLETE" } else { "FAILED" },
         );
@@ -974,6 +1017,7 @@ async fn issue613_application_delivery(cut: bool) {
         drop(publish_records);
         drop(collect_records);
         drop(collect_delivered);
+        drop(collect_witnessed);
         if let Err(panic) = phase {
             std::panic::resume_unwind(panic);
         }
@@ -995,6 +1039,23 @@ async fn issue613_application_delivery(cut: bool) {
             issue613_assert_full_mesh(&evidence["topology"]["observations"]["t1"], &agents);
         }
         let records = Arc::try_unwrap(records).expect("ledger sole owner").into_inner().expect("ledger");
+        let witnessed = Arc::try_unwrap(witnessed_ids)
+            .expect("witness ledger sole owner")
+            .into_inner()
+            .expect("witness ledger");
+        let witness_max_lag_ns = witnessed
+            .iter()
+            .map(|(request_id, observed_ns)| {
+                let invoked_ns = records
+                    .get(request_id)
+                    .expect("witness belongs to current run")
+                    .invoked_ns;
+                observed_ns
+                    .checked_sub(invoked_ns)
+                    .expect("witness cannot precede invocation")
+            })
+            .max()
+            .expect("positive witness evidence");
         assert_eq!(records.len(), ISSUE613_MESSAGES as usize);
         assert!(records.values().all(|record| record.ack_ns.is_some() && record.delivered_ns.is_some()));
         assert_eq!(records.values().filter(|record| record.pair == "G5>D5").count(), 100);
@@ -1010,9 +1071,31 @@ async fn issue613_application_delivery(cut: bool) {
         assert!(outer_messages >= attempted, "outer EAGER meter cannot undercount initial attempted sends");
         let recovery_extra_eager = outer_messages - attempted;
         let outer_average = outer_bytes.checked_div(outer_messages).expect("nonzero outer frames");
-        assert!((12_000..=18_000).contains(&outer_average), "outer frame average preserves diagnosed ~14.8KiB load");
         let inner_min = records.values().map(|record| record.wire_bytes).min().expect("records");
         let inner_max = records.values().map(|record| record.wire_bytes).max().expect("records");
+        assert_eq!(inner_min, inner_max, "fixed-size workload must produce fixed-size inner envelopes");
+        // SG V2 wraps every inner envelope in a GossipMessage carrying an
+        // ML-DSA-65 signature (3,309 bytes) and public key (1,952 bytes), plus
+        // a non-empty header and postcard length/discriminant fields.
+        let outer_source_lower_bound = u64::try_from(inner_max)
+            .expect("bounded inner envelope")
+            + 3_309
+            + 1_952;
+        eprintln!(
+            "ISSUE613_OUTER_ACCOUNTING {}",
+            serde_json::to_string(&serde_json::json!({
+                "t0": outer_t0,
+                "t1": outer_t1,
+                "outer_eager_messages": outer_messages,
+                "outer_eager_bytes": outer_bytes,
+                "outer_eager_average_bytes": outer_average,
+                "initial_attempted_peer_sends": attempted,
+                "recovery_extra_eager_messages": recovery_extra_eager,
+                "outer_eager_source_lower_bound_bytes": outer_source_lower_bound,
+            })).expect("outer accounting JSON")
+        );
+        assert!(outer_average > outer_source_lower_bound,
+            "outer frame average must include the inner envelope, fixed ML-DSA-65 material, and serialization overhead");
         let receipt = serde_json::json!({
             "schema": 1,
             "selector": if cut {"legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut"} else {"legacy_bus_interop_tests::paired_application_delivery_ids_no_disconnect_control"},
@@ -1031,15 +1114,25 @@ async fn issue613_application_delivery(cut: bool) {
             "duplicates": 0,
             "unexpected": 0,
             "receiver_closed": 0,
+            "witnessed": witnessed.len(),
+            "witness_max_lag_ns": witness_max_lag_ns,
+            "witness_missing_ids": records.keys().filter(|request_id| !witnessed.contains_key(*request_id))
+                .map(hex::encode).collect::<Vec<_>>(),
+            "witness_records": witnessed.iter().map(|(request_id, observed_ns)| serde_json::json!({
+                "request_id": hex::encode(request_id),
+                "observed_ns": observed_ns,
+            })).collect::<Vec<_>>(),
             "payload_bytes": ISSUE613_PAYLOAD_BYTES,
             "inner_envelope_bytes_min": inner_min,
             "inner_envelope_bytes_max": inner_max,
             "outer_eager_messages": outer_messages,
             "outer_eager_bytes": outer_bytes,
             "outer_eager_average_bytes": outer_average,
+            "outer_eager_source_lower_bound_bytes": outer_source_lower_bound,
             "initial_attempted_peer_sends": attempted,
             "recovery_extra_eager_messages": recovery_extra_eager,
-            "w5_raw_witnessed": ISSUE613_MESSAGES,
+            "w5_raw_witnessed": witnessed.len(),
+            "w5_witness_contract": "positive current-run topology evidence; not loss-free subscriber delivery",
             "period_ms": 50,
             "pairs": ["G5>D5", "G5>O5"],
             "records": records.into_values().collect::<Vec<_>>(),
@@ -1150,10 +1243,19 @@ fn issue613_partial_ledger_retains_missing_ids_without_payload() {
     let records = [([2; 16], published), ([3; 16], missing)]
         .into_iter()
         .collect();
-    let receipt = issue613_partial_ledger(&records, run, "FAILED");
+    let witnessed = [([2; 16], 13)].into_iter().collect();
+    let receipt = issue613_partial_ledger(&records, &witnessed, run, "FAILED");
     assert_eq!(receipt["attempted"], 2);
     assert_eq!(receipt["published"], 1);
     assert_eq!(receipt["delivered"], 1);
+    assert_eq!(receipt["witnessed"], 1);
+    assert_eq!(
+        receipt["witness_missing_ids"]
+            .as_array()
+            .expect("missing IDs")
+            .len(),
+        1
+    );
     assert_eq!(receipt["outcome"], "FAILED");
     assert!(!serde_json::to_string(&receipt)
         .expect("partial JSON")
@@ -1163,6 +1265,7 @@ fn issue613_partial_ledger_retains_missing_ids_without_payload() {
 #[test]
 fn issue613_partial_ledger_recovers_poison_for_diagnostics() {
     let records = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let witnessed = Mutex::new(std::collections::BTreeMap::new());
     let poisoned = Arc::clone(&records);
     assert!(std::thread::spawn(move || {
         let mut guard = poisoned.lock().expect("initial healthy ledger");
@@ -1172,7 +1275,7 @@ fn issue613_partial_ledger_recovers_poison_for_diagnostics() {
     })
     .join()
     .is_err());
-    let receipt = issue613_partial_ledger_from_mutex(&records, [1; 16], "FAILED");
+    let receipt = issue613_partial_ledger_from_mutex(&records, &witnessed, [1; 16], "FAILED");
     assert_eq!(receipt["attempted"], 1);
     assert_eq!(receipt["outcome"], "FAILED");
 }

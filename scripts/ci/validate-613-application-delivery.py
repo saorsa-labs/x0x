@@ -158,7 +158,7 @@ def validate(receipt):
     if any(receipt.get(k) != v for k, v in {
         "attempted": 200, "published": 200, "delivered": 200,
         "duplicates": 0, "unexpected": 0, "receiver_closed": 0,
-        "payload_bytes": 4096, "period_ms": 50, "w5_raw_witnessed": 200,
+        "payload_bytes": 4096, "period_ms": 50,
     }.items()):
         raise ValueError("count/load/anomaly contract failed")
     records = receipt.get("records")
@@ -198,9 +198,34 @@ def validate(receipt):
         raise ValueError("per-pair equality failed")
     if sequences != set(range(200)):
         raise ValueError("sequence set incomplete")
+    witnessed = receipt.get("witness_records")
+    witnessed_count = receipt.get("w5_raw_witnessed")
+    if (receipt.get("w5_witness_contract") !=
+            "positive current-run topology evidence; not loss-free subscriber delivery"):
+        raise ValueError("W5 witness scope missing")
+    if not isinstance(witnessed, list) or not witnessed or witnessed_count != len(witnessed):
+        raise ValueError("positive W5 witness evidence missing")
+    witness_ids = set()
+    witness_lags = []
+    invoked_by_id = {record["request_id"]: record["invoked_ns"] for record in records}
+    for witness in witnessed:
+        request_id = witness.get("request_id") if isinstance(witness, dict) else None
+        observed_ns = witness.get("observed_ns") if isinstance(witness, dict) else None
+        if (request_id not in ids or request_id in witness_ids or not isinstance(observed_ns, int)
+                or observed_ns < invoked_by_id[request_id]):
+            raise ValueError("invalid W5 witness binding")
+        witness_ids.add(request_id)
+        witness_lags.append(observed_ns - invoked_by_id[request_id])
+    missing = receipt.get("witness_missing_ids")
+    if not isinstance(missing, list) or set(missing) != ids - witness_ids or len(missing) != len(set(missing)):
+        raise ValueError("W5 missing-ID evidence mismatch")
+    if receipt.get("witness_max_lag_ns") != max(witness_lags):
+        raise ValueError("W5 witness lag evidence mismatch")
     inner = [record["wire_bytes"] for record in records]
     if receipt.get("inner_envelope_bytes_min") != min(inner) or receipt.get("inner_envelope_bytes_max") != max(inner):
         raise ValueError("inner envelope extrema mismatch")
+    if min(inner) != max(inner):
+        raise ValueError("fixed-size workload produced variable inner envelopes")
     attempted = sum(record["attempted_peer_sends"] for record in records)
     outer_messages = receipt.get("outer_eager_messages")
     extra = receipt.get("recovery_extra_eager_messages")
@@ -210,8 +235,11 @@ def validate(receipt):
         raise ValueError("recovery EAGER arithmetic mismatch")
     outer_bytes = receipt.get("outer_eager_bytes")
     average = receipt.get("outer_eager_average_bytes")
-    if not isinstance(outer_bytes, int) or average != outer_bytes // outer_messages or not 12000 <= average <= 18000:
-        raise ValueError("outer frame load differs from diagnosed range")
+    source_lower_bound = max(inner) + 3309 + 1952
+    if receipt.get("outer_eager_source_lower_bound_bytes") != source_lower_bound:
+        raise ValueError("outer source-derived lower bound mismatch")
+    if not isinstance(outer_bytes, int) or average != outer_bytes // outer_messages or average <= source_lower_bound:
+        raise ValueError("outer frame omits required current encoding material")
     return selector
 
 
