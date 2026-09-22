@@ -14,8 +14,27 @@ SELECTORS = {
 }
 HEX32 = re.compile(r"[0-9a-f]{32}").fullmatch
 HEX64 = re.compile(r"[0-9a-f]{64}").fullmatch
+# nextest renders captured test output under CARGO_TERM_COLOR=always and closes the
+# final captured line with complete ANSI SGR sequences (e.g. ESC[0m reset wrappers).
+LEADING_SGR = re.compile(r"\x1b\[[0-9;]*m").match
+TRAILING_SGR = re.compile(r"\x1b\[[0-9;]*m\Z").search
+RAW_CONTROL = re.compile(r"[\x00-\x1f]").search
 DIAMOND_TTL_NS = 120_000_000_000
 DIAMOND_MARGIN_NS = 5_000_000_000
+
+
+def strip_terminal_wrappers(raw):
+    """Strip only complete ANSI SGR sequences at the outer boundary of the receipt payload.
+
+    Anything else — unknown or truncated escapes, raw control characters — survives
+    here and is rejected by the caller, so wrapping never masks corrupted content.
+    """
+    payload = raw
+    while (lead := LEADING_SGR(payload)) is not None:
+        payload = payload[lead.end():]
+    while (trail := TRAILING_SGR(payload)) is not None:
+        payload = payload[:trail.start()]
+    return payload
 
 
 def interval(value):
@@ -253,7 +272,10 @@ def main():
         if PREFIX not in line:
             continue
         raw = line.split(PREFIX, 1)[1]
-        receipt = json.loads(raw)
+        payload = strip_terminal_wrappers(raw)
+        if RAW_CONTROL(payload):
+            raise ValueError("raw control character corrupts receipt payload")
+        receipt = json.loads(payload)
         selector = validate(receipt)
         if selector in found:
             raise ValueError(f"duplicate receipt for {selector}")

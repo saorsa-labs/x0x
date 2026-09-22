@@ -898,6 +898,18 @@ async fn issue613_application_delivery(cut: bool) {
         let collect_records = Arc::clone(&records);
         let collect_delivered = Arc::clone(&delivered_ids);
         let collect_witnessed = Arc::clone(&witnessed_ids);
+        // Passive local snapshots only: no dial, reconnect, refresh or publish.
+        // If the delivery phase fails, these bracket whether its full-mesh
+        // premise survived through the unchanged 180-second oracle.
+        let node_diagnostics_t0 = tokio::time::timeout(
+            Duration::from_secs(5),
+            issue613_node_diagnostics(&agents, clock),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            serde_json::json!({"diagnostic_status":"timed_out","budget_secs":5})
+        });
+        // The load clock intentionally excludes diagnostic acquisition.
         let started = std::time::Instant::now();
         let outer_t0 = generator_cut(sender, clock);
 
@@ -1024,6 +1036,7 @@ async fn issue613_application_delivery(cut: bool) {
                 AssertUnwindSafe(async {
                     let failure_t1 = generator_cut(sender, clock);
                     let final_admission = diamond_observations(&agents, clock).await;
+                    let node_diagnostics_t1 = issue613_node_diagnostics(&agents, clock).await;
                     let outer_counter = |cut: &serde_json::Value, field: &str| {
                         cut["stages"]["topics"]["bus_outbound"]["eager"][field].as_u64()
                     };
@@ -1042,6 +1055,7 @@ async fn issue613_application_delivery(cut: bool) {
                         "outer_eager_average_bytes":outer_messages.zip(outer_bytes)
                             .and_then(|(messages, bytes)| bytes.checked_div(messages)),
                         "final_admission":strip_peer_scores(final_admission),
+                        "node_diagnostics":{"t0":node_diagnostics_t0,"t1":node_diagnostics_t1},
                         "w5_bus_subscribed":pubsub(&agents[3]).is_topic_subscribed(DM_BUS_TOPIC).await,
                         "w5_raw_sample":raw_sample(&agents[3], clock),
                     })
@@ -2508,6 +2522,44 @@ fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
     serde_json::json!({"begin_ns":begin,"end_ns":diamond_now(clock),
         "egress":egress,"participation":participation,"stages":stages,
         "recv_pump":recv_pump})
+}
+
+async fn issue613_node_diagnostics(
+    agents: &[Agent],
+    clock: std::time::Instant,
+) -> serde_json::Value {
+    let mut nodes = serde_json::Map::new();
+    for (label, agent) in DIAMOND_LABELS.iter().zip(agents) {
+        let begin_ns = diamond_now(clock);
+        let admitted = agent
+            .network()
+            .expect("network")
+            .gossip_plane_peers()
+            .await
+            .into_iter()
+            .map(|peer| hex::encode(peer.0))
+            .collect::<Vec<_>>();
+        let transport = agent.transport_diagnostics().await;
+        let sample = raw_sample(agent, clock);
+        let bus_subscribed = pubsub(agent).is_topic_subscribed(DM_BUS_TOPIC).await;
+        let end_ns = diamond_now(clock);
+        nodes.insert(
+            (*label).to_owned(),
+            serde_json::json!({
+                "begin_ns": begin_ns,
+                "end_ns": end_ns,
+                "admitted": admitted,
+                "bus_subscribed": bus_subscribed,
+                "transport": transport,
+                "recv_pump": sample["recv_pump"],
+                "admission": sample["stages"]["admission"],
+                "peers_evicted_not_connected": sample["stages"]["peers_evicted_not_connected"],
+                "suppressed_peers": sample["stages"]["suppressed_peers"],
+                "outbound_by_topic_named": sample["egress"]["outbound_by_topic_named"],
+            }),
+        );
+    }
+    serde_json::Value::Object(nodes)
 }
 
 /// The bus wire kinds each arm's oracle judges on. Shared by

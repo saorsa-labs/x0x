@@ -50,6 +50,26 @@ def finish(receipt):
     return receipt
 
 
+def directed():
+    cut = json.loads(json.dumps(finish(valid())))
+    cut["selector"] = "legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut"
+    cut["topology"] = "directed_diamond"
+    peers = cut["topology_evidence"]["peer_ids"]
+    adjacency = {"G5":["D5","O5"],"D5":["G5","W5"],"O5":["G5","W5"],"W5":["D5","O5"]}
+    observations = {phase: {label: {"admitted": [peers[p] for p in adjacent], "begin_ns": 1 if phase == "pre_cut" else 21, "end_ns": 2 if phase == "pre_cut" else 22} for label, adjacent in adjacency.items()} for phase in ("pre_cut", "t1")}
+    def operation(owner, peer):
+        return {"reverse_install":{"owner":peer,"peer":owner,"owner_peer_id":peers[peer],"peer_id":peers[owner],"result":"Installed","begin_ns":1,"end_ns":3,"set_at_ns":2}, "forward_disconnect":{"owner":owner,"peer":peer,"owner_peer_id":peers[owner],"peer_id":peers[peer],"result":"Ok","begin_ns":4,"end_ns":6,"set_at_ns":5}}
+    def suppression(initial):
+        return {"set_at_stable":True,"initial_set_at_ns":initial,"ttl_ns":120_000_000_000,"margin_ns":5_000_000_000,"pre_check":{"live":True,"verdict":"Suppressed","begin_ns":7,"end_ns":8,"set_at_ns":initial,"check_ns":7,"age_ns":7-initial},"final_check":{"live":True,"verdict":"Suppressed","begin_ns":30,"end_ns":32,"set_at_ns":initial,"check_ns":31,"age_ns":31-initial}}
+    cut["topology_evidence"] = {"peer_ids":peers,"expected_allowed":adjacency,"forbidden_pairs":[["G5","W5"],["D5","O5"]],"observations":observations,"operations":{"G5|W5":operation("G5","W5"),"D5|O5":operation("D5","O5")},"suppression":{"G5|W5":suppression(5),"W5|G5":suppression(2),"D5|O5":suppression(5),"O5|D5":suppression(2)}}
+    cut["outer_load_cuts"] = {"t0":{"begin_ns":10,"end_ns":11},"t1":{"begin_ns":19,"end_ns":20}}
+    return cut
+
+
+def run_cli(log, out):
+    return subprocess.run(["python3", str(PATH), str(log), str(out)], capture_output=True, text=True)
+
+
 class ValidatorTests(unittest.TestCase):
     def test_accepts_delivery_before_ack(self):
         self.assertIn("no_disconnect", MOD.validate(finish(valid())))
@@ -86,18 +106,7 @@ class ValidatorTests(unittest.TestCase):
 
     def test_cli_requires_both_complete_success_logs(self):
         control = finish(valid())
-        cut = json.loads(json.dumps(control))
-        cut["selector"] = "legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut"
-        cut["topology"] = "directed_diamond"
-        peers = cut["topology_evidence"]["peer_ids"]
-        directed = {"G5":["D5","O5"],"D5":["G5","W5"],"O5":["G5","W5"],"W5":["D5","O5"]}
-        observations = {phase: {label: {"admitted": [peers[p] for p in adjacent], "begin_ns": 1 if phase == "pre_cut" else 21, "end_ns": 2 if phase == "pre_cut" else 22} for label, adjacent in directed.items()} for phase in ("pre_cut", "t1")}
-        def operation(owner, peer):
-            return {"reverse_install":{"owner":peer,"peer":owner,"owner_peer_id":peers[peer],"peer_id":peers[owner],"result":"Installed","begin_ns":1,"end_ns":3,"set_at_ns":2}, "forward_disconnect":{"owner":owner,"peer":peer,"owner_peer_id":peers[owner],"peer_id":peers[peer],"result":"Ok","begin_ns":4,"end_ns":6,"set_at_ns":5}}
-        def suppression(initial):
-            return {"set_at_stable":True,"initial_set_at_ns":initial,"ttl_ns":120_000_000_000,"margin_ns":5_000_000_000,"pre_check":{"live":True,"verdict":"Suppressed","begin_ns":7,"end_ns":8,"set_at_ns":initial,"check_ns":7,"age_ns":7-initial},"final_check":{"live":True,"verdict":"Suppressed","begin_ns":30,"end_ns":32,"set_at_ns":initial,"check_ns":31,"age_ns":31-initial}}
-        cut["topology_evidence"] = {"peer_ids":peers,"expected_allowed":directed,"forbidden_pairs":[["G5","W5"],["D5","O5"]],"observations":observations,"operations":{"G5|W5":operation("G5","W5"),"D5|O5":operation("D5","O5")},"suppression":{"G5|W5":suppression(5),"W5|G5":suppression(2),"D5|O5":suppression(5),"O5|D5":suppression(2)}}
-        cut["outer_load_cuts"] = {"t0":{"begin_ns":10,"end_ns":11},"t1":{"begin_ns":19,"end_ns":20}}
+        cut = directed()
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory); log = root / "test.log"; out = root / "receipt.json"
             log.write_text("\n".join(MOD.PREFIX + json.dumps(item) for item in (control, cut)))
@@ -105,6 +114,57 @@ class ValidatorTests(unittest.TestCase):
             self.assertEqual(set(json.loads(out.read_text())["receipts"]), set(MOD.SELECTORS))
             log.write_text(MOD.PREFIX + json.dumps(control))
             self.assertNotEqual(subprocess.run(["python3", str(PATH), str(log), str(out)]).returncode, 0)
+
+    def test_cli_accepts_sgr_decorated_receipts(self):
+        control = finish(valid())
+        cut = directed()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory); log = root / "test.log"; out = root / "receipt.json"
+            log.write_text("\n".join((
+                "    \x1b[0m" + MOD.PREFIX + "\x1b[0m" + json.dumps(control) + "\x1b[0m",
+                MOD.PREFIX + "\x1b[32;1m" + json.dumps(cut) + "\x1b[0m\x1b[0m",
+            )))
+            result = run_cli(log, out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(json.loads(out.read_text())["receipts"]), set(MOD.SELECTORS))
+
+    def test_cli_rejects_rendering_corruption(self):
+        control = finish(valid())
+        cut = directed()
+        wrapped_control = MOD.PREFIX + json.dumps(control) + "\x1b[0m"
+        directed_json = json.dumps(cut)
+        cases = (
+            ("arbitrary suffix after reset", MOD.PREFIX + directed_json + "\x1b[0m ok"),
+            ("truncated SGR escape", MOD.PREFIX + directed_json + "\x1b[0"),
+            ("unknown non-SGR CSI escape", MOD.PREFIX + directed_json + "\x1b[2K"),
+            ("malformed JSON missing brace", MOD.PREFIX + directed_json[:-1] + "\x1b[0m"),
+            ("truncated JSON", MOD.PREFIX + directed_json[:200] + "\x1b[0m"),
+            ("internal raw SGR between tokens", MOD.PREFIX + directed_json.replace('"outcome": "PASS"', '"outcome":\x1b[0m"PASS"', 1) + "\x1b[0m"),
+            ("internal tab between tokens", MOD.PREFIX + directed_json.replace('"outcome": "PASS"', '"outcome":\t"PASS"', 1) + "\x1b[0m"),
+        )
+        for label, corrupted in cases:
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = pathlib.Path(directory); log = root / "test.log"; out = root / "receipt.json"
+                    log.write_text("\n".join((wrapped_control, corrupted)))
+                    result = run_cli(log, out)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("#613 receipt validation failed", result.stderr)
+                    if "JSON" not in label:
+                        self.assertIn("raw control character corrupts receipt payload", result.stderr)
+
+    def test_cli_rejects_duplicate_and_missing_selector_with_ansi(self):
+        wrapped_control = MOD.PREFIX + json.dumps(finish(valid())) + "\x1b[0m"
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory); log = root / "test.log"; out = root / "receipt.json"
+            log.write_text("\n".join((wrapped_control, wrapped_control)))
+            result = run_cli(log, out)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("duplicate receipt for", result.stderr)
+            log.write_text(wrapped_control)
+            result = run_cli(log, out)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("both exact selector receipts are required", result.stderr)
 
     def test_accepts_recovery_extra_and_rejects_bad_arithmetic(self):
         receipt = finish(valid())
@@ -132,19 +192,7 @@ class ValidatorTests(unittest.TestCase):
                 MOD.validate(receipt)
 
     def test_rejects_directed_chronology_mutations(self):
-        control = finish(valid())
-        cut = json.loads(json.dumps(control))
-        cut["selector"] = "legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut"
-        cut["topology"] = "directed_diamond"
-        peers = cut["topology_evidence"]["peer_ids"]
-        directed = {"G5":["D5","O5"],"D5":["G5","W5"],"O5":["G5","W5"],"W5":["D5","O5"]}
-        observations = {phase: {label: {"admitted": [peers[p] for p in adjacent], "begin_ns": 1 if phase == "pre_cut" else 21, "end_ns": 2 if phase == "pre_cut" else 22} for label, adjacent in directed.items()} for phase in ("pre_cut", "t1")}
-        def operation(owner, peer):
-            return {"reverse_install":{"owner":peer,"peer":owner,"owner_peer_id":peers[peer],"peer_id":peers[owner],"result":"Installed","begin_ns":1,"end_ns":3,"set_at_ns":2},"forward_disconnect":{"owner":owner,"peer":peer,"owner_peer_id":peers[owner],"peer_id":peers[peer],"result":"Ok","begin_ns":4,"end_ns":6,"set_at_ns":5}}
-        def suppression(initial):
-            return {"set_at_stable":True,"initial_set_at_ns":initial,"ttl_ns":120_000_000_000,"margin_ns":5_000_000_000,"pre_check":{"live":True,"verdict":"Suppressed","begin_ns":7,"end_ns":8,"set_at_ns":initial,"check_ns":7,"age_ns":7-initial},"final_check":{"live":True,"verdict":"Suppressed","begin_ns":30,"end_ns":32,"set_at_ns":initial,"check_ns":31,"age_ns":31-initial}}
-        cut["topology_evidence"] = {"peer_ids":peers,"expected_allowed":directed,"forbidden_pairs":[["G5","W5"],["D5","O5"]],"observations":observations,"operations":{"G5|W5":operation("G5","W5"),"D5|O5":operation("D5","O5")},"suppression":{"G5|W5":suppression(5),"W5|G5":suppression(2),"D5|O5":suppression(5),"O5|D5":suppression(2)}}
-        cut["outer_load_cuts"] = {"t0":{"begin_ns":10,"end_ns":11},"t1":{"begin_ns":19,"end_ns":20}}
+        cut = directed()
         MOD.validate(cut)
         for mutate in (
             lambda value: value["topology_evidence"]["operations"]["G5|W5"]["forward_disconnect"].update(begin_ns=2),
