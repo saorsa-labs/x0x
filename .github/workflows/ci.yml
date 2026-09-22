@@ -100,11 +100,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-git-
 
-      # Cargo.lock is intentionally ignored in this application repo. Resolve it
-      # before caching so the target key identifies the dependency graph actually
-      # compiled by the locked test command below.
+      # Resolve an untracked graph before caching; preserve a tracked lock exactly
+      # when an integration candidate pins dependencies for test provenance.
       - name: Resolve test dependency graph
-        run: cargo generate-lockfile
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
 
       - name: Cache target directory
         uses: actions/cache@v5
@@ -212,7 +216,12 @@ jobs:
           key: ${{ runner.os }}-rust-1.95.0-issue703-cargo-${{ hashFiles('Cargo.toml') }}
 
       - name: Resolve acceptance dependency graph
-        run: cargo generate-lockfile
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
 
       - name: Cache acceptance target
         uses: actions/cache@v5
@@ -283,7 +292,12 @@ jobs:
           toolchain: 1.95.0
 
       - name: Resolve acceptance dependency graph
-        run: cargo generate-lockfile
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
 
       - name: Cache cargo registry and sources
         uses: actions/cache@v5

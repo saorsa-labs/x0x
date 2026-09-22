@@ -146,7 +146,9 @@ pub(super) const fn effective_self_update_enabled(
 /// immediately, which matters when binding `127.0.0.1:0` for tests.
 /// Dropping the handle requests shutdown (the supervisor is cancelled) but does
 /// not block; await [`wait`](ServerHandle::wait) or
-/// [`shutdown_and_wait`](ServerHandle::shutdown_and_wait) to observe completion.
+/// [`shutdown_and_wait`](ServerHandle::shutdown_and_wait) to observe completion,
+/// including a typed transport-release failure that makes an immediate
+/// same-port restart unsafe.
 /// The data-dir (and, when configured, shared-identity-dir) instance locks are
 /// held by the supervisor task itself and released only after it has finished
 /// draining (#645) — so after dropping the handle without awaiting completion,
@@ -215,7 +217,8 @@ impl ServerHandle {
             .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
-    /// Request shutdown, then await run-to-completion.
+    /// Request shutdown, then await run-to-completion, including confirmation
+    /// that the transport released its bound socket.
     pub async fn shutdown_and_wait(self) -> anyhow::Result<()> {
         self.cancel.cancel();
         self.wait().await

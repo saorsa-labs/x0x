@@ -538,6 +538,13 @@ async fn stamp_and_seal_home(
         placements,
         provisioned_at_ms: now_millis_u64(),
     });
+    // #565: bind the builder-issued owner→agent certificate onto the
+    // founding seat BEFORE the seal. `primary_agent_trusted` (the read
+    // side behind `GET /home`'s `verified` bit) trusts only
+    // roster-EMBEDDED bytes — the seal's verdict alone consults live
+    // identity evidence, so without this bind every freshly provisioned
+    // Home reported an unverified primary forever.
+    bind_primary_agent_certificate(state, &mut info);
     // Seal through the OwnerCertified wrapper: it re-verifies the roster
     // (refusing on any failing member) and the seal covers the freshly
     // stamped home digest.
@@ -629,6 +636,11 @@ async fn reseal_home(state: &Arc<AppState>, group_id: &str) -> Option<crate::gro
         );
         return None;
     }
+    // #565: a Home whose primary seat lost (or never carried) certificate
+    // bytes gets them rebound before this seal — the reseal is the
+    // chokepoint for legacy-unsigned records, so the heal rides the same
+    // authority, epoch check, and owner-certified commit.
+    bind_primary_agent_certificate(state, &mut info);
     if seal_commit_owner_certified(state, &mut info, signing_kp, now_millis_u64())
         .await
         .is_err()
@@ -825,6 +837,32 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
                     // recovery candidate below and is re-stamped fresh.
                 }
             }
+        } else if !primary_agent_trusted(
+            &info,
+            &owner,
+            crate::groups::owner_cert::restore_clock_now(),
+        ) && bindable_primary_certificate(state, &info).is_some()
+        {
+            // #565: a Home provisioned before the founding-seat
+            // certificate bind (the pre-fix roster shape) reports an
+            // unverified primary on every start — the read side trusts
+            // only roster-embedded bytes. When this device IS the
+            // primary and lawfully holds a currently verifying
+            // certificate, heal the seat through the owner-certified
+            // reseal instead of leaving the warning standing; anything
+            // less attributable (remote primary, digest mismatch, no
+            // held certificate) stays fail-closed with no reseal churn.
+            let info = match reseal_home(state, &id).await {
+                Some(resealed) => {
+                    tracing::info!(
+                        group_id = %id,
+                        "#565: rebound the primary agent certificate onto the Home seat"
+                    );
+                    resealed
+                }
+                None => info,
+            };
+            repair_or_write_marker(state, &owner_hex, &marker_path, &id, &info).await;
         } else {
             repair_or_write_marker(state, &owner_hex, &marker_path, &id, &info).await;
         }
@@ -1037,6 +1075,72 @@ fn primary_agent_trusted(
         )
         .is_ok()
     })
+}
+
+/// The owner→agent certificate this device may lawfully bind onto its
+/// Home's PRIMARY seat, or `None` when it may not (#565).
+///
+/// Bindings are deliberately narrow so the heal can never mint trust:
+/// the primary must be THIS agent (a remote/nonlocal primary holds a
+/// certificate this device does not hold — not ours to install), the
+/// seat must be active and byte-less, the locally held certificate must
+/// verify against the roster's OWN OwnerCertified owner (correct
+/// owner+agent binding, fail-closed), and any committed digest must
+/// already match the held bytes — a differing digest is committed state
+/// under the signed roster root and is never rewritten here.
+fn bindable_primary_certificate(
+    state: &AppState,
+    info: &crate::groups::GroupInfo,
+) -> Option<crate::identity::AgentCertificate> {
+    let home = info.home.as_ref()?;
+    let owner = info.policy.admission.owner_certified_user_id().copied()?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if !home.primary_agent.eq_ignore_ascii_case(&local_hex) {
+        return None;
+    }
+    let seat = info.members_v2.get(&home.primary_agent)?;
+    if !seat.is_active() || seat.certificate.is_some() {
+        return None;
+    }
+    let cert = state.agent.identity().agent_certificate()?;
+    crate::groups::owner_cert::verify_cert_against_owner(
+        &owner,
+        &home.primary_agent,
+        cert,
+        false,
+        crate::groups::owner_cert::restore_clock_now(),
+    )
+    .ok()?;
+    let digest = crate::groups::owner_cert::certificate_digest_hex(cert);
+    seat.certificate_digest
+        .as_deref()
+        .is_none_or(|committed| committed == digest)
+        .then(|| cert.clone())
+}
+
+/// Bind [`bindable_primary_certificate`] onto the primary seat so the
+/// signed state-commit's roster root covers it (#565). Returns whether
+/// bytes were installed; a refusal (digest mismatch) leaves the roster
+/// untouched and trust stays fail-closed.
+fn bind_primary_agent_certificate(state: &AppState, info: &mut crate::groups::GroupInfo) -> bool {
+    let Some(cert) = bindable_primary_certificate(state, info) else {
+        return false;
+    };
+    let primary = info
+        .home
+        .as_ref()
+        .map_or_else(String::new, |h| h.primary_agent.clone());
+    match info.set_member_certificate(&primary, cert) {
+        Ok(()) => true,
+        Err(crate::groups::SetMemberCertificateError::CertificateDigestMismatch) => {
+            tracing::warn!(
+                group_id = %info.stable_group_id(),
+                "primary seat commits to a different certificate digest; refusing to rewrite \
+                 committed state under the signed roster root"
+            );
+            false
+        }
+    }
 }
 
 /// 200 body for "the owner's Home lives on another device" (#449).
@@ -2644,6 +2748,294 @@ pub(in crate::server::routes) mod tests {
                 .is_none_or(|w| w.is_empty()),
             "auth-exempt /health must not leak Home existence: {health_body}"
         );
+        Ok(())
+    }
+
+    /// WHY (#565): a freshly provisioned Home must report a VERIFIED
+    /// primary agent. The synthetic-owner live receipt proved the
+    /// opposite — `GET /home` answered `state: local` with
+    /// `primary_agent.verified=false` and
+    /// `warnings.primary_agent_unverified=true` — because the stamp
+    /// sealed Home metadata without binding the builder-issued
+    /// owner→agent certificate into the founding roster seat, while the
+    /// read side (`primary_agent_trusted`) trusts only roster-EMBEDDED
+    /// bytes. The verification must also survive a restart on roster
+    /// bytes alone, with no repair pass involved.
+    #[tokio::test]
+    async fn freshly_provisioned_home_reports_verified_primary() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x77; 32]).await?;
+        provision_home(&state).await;
+
+        let owner = owner_of(&state);
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (_, info) = find_home(&state, &owner).await.expect("home provisioned");
+        let founding = info.members_v2.get(&local_hex).expect("founding seat");
+        assert!(
+            founding.certificate.is_some() && founding.certificate_digest.is_some(),
+            "trust must come from roster-embedded bytes (the committed evidence the \
+             signed roster root covers), not from live identity evidence"
+        );
+
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "local");
+        assert_eq!(body["primary_agent"]["agent_id"], local_hex);
+        assert_eq!(
+            body["primary_agent"]["verified"], true,
+            "a fresh owned install must verify its own primary agent"
+        );
+        assert_eq!(body["warnings"]["primary_agent_unverified"], false);
+
+        // Restart over the same data dir: the persisted roster bytes keep
+        // the primary verified without the heal path firing.
+        drop(state);
+        let state2 = owned_state(dir.path(), [0x77; 32]).await?;
+        let (status, body2) =
+            response_json(get_home(State(Arc::clone(&state2))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body2}");
+        assert_eq!(body2["primary_agent"]["verified"], true);
+        assert_eq!(body2["warnings"]["primary_agent_unverified"], false);
+        Ok(())
+    }
+
+    /// WHY (#565): Homes provisioned by the pre-fix build carry a sealed,
+    /// restart-stable `verified=false` (root reproduced this on the live
+    /// synthetic owner). This device is the primary and lawfully holds the
+    /// owner-issued certificate, so the next provisioning pass (daemon
+    /// start) must heal the seat through the owner-certified reseal — no
+    /// operator action, no duplicate group, and no trust without
+    /// roster-embedded bytes.
+    #[tokio::test]
+    async fn unverified_existing_home_is_healed_on_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x78; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (id, _) = find_home(&state, &owner).await.expect("home provisioned");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // Rewind the roster to the exact pre-#565 shape: founding seat
+        // with NO certificate bytes and NO committed digest, state hash
+        // current (the old stamp sealed precisely this roster).
+        {
+            let mut info = {
+                let groups = state.named_groups.read().await;
+                groups.get(&id).cloned().expect("home info")
+            };
+            if let Some(seat) = info.members_v2.get_mut(&local_hex) {
+                seat.certificate = None;
+                seat.certificate_digest = None;
+            }
+            seal_commit_owner_certified(
+                &state,
+                &mut info,
+                state.agent.identity().agent_keypair(),
+                now_millis_u64(),
+            )
+            .await
+            .expect("re-seal the stripped roster");
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(id.clone(), info.clone());
+                true
+            })
+            .await
+            .expect("persist the rewound roster");
+        }
+
+        // The fixture reproduces the live receipt before any heal.
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["primary_agent"]["verified"], false,
+            "fixture must reproduce #565 before the heal"
+        );
+
+        provision_home(&state).await;
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["primary_agent"]["verified"], true, "healed on start");
+        assert_eq!(body["warnings"]["primary_agent_unverified"], false);
+        let (_, info) = find_home(&state, &owner).await.expect("home still present");
+        assert!(
+            info.members_v2
+                .get(&local_hex)
+                .is_some_and(|seat| seat.certificate.is_some()),
+            "the heal must install roster bytes under a fresh seal, not flip a read-side bit"
+        );
+        Ok(())
+    }
+
+    /// WHY (#565 scope): a Home whose primary is a REMOTE agent with valid
+    /// committed certificate bytes is already verified; the heal path must
+    /// leave it untouched — no reseal churn, no rewriting a seat this
+    /// device holds no certificate for.
+    #[tokio::test]
+    async fn verified_remote_primary_is_left_alone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x79; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (id, _) = find_home(&state, &owner).await.expect("home provisioned");
+
+        // Seat a second, owner-certified agent as the Home primary — the
+        // shape `x0x home seat <agent>` produces on another device (#449
+        // option (c)).
+        let other = crate::identity::AgentKeypair::generate()?;
+        let other_hex = hex::encode(other.agent_id().as_bytes());
+        let owner_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned fixture");
+        let other_cert = crate::identity::AgentCertificate::issue(owner_kp, &other)?;
+        {
+            let mut info = {
+                let groups = state.named_groups.read().await;
+                groups.get(&id).cloned().expect("home info")
+            };
+            let mut member = crate::groups::GroupMember::new_member(
+                other_hex.clone(),
+                None,
+                Some(hex::encode(state.agent.agent_id().as_bytes())),
+                0,
+            );
+            member.state = crate::groups::GroupMemberState::Active;
+            info.members_v2.insert(other_hex.clone(), member);
+            info.set_member_certificate(&other_hex, other_cert)
+                .expect("seat the remote primary's certificate");
+            if let Some(home) = info.home.as_mut() {
+                home.primary_agent = other_hex.clone();
+            }
+            seal_commit_owner_certified(
+                &state,
+                &mut info,
+                state.agent.identity().agent_keypair(),
+                now_millis_u64(),
+            )
+            .await
+            .expect("seal the remote-primary roster");
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(id.clone(), info.clone());
+                true
+            })
+            .await
+            .expect("persist the remote-primary roster");
+        }
+        let expected_digest = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .and_then(|info| info.members_v2.get(&other_hex))
+                .and_then(|seat| seat.certificate_digest.clone())
+                .expect("remote primary digest")
+        };
+        let revision_before = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .map(|info| info.state_revision)
+                .expect("home")
+        };
+
+        provision_home(&state).await;
+
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["primary_agent"]["agent_id"], other_hex);
+        assert_eq!(
+            body["primary_agent"]["verified"], true,
+            "an already-valid remote primary keeps its verification"
+        );
+        let (revision_after, digest_after) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&id).expect("home");
+            (
+                info.state_revision,
+                info.members_v2
+                    .get(&other_hex)
+                    .and_then(|seat| seat.certificate_digest.clone())
+                    .expect("remote primary digest"),
+            )
+        };
+        assert_eq!(
+            revision_after, revision_before,
+            "an already-verified Home must not be resealed"
+        );
+        assert_eq!(digest_after, expected_digest);
+        Ok(())
+    }
+
+    /// WHY (#565 fail-closed): a primary seat that already commits to a
+    /// DIFFERENT certificate digest than the one this device holds must
+    /// not be rewritten — the digest is part of the signed roster root,
+    /// and healing over it would silently rewrite committed state (e.g.
+    /// evidence of an owner re-key in flight). The warning stays;
+    /// digest-only seats belong to the hydration paths, not the heal.
+    #[tokio::test]
+    async fn heal_refuses_a_primary_seat_committed_to_another_digest() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x7A; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (id, _) = find_home(&state, &owner).await.expect("home provisioned");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let foreign_digest = "00".repeat(32);
+
+        {
+            let mut info = {
+                let groups = state.named_groups.read().await;
+                groups.get(&id).cloned().expect("home info")
+            };
+            if let Some(seat) = info.members_v2.get_mut(&local_hex) {
+                seat.certificate = None;
+                seat.certificate_digest = Some(foreign_digest.clone());
+            }
+            info.recompute_state_hash();
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(id.clone(), info.clone());
+                true
+            })
+            .await
+            .expect("persist the digest-only roster");
+        }
+        let revision_before = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .map(|info| info.state_revision)
+                .expect("home")
+        };
+
+        provision_home(&state).await;
+
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["primary_agent"]["verified"], false,
+            "a digest-committed seat is not healable by this device"
+        );
+        let (revision_after, digest_after) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&id).expect("home");
+            (
+                info.state_revision,
+                info.members_v2
+                    .get(&local_hex)
+                    .and_then(|seat| seat.certificate_digest.clone())
+                    .expect("primary digest"),
+            )
+        };
+        assert_eq!(
+            revision_after, revision_before,
+            "no reseal churn on refusal"
+        );
+        assert_eq!(digest_after, foreign_digest, "committed digest untouched");
         Ok(())
     }
 
