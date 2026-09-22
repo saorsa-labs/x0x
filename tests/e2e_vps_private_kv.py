@@ -9,7 +9,9 @@ is a failed prerequisite, never a skip or a substitute group.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import time
 import uuid
 from typing import Any, Callable
 
@@ -63,23 +65,114 @@ class Scenario(SharedScenario):
                      and body.get("ok") is not False and body.get("group_id", gid) == gid,
                      status=status, join_state=join_state)
         aid = self.c[member].agent_id()
-        def seat_receipt(facts: dict[str, Any], last: Any) -> None:
-            roster = (last[1] if isinstance(last, tuple) and len(last) > 1
-                      and last[0] == 200 and isinstance(last[1], dict) else {})
-            members = roster.get("members")
+        started = time.monotonic()
+        deadline = started + self.timeout
+        owner_samples = local_samples = 0
+        owner_last: Any = None
+        local_last: Any = None
+        owner_body: dict[str, Any] = {}
+        local_body: dict[str, Any] = {}
+        owner_ready = False
+        first_sample_utc = last_sample_utc = None
+        last_error: str | None = None
+        deadline_reached = False
+
+        def safe_request(client: Any, method: str, path: str) -> tuple[Any, str | None]:
+            try:
+                return client.request(method, path), None
+            except Exception as error:  # preserve the bounded receipt, like poll()
+                return None, type(error).__name__
+
+        def state_label(body: dict[str, Any]) -> str | None:
+            value = body.get("membership_state")
+            allowed = {"active", "pending_authority_commit", "pending", "idle", "not_member"}
+            return value if isinstance(value, str) and value in allowed else ("other" if value is not None else None)
+
+        while time.monotonic() < deadline:
+            sampled = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            first_sample_utc = first_sample_utc or sampled
+            last_sample_utc = sampled
+            owner_samples += 1
+            owner_last, request_error = safe_request(
+                self.c[owner], "GET", f"/groups/{enc(gid)}/members")
+            last_error = request_error or last_error
+            owner_body = (owner_last[1] if isinstance(owner_last, tuple) and len(owner_last) > 1
+                          and isinstance(owner_last[1], dict) else {})
+            members = owner_body.get("members")
             rows = members if isinstance(members, list) else None
-            self.e.record_poll(
-                facts, operation="home_seat", node=owner, member=member,
-                group_id=safe_identifier(gid), deadline_seconds=self.timeout,
-                last_http_status=facts["last_status"],
-                observed_member_count=len(rows) if rows is not None else None,
-                expected_member_present=(any(isinstance(row, dict) and row.get("agent_id") == aid
-                                             for row in rows) if rows is not None else None))
-        poll(f"{member} Home seat reaches owner", self.timeout,
-             lambda: self.c[owner].request("GET", f"/groups/{enc(gid)}/members"),
-             lambda result: result[0] == 200
-             and any(row.get("agent_id") == aid for row in result[1].get("members", [])),
-             seat_receipt)
+            owner_ready = (isinstance(owner_last, tuple) and owner_last[0] == 200
+                           and rows is not None
+                           and any(isinstance(row, dict) and row.get("agent_id") == aid for row in rows))
+            if time.monotonic() >= deadline:
+                deadline_reached = True
+                break
+            local_samples += 1
+            local_last, request_error = safe_request(
+                self.c[member], "GET", f"/groups/{enc(gid)}")
+            last_error = request_error or last_error
+            local_body = (local_last[1] if isinstance(local_last, tuple) and len(local_last) > 1
+                          and isinstance(local_last[1], dict) else {})
+            local_ready = (isinstance(local_last, tuple) and local_last[0] == 200
+                           and local_body.get("group_id") == gid
+                           and state_label(local_body) == "active")
+            if time.monotonic() >= deadline:
+                deadline_reached = True
+                break
+            if owner_ready and local_ready:
+                elapsed = round(time.monotonic() - started, 3)
+                self.e.record_poll(
+                    {"label": f"{member} Home seat reaches owner and local readiness", "elapsed_seconds": elapsed,
+                     "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
+                     "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+                     "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
+                     "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+                     "local_membership_state": "active", "outcome": "accepted",
+                     "observed_member_count": len(rows) if rows is not None else None,
+                     "expected_member_present": True, "last_error_class": last_error},
+                    operation="home_join_readiness", node=member, owner=owner,
+                    group_id=safe_identifier(gid), deadline_seconds=self.timeout,
+                    observed_member_count=len(rows) if rows is not None else None,
+                    expected_member_present=True, local_probe_count=local_samples)
+                return
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
+
+        diagnostic_started = time.monotonic()
+        deadline_reached = time.monotonic() >= deadline
+        join_status, terminal_error = safe_request(
+            self.c[member], "GET", f"/groups/{enc(gid)}/join-status")
+        terminal_body = (join_status[1] if isinstance(join_status, tuple) and len(join_status) > 1
+                         and isinstance(join_status[1], dict) else {})
+        terminal = terminal_body.get("last_join_outcome")
+        terminal_value = terminal.get("outcome") if isinstance(terminal, dict) else None
+        terminal_outcome = (terminal_value if isinstance(terminal_value, str)
+                            and terminal_value in {"refused", "timed_out"} else
+                            ("other" if terminal_value is not None else None))
+        elapsed = round(diagnostic_started - started, 3)
+        self.e.record_poll(
+            {"label": f"{member} Home seat reaches owner and local readiness", "elapsed_seconds": elapsed,
+             "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
+             "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+             "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
+             "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
+             "local_membership_state": state_label(local_body),
+             "terminal_join_status": join_status[0] if isinstance(join_status, tuple) else None,
+             "terminal_join_outcome": terminal_outcome,
+             "terminal_join_status_error_class": terminal_error,
+             "deadline_reached_before_acceptance": deadline_reached,
+             "diagnostic_elapsed_seconds": round(time.monotonic() - diagnostic_started, 3),
+             "last_error_class": last_error, "outcome": "timeout"},
+            operation="home_join_readiness", node=member, owner=owner,
+            group_id=safe_identifier(gid), deadline_seconds=self.timeout,
+            observed_member_count=(len(owner_body.get("members"))
+                                   if isinstance(owner_last, tuple) and owner_last[0] == 200
+                                   and isinstance(owner_body.get("members"), list) else None),
+            expected_member_present=(owner_ready if isinstance(owner_last, tuple)
+                                     and owner_last[0] == 200
+                                     and isinstance(owner_body.get("members"), list) else None),
+            local_probe_count=local_samples)
+        raise AssertionError(f"{member} Home seat reaches owner and local readiness did not converge in {self.timeout:g}s")
 
     def exercise(self, label: str, owner: str, writer: str, late: str, admin: str, revoked: str,
                  gid: str, admit_admin: Callable[[], None], mint_late: Callable[[], str],

@@ -152,15 +152,19 @@ class PrivateKvHarnessTests(unittest.TestCase):
         owner.request = mock.Mock(side_effect=[
             (200, {"ok": True, "group_id": "home-id", "owner_user_id": "f" * 64,
                    "intended_joiner": "2" * 64, "seated": False,
-                   "invite": "x0x://invite/real"})])
-        member.request = mock.Mock(return_value=(200, {"ok": True, "group_id": "home-id"}))
+                   "invite": "x0x://invite/real"}),
+            (200, {"members": [{"agent_id": "2" * 64}]})])
+        member.request = mock.Mock(side_effect=[
+            (200, {"ok": True, "group_id": "home-id", "join_state": "pending_authority_commit"}),
+            (200, {"ok": True, "group_id": "home-id", "membership_state": "active"}),
+        ])
         scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence())
         invite = scenario.home_invite("owner", "member", "home-id", "f" * 64)
         with mock.patch.object(self.h, "poll", return_value=(200, {"members": [{"agent_id": "2" * 64}]})):
             scenario.join_home("owner", "member", "home-id", "f" * 64, invite)
         self.assertEqual(("POST", "/home/seat", {"agent_id": "2" * 64}), owner.request.call_args_list[0].args)
         self.assertEqual({"invite": "x0x://invite/real", "mode": "home",
-                          "expected_owner_user_id": "f" * 64}, member.request.call_args.args[2])
+                          "expected_owner_user_id": "f" * 64}, member.request.call_args_list[0].args[2])
 
     def test_missing_or_remote_home_fails_prerequisite(self):
         api = FakeApi()
