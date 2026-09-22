@@ -744,6 +744,48 @@ fn issue613_redact_topology(topology: &serde_json::Value) -> serde_json::Value {
     redacted
 }
 
+fn issue613_readiness_failure(
+    evidence: &serde_json::Value,
+    rejected: &RejectedReadiness,
+) -> serde_json::Value {
+    let rejection_class =
+        issue613_readiness_rejection_class(rejected.last_rejection_reason.as_deref());
+    let last_observation = rejected.last_observation.clone().map(|observation| {
+        let mut wrapped =
+            serde_json::json!({"observations":{"last":strip_peer_scores(observation)}});
+        wrapped = issue613_redact_topology(&wrapped);
+        wrapped["observations"]["last"].take()
+    });
+    serde_json::json!({
+        "schema": 1,
+        "selector": "legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut",
+        "outcome": "INCONCLUSIVE",
+        "reason": rejected.reason,
+        "last_rejection_class": rejection_class,
+        "last_completed_observation": last_observation,
+        "topology": issue613_redact_topology(&evidence["topology"]),
+        "readiness_diagnostics": {
+            "schema": rejected.diagnostics.schema,
+            "terminal_stage": rejected.diagnostics.terminal_stage,
+            "deadline_ns": rejected.diagnostics.deadline_ns,
+            "terminal_ns": rejected.diagnostics.terminal_ns,
+            "clock_incomplete": rejected.diagnostics.clock_incomplete,
+            "output_overflow": rejected.diagnostics.output_overflow,
+            "counts": rejected.diagnostics.counts,
+        },
+    })
+}
+
+fn issue613_readiness_rejection_class(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some(reason) if reason.contains("scores not yet populated") => "topic_scores_absent",
+        Some(reason) if reason.contains("#611 eager-mesh oracle") => "eager_mesh_invalid",
+        Some(reason) if reason.contains("admitted set differs") => "admitted_set_invalid",
+        Some(_) => "other_validation_rejection",
+        None => "no_completed_rejection",
+    }
+}
+
 fn issue613_partial_ledger(
     records: &std::collections::BTreeMap<[u8; 16], Issue613Record>,
     run: [u8; 16],
@@ -799,9 +841,17 @@ async fn issue613_application_delivery(cut: bool) {
         let clock = std::time::Instant::now();
         let mut evidence = serde_json::json!({});
         let originals = if cut {
-            Some(shape_diamond(&agents, &mut evidence, clock, &[])
-                .await
-                .unwrap_or_else(|rejected| panic!("INCONCLUSIVE: {}", rejected.reason)))
+            match shape_diamond(&agents, &mut evidence, clock, &[]).await {
+                Ok(originals) => Some(originals),
+                Err(rejected) => {
+                    let diagnostic = issue613_readiness_failure(&evidence, &rejected);
+                    eprintln!(
+                        "ISSUE613_READINESS_FAILURE {}",
+                        serde_json::to_string(&diagnostic).expect("readiness diagnostic JSON")
+                    );
+                    panic!("INCONCLUSIVE: {}", rejected.reason);
+                }
+            }
         } else {
             let observed = diamond_observations(&agents, clock).await;
             issue613_assert_full_mesh(&observed, &agents);
@@ -1125,6 +1175,26 @@ fn issue613_partial_ledger_recovers_poison_for_diagnostics() {
     let receipt = issue613_partial_ledger_from_mutex(&records, [1; 16], "FAILED");
     assert_eq!(receipt["attempted"], 1);
     assert_eq!(receipt["outcome"], "FAILED");
+}
+
+#[test]
+fn issue613_readiness_failure_classification_is_bounded() {
+    assert_eq!(
+        issue613_readiness_rejection_class(Some("scores not yet populated peer deadbeef")),
+        "topic_scores_absent"
+    );
+    assert_eq!(
+        issue613_readiness_rejection_class(Some("#611 eager-mesh oracle peer deadbeef")),
+        "eager_mesh_invalid"
+    );
+    assert_eq!(
+        issue613_readiness_rejection_class(Some("admitted set differs peer deadbeef")),
+        "admitted_set_invalid"
+    );
+    assert_eq!(
+        issue613_readiness_rejection_class(None),
+        "no_completed_rejection"
+    );
 }
 
 // Literal source-reviewed lifetime universe, not observed subscriptions. The
@@ -1719,11 +1789,14 @@ async fn shape_diamond(
         }
     })
     .await;
+    // Let the administrative disconnects leave the transport's connected-peer
+    // snapshot before rebuilding PlumTree. Refreshing before this settle can
+    // seed a forbidden, just-disconnected peer and leave the strict eager
+    // oracle polling an immutable stale set for its whole deadline.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     for agent in agents {
         pubsub(agent).refresh_topic_peers().await;
     }
-    // Keep the existing settle outside the unchanged final 20-second budget.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let start = tokio::time::Instant::now();
     let pre_cut = capture_ready_diamond(
         &raw["topology"],

@@ -443,7 +443,7 @@ jobs:
           mkdir -p "$root"
           set +e
           RUNNER_TEMP="$root" bash scripts/ci/nextest-isolated.sh --locked --all-features --lib -- \
-            --run-ignored ignored-only --test-threads 1 --no-tests=fail --success-output immediate \
+            --run-ignored ignored-only --test-threads 1 --no-fail-fast --no-tests=fail --success-output immediate \
             -E 'test(=legacy_bus_interop_tests::paired_application_delivery_ids_no_disconnect_control) | test(=legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut)' \
             > "$root/test.log" 2>&1
           status=$?
