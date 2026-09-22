@@ -119,29 +119,6 @@ pub(in crate::server) struct TreeKemCacheMutation {
 }
 
 #[cfg(test)]
-static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<
-    Vec<(String, String, Option<String>)>,
-> = StdMutex::new(Vec::new());
-/// #477 T9b (r6 item 6): the exact serialized payload bytes of every
-/// metadata publish attempt (topic, bytes) — pins the stored-bytes
-/// resend contract at the transport boundary.
-#[cfg(test)]
-static NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST: StdMutex<Vec<(String, Vec<u8>)>> =
-    StdMutex::new(Vec::new());
-#[cfg(test)]
-// Records each (recipient_hex, event_group_id, event_kind, path) delivery
-// attempt — event_kind is the named-group event variant tag (e.g.
-// "member_removed", "join_request_approved") and path is "direct" or "delayed"
-// — so a handler's recipient set AND that BOTH paths fired per recipient are
-// observable in a deterministic unit test (the live send targets an absent
-// daemon). The full event kind (not just a MemberRemoved boolean) is recorded
-// so an approval-delivery test can distinguish a JoinRequestApproved delivery
-// from a MemberRemoved one and cannot infer the event from recipient presence.
-static NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST: StdMutex<
-    Vec<(String, String, &'static str, &'static str)>,
-> = StdMutex::new(Vec::new());
-
-#[cfg(test)]
 static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
     Option<(String, Arc<tokio::sync::Notify>)>,
 > = StdMutex::new(None);
@@ -149,11 +126,6 @@ static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
 #[cfg(test)]
 static RECOVERED_KP_BEFORE_MEMBERSHIP_LOCK_NOTIFY: StdMutex<
     Option<(String, Arc<tokio::sync::Notify>)>,
-> = StdMutex::new(None);
-
-#[cfg(test)]
-static NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY: StdMutex<
-    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = StdMutex::new(None);
 
 #[cfg(test)]
@@ -2545,7 +2517,7 @@ async fn publish_named_group_metadata_event(
     event: &NamedGroupMetadataEvent,
 ) {
     #[cfg(test)]
-    if let Ok(mut attempts) = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST.lock() {
+    if let Ok(mut attempts) = state.named_group_test_recorders.publish_attempts.lock() {
         attempts.push((
             metadata_topic.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
@@ -2559,7 +2531,7 @@ async fn publish_named_group_metadata_event(
             // bytes each publish attempt hands to the transport, so the
             // stored-bytes resend contract is observable end-to-end.
             #[cfg(test)]
-            if let Ok(mut published) = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST.lock() {
+            if let Ok(mut published) = state.named_group_test_recorders.publish_bytes.lock() {
                 published.push((metadata_topic.to_string(), bytes.clone()));
             }
             match tokio::time::timeout(
@@ -2598,7 +2570,7 @@ async fn publish_named_group_metadata_event_with_envelope(
     event: &NamedGroupMetadataEvent,
 ) -> Option<Bytes> {
     #[cfg(test)]
-    if let Ok(mut attempts) = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST.lock() {
+    if let Ok(mut attempts) = state.named_group_test_recorders.publish_attempts.lock() {
         attempts.push((
             metadata_topic.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
@@ -2673,7 +2645,7 @@ fn named_group_event_delivery_future(
         }
     };
     #[cfg(test)]
-    if let Ok(mut rec) = NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST.lock() {
+    if let Ok(mut rec) = state.named_group_test_recorders.direct_deliveries.lock() {
         rec.push((
             recipient_hex.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
@@ -30553,7 +30525,8 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     };
     #[cfg(test)]
     {
-        let hook = NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        let hook = state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .ok()
             .and_then(|guard| guard.as_ref().cloned());
@@ -34343,6 +34316,9 @@ pub(in crate::server) mod tests {
             forward_service: None,
             owner_sync,
             named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            #[cfg(test)]
+            named_groups_save_after_snapshot_notify: std::sync::Mutex::new(None),
+            named_group_test_recorders: crate::server::state::NamedGroupTestRecorders::default(),
         });
 
         // Review r2 (#451): mirror daemon startup — migrate a pre-#451
@@ -34723,7 +34699,7 @@ pub(in crate::server) mod tests {
                 );
             // Execute the PRODUCTION refire (stored-bytes branch) — with
             // the transport-bytes capture armed (r6 item 6).
-            if let Ok(mut published) = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST.lock() {
+            if let Ok(mut published) = state.named_group_test_recorders.publish_bytes.lock() {
                 published.clear();
             }
             refire_pending_join_volley(
@@ -34738,7 +34714,9 @@ pub(in crate::server) mod tests {
             // The EXACT stored payload bytes reached the transport
             // boundary (publish attempt), unchanged.
             let stored_payload = stored.payload.clone();
-            let published_bytes = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST
+            let published_bytes = state
+                .named_group_test_recorders
+                .publish_bytes
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone();
@@ -38826,7 +38804,9 @@ pub(in crate::server) mod tests {
             );
         }
 
-        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        joiner
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -38876,7 +38856,9 @@ pub(in crate::server) mod tests {
             );
             stub.metadata_topic.clone()
         };
-        let publish_attempts = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        let publish_attempts = joiner
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned");
         assert!(
@@ -40742,7 +40724,7 @@ pub(in crate::server) mod tests {
     //
     // Observed lane: the metadata-topic publish of the survivor envelopes only.
     // The direct + delayed delivery of the MemberRemoved event itself is now
-    // recorded (NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST) and covered by a
+    // recorded (state.named_group_test_recorders.direct_deliveries) and covered by a
     // dedicated test below; THIS test's scope remains the published survivor
     // recipient set, not the MemberRemoved delivery.
     //
@@ -40831,7 +40813,9 @@ pub(in crate::server) mod tests {
             );
         }
 
-        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -40872,7 +40856,9 @@ pub(in crate::server) mod tests {
         // Core 4c observation: the published recipient set. The recorder now
         // carries `SecureShareDelivered.recipient` alongside topic+group, so
         // the assertion is on the recipient set, not a publish count.
-        let published_recipients: Vec<String> = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        let published_recipients: Vec<String> = state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .iter()
@@ -40918,7 +40904,7 @@ pub(in crate::server) mod tests {
     // attribution. The final proof remains MiniMax's five real-daemon tests.
     //
     // Observed lane: the direct + delayed delivery recorder
-    // (NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST), which records
+    // (state.named_group_test_recorders.direct_deliveries), which records
     // (recipient_hex, group_id, is_member_removed, kind) per attempt — kind is
     // "direct" or "delayed". The test asserts each recipient appears on BOTH
     // paths, so loss of either one cannot hide behind the other.
@@ -41002,7 +40988,9 @@ pub(in crate::server) mod tests {
             );
         }
 
-        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+        state
+            .named_group_test_recorders
+            .direct_deliveries
             .lock()
             .expect("delivery recorder poisoned")
             .clear();
@@ -41033,7 +41021,9 @@ pub(in crate::server) mod tests {
         // independently and assert the removed member AND a survivor appear in
         // BOTH — loss of either path is caught (mutation B).
         let recipients_for = |kind: &str| -> Vec<String> {
-            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            state
+                .named_group_test_recorders
+                .direct_deliveries
                 .lock()
                 .expect("delivery recorder poisoned")
                 .iter()
@@ -41105,7 +41095,9 @@ pub(in crate::server) mod tests {
             .await
             .insert(group_id.clone(), info);
 
-        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+        state
+            .named_group_test_recorders
+            .direct_deliveries
             .lock()
             .expect("delivery recorder poisoned")
             .clear();
@@ -41129,7 +41121,9 @@ pub(in crate::server) mod tests {
         );
 
         let recipients_for = |kind: &str| -> Vec<String> {
-            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            state
+                .named_group_test_recorders
+                .direct_deliveries
                 .lock()
                 .expect("delivery recorder poisoned")
                 .iter()
@@ -41542,7 +41536,9 @@ pub(in crate::server) mod tests {
             );
         }
 
-        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+        state
+            .named_group_test_recorders
+            .direct_deliveries
             .lock()
             .expect("delivery recorder poisoned")
             .clear();
@@ -41572,7 +41568,9 @@ pub(in crate::server) mod tests {
         // independently and assert the witness AND requester appear in BOTH —
         // loss of either path or either recipient is caught.
         let recipients_for = |kind: &str| -> Vec<String> {
-            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            state
+                .named_group_test_recorders
+                .direct_deliveries
                 .lock()
                 .expect("delivery recorder poisoned")
                 .iter()
@@ -46743,14 +46741,16 @@ pub(in crate::server) mod tests {
 
         let snapshot_reached = Arc::new(tokio::sync::Notify::new());
         let release_snapshot = Arc::new(tokio::sync::Notify::new());
-        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        *state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("save race hook poisoned") =
             Some((Arc::clone(&snapshot_reached), Arc::clone(&release_snapshot)));
         let stale_state = Arc::clone(&state);
         let stale_save = tokio::spawn(async move { save_named_groups(&stale_state).await });
         snapshot_reached.notified().await;
-        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        *state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("save race hook poisoned") = None;
 
@@ -47392,7 +47392,9 @@ pub(in crate::server) mod tests {
                 .expect("mint signed v4 invite for the replay")
                 .1
         };
-        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -47424,7 +47426,9 @@ pub(in crate::server) mod tests {
             "idempotent response keeps the success shape, body: {body}"
         );
         assert!(
-            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            state
+                .named_group_test_recorders
+                .publish_attempts
                 .lock()
                 .expect("publish-attempt recorder poisoned")
                 .is_empty(),
@@ -52931,7 +52935,7 @@ mod cas_rollback_470 {
     use super::tests::secure_endpoint_test_state;
     use super::{
         persist_named_groups_mutation, save_named_groups, set_save_fault, AtomicWriteOutcome,
-        SaveFault, NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY,
+        SaveFault,
     };
     use crate as x0x;
     use crate::server::AppState;
@@ -53161,7 +53165,8 @@ mod cas_rollback_470 {
     ) -> std::io::Result<AtomicWriteOutcome> {
         let reached = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        *state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("hook lock") = Some((Arc::clone(&reached), Arc::clone(&release)));
         let _fault_guard = set_save_fault(state, fault);
@@ -53176,7 +53181,8 @@ mod cas_rollback_470 {
         reached.notified().await;
         // The save is parked between the mutation and the rollback: this is
         // the concurrent-writer window.
-        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        *state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("hook lock") = None;
         if let Some(variant) = y {
@@ -53368,7 +53374,9 @@ mod cas_rollback_470 {
         let case = seeded_state().await;
         let reached = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        *case
+            .state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("hook lock") = Some((Arc::clone(&reached), Arc::clone(&release)));
         let _fault_guard = set_save_fault(&case.state, SaveFault::NotReplaced);
@@ -53380,7 +53388,9 @@ mod cas_rollback_470 {
             persist_named_groups_mutation(&task_state, |_| true).await
         });
         reached.notified().await;
-        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        *case
+            .state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("hook lock") = None;
         // Review r2: rewrite-sensitivity — value equality alone would also
@@ -53421,6 +53431,74 @@ mod cas_rollback_470 {
             "no-op mutation rewrites nothing — the map equals the seed plus \
              exactly the concurrent Y change"
         );
+    }
+
+    /// #759 item 4 regression: the save-race notify cell is per `AppState`,
+    /// so two concurrently armed tests can neither displace nor fire each
+    /// other's pairs. Under the process-global slot this fixture cannot pass:
+    /// arming B's pair overwrote A's in the single slot, so A's save signalled
+    /// B's `reached` (cross-fire) and A's own await below timed out — the
+    /// plain `cargo test --lib` parallel hang.
+    ///
+    /// Mutation control: route the fire site and the arms back through one
+    /// process-global slot and the first timeout fails (A's `reached` never
+    /// fires; `reached_b` fires instead).
+    ///
+    /// The save OUTCOME is not asserted — outcome semantics are the #470
+    /// matrix's contract; here only the handshake isolation is under test,
+    /// and the two timeouts are the oracle.
+    #[tokio::test]
+    async fn snapshot_save_race_hook_is_per_instance_759() {
+        let case_a = seeded_state().await;
+        let case_b = seeded_state().await;
+        let (reached_a, release_a) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let (reached_b, release_b) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *case_a
+            .state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("hook a poisoned") = Some((Arc::clone(&reached_a), Arc::clone(&release_a)));
+        // The overwrite hazard: this arm must not disturb A's.
+        *case_b
+            .state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("hook b poisoned") = Some((Arc::clone(&reached_b), Arc::clone(&release_b)));
+
+        let a_state = Arc::clone(&case_a.state);
+        let save_a = tokio::spawn(async move { save_named_groups(&a_state).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached_a.notified())
+            .await
+            .expect("A's save reached its OWN hook — B's arm must not displace it");
+        release_a.notify_one();
+        let _ = save_a.await.expect("A's save task panicked");
+
+        // B's pair must survive A's full arm/save cycle untouched — no
+        // global slot exists for A's cleanup to clear.
+        let b_state = Arc::clone(&case_b.state);
+        let save_b = tokio::spawn(async move { save_named_groups(&b_state).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached_b.notified())
+            .await
+            .expect("B's hook survived A's arm/save cycle");
+        release_b.notify_one();
+        let _ = save_b.await.expect("B's save task panicked");
+
+        *case_a
+            .state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("hook a poisoned") = None;
+        *case_b
+            .state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("hook b poisoned") = None;
     }
 
     /// INVERTED (#471). This test previously PINNED the defect: it asserted

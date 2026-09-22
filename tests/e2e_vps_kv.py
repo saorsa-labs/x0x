@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
+import hashlib
 import json
 import logging
+import re
 import subprocess
 import time
 import urllib.error
@@ -64,33 +67,97 @@ def active_provider_ids(status: int, roster: dict[str, Any]) -> set[str]:
             if isinstance(row, dict) and isinstance(row.get("agent_id"), str)}
 
 
-def poll(label: str, timeout: float, probe: Callable[[], Any], accept: Callable[[Any], bool]) -> Any:
-    deadline, last, last_error = time.monotonic() + timeout, None, None
+def poll(label: str, timeout: float, probe: Callable[[], Any], accept: Callable[[Any], bool],
+         receipt: Callable[[dict[str, Any], Any], None] | None = None) -> Any:
+    started = time.monotonic()
+    deadline, last, last_error = started + timeout, None, None
+    first_sample_utc = None
+    last_sample_utc = None
+    probe_count = 0
     while time.monotonic() < deadline:
+        sampled = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        first_sample_utc = first_sample_utc or sampled
+        last_sample_utc = sampled
+        probe_count += 1
         try:
             last = probe()
-            if accept(last):
-                return last
+            last_error = None
+            accepted = accept(last)
         except Exception as error:
             last_error = type(error).__name__
+            accepted = False
+        if accepted:
+            if receipt is not None:
+                receipt({"label": label, "elapsed_seconds": round(time.monotonic() - started, 3),
+                         "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
+                         "probe_count": probe_count, "last_status": poll_status(last),
+                         "last_error_class": None, "outcome": "accepted"}, last)
+            return last
         time.sleep(1)
-    status = last[0] if isinstance(last, tuple) and last and isinstance(last[0], int) else None
+    status = poll_status(last)
+    if receipt is not None:
+        receipt({"label": label, "elapsed_seconds": round(time.monotonic() - started, 3),
+                 "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
+                 "probe_count": probe_count, "last_status": status,
+                 "last_error_class": last_error, "outcome": "timeout"}, last)
     raise AssertionError(f"{label} did not converge in {timeout:g}s; last_status={status}; last_error={last_error}")
+
+
+def poll_status(value: Any) -> int | None:
+    return value[0] if isinstance(value, tuple) and value and isinstance(value[0], int) else None
+
+
+def value_hash(value: Any) -> str | None:
+    return hashlib.sha256(value.encode()).hexdigest() if isinstance(value, str) else None
+
+
+def read_response_class(status: int, body: dict[str, Any]) -> str:
+    if status < 400:
+        return "none"
+    error = body.get("error")
+    if status == 404 and error == "store not found":
+        return "store_not_found"
+    if status == 404 and error == "key not found":
+        return "key_not_found"
+    return "http_error"
+
+
+SAFE_IDENTIFIER = re.compile(r"\A[A-Za-z0-9._:/-]{1,512}\Z")
+
+
+def safe_identifier(value: Any) -> str | None:
+    return value if isinstance(value, str) and SAFE_IDENTIFIER.fullmatch(value) else None
 
 
 @dataclass
 class Evidence:
     assertions: list[dict[str, Any]] = field(default_factory=list)
+    stores: list[dict[str, Any]] = field(default_factory=list)
+    polls: list[dict[str, Any]] = field(default_factory=list)
 
     def check(self, label: str, condition: bool, **facts: Any) -> None:
         self.assertions.append({"label": label, "passed": bool(condition), **facts})
         if not condition:
             raise AssertionError(f"{label}: {facts}")
 
+    def record_store(self, node: str, group_id: str, app: str, payload: dict[str, Any]) -> None:
+        self.stores.append({"node": node, "group_id": safe_identifier(group_id), "app": app,
+                            "topic": safe_identifier(payload.get("id")),
+                            "store_id": safe_identifier(payload.get("store_id"))})
+
+    def record_poll(self, facts: dict[str, Any], **context: Any) -> None:
+        self.polls.append({**context, **facts})
+
+    def report(self) -> dict[str, Any]:
+        return {"scenario": "ordinary-shared-wiki-web", "stores": self.stores,
+                "polls": self.polls, "assertions": self.assertions}
+
 
 class Scenario:
     def __init__(self, clients: dict[str, Api], evidence: Evidence, timeout: float = 120) -> None:
         self.c, self.e, self.timeout = clients, evidence, timeout
+        self.store_context: dict[str, tuple[str, str]] = {}
+        self.read_classes: dict[tuple[str, str, str], str] = {}
 
     def ok(self, node: str, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         status, payload = self.c[node].request(method, path, body)
@@ -110,28 +177,54 @@ class Scenario:
         aid = self.c[member].agent_id()
         poll(f"{member} roster on owner", self.timeout,
              lambda: self.c[owner].request("GET", f"/groups/{enc(gid)}/members"),
-             lambda result: result[0] == 200 and any(row.get("agent_id") == aid for row in result[1].get("members", [])))
+             lambda result: result[0] == 200 and any(row.get("agent_id") == aid for row in result[1].get("members", [])),
+             lambda facts, _last: self.e.record_poll(facts, operation="roster", node=owner,
+                                                       group_id=safe_identifier(gid)))
 
     def open_store(self, node: str, gid: str, app: str) -> dict[str, Any]:
-        return self.ok(node, "POST", f"/groups/{enc(gid)}/stores", {"name": app})
+        payload = self.ok(node, "POST", f"/groups/{enc(gid)}/stores", {"name": app})
+        self.e.record_store(node, gid, app, payload)
+        topic = safe_identifier(payload.get("id"))
+        if topic is not None:
+            self.store_context[topic] = (gid, app)
+        return payload
 
     def put(self, node: str, sid: str, key: str, value: str) -> tuple[int, dict[str, Any]]:
         return self.c[node].request("PUT", f"/stores/{enc(sid)}/{enc(key)}", {
             "value": base64.b64encode(value.encode()).decode(), "content_type": "text/plain"})
 
     def read_value(self, node: str, sid: str, key: str) -> tuple[int, str | None]:
+        read_key = (node, sid, key)
+        self.read_classes.pop(read_key, None)
         status, body = self.c[node].request("GET", f"/stores/{enc(sid)}/{enc(key)}")
+        self.read_classes[read_key] = read_response_class(status, body)
         raw = body.get("value")
         return status, base64.b64decode(raw).decode() if status == 200 and isinstance(raw, str) else None
 
     def await_value(self, node: str, sid: str, key: str, value: str) -> None:
+        gid, app = self.store_context.get(sid, (None, None))
+        expected_hash = value_hash(value)
+        def receipt(facts: dict[str, Any], last: Any) -> None:
+            observed = last[1] if isinstance(last, tuple) and len(last) > 1 else None
+            self.e.record_poll(facts, operation="value", node=node, group_id=safe_identifier(gid),
+                               app=app, store_topic=safe_identifier(sid), key=safe_identifier(key),
+                               response_class=self.read_classes.get((node, sid, key)),
+                               expected_value_sha256=expected_hash,
+                               observed_value_sha256=value_hash(observed))
         result = poll(f"{node} receives {key}", self.timeout,
-                      lambda: self.read_value(node, sid, key), lambda got: got == (200, value))
-        self.e.check(f"{node} converged {key}", result == (200, value), value_sha256=__import__("hashlib").sha256(value.encode()).hexdigest())
+                      lambda: self.read_value(node, sid, key), lambda got: got == (200, value), receipt)
+        self.e.check(f"{node} converged {key}", result == (200, value), value_sha256=expected_hash)
 
     def await_absent(self, node: str, sid: str, key: str) -> None:
+        gid, app = self.store_context.get(sid, (None, None))
         result = poll(f"{node} observes removal {key}", self.timeout,
-                      lambda: self.read_value(node, sid, key), lambda got: got[0] == 404)
+                      lambda: self.read_value(node, sid, key), lambda got: got[0] == 404,
+                      lambda facts, last: self.e.record_poll(
+                          facts, operation="absence", node=node, group_id=safe_identifier(gid), app=app,
+                          store_topic=safe_identifier(sid), key=safe_identifier(key),
+                          response_class=self.read_classes.get((node, sid, key)),
+                          expected_value_sha256=None,
+                          observed_value_sha256=value_hash(last[1]) if isinstance(last, tuple) and len(last) > 1 else None))
         self.e.check(f"{node} converged removal {key}", result[0] == 404)
 
     def prove_denied_did_not_converge(self, observer: str, writer: str, sid: str, forbidden: str) -> None:
@@ -178,7 +271,9 @@ class Scenario:
         self.e.check("owner removes member", self.c[owner].request("DELETE", f"/groups/{enc(gid)}/members/{revoke_aid}")[0] == 200)
         poll("revocation reaches former member", self.timeout,
              lambda: self.c[revoked].request("POST", f"/groups/{enc(gid)}/stores", {"name": "wiki"}),
-             lambda result: result[0] in (403, 404, 409))
+             lambda result: result[0] in (403, 404, 409),
+             lambda facts, _last: self.e.record_poll(facts, operation="revocation", node=revoked,
+                                                       group_id=safe_identifier(gid), app="wiki"))
         before = self.read_value(owner, stores["wiki"], "forbidden")
         denied = self.put(revoked, stores["wiki"], "forbidden", "bad")
         self.e.check("revoked mutation refused", denied[0] in (403, 404), status=denied[0])
@@ -277,7 +372,8 @@ def main() -> int:
         if client is None:
             raise RuntimeError(f"no owned API client available to verify {node} health")
         poll(f"{node} health", 60, lambda: client.request("GET", "/health"),
-             lambda result: result[0] == 200 and result[1].get("ok") is True)
+             lambda result: result[0] == 200 and result[1].get("ok") is True,
+             lambda facts, _last: evidence.record_poll(facts, operation="health", node=node))
     try:
         for index, node in enumerate(args.nodes):
             ip, token = tokens[node]
@@ -301,7 +397,8 @@ def main() -> int:
         Scenario(clients, evidence, args.poll_timeout).run(owner, writer, late, outsider, revoked, stop_owner, restart_writer)
         succeeded = True
     except Exception as error:
-        evidence.assertions.append({"label": "harness", "passed": False, "error": str(error)})
+        evidence.assertions.append({"label": "harness", "passed": False,
+                                    "error_class": type(error).__name__})
     finally:
         for error in custody.restore(await_health):
             succeeded = False; evidence.assertions.append({"label": error, "passed": False})
@@ -312,7 +409,7 @@ def main() -> int:
                 evidence.assertions.append({"label": f"cleanup {node}: {type(error).__name__}", "passed": False})
         try:
             with open(args.report, "w", encoding="utf-8") as output:
-                json.dump({"scenario": "ordinary-shared-wiki-web", "assertions": evidence.assertions}, output, indent=2)
+                json.dump(evidence.report(), output, indent=2)
         except Exception:
             succeeded = False
     return 0 if succeeded and all(item["passed"] for item in evidence.assertions) else 1

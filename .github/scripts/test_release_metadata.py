@@ -7,21 +7,28 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 VALIDATOR = Path('.github/scripts/validate_release_metadata.py')
 WORKFLOW = Path('.github/workflows/release.yml')
+PROMOTED_WORKFLOW = Path('.github/workflows/publish-promoted-release.yml')
 CARD = Path('.well-known/agent.json')
 
 EXPECTED_RELEASE_JOB_NEEDS = {
     'require-green-ci': ['validate-release-metadata'],
-    'build-release': ['validate-release-metadata', 'require-green-ci'],
+    'resolve-release-lock': ['validate-release-metadata', 'require-green-ci'],
+    'build-release': [
+        'validate-release-metadata', 'require-green-ci', 'resolve-release-lock'],
     'sign-release': ['build-release'],
     'create-release': ['build-release', 'sign-release'],
-    'publish-clawhub': ['create-release'],
-    'publish-crates': ['create-release'],
+}
+
+EXPECTED_PROMOTED_JOB_NEEDS = {
+    'publish-clawhub': ['validate-promoted-release'],
+    'publish-crates': ['validate-promoted-release'],
 }
 
 
@@ -52,13 +59,13 @@ def parse_workflow_needs(text):
     return needs
 
 
-def release_job_needs_violations(text):
-    """Return exact-name gating violations for release.yml jobs."""
+def job_needs_violations(text, expected, workflow_name):
+    """Return exact-name gating violations for one workflow's jobs."""
     needs = parse_workflow_needs(text)
     violations = []
-    for job, dependencies in EXPECTED_RELEASE_JOB_NEEDS.items():
+    for job, dependencies in expected.items():
         if job not in needs:
-            violations.append(f'{job} is missing from release.yml')
+            violations.append(f'{job} is missing from {workflow_name}')
             continue
         for dependency in dependencies:
             if dependency not in needs[job]:
@@ -68,12 +75,24 @@ def release_job_needs_violations(text):
     return violations
 
 
+def release_job_needs_violations(text):
+    return job_needs_violations(
+        text, EXPECTED_RELEASE_JOB_NEEDS, 'release.yml')
+
+
+def promoted_job_needs_violations(text):
+    return job_needs_violations(
+        text, EXPECTED_PROMOTED_JOB_NEEDS,
+        'publish-promoted-release.yml')
+
+
 class ReleaseCardTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for name in [VALIDATOR, WORKFLOW, CARD, Path('Cargo.toml'), Path('SKILL.md'),
+        for name in [VALIDATOR, WORKFLOW, PROMOTED_WORKFLOW, CARD,
+                     Path('Cargo.toml'), Path('SKILL.md'),
                      Path('scripts/bump-version.sh')]:
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -388,6 +407,85 @@ class ReleaseCardTests(unittest.TestCase):
             with self.subTest(violation=violation):
                 self.fail(violation)
 
+        promoted = (ROOT / PROMOTED_WORKFLOW).read_text()
+        self.assertIn('types: [published]', promoted)
+        self.assertIn('RELEASE_TAG: ${{ github.event.release.tag_name }}', promoted)
+        self.assertIn('RELEASE_DRAFT: ${{ github.event.release.draft }}', promoted)
+        self.assertIn('RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}', promoted)
+        self.assertIn('ref: ${{ github.event.release.tag_name }}', promoted)
+        self.assertIn('[ "$RELEASE_DRAFT" = "false" ]', promoted)
+        self.assertIn('[ "$RELEASE_PRERELEASE" = "false" ]', promoted)
+        self.assertIn('--mode release_tag --tag "$RELEASE_TAG" --ref "refs/tags/$RELEASE_TAG"', promoted)
+        for violation in promoted_job_needs_violations(promoted):
+            with self.subTest(violation=violation):
+                self.fail(violation)
+
+        promoted_gate = self.validator.extract_step_run_block(
+            str(PROMOTED_WORKFLOW),
+            'Require the published event to match the tagged source')
+        base_env = dict(os.environ, RELEASE_TAG=f'v{self.version}',
+                        RELEASE_DRAFT='false', RELEASE_PRERELEASE='false')
+        accepted = subprocess.run(
+            ['bash', '-c', promoted_gate], cwd=self.root,
+            capture_output=True, text=True, env=base_env)
+        self.assertEqual(accepted.returncode, 0,
+                         accepted.stdout + accepted.stderr)
+        for overrides in (
+                {'RELEASE_DRAFT': 'true'},
+                {'RELEASE_PRERELEASE': 'true'},
+                {'RELEASE_TAG': 'v999.0.0'}):
+            with self.subTest(overrides=overrides):
+                refused = subprocess.run(
+                    ['bash', '-c', promoted_gate], cwd=self.root,
+                    capture_output=True, text=True,
+                    env={**base_env, **overrides})
+                self.assertNotEqual(refused.returncode, 0)
+
+        self.assertEqual(
+            self.validator.extract_release_unix_bins(str(ROOT / WORKFLOW)),
+            ['x0xd', 'x0x'])
+        self.assertEqual(
+            self.validator.extract_release_windows_bins(str(ROOT / WORKFLOW)),
+            ['x0xd.exe', 'x0x.exe'])
+        workflow_text = (ROOT / WORKFLOW).read_text()
+        packaging_tampers = (
+            ('for bin in x0xd x0x; do', 'for bin in x0xd; do'),
+            ('for bin in x0xd x0x; do', 'for bin in x0x; do'),
+            ('foreach ($bin in @("x0xd.exe", "x0x.exe"))',
+             'foreach ($bin in @("x0xd.exe"))'),
+            ('foreach ($bin in @("x0xd.exe", "x0x.exe"))',
+             'foreach ($bin in @("x0x.exe"))'),
+        )
+        rule = {
+            'level': 'blocking',
+            'inputs': [str(ROOT / 'SKILL.md'), str(ROOT / 'scripts/install.sh'), ''],
+            'expected_bins': {
+                'unix': ['x0xd', 'x0x'],
+                'windows': ['x0xd.exe', 'x0x.exe'],
+            },
+        }
+        for declaration, replacement in packaging_tampers:
+            with self.subTest(omitted_packaged_binary=replacement):
+                before, separator, after = workflow_text.rpartition(declaration)
+                self.assertEqual(separator, declaration)
+                fixture = self.root / ('tampered-' + str(len(replacement)) + '.yml')
+                fixture.write_text(before + replacement + after)
+                rule['inputs'][2] = str(fixture)
+                state = self.validator.ValidationState()
+                self.validator.validate_openclaw_bins(rule, state)
+                self.assertTrue(state.failures, 'omitted packaged binary must block')
+
+        for declaration, extractor in (
+                ('for bin in x0xd x0x; do', self.validator.extract_release_unix_bins),
+                ('foreach ($bin in @("x0xd.exe", "x0x.exe"))',
+                 self.validator.extract_release_windows_bins)):
+            before, separator, after = workflow_text.rpartition(declaration)
+            self.assertEqual(separator, declaration)
+            fixture = self.root / ('unknown-' + str(len(declaration)) + '.yml')
+            fixture.write_text(before + after)
+            with self.assertRaises(ValueError):
+                extractor(str(fixture))
+
     def test_suffixed_dependency_name_fails_the_gate_check(self):
         # Negative control: the old substring check (assertIn(dependency,
         # raw_needs_string)) passed when a job declared
@@ -399,6 +497,8 @@ class ReleaseCardTests(unittest.TestCase):
              'needs: validate-release-metadata-typo'),
             ('needs: [validate-release-metadata, require-green-ci]',
              'needs: [validate-release-metadata-typo, require-green-ci]'),
+            ('needs: [validate-release-metadata, require-green-ci, resolve-release-lock]',
+             'needs: [validate-release-metadata-typo, require-green-ci, resolve-release-lock]'),
         ]
         for original, tampered in tampers:
             with self.subTest(tampered=tampered):
@@ -406,6 +506,53 @@ class ReleaseCardTests(unittest.TestCase):
                 self.assertTrue(
                     release_job_needs_violations(text.replace(original, tampered, 1)),
                     f'suffixed dependency {tampered!r} must be flagged')
+
+        promoted = (ROOT / PROMOTED_WORKFLOW).read_text()
+        self.assertTrue(promoted_job_needs_violations(
+            promoted.replace(
+                'needs: validate-promoted-release',
+                'needs: validate-promoted-release-typo', 1)))
+
+    def test_tar_packaging_has_exact_custody_members_and_fails_missing_inputs(self):
+        block = self.validator.extract_step_run_block(
+            str(WORKFLOW), 'Package (tar.gz)')
+        platform = 'macos-arm64'
+        block = block.replace('${{ matrix.platform }}', platform)
+        required = ('x0xd', 'x0x', 'Cargo.lock', 'build-provenance.json')
+
+        def run_case(missing=None):
+            case = self.root / ('package-' + (missing or 'complete').replace('.', '-'))
+            case.mkdir()
+            runner_temp = case / 'runner-temp'
+            custody = runner_temp / f'release-{platform}-custody'
+            custody.mkdir(parents=True)
+            for name in required:
+                if name != missing:
+                    path = custody / name
+                    path.write_bytes((name + '\n').encode())
+                    if hasattr(os, 'setxattr'):
+                        try:
+                            os.setxattr(path, 'user.x0x-test', b'owned')
+                        except OSError:
+                            pass
+            env = dict(os.environ, RUNNER_TEMP=str(runner_temp),
+                       GITHUB_ENV=str(case / 'github-env'))
+            result = subprocess.run(
+                ['bash', '-c', 'set -euo pipefail\n' + block], cwd=case,
+                capture_output=True, text=True, env=env)
+            return case, result
+
+        case, result = run_case()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with tarfile.open(case / f'x0x-{platform}.tar.gz', 'r:gz') as archive:
+            self.assertEqual(
+                set(archive.getnames()),
+                {f'x0x-{platform}',
+                 *(f'x0x-{platform}/{name}' for name in required)})
+        for missing in required:
+            with self.subTest(missing=missing):
+                _, failed = run_case(missing)
+                self.assertNotEqual(failed.returncode, 0)
 
 
 if __name__ == '__main__':

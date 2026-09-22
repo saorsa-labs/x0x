@@ -378,13 +378,18 @@ def extract_release_unix_bins(path_str):
 
 
 def extract_release_windows_bins(path_str):
-    text = read_text(path_str)
+    run_block = extract_step_run_block(path_str, "Package (zip)")
+    match = re.search(r'foreach \(\$bin in @\(([^)]+)\)\)', run_block)
+    if not match:
+        raise ValueError(
+            f"Could not find packaged windows binaries in Package (zip) step of {path_str}"
+        )
     bins = []
-    for candidate in ["x0xd.exe", "x0x.exe"]:
-        if candidate in text:
-            bins.append(candidate)
-    if len(bins) != 2:
-        raise ValueError(f"Could not find packaged windows binaries in {path_str}")
+    for item in match.group(1).split(","):
+        item = item.strip()
+        if len(item) < 2 or item[0] not in "\"'" or item[-1] != item[0]:
+            raise ValueError(f"Invalid packaged windows binary declaration in {path_str}")
+        bins.append(item[1:-1])
     return bins
 
 

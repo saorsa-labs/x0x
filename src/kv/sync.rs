@@ -32,6 +32,26 @@ use tokio::sync::RwLock;
 /// never subscribe to the side channel and are unaffected.
 const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 
+fn trace_group_signed_record(
+    stage: &'static str,
+    record_kind: &'static str,
+    store_id: &KvStoreId,
+    wire: &[u8],
+) {
+    if !tracing::enabled!(target: "x0x.kv.gss_trace", tracing::Level::DEBUG) {
+        return;
+    }
+    let record_hash = blake3::hash(wire).to_hex();
+    tracing::debug!(
+        target: "x0x.kv.gss_trace",
+        stage,
+        record_kind,
+        store_id = %store_id,
+        record_hash = %record_hash,
+        "group-signed KV convergence trace"
+    );
+}
+
 /// An async hook that refreshes the sync's
 /// [`KvSecureContext`](crate::kv::encrypted::KvSecureContext) snapshot
 /// before cryptographic or membership decisions.
@@ -929,6 +949,17 @@ impl KvStoreSync {
             })?;
         let frames =
             crate::kv::retained_paging::split_image(retained, max_wire.saturating_sub(16 * 1024))?;
+        let trace_store_id = if tracing::enabled!(
+            target: "x0x.kv.gss_trace",
+            tracing::Level::DEBUG
+        ) && publish.seal.treekem.is_none()
+            && publish.seal.secure.is_some()
+            && !publish.seal.encrypted
+        {
+            Some(*publish.seal.store.read().await.id())
+        } else {
+            None
+        };
         for frame in frames {
             #[cfg(test)]
             if let Some(state) = publish.test_state {
@@ -959,13 +990,34 @@ impl KvStoreSync {
                     "sealed retained image frame exceeds signed V3 wire limit".to_string(),
                 ));
             }
-            publish
+            let wire = bytes::Bytes::from(serialized);
+            if let Some(store_id) = trace_store_id.as_ref() {
+                trace_group_signed_record(
+                    "state_serve_publish_attempted",
+                    "retained_state",
+                    store_id,
+                    &wire,
+                );
+            }
+            let result = publish
                 .pubsub
-                .publish(publish.topic.to_string(), bytes::Bytes::from(serialized))
-                .await
-                .map_err(|error| {
-                    KvError::Gossip(format!("retained image publish failed: {error}"))
-                })?;
+                .publish(publish.topic.to_string(), wire.clone())
+                .await;
+            if let Some(store_id) = trace_store_id.as_ref() {
+                trace_group_signed_record(
+                    if result.is_ok() {
+                        "state_serve_publish_api_ok"
+                    } else {
+                        "state_serve_publish_failed"
+                    },
+                    "retained_state",
+                    store_id,
+                    &wire,
+                );
+            }
+            result.map_err(|error| {
+                KvError::Gossip(format!("retained image publish failed: {error}"))
+            })?;
             #[cfg(test)]
             if let Some(state) = publish.test_state {
                 state
@@ -992,6 +1044,7 @@ impl KvStoreSync {
         let (sender_peer, record) = match decode_delta::<SignedKvMutation>(payload) {
             Ok(decoded) => decoded,
             Err(e) => {
+                trace_group_signed_record("receive_rejected_decode", "unknown", store_id, payload);
                 tracing::warn!("rejected malformed group-signed record: {e}");
                 return false;
             }
@@ -999,6 +1052,12 @@ impl KvStoreSync {
         let mutation = match open_signed_mutation(ctx.as_ref(), store_id, record) {
             Ok(mutation) => mutation,
             Err(e) => {
+                trace_group_signed_record(
+                    "receive_rejected_signed_record",
+                    "unknown",
+                    store_id,
+                    payload,
+                );
                 tracing::warn!("rejected group-signed record: {e}");
                 return false;
             }
@@ -1006,9 +1065,21 @@ impl KvStoreSync {
         let mutation_payload = match open_public_payload(ctx.as_ref(), &mutation.payload) {
             Ok(payload) => payload,
             Err(e) => {
+                trace_group_signed_record(
+                    "receive_rejected_authorization",
+                    "unknown",
+                    store_id,
+                    payload,
+                );
                 tracing::warn!("rejected group-signed authorization binding: {e}");
                 return false;
             }
+        };
+        let record_kind = match mutation.kind {
+            KvMutationKind::Delta => "delta",
+            KvMutationKind::RetainedState => "retained_state",
+            KvMutationKind::FullState => "full_state",
+            KvMutationKind::Control => "control",
         };
         let retained_image = if mutation.kind == KvMutationKind::RetainedState {
             let authorization = ctx.authorization_binding().unwrap_or_else(|| {
@@ -1025,8 +1096,22 @@ impl KvStoreSync {
                 pages,
             ) {
                 Ok(Some(image)) => Some(image),
-                Ok(None) => return false,
+                Ok(None) => {
+                    trace_group_signed_record(
+                        "receive_page_buffered",
+                        record_kind,
+                        store_id,
+                        payload,
+                    );
+                    return false;
+                }
                 Err(error) => {
+                    trace_group_signed_record(
+                        "receive_rejected_page",
+                        record_kind,
+                        store_id,
+                        payload,
+                    );
                     tracing::warn!(%error, "rejected retained group page");
                     return false;
                 }
@@ -1070,10 +1155,17 @@ impl KvStoreSync {
                 "wrong mutation kind on group-signed main topic".to_string(),
             )),
         };
-        result.map(|()| true).unwrap_or_else(|e| {
-            tracing::warn!("failed to merge group-signed record: {e}");
-            false
-        })
+        match result {
+            Ok(()) => {
+                trace_group_signed_record("receive_applied", record_kind, store_id, payload);
+                true
+            }
+            Err(e) => {
+                trace_group_signed_record("receive_rejected_merge", record_kind, store_id, payload);
+                tracing::warn!("failed to merge group-signed record: {e}");
+                false
+            }
+        }
     }
 
     /// Open and merge one encrypted record received on the main topic.
@@ -1716,6 +1808,12 @@ impl KvStoreSync {
                         )
                         .await
                     } else {
+                        trace_group_signed_record(
+                            "receive_before_verification",
+                            "unknown",
+                            &listener_store_id,
+                            &msg.payload,
+                        );
                         Self::merge_group_signed_record(
                             ctx,
                             listener_refresh.as_ref(),
@@ -1977,6 +2075,14 @@ impl KvStoreSync {
                     KvSyncMessage::StateRequest { requester } => {
                         if requester == local_peer_id {
                             continue;
+                        }
+                        if responder_is_group_signed {
+                            trace_group_signed_record(
+                                "state_request_received",
+                                "control",
+                                &responder_store_id,
+                                &msg.payload,
+                            );
                         }
                         // Owner: announce authoritative metadata so anchored
                         // joiners can refresh policy / confirm ownership.
@@ -2595,10 +2701,37 @@ impl KvStoreSync {
                     let Some(serialized) = serialized else {
                         return;
                     };
-                    if let Err(e) = requester_pubsub
-                        .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
-                        .await
+                    let wire = bytes::Bytes::from(serialized);
+                    if requester_secure.is_some()
+                        && requester_treekem.is_none()
+                        && !requester_is_encrypted
                     {
+                        trace_group_signed_record(
+                            "state_request_publish_attempted",
+                            "control",
+                            &requester_store_id,
+                            &wire,
+                        );
+                    }
+                    let result = requester_pubsub
+                        .publish(sync_topic.clone(), wire.clone())
+                        .await;
+                    if requester_secure.is_some()
+                        && requester_treekem.is_none()
+                        && !requester_is_encrypted
+                    {
+                        trace_group_signed_record(
+                            if result.is_ok() {
+                                "state_request_publish_api_ok"
+                            } else {
+                                "state_request_publish_failed"
+                            },
+                            "control",
+                            &requester_store_id,
+                            &wire,
+                        );
+                    }
+                    if let Err(e) = result {
                         tracing::debug!("KvStore state-request publish failed: {e}");
                     }
                 }
@@ -2793,10 +2926,31 @@ impl KvStoreSync {
                 .map_err(|e| KvError::Gossip(format!("serialize delta failed: {e}")))?
         };
 
-        self.pubsub
-            .publish(self.topic.clone(), bytes::Bytes::from(serialized))
-            .await
-            .map_err(|e| KvError::Gossip(format!("publish delta failed: {e}")))?;
+        let wire = bytes::Bytes::from(serialized);
+        let trace_store_id = if store_is_group_signed
+            && tracing::enabled!(target: "x0x.kv.gss_trace", tracing::Level::DEBUG)
+        {
+            Some(*self.store.read().await.id())
+        } else {
+            None
+        };
+        if let Some(store_id) = trace_store_id.as_ref() {
+            trace_group_signed_record("publish_attempted", "delta", store_id, &wire);
+        }
+        let result = self.pubsub.publish(self.topic.clone(), wire.clone()).await;
+        if let Some(store_id) = trace_store_id.as_ref() {
+            trace_group_signed_record(
+                if result.is_ok() {
+                    "publish_api_ok"
+                } else {
+                    "publish_failed"
+                },
+                "delta",
+                store_id,
+                &wire,
+            );
+        }
+        result.map_err(|e| KvError::Gossip(format!("publish delta failed: {e}")))?;
 
         Ok(())
     }

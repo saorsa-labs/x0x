@@ -1143,6 +1143,118 @@ pub(super) struct AppState {
     /// other's injected faults (fixes #732 / #673 ambient flake).
     #[cfg(test)]
     pub(super) named_groups_save_fault: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Per-instance deterministic-interleave cell for the #470 save-race hook:
+    /// an armed test parks `save_named_groups` between the roster snapshot and
+    /// the durable writes until released. It lives on the `AppState` — like
+    /// `named_groups_save_fault`, NOT in a process-global static — because the
+    /// plain `cargo test --lib` binary runs these tests in parallel in one
+    /// process: a global single slot let one test's arm overwrite another's
+    /// (whose save then hung awaiting a pair nobody would release) and let a
+    /// FOREIGN save park forever on a pair whose arming test had finished
+    /// (#759 item 4).
+    #[cfg(test)]
+    pub(super) named_groups_save_after_snapshot_notify: std::sync::Mutex<
+        Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    >,
+    /// Per-instance named-group transport observations. These remain on the
+    /// exact `AppState` whose route emitted them so parallel tests cannot
+    /// clear or append another instance's evidence (#759 item 4).
+    #[cfg(test)]
+    pub(super) named_group_test_recorders: NamedGroupTestRecorders,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct NamedGroupTestRecorders {
+    pub(super) publish_attempts: StdMutex<Vec<(String, String, Option<String>)>>,
+    pub(super) publish_bytes: StdMutex<Vec<(String, Vec<u8>)>>,
+    pub(super) direct_deliveries: StdMutex<Vec<(String, String, &'static str, &'static str)>>,
+}
+
+#[cfg(test)]
+mod named_group_test_recorder_tests {
+    use super::NamedGroupTestRecorders;
+
+    #[test]
+    fn independent_instances_do_not_clear_or_pollute_each_other() {
+        let a = NamedGroupTestRecorders::default();
+        let b = NamedGroupTestRecorders::default();
+        a.publish_attempts.lock().expect("A recorder").push((
+            "a-topic".into(),
+            "a-group".into(),
+            None,
+        ));
+        b.publish_attempts.lock().expect("B recorder").push((
+            "b-topic".into(),
+            "b-group".into(),
+            Some("b-recipient".into()),
+        ));
+        b.publish_bytes
+            .lock()
+            .expect("B bytes recorder")
+            .push(("b-topic".into(), vec![2]));
+        b.direct_deliveries
+            .lock()
+            .expect("B delivery recorder")
+            .push((
+                "b-recipient".into(),
+                "b-group".into(),
+                "member_added",
+                "direct",
+            ));
+
+        a.publish_attempts.lock().expect("A recorder").clear();
+        a.publish_bytes.lock().expect("A bytes recorder").clear();
+        a.direct_deliveries
+            .lock()
+            .expect("A delivery recorder")
+            .clear();
+        a.publish_attempts.lock().expect("A recorder").push((
+            "a-second-topic".into(),
+            "a-second-group".into(),
+            None,
+        ));
+
+        assert_eq!(
+            a.publish_attempts.lock().expect("A recorder").as_slice(),
+            &[("a-second-topic".into(), "a-second-group".into(), None)],
+            "A must contain only its post-clear append"
+        );
+        assert!(a.publish_bytes.lock().expect("A bytes recorder").is_empty());
+        assert!(a
+            .direct_deliveries
+            .lock()
+            .expect("A delivery recorder")
+            .is_empty());
+        assert_eq!(
+            b.publish_attempts.lock().expect("B recorder").as_slice(),
+            &[(
+                "b-topic".into(),
+                "b-group".into(),
+                Some("b-recipient".into())
+            )],
+            "clearing A must retain B's exact evidence"
+        );
+        assert_eq!(
+            b.publish_bytes.lock().expect("B bytes recorder").as_slice(),
+            &[("b-topic".into(), vec![2])]
+        );
+        assert_eq!(
+            b.direct_deliveries
+                .lock()
+                .expect("B delivery recorder")
+                .as_slice(),
+            &[(
+                "b-recipient".into(),
+                "b-group".into(),
+                "member_added",
+                "direct"
+            )]
+        );
+    }
 }
 
 #[derive(Clone)]

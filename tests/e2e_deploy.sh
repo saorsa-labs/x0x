@@ -37,10 +37,14 @@ set -- "${X0X_FILTERED_ARGS[@]+"${X0X_FILTERED_ARGS[@]}"}"
 TOKEN_FILE="$X0X_TOKEN_FILE"
 # Per-network runner identity: testnet runs alongside prod, must not collide.
 if [ "$X0X_NETWORK" = "prod" ]; then
+    RUNNER_NETWORK="prod"
     RUNNER_UNIT_NAME="x0x-test-runner.service"
     RUNNER_ENV_FILE="/etc/x0x-test-runner.env"
     RUNNER_AGENT_DATA_DIR="/root/.local/share/x0x"
 else
+    # The fleet selector calls this network "test", while the runner bundle
+    # installer and its on-disk paths use the canonical name "testnet".
+    RUNNER_NETWORK="testnet"
     RUNNER_UNIT_NAME="x0x-test-runner-testnet.service"
     RUNNER_ENV_FILE="/etc/x0x-test-runner-testnet.env"
     RUNNER_AGENT_DATA_DIR="/root/.local/share/x0x-testnet"
@@ -259,11 +263,11 @@ LRCONF
            && cat "$RUNNER_INSTALLER" \
             | $SSH root@"$ip" 'cat > /tmp/x0x-install-runner-bundle.sh.codex && chmod 755 /tmp/x0x-install-runner-bundle.sh.codex' 2>/dev/null \
            && sed -e "s|EnvironmentFile=.*|EnvironmentFile=$RUNNER_ENV_FILE|" \
-                  -e "s|ExecStart=.*|ExecStart=/usr/local/bin/x0x-test-runner-$X0X_NETWORK.py|" "$RUNNER_UNIT" \
+                  -e "s|ExecStart=.*|ExecStart=/usr/local/bin/x0x-test-runner-$RUNNER_NETWORK.py|" "$RUNNER_UNIT" \
             | $SSH root@"$ip" "cat > /tmp/$RUNNER_UNIT_NAME.codex" 2>/dev/null \
            && $SSH root@"$ip" "
                 set -e
-                /tmp/x0x-install-runner-bundle.sh.codex /tmp/x0x-test-runner.py.codex /tmp/x0x-result-framing.py.codex / $X0X_NETWORK
+                /tmp/x0x-install-runner-bundle.sh.codex /tmp/x0x-test-runner.py.codex /tmp/x0x-result-framing.py.codex / $RUNNER_NETWORK
                 install -m 644 /tmp/$RUNNER_UNIT_NAME.codex $REMOTE_UNIT_PATH
                 rm -f /tmp/x0x-test-runner.py.codex /tmp/x0x-result-framing.py.codex /tmp/x0x-install-runner-bundle.sh.codex /tmp/$RUNNER_UNIT_NAME.codex
                 cat > $RUNNER_ENV_FILE <<EOF

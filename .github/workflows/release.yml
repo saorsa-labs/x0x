@@ -101,11 +101,35 @@ jobs:
           done
 
   # ============================================================
+  # Resolve one dependency graph for every release build and signer.
+  # ============================================================
+  resolve-release-lock:
+    name: Resolve release dependency graph
+    needs: [validate-release-metadata, require-green-ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve and capture release lock
+        run: |
+          cargo generate-lockfile
+          python3 .github/scripts/release_artifact_custody.py resolve \
+            --repo . --output "${RUNNER_TEMP}/release-lock"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-lock
+          path: ${{ runner.temp }}/release-lock/
+          if-no-files-found: error
+
+  # ============================================================
   # Build release binaries for all platforms
   # ============================================================
   build-release:
     name: Build ${{ matrix.platform }}
-    needs: [validate-release-metadata, require-green-ci]
+    # Keep the release safety gates explicit on the side-effecting build job.
+    # The lock job also depends on both, but direct needs make accidental
+    # rewiring of that artifact producer fail closed under the static guard.
+    needs: [validate-release-metadata, require-green-ci, resolve-release-lock]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -156,6 +180,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Download resolved release lock
+        uses: actions/download-artifact@v5
+        with:
+          name: release-lock
+          path: ${{ runner.temp }}/release-lock
+
+      - name: Install and verify resolved release lock
+        shell: bash
+        run: |
+          python3 .github/scripts/release_artifact_custody.py install-lock \
+            --repo . --custody "${RUNNER_TEMP}/release-lock"
+
+      - name: Capture source and dependency provenance
+        shell: bash
+        run: |
+          python3 .github/scripts/build_artifact_provenance.py prepare \
+            --repo . \
+            --artifact-dir "${RUNNER_TEMP}/release-${{ matrix.platform }}-custody" \
+            --platform "${{ matrix.platform }}" \
+            --target "${{ matrix.target }}"
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -185,11 +230,21 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }} --bin x0xd --bin x0x
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --locked --release --target ${{ matrix.target }} \
+            --bin x0xd --bin x0x --message-format=json-render-diagnostics \
+            | tee "${RUNNER_TEMP}/release-${{ matrix.platform }}-build.jsonl"
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --bin x0xd --bin x0x
+        shell: bash
+        run: |
+          set -o pipefail
+          cross build --locked --release --target ${{ matrix.target }} \
+            --bin x0xd --bin x0x --message-format=json-render-diagnostics \
+            | tee "${RUNNER_TEMP}/release-${{ matrix.platform }}-build.jsonl"
 
       # ---- macOS Code Signing & Notarization ----
       - name: Import macOS signing certificate
@@ -270,20 +325,31 @@ jobs:
           strip target/${{ matrix.target }}/release/x0xd
           strip target/${{ matrix.target }}/release/x0x
 
+      - name: Capture final packaged binary custody
+        shell: bash
+        run: |
+          python3 .github/scripts/build_artifact_provenance.py finalize \
+            --repo . \
+            --artifact-dir "${RUNNER_TEMP}/release-${{ matrix.platform }}-custody" \
+            --release-dir "target/${{ matrix.target }}/release" \
+            --build-messages "${RUNNER_TEMP}/release-${{ matrix.platform }}-build.jsonl"
+          python3 .github/scripts/build_artifact_provenance.py verify \
+            --artifact-dir "${RUNNER_TEMP}/release-${{ matrix.platform }}-custody"
+
       # ---- Package artifacts ----
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
           STAGING="x0x-${{ matrix.platform }}"
           mkdir -p "$STAGING"
-          # Include x0xd daemon and x0x CLI binaries
+          CUSTODY="${RUNNER_TEMP}/release-${{ matrix.platform }}-custody"
           for bin in x0xd x0x; do
-            BIN="target/${{ matrix.target }}/release/${bin}"
-            if [ -f "$BIN" ]; then cp "$BIN" "$STAGING/"; fi
+            cp "$CUSTODY/$bin" "$STAGING/$bin"
           done
+          cp "$CUSTODY/Cargo.lock" "$CUSTODY/build-provenance.json" "$STAGING/"
           cp LICENSE* "$STAGING/" 2>/dev/null || true
           cp README.md "$STAGING/" 2>/dev/null || true
-          tar czf "x0x-${{ matrix.platform }}.tar.gz" "$STAGING"
+          COPYFILE_DISABLE=1 tar czf "x0x-${{ matrix.platform }}.tar.gz" "$STAGING"
           echo "ASSET=x0x-${{ matrix.platform }}.tar.gz" >> $GITHUB_ENV
 
       - name: Package (zip)
@@ -292,11 +358,11 @@ jobs:
         run: |
           $staging = "x0x-${{ matrix.platform }}"
           New-Item -ItemType Directory -Path $staging -Force
-          # Include x0xd daemon and x0x CLI binaries
-          $x0xd = "target/${{ matrix.target }}/release/x0xd.exe"
-          if (Test-Path $x0xd) { Copy-Item $x0xd -Destination $staging }
-          $x0x = "target/${{ matrix.target }}/release/x0x.exe"
-          if (Test-Path $x0x) { Copy-Item $x0x -Destination $staging }
+          $custody = "$env:RUNNER_TEMP/release-${{ matrix.platform }}-custody"
+          foreach ($bin in @("x0xd.exe", "x0x.exe")) {
+            Copy-Item "$custody/$bin" -Destination "$staging/$bin"
+          }
+          Copy-Item "$custody/Cargo.lock", "$custody/build-provenance.json" -Destination $staging
           if (Test-Path "LICENSE*") { Copy-Item LICENSE* -Destination $staging }
           if (Test-Path "README.md") { Copy-Item README.md -Destination $staging }
           Compress-Archive -Path "$staging/*" -DestinationPath "x0x-${{ matrix.platform }}.zip"
@@ -334,6 +400,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Download resolved release lock
+        uses: actions/download-artifact@v5
+        with:
+          name: release-lock
+          path: ${{ runner.temp }}/release-lock
+
+      - name: Install and verify resolved release lock
+        run: |
+          python3 .github/scripts/release_artifact_custody.py install-lock \
+            --repo . --custody "${RUNNER_TEMP}/release-lock"
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
@@ -347,13 +424,20 @@ jobs:
           key: ${{ runner.os }}-sign-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build x0x-keygen
-        run: cargo build --release --bin x0x-keygen
+        run: cargo build --locked --release --bin x0x-keygen
 
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts
           pattern: release-*
+
+      - name: Verify all packaged release custody
+        run: |
+          python3 .github/scripts/release_artifact_custody.py aggregate \
+            --custody "${RUNNER_TEMP}/release-lock" \
+            --artifacts artifacts \
+            --output release-custody.json
 
       - name: Write ML-DSA-65 signing key
         env:
@@ -420,6 +504,13 @@ jobs:
             manifest-assets/release-manifest.json.sig
           if-no-files-found: error
 
+      - name: Upload aggregate release custody
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-custody
+          path: release-custody.json
+          if-no-files-found: error
+
   # ============================================================
   # GPG-sign SKILL.md and create GitHub Release
   # ============================================================
@@ -449,6 +540,12 @@ jobs:
         with:
           name: release-manifest
           path: artifacts/manifest
+
+      - name: Download aggregate release custody
+        uses: actions/download-artifact@v5
+        with:
+          name: release-custody
+          path: artifacts/custody
 
       - name: Import GPG key
         env:
@@ -496,6 +593,7 @@ jobs:
           # Copy release manifest
           cp artifacts/manifest/release-manifest.json release-files/ 2>/dev/null || true
           cp artifacts/manifest/release-manifest.json.sig release-files/ 2>/dev/null || true
+          cp artifacts/custody/release-custody.json release-files/
           # Copy SKILL.md artifacts
           cp SKILL.md release-files/
           cp SKILL.md.sig release-files/
@@ -515,7 +613,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release-files/*
-          draft: false
+          # A published release enters the daemon auto-update feed. Keep these
+          # exact signed bytes private until the operator verifies the draft's
+          # Linux archive on testnet and explicitly promotes this same draft.
+          draft: true
           generate_release_notes: true
           body: |
             ## x0x ${{ github.ref_name }}
@@ -590,343 +691,3 @@ jobs:
 
             **x0x** - A gift to the AI agent ecosystem from [Saorsa Labs](https://saorsalabs.com).
             No winners, no losers - just cooperation.
-
-  # ============================================================
-  # Publish SKILL.md to ClawHub/OpenClaw
-  # ============================================================
-  publish-clawhub:
-    name: Publish SKILL.md to ClawHub
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: create-release
-    runs-on: ubuntu-latest
-    env:
-      CLAWHUB_REGISTRY: https://clawhub.ai
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: Require ClawHub token
-        env:
-          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
-        run: |
-          if [ -z "$CLAWHUB_TOKEN" ]; then
-            echo "::error::CLAWHUB_TOKEN secret is required to publish x0x to ClawHub"
-            exit 1
-          fi
-
-      - name: Verify ClawHub token
-        env:
-          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
-        run: |
-          node - <<'NODE'
-          (async () => {
-            const registry = process.env.CLAWHUB_REGISTRY;
-            const token = process.env.CLAWHUB_TOKEN;
-
-            const response = await fetch(`${registry}/api/v1/whoami`, {
-              headers: {
-                Accept: 'application/json',
-                Authorization: `Bearer ${token}`,
-              },
-            });
-
-            const body = await response.text();
-            console.log(body);
-            if (!response.ok) {
-              throw new Error(`ClawHub token validation failed with status ${response.status}`);
-            }
-          })().catch((error) => {
-            console.error(error);
-            process.exit(1);
-          });
-          NODE
-
-      - name: Resolve ClawHub publish mode
-        run: |
-          latest_tag="$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
-          if [ -z "$latest_tag" ]; then
-            echo "::error::Could not resolve the newest semver tag for ClawHub publish gating"
-            exit 1
-          fi
-
-          # Only the newest semver tag is allowed to move ClawHub's `latest`
-          # pointer automatically. Older tag reruns stay verify-only so a
-          # delayed backfill or manual rerun cannot move the live listing
-          # backward by accident. Backfilling an older missing version remains
-          # an explicit manual publish instead of part of this automatic path.
-          if [ "${GITHUB_REF_NAME}" = "$latest_tag" ]; then
-            echo "CLAWHUB_PUBLISH_MODE=latest" >> "$GITHUB_ENV"
-            echo "CLAWHUB_SHOULD_PUBLISH=true" >> "$GITHUB_ENV"
-          else
-            echo "CLAWHUB_PUBLISH_MODE=selected" >> "$GITHUB_ENV"
-            echo "CLAWHUB_SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
-            echo "::notice::Skipping live ClawHub publish for ${GITHUB_REF_NAME}; newest repo tag is $latest_tag. Verification will only check that this version exists and has completed security scanning."
-          fi
-
-      - name: Publish tagged SKILL.md via ClawHub API
-        env:
-          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
-        run: |
-          if [ "${CLAWHUB_SHOULD_PUBLISH:-false}" != "true" ]; then
-            echo "ClawHub publish skipped for ${GITHUB_REF_NAME}; verify-only mode is active."
-            exit 0
-          fi
-
-          VERSION="${GITHUB_REF_NAME#v}"
-          export VERSION
-
-          node - <<'NODE'
-          (async () => {
-            const fs = require('node:fs');
-            const path = require('node:path');
-
-            const registry = process.env.CLAWHUB_REGISTRY;
-            const token = process.env.CLAWHUB_TOKEN;
-            const version = process.env.VERSION;
-            const skillPath = path.join(process.cwd(), 'SKILL.md');
-            const skillBytes = fs.readFileSync(skillPath);
-
-            const payload = {
-              slug: 'x0x',
-              displayName: 'x0x',
-              version,
-              changelog: `Update x0x to v${version}.`,
-              acceptLicenseTerms: true,
-              tags: ['latest'],
-            };
-
-            const form = new FormData();
-            form.set('payload', JSON.stringify(payload));
-            form.append('files', new Blob([skillBytes], { type: 'text/markdown' }), 'SKILL.md');
-
-            // The skill source of truth remains SKILL.md in the repo root.
-            // We upload that file directly via the ClawHub API instead of going
-            // through the CLI's folder-based publish contract, which avoids both
-            // temporary bundle staging and passing the token on the command line.
-            // Publish only after the GitHub release job has succeeded so the
-            // SKILL.md install metadata can point at already-uploaded release assets.
-            const response = await fetch(`${registry}/api/v1/skills`, {
-              method: 'POST',
-              headers: {
-                Accept: 'application/json',
-                Authorization: `Bearer ${token}`,
-              },
-              body: form,
-            });
-
-            const body = await response.text();
-            console.log(body);
-
-            if (response.ok) {
-              return;
-            }
-
-            if (response.status === 409 || /already exists/i.test(body)) {
-              console.log(`::notice::ClawHub already has x0x@${version}; continuing to verification`);
-              return;
-            }
-
-            throw new Error(`ClawHub publish failed with status ${response.status}`);
-          })().catch((error) => {
-            console.error(error);
-            process.exit(1);
-          });
-          NODE
-
-      # Status-aware, pending-tolerant verification.
-      #
-      # ClawHub runs an ASYNCHRONOUS multi-scanner pipeline (static analysis +
-      # VirusTotal + SkillSpector -> ClawScan verdict) that routinely takes
-      # longer than this release run. The publish step above already succeeded;
-      # the release must NOT be failed merely because the scan clock has not
-      # finished. We therefore key off the SecuritySnapshot `status` enum
-      # (clean | suspicious | malicious | pending | error) and resolve as:
-      #   clean      -> success
-      #   malicious  -> FAIL (a malicious verdict must block the release)
-      #   suspicious -> WARN, succeed (still published + installable; surfaces
-      #                 the summary so SKILL.md content can be improved to clean)
-      #   pending/error/not-yet-listed -> keep polling; tolerate on timeout
-      #                 (ClawHub finalizes asynchronously)
-      - name: Verify published version after security scan
-        env:
-          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          export VERSION
-
-          node - <<'NODE'
-          (async () => {
-            const registry = process.env.CLAWHUB_REGISTRY;
-            const token = process.env.CLAWHUB_TOKEN;
-            const version = process.env.VERSION;
-            const mode = process.env.CLAWHUB_PUBLISH_MODE || 'latest';
-
-            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-            const auth = { Accept: 'application/json', Authorization: `Bearer ${token}` };
-            const MAX_ATTEMPTS = 40; // ~10 minutes at 15s spacing
-
-            // Best-effort: the /verify envelope carries a human-readable summary.
-            const fetchSummary = async () => {
-              try {
-                const r = await fetch(
-                  `${registry}/api/v1/skills/x0x/verify?version=${encodeURIComponent(version)}`,
-                  { headers: auth },
-                );
-                if (!r.ok) return '';
-                const j = await r.json();
-                return j?.security?.summary ?? '';
-              } catch {
-                return '';
-              }
-            };
-
-            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-              const res = await fetch(
-                `${registry}/api/v1/skills/x0x/versions/${encodeURIComponent(version)}`,
-                { headers: auth },
-              );
-              const bodyText = await res.text();
-
-              let observed = null;
-              let status = null; // clean | suspicious | malicious | pending | error
-              if (res.ok) {
-                try {
-                  const json = JSON.parse(bodyText);
-                  observed = json?.version?.version ?? null;
-                  status = json?.version?.security?.status ?? null;
-                } catch {
-                  // fall through; treat as not-yet-parseable
-                }
-              }
-
-              // The `latest` pointer only gates the "latest" publish mode.
-              let latestMatches = mode !== 'latest';
-              if (mode === 'latest') {
-                const lr = await fetch(`${registry}/api/v1/skills/x0x`, { headers: auth });
-                if (lr.ok) {
-                  const lj = await lr.json();
-                  latestMatches = lj?.latestVersion?.version === version;
-                }
-              }
-
-              console.log(
-                `attempt ${attempt}: http=${res.status} version=${observed} security.status=${status} latestMatches=${latestMatches}`,
-              );
-
-              if (observed === version) {
-                if (status === 'malicious') {
-                  const summary = await fetchSummary();
-                  if (summary) console.error(`ClawScan: ${summary}`);
-                  throw new Error(`ClawHub flagged x0x@${version} as MALICIOUS — blocking release`);
-                }
-                if (status === 'suspicious') {
-                  const summary = await fetchSummary();
-                  console.log(
-                    `::warning title=ClawHub scan: suspicious::x0x@${version} is published and installable, but ClawScan rates it "suspicious". ${summary} Review SKILL.md to reach a clean verdict.`,
-                  );
-                  return;
-                }
-                if (status === 'clean' && latestMatches) {
-                  console.log(
-                    `::notice::ClawHub: x0x@${version} scanned clean${mode === 'latest' ? ' and promoted to latest' : ''}.`,
-                  );
-                  return;
-                }
-                // status === clean but latest not moved yet, or pending/error: keep waiting.
-              }
-
-              if (attempt < MAX_ATTEMPTS) {
-                console.log(
-                  `attempt ${attempt}: not terminal yet (status=${status ?? 'unlisted'}); retrying in 15s`,
-                );
-                await sleep(15_000);
-              }
-            }
-
-            // Scan/listing still settling. Publishing already succeeded, and
-            // ClawHub finalizes asynchronously — do NOT fail the release on the
-            // scan clock. A genuine malicious verdict is caught above if it
-            // lands within the window; later finalization is surfaced out-of-band.
-            console.log(
-              `::warning title=ClawHub scan pending::x0x@${version} uploaded, but the security scan / latest promotion did not finalize within ~10 minutes. ClawHub finalizes asynchronously — not failing the release.`,
-            );
-          })().catch((error) => {
-            console.error(error);
-            process.exit(1);
-          });
-          NODE
-
-  # ============================================================
-  # Publish to crates.io
-  # ============================================================
-  publish-crates:
-    name: Publish to crates.io
-    needs: create-release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Resolve crate version
-        id: crate
-        run: |
-          version=$(grep -m1 '^version =' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
-          if [ -z "$version" ]; then
-            echo "::error::could not parse [package].version from Cargo.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "x0x crate version: $version"
-
-      - name: Publish x0x crate
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set +e
-          output=$(cargo publish -p x0x 2>&1)
-          status=$?
-          echo "$output"
-          if [ $status -eq 0 ]; then
-            echo "::notice::x0x ${{ steps.crate.outputs.version }} uploaded to crates.io"
-            exit 0
-          fi
-          if echo "$output" | grep -qiE "already (uploaded|exists)"; then
-            echo "::notice::x0x ${{ steps.crate.outputs.version }} already on crates.io — treating as success"
-            exit 0
-          fi
-          echo "::error::cargo publish failed (exit $status); see log above"
-          exit $status
-
-      - name: Verify version is indexed on crates.io
-        run: |
-          # crates.io API rejects requests without a User-Agent (HTTP 403),
-          # per https://crates.io/policies#api. v0.19.4 and v0.19.5 both
-          # had this verify-step false-fail while the actual cargo publish
-          # had already succeeded.
-          version="${{ steps.crate.outputs.version }}"
-          ua="x0x-release-ci/${version} (release@saorsalabs.com)"
-          for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            body=$(curl -fsSL --retry 2 -A "$ua" \
-              "https://crates.io/api/v1/crates/x0x" 2>/dev/null || echo "")
-            if [ -n "$body" ]; then
-              indexed=$(echo "$body" \
-                | python3 -c 'import sys,json; print(json.load(sys.stdin).get("crate",{}).get("max_version",""))' \
-                2>/dev/null || echo "")
-            else
-              indexed=""
-            fi
-            if [ "$indexed" = "$version" ]; then
-              echo "::notice::x0x $version is the indexed max_version on crates.io"
-              exit 0
-            fi
-            echo "attempt $attempt: indexed max_version='$indexed', want='$version'; retrying in 30s"
-            sleep 30
-          done
-          echo "::error::crates.io did not index x0x $version within ~5 min (last seen max_version='$indexed')"
-          exit 1
