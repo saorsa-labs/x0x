@@ -1704,6 +1704,112 @@ async fn disconnect_pool_candidates(
     }
 }
 
+/// #774 diagnostic-only (test builds): one per-edge `send_to_peer` verdict.
+/// Records peer identity, frame length (never payload bytes), the
+/// admission-relevant gate booleans as evaluated on the send path (`None`
+/// marks a gate the taken branch never evaluated — never an invented
+/// value), the branch taken, and a monotonic offset from trace arming. A
+/// `send_entry` sample is recorded before any await so a timed-out or
+/// cancelled `node.send` still leaves timing evidence. No key or token
+/// material is retained; error details are bounded to an error-class
+/// prefix.
+#[cfg(test)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct Issue774EdgeSample {
+    pub at_ms: u128,
+    pub peer: String,
+    pub stream: &'static str,
+    pub bytes: usize,
+    pub suppressed: Option<bool>,
+    pub plane_allows: Option<bool>,
+    pub branch: &'static str,
+    pub detail: Option<String>,
+}
+
+/// #774 diagnostic-only (test builds): bounded first-per-(peer, branch)
+/// trace of gossip `send_to_peer` verdicts. The delivery fixture arms this
+/// immediately before its load phase and reads it only on failure, before
+/// teardown. Pure state machine — no I/O — so it is unit-testable without
+/// constructing a `NetworkNode`.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct Issue774EdgeTrace {
+    base: Option<Instant>,
+    samples: std::collections::VecDeque<Issue774EdgeSample>,
+    seen: std::collections::HashSet<([u8; 32], &'static str)>,
+    overflow: u64,
+}
+
+/// #774 diagnostic-only bound on the edge-trace ring.
+#[cfg(test)]
+pub(crate) const ISSUE774_EDGE_TRACE_MAX: usize = 64;
+
+/// #774 diagnostic-only bound on retained per-sample error detail.
+#[cfg(test)]
+const ISSUE774_EDGE_DETAIL_MAX: usize = 120;
+
+#[cfg(test)]
+impl Issue774EdgeTrace {
+    pub(crate) fn arm(&mut self) {
+        if self.base.is_none() {
+            self.base = Some(Instant::now());
+        }
+    }
+
+    pub(crate) fn base(&self) -> Option<Instant> {
+        self.base
+    }
+
+    fn record(
+        &mut self,
+        peer: &[u8; 32],
+        stream: &'static str,
+        bytes: usize,
+        gates: (Option<bool>, Option<bool>),
+        branch: &'static str,
+        detail: Option<String>,
+    ) {
+        let Some(base) = self.base else {
+            return;
+        };
+        // Bound ALL retained state: a key is remembered only when its
+        // sample is actually stored, so `seen` can never exceed the ring
+        // capacity regardless of how many distinct peers send.
+        if self.seen.contains(&(*peer, branch)) {
+            return;
+        }
+        if self.samples.len() >= ISSUE774_EDGE_TRACE_MAX {
+            self.overflow = self.overflow.saturating_add(1);
+            return;
+        }
+        self.seen.insert((*peer, branch));
+        self.samples.push_back(Issue774EdgeSample {
+            at_ms: base.elapsed().as_millis(),
+            peer: hex::encode(peer),
+            stream,
+            bytes,
+            suppressed: gates.0,
+            plane_allows: gates.1,
+            branch,
+            detail: detail.map(|text| {
+                // Keep only a bounded error-class prefix; the map_gossip
+                // error Display never carries key material, and truncation
+                // bounds anything unexpected.
+                text.chars().take(ISSUE774_EDGE_DETAIL_MAX).collect()
+            }),
+        });
+    }
+
+    pub(crate) fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "samples": self.samples,
+            "overflow_dropped": self.overflow,
+            "retained_keys": self.seen.len(),
+            "capacity": ISSUE774_EDGE_TRACE_MAX,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkNode {
     /// ant-quic P2P node (wrapped in `Arc<RwLock>` for shared async access).
@@ -1786,6 +1892,13 @@ pub struct NetworkNode {
     /// Test-only: capture PubSub `send_to_peer` payloads (recording transport).
     #[cfg(test)]
     pubsub_send_capture: Arc<Mutex<Vec<bytes::Bytes>>>,
+    /// #774 diagnostic-only (test builds): fast arming check for the
+    /// per-edge send-verdict trace; guard bit for the bounded state below.
+    #[cfg(test)]
+    issue774_edge_armed: Arc<std::sync::atomic::AtomicBool>,
+    /// The fixture arms it before load and reads it only on failure.
+    #[cfg(test)]
+    issue774_edge_trace: Arc<Mutex<Issue774EdgeTrace>>,
 }
 
 /// #677 test-only seam: when armed for a node id, THAT node's accept loop
@@ -1977,6 +2090,10 @@ impl NetworkNode {
             background_tasks: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             pubsub_send_capture: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            issue774_edge_armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            issue774_edge_trace: Arc::new(Mutex::new(Issue774EdgeTrace::default())),
         };
 
         let receiver = network_node.spawn_receiver();
@@ -2033,6 +2150,71 @@ impl NetworkNode {
     /// runs maintenance.
     pub fn bootstrap_cache(&self) -> Option<Arc<ant_quic::BootstrapCache>> {
         self.bootstrap_cache.clone()
+    }
+
+    /// #774 diagnostic-only (test builds): arm the bounded per-edge
+    /// send-verdict trace and first-per-peer close-reason capture. Zero
+    /// effect until armed; the delivery fixture arms immediately before
+    /// its load phase and reads only on failure.
+    #[cfg(test)]
+    pub fn arm_issue774_diagnostics(&self) {
+        let base = match self.issue774_edge_trace.lock() {
+            Ok(mut trace) => {
+                trace.arm();
+                trace.base()
+            }
+            Err(poisoned) => {
+                let mut trace = poisoned.into_inner();
+                trace.arm();
+                trace.base()
+            }
+        };
+        self.issue774_edge_armed.store(true, Ordering::Relaxed);
+        if let Some(base) = base {
+            self.churn.arm_close_reason_capture(base);
+        }
+    }
+
+    /// #774 diagnostic-only (test builds): bounded snapshot of the edge
+    /// trace plus the node's first-per-peer close reasons.
+    #[cfg(test)]
+    pub fn issue774_diagnostics_snapshot(&self) -> serde_json::Value {
+        let edges = match self.issue774_edge_trace.lock() {
+            Ok(trace) => trace.snapshot(),
+            Err(poisoned) => poisoned.into_inner().snapshot(),
+        };
+        serde_json::json!({
+            "edge_trace": edges,
+            "close_reasons": self.churn.close_reason_snapshot(),
+        })
+    }
+
+    /// #774 diagnostic-only (test builds): record one `send_to_peer`
+    /// verdict. Called from the existing acceptance-path branches only;
+    /// evaluated gates are passed as `Some(value)` and gates the taken
+    /// branch never evaluated as `None` — no value is invented. No await,
+    /// dial, or retry is introduced.
+    #[cfg(test)]
+    fn record_issue774_edge(
+        &self,
+        peer: &[u8; 32],
+        stream: saorsa_gossip_transport::GossipStreamType,
+        bytes: usize,
+        gates: (Option<bool>, Option<bool>),
+        branch: &'static str,
+        detail: Option<String>,
+    ) {
+        if !self.issue774_edge_armed.load(Ordering::Relaxed) {
+            return;
+        }
+        let stream_label = match stream {
+            saorsa_gossip_transport::GossipStreamType::Membership => "Membership",
+            saorsa_gossip_transport::GossipStreamType::PubSub => "PubSub",
+            saorsa_gossip_transport::GossipStreamType::Bulk => "Bulk",
+        };
+        if let Ok(mut trace) = self.issue774_edge_trace.lock() {
+            trace.record(peer, stream_label, bytes, gates, branch, detail);
+        }
     }
 
     /// Get the configured bind address (may contain port 0 before binding).
@@ -5383,13 +5565,37 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             }
         }
         let ant_peer = gossip_to_ant_peer_id(&peer);
+        // #774 diagnostic-only: entry sample recorded BEFORE any gate
+        // evaluation or await, so a slow, timed-out, or cancelled
+        // node.send still leaves pre-send timing evidence. Gates are
+        // `None` here — nothing has been evaluated yet.
+        #[cfg(test)]
+        self.record_issue774_edge(
+            &ant_peer.0,
+            stream_type,
+            data.len(),
+            (None, None),
+            "send_entry",
+            None,
+        );
 
         // Issue #292 invariant B: no gossip stream is opened toward a
         // reconnect-suppressed peer. Reported as success for the same
         // reason as the plane-pending hold below — the peer is already
         // excluded from `gossip_plane_peers`, so there is no overlay view
         // to protect, and a suppressed peer must never receive gossip.
-        if self.is_reconnect_suppressed(ant_peer.0) {
+        let suppressed = self.is_reconnect_suppressed(ant_peer.0);
+        if suppressed {
+            #[cfg(test)]
+            self.record_issue774_edge(
+                &ant_peer.0,
+                stream_type,
+                data.len(),
+                // The plane gate was never evaluated on this branch.
+                (Some(true), None),
+                "held_suppressed",
+                None,
+            );
             debug!(
                 "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} is reconnect-suppressed",
                 stream_type,
@@ -5404,7 +5610,17 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // so a briefly-pending same-plane peer is not pruned from overlay
         // views for what is effectively a sub-second handshake delay; gossip
         // is loss-tolerant and the frames flow once the peer clears.
-        if !self.plane_gate_allows(&ant_peer) {
+        let plane_allows = self.plane_gate_allows(&ant_peer);
+        if !plane_allows {
+            #[cfg(test)]
+            self.record_issue774_edge(
+                &ant_peer.0,
+                stream_type,
+                data.len(),
+                (Some(false), Some(false)),
+                "held_plane_pending",
+                None,
+            );
             debug!(
                 "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} not plane-cleared",
                 stream_type,
@@ -5430,9 +5646,27 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
 
-            node.send(&ant_peer, &buf)
-                .await
-                .map_err(|e| map_gossip_send_error(e, peer))?;
+            let send_outcome = node.send(&ant_peer, &buf).await;
+            #[cfg(test)]
+            match &send_outcome {
+                Ok(()) => self.record_issue774_edge(
+                    &ant_peer.0,
+                    stream_type,
+                    data.len(),
+                    (Some(false), Some(true)),
+                    "node_send_ok",
+                    None,
+                ),
+                Err(error) => self.record_issue774_edge(
+                    &ant_peer.0,
+                    stream_type,
+                    data.len(),
+                    (Some(false), Some(true)),
+                    "node_send_error",
+                    Some(error.to_string()),
+                ),
+            }
+            send_outcome.map_err(|e| map_gossip_send_error(e, peer))?;
         }
         self.note_connection_pool_activity(ant_peer).await;
 
@@ -5787,6 +6021,104 @@ mod map_gossip_send_error_tests {
             err.downcast_ref::<saorsa_gossip_transport::GossipTransportError>()
                 .is_none(),
             "live-connection errors must keep the anyhow wrap"
+        );
+    }
+}
+
+/// #774 diagnostic-only state machine: socket-free pure control. The
+/// adapter branch recording itself (`NetworkNode::send_to_peer` →
+/// `record_issue774_edge`) is exercised by compile coverage here and runs
+/// for real only in the isolated Linux CI delivery control; constructing a
+/// `NetworkNode` locally is out of scope (no ambient Mac binds).
+#[cfg(test)]
+mod issue774_edge_trace_tests {
+    use super::*;
+
+    #[test]
+    fn edge_trace_is_opt_in_bounded_first_per_key() {
+        let mut trace = Issue774EdgeTrace::default();
+        let peer_a = [0x11; 32];
+
+        // Unarmed: record is a no-op.
+        trace.record(&peer_a, "PubSub", 120, (None, None), "send_entry", None);
+        assert!(
+            trace.snapshot()["samples"]
+                .as_array()
+                .expect("samples array")
+                .is_empty(),
+            "record before arm must retain nothing"
+        );
+
+        trace.arm();
+        // Entry sample: no gate evaluated yet — both flags null, never
+        // invented values.
+        trace.record(&peer_a, "PubSub", 120, (None, None), "send_entry", None);
+        // Same (peer, branch): first sample wins, duplicates ignored.
+        trace.record(&peer_a, "PubSub", 999, (None, None), "send_entry", None);
+        // Verdict samples for the same peer are retained separately. The
+        // suppressed branch never evaluated the plane gate: null, not true.
+        trace.record(
+            &peer_a,
+            "PubSub",
+            140,
+            (Some(true), None),
+            "held_suppressed",
+            None,
+        );
+        // Detail is bounded to the error-class prefix.
+        let long_error = "E".repeat(400);
+        trace.record(
+            &peer_a,
+            "Bulk",
+            140,
+            (Some(false), Some(false)),
+            "node_send_error",
+            Some(long_error),
+        );
+
+        let snapshot = trace.snapshot();
+        let samples = snapshot["samples"].as_array().expect("samples array");
+        assert_eq!(samples.len(), 3, "first-per-(peer, branch) retention");
+        assert_eq!(samples[0]["branch"], "send_entry");
+        assert!(samples[0]["suppressed"].is_null());
+        assert!(samples[0]["plane_allows"].is_null());
+        assert_eq!(samples[0]["bytes"], 120, "duplicate did not replace first");
+        assert_eq!(samples[1]["branch"], "held_suppressed");
+        assert_eq!(samples[1]["suppressed"], true);
+        assert!(
+            samples[1]["plane_allows"].is_null(),
+            "unevaluated plane gate must be null, never invented"
+        );
+        assert_eq!(samples[2]["branch"], "node_send_error");
+        assert_eq!(
+            samples[2]["detail"]
+                .as_str()
+                .expect("detail")
+                .chars()
+                .count(),
+            ISSUE774_EDGE_DETAIL_MAX,
+            "error detail must be bounded"
+        );
+        assert!(samples[0]["at_ms"].as_u64().is_some());
+
+        // Bound: ALL retained state stays capped. Distinct peers beyond
+        // capacity are counted as overflow, never remembered in `seen`.
+        for byte in 0..u8::try_from(ISSUE774_EDGE_TRACE_MAX + 8).expect("bound fits u8") {
+            trace.record(&[byte; 32], "PubSub", 10, (None, None), "send_entry", None);
+        }
+        let bounded = trace.snapshot();
+        assert!(
+            bounded["samples"].as_array().expect("samples array").len() <= ISSUE774_EDGE_TRACE_MAX,
+            "trace must stay bounded"
+        );
+        assert_eq!(
+            bounded["retained_keys"].as_u64().expect("retained keys"),
+            bounded["samples"].as_array().expect("samples array").len() as u64,
+            "seen-set must be bounded with the ring, never larger"
+        );
+        assert!(
+            bounded["overflow_dropped"].as_u64().expect("overflow") > 0,
+            "dropped novel keys must be counted"
         );
     }
 }

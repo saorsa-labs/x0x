@@ -8,7 +8,7 @@
 use crate::dm::{self, DmPath, DmSendConfig, DurableSendStages, EnvelopeBuilder, DM_PROTOCOL_V1};
 use crate::dm_inbox::{DmInboxConfig, DmInboxService, DmTypedPayload, DM_BUS_TOPIC};
 use crate::dm_send::{self, DmSendContext};
-use crate::gossip::{PubSubManager, SigningContext, Subscription};
+use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
 use crate::trust::TrustDecision;
 use crate::{network, Agent};
@@ -598,6 +598,1097 @@ async fn paired_controlled_load_bus_eager_attempts_default_vs_optout() {
     run(Case::Measurement).await;
 }
 
+const ISSUE613_MESSAGES: u64 = 200;
+const ISSUE613_PAYLOAD_BYTES: usize = 4096;
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct Issue613Record {
+    pair: &'static str,
+    destination: u8,
+    sequence: u64,
+    request_id: String,
+    invoked_ns: u64,
+    ack_ns: Option<u64>,
+    delivered_ns: Option<u64>,
+    fanout: Option<u32>,
+    attempted_peer_sends: Option<u64>,
+    wire_bytes: usize,
+}
+
+fn issue613_credit_delivery(
+    record: &mut Issue613Record,
+    actual: &DmTypedPayload,
+    sender_agent: crate::identity::AgentId,
+    sender_machine: crate::identity::MachineId,
+    run: [u8; 16],
+    destination: u8,
+    delivered_ns: u64,
+) {
+    assert_eq!(
+        record.destination, destination,
+        "receiver/pair destination changed"
+    );
+    assert_eq!(
+        record.pair,
+        if destination == 1 { "G5>D5" } else { "G5>O5" }
+    );
+    assert_eq!(hex::encode(actual.request_id), record.request_id);
+    assert_eq!(actual.sender, sender_agent);
+    assert_eq!(actual.machine_id, sender_machine);
+    assert!(actual.verified);
+    assert_eq!(actual.trust_decision, Some(TrustDecision::Accept));
+    issue613_validate_payload(&actual.payload, run, destination, record.sequence);
+    assert!(delivered_ns >= record.invoked_ns);
+    assert!(
+        record.delivered_ns.replace(delivered_ns).is_none(),
+        "duplicate typed delivery"
+    );
+}
+
+fn issue613_payload(run: [u8; 16], destination: u8, sequence: u64) -> Vec<u8> {
+    let mut payload = vec![0x61; ISSUE613_PAYLOAD_BYTES];
+    payload[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut offset = PREFIX.len();
+    payload[offset..offset + 16].copy_from_slice(&run);
+    offset += 16;
+    payload[offset] = destination;
+    offset += 1;
+    payload[offset..offset + 8].copy_from_slice(&sequence.to_be_bytes());
+    payload
+}
+
+fn issue613_validate_payload(payload: &[u8], run: [u8; 16], destination: u8, sequence: u64) {
+    assert_eq!(payload.len(), ISSUE613_PAYLOAD_BYTES);
+    assert_eq!(&payload[..PREFIX.len()], PREFIX);
+    let mut offset = PREFIX.len();
+    assert_eq!(&payload[offset..offset + 16], run.as_slice());
+    offset += 16;
+    assert_eq!(payload[offset], destination);
+    offset += 1;
+    assert_eq!(&payload[offset..offset + 8], &sequence.to_be_bytes());
+    assert!(payload[offset + 8..].iter().all(|byte| *byte == 0x61));
+}
+
+fn issue613_assert_full_mesh(observed: &serde_json::Value, agents: &[Agent]) {
+    use std::collections::BTreeSet;
+    let expected = agents
+        .iter()
+        .map(|agent| hex::encode(agent.machine_id().0))
+        .collect::<BTreeSet<_>>();
+    for (index, label) in DIAMOND_LABELS.iter().enumerate() {
+        let actual = observed[*label]["admitted"]
+            .as_array()
+            .expect("full-mesh peers")
+            .iter()
+            .map(|value| value.as_str().expect("peer ID").to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut wanted = expected.clone();
+        wanted.remove(&hex::encode(agents[index].machine_id().0));
+        assert_eq!(actual, wanted, "control requires full admitted adjacency");
+    }
+}
+
+fn issue613_hash_peer_id(value: &serde_json::Value) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let encoded = value.as_str().expect("peer ID string");
+    let bytes = hex::decode(encoded).expect("peer ID hex");
+    serde_json::json!(hex::encode(Sha256::digest(bytes)))
+}
+
+fn issue613_redact_topology(topology: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = topology.clone();
+    if let Some(peers) = redacted
+        .get_mut("peer_ids")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for peer in peers.values_mut() {
+            *peer = issue613_hash_peer_id(peer);
+        }
+    }
+    if let Some(observations) = redacted
+        .get_mut("observations")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for phase in observations.values_mut() {
+            if let Some(nodes) = phase.as_object_mut() {
+                for node in nodes.values_mut() {
+                    if let Some(admitted) = node
+                        .get_mut("admitted")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for peer in admitted {
+                            *peer = issue613_hash_peer_id(peer);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(operations) = redacted
+        .get_mut("operations")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for operation in operations.values_mut() {
+            for leg in ["reverse_install", "forward_disconnect"] {
+                for field in ["owner_peer_id", "peer_id"] {
+                    if let Some(peer) = operation
+                        .get_mut(leg)
+                        .and_then(|value| value.get_mut(field))
+                    {
+                        *peer = issue613_hash_peer_id(peer);
+                    }
+                }
+            }
+        }
+    }
+    redacted
+}
+
+fn issue613_readiness_failure(
+    evidence: &serde_json::Value,
+    rejected: &RejectedReadiness,
+) -> serde_json::Value {
+    let rejection_class =
+        issue613_readiness_rejection_class(rejected.last_rejection_reason.as_deref());
+    let last_observation = rejected.last_observation.clone().map(|observation| {
+        let mut wrapped =
+            serde_json::json!({"observations":{"last":strip_peer_scores(observation)}});
+        wrapped = issue613_redact_topology(&wrapped);
+        wrapped["observations"]["last"].take()
+    });
+    serde_json::json!({
+        "schema": 1,
+        "selector": "legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut",
+        "outcome": "INCONCLUSIVE",
+        "reason": rejected.reason,
+        "last_rejection_class": rejection_class,
+        "last_completed_observation": last_observation,
+        "topology": issue613_redact_topology(&evidence["topology"]),
+        "readiness_diagnostics": {
+            "schema": rejected.diagnostics.schema,
+            "terminal_stage": rejected.diagnostics.terminal_stage,
+            "deadline_ns": rejected.diagnostics.deadline_ns,
+            "terminal_ns": rejected.diagnostics.terminal_ns,
+            "clock_incomplete": rejected.diagnostics.clock_incomplete,
+            "output_overflow": rejected.diagnostics.output_overflow,
+            "counts": rejected.diagnostics.counts,
+        },
+    })
+}
+
+fn issue613_readiness_rejection_class(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some(reason) if reason.contains("scores not yet populated") => "topic_scores_absent",
+        Some(reason) if reason.contains("#611 eager-mesh oracle") => "eager_mesh_invalid",
+        Some(reason) if reason.contains("admitted set differs") => "admitted_set_invalid",
+        Some(_) => "other_validation_rejection",
+        None => "no_completed_rejection",
+    }
+}
+
+fn issue613_partial_ledger(
+    records: &std::collections::BTreeMap<[u8; 16], Issue613Record>,
+    witnessed: &std::collections::BTreeMap<[u8; 16], u64>,
+    run: [u8; 16],
+    outcome: &str,
+) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let witness_max_lag_ns = witnessed
+        .iter()
+        .filter_map(|(request_id, observed_ns)| {
+            records
+                .get(request_id)
+                .map(|record| observed_ns.saturating_sub(record.invoked_ns))
+        })
+        .max();
+    serde_json::json!({
+        "schema": 1,
+        "run_nonce_hash": hex::encode(Sha256::digest(run)),
+        "outcome": outcome,
+        "attempted": records.len(),
+        "published": records.values().filter(|record| record.ack_ns.is_some()).count(),
+        "delivered": records.values().filter(|record| record.delivered_ns.is_some()).count(),
+        "witnessed": witnessed.len(),
+        "witness_max_lag_ns": witness_max_lag_ns,
+        "witness_records": witnessed.iter().map(|(request_id, observed_ns)| serde_json::json!({
+            "request_id": hex::encode(request_id),
+            "observed_ns": observed_ns,
+        })).collect::<Vec<_>>(),
+        "witness_missing_ids": records.keys().filter(|request_id| !witnessed.contains_key(*request_id))
+            .map(hex::encode).collect::<Vec<_>>(),
+        "records": records.values().collect::<Vec<_>>(),
+    })
+}
+
+fn issue613_partial_ledger_from_mutex(
+    records: &Mutex<std::collections::BTreeMap<[u8; 16], Issue613Record>>,
+    witnessed: &Mutex<std::collections::BTreeMap<[u8; 16], u64>>,
+    run: [u8; 16],
+    outcome: &str,
+) -> serde_json::Value {
+    // A collector assertion can unwind while holding this test-only ledger.
+    // Recover only to preserve diagnostics, then the caller resumes the
+    // original panic; poison never turns a failed acceptance into success.
+    let guard = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let witness_guard = witnessed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    issue613_partial_ledger(&guard, &witness_guard, run, outcome)
+}
+
+trait Issue613Witness {
+    async fn recv(&mut self) -> Option<PubSubMessage>;
+}
+
+impl Issue613Witness for Subscription {
+    async fn recv(&mut self) -> Option<PubSubMessage> {
+        Subscription::recv(self).await
+    }
+}
+
+impl Issue613Witness for mpsc::Receiver<PubSubMessage> {
+    async fn recv(&mut self) -> Option<PubSubMessage> {
+        mpsc::Receiver::recv(self).await
+    }
+}
+
+struct Issue613Ledgers<'a> {
+    records: &'a Mutex<std::collections::BTreeMap<[u8; 16], Issue613Record>>,
+    delivered_ids: &'a Mutex<std::collections::BTreeSet<[u8; 16]>>,
+    witnessed_ids: &'a Mutex<std::collections::BTreeMap<[u8; 16], u64>>,
+}
+
+async fn issue613_collect_delivery<W: Issue613Witness>(
+    receivers: (&mut Inbox, &mut Inbox, &mut W),
+    ledgers: Issue613Ledgers<'_>,
+    identity: (
+        crate::identity::AgentId,
+        crate::identity::MachineId,
+        [u8; 16],
+    ),
+    started: std::time::Instant,
+    message_count: usize,
+) {
+    let (d5, o5, witness) = receivers;
+    let Issue613Ledgers {
+        records,
+        delivered_ids,
+        witnessed_ids,
+    } = ledgers;
+    let (sender_agent, sender_machine, run) = identity;
+    while delivered_ids.lock().expect("delivered set").len() < message_count
+        || witnessed_ids.lock().expect("witness set").is_empty()
+    {
+        let received = tokio::select! {
+            actual = d5.recv() => Some((actual.expect("D5 typed inbox open"), 1u8)),
+            actual = o5.recv() => Some((actual.expect("O5 typed inbox open"), 2u8)),
+            raw = witness.recv() => {
+                let raw = raw.expect("W5 raw bus witness open");
+                if raw.sender == Some(sender_agent) && raw.verified {
+                    let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
+                        .expect("W5 observed a valid DM envelope");
+                    assert!(records.lock().expect("ledger").contains_key(&envelope.request_id));
+                    let observed_ns = u64::try_from(started.elapsed().as_nanos())
+                        .expect("bounded monotonic offset");
+                    assert!(witnessed_ids.lock().expect("witness set")
+                        .insert(envelope.request_id, observed_ns).is_none(), "duplicate W5 raw frame");
+                }
+                None
+            }
+        };
+        let Some((actual, destination)) = received else {
+            continue;
+        };
+        let now = u64::try_from(started.elapsed().as_nanos()).expect("bounded monotonic offset");
+        let mut ledger = records.lock().expect("ledger");
+        let record = ledger
+            .get_mut(&actual.request_id)
+            .expect("typed delivery must belong to an attempted current-run ID");
+        issue613_credit_delivery(
+            record,
+            &actual,
+            sender_agent,
+            sender_machine,
+            run,
+            destination,
+            now,
+        );
+        assert!(delivered_ids
+            .lock()
+            .expect("delivered set")
+            .insert(actual.request_id));
+    }
+    let deadline = tokio::time::Instant::now() + NEGATIVE_WINDOW;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            actual = d5.recv() => match actual {
+                Some(value) => panic!("unexpected late D5 frame {}", hex::encode(value.request_id)),
+                None => panic!("D5 capture channel closed during stability window"),
+            },
+            actual = o5.recv() => match actual {
+                Some(value) => panic!("unexpected late O5 frame {}", hex::encode(value.request_id)),
+                None => panic!("O5 capture channel closed during stability window"),
+            },
+            raw = witness.recv() => {
+                let raw = raw.expect("W5 capture channel open during stability window");
+                if raw.sender == Some(sender_agent) && raw.verified {
+                    let envelope = dm::DmEnvelope::from_wire_bytes(&raw.payload)
+                        .expect("W5 observed a valid late DM envelope");
+                    assert!(records.lock().expect("ledger").contains_key(&envelope.request_id));
+                    let observed_ns = u64::try_from(started.elapsed().as_nanos())
+                        .expect("bounded monotonic offset");
+                    assert!(witnessed_ids.lock().expect("witness set")
+                        .insert(envelope.request_id, observed_ns).is_none(), "duplicate W5 raw frame");
+                }
+            }
+        }
+    }
+    assert!(
+        !witnessed_ids.lock().expect("witness set").is_empty(),
+        "W5 must positively witness current-run load"
+    );
+}
+
+async fn issue613_application_delivery(cut: bool) {
+    use sha2::Digest;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let mut agents = Vec::new();
+    let outcome = AssertUnwindSafe(async {
+        for label in DIAMOND_LABELS {
+            agents.push(build(dir.path(), label, false).await);
+        }
+        let keys = agents
+            .iter()
+            .map(|_| Arc::new(AgentKemKeypair::generate().expect("real KEM")))
+            .collect::<Vec<_>>();
+        let (mut receivers, _) = bounded(
+            "#613 services and full-mesh setup",
+            Duration::from_secs(90),
+            prepare(&agents, &keys, None),
+        )
+        .await;
+        let preparation = prepare_measurement();
+        let clock = std::time::Instant::now();
+        let mut evidence = serde_json::json!({});
+        let originals = if cut {
+            match shape_diamond(&agents, &mut evidence, clock, &[]).await {
+                Ok(originals) => Some(originals),
+                Err(rejected) => {
+                    let diagnostic = issue613_readiness_failure(&evidence, &rejected);
+                    eprintln!(
+                        "ISSUE613_READINESS_FAILURE {}",
+                        serde_json::to_string(&diagnostic).expect("readiness diagnostic JSON")
+                    );
+                    panic!("INCONCLUSIVE: {}", rejected.reason);
+                }
+            }
+        } else {
+            let observed = diamond_observations(&agents, clock).await;
+            issue613_assert_full_mesh(&observed, &agents);
+            evidence["topology"] = serde_json::json!({
+                "configuration":"full admitted mesh; no administrative disconnects",
+                "peer_ids": DIAMOND_LABELS.iter().zip(&agents).map(|(label, agent)| ((*label).to_owned(), serde_json::json!(hex::encode(agent.machine_id().0)))).collect::<serde_json::Map<_, _>>(),
+                "observations":{"t0":observed}
+            });
+            None
+        };
+        let topology_before = evidence["topology"].clone();
+        let run = dm_send::fresh_request_id();
+        // W5 is deliberately only a raw downstream bus witness. Its frames
+        // cannot credit application delivery at D5/O5.
+        let mut witness = pubsub(&agents[3]).subscribe(DM_BUS_TOPIC.to_owned()).await;
+        let records = Arc::new(Mutex::new(BTreeMap::<[u8; 16], Issue613Record>::new()));
+        let delivered_ids = Arc::new(Mutex::new(BTreeSet::<[u8; 16]>::new()));
+        let witnessed_ids = Arc::new(Mutex::new(BTreeMap::<[u8; 16], u64>::new()));
+        let mut d5 = receivers.remove(1);
+        let mut o5 = receivers.remove(1);
+        let sender = &agents[0];
+        let publish_records = Arc::clone(&records);
+        let collect_records = Arc::clone(&records);
+        let collect_delivered = Arc::clone(&delivered_ids);
+        let collect_witnessed = Arc::clone(&witnessed_ids);
+        // Passive local snapshots only: no dial, reconnect, refresh or publish.
+        // If the delivery phase fails, these bracket whether its full-mesh
+        // premise survived through the unchanged 180-second oracle.
+        let node_diagnostics_t0 = tokio::time::timeout(
+            Duration::from_secs(5),
+            issue613_node_diagnostics(&agents, clock),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            serde_json::json!({"diagnostic_status":"timed_out","budget_secs":5})
+        });
+        // The load clock intentionally excludes diagnostic acquisition.
+        let started = std::time::Instant::now();
+        let outer_t0 = generator_cut(sender, clock);
+        // #774 diagnostic-only: arm the bounded per-edge send-verdict trace
+        // and first-per-peer close-reason capture immediately before load.
+        // Zero behaviour change; read only on failure, before teardown.
+        for agent in &agents {
+            if let Some(network) = agent.network() {
+                network.arm_issue774_diagnostics();
+            }
+        }
+
+        let publisher = async {
+            let mut timer = tokio::time::interval_at(
+                tokio::time::Instant::now(),
+                Duration::from_millis(50),
+            );
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            for sequence in 0..ISSUE613_MESSAGES {
+                timer.tick().await;
+                let destination = if sequence % 2 == 0 { 1 } else { 2 };
+                let recipient = &agents[destination];
+                let request_id = dm_send::fresh_request_id();
+                let payload = issue613_payload(run, destination as u8, sequence);
+                let invoked_ns = u64::try_from(started.elapsed().as_nanos())
+                    .expect("bounded monotonic offset");
+                let pair = if destination == 1 { "G5>D5" } else { "G5>O5" };
+                let wire = envelope(sender, recipient, &keys[destination], request_id, payload);
+                assert!(publish_records
+                    .lock()
+                    .expect("ledger")
+                    .insert(request_id, Issue613Record { pair, destination: destination as u8, sequence, request_id: hex::encode(request_id), invoked_ns, ack_ns: None, delivered_ns: None, fanout: None, attempted_peer_sends: None, wire_bytes: wire.len() })
+                    .is_none());
+                let returned = sender
+                    .publish_with_observed_fanout(DM_BUS_TOPIC, wire)
+                    .await
+                    .expect("#613 signed bus publication");
+                let ack_ns = u64::try_from(started.elapsed().as_nanos())
+                    .expect("bounded monotonic offset");
+                {
+                    let mut ledger = publish_records.lock().expect("ledger");
+                    let record = ledger.get_mut(&request_id).expect("attempted before publish");
+                    record.ack_ns = Some(ack_ns);
+                    record.fanout = Some(returned.0);
+                    record.attempted_peer_sends = returned.1.map(|counts| {
+                        u64::try_from(counts.attempted).expect("bounded fixture peer count")
+                    });
+                }
+                if returned.0 == 0 {
+                    let boundary_begin_ns = diamond_now(clock);
+                    // Capture the synchronous generator state before any
+                    // diagnostic await can let the one-second refresh loop
+                    // advance. The full-node projection that follows is
+                    // bounded and still runs before the unchanged assertion
+                    // unwinds the live agents.
+                    let generator = generator_cut(sender, clock);
+                    let generator_raw = raw_sample(sender, clock);
+                    let nodes = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        issue613_node_diagnostics(&agents, clock),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        serde_json::json!({"diagnostic_status":"timed_out","budget_secs":5})
+                    });
+                    let receipt = issue613_zero_fanout_boundary_receipt(
+                        sequence,
+                        request_id,
+                        returned,
+                        (boundary_begin_ns, diamond_now(clock)),
+                        serde_json::json!({
+                            "generator_immediate_cut": generator,
+                            "generator_immediate_raw": generator_raw,
+                            "nodes_before_assert": nodes,
+                        }),
+                    );
+                    eprintln!(
+                        "ISSUE613_ZERO_FANOUT_BOUNDARY {}",
+                        serde_json::to_string(&receipt).expect("zero-fanout boundary JSON")
+                    );
+                }
+                assert!(returned.0 > 0, "publication must attempt a peer");
+            }
+        };
+        let collector = issue613_collect_delivery(
+            (&mut d5, &mut o5, &mut witness),
+            Issue613Ledgers {
+                records: &collect_records,
+                delivered_ids: &collect_delivered,
+                witnessed_ids: &collect_witnessed,
+            },
+            (sender.agent_id(), sender.machine_id(), run),
+            started,
+            ISSUE613_MESSAGES as usize,
+        );
+        let phase = {
+        let phase_future = AssertUnwindSafe(bounded(
+            "#613 publication and typed delivery",
+            Duration::from_secs(180),
+            async { tokio::join!(publisher, collector) },
+        ))
+        .catch_unwind();
+        tokio::pin!(phase_future);
+        // Capture the live witness/overlay state before an outer timeout can
+        // cancel collection. This runs beside the phase, under its original
+        // deadline; no diagnostic await consumes collection time.
+        let pre_timeout_w5_diagnostic = async {
+            tokio::time::sleep(Duration::from_secs(165)).await;
+            if witnessed_ids.lock().expect("witness set").is_empty() {
+                let snapshot = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    AssertUnwindSafe(issue613_node_diagnostics(&agents, clock)).catch_unwind(),
+                )
+                .await;
+                let snapshot = match snapshot {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(_)) => serde_json::json!({"diagnostic_status":"panicked"}),
+                    Err(_) => serde_json::json!({"diagnostic_status":"timed_out","budget_secs":5}),
+                };
+                let receipt = serde_json::json!({
+                    "schema": 1,
+                    "phase_elapsed_ms": started.elapsed().as_millis(),
+                    "delivered": delivered_ids.lock().expect("delivered set").len(),
+                    "witnessed": witnessed_ids.lock().expect("witness set").len(),
+                    "nodes_before_phase_timeout": snapshot,
+                });
+                eprintln!("ISSUE613_W5_PRE_TIMEOUT {}", serde_json::to_string(&receipt).expect("pre-timeout diagnostic JSON"));
+            }
+        };
+        let phase = tokio::select! {
+            result = &mut phase_future => result,
+            _ = pre_timeout_w5_diagnostic => phase_future.await,
+        };
+        phase
+        };
+        let partial = issue613_partial_ledger_from_mutex(
+            &records,
+            &witnessed_ids,
+            run,
+            if phase.is_ok() { "COMPLETE" } else { "FAILED" },
+        );
+        eprintln!(
+            "ISSUE613_APPLICATION_DELIVERY_PARTIAL {}",
+            serde_json::to_string(&partial).expect("partial ledger JSON")
+        );
+        drop(publish_records);
+        drop(collect_records);
+        drop(collect_delivered);
+        drop(collect_witnessed);
+        if let Err(panic) = phase {
+            let diagnostic = tokio::time::timeout(
+                Duration::from_secs(5),
+                AssertUnwindSafe(async {
+                    let failure_t1 = generator_cut(sender, clock);
+                    let final_admission = diamond_observations(&agents, clock).await;
+                    let node_diagnostics_t1 = issue613_node_diagnostics(&agents, clock).await;
+                    let outer_counter = |cut: &serde_json::Value, field: &str| {
+                        cut["stages"]["topics"]["bus_outbound"]["eager"][field].as_u64()
+                    };
+                    let outer_messages = outer_counter(&failure_t1, "msgs")
+                        .zip(outer_counter(&outer_t0, "msgs"))
+                        .and_then(|(end, begin)| end.checked_sub(begin));
+                    let issue774_edges = serde_json::json!(
+                        DIAMOND_LABELS
+                            .iter()
+                            .zip(&agents)
+                            .map(|(label, agent)| {
+                                let snapshot = agent
+                                    .network()
+                                    .map(|network| network.issue774_diagnostics_snapshot())
+                                    .unwrap_or(serde_json::Value::Null);
+                                ((*label).to_owned(), snapshot)
+                            })
+                            .collect::<serde_json::Map<_, _>>()
+                    );
+                    let outer_bytes = outer_counter(&failure_t1, "bytes")
+                        .zip(outer_counter(&outer_t0, "bytes"))
+                        .and_then(|(end, begin)| end.checked_sub(begin));
+                    serde_json::json!({
+                        "schema": 1,
+                        "diagnostic_status":"complete",
+                        "outer_load_cuts": {"t0":outer_t0,"t1":failure_t1},
+                        "outer_eager_messages":outer_messages,
+                        "issue774_edge_trace": issue774_edges,
+                        "outer_eager_bytes":outer_bytes,
+                        "outer_eager_average_bytes":outer_messages.zip(outer_bytes)
+                            .and_then(|(messages, bytes)| bytes.checked_div(messages)),
+                        "final_admission":strip_peer_scores(final_admission),
+                        "node_diagnostics":{"t0":node_diagnostics_t0,"t1":node_diagnostics_t1},
+                        "w5_bus_subscribed":pubsub(&agents[3]).is_topic_subscribed(DM_BUS_TOPIC).await,
+                        "w5_raw_sample":raw_sample(&agents[3], clock),
+                    })
+                })
+                .catch_unwind(),
+            )
+            .await;
+            let diagnostic = match diagnostic {
+                Ok(Ok(value)) => value,
+                Ok(Err(_)) => serde_json::json!({"schema":1,"diagnostic_status":"panicked"}),
+                Err(_) => serde_json::json!({"schema":1,"diagnostic_status":"timed_out"}),
+            };
+            eprintln!(
+                "ISSUE613_PHASE_FAILURE {}",
+                serde_json::to_string(&diagnostic).unwrap_or_else(|_| {
+                    r#"{"schema":1,"diagnostic_status":"serialization_failed"}"#.to_owned()
+                })
+            );
+            std::panic::resume_unwind(panic);
+        }
+        let outer_t1 = generator_cut(sender, clock);
+        if let Some(originals) = &originals {
+            evidence["topology"]["observations"]["t1"] = strip_peer_scores(diamond_observations(&agents, clock).await);
+            diamond_peer_sets(&evidence["topology"], &evidence["topology"]["observations"]["t1"])
+                .expect("final directed adjacency");
+            for ((from, to), original) in DIAMOND_EDGES.into_iter().zip(originals) {
+                let (check, returned) = diamond_suppression_check(&agents[from], agents[to].machine_id().0, clock).await;
+                let edge = format!("{}|{}", DIAMOND_LABELS[from], DIAMOND_LABELS[to]);
+                evidence["topology"]["suppression"][&edge]["set_at_stable"] = serde_json::json!(returned == Some(*original));
+                evidence["topology"]["suppression"][&edge]["final_check"] = check;
+            }
+            validate_topology_capture(&topology_before, &evidence["topology"])
+                .expect("directed topology remained valid through delivery load");
+        } else {
+            evidence["topology"]["observations"]["t1"] = diamond_observations(&agents, clock).await;
+            issue613_assert_full_mesh(&evidence["topology"]["observations"]["t1"], &agents);
+        }
+        let records = Arc::try_unwrap(records).expect("ledger sole owner").into_inner().expect("ledger");
+        let witnessed = Arc::try_unwrap(witnessed_ids)
+            .expect("witness ledger sole owner")
+            .into_inner()
+            .expect("witness ledger");
+        let witness_max_lag_ns = witnessed
+            .iter()
+            .map(|(request_id, observed_ns)| {
+                let invoked_ns = records
+                    .get(request_id)
+                    .expect("witness belongs to current run")
+                    .invoked_ns;
+                observed_ns
+                    .checked_sub(invoked_ns)
+                    .expect("witness cannot precede invocation")
+            })
+            .max()
+            .expect("positive witness evidence");
+        assert_eq!(records.len(), ISSUE613_MESSAGES as usize);
+        assert!(records.values().all(|record| record.ack_ns.is_some() && record.delivered_ns.is_some()));
+        assert_eq!(records.values().filter(|record| record.pair == "G5>D5").count(), 100);
+        assert_eq!(records.values().filter(|record| record.pair == "G5>O5").count(), 100);
+        let counter = |cut: &serde_json::Value, field: &str| {
+            cut["stages"]["topics"]["bus_outbound"]["eager"][field].as_u64()
+        };
+        let outer_messages = counter(&outer_t1, "msgs").expect("final bus EAGER message counter")
+            - counter(&outer_t0, "msgs").unwrap_or(0);
+        let outer_bytes = counter(&outer_t1, "bytes").expect("final bus EAGER byte counter")
+            - counter(&outer_t0, "bytes").unwrap_or(0);
+        let attempted = records.values().map(|record| record.attempted_peer_sends.expect("observed attempted sends")).sum::<u64>();
+        assert!(outer_messages >= attempted, "outer EAGER meter cannot undercount initial attempted sends");
+        let recovery_extra_eager = outer_messages - attempted;
+        let outer_average = outer_bytes.checked_div(outer_messages).expect("nonzero outer frames");
+        let inner_min = records.values().map(|record| record.wire_bytes).min().expect("records");
+        let inner_max = records.values().map(|record| record.wire_bytes).max().expect("records");
+        assert_eq!(inner_min, inner_max, "fixed-size workload must produce fixed-size inner envelopes");
+        // SG V2 wraps every inner envelope in a GossipMessage carrying an
+        // ML-DSA-65 signature (3,309 bytes) and public key (1,952 bytes), plus
+        // a non-empty header and postcard length/discriminant fields.
+        let outer_source_lower_bound = u64::try_from(inner_max)
+            .expect("bounded inner envelope")
+            + 3_309
+            + 1_952;
+        eprintln!(
+            "ISSUE613_OUTER_ACCOUNTING {}",
+            serde_json::to_string(&serde_json::json!({
+                "t0": outer_t0,
+                "t1": outer_t1,
+                "outer_eager_messages": outer_messages,
+                "outer_eager_bytes": outer_bytes,
+                "outer_eager_average_bytes": outer_average,
+                "initial_attempted_peer_sends": attempted,
+                "recovery_extra_eager_messages": recovery_extra_eager,
+                "outer_eager_source_lower_bound_bytes": outer_source_lower_bound,
+            })).expect("outer accounting JSON")
+        );
+        assert!(outer_average > outer_source_lower_bound,
+            "outer frame average must include the inner envelope, fixed ML-DSA-65 material, and serialization overhead");
+        let receipt = serde_json::json!({
+            "schema": 1,
+            "selector": if cut {"legacy_bus_interop_tests::paired_application_delivery_ids_directed_cut"} else {"legacy_bus_interop_tests::paired_application_delivery_ids_no_disconnect_control"},
+            "topology": if cut {"directed_diamond"} else {"full_mesh"},
+            "topology_evidence": issue613_redact_topology(&evidence["topology"]),
+            "outer_load_cuts": {"t0":outer_t0,"t1":outer_t1},
+            "run_nonce_hash": hex::encode(sha2::Sha256::digest(run)),
+            "binary_sha256": preparation.binary_sha256,
+            "build_lock_sha256": preparation.build_lock_sha256,
+            "identity_hashes": DIAMOND_LABELS.iter().zip(&agents).map(|(label, agent)| {
+                (*label, hex::encode(sha2::Sha256::digest(agent.machine_id().0)))
+            }).collect::<BTreeMap<_, _>>(),
+            "attempted": ISSUE613_MESSAGES,
+            "published": ISSUE613_MESSAGES,
+            "delivered": ISSUE613_MESSAGES,
+            "duplicates": 0,
+            "unexpected": 0,
+            "receiver_closed": 0,
+            "witnessed": witnessed.len(),
+            "witness_max_lag_ns": witness_max_lag_ns,
+            "witness_missing_ids": records.keys().filter(|request_id| !witnessed.contains_key(*request_id))
+                .map(hex::encode).collect::<Vec<_>>(),
+            "witness_records": witnessed.iter().map(|(request_id, observed_ns)| serde_json::json!({
+                "request_id": hex::encode(request_id),
+                "observed_ns": observed_ns,
+            })).collect::<Vec<_>>(),
+            "payload_bytes": ISSUE613_PAYLOAD_BYTES,
+            "inner_envelope_bytes_min": inner_min,
+            "inner_envelope_bytes_max": inner_max,
+            "outer_eager_messages": outer_messages,
+            "outer_eager_bytes": outer_bytes,
+            "outer_eager_average_bytes": outer_average,
+            "outer_eager_source_lower_bound_bytes": outer_source_lower_bound,
+            "initial_attempted_peer_sends": attempted,
+            "recovery_extra_eager_messages": recovery_extra_eager,
+            "w5_raw_witnessed": witnessed.len(),
+            "w5_witness_contract": "positive current-run topology evidence; not loss-free subscriber delivery",
+            "period_ms": 50,
+            "pairs": ["G5>D5", "G5>O5"],
+            "records": records.into_values().collect::<Vec<_>>(),
+            "outcome": "PASS"
+        });
+        eprintln!("ISSUE613_APPLICATION_DELIVERY {}", serde_json::to_string(&receipt).expect("receipt JSON"));
+    }).catch_unwind().await;
+    for agent in &agents {
+        agent.shutdown().await;
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+#[ignore = "real four-agent loopback acceptance; dedicated isolated Linux CI"]
+async fn paired_application_delivery_ids_no_disconnect_control() {
+    issue613_application_delivery(false).await;
+}
+
+#[tokio::test]
+#[ignore = "real four-agent loopback acceptance; dedicated isolated Linux CI"]
+async fn paired_application_delivery_ids_directed_cut() {
+    issue613_application_delivery(true).await;
+}
+
+fn issue613_synthetic_delivery(
+    request_id: [u8; 16],
+    run: [u8; 16],
+    destination: u8,
+    sequence: u64,
+) -> (
+    Issue613Record,
+    DmTypedPayload,
+    crate::identity::AgentId,
+    crate::identity::MachineId,
+) {
+    let sender = crate::identity::AgentId([7; 32]);
+    let machine = crate::identity::MachineId([8; 32]);
+    let pair = if destination == 1 { "G5>D5" } else { "G5>O5" };
+    (
+        Issue613Record {
+            pair,
+            destination,
+            sequence,
+            request_id: hex::encode(request_id),
+            invoked_ns: 10,
+            ack_ns: None,
+            delivered_ns: None,
+            fanout: None,
+            attempted_peer_sends: None,
+            wire_bytes: 5000,
+        },
+        DmTypedPayload {
+            sender,
+            machine_id: machine,
+            payload: issue613_payload(run, destination, sequence),
+            verified: true,
+            trust_decision: Some(TrustDecision::Accept),
+            received_at_unix_ms: 0,
+            request_id,
+            completion: None,
+        },
+        sender,
+        machine,
+    )
+}
+
+fn issue613_synthetic_witness(
+    request_id: [u8; 16],
+    sender: crate::identity::AgentId,
+) -> PubSubMessage {
+    let envelope = dm::DmEnvelope {
+        protocol_version: DM_PROTOCOL_V1,
+        request_id,
+        sender_agent_id: sender.0,
+        sender_machine_id: [8; 32],
+        recipient_agent_id: [9; 32],
+        created_at_unix_ms: 1,
+        expires_at_unix_ms: 2,
+        body: EnvelopeBuilder::build_ack_body(request_id, dm::DmAckOutcome::Accepted),
+        signature: vec![0; 64],
+        origin_attestation: None,
+    };
+    PubSubMessage {
+        topic: DM_BUS_TOPIC.to_owned(),
+        payload: Bytes::from(envelope.to_wire_bytes().expect("synthetic wire envelope")),
+        sender: Some(sender),
+        sender_public_key: None,
+        verified: true,
+        trust_level: None,
+        raw_envelope: None,
+    }
+}
+
+#[tokio::test]
+async fn issue613_collector_accepts_w5_after_old_stability_window() {
+    let run = [1; 16];
+    let request_id = [2; 16];
+    let (record, actual, sender, machine) = issue613_synthetic_delivery(request_id, run, 1, 3);
+    let records = Mutex::new([(request_id, record)].into_iter().collect());
+    let delivered = Mutex::new(std::collections::BTreeSet::new());
+    let witnessed = Mutex::new(std::collections::BTreeMap::new());
+    let (d_tx, mut d5) = mpsc::channel(2);
+    let (_o_tx, mut o5) = mpsc::channel(2);
+    let (w_tx, mut w5) = mpsc::channel(2);
+    let _keep_w5_open = w_tx.clone();
+    d_tx.send(actual).await.expect("typed fixture send");
+    let delayed_witness = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        w_tx.send(issue613_synthetic_witness(request_id, sender))
+            .await
+            .expect("witness fixture send");
+    });
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        issue613_collect_delivery(
+            (&mut d5, &mut o5, &mut w5),
+            Issue613Ledgers {
+                records: &records,
+                delivered_ids: &delivered,
+                witnessed_ids: &witnessed,
+            },
+            (sender, machine, run),
+            std::time::Instant::now(),
+            1,
+        ),
+    )
+    .await
+    .expect("late current-run W5 must complete within phase");
+    delayed_witness.await.expect("witness sender task");
+    assert_eq!(delivered.lock().expect("delivered set").len(), 1);
+    assert_eq!(witnessed.lock().expect("witness set").len(), 1);
+}
+
+#[tokio::test]
+async fn issue613_collector_requires_w5_and_rejects_bad_typed_while_waiting() {
+    for bad_typed in [None, Some(false), Some(true)] {
+        let run = [1; 16];
+        let request_id = [2; 16];
+        let (record, actual, sender, machine) = issue613_synthetic_delivery(request_id, run, 1, 3);
+        let records = Mutex::new([(request_id, record)].into_iter().collect());
+        let delivered = Mutex::new(std::collections::BTreeSet::new());
+        let witnessed = Mutex::new(std::collections::BTreeMap::new());
+        let (d_tx, mut d5) = mpsc::channel(2);
+        let (_o_tx, mut o5) = mpsc::channel(2);
+        let (_w_tx, mut w5) = mpsc::channel(2);
+        d_tx.send(actual).await.expect("typed fixture send");
+        if let Some(wrong_id) = bad_typed {
+            let id = if wrong_id { [3; 16] } else { request_id };
+            let (_, duplicate, _, _) = issue613_synthetic_delivery(id, run, 1, 3);
+            d_tx.send(duplicate).await.expect("bad typed fixture send");
+        }
+        let collection = issue613_collect_delivery(
+            (&mut d5, &mut o5, &mut w5),
+            Issue613Ledgers {
+                records: &records,
+                delivered_ids: &delivered,
+                witnessed_ids: &witnessed,
+            },
+            (sender, machine, run),
+            std::time::Instant::now(),
+            1,
+        );
+        let failed = AssertUnwindSafe(bounded(
+            "#613 fake-channel phase",
+            Duration::from_millis(100),
+            collection,
+        ))
+        .catch_unwind()
+        .await;
+        let panic = failed.expect_err("missing W5 or invalid typed frame must fail");
+        let reason = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("collector failure message");
+        let expected = match bad_typed {
+            None => "#501 labelled deadline: #613 fake-channel phase",
+            Some(false) => "duplicate typed delivery",
+            Some(true) => "typed delivery must belong to an attempted current-run ID",
+        };
+        assert!(reason.contains(expected), "unexpected failure: {reason}");
+        assert_eq!(delivered.lock().expect("delivered set").len(), 1);
+        assert!(witnessed.lock().expect("witness set").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn issue613_collector_filters_or_rejects_bad_w5_frames() {
+    for case in 0..4 {
+        let run = [1; 16];
+        let request_id = [2; 16];
+        let (record, actual, sender, machine) = issue613_synthetic_delivery(request_id, run, 1, 3);
+        let records = Mutex::new([(request_id, record)].into_iter().collect());
+        let delivered = Mutex::new(std::collections::BTreeSet::new());
+        let witnessed = Mutex::new(std::collections::BTreeMap::new());
+        let (d_tx, mut d5) = mpsc::channel(2);
+        let (_o_tx, mut o5) = mpsc::channel(2);
+        let (w_tx, mut w5) = mpsc::channel(2);
+        d_tx.send(actual).await.expect("typed fixture send");
+        let mut raw =
+            issue613_synthetic_witness(if case == 2 { [3; 16] } else { request_id }, sender);
+        if case == 0 {
+            raw.sender = Some(crate::identity::AgentId([9; 32]));
+        } else if case == 1 {
+            raw.verified = false;
+        }
+        w_tx.send(raw.clone()).await.expect("W5 fixture send");
+        if case == 3 {
+            w_tx.send(raw).await.expect("duplicate W5 fixture send");
+        }
+        let collection = issue613_collect_delivery(
+            (&mut d5, &mut o5, &mut w5),
+            Issue613Ledgers {
+                records: &records,
+                delivered_ids: &delivered,
+                witnessed_ids: &witnessed,
+            },
+            (sender, machine, run),
+            std::time::Instant::now(),
+            1,
+        );
+        let panic = AssertUnwindSafe(bounded(
+            "#613 fake-channel phase",
+            Duration::from_millis(100),
+            collection,
+        ))
+        .catch_unwind()
+        .await
+        .expect_err("bad W5 frame must not complete the collector");
+        let reason = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("collector failure message");
+        let expected = match case {
+            0 | 1 => "#501 labelled deadline: #613 fake-channel phase",
+            2 => "assertion failed",
+            3 => "duplicate W5 raw frame",
+            _ => unreachable!("bounded test cases"),
+        };
+        assert!(reason.contains(expected), "unexpected W5 failure: {reason}");
+    }
+}
+
+#[test]
+fn issue613_collector_accepts_delivery_before_ack() {
+    let run = [1; 16];
+    let (mut record, actual, sender, machine) = issue613_synthetic_delivery([2; 16], run, 1, 3);
+    issue613_credit_delivery(&mut record, &actual, sender, machine, run, 1, 11);
+    assert_eq!(record.ack_ns, None);
+    assert_eq!(record.delivered_ns, Some(11));
+}
+
+#[test]
+fn issue613_collector_rejects_wrong_binding() {
+    type Mutation = Box<dyn Fn(&mut Issue613Record, &mut DmTypedPayload, &mut [u8; 16], &mut u8)>;
+    let cases: [Mutation; 4] = [
+        Box::new(|_, _, run, _| *run = [9; 16]),
+        Box::new(|_, actual, _, _| actual.payload = issue613_payload([1; 16], 1, 99)),
+        Box::new(|_, _, _, destination| *destination = 2),
+        Box::new(|_, actual, _, _| actual.request_id = [6; 16]),
+    ];
+    for mutate in cases {
+        let mut run = [1; 16];
+        let mut destination = 1;
+        let (mut record, mut actual, sender, machine) =
+            issue613_synthetic_delivery([2; 16], run, destination, 3);
+        mutate(&mut record, &mut actual, &mut run, &mut destination);
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            issue613_credit_delivery(&mut record, &actual, sender, machine, run, destination, 11);
+        }))
+        .is_err());
+    }
+}
+
+#[test]
+fn issue613_partial_ledger_retains_missing_ids_without_payload() {
+    let run = [1; 16];
+    let (mut published, _, _, _) = issue613_synthetic_delivery([2; 16], run, 1, 2);
+    published.ack_ns = Some(12);
+    published.delivered_ns = Some(11);
+    let (missing, _, _, _) = issue613_synthetic_delivery([3; 16], run, 2, 3);
+    let records = [([2; 16], published), ([3; 16], missing)]
+        .into_iter()
+        .collect();
+    let witnessed = [([2; 16], 13)].into_iter().collect();
+    let receipt = issue613_partial_ledger(&records, &witnessed, run, "FAILED");
+    assert_eq!(receipt["attempted"], 2);
+    assert_eq!(receipt["published"], 1);
+    assert_eq!(receipt["delivered"], 1);
+    assert_eq!(receipt["witnessed"], 1);
+    assert_eq!(
+        receipt["witness_missing_ids"]
+            .as_array()
+            .expect("missing IDs")
+            .len(),
+        1
+    );
+    assert_eq!(receipt["outcome"], "FAILED");
+    assert!(!serde_json::to_string(&receipt)
+        .expect("partial JSON")
+        .contains("x0x-501-interop"));
+}
+
+#[test]
+fn issue613_partial_ledger_recovers_poison_for_diagnostics() {
+    let records = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let witnessed = Mutex::new(std::collections::BTreeMap::new());
+    let poisoned = Arc::clone(&records);
+    assert!(std::thread::spawn(move || {
+        let mut guard = poisoned.lock().expect("initial healthy ledger");
+        let (record, _, _, _) = issue613_synthetic_delivery([4; 16], [1; 16], 1, 4);
+        guard.insert([4; 16], record);
+        panic!("collector assertion while ledger held");
+    })
+    .join()
+    .is_err());
+    let receipt = issue613_partial_ledger_from_mutex(&records, &witnessed, [1; 16], "FAILED");
+    assert_eq!(receipt["attempted"], 1);
+    assert_eq!(receipt["outcome"], "FAILED");
+}
+
+#[test]
+fn issue613_readiness_failure_classification_is_bounded() {
+    assert_eq!(
+        issue613_readiness_rejection_class(Some("scores not yet populated peer deadbeef")),
+        "topic_scores_absent"
+    );
+    assert_eq!(
+        issue613_readiness_rejection_class(Some("#611 eager-mesh oracle peer deadbeef")),
+        "eager_mesh_invalid"
+    );
+    assert_eq!(
+        issue613_readiness_rejection_class(Some("admitted set differs peer deadbeef")),
+        "admitted_set_invalid"
+    );
+    assert_eq!(
+        issue613_readiness_rejection_class(None),
+        "no_completed_rejection"
+    );
+}
+
 // Literal source-reviewed lifetime universe, not observed subscriptions. The
 // full Agent fixture starts only identity/machine/user listeners, revocation,
 // move listeners, capability services, blob service and the actual DM inboxes.
@@ -1145,6 +2236,14 @@ async fn shape_diamond(
     clock: std::time::Instant,
     dm_bus_non_subscriber_label_indices: &[usize],
 ) -> Result<Vec<std::time::Instant>, RejectedReadiness> {
+    let initial_admission = tokio::time::timeout(
+        Duration::from_secs(5),
+        AssertUnwindSafe(diamond_observations(agents, clock)).catch_unwind(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(strip_peer_scores);
     let expected = diamond_expected();
     let peer_ids: serde_json::Map<String, serde_json::Value> = DIAMOND_LABELS
         .iter()
@@ -1190,11 +2289,91 @@ async fn shape_diamond(
         }
     })
     .await;
+    // Let the administrative disconnects leave the transport's connected-peer
+    // snapshot before rebuilding PlumTree. Refreshing before this settle can
+    // seed a forbidden, just-disconnected peer and leave the strict eager
+    // oracle polling an immutable stale set for its whole deadline.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The two administrative cuts are the only forbidden edges. Re-establish
+    // every allowed edge explicitly instead of assuming the initial full-mesh
+    // connections survived unrelated connection arbitration while the cuts
+    // settled. The reverse suppressions above remain installed, so this cannot
+    // reconnect either forbidden pair.
+    let reconnect_deadline = tokio::time::Instant::now() + SETUP;
+    let mut allowed_reconnects = Vec::new();
+    for (from, to) in [(0, 1), (0, 2), (1, 3), (2, 3)] {
+        let begin = diamond_now(clock);
+        let expected_peer_id = agents[to].machine_id().0;
+        let attempt = AssertUnwindSafe(async {
+            let network = agents[from].network().ok_or("source network unavailable")?;
+            let address = agents[to]
+                .network()
+                .ok_or("target network unavailable")?
+                .bound_addr()
+                .await
+                .ok_or("target bound address unavailable")?;
+            network
+                .connect_addr(address)
+                .await
+                .map(|peer| peer.0)
+                .map_err(|_| "connect returned error")
+        })
+        .catch_unwind();
+        let result = tokio::time::timeout_at(reconnect_deadline, attempt).await;
+        let (connected_peer_id, native_outcome) = match result {
+            Ok(Ok(Ok(peer))) if peer == expected_peer_id => {
+                (Some(hex::encode(peer)), "ConnectedExpectedPeer")
+            }
+            Ok(Ok(Ok(peer))) => (Some(hex::encode(peer)), "ConnectedWrongPeer"),
+            Ok(Ok(Err(reason))) => (None, reason),
+            Ok(Err(_)) => (None, "Panicked"),
+            Err(_) => (None, "TimedOut"),
+        };
+        let row = serde_json::json!({
+            "owner":DIAMOND_LABELS[from],
+            "peer":DIAMOND_LABELS[to],
+            "owner_peer_id":hex::encode(agents[from].machine_id().0),
+            "expected_peer_id":hex::encode(expected_peer_id),
+            "connected_peer_id":connected_peer_id,
+            "begin_ns":begin,
+            "end_ns":diamond_now(clock),
+            "native_outcome":native_outcome,
+        });
+        eprintln!(
+            "ISSUE613_ALLOWED_EDGE_ATTEMPT {}",
+            serde_json::to_string(&row)
+                .unwrap_or_else(|_| { r#"{"native_outcome":"SerializationFailed"}"#.to_owned() })
+        );
+        allowed_reconnects.push(row);
+        assert_eq!(
+            native_outcome, "ConnectedExpectedPeer",
+            "INCONCLUSIVE: allowed diamond edge reconnect did not reach expected peer"
+        );
+    }
+    let after_allowed_reconnect = tokio::time::timeout(
+        Duration::from_secs(5),
+        AssertUnwindSafe(diamond_observations(agents, clock)).catch_unwind(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .map(strip_peer_scores);
+    eprintln!(
+        "ISSUE613_ALLOWED_EDGE_SETUP {}",
+        serde_json::to_string(&serde_json::json!({
+            "schema":1,
+            "initial_admission":initial_admission,
+            "allowed_reconnects":allowed_reconnects,
+            "after_allowed_reconnect_admission":after_allowed_reconnect,
+            "forbidden_pairs":[["G5","W5"],["D5","O5"]],
+        }))
+        .unwrap_or_else(|_| {
+            r#"{"schema":1,"diagnostic_status":"serialization_failed"}"#.to_owned()
+        })
+    );
     for agent in agents {
         pubsub(agent).refresh_topic_peers().await;
     }
-    // Keep the existing settle outside the unchanged final 20-second budget.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let start = tokio::time::Instant::now();
     let pre_cut = capture_ready_diamond(
         &raw["topology"],
@@ -1589,6 +2768,35 @@ fn generator_cut_projection(
     serde_json::json!({"begin_ns":begin,"end_ns":end,"publish":publish,"stages":stages})
 }
 
+fn issue613_zero_fanout_boundary_receipt(
+    sequence: u64,
+    request_id: [u8; 16],
+    returned: (u32, Option<saorsa_gossip_pubsub::FanoutCounts>),
+    timing_ns: (u64, u64),
+    snapshots: serde_json::Value,
+) -> serde_json::Value {
+    let counts = returned.1.map(|counts| {
+        serde_json::json!({
+            "candidates": counts.candidates,
+            "byte_rejected": counts.byte_rejected,
+            "admission_dropped": counts.admission_dropped,
+            "claim_skipped": counts.claim_skipped,
+            "attempted": counts.attempted,
+            "succeeded": counts.succeeded,
+        })
+    });
+    serde_json::json!({
+        "schema": 1,
+        "sequence": sequence,
+        "request_id": hex::encode(request_id),
+        "begin_ns": timing_ns.0,
+        "end_ns": timing_ns.1,
+        "reported_fanout": returned.0,
+        "fanout_counts": counts,
+        "snapshots": snapshots,
+    })
+}
+
 fn generator_load_returns(
     calls: &[(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)],
 ) -> serde_json::Value {
@@ -1677,6 +2885,74 @@ fn raw_sample(agent: &Agent, clock: std::time::Instant) -> serde_json::Value {
     serde_json::json!({"begin_ns":begin,"end_ns":diamond_now(clock),
         "egress":egress,"participation":participation,"stages":stages,
         "recv_pump":recv_pump})
+}
+
+async fn issue613_node_diagnostics(
+    agents: &[Agent],
+    clock: std::time::Instant,
+) -> serde_json::Value {
+    // #774 (d83 repeat): every projection below is aggregate, so the t0/t1
+    // cuts cannot separate "D5 absent from G5's DM-bus topic overlay" from
+    // "present but never selected" — both leave admission, transport and
+    // egress counters looking healthy. raw_sample already serializes the
+    // full stage_stats() snapshot, so project the DM-bus entry of
+    // peer_scores_by_topic (per-peer role, eager eligibility, cooling
+    // state) and the DM-bus rows of the flat peer_scores (adding decayed
+    // outbound-send evidence) with no second stats fetch, lock, or await.
+    // Null marks the topic absent from the scores map; peer rows are never
+    // invented. outbound_send_successes/_timeouts, cooling_events and
+    // recovery_* are decayed evidence, not exact attempt counts.
+    let dm_bus_topic =
+        saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()).to_string();
+    let mut nodes = serde_json::Map::new();
+    for (label, agent) in DIAMOND_LABELS.iter().zip(agents) {
+        let begin_ns = diamond_now(clock);
+        let admitted = agent
+            .network()
+            .expect("network")
+            .gossip_plane_peers()
+            .await
+            .into_iter()
+            .map(|peer| hex::encode(peer.0))
+            .collect::<Vec<_>>();
+        let transport = agent.transport_diagnostics().await;
+        let sample = raw_sample(agent, clock);
+        let bus_subscribed = pubsub(agent).is_topic_subscribed(DM_BUS_TOPIC).await;
+        let end_ns = diamond_now(clock);
+        // Topic absence stays explicit: null, never a fabricated empty peer
+        // map (the snapshot builder only inserts a peer under a live topic).
+        let dm_bus_scores_by_topic = sample["stages"]["peer_scores_by_topic"]
+            .get(&dm_bus_topic)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let dm_bus_flat_scores: Vec<serde_json::Value> = sample["stages"]["peer_scores"]
+            .as_array()
+            .map_or_else(Vec::new, |rows| {
+                rows.iter()
+                    .filter(|row| row["topic"].as_str() == Some(dm_bus_topic.as_str()))
+                    .cloned()
+                    .collect()
+            });
+        nodes.insert(
+            (*label).to_owned(),
+            serde_json::json!({
+                "begin_ns": begin_ns,
+                "end_ns": end_ns,
+                "admitted": admitted,
+                "bus_subscribed": bus_subscribed,
+                "transport": transport,
+                "recv_pump": sample["recv_pump"],
+                "admission": sample["stages"]["admission"],
+                "peers_evicted_not_connected": sample["stages"]["peers_evicted_not_connected"],
+                "suppressed_peers": sample["stages"]["suppressed_peers"],
+                "outbound_by_topic_named": sample["egress"]["outbound_by_topic_named"],
+                "dm_bus_topic_key": dm_bus_topic.as_str(),
+                "dm_bus_peer_scores_by_topic": dm_bus_scores_by_topic,
+                "dm_bus_peer_scores": dm_bus_flat_scores,
+            }),
+        );
+    }
+    serde_json::Value::Object(nodes)
 }
 
 /// The bus wire kinds each arm's oracle judges on. Shared by
@@ -2715,6 +3991,47 @@ fn readiness_diagnostic_checks_identity_clock_overflow_and_closed_fallback() {
     assert_eq!(retained["samples"], samples);
     assert_eq!(retained["load"], load);
     assert_eq!(retained["readiness_diagnostics"], value);
+}
+
+#[test]
+fn zero_fanout_boundary_receipt_is_retained_before_assertion_unwind() {
+    let mut retained = None;
+    let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        retained = Some(issue613_zero_fanout_boundary_receipt(
+            1,
+            [7; 16],
+            (
+                0,
+                Some(saorsa_gossip_pubsub::FanoutCounts {
+                    candidates: 2,
+                    byte_rejected: 0,
+                    admission_dropped: 1,
+                    claim_skipped: 1,
+                    attempted: 0,
+                    succeeded: 0,
+                }),
+            ),
+            (10, 12),
+            serde_json::json!({
+                "generator_immediate_cut":{"cut":"immediate"},
+                "generator_immediate_raw":{"roles":2},
+                "nodes_before_assert":{"G5":{"active_connections":3}},
+            }),
+        ));
+        panic!("unchanged zero-fanout assertion");
+    }));
+    assert!(panic.is_err());
+    let receipt = retained.expect("receipt exists before assertion unwind");
+    assert_eq!(receipt["begin_ns"], 10);
+    assert_eq!(receipt["end_ns"], 12);
+    assert_eq!(receipt["fanout_counts"]["candidates"], 2);
+    assert_eq!(receipt["fanout_counts"]["admission_dropped"], 1);
+    assert_eq!(receipt["fanout_counts"]["claim_skipped"], 1);
+    assert_eq!(receipt["fanout_counts"]["attempted"], 0);
+    assert_eq!(
+        receipt["snapshots"]["nodes_before_assert"]["G5"]["active_connections"],
+        3
+    );
 }
 
 // Constructor-free ancillary diagnostics controls; no call into generator_cut.
