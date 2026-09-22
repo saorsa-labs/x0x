@@ -940,13 +940,48 @@ async fn issue613_application_delivery(cut: bool) {
                     .expect("#613 signed bus publication");
                 let ack_ns = u64::try_from(started.elapsed().as_nanos())
                     .expect("bounded monotonic offset");
-                let mut ledger = publish_records.lock().expect("ledger");
-                let record = ledger.get_mut(&request_id).expect("attempted before publish");
-                record.ack_ns = Some(ack_ns);
-                record.fanout = Some(returned.0);
-                record.attempted_peer_sends = returned.1.map(|counts| {
-                    u64::try_from(counts.attempted).expect("bounded fixture peer count")
-                });
+                {
+                    let mut ledger = publish_records.lock().expect("ledger");
+                    let record = ledger.get_mut(&request_id).expect("attempted before publish");
+                    record.ack_ns = Some(ack_ns);
+                    record.fanout = Some(returned.0);
+                    record.attempted_peer_sends = returned.1.map(|counts| {
+                        u64::try_from(counts.attempted).expect("bounded fixture peer count")
+                    });
+                }
+                if returned.0 == 0 {
+                    let boundary_begin_ns = diamond_now(clock);
+                    // Capture the synchronous generator state before any
+                    // diagnostic await can let the one-second refresh loop
+                    // advance. The full-node projection that follows is
+                    // bounded and still runs before the unchanged assertion
+                    // unwinds the live agents.
+                    let generator = generator_cut(sender, clock);
+                    let generator_raw = raw_sample(sender, clock);
+                    let nodes = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        issue613_node_diagnostics(&agents, clock),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        serde_json::json!({"diagnostic_status":"timed_out","budget_secs":5})
+                    });
+                    let receipt = issue613_zero_fanout_boundary_receipt(
+                        sequence,
+                        request_id,
+                        returned,
+                        (boundary_begin_ns, diamond_now(clock)),
+                        serde_json::json!({
+                            "generator_immediate_cut": generator,
+                            "generator_immediate_raw": generator_raw,
+                            "nodes_before_assert": nodes,
+                        }),
+                    );
+                    eprintln!(
+                        "ISSUE613_ZERO_FANOUT_BOUNDARY {}",
+                        serde_json::to_string(&receipt).expect("zero-fanout boundary JSON")
+                    );
+                }
                 assert!(returned.0 > 0, "publication must attempt a peer");
             }
         };
@@ -2434,6 +2469,35 @@ fn generator_cut_projection(
     serde_json::json!({"begin_ns":begin,"end_ns":end,"publish":publish,"stages":stages})
 }
 
+fn issue613_zero_fanout_boundary_receipt(
+    sequence: u64,
+    request_id: [u8; 16],
+    returned: (u32, Option<saorsa_gossip_pubsub::FanoutCounts>),
+    timing_ns: (u64, u64),
+    snapshots: serde_json::Value,
+) -> serde_json::Value {
+    let counts = returned.1.map(|counts| {
+        serde_json::json!({
+            "candidates": counts.candidates,
+            "byte_rejected": counts.byte_rejected,
+            "admission_dropped": counts.admission_dropped,
+            "claim_skipped": counts.claim_skipped,
+            "attempted": counts.attempted,
+            "succeeded": counts.succeeded,
+        })
+    });
+    serde_json::json!({
+        "schema": 1,
+        "sequence": sequence,
+        "request_id": hex::encode(request_id),
+        "begin_ns": timing_ns.0,
+        "end_ns": timing_ns.1,
+        "reported_fanout": returned.0,
+        "fanout_counts": counts,
+        "snapshots": snapshots,
+    })
+}
+
 fn generator_load_returns(
     calls: &[(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)],
 ) -> serde_json::Value {
@@ -3628,6 +3692,47 @@ fn readiness_diagnostic_checks_identity_clock_overflow_and_closed_fallback() {
     assert_eq!(retained["samples"], samples);
     assert_eq!(retained["load"], load);
     assert_eq!(retained["readiness_diagnostics"], value);
+}
+
+#[test]
+fn zero_fanout_boundary_receipt_is_retained_before_assertion_unwind() {
+    let mut retained = None;
+    let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        retained = Some(issue613_zero_fanout_boundary_receipt(
+            1,
+            [7; 16],
+            (
+                0,
+                Some(saorsa_gossip_pubsub::FanoutCounts {
+                    candidates: 2,
+                    byte_rejected: 0,
+                    admission_dropped: 1,
+                    claim_skipped: 1,
+                    attempted: 0,
+                    succeeded: 0,
+                }),
+            ),
+            (10, 12),
+            serde_json::json!({
+                "generator_immediate_cut":{"cut":"immediate"},
+                "generator_immediate_raw":{"roles":2},
+                "nodes_before_assert":{"G5":{"active_connections":3}},
+            }),
+        ));
+        panic!("unchanged zero-fanout assertion");
+    }));
+    assert!(panic.is_err());
+    let receipt = retained.expect("receipt exists before assertion unwind");
+    assert_eq!(receipt["begin_ns"], 10);
+    assert_eq!(receipt["end_ns"], 12);
+    assert_eq!(receipt["fanout_counts"]["candidates"], 2);
+    assert_eq!(receipt["fanout_counts"]["admission_dropped"], 1);
+    assert_eq!(receipt["fanout_counts"]["claim_skipped"], 1);
+    assert_eq!(receipt["fanout_counts"]["attempted"], 0);
+    assert_eq!(
+        receipt["snapshots"]["nodes_before_assert"]["G5"]["active_connections"],
+        3
+    );
 }
 
 // Constructor-free ancillary diagnostics controls; no call into generator_cut.
