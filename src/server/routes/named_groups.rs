@@ -119,29 +119,6 @@ pub(in crate::server) struct TreeKemCacheMutation {
 }
 
 #[cfg(test)]
-static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<
-    Vec<(String, String, Option<String>)>,
-> = StdMutex::new(Vec::new());
-/// #477 T9b (r6 item 6): the exact serialized payload bytes of every
-/// metadata publish attempt (topic, bytes) — pins the stored-bytes
-/// resend contract at the transport boundary.
-#[cfg(test)]
-static NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST: StdMutex<Vec<(String, Vec<u8>)>> =
-    StdMutex::new(Vec::new());
-#[cfg(test)]
-// Records each (recipient_hex, event_group_id, event_kind, path) delivery
-// attempt — event_kind is the named-group event variant tag (e.g.
-// "member_removed", "join_request_approved") and path is "direct" or "delayed"
-// — so a handler's recipient set AND that BOTH paths fired per recipient are
-// observable in a deterministic unit test (the live send targets an absent
-// daemon). The full event kind (not just a MemberRemoved boolean) is recorded
-// so an approval-delivery test can distinguish a JoinRequestApproved delivery
-// from a MemberRemoved one and cannot infer the event from recipient presence.
-static NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST: StdMutex<
-    Vec<(String, String, &'static str, &'static str)>,
-> = StdMutex::new(Vec::new());
-
-#[cfg(test)]
 static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
     Option<(String, Arc<tokio::sync::Notify>)>,
 > = StdMutex::new(None);
@@ -2540,7 +2517,7 @@ async fn publish_named_group_metadata_event(
     event: &NamedGroupMetadataEvent,
 ) {
     #[cfg(test)]
-    if let Ok(mut attempts) = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST.lock() {
+    if let Ok(mut attempts) = state.named_group_test_recorders.publish_attempts.lock() {
         attempts.push((
             metadata_topic.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
@@ -2554,7 +2531,7 @@ async fn publish_named_group_metadata_event(
             // bytes each publish attempt hands to the transport, so the
             // stored-bytes resend contract is observable end-to-end.
             #[cfg(test)]
-            if let Ok(mut published) = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST.lock() {
+            if let Ok(mut published) = state.named_group_test_recorders.publish_bytes.lock() {
                 published.push((metadata_topic.to_string(), bytes.clone()));
             }
             match tokio::time::timeout(
@@ -2593,7 +2570,7 @@ async fn publish_named_group_metadata_event_with_envelope(
     event: &NamedGroupMetadataEvent,
 ) -> Option<Bytes> {
     #[cfg(test)]
-    if let Ok(mut attempts) = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST.lock() {
+    if let Ok(mut attempts) = state.named_group_test_recorders.publish_attempts.lock() {
         attempts.push((
             metadata_topic.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
@@ -2668,7 +2645,7 @@ fn named_group_event_delivery_future(
         }
     };
     #[cfg(test)]
-    if let Ok(mut rec) = NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST.lock() {
+    if let Ok(mut rec) = state.named_group_test_recorders.direct_deliveries.lock() {
         rec.push((
             recipient_hex.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
@@ -34341,6 +34318,7 @@ pub(in crate::server) mod tests {
             named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             #[cfg(test)]
             named_groups_save_after_snapshot_notify: std::sync::Mutex::new(None),
+            named_group_test_recorders: crate::server::state::NamedGroupTestRecorders::default(),
         });
 
         // Review r2 (#451): mirror daemon startup — migrate a pre-#451
@@ -34721,7 +34699,7 @@ pub(in crate::server) mod tests {
                 );
             // Execute the PRODUCTION refire (stored-bytes branch) — with
             // the transport-bytes capture armed (r6 item 6).
-            if let Ok(mut published) = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST.lock() {
+            if let Ok(mut published) = state.named_group_test_recorders.publish_bytes.lock() {
                 published.clear();
             }
             refire_pending_join_volley(
@@ -34736,7 +34714,9 @@ pub(in crate::server) mod tests {
             // The EXACT stored payload bytes reached the transport
             // boundary (publish attempt), unchanged.
             let stored_payload = stored.payload.clone();
-            let published_bytes = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST
+            let published_bytes = state
+                .named_group_test_recorders
+                .publish_bytes
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone();
@@ -38824,7 +38804,9 @@ pub(in crate::server) mod tests {
             );
         }
 
-        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        joiner
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -38874,7 +38856,9 @@ pub(in crate::server) mod tests {
             );
             stub.metadata_topic.clone()
         };
-        let publish_attempts = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        let publish_attempts = joiner
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned");
         assert!(
@@ -40740,7 +40724,7 @@ pub(in crate::server) mod tests {
     //
     // Observed lane: the metadata-topic publish of the survivor envelopes only.
     // The direct + delayed delivery of the MemberRemoved event itself is now
-    // recorded (NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST) and covered by a
+    // recorded (state.named_group_test_recorders.direct_deliveries) and covered by a
     // dedicated test below; THIS test's scope remains the published survivor
     // recipient set, not the MemberRemoved delivery.
     //
@@ -40829,7 +40813,9 @@ pub(in crate::server) mod tests {
             );
         }
 
-        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -40870,7 +40856,9 @@ pub(in crate::server) mod tests {
         // Core 4c observation: the published recipient set. The recorder now
         // carries `SecureShareDelivered.recipient` alongside topic+group, so
         // the assertion is on the recipient set, not a publish count.
-        let published_recipients: Vec<String> = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        let published_recipients: Vec<String> = state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .iter()
@@ -40916,7 +40904,7 @@ pub(in crate::server) mod tests {
     // attribution. The final proof remains MiniMax's five real-daemon tests.
     //
     // Observed lane: the direct + delayed delivery recorder
-    // (NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST), which records
+    // (state.named_group_test_recorders.direct_deliveries), which records
     // (recipient_hex, group_id, is_member_removed, kind) per attempt — kind is
     // "direct" or "delayed". The test asserts each recipient appears on BOTH
     // paths, so loss of either one cannot hide behind the other.
@@ -41000,7 +40988,9 @@ pub(in crate::server) mod tests {
             );
         }
 
-        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+        state
+            .named_group_test_recorders
+            .direct_deliveries
             .lock()
             .expect("delivery recorder poisoned")
             .clear();
@@ -41031,7 +41021,9 @@ pub(in crate::server) mod tests {
         // independently and assert the removed member AND a survivor appear in
         // BOTH — loss of either path is caught (mutation B).
         let recipients_for = |kind: &str| -> Vec<String> {
-            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            state
+                .named_group_test_recorders
+                .direct_deliveries
                 .lock()
                 .expect("delivery recorder poisoned")
                 .iter()
@@ -41103,7 +41095,9 @@ pub(in crate::server) mod tests {
             .await
             .insert(group_id.clone(), info);
 
-        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+        state
+            .named_group_test_recorders
+            .direct_deliveries
             .lock()
             .expect("delivery recorder poisoned")
             .clear();
@@ -41127,7 +41121,9 @@ pub(in crate::server) mod tests {
         );
 
         let recipients_for = |kind: &str| -> Vec<String> {
-            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            state
+                .named_group_test_recorders
+                .direct_deliveries
                 .lock()
                 .expect("delivery recorder poisoned")
                 .iter()
@@ -41540,7 +41536,9 @@ pub(in crate::server) mod tests {
             );
         }
 
-        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+        state
+            .named_group_test_recorders
+            .direct_deliveries
             .lock()
             .expect("delivery recorder poisoned")
             .clear();
@@ -41570,7 +41568,9 @@ pub(in crate::server) mod tests {
         // independently and assert the witness AND requester appear in BOTH —
         // loss of either path or either recipient is caught.
         let recipients_for = |kind: &str| -> Vec<String> {
-            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            state
+                .named_group_test_recorders
+                .direct_deliveries
                 .lock()
                 .expect("delivery recorder poisoned")
                 .iter()
@@ -47392,7 +47392,9 @@ pub(in crate::server) mod tests {
                 .expect("mint signed v4 invite for the replay")
                 .1
         };
-        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -47424,7 +47426,9 @@ pub(in crate::server) mod tests {
             "idempotent response keeps the success shape, body: {body}"
         );
         assert!(
-            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            state
+                .named_group_test_recorders
+                .publish_attempts
                 .lock()
                 .expect("publish-attempt recorder poisoned")
                 .is_empty(),

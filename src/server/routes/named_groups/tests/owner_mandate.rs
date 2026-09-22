@@ -1523,7 +1523,9 @@ async fn direct_admin_add_mints_mandate_peer_applies_and_records_capable() -> Re
             },
         );
     }
-    NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST
+    authority
+        .named_group_test_recorders
+        .publish_bytes
         .lock()
         .expect("publish hook")
         .clear();
@@ -1541,7 +1543,9 @@ async fn direct_admin_add_mints_mandate_peer_applies_and_records_capable() -> Re
     .into_response();
     assert_eq!(response.status(), StatusCode::OK);
     // The published MemberAdded carries a mandate that verifies.
-    let published = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST
+    let published = authority
+        .named_group_test_recorders
+        .publish_bytes
         .lock()
         .expect("publish hook")
         .iter()
@@ -2050,7 +2054,9 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
     let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(joiner_id, &[0x5E; 32])?;
     let key_package_b64 = BASE64.encode(prepared.key_package_bytes());
 
-    NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST
+    authority
+        .named_group_test_recorders
+        .publish_bytes
         .lock()
         .expect("publish hook")
         .clear();
@@ -2072,7 +2078,9 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
         "TreeKEM direct add must succeed"
     );
 
-    let published = NAMED_GROUP_METADATA_PUBLISH_BYTES_FOR_TEST
+    let published = authority
+        .named_group_test_recorders
+        .publish_bytes
         .lock()
         .expect("publish hook")
         .iter()
