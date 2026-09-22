@@ -171,7 +171,7 @@ esac
                                   api_port_base=14600, quic_port_base=7483, local_port_base=24700,
                                   poll_timeout=20)
 
-    def run_model(self, fixture=None, scenario_cls=None):
+    def run_model(self, fixture=None, scenario_cls=None, card_reply=None):
         """Run the REAL run_fixture -> run_home -> exercise ordering against a stateful model.
 
         The model encodes the product facts the harness depends on: a Home join is
@@ -183,6 +183,7 @@ esac
         args = self.args(); evidence = self.h.Evidence(); resources = {}
         tokens = {n: (f"192.0.2.{i}", "unused") for i, n in enumerate(args.nodes, 1)}
         ids = {n: (str(i) * 64) for i, n in enumerate(args.nodes, 1)}
+        public_keys = {n: f"{i:02x}" * 1952 for i, n in enumerate(args.nodes, 1)}
         owner_user, gid, owner_key = "f" * 64, "home-gid", "k" * 64
         events: list[tuple] = []
         world = {"seats": {"owner": "admin"}, "certs": set(), "announced": set(), "invites": {}, "kv": {}}
@@ -227,9 +228,17 @@ esac
                 if path == "/home": return 200, {"state": "local", "group_id": gid, "owner_user_id": owner_user,
                                                     "primary_agent": {"verified": True}}
                 if path == "/health": return 200, {"ok": True}
-                if path == "/agent/card": return 200, {"agent_public_key": f"pub-{me}"}
+                if path == "/agent/card":
+                    if card_reply is not None: return 200, card_reply
+                    return 200, {"ok": True, "card": {"agent_id": ids[me],
+                                                      "agent_public_key": public_keys[me],
+                                                      "signature": "ab" * 3309}, "link": "x0x://agent"}
                 if path == "/agent/user-id": return 200, {"ok": True, "user_id": owner_user if keyed else None}
-                if path == "/owner/agents/issue": return 200, {"certificate": {"storage_b64": "Y2VydA=="}}
+                if path == "/owner/agents/issue":
+                    target = body["label"].removeprefix("home-e2e-")
+                    if me != "owner" or body["mode"] != "acp" or body["agent_public_key"] != public_keys[target]:
+                        return 400, {"ok": False}
+                    return 200, {"certificate": {"storage_b64": "Y2VydA=="}}
                 if path == "/announce":
                     if not (keyed and me in world["certs"]): return 400, {"ok": False}
                     world["announced"].add(me); return 200, {"ok": True}
@@ -326,6 +335,26 @@ esac
                  last(("stop", "writer"))]
         self.assertEqual(sorted(chain), chain)
         self.assertEqual({"owner", "writer", "late", "outsider"}, set(world["seats"]))
+
+    def test_card_envelope_rejects_missing_or_malformed_signed_fields_before_issuance(self):
+        key, signature = "02" * 1952, "ab" * 3309
+        invalid = {
+            "top-level fields only": {"ok": True, "agent_public_key": key, "signature": signature},
+            "wrong nested shape": {"ok": True, "card": [key, signature]},
+            "missing public key": {"ok": True, "card": {"signature": signature}},
+            "unsigned": {"ok": True, "card": {"agent_public_key": key}},
+            "malformed public key": {"ok": True, "card": {"agent_public_key": "zz" * 1952,
+                                                        "signature": signature}},
+            "malformed signature": {"ok": True, "card": {"agent_public_key": key,
+                                                       "signature": "ab" * 3308}},
+        }
+        for name, reply in invalid.items():
+            with self.subTest(card=name):
+                events, _custody, _world, evidence, error = self.run_model(card_reply=reply)
+                self.assertIsInstance(error, AssertionError)
+                self.assertFalse(next(row["passed"] for row in evidence.assertions
+                                      if row["label"] == "writer signed card exposes public key"))
+                self.assertNotIn(("req", "owner", "POST", "/owner/agents/issue"), events)
 
     def test_revert_controls_fail(self):
         tests = Path(__file__).parent
