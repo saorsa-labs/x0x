@@ -19,6 +19,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Test build artifact provenance controls
+        run: python3 .github/scripts/test_build_artifact_provenance.py
+
       - name: Test release metadata validation
         run: python3 .github/scripts/test_release_metadata.py
 
@@ -87,6 +90,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Resolve dependency graph
+        shell: bash
+        run: cargo generate-lockfile
+
+      - name: Capture source and dependency provenance
+        shell: bash
+        run: |
+          python3 .github/scripts/build_artifact_provenance.py prepare \
+            --repo . \
+            --artifact-dir "${RUNNER_TEMP}/x0x-${{ matrix.platform }}" \
+            --platform "${{ matrix.platform }}" \
+            --target "${{ matrix.target }}"
+
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
@@ -117,18 +133,36 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --locked --release --target ${{ matrix.target }} \
+            --message-format=json-render-diagnostics \
+            | tee "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl"
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cross build --locked --release --target ${{ matrix.target }} \
+            --message-format=json-render-diagnostics \
+            | tee "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl"
+
+      - name: Finalize and verify artifact provenance
+        shell: bash
+        run: |
+          python3 .github/scripts/build_artifact_provenance.py finalize \
+            --repo . \
+            --artifact-dir "${RUNNER_TEMP}/x0x-${{ matrix.platform }}" \
+            --release-dir "target/${{ matrix.target }}/release" \
+            --build-messages "${RUNNER_TEMP}/x0x-${{ matrix.platform }}-build.jsonl"
+          python3 .github/scripts/build_artifact_provenance.py verify \
+            --artifact-dir "${RUNNER_TEMP}/x0x-${{ matrix.platform }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
         with:
           name: x0x-${{ matrix.platform }}
-          path: |
-            target/${{ matrix.target }}/release/x0x*
-            !target/${{ matrix.target }}/release/*.d
-            !target/${{ matrix.target }}/release/*.pdb
+          path: ${{ runner.temp }}/x0x-${{ matrix.platform }}/
           if-no-files-found: error
