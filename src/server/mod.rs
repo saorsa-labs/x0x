@@ -978,6 +978,8 @@ pub async fn serve_with_options(
         owner_sync,
         #[cfg(test)]
         named_groups_save_fault: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        #[cfg(test)]
+        named_groups_save_after_snapshot_notify: std::sync::Mutex::new(None),
     });
 
     // ADR-0068 D1: teach the history retention reaper which scopes are

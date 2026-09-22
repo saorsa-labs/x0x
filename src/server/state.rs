@@ -1143,6 +1143,22 @@ pub(super) struct AppState {
     /// other's injected faults (fixes #732 / #673 ambient flake).
     #[cfg(test)]
     pub(super) named_groups_save_fault: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Per-instance deterministic-interleave cell for the #470 save-race hook:
+    /// an armed test parks `save_named_groups` between the roster snapshot and
+    /// the durable writes until released. It lives on the `AppState` — like
+    /// `named_groups_save_fault`, NOT in a process-global static — because the
+    /// plain `cargo test --lib` binary runs these tests in parallel in one
+    /// process: a global single slot let one test's arm overwrite another's
+    /// (whose save then hung awaiting a pair nobody would release) and let a
+    /// FOREIGN save park forever on a pair whose arming test had finished
+    /// (#759 item 4).
+    #[cfg(test)]
+    pub(super) named_groups_save_after_snapshot_notify: std::sync::Mutex<
+        Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    >,
 }
 
 #[derive(Clone)]

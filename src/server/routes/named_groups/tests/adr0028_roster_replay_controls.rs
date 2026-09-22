@@ -269,7 +269,8 @@ async fn replay_persistence_excludes_cross_group_roster_transaction() {
 
     let snapshot_reached = Arc::new(tokio::sync::Notify::new());
     let release_snapshot = Arc::new(tokio::sync::Notify::new());
-    *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+    *state
+        .named_groups_save_after_snapshot_notify
         .lock()
         .expect("roster snapshot hook poisoned") =
         Some((Arc::clone(&snapshot_reached), Arc::clone(&release_snapshot)));
@@ -284,7 +285,8 @@ async fn replay_persistence_excludes_cross_group_roster_transaction() {
     timeout(Duration::from_secs(5), snapshot_reached.notified())
         .await
         .expect("replay reached roster persistence snapshot");
-    *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+    *state
+        .named_groups_save_after_snapshot_notify
         .lock()
         .expect("roster snapshot hook poisoned") = None;
 

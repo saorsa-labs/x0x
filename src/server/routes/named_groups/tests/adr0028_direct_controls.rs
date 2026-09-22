@@ -11,8 +11,9 @@
 //! Failures are triggered by REAL mechanisms, never mocks:
 //! - a read-only parent directory forces `save_predecessor_relay_outbox` to
 //!   return `Err` (the production write path creates its temp file there);
-//! - the `NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY` test hook gates the roster
-//!   save so its failure can be interleaved after a successful outbox save;
+//! - the per-instance `named_groups_save_after_snapshot_notify` hook on
+//!   `AppState` gates the roster save so its failure can be interleaved after
+//!   a successful outbox save;
 //! - a loopback relay target (the local agent) makes a due obligation
 //!   deterministically complete without any network peer;
 //! - a `first_seen_ms` deep in the past exercises the restart expiry prune;
@@ -1640,7 +1641,8 @@ async fn b8_roster_save_failure_after_outbox_success_leaves_durable_outbox_for_a
     let reached = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     {
-        let mut hook = NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        let mut hook = state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("hook lock");
         *hook = Some((Arc::clone(&reached), Arc::clone(&release)));
@@ -1655,11 +1657,13 @@ async fn b8_roster_save_failure_after_outbox_success_leaves_durable_outbox_for_a
         .to_path_buf();
     let reached_c = Arc::clone(&reached);
     let release_c = Arc::clone(&release);
+    let hook_state = Arc::clone(&state);
     let orchestrator = tokio::spawn(async move {
         // Wait for the roster save to reach its post-snapshot hook point (the
         // outbox save has already succeeded by then), then force its write fail.
         reached_c.notified().await;
-        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        *hook_state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("hook lock") = None;
         {
@@ -1697,7 +1701,8 @@ async fn b8_roster_save_failure_after_outbox_success_leaves_durable_outbox_for_a
         .await;
     }
     {
-        let mut hook = NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+        let mut hook = state
+            .named_groups_save_after_snapshot_notify
             .lock()
             .expect("hook lock");
         *hook = None;
