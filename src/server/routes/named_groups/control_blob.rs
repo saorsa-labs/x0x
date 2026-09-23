@@ -688,6 +688,7 @@ async fn fetch_and_apply(
             if named_group_metadata_event_group_id(&event) != reference.group_id {
                 return Err("control blob event group mismatch");
             }
+            log_validated_for_handler(named_group_event_witness_kind(&event), reference);
             let _ = apply_named_group_metadata_event(state, event, source, true, None).await;
         }
         ControlBlobKind::JoinResult => {
@@ -708,6 +709,7 @@ async fn fetch_and_apply(
             if group_id != &reference.group_id || agent_id != &reference.recipient {
                 return Err("control blob result binding mismatch");
             }
+            log_validated_for_handler("join_result", reference);
             handle_join_result_message_bound(
                 state,
                 &source,
@@ -719,6 +721,34 @@ async fn fetch_and_apply(
         }
     }
     Ok(())
+}
+
+/// Stage named by the runtime witness: exact length/digest, reference
+/// binding and payload shape all passed, and the bytes are about to go to the
+/// original handler. That handler may still reject them, so this is never an
+/// "applied" receipt.
+const WITNESS_STAGE: &str = "reassembled_validated_for_handler";
+
+fn named_group_event_witness_kind(event: &NamedGroupMetadataEvent) -> &'static str {
+    if matches!(event, NamedGroupMetadataEvent::MemberAdded { .. }) {
+        "member_added"
+    } else {
+        "named_group_event"
+    }
+}
+
+fn witness_line(kind: &str, reference: &ControlBlobRef) -> String {
+    format!(
+        "x0x_control_blob_witness stage={WITNESS_STAGE} kind={kind} byte_len={} digest={}",
+        reference.byte_len, reference.digest
+    )
+}
+
+/// Metadata-only runtime evidence for the Home oversize fixture
+/// (`tests/e2e_home_fixture.py` parses this exact line). Never logs payload,
+/// keys or invites: the digest was already verified against the bytes.
+fn log_validated_for_handler(kind: &'static str, reference: &ControlBlobRef) {
+    tracing::info!("{}", witness_line(kind, reference));
 }
 
 /// Drives the actual stage/chunk/frame/incoming/digest functions without a
@@ -809,6 +839,27 @@ mod tests {
             digest: hex::encode(blake3::hash(bytes).as_bytes()),
             byte_len: bytes.len() as u64,
             join_attempt_id: None,
+        }
+    }
+
+    /// The Home oversize fixture fails unless it parses this exact line, and the
+    /// line must never carry routing identities or payload bytes.
+    #[test]
+    fn witness_line_is_metadata_only_and_matches_fixture_contract() {
+        let bytes = vec![7u8; x0x::dm::MAX_PAYLOAD_BYTES + 1];
+        let reference = reference(&bytes);
+        let line = witness_line("member_added", &reference);
+        assert_eq!(
+            line,
+            format!(
+                "x0x_control_blob_witness stage=reassembled_validated_for_handler \
+                 kind=member_added byte_len={} digest={}",
+                bytes.len(),
+                reference.digest
+            )
+        );
+        for identity in [&reference.group_id, &reference.source, &reference.recipient] {
+            assert!(!line.contains(identity.as_str()));
         }
     }
 

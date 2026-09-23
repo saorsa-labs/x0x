@@ -24,6 +24,47 @@ from e2e_vps_kv import Api, Evidence, active_provider_ids, enc, poll
 from e2e_vps_private_kv import Scenario
 
 ROOT_RE = re.compile(r"/var/tmp/x0x-home-e2e-[0-9a-f]{32}\Z")
+# Runtime witness emitted by control_blob.rs after exact-length/digest, binding
+# and shape checks, BEFORE the original handler: it proves real oversized
+# transport + reassembly, never that the handler applied the payload.
+DM_MAX_PAYLOAD_BYTES = 49_152
+WITNESS_STAGE = "reassembled_validated_for_handler"
+REQUIRED_WITNESS_KINDS = ("member_added", "join_result")
+WITNESS_RE = re.compile(r"x0x_control_blob_witness stage=([a-z_]+) kind=([a-z_]+) "
+                        r"byte_len=([0-9]{1,12}) digest=([0-9a-f]{64})\Z")
+WITNESS_LINES_PER_NODE = 64
+WITNESS_BYTES_PER_NODE = 16_384
+# head emits one line past WITNESS_LINES_PER_NODE so real overflow reaches the
+# Python bound in control_blob_witnesses and fails closed instead of being
+# silently truncated down to the bound.
+WITNESS_SCRIPT = r'''set -eu
+root=$1 marker=$2
+[ "$(cat "$root/fixture.marker")" = "$marker" ]
+[ -f "$root/logs/daemon.log" ] || exit 0
+{ grep -a -o -E 'x0x_control_blob_witness stage=[a-z_]+ kind=[a-z_]+ byte_len=[0-9]{1,12} digest=[0-9a-f]{64}' "$root/logs/daemon.log" || true; } | head -n ''' + str(WITNESS_LINES_PER_NODE + 1) + '\n'
+
+
+def parse_witness_line(line: str) -> dict[str, Any]:
+    match = WITNESS_RE.fullmatch(line)
+    if match is None:
+        raise RuntimeError("malformed control blob witness receipt")
+    stage, kind, byte_len, digest = match.groups()
+    return {"stage": stage, "kind": kind, "byte_len": int(byte_len), "digest": digest}
+
+
+def witness_assertions(witnesses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per required kind; passes only for the right stage above the DM limit."""
+    rows = []
+    for kind in REQUIRED_WITNESS_KINDS:
+        matching = [w for w in witnesses if w["kind"] == kind and w["stage"] == WITNESS_STAGE
+                    and w["byte_len"] > DM_MAX_PAYLOAD_BYTES]
+        best = max(matching, key=lambda w: w["byte_len"], default=None)
+        rows.append({"label": f"oversized {kind} reassembled and validated for handler",
+                     "passed": best is not None, "stage": WITNESS_STAGE,
+                     "threshold_bytes": DM_MAX_PAYLOAD_BYTES, "receipt_count": len(matching),
+                     "node": best and best["node"], "byte_len": best and best["byte_len"],
+                     "digest": best and best["digest"]})
+    return rows
 SSH = ("ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none",
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 
@@ -284,6 +325,22 @@ printf '%s %s\n' "$(cat "$root/config.sha256")" "$(cat "$root/binary.sha256")"
             raise RuntimeError("invalid synthetic custody hash receipt")
         return fields[0], fields[1]
 
+    def control_blob_witnesses(self) -> list[dict[str, Any]]:
+        """Strictly parsed, node-tagged witness receipts from every started node's log."""
+        witnesses: list[dict[str, Any]] = []
+        for label, node in self.started.items():
+            raw = self.remote.run(node.host, WITNESS_SCRIPT, [node.root, self.marker], capture=True)
+            if len(raw) > WITNESS_BYTES_PER_NODE:
+                raise RuntimeError(f"control blob witness bytes exceed the bound for {label}")
+            lines = raw.decode().splitlines()
+            if len(lines) > WITNESS_LINES_PER_NODE:
+                raise RuntimeError(f"control blob witness lines exceed the bound for {label}")
+            for line in lines:
+                witness = parse_witness_line(line)
+                witness["node"] = label
+                witnesses.append(witness)
+        return witnesses
+
     def restore(self) -> list[str]:
         errors = []
         for label, node in reversed(list(self.started.items())):
@@ -450,8 +507,21 @@ def main() -> int:
         evidence.assertions.append({"label": f"fixture {type(error).__name__}", "passed": False})
     finally:
         custody = resources.get("custody")
+        witnesses: list[dict[str, Any]] = []
         if custody is not None:
             for error in custody.restore(): evidence.assertions.append({"label": error, "passed": False}); succeeded = False
+            # Collected only after restore: every owned daemon is stopped, so
+            # each log is flushed and complete. The witness proves oversized
+            # transport and reassembly reached the handler boundary; it never
+            # claims the handler applied the payload.
+            try:
+                witnesses = custody.control_blob_witnesses()
+                evidence.assertions.extend(witness_assertions(witnesses))
+            except Exception as error:
+                witnesses = []
+                evidence.assertions.append({"label": f"control blob witness collection {type(error).__name__}", "passed": False}); succeeded = False
+        else:
+            evidence.assertions.append({"label": "control blob witness collection unavailable", "passed": False}); succeeded = False
         for tunnel in resources.get("tunnels", []):
             try: stop_ssh_tunnel(tunnel)
             except Exception as error: evidence.assertions.append({"label": f"tunnel cleanup {type(error).__name__}", "passed": False}); succeeded = False
@@ -459,6 +529,7 @@ def main() -> int:
             with open(args.report, "w", encoding="utf-8") as output:
                 json.dump({"scenario": "synthetic-home", "custody": resources.get("manifest"),
                            "stores": evidence.stores, "polls": evidence.polls,
+                           "control_blob_witnesses": witnesses,
                            "assertions": evidence.assertions}, output, indent=2)
         except Exception: succeeded = False
     return 0 if succeeded and all(row["passed"] for row in evidence.assertions) else 1
