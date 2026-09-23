@@ -261,7 +261,7 @@ impl PubSubStats {
 }
 
 /// Inbound frames and bytes per (topic class, PlumTree message kind),
-/// counted off the already-decoded [`MessageHeader`] before any signature
+/// counted off the already-decoded [`saorsa_gossip_pubsub::InspectedMessageHeader`] before any signature
 /// work (#674): `/diagnostics/gossip` could not previously attribute
 /// inbound cost to a topic, forcing eviction-rate inference. Exposed as
 /// `inbound_by_topic` on the `GET /diagnostics/gossip` snapshot.
