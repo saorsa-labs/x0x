@@ -22,7 +22,12 @@ from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody
 
 class Scenario(SharedScenario):
     def join_private(self, owner: str, member: str, gid: str, invite: str | None = None) -> None:
-        self.join(owner, member, gid, invite)
+        invite = invite or self.invite(owner, member, gid)
+        self._join_with_local_readiness(
+            owner, member, gid, {"invite": invite},
+            accepted_label=f"{member} joined expected group",
+            readiness_label=f"{member} private join reaches owner and local readiness",
+            operation="private_join_readiness")
 
     def home(self, owner: str) -> tuple[str, str]:
         status, body = self.c[owner].request("GET", "/home")
@@ -56,12 +61,22 @@ class Scenario(SharedScenario):
         return invite
 
     def join_home(self, owner: str, member: str, gid: str, owner_id: str, invite: str) -> None:
-        status, body = self.c[member].request("POST", "/groups/join", {
-            "invite": invite, "mode": "home", "expected_owner_user_id": owner_id})
+        self._join_with_local_readiness(
+            owner, member, gid,
+            {"invite": invite, "mode": "home", "expected_owner_user_id": owner_id},
+            accepted_label=f"{member} canonical Home join request accepted",
+            readiness_label=f"{member} Home seat reaches owner and local readiness",
+            operation="home_join_readiness")
+
+    def _join_with_local_readiness(self, owner: str, member: str, gid: str,
+                                   join_body: dict[str, Any], accepted_label: str,
+                                   readiness_label: str, operation: str) -> None:
+        status, body = self.c[member].request("POST", "/groups/join", join_body)
+        body = body if isinstance(body, dict) else {}
         join_state = body.get("join_state")
         if join_state not in ("active", "pending_authority_commit", "idle", "timed_out"):
             join_state = "other" if join_state is not None else None
-        self.e.check(f"{member} canonical Home join request accepted", status in (200, 201)
+        self.e.check(accepted_label, status in (200, 201)
                      and body.get("ok") is not False and body.get("group_id", gid) == gid,
                      status=status, join_state=join_state)
         aid = self.c[member].agent_id()
@@ -73,6 +88,7 @@ class Scenario(SharedScenario):
         owner_body: dict[str, Any] = {}
         local_body: dict[str, Any] = {}
         owner_ready = False
+        local_ready = False
         first_sample_utc = last_sample_utc = None
         last_error: str | None = None
         deadline_reached = False
@@ -80,13 +96,14 @@ class Scenario(SharedScenario):
         def safe_request(client: Any, method: str, path: str) -> tuple[Any, str | None]:
             try:
                 return client.request(method, path), None
-            except Exception as error:  # preserve the bounded receipt, like poll()
+            except Exception as error:
                 return None, type(error).__name__
 
-        def state_label(body: dict[str, Any]) -> str | None:
-            value = body.get("membership_state")
+        def state_label(response_body: dict[str, Any]) -> str | None:
+            value = response_body.get("membership_state")
             allowed = {"active", "pending_authority_commit", "pending", "idle", "not_member"}
-            return value if isinstance(value, str) and value in allowed else ("other" if value is not None else None)
+            return value if isinstance(value, str) and value in allowed else (
+                "other" if value is not None else None)
 
         while time.monotonic() < deadline:
             sampled = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -121,15 +138,16 @@ class Scenario(SharedScenario):
             if owner_ready and local_ready:
                 elapsed = round(time.monotonic() - started, 3)
                 self.e.record_poll(
-                    {"label": f"{member} Home seat reaches owner and local readiness", "elapsed_seconds": elapsed,
+                    {"label": readiness_label, "elapsed_seconds": elapsed,
                      "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
                      "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
                      "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
                      "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
                      "local_membership_state": "active", "outcome": "accepted",
+                     "local_observed_group_id": safe_identifier(local_body.get("group_id")),
                      "observed_member_count": len(rows) if rows is not None else None,
                      "expected_member_present": True, "last_error_class": last_error},
-                    operation="home_join_readiness", node=member, owner=owner,
+                    operation=operation, node=member, owner=owner,
                     group_id=safe_identifier(gid), deadline_seconds=self.timeout,
                     observed_member_count=len(rows) if rows is not None else None,
                     expected_member_present=True, local_probe_count=local_samples)
@@ -151,19 +169,20 @@ class Scenario(SharedScenario):
                             ("other" if terminal_value is not None else None))
         elapsed = round(diagnostic_started - started, 3)
         self.e.record_poll(
-            {"label": f"{member} Home seat reaches owner and local readiness", "elapsed_seconds": elapsed,
+            {"label": readiness_label, "elapsed_seconds": elapsed,
              "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
              "probe_count": owner_samples, "last_status": owner_last[0] if isinstance(owner_last, tuple) else None,
              "local_last_status": local_last[0] if isinstance(local_last, tuple) else None,
              "last_http_status": owner_last[0] if isinstance(owner_last, tuple) else None,
              "local_membership_state": state_label(local_body),
+             "local_observed_group_id": safe_identifier(local_body.get("group_id")),
              "terminal_join_status": join_status[0] if isinstance(join_status, tuple) else None,
              "terminal_join_outcome": terminal_outcome,
              "terminal_join_status_error_class": terminal_error,
              "deadline_reached_before_acceptance": deadline_reached,
              "diagnostic_elapsed_seconds": round(time.monotonic() - diagnostic_started, 3),
              "last_error_class": last_error, "outcome": "timeout"},
-            operation="home_join_readiness", node=member, owner=owner,
+            operation=operation, node=member, owner=owner,
             group_id=safe_identifier(gid), deadline_seconds=self.timeout,
             observed_member_count=(len(owner_body.get("members"))
                                    if isinstance(owner_last, tuple) and owner_last[0] == 200
@@ -172,7 +191,7 @@ class Scenario(SharedScenario):
                                      and owner_last[0] == 200
                                      and isinstance(owner_body.get("members"), list) else None),
             local_probe_count=local_samples)
-        raise AssertionError(f"{member} Home seat reaches owner and local readiness did not converge in {self.timeout:g}s")
+        raise AssertionError(f"{readiness_label} did not converge in {self.timeout:g}s")
 
     def exercise(self, label: str, owner: str, writer: str, late: str, admin: str, revoked: str,
                  gid: str, admit_admin: Callable[[], None], mint_late: Callable[[], str],
