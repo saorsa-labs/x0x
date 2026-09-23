@@ -23,9 +23,9 @@ use crate::network::NetworkNode;
 use bytes::Bytes;
 use saorsa_gossip_pubsub::{BytePolicy, LeafEgressConfig, PlumtreePubSub, PubSub, SignaturePolicy};
 use saorsa_gossip_transport::GossipTransport;
-use saorsa_gossip_types::{
-    MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
-};
+#[cfg(test)]
+use saorsa_gossip_types::MessageHeader;
+use saorsa_gossip_types::{MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -365,9 +365,9 @@ impl Default for InboundByTopicStats {
 
 impl InboundByTopicStats {
     /// Attribute one inbound frame. `frame_len` is the full wire length.
-    fn record(&self, header: &MessageHeader, frame_len: u64) {
-        let slot = &self.slots[inbound_topic_class(&header.topic) * INBOUND_KIND_NAMES.len()
-            + inbound_kind_index(header.kind)];
+    fn record(&self, inspected: &saorsa_gossip_pubsub::InspectedMessageHeader, frame_len: u64) {
+        let slot = &self.slots[inbound_topic_class(&inspected.topic) * INBOUND_KIND_NAMES.len()
+            + inbound_kind_index(inspected.kind)];
         slot.frames.fetch_add(1, Ordering::Relaxed);
         slot.bytes.fetch_add(frame_len, Ordering::Relaxed);
     }
@@ -832,8 +832,10 @@ pub fn is_local_topic(topic: &str) -> bool {
 }
 
 /// Peek the PlumTree header of a serialized `GossipMessage` without verifying
-/// the signature. Used by the Leaf C0 refuse gate so unsubscribed frames
-/// never reach `handle_message`.
+/// the signature. Test assertions on captured legacy egress frames; the
+/// production inbound gates use SG's structural `inspect_message_header`,
+/// which also recognizes v3 frames and enforces exact ML-DSA sizes.
+#[cfg(test)]
 fn peek_pubsub_header(frame: &[u8]) -> Option<MessageHeader> {
     postcard::take_from_bytes::<MessageHeader>(frame)
         .ok()
@@ -1782,21 +1784,42 @@ impl PubSubManager {
         Ok(())
     }
 
-    /// Handle an incoming message from a peer.
+    /// Handle an incoming message from a peer, optionally with SG session
+    /// provenance stamped from the frame's source connection.
     ///
     /// Leaf (#380 C0): refuse GRAFT-equivalent / eager / IHAVE / IWANT /
     /// anti-entropy frames for topics this node does not subscribe to, so
     /// PlumTree never creates pass-through state or eager-forwards them.
     /// Full nodes keep today's `handle_message` behaviour.
-    pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
+    ///
+    /// Topic gates run on SG's public `inspect_message_header`, which
+    /// recognizes both legacy postcard frames and key-cache v3 frames —
+    /// v3 reaches the same inbound-by-topic counters, Leaf refusal, and
+    /// relay fan-out validator registration as legacy. The reserved SG
+    /// hop-local control topic stays internal to SG: x0x performs no topic
+    /// accounting, Leaf gating, or relay registration on it.
+    ///
+    /// Only a `Some(session)` whose peer matches the dequeued peer reaches
+    /// SG's authenticated dispatcher; legacy `None` frames use the ordinary
+    /// dispatcher.
+    pub async fn handle_incoming(
+        &self,
+        peer: PeerId,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+        data: Bytes,
+    ) {
         self.ensure_eager_ceiling().await;
-        // One header decode serves the inbound-by-topic counters (#674),
-        // the Leaf refuse gate, and the IWANT repair tracker — no crypto.
-        let header = peek_pubsub_header(&data);
-        if let Some(header) = &header {
+        // One structural header inspection serves the inbound-by-topic
+        // counters (#674), the Leaf refuse gate, and the IWANT repair
+        // tracker — no crypto.
+        let inspected = saorsa_gossip_pubsub::inspect_message_header(&data);
+        let ordinary_frame = inspected
+            .as_ref()
+            .filter(|header| !header.hop_local_control);
+        if let Some(header) = ordinary_frame {
             self.inbound_by_topic.record(header, data.len() as u64);
         }
-        if self.refuse_leaf_unsubscribed_passthrough(header.as_ref(), &data) {
+        if self.refuse_leaf_unsubscribed_passthrough(ordinary_frame, &data) {
             return;
         }
         // #674 C2/C3: first sight of a topic id on the inbound path
@@ -1805,19 +1828,33 @@ impl PubSubManager {
         // subscribe/unsubscribe) gets the lazy-forward verdict — sg creates
         // topic state from inbound frames directly. One read-locked set
         // lookup per frame; the write path runs once per topic.
-        if let Some(header) = &header {
+        if let Some(header) = ordinary_frame {
             self.relay_fanout
                 .ensure_registered(self.plumtree.as_ref(), header.topic);
         }
-        let _repair_scope = if header
-            .as_ref()
-            .is_some_and(|header| header.kind == MessageKind::IWant)
-        {
-            self.transport.track_iwant(peer, &data)
-        } else {
-            None
+        // Legacy-only diagnostics (#656): the postcard IWANT decode below
+        // does not understand v3 envelopes, so v3 repair traffic stays
+        // uncounted until SG exposes a bounded wire-inspection helper.
+        let _repair_scope =
+            if ordinary_frame.is_some_and(|header| header.kind == MessageKind::IWant) {
+                self.transport.track_iwant(peer, &data)
+            } else {
+                None
+            };
+        let dispatch_result = match session {
+            Some(session) if session.peer == peer => {
+                self.plumtree
+                    .handle_authenticated_message(session, data)
+                    .await
+            }
+            Some(mismatched) => Err(anyhow::anyhow!(
+                "session token peer {} does not match dequeued peer {}",
+                mismatched.peer,
+                peer
+            )),
+            None => self.plumtree.handle_message(peer, data).await,
         };
-        if let Err(e) = self.plumtree.handle_message(peer, data).await {
+        if let Err(e) = dispatch_result {
             tracing::warn!(
                 "Failed to handle PlumTree pubsub message from {}: {e}",
                 crate::logging::LogPeerId::from(peer)
@@ -1827,7 +1864,7 @@ impl PubSubManager {
 
     fn refuse_leaf_unsubscribed_passthrough(
         &self,
-        header: Option<&MessageHeader>,
+        header: Option<&saorsa_gossip_pubsub::InspectedMessageHeader>,
         data: &[u8],
     ) -> bool {
         let Some(header) = header else {
@@ -3411,7 +3448,7 @@ mod tests {
                 let payload = encode_v1(name, &Bytes::from(format!("remote-{writer}"))).unwrap();
                 let frame = slice1_signed_frame(MessageKind::Eager, topic, payload, inbound_msg_id);
                 let inbound_before = eager_outbound_attempt_msgs(&manager);
-                manager.handle_incoming(inbound_from, frame).await;
+                manager.handle_incoming(inbound_from, None, frame).await;
                 let inbound_attempted =
                     (eager_outbound_attempt_msgs(&manager) - inbound_before) as usize;
                 let sends =
@@ -3529,7 +3566,9 @@ mod tests {
         );
         // Real cached IWANT handler + spawned send task + outbound recorder.
         let repair_before = eager_outbound_attempt_msgs(&manager);
-        manager.handle_incoming(PeerId::new([7; 32]), request).await;
+        manager
+            .handle_incoming(PeerId::new([7; 32]), None, request)
+            .await;
         let repair_attempted = (eager_outbound_attempt_msgs(&manager) - repair_before) as usize;
         let repaired = await_eager_settled_for_msg(&manager, id, repair_attempted).await;
         assert_eq!(repaired.len(), 1);
@@ -3669,7 +3708,7 @@ mod tests {
                 inbound_msg_id,
             );
             let inbound_before = eager_outbound_attempt_msgs(&manager);
-            manager.handle_incoming(inbound_from, frame).await;
+            manager.handle_incoming(inbound_from, None, frame).await;
             let inbound_attempted =
                 (eager_outbound_attempt_msgs(&manager) - inbound_before) as usize;
             let sends =
@@ -3700,7 +3739,7 @@ mod tests {
                 [0; 32],
             );
             let repair_before = eager_outbound_attempt_msgs(&manager);
-            manager.handle_incoming(requester, request).await;
+            manager.handle_incoming(requester, None, request).await;
             let repair_attempted = (eager_outbound_attempt_msgs(&manager) - repair_before) as usize;
             let repair =
                 await_eager_settled_for_msg(&manager, inbound_msg_id, repair_attempted).await;
@@ -3784,7 +3823,7 @@ mod tests {
         tokio::join!(
             async {
                 for (peer, frame) in frames {
-                    manager.handle_incoming(peer, frame).await;
+                    manager.handle_incoming(peer, None, frame).await;
                 }
             },
             async {
@@ -3873,7 +3912,9 @@ mod tests {
             postcard::to_stdvec(&vec![id]).unwrap().into(),
             [0; 32],
         );
-        receiver.handle_incoming(PeerId::new([3; 32]), ihave).await;
+        receiver
+            .handle_incoming(PeerId::new([3; 32]), None, ihave)
+            .await;
         let sends = std::mem::take(
             &mut receiver
                 .transport
@@ -3893,7 +3934,9 @@ mod tests {
             .expect("real IHAVE handler emits IWANT")
             .1;
         let repair_before = eager_outbound_attempt_msgs(&owner);
-        owner.handle_incoming(PeerId::new([4; 32]), request).await;
+        owner
+            .handle_incoming(PeerId::new([4; 32]), None, request)
+            .await;
         let repair_attempted = (eager_outbound_attempt_msgs(&owner) - repair_before) as usize;
         let repair = await_eager_settled_for_msg(&owner, id, repair_attempted).await;
         assert_eq!(repair.len(), 1);
@@ -3902,6 +3945,7 @@ mod tests {
         receiver
             .handle_incoming(
                 PeerId::new([3; 32]),
+                None,
                 postcard::to_stdvec(&repair[0].1).unwrap().into(),
             )
             .await;
@@ -5051,19 +5095,28 @@ mod tests {
     }
 
     fn passthrough_frame(kind: MessageKind, topic: TopicId) -> Bytes {
+        // SG's structural `inspect_message_header` enforces exact ML-DSA
+        // signature (3309) and public key (1952) sizes before a frame is
+        // routable through x0x's topic gates, so the fixture signs with a
+        // real key instead of empty vectors.
+        let key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("gate fixture key");
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind,
+            hop: 0,
+            ttl: 10,
+            payload_hash: None,
+        };
+        let signature = key
+            .sign(&postcard::to_stdvec(&header).expect("header serializes"))
+            .expect("gate fixture signature");
         let msg = saorsa_gossip_pubsub::GossipMessage {
-            header: MessageHeader {
-                version: 1,
-                topic,
-                msg_id: [0u8; 32],
-                kind,
-                hop: 0,
-                ttl: 10,
-                payload_hash: None,
-            },
+            header,
             payload: None,
-            signature: Vec::new(),
-            public_key: Vec::new(),
+            signature,
+            public_key: key.public_key().to_vec(),
         };
         postcard::to_stdvec(&msg)
             .expect("passthrough frame serializes")
@@ -5091,7 +5144,7 @@ mod tests {
 
         for kind in [MessageKind::Eager, MessageKind::IHave, MessageKind::IWant] {
             manager
-                .handle_incoming(peer, passthrough_frame(kind, passthrough_id))
+                .handle_incoming(peer, None, passthrough_frame(kind, passthrough_id))
                 .await;
         }
 
@@ -5130,7 +5183,11 @@ mod tests {
         let subscribed_id = TopicId::from_entity(subscribed.as_bytes());
 
         manager
-            .handle_incoming(peer, passthrough_frame(MessageKind::Eager, subscribed_id))
+            .handle_incoming(
+                peer,
+                None,
+                passthrough_frame(MessageKind::Eager, subscribed_id),
+            )
             .await;
 
         let snap = manager.participation_snapshot();
@@ -5162,7 +5219,11 @@ mod tests {
         let passthrough_id = TopicId::from_entity(passthrough.as_bytes());
 
         manager
-            .handle_incoming(peer, passthrough_frame(MessageKind::Eager, passthrough_id))
+            .handle_incoming(
+                peer,
+                None,
+                passthrough_frame(MessageKind::Eager, passthrough_id),
+            )
             .await;
 
         let snap = manager.participation_snapshot();
@@ -5276,7 +5337,7 @@ mod tests {
             loop {
                 let sends = drain_sends(&publisher);
                 for (_peer, bytes) in sends {
-                    relay.handle_incoming(pub_peer, bytes).await;
+                    relay.handle_incoming(pub_peer, None, bytes).await;
                     ferried += 1;
                 }
                 if ferried > i {
@@ -5316,16 +5377,16 @@ mod tests {
 
         // --- The delivery guarantee: IHAVE → IWANT → serve → subscriber. ---
         for (_peer, bytes) in relay_frames {
-            subscriber.handle_incoming(relay_peer, bytes).await;
+            subscriber.handle_incoming(relay_peer, None, bytes).await;
         }
         let mut received: StdHashSet<String> = StdHashSet::new();
         let pull_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while received.len() < N as usize && tokio::time::Instant::now() < pull_deadline {
             for (_peer, bytes) in drain_sends(&subscriber) {
-                relay.handle_incoming(sub_peer, bytes).await;
+                relay.handle_incoming(sub_peer, None, bytes).await;
             }
             for (_peer, bytes) in drain_sends(&relay) {
-                subscriber.handle_incoming(relay_peer, bytes).await;
+                subscriber.handle_incoming(relay_peer, None, bytes).await;
             }
             while let Ok(Some(message)) =
                 tokio::time::timeout(Duration::from_millis(20), sub.recv()).await
@@ -5402,7 +5463,7 @@ mod tests {
             } else {
                 continue;
             }
-            a.handle_incoming(peer, Bytes::from(frame)).await;
+            a.handle_incoming(peer, None, Bytes::from(frame)).await;
         }
 
         let snapshot = serde_json::to_value(a.inbound_by_topic_snapshot()).unwrap();
@@ -5436,7 +5497,7 @@ mod tests {
         let peer = PeerId::new([1; 32]);
         // Should not panic on invalid data
         manager
-            .handle_incoming(peer, Bytes::from(&[0x12][..]))
+            .handle_incoming(peer, None, Bytes::from(&[0x12][..]))
             .await;
     }
 
@@ -5866,7 +5927,9 @@ mod tests {
         let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, false);
         assert_eq!(manager.outer_v1_receipts(), 0);
 
-        manager.handle_incoming(PeerId::new([9; 32]), frame).await;
+        manager
+            .handle_incoming(PeerId::new([9; 32]), None, frame)
+            .await;
 
         assert_eq!(
             manager.outer_v1_receipts(),
@@ -5894,7 +5957,9 @@ mod tests {
         let inner = encode_v1(topic, &Bytes::from("v2-payload")).expect("inner");
         let good = signed_outer_frame(&signing_key, topic_id, inner.clone(), true);
 
-        manager.handle_incoming(PeerId::new([3; 32]), good).await;
+        manager
+            .handle_incoming(PeerId::new([3; 32]), None, good)
+            .await;
 
         let delivered = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv())
             .await
@@ -5932,7 +5997,7 @@ mod tests {
             .expect("serialize tampered")
             .into();
         manager
-            .handle_incoming(PeerId::new([4; 32]), tampered_bytes)
+            .handle_incoming(PeerId::new([4; 32]), None, tampered_bytes)
             .await;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv())
@@ -5994,7 +6059,9 @@ mod tests {
             let mut sub = manager.subscribe(topic.clone()).await;
             let inner = encode_v1(&topic, &Bytes::from("still-v1")).expect("inner");
             let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, false);
-            manager.handle_incoming(PeerId::new([5; 32]), frame).await;
+            manager
+                .handle_incoming(PeerId::new([5; 32]), None, frame)
+                .await;
             assert_eq!(manager.outer_v1_receipts(), 1);
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv())
@@ -6168,5 +6235,202 @@ mod closed_input_tests {
         assert_eq!(recv_from_either(&mut first, &mut second).await, Some(31));
         second_tx.try_send(47).expect("second still live");
         assert_eq!(recv_from_either(&mut first, &mut second).await, Some(47));
+    }
+}
+
+/// SG76: marker-aware inbound routing gates, proven without sockets.
+///
+/// x0x's pre-dispatch gates (inbound-by-topic counters, Leaf unsubscribed
+/// refusal, relay fan-out registration) consume SG's public
+/// `inspect_message_header`, which recognizes both legacy postcard frames
+/// and key-cache v3 frames. These tests prove legacy and v3 forms of the
+/// same logical message route identically, and that the reserved SG
+/// hop-local control topic is excluded from x0x's gates.
+///
+/// SG publishes no v3 frame encoder, so the fixtures mirror SG's private
+/// v3 wire shape (`marker || postcard { header, payload, signature, key }`)
+/// with serde-derived stand-in types. If SG changes that private format,
+/// `inspect_message_header` returns `None` here and these tests fail
+/// loudly — the intended drift signal. Production code never sees the
+/// marker bytes.
+#[cfg(test)]
+mod sg76_marker_gate_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::leaf_refuses_unsubscribed_passthrough;
+    use super::ParticipationMode;
+    use bytes::Bytes;
+    use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
+    use serde::Serialize;
+
+    /// SG key-cache v3 wire marker (private in SG; test fixture only).
+    const V3_MARKER: &[u8; 6] = b"\xffSGKC\x03";
+    /// SG key-cache reserved hop-local control topic domain (private in
+    /// SG; test fixture only).
+    const CONTROL_DOMAIN: &str = "saorsa-gossip/key-cache-control/v1";
+
+    /// Mirror of SG's private `key_cache::WireMessage` wire shape.
+    #[derive(Serialize)]
+    struct MirrorWireMessage {
+        header: MessageHeader,
+        payload: Option<Bytes>,
+        signature: Vec<u8>,
+        key: MirrorKeyMaterial,
+    }
+
+    /// Mirror of SG's private `key_cache::KeyMaterial` (variant order is
+    /// wire-significant: `Full` is variant 0).
+    #[derive(Serialize)]
+    enum MirrorKeyMaterial {
+        Full {
+            key_id: PeerId,
+            public_key: Vec<u8>,
+        },
+        #[allow(dead_code)]
+        Ref {
+            key_id: PeerId,
+        },
+    }
+
+    fn signed_header_parts(kind: MessageKind, topic: TopicId) -> (MessageHeader, Vec<u8>, Vec<u8>) {
+        let key = saorsa_gossip_identity::MlDsaKeyPair::generate().unwrap();
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind,
+            hop: 0,
+            ttl: 10,
+            payload_hash: None,
+        };
+        let signature = key.sign(&postcard::to_stdvec(&header).unwrap()).unwrap();
+        (header, signature, key.public_key().to_vec())
+    }
+
+    fn legacy_frame(kind: MessageKind, topic: TopicId) -> Bytes {
+        let (header, signature, public_key) = signed_header_parts(kind, topic);
+        let msg = saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: None,
+            signature,
+            public_key,
+        };
+        postcard::to_stdvec(&msg).unwrap().into()
+    }
+
+    fn v3_frame(kind: MessageKind, topic: TopicId) -> Bytes {
+        let (header, signature, public_key) = signed_header_parts(kind, topic);
+        let key_id = PeerId::from_pubkey(&public_key);
+        let wire = MirrorWireMessage {
+            header,
+            payload: Some(Bytes::from_static(b"p")),
+            signature,
+            key: MirrorKeyMaterial::Full { key_id, public_key },
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(V3_MARKER);
+        bytes.extend_from_slice(&postcard::to_stdvec(&wire).unwrap());
+        bytes.into()
+    }
+
+    #[test]
+    fn legacy_and_v3_reach_the_same_topic_gates() {
+        let topic = TopicId::from_entity(b"sg76.gate-equivalence");
+        for kind in [
+            MessageKind::Eager,
+            MessageKind::IHave,
+            MessageKind::IWant,
+            MessageKind::AntiEntropy,
+        ] {
+            let legacy = saorsa_gossip_pubsub::inspect_message_header(&legacy_frame(kind, topic))
+                .unwrap_or_else(|| panic!("legacy {kind:?} must be inspectable"));
+            let v3 = saorsa_gossip_pubsub::inspect_message_header(&v3_frame(kind, topic))
+                .unwrap_or_else(|| panic!("v3 {kind:?} must be inspectable"));
+            assert_eq!(legacy.topic, v3.topic);
+            assert_eq!(legacy.topic, topic);
+            assert_eq!(legacy.kind, v3.kind);
+            assert_eq!(legacy.kind, kind);
+            assert!(!legacy.hop_local_control);
+            assert!(!v3.hop_local_control);
+
+            // The Leaf refuse gate (#380 C0) keys off (subscribed, kind)
+            // only, so both wire forms must share its verdict: refused
+            // when unsubscribed, admitted when subscribed.
+            assert_eq!(
+                leaf_refuses_unsubscribed_passthrough(ParticipationMode::Leaf, false, legacy.kind),
+                leaf_refuses_unsubscribed_passthrough(ParticipationMode::Leaf, false, v3.kind),
+            );
+            assert!(leaf_refuses_unsubscribed_passthrough(
+                ParticipationMode::Leaf,
+                false,
+                v3.kind
+            ));
+            assert!(!leaf_refuses_unsubscribed_passthrough(
+                ParticipationMode::Leaf,
+                true,
+                v3.kind
+            ));
+        }
+    }
+
+    #[test]
+    fn hop_local_control_topic_is_flagged_and_excluded_from_gates() {
+        let control = TopicId::from_entity(CONTROL_DOMAIN.as_bytes());
+        // v3 control frame on the reserved topic.
+        let v3 =
+            saorsa_gossip_pubsub::inspect_message_header(&v3_frame(MessageKind::Ping, control))
+                .expect("v3 control frame must be inspectable");
+        assert!(v3.hop_local_control);
+        assert_eq!(v3.topic, control);
+
+        // Legacy control shape (Ping on the reserved topic) is equally
+        // flagged — a legacy sender cannot smuggle the control topic past
+        // the exclusion by dropping the marker.
+        let legacy =
+            saorsa_gossip_pubsub::inspect_message_header(&legacy_frame(MessageKind::Ping, control))
+                .expect("legacy control frame must be inspectable");
+        assert!(legacy.hop_local_control);
+
+        // Non-control topics on both wire forms never set the flag.
+        let ordinary = TopicId::from_entity(b"sg76.ordinary");
+        for frame in [
+            legacy_frame(MessageKind::Eager, ordinary),
+            v3_frame(MessageKind::Eager, ordinary),
+        ] {
+            let inspected =
+                saorsa_gossip_pubsub::inspect_message_header(&frame).expect("inspectable");
+            assert!(!inspected.hop_local_control);
+        }
+    }
+
+    #[test]
+    fn structurally_invalid_frames_are_not_gate_routable() {
+        // SG's inspect enforces exact ML-DSA signature/key sizes and exact
+        // v3 framing; malformed or truncated frames yield `None` and x0x's
+        // topic gates skip them (SG's verified dispatcher still rejects
+        // the bytes). This is the tightened contract versus the old
+        // bare-postcard header peek.
+        let topic = TopicId::from_entity(b"sg76.malformed");
+        let unsigned = saorsa_gossip_pubsub::GossipMessage {
+            header: MessageHeader {
+                version: 1,
+                topic,
+                msg_id: [0u8; 32],
+                kind: MessageKind::Eager,
+                hop: 0,
+                ttl: 10,
+                payload_hash: None,
+            },
+            payload: None,
+            signature: Vec::new(),
+            public_key: Vec::new(),
+        };
+        let bytes = postcard::to_stdvec(&unsigned).unwrap();
+        assert_eq!(saorsa_gossip_pubsub::inspect_message_header(&bytes), None);
+
+        // Truncated v3 marker alone is also not routable.
+        assert_eq!(
+            saorsa_gossip_pubsub::inspect_message_header(V3_MARKER),
+            None
+        );
     }
 }

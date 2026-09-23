@@ -147,7 +147,7 @@ dependencies = [
 [[package]]
 name = "ant-quic"
 version = "0.27.53"
-source = "git+https://github.com/saorsa-labs/ant-quic.git?rev=ca71457b822ba0cd074da4beddda64de8df27962#ca71457b822ba0cd074da4beddda64de8df27962"
+source = "git+https://github.com/saorsa-labs/ant-quic.git?rev=8cb8098181a846b9719260e842df3f679306b705#8cb8098181a846b9719260e842df3f679306b705"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1385,7 +1385,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2247,7 +2247,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2661,7 +2661,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3044,7 +3044,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3379,7 +3379,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3447,7 +3447,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3524,7 +3524,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-coordinator"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "ant-quic",
  "anyhow",
@@ -3547,7 +3547,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-crdt-sync"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3562,7 +3562,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-groups"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3575,7 +3575,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-identity"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3590,7 +3590,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-membership"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3608,7 +3608,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-presence"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3630,7 +3630,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-pubsub"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3653,7 +3653,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-rendezvous"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3669,7 +3669,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-runtime"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3695,7 +3695,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-transport"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "ant-quic",
  "anyhow",
@@ -3717,7 +3717,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-types"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3734,7 +3734,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=62eef65f166374d96b33f702a1241fecc6499458#62eef65f166374d96b33f702a1241fecc6499458"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9"
 dependencies = [
  "bytes",
  "cc",
@@ -4316,7 +4316,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4342,7 +4342,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5086,7 +5086,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
