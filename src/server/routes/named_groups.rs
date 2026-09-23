@@ -6,6 +6,11 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
+mod control_blob;
+pub(in crate::server) use control_blob::{
+    handle_control_blob_message, ControlBlobMessage, ControlBlobState,
+};
+
 use super::super::state::AppState;
 use super::super::{
     api_error, api_error_with_reason, bad_request, forbidden, not_found, parse_agent_id_hex,
@@ -919,6 +924,10 @@ pub(in crate::server) enum JoinResultMessage {
         /// legacy decoders.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         accepts_refusal: bool,
+        /// A new joiner can pull an oversized exact-byte Result. Legacy
+        /// peers omit this flag and continue receiving only inline Results.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accepts_control_blob_ref: bool,
         /// #477 W1: the joiner's pending-attempt id (blake3 over the
         /// canonical `MemberJoined` bytes || raw signature). Binds a served
         /// refusal to exactly the attempt that asked.
@@ -2663,12 +2672,29 @@ fn named_group_event_delivery_future(
         }
     };
     let agent = Arc::clone(&state.agent);
+    let control_blobs = state.control_blobs.clone();
+    let group_id = named_group_metadata_event_group_id(event).to_string();
     let requester = recipient_hex.to_string();
     Some(async move {
-        if let Err(e) = agent
-            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+        let result = if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+            control_blob::send_reference(
+                &control_blobs,
+                &agent,
+                &recipient,
+                control_blob::ControlBlobKind::NamedGroupEvent,
+                &group_id,
+                None,
+                payload,
+            )
             .await
-        {
+        } else {
+            agent
+                .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        if let Err(e) = result {
             tracing::warn!(
                 requester = %LogHexId::agent(&requester),
                 "failed to {label}-direct-deliver named-group event: {e}"
@@ -8795,6 +8821,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             None,
             &mut replay_group_id,
             &mut iteration_cleared,
+            None,
             true, // lock_already_held
             true, // roster_lock_already_held
         ))
@@ -9327,6 +9354,25 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     verified: bool,
     envelope_bytes: Option<&[u8]>,
 ) -> ApplyMetadataResult {
+    apply_named_group_metadata_event_with_binding(
+        state,
+        event,
+        sender,
+        verified,
+        envelope_bytes,
+        None,
+    )
+    .await
+}
+
+async fn apply_named_group_metadata_event_with_binding(
+    state: &Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+    envelope_bytes: Option<&[u8]>,
+    bound_join_attempt: Option<&str>,
+) -> ApplyMetadataResult {
     // A non-inviter may retain the first fully member-authenticated join event
     // as provisional evidence, but it cannot replace an existing entry. The
     // inviter's post-acceptance countersigned event (distributed in MemberAdded)
@@ -9353,6 +9399,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
         None,
         &mut replay_group_id,
         &mut cleared_quarantine,
+        bound_join_attempt,
         false,
         false,
     ))
@@ -9389,6 +9436,7 @@ async fn apply_named_group_metadata_event_inner(
         None,
         &mut replay_group_id,
         &mut cleared_quarantine,
+        None,
         false,
         false,
     ))
@@ -9440,6 +9488,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     predecessor_first_seen_ms: Option<u64>,
     replay_group_id: &mut Option<String>,
     cleared_quarantine: &mut std::collections::BTreeSet<String>,
+    bound_join_attempt: Option<&str>,
     lock_already_held: bool,
     roster_lock_already_held: bool,
 ) -> ApplyMetadataResult {
@@ -9576,6 +9625,23 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     } else {
         None
     };
+    // An oversized pulled JoinResult is bound to the specific attempt that
+    // requested it. Check under the SAME membership lock as finalization and
+    // keep that guard through apply, so a later attempt cannot inherit a
+    // delayed predecessor's signed response.
+    if let Some(attempt_id) = bound_join_attempt {
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let key = join_result_key(&group_id, &local_hex);
+        let current = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .is_some_and(|entry| entry.attempt_id == attempt_id);
+        if !current {
+            return ApplyMetadataResult::REJECTED;
+        }
+    }
     // Causal replay already holds the global roster lock and confirms through
     // the unlocked helper immediately before entering this function.
     if !roster_lock_already_held && !confirm_named_groups_durability(state).await {
@@ -18327,6 +18393,7 @@ async fn wipe_local_group_crypto_material(
             acks.remove(&welcome_id);
         }
     }
+    state.control_blobs.prune_groups(&aliases);
 
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
@@ -31784,6 +31851,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             }
         }
     };
+    state
+        .control_blobs
+        .cancel_attempt(event_group_id, member_agent_id, attempt_id);
     clear_expected_join_result_inviter(state, &expected_key);
     // #477 (r7 item 3): abort every owned poll/task EXCEPT the finalizer's
     // own task — the timeout owner IS a registered poll whose handle sits
@@ -32218,6 +32288,19 @@ pub(in crate::server) async fn handle_join_result_message(
     verified: bool,
     msg: JoinResultMessage,
 ) {
+    handle_join_result_message_bound(state, sender, verified, msg, None).await;
+}
+
+async fn handle_join_result_message_bound(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    msg: JoinResultMessage,
+    bound_join_attempt: Option<&str>,
+) {
+    if bound_join_attempt.is_some() && !matches!(&msg, JoinResultMessage::Result { .. }) {
+        return;
+    }
     match msg {
         JoinResultMessage::FetchRequest {
             group_id,
@@ -32225,6 +32308,7 @@ pub(in crate::server) async fn handle_join_result_message(
             from_revision,
             base_state_hash: _base_state_hash,
             accepts_refusal,
+            accepts_control_blob_ref,
             attempt_id,
         } => {
             let sender_hex = hex::encode(sender.as_bytes());
@@ -32320,6 +32404,10 @@ pub(in crate::server) async fn handle_join_result_message(
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
             };
+            // The linearized result/refusal choice is complete. Network
+            // transfer may take the full pull window and must not hold the
+            // per-group membership lock needed by the join apply path.
+            drop(selection_guard);
             tracing::debug!(
                 target: "treekem.trace",
                 stage = "fetch_request_lookup_hit",
@@ -32391,6 +32479,31 @@ pub(in crate::server) async fn handle_join_result_message(
                 payload_len,
                 payload_hash = %payload_hash,
             );
+            if payload_len > x0x::dm::MAX_PAYLOAD_BYTES {
+                if !verified || !accepts_control_blob_ref || attempt_id.is_none() {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&group_id),
+                        member = %LogHexId::agent(&member_agent_id),
+                        payload_len,
+                        "oversized join-result needs a verified ref-capable fetch"
+                    );
+                    return;
+                }
+                if let Err(e) = control_blob::send_reference(
+                    &state.control_blobs,
+                    &state.agent,
+                    sender,
+                    control_blob::ControlBlobKind::JoinResult,
+                    &group_id,
+                    attempt_id.as_deref(),
+                    payload,
+                )
+                .await
+                {
+                    tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to send join-result reference: {e}");
+                }
+                return;
+            }
             if let Err(e) = state
                 .agent
                 .send_direct_with_config(sender, payload, direct_message_send_config())
@@ -32475,6 +32588,48 @@ pub(in crate::server) async fn handle_join_result_message(
                 );
                 return;
             }
+            // Serialize the whole context lifecycle for this joiner: a
+            // detached control-blob fetch task can deliver a stale bound
+            // result while a current one is mid-apply; without this guard
+            // the stale task's unconditional removal could strip the
+            // current apply's chain/attestation context. The mutex is
+            // keyed by the same join_result_key as the context maps and is
+            // always taken BEFORE the membership lock apply acquires (no
+            // inversion: nothing acquires it while holding the membership
+            // lock).
+            let processing_lock = {
+                let mut guards = state
+                    .pending_join_result_processing
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::sync::Arc::clone(
+                    guards
+                        .entry(expected_key.clone())
+                        .or_insert_with(|| std::sync::Arc::new(Mutex::new(()))),
+                )
+            };
+            let _result_processing = processing_lock.lock().await;
+            // Cheap bound-currency pre-check so an obviously stale bound
+            // response returns before touching any shared context. The
+            // authoritative check remains inside apply, under the
+            // membership lock.
+            if let Some(bound) = bound_join_attempt {
+                let attempt_current = state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&expected_key)
+                    .is_some_and(|attempt| attempt.attempt_id == bound);
+                if !attempt_current {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&group_id),
+                        member = %LogHexId::agent(&member_agent_id),
+                        bound,
+                        "stale bound join-result rejected before context insertion"
+                    );
+                    return;
+                }
+            }
             // #458 r3/r5: expose the carried chain AND head attestation
             // to the joiner's adoption path for exactly this apply.
             {
@@ -32493,9 +32648,16 @@ pub(in crate::server) async fn handle_join_result_message(
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(expected_key.clone(), attestation.clone());
             }
-            let applied = apply_named_group_metadata_event(state, event, *sender, true, None)
-                .await
-                .accepted;
+            let applied = apply_named_group_metadata_event_with_binding(
+                state,
+                event,
+                *sender,
+                true,
+                None,
+                bound_join_attempt,
+            )
+            .await
+            .accepted;
             state
                 .pending_adoption_chains
                 .lock()
@@ -32834,6 +32996,7 @@ async fn poll_join_result_until_membership_confirmed(
             // fetch to this attempt so a stale staged refusal is not
             // served.
             accepts_refusal: true,
+            accepts_control_blob_ref: true,
             attempt_id: Some(attempt_id.clone()),
         };
         let payload = match serde_json::to_vec(&request) {
@@ -33529,6 +33692,7 @@ pub(in crate::server) mod tests {
     mod adr0068_task_buffer;
     mod cache_hardening_followup;
     mod fork_quarantine;
+    mod home_control_payload_size;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod issue492_queue_admission;
@@ -34259,10 +34423,12 @@ pub(in crate::server) mod tests {
             pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
             pending_adoption_chains: StdMutex::new(HashMap::new()),
             pending_head_attestations: StdMutex::new(HashMap::new()),
+            pending_join_result_processing: StdMutex::new(HashMap::new()),
             pending_welcomes: RwLock::new(HashMap::new()),
             pending_welcome_receives: RwLock::new(HashMap::new()),
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
+            control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
@@ -34516,6 +34682,7 @@ pub(in crate::server) mod tests {
                 from_revision: None,
                 base_state_hash: None,
                 accepts_refusal: true,
+                accepts_control_blob_ref: false,
                 attempt_id: Some("a1".into()),
             };
             let bytes = serde_json::to_vec(&capable).expect("serialize");
@@ -34529,14 +34696,34 @@ pub(in crate::server) mod tests {
                 from_revision: None,
                 base_state_hash: None,
                 accepts_refusal: false,
+                accepts_control_blob_ref: false,
                 attempt_id: None,
             };
             let legacy_bytes = serde_json::to_vec(&incapable).expect("serialize");
             assert!(
                 !String::from_utf8_lossy(&legacy_bytes).contains("accepts_refusal")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("accepts_control_blob_ref")
                     && !String::from_utf8_lossy(&legacy_bytes).contains("attempt_id"),
                 "skip_serializing_if keeps false/None fields absent (legacy shape)"
             );
+            let ref_capable = JoinResultMessage::FetchRequest {
+                group_id: "g".into(),
+                member_agent_id: "m".into(),
+                from_revision: None,
+                base_state_hash: None,
+                accepts_refusal: true,
+                accepts_control_blob_ref: true,
+                attempt_id: Some("a1".into()),
+            };
+            let ref_bytes = serde_json::to_vec(&ref_capable).expect("ref-capable serializes");
+            assert!(String::from_utf8_lossy(&ref_bytes).contains("accepts_control_blob_ref"));
+            assert!(matches!(
+                serde_json::from_slice::<JoinResultMessage>(&ref_bytes),
+                Ok(JoinResultMessage::FetchRequest {
+                    accepts_control_blob_ref: true,
+                    ..
+                })
+            ));
             let back: JoinResultMessage = serde_json::from_slice(&bytes).expect("round-trip");
             match back {
                 JoinResultMessage::FetchRequest {
@@ -35485,6 +35672,7 @@ pub(in crate::server) mod tests {
                     from_revision: None,
                     base_state_hash: None,
                     accepts_refusal: true,
+                    accepts_control_blob_ref: false,
                     attempt_id: Some(attempt_b.clone()),
                 },
             )
@@ -35765,6 +35953,7 @@ pub(in crate::server) mod tests {
                         from_revision: None,
                         base_state_hash: None,
                         accepts_refusal: true,
+                        accepts_control_blob_ref: false,
                         attempt_id: Some(staged_attempt_id),
                     },
                 )
@@ -35883,6 +36072,7 @@ pub(in crate::server) mod tests {
                         from_revision: None,
                         base_state_hash: None,
                         accepts_refusal: true,
+                        accepts_control_blob_ref: false,
                         attempt_id: None,
                     },
                 )
@@ -36195,6 +36385,7 @@ pub(in crate::server) mod tests {
                     from_revision: None,
                     base_state_hash: None,
                     accepts_refusal: accepts,
+                    accepts_control_blob_ref: false,
                     attempt_id: attempt,
                 }
             };
@@ -44395,8 +44586,9 @@ pub(in crate::server) mod tests {
             member_agent_id: "bb".repeat(32),
             from_revision: Some(3),
             base_state_hash: None,
-            // #477: the legacy shape — both new fields absent.
+            // #477: the legacy shape — optional capability fields absent.
             accepts_refusal: false,
+            accepts_control_blob_ref: false,
             attempt_id: None,
         };
         let payload = serde_json::to_vec(&request);
