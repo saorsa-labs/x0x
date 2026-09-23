@@ -1529,6 +1529,16 @@ fn validate_topology_capture(
 // These cuts include background/local/relayed activity. Only load_returns
 // attributes counts to controlled calls. publish_total deltas do not validate
 // vector length or controlled origin; no cut is an acceptance predicate.
+//
+// Producer semantics pinned by `reviewed_pubsub_producer` below: the meter
+// records exactly the four application kinds (eager/ihave/iwant/
+// anti_entropy) per topic, with `bytes` being the measured wire bytes for
+// each claimed peer — the SG93 producer (git 7e395117) records the actual
+// Full/Ref/legacy frame length per peer instead of one shared legacy
+// serialized length, so `msgs` stays one attempt per peer and `bytes`
+// becomes exact for mixed fan-out (reviewed meter comparison, luna
+// 2026-09-23). Hop-local key-cache control bytes ride a separate reserved
+// topic and never enter these four fields.
 fn generator_topic_projection(
     rows: &std::collections::BTreeMap<String, saorsa_gossip_pubsub::OutboundTopicMeterSnapshot>,
     zero_fanout: &std::collections::BTreeMap<String, u64>,
@@ -2033,6 +2043,66 @@ fn prepare_measurement() -> MeasurementPreparation {
     }
 }
 
+fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
+    const REGISTRY_PUBSUB_VERSION: &str = "0.5.84";
+    const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    const REGISTRY_PUBSUB_SHA: &str =
+        "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3";
+    const GIT_PUBSUB_VERSION: &str = "0.5.85";
+    // SG93 candidate producer 7e395117 (reviewed meter comparison, luna
+    // 2026-09-23): the exact git source graph this measurement accepts.
+    // No checksum: git lock entries carry none.
+    const GIT_PUBSUB_SOURCE: &str = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9";
+    let version = package.get("version").and_then(toml::Value::as_str);
+    let source = package.get("source").and_then(toml::Value::as_str);
+    let registry = version == Some(REGISTRY_PUBSUB_VERSION)
+        && source == Some(REGISTRY_PUBSUB_SOURCE)
+        && package.get("checksum").and_then(toml::Value::as_str) == Some(REGISTRY_PUBSUB_SHA);
+    let git = version == Some(GIT_PUBSUB_VERSION)
+        && source == Some(GIT_PUBSUB_SOURCE)
+        && package.get("checksum").is_none();
+    registry || git
+}
+
+#[test]
+fn controlled_load_producer_allowlist_is_exact() {
+    let registry: toml::Value = toml::from_str(
+        "version = '0.5.84'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3'",
+    )
+    .expect("registry fixture");
+    let git: toml::Value = toml::from_str(
+        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9'",
+    )
+    .expect("git fixture");
+    assert!(reviewed_pubsub_producer(&registry));
+    assert!(reviewed_pubsub_producer(&git));
+    let mut wrong_registry = registry.clone();
+    wrong_registry["source"] = toml::Value::String("registry+https://example.invalid".into());
+    assert!(!reviewed_pubsub_producer(&wrong_registry));
+    // Exactly one component wrong versus the accepted git source: the
+    // revision query parameter.
+    let mut wrong_revision = git.clone();
+    wrong_revision["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=0000000000000000000000000000000000000000#7e395117359d3ba19e7190f32c421befa36cc3e9".into());
+    assert!(!reviewed_pubsub_producer(&wrong_revision));
+    // Exactly one component wrong versus the accepted git source: the URL
+    // (a lookalike repository must not satisfy the premise).
+    let mut wrong_url = git.clone();
+    wrong_url["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip-mirror.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9".into());
+    assert!(!reviewed_pubsub_producer(&wrong_url));
+    let mut spurious_checksum = git.clone();
+    spurious_checksum
+        .as_table_mut()
+        .expect("table fixture")
+        .insert("checksum".into(), toml::Value::String("0".repeat(64)));
+    assert!(!reviewed_pubsub_producer(&spurious_checksum));
+    let mut missing_source = git;
+    missing_source
+        .as_table_mut()
+        .expect("table fixture")
+        .remove("source");
+    assert!(!reviewed_pubsub_producer(&missing_source));
+}
+
 async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde_json::Value {
     use serde_json::json;
     let clock = std::time::Instant::now();
@@ -2052,11 +2122,8 @@ async fn measure(agents: &[Agent], preparation: MeasurementPreparation) -> serde
         .iter()
         .filter(|p| p["name"].as_str() == Some("saorsa-gossip-pubsub"))
         .collect::<Vec<_>>();
-    if pinned.len() != 1
-        || pinned[0]["version"].as_str() != Some("0.5.84")
-        || pinned[0]["checksum"].as_str()
-            != Some("ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3")
-    {
+    let reviewed_producer = pinned.len() == 1 && reviewed_pubsub_producer(pinned[0]);
+    if !reviewed_producer {
         raw["outcome"] = json!("INCONCLUSIVE");
         raw["reason"] = json!("published meter producer pin unavailable");
         emit_measurement(&raw);
