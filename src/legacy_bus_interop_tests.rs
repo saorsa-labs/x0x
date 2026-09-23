@@ -2085,10 +2085,16 @@ fn prepare_measurement() -> MeasurementPreparation {
 }
 
 fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
-    const REGISTRY_PUBSUB_VERSION: &str = "0.5.84";
+    // crates.io 0.5.85 (SG tag v0.5.85, 968308c2). Its outbound meters,
+    // wire_bytes_for_peer and key_cache CONTROL_DOMAIN are byte-identical to
+    // git 9258cee9; it differs only on inbound paths (unsolicited key-cache
+    // Response entries are dropped; priority-skewed Ref frames resolve
+    // instead of erroring), which a homogeneous controlled-load run never
+    // exercises.
+    const REGISTRY_PUBSUB_VERSION: &str = "0.5.85";
     const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const REGISTRY_PUBSUB_SHA: &str =
-        "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3";
+        "2fa074fd1df627f8da147cd31d008cc56c9b2548d4ce4cdfee7fc7cf332d8d22";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
     // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
@@ -2112,7 +2118,7 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
 #[test]
 fn controlled_load_producer_allowlist_is_exact() {
     let registry: toml::Value = toml::from_str(
-        "version = '0.5.84'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3'",
+        "version = '0.5.85'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '2fa074fd1df627f8da147cd31d008cc56c9b2548d4ce4cdfee7fc7cf332d8d22'",
     )
     .expect("registry fixture");
     let git_accounting: toml::Value = toml::from_str(
@@ -2131,6 +2137,13 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("stale current git fixture");
     assert!(!reviewed_pubsub_producer(&stale_current));
+    // The superseded 0.5.84 registry package is no longer the reviewed
+    // producer: moving the premise must not leave the old graph accepted.
+    let stale_registry: toml::Value = toml::from_str(
+        "version = '0.5.84'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3'",
+    )
+    .expect("stale registry fixture");
+    assert!(!reviewed_pubsub_producer(&stale_registry));
     let mut wrong_registry = registry.clone();
     wrong_registry["source"] = toml::Value::String("registry+https://example.invalid".into());
     assert!(!reviewed_pubsub_producer(&wrong_registry));

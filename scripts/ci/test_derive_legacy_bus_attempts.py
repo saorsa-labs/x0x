@@ -13,7 +13,9 @@ spec.loader.exec_module(module)
 LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.REGISTRY_PUBSUB_VERSION
         + '"\nsource="' + module.REGISTRY_PUBSUB_SOURCE + '"\nchecksum="' + module.REGISTRY_PUBSUB_SHA + '"\n').encode()
 GIT_LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.GIT_PUBSUB_VERSION
-            + '"\nsource="' + module.GIT_PUBSUB_SOURCE + '"\n').encode()
+            + '"\nsource="' + module.GIT_PUBSUB_SOURCE_CURRENT + '"\n').encode()
+GIT_LOCK_ACCOUNTING = GIT_LOCK.replace(module.GIT_PUBSUB_REV_CURRENT.encode(),
+                                       module.GIT_PUBSUB_REV_ACCOUNTING.encode())
 
 
 def fixture():
@@ -86,19 +88,25 @@ class DerivationControls(unittest.TestCase):
         workspace = Path(__file__).resolve().parents[2]
         cargo = (workspace / "Cargo.toml").read_bytes()
         rust = (workspace / "src/legacy_bus_interop_tests.rs").read_bytes()
-        registry_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.84"\n'
+        registry_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.85"\n'
+
+        def git_cargo(rev):
+            return (registry_cargo + b'[patch.crates-io]\nsaorsa-gossip-pubsub = { git = "'
+                    + module.GIT_PUBSUB_URL.encode() + b'", rev = "' + rev.encode() + b'" }\n')
+
         module.validate_source_premise(registry_cargo, rust)
+        module.validate_source_premise(git_cargo(module.GIT_PUBSUB_REV_CURRENT), rust)
+        module.validate_source_premise(git_cargo(module.GIT_PUBSUB_REV_ACCOUNTING), rust)
         for cargo_input, rust_input, code in (
             (cargo.replace(b'saorsa-gossip-pubsub = "=0.5.85"',
-                           b'saorsa-gossip-pubsub = "=0.5.84"'), rust, "WORKSPACE_PUBSUB_PATCH_MISMATCH"),
-            (cargo.replace(b'saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "'
-                           + module.GIT_PUBSUB_REV.encode() + b'" }',
-                           b'saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "'
-                           + b"0" * 40 + b'" }'), rust, "WORKSPACE_PUBSUB_PATCH_MISMATCH"),
-            (registry_cargo.replace(b'=0.5.84', b'0.5.84'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+                           b'saorsa-gossip-pubsub = "=0.5.84"'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (git_cargo("0" * 40), rust, "WORKSPACE_PUBSUB_PATCH_MISMATCH"),
+            (registry_cargo.replace(b'=0.5.85', b'0.5.85'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
             (cargo, rust.replace(b'const GIT_PUBSUB_VERSION: &str = "0.5.85"',
                                  b'const GIT_PUBSUB_VERSION: &str = "0.5.86"'), "RUST_GIT_PUBSUB_VERSION_MISMATCH"),
             (cargo, rust.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64, 1), "RUST_REGISTRY_PUBSUB_SHA_MISMATCH"),
+            (cargo, rust.replace(module.GIT_PUBSUB_REV_CURRENT.encode(), b"0" * 40, 1),
+             "RUST_GIT_PUBSUB_SOURCE_CURRENT_MISMATCH"),
             (cargo, rust.replace(b'const SG_KEY_CACHE_CONTROL_TOPIC: &str = "saorsa-gossip/key-cache-control/v1";',
                                  b'const SG_KEY_CACHE_CONTROL_TOPIC: &str = "other-control-topic";'),
              "RUST_SG_KEY_CACHE_CONTROL_TOPIC_MISMATCH"),
@@ -107,12 +115,12 @@ class DerivationControls(unittest.TestCase):
                 module.validate_source_premise(cargo_input, rust_input)
 
     def test_exact_registry_and_git_producer_sources(self):
-        for lock in (LOCK, GIT_LOCK):
+        for lock in (LOCK, GIT_LOCK, GIT_LOCK_ACCOUNTING):
             record = fixture()
             record["build_lock_sha256"] = hashlib.sha256(lock).hexdigest()
             self.assertEqual(module.derive(record, lock)["derivation"], "CONSISTENT")
         invalid = (
-            GIT_LOCK.replace(module.GIT_PUBSUB_REV.encode(), b"0" * 40, 1),
+            GIT_LOCK.replace(module.GIT_PUBSUB_REV_CURRENT.encode(), b"0" * 40, 1),
             # Lookalike repository URL with the exact reviewed revision:
             # the premise is source-bound, not revision-bound alone.
             GIT_LOCK.replace(
@@ -125,6 +133,10 @@ class DerivationControls(unittest.TestCase):
             GIT_LOCK + GIT_LOCK,
             LOCK.replace(module.REGISTRY_PUBSUB_SOURCE.encode(), b'registry+https://example.invalid'),
             LOCK.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64),
+            # The superseded 0.5.84 registry package is no longer reviewed.
+            LOCK.replace(b'0.5.85', b'0.5.84').replace(
+                module.REGISTRY_PUBSUB_SHA.encode(),
+                b"ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"),
         )
         for lock in invalid:
             record = fixture()

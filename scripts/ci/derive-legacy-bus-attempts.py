@@ -27,16 +27,22 @@ KEY_CACHE_CONTROL_TOPIC = "saorsa-gossip/key-cache-control/v1"
 CONTROL = "87f4025bf2b9a4ad"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-REGISTRY_PUBSUB_VERSION = "0.5.84"
+# crates.io 0.5.85 (SG tag v0.5.85): outbound meters, wire_bytes_for_peer and
+# key_cache CONTROL_DOMAIN byte-identical to git 9258cee9; differs only on
+# inbound key-cache Response admission and priority-skewed Ref resolution.
+REGISTRY_PUBSUB_VERSION = "0.5.85"
 REGISTRY_PUBSUB_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-REGISTRY_PUBSUB_SHA = "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"
+REGISTRY_PUBSUB_SHA = "2fa074fd1df627f8da147cd31d008cc56c9b2548d4ce4cdfee7fc7cf332d8d22"
 GIT_PUBSUB_VERSION = "0.5.85"
 GIT_PUBSUB_URL = "https://github.com/saorsa-labs/saorsa-gossip.git"
 # SG 997abc75: per-peer wire-byte accounting via wire_bytes_for_peer;
 # ordinary legacy/v3 Full outbound submissions use final frame lengths.
 # The per-topic application snapshot still exposes exactly four KINDS.
-GIT_PUBSUB_REV = "997abc7560d9aabc1ca248b8c6774268aaf57867"
-GIT_PUBSUB_SOURCE = f"git+{GIT_PUBSUB_URL}?rev={GIT_PUBSUB_REV}#{GIT_PUBSUB_REV}"
+# Its descendant 9258cee9 keeps the same meter definitions.
+GIT_PUBSUB_REV_ACCOUNTING = "997abc7560d9aabc1ca248b8c6774268aaf57867"
+GIT_PUBSUB_REV_CURRENT = "9258cee9b5f30455675279d02730df1345e6aedc"
+GIT_PUBSUB_SOURCE_ACCOUNTING = f"git+{GIT_PUBSUB_URL}?rev={GIT_PUBSUB_REV_ACCOUNTING}#{GIT_PUBSUB_REV_ACCOUNTING}"
+GIT_PUBSUB_SOURCE_CURRENT = f"git+{GIT_PUBSUB_URL}?rev={GIT_PUBSUB_REV_CURRENT}#{GIT_PUBSUB_REV_CURRENT}"
 
 
 class Inconclusive(ValueError):
@@ -54,7 +60,7 @@ def integer(value):
 
 
 def reviewed_producer(package):
-    """Only the two exact source graphs whose meter implementations were compared.
+    """Only the exact source graphs whose meter implementations were compared.
 
     Meter premise (reviewed comparison, luna 2026-09-23): both graphs expose
     exactly the four application KINDS per topic; `bytes` are the measured
@@ -72,7 +78,7 @@ def reviewed_producer(package):
         and package.get("checksum") == REGISTRY_PUBSUB_SHA
     ) or (
         package.get("version") == GIT_PUBSUB_VERSION
-        and package.get("source") == GIT_PUBSUB_SOURCE
+        and package.get("source") in (GIT_PUBSUB_SOURCE_ACCOUNTING, GIT_PUBSUB_SOURCE_CURRENT)
         and "checksum" not in package
     )
 
@@ -82,19 +88,23 @@ def validate_source_premise(cargo_bytes, rust_bytes):
     manifest = tomllib.loads(cargo_bytes.decode())
     pin = manifest.get("dependencies", {}).get("saorsa-gossip-pubsub")
     patch = manifest.get("patch", {}).get("crates-io", {}).get("saorsa-gossip-pubsub")
-    if pin == f"={REGISTRY_PUBSUB_VERSION}":
-        require(patch is None, "WORKSPACE_PUBSUB_PATCH_MISMATCH")
-    elif pin == f"={GIT_PUBSUB_VERSION}":
-        require(patch == {"git": GIT_PUBSUB_URL, "rev": GIT_PUBSUB_REV}, "WORKSPACE_PUBSUB_PATCH_MISMATCH")
+    # Registry and git share 0.5.85, so the patch alone selects the graph:
+    # none means the crates.io package, otherwise an exact reviewed git rev.
+    if patch is None:
+        require(pin == f"={REGISTRY_PUBSUB_VERSION}", "WORKSPACE_PUBSUB_PIN_MISMATCH")
     else:
-        raise Inconclusive("WORKSPACE_PUBSUB_PIN_MISMATCH")
+        require(pin == f"={GIT_PUBSUB_VERSION}", "WORKSPACE_PUBSUB_PIN_MISMATCH")
+        require(patch in ({"git": GIT_PUBSUB_URL, "rev": GIT_PUBSUB_REV_ACCOUNTING},
+                          {"git": GIT_PUBSUB_URL, "rev": GIT_PUBSUB_REV_CURRENT}),
+                "WORKSPACE_PUBSUB_PATCH_MISMATCH")
     rust = rust_bytes.decode()
     for name, expected in (
         ("REGISTRY_PUBSUB_VERSION", REGISTRY_PUBSUB_VERSION),
         ("REGISTRY_PUBSUB_SOURCE", REGISTRY_PUBSUB_SOURCE),
         ("REGISTRY_PUBSUB_SHA", REGISTRY_PUBSUB_SHA),
         ("GIT_PUBSUB_VERSION", GIT_PUBSUB_VERSION),
-        ("GIT_PUBSUB_SOURCE", GIT_PUBSUB_SOURCE),
+        ("GIT_PUBSUB_SOURCE_ACCOUNTING", GIT_PUBSUB_SOURCE_ACCOUNTING),
+        ("GIT_PUBSUB_SOURCE_CURRENT", GIT_PUBSUB_SOURCE_CURRENT),
         ("SG_KEY_CACHE_CONTROL_TOPIC", KEY_CACHE_CONTROL_TOPIC),
     ):
         values = re.findall(rf'const {name}: &str =\s*"([^"]+)";', rust)
