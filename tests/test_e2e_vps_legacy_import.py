@@ -153,6 +153,18 @@ class LegacyHarnessTests(unittest.TestCase):
         custody.restart.assert_called_once_with("writer")
 
     def test_full_scenario_requires_open_handles_and_rejects_stopped_nodes(self):
+        for removal_status in (403, 404):
+            with self.subTest(removal_status=removal_status):
+                self._run_full_scenario(removal_status)
+
+    def test_refusal_rejects_unrelated_404_server_errors_and_import_permission(self):
+        for response in [(404, {"error": "source not found"}), (404, {}),
+                         (500, {}), (401, {}), (200, {"candidates": []}),
+                         (200, {"candidates": [{"can_import": True}]})]:
+            with self.subTest(response=response):
+                self.assertFalse(self.m.revoked_listing_refusal(response))
+
+    def _run_full_scenario(self, removal_status):
         class Backend:
             def __init__(self):
                 self.groups = {}; self.opens = set(); self.values = {}; self.sources = {}
@@ -182,6 +194,8 @@ class LegacyHarnessTests(unittest.TestCase):
                     return 201, {"id": sid}
                 if len(parts) >= 3 and parts[0] == "groups" and parts[2] == "stores":
                     gid = parts[1]
+                    if removal_status == 404 and node not in self.groups[gid]["members"]:
+                        return 404, {"error": "group not found"}
                     app = body["name"] if len(parts) == 3 else parts[3]
                     sid = f"canonical-{gid}-{app}"
                     if method == "POST" and len(parts) == 3:
@@ -228,6 +242,10 @@ class LegacyHarnessTests(unittest.TestCase):
         with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: float(next(ticks))), \
              mock.patch.object(self.m.time, "sleep"):
             scenario.run(*nodes, stop_owner, restart_writer)
+        refused = [x for x in scenario.e.assertions if x["label"] == "revoked import mutation refused"]
+        self.assertEqual([removal_status], [x["status"] for x in refused])
+        self.assertEqual(1, len(scenario.e.polls))
+        self.assertEqual("accepted", scenario.e.polls[0]["outcome"])
         self.assertIn("owner", backend.stopped)
         self.assertIn("observer", backend.stopped)
 
