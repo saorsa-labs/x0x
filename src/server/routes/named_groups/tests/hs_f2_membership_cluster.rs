@@ -708,6 +708,8 @@ async fn issue457_treekem_unavailable_rejection_is_counted() -> Result<()> {
         invite_secret,
         ts_ms: now_ms,
         treekem_key_package_b64: Some(treekem_key_package_b64),
+        kem_public_key_b64: None,
+        kem_signature_b64: None,
         recovery_authority_agent_id: None,
         recovery_authority_public_key_b64: None,
         recovery_authority_signature_b64: None,

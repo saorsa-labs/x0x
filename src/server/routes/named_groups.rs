@@ -1481,6 +1481,24 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// Base64 postcard-encoded TreeKEM KeyPackage for invite joins.
         #[serde(default)]
         treekem_key_package_b64: Option<String>,
+        /// #794: Base64 ML-KEM-768 public key of the joiner, so the
+        /// authority can seal the group's real shared secret to the
+        /// invite-joined member (`SecureShareDelivered`), exactly as the
+        /// request/approve path already does via
+        /// `JoinRequestCreated::requester_kem_public_key_b64`. Present only
+        /// for MlsEncrypted GSS-plane invite joins.
+        #[serde(default)]
+        kem_public_key_b64: Option<String>,
+        /// #794: Base64 ML-DSA-65 signature by the SAME joiner key as
+        /// `signature_b64` over `canonical_member_joined_kem_bytes` — binds
+        /// `kem_public_key_b64` to the authenticated joiner identity for
+        /// this group. The legacy `canonical_member_joined_bytes` are
+        /// deliberately UNCHANGED so old and new daemons keep verifying the
+        /// join signature identically; the binding rides only this
+        /// separately domain-separated signature. An authority seals a
+        /// share ONLY when this sub-signature verifies.
+        #[serde(default)]
+        kem_signature_b64: Option<String>,
         /// Inviter countersignature added only after authoritative acceptance.
         #[serde(default)]
         recovery_authority_agent_id: Option<String>,
@@ -2518,6 +2536,104 @@ fn canonical_member_joined_bytes(
     buf.extend_from_slice(&ts_ms.to_be_bytes());
     push_lp(&mut buf, treekem_key_package_b64.unwrap_or("").as_bytes());
     buf
+}
+
+/// #794: domain-separation tag for the `MemberJoined` KEM-binding
+/// sub-signature. Kept SEPARATE from `MEMBER_JOINED_DOMAIN` so the legacy
+/// join signature bytes stay byte-identical for old and new daemons alike —
+/// the KEM binding must not fork legacy verification.
+const MEMBER_JOINED_KEM_DOMAIN: &[u8] = b"x0x.named_group.member_joined.kem.v1";
+
+/// #794: canonical bytes for the `MemberJoined` KEM-binding sub-signature.
+///
+/// Binds the joiner's ML-KEM-768 public key to the FULL legacy
+/// `canonical_member_joined_bytes` of the event that carries it — the same
+/// bytes the joiner's outer signature already covers (group, stable id,
+/// member identity key, role, display name, inviter, one-time invite
+/// secret, timestamp, TreeKEM KeyPackage) — plus the KEM key itself:
+///
+/// ```text
+/// MEMBER_JOINED_KEM_DOMAIN
+/// u32 len + canonical_member_joined_bytes(...)
+/// u32 len + kem_public_key_b64
+/// ```
+///
+/// Because the legacy signature bytes deliberately do NOT cover the KEM
+/// field (wire compatibility), a relay could otherwise strip, swap, or
+/// transplant the KEM pair onto a DIFFERENT invite/admission attempt. This
+/// sub-signature covers every per-attempt field (notably the one-time
+/// `invite_secret` and `ts_ms`), so a transplanted binding fails
+/// verification and an authority never seals the group secret to an
+/// injected key.
+fn canonical_member_joined_kem_bytes(
+    member_joined_canonical: &[u8],
+    kem_public_key_b64: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        MEMBER_JOINED_KEM_DOMAIN.len()
+            + member_joined_canonical.len()
+            + kem_public_key_b64.len()
+            + 8,
+    );
+    buf.extend_from_slice(MEMBER_JOINED_KEM_DOMAIN);
+    buf.extend_from_slice(&(member_joined_canonical.len() as u32).to_be_bytes());
+    buf.extend_from_slice(member_joined_canonical);
+    buf.extend_from_slice(&(kem_public_key_b64.len() as u32).to_be_bytes());
+    buf.extend_from_slice(kem_public_key_b64.as_bytes());
+    buf
+}
+
+/// #794: verify a `MemberJoined` KEM-binding sub-signature under the
+/// joiner's ML-DSA-65 public key (the same key whose AgentId derivation the
+/// apply path already checked, and whose legacy event signature already
+/// verified over `member_joined_canonical`). Returns false on any
+/// decode/verify failure — callers must treat false as "do not seal a
+/// share to this key".
+fn verify_member_joined_kem_binding(
+    member_joined_canonical: &[u8],
+    member_public_key_b64: &str,
+    kem_public_key_b64: &str,
+    kem_signature_b64: &str,
+) -> bool {
+    use base64::Engine as _;
+    let Ok(pubkey_bytes) = BASE64.decode(member_public_key_b64) else {
+        return false;
+    };
+    let Ok(pubkey) = ant_quic::MlDsaPublicKey::from_bytes(&pubkey_bytes) else {
+        return false;
+    };
+    let Ok(sig_bytes) = BASE64.decode(kem_signature_b64) else {
+        return false;
+    };
+    let Ok(sig) = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+    else {
+        return false;
+    };
+    let canonical = canonical_member_joined_kem_bytes(member_joined_canonical, kem_public_key_b64);
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig).is_ok()
+}
+
+/// #794: sign the KEM-binding sub-signature for a `MemberJoined`. Returns
+/// `None` on signing failure — callers must then drop the KEM key (a key
+/// without its binding signature must never ride the event).
+fn sign_member_joined_kem_binding(
+    signing_kp: &crate::identity::AgentKeypair,
+    member_joined_canonical: &[u8],
+    kem_public_key_b64: &str,
+) -> Option<String> {
+    use base64::Engine as _;
+    let canonical_kem =
+        canonical_member_joined_kem_bytes(member_joined_canonical, kem_public_key_b64);
+    match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        signing_kp.secret_key(),
+        &canonical_kem,
+    ) {
+        Ok(sig) => Some(BASE64.encode(sig.as_bytes())),
+        Err(e) => {
+            tracing::warn!("MemberJoined: failed to sign KEM binding: {e:?} — joining keyless");
+            None
+        }
+    }
 }
 
 async fn publish_named_group_metadata_event(
@@ -11701,6 +11817,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             invite_secret,
             ts_ms,
             treekem_key_package_b64,
+            kem_public_key_b64,
+            kem_signature_b64,
             recovery_authority_signature_b64,
             signature_b64,
             ..
@@ -11813,6 +11931,52 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 );
                 return ApplyMetadataResult::REJECTED;
             }
+
+            // 4b. #794: verify the joiner's KEM-binding sub-signature (pure,
+            //     before ANY state mutation). The binding covers the full
+            //     canonical event bytes plus the KEM key, so a pair
+            //     transplanted from a different invite/admission attempt
+            //     fails here. Only a VERIFIED key may later receive the
+            //     group secret; a half-present or unverifiable pair means
+            //     the joiner stays keyless (store open fails closed) — the
+            //     seat itself does not depend on the KEM key, and rejecting
+            //     the join outright would buy nothing (the field is
+            //     strippable to the old-wire shape by any relay).
+            let verified_joiner_kem_b64 = match (
+                kem_public_key_b64.as_deref(),
+                kem_signature_b64.as_deref(),
+            ) {
+                (Some(kem_b64), Some(kem_sig_b64)) => {
+                    if verify_member_joined_kem_binding(
+                        &canonical,
+                        &member_public_key_b64,
+                        kem_b64,
+                        kem_sig_b64,
+                    ) {
+                        Some(kem_b64.to_string())
+                    } else {
+                        tracing::warn!(
+                            group_id = %resolved_group_key,
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined: KEM binding signature did not verify — seating without secret delivery"
+                        );
+                        state.groups_diagnostics.record_invite_refusal(
+                            &resolved_group_key,
+                            "member_joined_kem_binding_invalid",
+                        );
+                        None
+                    }
+                }
+                (None, None) => None,
+                (Some(_), None) | (None, Some(_)) => {
+                    tracing::warn!(
+                        group_id = %resolved_group_key,
+                        member = %LogHexId::agent(&member_agent_id),
+                        "MemberJoined: half-present KEM binding fields — seating without secret delivery"
+                    );
+                    None
+                }
+            };
 
             // 6. Only the original local inviter can validate and consume the
             //    one-time invite secret. Third-party receivers deliberately do
@@ -12066,6 +12230,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         invite_secret: invite_secret.clone(),
                         ts_ms,
                         treekem_key_package_b64: treekem_key_package_b64.clone(),
+                        // Recovery records exist for the TreeKEM KeyPackage
+                        // flow only; a GSS KEM binding never rides them.
+                        kem_public_key_b64: None,
+                        kem_signature_b64: None,
                         recovery_authority_agent_id: None,
                         recovery_authority_public_key_b64: None,
                         recovery_authority_signature_b64: None,
@@ -12097,6 +12265,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // (named_group_integration::member_banned_lost_initial_volley_…).
             if let Some(kp_b64) = treekem_key_package_b64.clone() {
                 next.set_member_treekem_key_package(&member_agent_id, kp_b64);
+            }
+            // #794: record the joiner's VERIFIED ML-KEM-768 public key on
+            // the seat before the commit seals — roster-root-neutral (the
+            // projection does not hash it), mirroring the approve path's
+            // `JoinRequestCreated` seat write. Later rekey/reseal paths
+            // (ban survivors, admin remove, /secure/reseal) read it from
+            // the seat.
+            if let Some(kem_b64) = verified_joiner_kem_b64.clone() {
+                next.set_member_kem_public_key(&member_agent_id, kem_b64);
             }
             // r3 (Codex 8) → r4 (addendum item 9): seat-time hydrate for a
             // DIGEST-ONLY joiner seat, BEFORE the event's own certificate
@@ -12421,6 +12598,58 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     GROUP_BACKGROUND_PUBLISH_DELAY,
                 );
             }
+            // #794 Gap 2: deliver the REAL group secret to the invite-joined
+            // member. Runs only AFTER the seat was durably committed and the
+            // authoritative MemberAdded was published — sealing before
+            // committed admission is forbidden. GSS plane only (TreeKEM
+            // members get their keys via the Welcome path), and only to a
+            // KEM key whose binding sub-signature verified above. The joiner
+            // applies the `SecureShareDelivered` through the ordinary arm
+            // (actor = inviter, an Admin+ in the joiner's base-roster view;
+            // its keyless stub accepts the equal-epoch envelope).
+            if treekem_epoch.is_none()
+                && next.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
+                && next.secure_plane == x0x::mls::SecureGroupPlane::Gss
+            {
+                match (
+                    verified_joiner_kem_b64.as_deref(),
+                    next.shared_secret.as_ref(),
+                ) {
+                    (Some(recipient_kem_b64), Some(secret_vec)) if secret_vec.len() == 32 => {
+                        let mut secret = [0u8; 32];
+                        secret.copy_from_slice(secret_vec);
+                        publish_secure_share(
+                            state,
+                            &metadata_topic,
+                            &event_group_id,
+                            &member_agent_id,
+                            recipient_kem_b64,
+                            &inviter_agent_id,
+                            &secret,
+                            next.secret_epoch,
+                        )
+                        .await;
+                    }
+                    (Some(_), Some(_)) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined: group shared secret has unexpected length; invite-joined member stays keyless"
+                        );
+                    }
+                    (Some(_), None) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined: no group shared secret yet; invite-joined member stays keyless"
+                        );
+                    }
+                    (None, _) => {
+                        // Keyless join (legacy wire shape, or the binding
+                        // failed verification above — already logged).
+                    }
+                }
+            }
             maybe_publish_group_card_after_state_change(state, &resolved_group_key).await;
             tracing::info!(
                 group_id = %resolved_group_key,
@@ -12678,6 +12907,8 @@ pub(in crate::server) async fn create_named_group(
                         .as_ref()
                         .map_or(info.created_at, |genesis| genesis.created_at),
                     treekem_key_package_b64: Some(creator_package),
+                    kem_public_key_b64: None,
+                    kem_signature_b64: None,
                     recovery_authority_agent_id: None,
                     recovery_authority_public_key_b64: None,
                     recovery_authority_signature_b64: None,
@@ -15662,9 +15893,15 @@ fn invite_join_group_info(
     if let Some(secure_plane) = invite.secure_plane {
         info.secure_plane = secure_plane;
     }
-    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-        info.shared_secret = None;
-    }
+    // #794 Gap 1: an invite-join stub NEVER keeps a locally minted secret.
+    // TreeKEM never had one; a GSS stub holding `with_policy`'s fresh
+    // random 32-byte secret shares those bytes with nobody, yet passes
+    // `validate_gss_store_group`'s presence-only check — every later
+    // sealed record then fails `AEAD open` on this daemon (issue #794).
+    // Null it on every plane: the real secret arrives via the authority's
+    // `SecureShareDelivered` after the committed admission, and until then
+    // store open fails closed (409 "no shared secret").
+    info.shared_secret = None;
     if let Some(base_secret_epoch) = invite.base_secret_epoch {
         info.secret_epoch = base_secret_epoch;
     }
@@ -15789,6 +16026,13 @@ pub(in crate::server) const JOIN_DISPLAY_NAME_MAX_BYTES: usize = 128;
 /// resend ONCE — called BEFORE any state insert so a sign/serialize
 /// failure leaves nothing installed. Extracted so the test-injection 503
 /// path exercises the exact production branch.
+///
+/// #794: for MlsEncrypted GSS-plane invites, `joiner_kem` carries the
+/// joiner's ML-KEM-768 keypair; its public half is attached to the event
+/// together with a domain-separated ML-DSA sub-signature binding that key
+/// to this join, so the authority can later `publish_secure_share` the
+/// REAL group secret to the invite-joined member (Gap 2). The legacy
+/// signature bytes above are unchanged.
 fn build_signed_member_joined_resend(
     info: &x0x::groups::GroupInfo,
     joiner_hex: &str,
@@ -15796,11 +16040,22 @@ fn build_signed_member_joined_resend(
     display_name: &Option<String>,
     treekem_key_package_b64: &Option<String>,
     signing_kp: &crate::identity::AgentKeypair,
+    joiner_kem: Option<&x0x::groups::kem_envelope::AgentKemKeypair>,
 ) -> Option<MemberJoinedResend> {
     let now_ms = now_millis_u64();
     use base64::Engine as _;
     let member_pubkey_b64 = BASE64.encode(signing_kp.public_key().as_bytes());
     let stable_id_for_event = info.stable_group_id().to_string();
+    // #794: the KEM binding is only meaningful for groups whose secrets are
+    // GSS-delivered — never for TreeKEM (KeyPackage flow) or SignedPublic
+    // (no secret). `joiner_kem` is only `Some` on that path; the policy
+    // re-check here keeps the helper safe for any internal caller.
+    let joiner_kem_b64 = joiner_kem
+        .filter(|_| {
+            info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
+                && info.secure_plane == x0x::mls::SecureGroupPlane::Gss
+        })
+        .map(|kp| BASE64.encode(&kp.public_bytes));
     let canonical = canonical_member_joined_bytes(
         &info.mls_group_id,
         Some(&stable_id_for_event),
@@ -15813,6 +16068,15 @@ fn build_signed_member_joined_resend(
         now_ms,
         treekem_key_package_b64.as_deref(),
     );
+    // #794: the KEM binding covers the FULL canonical event bytes plus the
+    // KEM key, so the pair cannot be transplanted onto a different
+    // invite/admission attempt (different invite_secret/ts_ms/inviter...).
+    // A KEM key whose binding signature cannot be produced never rides the
+    // event — the authority only seals to a VERIFIED key.
+    let kem_signature_b64 = joiner_kem_b64
+        .as_deref()
+        .and_then(|kem_b64| sign_member_joined_kem_binding(signing_kp, &canonical, kem_b64));
+    let joiner_kem_b64 = kem_signature_b64.as_ref().and(joiner_kem_b64);
     match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
         signing_kp.secret_key(),
         &canonical,
@@ -15830,6 +16094,8 @@ fn build_signed_member_joined_resend(
                 invite_secret: invite.invite_secret.clone(),
                 ts_ms: now_ms,
                 treekem_key_package_b64: treekem_key_package_b64.clone(),
+                kem_public_key_b64: joiner_kem_b64,
+                kem_signature_b64,
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -16453,6 +16719,15 @@ pub(in crate::server) async fn join_group_via_invite(
                 );
                 None
             } else {
+                // #794 Gap 2: for MlsEncrypted GSS-plane invites, publish
+                // our ML-KEM-768 public key (with its identity-binding
+                // sub-signature) on the MemberJoined so the authority can
+                // seal the REAL group secret to us after admission.
+                let joiner_kem = (!invite_is_treekem
+                    && invite.policy.as_ref().is_some_and(|policy| {
+                        policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
+                    }))
+                .then(|| state.agent_kem_keypair.as_ref());
                 build_signed_member_joined_resend(
                     &info,
                     &joiner_hex,
@@ -16460,6 +16735,7 @@ pub(in crate::server) async fn join_group_via_invite(
                     &req.display_name,
                     &treekem_key_package_b64,
                     signing_kp,
+                    joiner_kem,
                 )
             };
             let Some(member_joined_resend) = signed_resend else {
@@ -17352,6 +17628,8 @@ async fn add_treekem_named_group_member(
         invite_secret: String::new(),
         ts_ms: now_ms,
         treekem_key_package_b64: Some(kp_b64.clone()),
+        kem_public_key_b64: None,
+        kem_signature_b64: None,
         recovery_authority_agent_id: None,
         recovery_authority_public_key_b64: None,
         recovery_authority_signature_b64: None,
@@ -23079,6 +23357,8 @@ async fn approve_treekem_join_request(
         display_name: None,
         inviter_agent_id: caller_hex.clone(),
         invite_secret: String::new(),
+        kem_public_key_b64: None,
+        kem_signature_b64: None,
         ts_ms: now_ms,
         treekem_key_package_b64: Some(BASE64.encode(&kp_bytes)),
         recovery_authority_agent_id: None,
@@ -31164,7 +31444,7 @@ async fn refire_pending_join_volley(
     // signed volley. Its children are unowned (empty attempt id) and spawn
     // detached exactly as before #477 (C8's legacy deadline owner) unless
     // a registered attempt has meanwhile claimed the key.
-    let (metadata_topic, mls_group_id) = {
+    let (metadata_topic, mls_group_id, gss_encrypted) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(group_id_hex).or_else(|| {
             groups
@@ -31173,7 +31453,12 @@ async fn refire_pending_join_volley(
         }) else {
             return;
         };
-        (info.metadata_topic.clone(), info.mls_group_id.clone())
+        (
+            info.metadata_topic.clone(),
+            info.mls_group_id.clone(),
+            info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
+                && info.secure_plane == x0x::mls::SecureGroupPlane::Gss,
+        )
     };
     let treekem_key_package_b64 = if invite_is_treekem {
         match hex::decode(&mls_group_id) {
@@ -31213,6 +31498,15 @@ async fn refire_pending_join_volley(
         now_ms,
         treekem_key_package_b64.as_deref(),
     );
+    // #794: the post-restart rebuild carries the KEM binding too — without
+    // it the authority would seat this member but never seal the group
+    // secret, stranding the restarted joiner keyless.
+    let joiner_kem_b64 =
+        gss_encrypted.then(|| BASE64.encode(&state.agent_kem_keypair.public_bytes));
+    let kem_signature_b64 = joiner_kem_b64
+        .as_deref()
+        .and_then(|kem_b64| sign_member_joined_kem_binding(signing_kp, &canonical, kem_b64));
+    let joiner_kem_b64 = kem_signature_b64.as_ref().and(joiner_kem_b64);
     let event = match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
         signing_kp.secret_key(),
         &canonical,
@@ -31228,6 +31522,8 @@ async fn refire_pending_join_volley(
             invite_secret,
             ts_ms: now_ms,
             treekem_key_package_b64,
+            kem_public_key_b64: joiner_kem_b64,
+            kem_signature_b64,
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -34841,6 +35137,8 @@ pub(in crate::server) mod tests {
                 invite_secret: "sec-t9b".into(),
                 ts_ms: 1_700_000_555_000,
                 treekem_key_package_b64: None,
+                kem_public_key_b64: None,
+                kem_signature_b64: None,
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -34995,6 +35293,8 @@ pub(in crate::server) mod tests {
                     invite_secret: secret.to_string(),
                     ts_ms,
                     treekem_key_package_b64: None,
+                    kem_public_key_b64: None,
+                    kem_signature_b64: None,
                     recovery_authority_agent_id: None,
                     recovery_authority_public_key_b64: None,
                     recovery_authority_signature_b64: None,
@@ -42117,6 +42417,8 @@ pub(in crate::server) mod tests {
             invite_secret,
             ts_ms: now_ms,
             treekem_key_package_b64: Some(treekem_key_package_b64),
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -42289,6 +42591,8 @@ pub(in crate::server) mod tests {
             invite_secret: invite_secret.to_string(),
             ts_ms,
             treekem_key_package_b64: None,
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -45994,6 +46298,8 @@ pub(in crate::server) mod tests {
             invite_secret: "s".to_string(),
             ts_ms: 1,
             treekem_key_package_b64: Some("kp".to_string()),
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -46164,6 +46470,8 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                kem_public_key_b64: None,
+                kem_signature_b64: None,
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -46221,6 +46529,8 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                kem_public_key_b64: None,
+                kem_signature_b64: None,
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -46293,6 +46603,8 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                kem_public_key_b64: None,
+                kem_signature_b64: None,
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -47072,6 +47384,8 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                kem_public_key_b64: None,
+                kem_signature_b64: None,
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -47141,6 +47455,8 @@ pub(in crate::server) mod tests {
                     invite_secret,
                     ts_ms,
                     treekem_key_package_b64,
+                    kem_public_key_b64: None,
+                    kem_signature_b64: None,
                     recovery_authority_agent_id: None,
                     recovery_authority_public_key_b64: None,
                     recovery_authority_signature_b64: None,
@@ -47196,6 +47512,8 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                kem_public_key_b64: None,
+                kem_signature_b64: None,
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -47940,6 +48258,8 @@ pub(in crate::server) mod tests {
             invite_secret,
             ts_ms: now_ms,
             treekem_key_package_b64: Some(kp_b64),
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -48435,6 +48755,8 @@ pub(in crate::server) mod tests {
             ts_ms: sequence,
             treekem_key_package_b64: Some(key_package),
             recovery_authority_agent_id: None,
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
@@ -48450,6 +48772,832 @@ pub(in crate::server) mod tests {
         let on_disk = tokio::fs::read_to_string(path).await?;
         let parsed: BTreeMap<String, serde_json::Value> = serde_json::from_str(&on_disk)?;
         Ok(parsed.into_keys().collect())
+    }
+    /// #794 tests use anyhow's error type explicitly — the tests mod has no
+    /// one-argument `Result` alias at this scope.
+    type Gss794Result<T> = std::result::Result<T, anyhow::Error>;
+
+    // =========================================================================
+    // #794 — GSS invite-link wrong-secret repair (keyless stub + KEM delivery)
+    // =========================================================================
+
+    fn gss794_invite(
+        policy: x0x::groups::GroupPolicy,
+        plane: x0x::mls::SecureGroupPlane,
+        secret_epoch: u64,
+        binding: Option<&str>,
+    ) -> x0x::groups::invite::SignedInvite {
+        let inviter_kp = crate::identity::AgentKeypair::generate().expect("inviter keypair");
+        let mut invite = x0x::groups::invite::SignedInvite::new(
+            "ee".repeat(32),
+            "gss794".to_string(),
+            &inviter_kp.agent_id(),
+            0,
+        );
+        invite.policy = Some(policy);
+        invite.secure_plane = Some(plane);
+        invite.base_secret_epoch = Some(secret_epoch);
+        invite.base_security_binding = binding.map(str::to_string);
+        invite
+    }
+
+    #[test]
+    fn gss794_invite_stub_is_keyless_on_every_plane() {
+        let inviter_kp = crate::identity::AgentKeypair::generate().expect("inviter keypair");
+        let inviter_hex = hex::encode(inviter_kp.agent_id().as_bytes());
+        let joiner_hex = "8b".repeat(32);
+
+        // The delta this patch closes: the generic constructor DOES mint a
+        // secret for MlsEncrypted groups (correct for a creator)…
+        let creator_side = x0x::groups::GroupInfo::with_policy(
+            "gss794".to_string(),
+            String::new(),
+            inviter_kp.agent_id(),
+            "ee".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        assert!(
+            creator_side.shared_secret.is_some(),
+            "fixture premise: with_policy mints a secret for MlsEncrypted groups"
+        );
+
+        // …but an invite-join stub must never keep it — on ANY plane.
+        for plane in [
+            x0x::mls::SecureGroupPlane::Gss,
+            x0x::mls::SecureGroupPlane::TreeKem,
+        ] {
+            let invite = gss794_invite(
+                x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+                plane,
+                7,
+                Some("gss:epoch=7"),
+            );
+            let stub = invite_join_group_info(
+                &invite,
+                inviter_kp.agent_id(),
+                &inviter_hex,
+                &"ee".repeat(32),
+                &joiner_hex,
+                None,
+                None,
+            );
+            assert!(
+                stub.shared_secret.is_none(),
+                "{plane:?} invite stub must be keyless until SecureShareDelivered"
+            );
+            assert_eq!(stub.secret_epoch, 7, "epoch label survives the null-out");
+            assert_eq!(
+                stub.security_binding.as_deref(),
+                Some("gss:epoch=7"),
+                "binding label survives the null-out"
+            );
+        }
+    }
+
+    #[test]
+    fn gss794_kem_binding_covers_full_canonical_event_bytes() {
+        let joiner_kp = crate::identity::AgentKeypair::generate().expect("joiner keypair");
+        let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+        let member_pubkey_b64 = BASE64.encode(joiner_kp.public_key().as_bytes());
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate().expect("kem");
+        let kem_b64 = BASE64.encode(&kem.public_bytes);
+
+        let canonical = canonical_member_joined_bytes(
+            &"ee".repeat(32),
+            Some(&"ef".repeat(32)),
+            &joiner_hex,
+            &member_pubkey_b64,
+            x0x::groups::GroupRole::Member,
+            None,
+            &"11".repeat(32),
+            "invite-secret-a",
+            1_000,
+            None,
+        );
+        let sig_b64 =
+            sign_member_joined_kem_binding(&joiner_kp, &canonical, &kem_b64).expect("sign");
+        assert!(
+            verify_member_joined_kem_binding(&canonical, &member_pubkey_b64, &kem_b64, &sig_b64),
+            "well-formed binding verifies"
+        );
+
+        // Tampered KEM key (relay swaps the recipient key): must fail.
+        let other_kem_b64 = BASE64.encode(
+            &x0x::groups::kem_envelope::AgentKemKeypair::generate()
+                .expect("kem2")
+                .public_bytes,
+        );
+        assert!(
+            !verify_member_joined_kem_binding(
+                &canonical,
+                &member_pubkey_b64,
+                &other_kem_b64,
+                &sig_b64
+            ),
+            "swapped KEM key must not verify"
+        );
+
+        // Transplant across attempts: the same member + key, but a DIFFERENT
+        // invite attempt (different one-time secret / timestamp) changes the
+        // canonical bytes — the binding must not carry over.
+        let other_attempt = canonical_member_joined_bytes(
+            &"ee".repeat(32),
+            Some(&"ef".repeat(32)),
+            &joiner_hex,
+            &member_pubkey_b64,
+            x0x::groups::GroupRole::Member,
+            None,
+            &"11".repeat(32),
+            "invite-secret-b",
+            2_000,
+            None,
+        );
+        assert!(
+            !verify_member_joined_kem_binding(
+                &other_attempt,
+                &member_pubkey_b64,
+                &kem_b64,
+                &sig_b64
+            ),
+            "binding must not transplant across invite attempts"
+        );
+
+        // Wrong signer: verified under a different member key.
+        let stranger_kp = crate::identity::AgentKeypair::generate().expect("stranger");
+        let stranger_pubkey_b64 = BASE64.encode(stranger_kp.public_key().as_bytes());
+        assert!(
+            !verify_member_joined_kem_binding(&canonical, &stranger_pubkey_b64, &kem_b64, &sig_b64),
+            "binding must not verify under a different member key"
+        );
+
+        // Corrupt signature bytes fail decode/verify.
+        assert!(
+            !verify_member_joined_kem_binding(
+                &canonical,
+                &member_pubkey_b64,
+                &kem_b64,
+                "!!!not-base64!!!"
+            ),
+            "garbage signature must fail closed"
+        );
+    }
+
+    fn gss794_group_info(plane: x0x::mls::SecureGroupPlane) -> x0x::groups::GroupInfo {
+        gss794_group_info_with_creator(
+            plane,
+            crate::identity::AgentKeypair::generate()
+                .expect("creator")
+                .agent_id(),
+        )
+    }
+
+    fn gss794_group_info_with_creator(
+        plane: x0x::mls::SecureGroupPlane,
+        creator: AgentId,
+    ) -> x0x::groups::GroupInfo {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "gss794".to_string(),
+            String::new(),
+            creator,
+            "ee".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        info.secure_plane = plane;
+        info
+    }
+
+    #[test]
+    fn gss794_resend_builder_attaches_kem_for_gss_encrypted_only() {
+        let joiner_kp = crate::identity::AgentKeypair::generate().expect("joiner keypair");
+        let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate().expect("kem");
+        let invite = gss794_invite(
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+            x0x::mls::SecureGroupPlane::Gss,
+            7,
+            Some("gss:epoch=7"),
+        );
+
+        // GSS + MlsEncrypted: both fields present and the binding verifies
+        // against the event's own canonical bytes.
+        let info = gss794_group_info(x0x::mls::SecureGroupPlane::Gss);
+        let resend = build_signed_member_joined_resend(
+            &info,
+            &joiner_hex,
+            &invite,
+            &None,
+            &None,
+            &joiner_kp,
+            Some(&kem),
+        )
+        .expect("resend");
+        let NamedGroupMetadataEvent::MemberJoined {
+            group_id,
+            stable_group_id,
+            member_agent_id,
+            member_public_key_b64,
+            role,
+            display_name,
+            inviter_agent_id,
+            invite_secret,
+            ts_ms,
+            treekem_key_package_b64,
+            kem_public_key_b64,
+            kem_signature_b64,
+            ..
+        } = &resend.event
+        else {
+            panic!("member joined");
+        };
+        let (kem_key, kem_sig) = (
+            kem_public_key_b64.clone().expect("kem key attached"),
+            kem_signature_b64.clone().expect("kem sig attached"),
+        );
+        assert_eq!(kem_key, BASE64.encode(&kem.public_bytes));
+        let canonical = canonical_member_joined_bytes(
+            group_id,
+            stable_group_id.as_deref(),
+            member_agent_id,
+            member_public_key_b64,
+            *role,
+            display_name.as_deref(),
+            inviter_agent_id,
+            invite_secret,
+            *ts_ms,
+            treekem_key_package_b64.as_deref(),
+        );
+        assert!(
+            verify_member_joined_kem_binding(&canonical, member_public_key_b64, &kem_key, &kem_sig),
+            "attached binding must verify over the event's canonical bytes"
+        );
+
+        // TreeKEM and SignedPublic never attach a GSS KEM binding.
+        let treekem_invite = gss794_invite(
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+            x0x::mls::SecureGroupPlane::TreeKem,
+            7,
+            Some("treekem:epoch=7"),
+        );
+        let treekem_info = gss794_group_info(x0x::mls::SecureGroupPlane::TreeKem);
+        let treekem_resend = build_signed_member_joined_resend(
+            &treekem_info,
+            &joiner_hex,
+            &treekem_invite,
+            &None,
+            &None,
+            &joiner_kp,
+            Some(&kem),
+        )
+        .expect("resend");
+        let NamedGroupMetadataEvent::MemberJoined {
+            kem_public_key_b64,
+            kem_signature_b64,
+            ..
+        } = treekem_resend.event
+        else {
+            panic!("member joined");
+        };
+        assert!(kem_public_key_b64.is_none() && kem_signature_b64.is_none());
+
+        let mut signed_public_info = gss794_group_info(x0x::mls::SecureGroupPlane::Gss);
+        signed_public_info.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+        let signed_public_resend = build_signed_member_joined_resend(
+            &signed_public_info,
+            &joiner_hex,
+            &invite,
+            &None,
+            &None,
+            &joiner_kp,
+            Some(&kem),
+        )
+        .expect("resend");
+        let NamedGroupMetadataEvent::MemberJoined {
+            kem_public_key_b64,
+            kem_signature_b64,
+            ..
+        } = signed_public_resend.event
+        else {
+            panic!("member joined");
+        };
+        assert!(kem_public_key_b64.is_none() && kem_signature_b64.is_none());
+    }
+
+    #[test]
+    fn gss794_member_joined_wire_compat_legacy_and_new_fields() {
+        // Legacy wire shape (pre-#794 daemon): the new fields are absent and
+        // must deserialize as None.
+        let legacy = serde_json::json!({
+            "event": "member_joined",
+            "group_id": "ee".repeat(32),
+            "stable_group_id": "ef".repeat(32),
+            "member_agent_id": "8b".repeat(32),
+            "member_public_key_b64": "a2V5",
+            "role": "member",
+            "inviter_agent_id": "11".repeat(32),
+            "invite_secret": "secret",
+            "ts_ms": 1_u64,
+            "signature_b64": "c2ln"
+        });
+        let event: NamedGroupMetadataEvent =
+            serde_json::from_value(legacy).expect("legacy MemberJoined deserializes");
+        let NamedGroupMetadataEvent::MemberJoined {
+            kem_public_key_b64,
+            kem_signature_b64,
+            ..
+        } = event
+        else {
+            panic!("member joined");
+        };
+        assert!(kem_public_key_b64.is_none() && kem_signature_b64.is_none());
+
+        let modern = serde_json::json!({
+            "event": "member_joined",
+            "group_id": "ee".repeat(32),
+            "stable_group_id": "ef".repeat(32),
+            "member_agent_id": "8b".repeat(32),
+            "member_public_key_b64": "a2V5",
+            "role": "member",
+            "inviter_agent_id": "11".repeat(32),
+            "invite_secret": "secret",
+            "ts_ms": 1_u64,
+            "kem_public_key_b64": "a2Vt",
+            "kem_signature_b64": "c2lnMg==",
+            "signature_b64": "c2ln"
+        });
+        let event: NamedGroupMetadataEvent =
+            serde_json::from_value(modern).expect("modern MemberJoined deserializes");
+        let NamedGroupMetadataEvent::MemberJoined {
+            kem_public_key_b64,
+            kem_signature_b64,
+            ..
+        } = event
+        else {
+            panic!("member joined");
+        };
+        assert_eq!(kem_public_key_b64.as_deref(), Some("a2Vt"));
+        assert_eq!(kem_signature_b64.as_deref(), Some("c2lnMg=="));
+
+        // The legacy signature input is unchanged: identical arguments must
+        // keep hashing to identical bytes (no fork of old verification).
+        let a = canonical_member_joined_bytes(
+            "g",
+            Some("s"),
+            "m",
+            "p",
+            x0x::groups::GroupRole::Member,
+            None,
+            "i",
+            "sec",
+            42,
+            None,
+        );
+        let b = canonical_member_joined_bytes(
+            "g",
+            Some("s"),
+            "m",
+            "p",
+            x0x::groups::GroupRole::Member,
+            None,
+            "i",
+            "sec",
+            42,
+            None,
+        );
+        assert_eq!(a, b);
+    }
+
+    /// Shared recipient-side fixture: a GSS-plane MlsEncrypted group on the
+    /// LOCAL daemon (an active Member), an admin actor in the roster, and a
+    /// `SecureShareDelivered` sealed to the LOCAL daemon's ML-KEM key.
+    struct Gss794ShareFixture {
+        state: std::sync::Arc<crate::server::state::AppState>,
+        _dir: tempfile::TempDir,
+        admin_id: AgentId,
+        group_id: String,
+        secret: [u8; 32],
+    }
+
+    async fn gss794_share_fixture(
+        stored_secret: Option<[u8; 32]>,
+        epoch: u64,
+    ) -> Gss794Result<Gss794ShareFixture> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_kp = crate::identity::AgentKeypair::generate()?;
+        let admin_id = admin_kp.agent_id();
+        let admin_hex = hex::encode(admin_id.as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let group_id = "d7".repeat(32);
+
+        let mut info = gss794_group_info_with_creator(x0x::mls::SecureGroupPlane::Gss, admin_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            group_id.clone(),
+            admin_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.mls_group_id = group_id.clone();
+        info.shared_secret = stored_secret.map(Vec::from);
+        info.secret_epoch = epoch;
+        info.security_binding = Some(format!("gss:epoch={epoch}"));
+        // The local daemon is a plain Member (the invite-join shape); the
+        // distributor is the admin.
+        info.add_member(
+            local_hex,
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        Ok(Gss794ShareFixture {
+            state,
+            _dir,
+            admin_id,
+            group_id,
+            secret: [0x5e; 32],
+        })
+    }
+
+    impl Gss794ShareFixture {
+        fn envelope(
+            &self,
+            recipient_hex: &str,
+            epoch: u64,
+            actor_hex: &str,
+        ) -> NamedGroupMetadataEvent {
+            use base64::Engine as _;
+            build_secure_share_event(
+                &self.group_id,
+                recipient_hex,
+                &BASE64.encode(&self.state.agent_kem_keypair.public_bytes),
+                actor_hex,
+                &self.secret,
+                epoch,
+            )
+            .expect("seal envelope")
+        }
+
+        async fn stored_secret(&self) -> Option<Vec<u8>> {
+            self.state
+                .named_groups
+                .read()
+                .await
+                .get(&self.group_id)
+                .and_then(|info| info.shared_secret.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn gss794_share_installs_into_keyless_stub_at_equal_epoch() -> Gss794Result<()> {
+        // The #794 joiner shape: keyless stub seeded at the invite's epoch.
+        // The authority's share arrives at the SAME epoch — it must install.
+        let f = gss794_share_fixture(None, 7).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let admin_hex = hex::encode(f.admin_id.as_bytes());
+        let event = f.envelope(&local_hex, 7, &admin_hex);
+        let result =
+            apply_named_group_metadata_event(&f.state, event, f.admin_id, true, None).await;
+        assert!(!result.should_exit, "share does not exit the subscriber");
+        assert_eq!(
+            f.stored_secret().await.as_deref(),
+            Some(f.secret.as_slice()),
+            "keyless stub must install the real secret at the equal epoch"
+        );
+        let groups = f.state.named_groups.read().await;
+        let info = groups.get(&f.group_id).expect("group");
+        assert_eq!(info.secret_epoch, 7);
+        assert_eq!(info.security_binding.as_deref(), Some("gss:epoch=7"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gss794_share_rejects_populated_duplicate_and_conflict_at_equal_epoch(
+    ) -> Gss794Result<()> {
+        // Root decision: a populated current-epoch secret stays immutable on
+        // the ordinary receive arm — duplicates are no-ops and conflicting
+        // plaintext (e.g. a pre-#794 wrong-secret holder receiving the real
+        // bytes at the same epoch) is NOT auto-replaced; affected holders
+        // converge via the epoch-advancing rekey path instead.
+        // The stored secret mirrors the fixture's envelope secret
+        // (`secret: [0x5e; 32]`) — the equal-epoch duplicate shape.
+        let f = gss794_share_fixture(Some([0x5e; 32]), 7).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let admin_hex = hex::encode(f.admin_id.as_bytes());
+        let sender = f.admin_id;
+
+        // Duplicate: same secret, same epoch → rejected, state unchanged.
+        let dup = f.envelope(&local_hex, 7, &admin_hex);
+        let result = apply_named_group_metadata_event(&f.state, dup, sender, true, None).await;
+        assert!(!result.accepted, "equal-epoch duplicate must be rejected");
+        assert_eq!(
+            f.stored_secret().await.as_deref(),
+            Some(f.secret.as_slice())
+        );
+
+        // Conflict: different secret, same epoch → rejected, stored secret
+        // stays exactly what it was.
+        use base64::Engine as _;
+        let conflict_event = build_secure_share_event(
+            &f.group_id,
+            &local_hex,
+            &BASE64.encode(&f.state.agent_kem_keypair.public_bytes),
+            &admin_hex,
+            &[0x99; 32],
+            7,
+        )
+        .expect("seal conflict envelope");
+        let result =
+            apply_named_group_metadata_event(&f.state, conflict_event, sender, true, None).await;
+        assert!(
+            !result.accepted,
+            "equal-epoch conflicting plaintext must be rejected (immutability)"
+        );
+        assert_eq!(
+            f.stored_secret().await.as_deref(),
+            Some(f.secret.as_slice()),
+            "stored secret must be untouched by the conflicting envelope"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gss794_share_rejects_lower_epoch() -> Gss794Result<()> {
+        let f = gss794_share_fixture(Some([0x5e; 32]), 7).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let admin_hex = hex::encode(f.admin_id.as_bytes());
+        let stale = f.envelope(&local_hex, 6, &admin_hex);
+        let result =
+            apply_named_group_metadata_event(&f.state, stale, f.admin_id, true, None).await;
+        assert!(!result.accepted, "lower-epoch envelope is a rollback");
+        assert_eq!(
+            f.stored_secret().await.as_deref(),
+            Some(f.secret.as_slice()),
+            "rollback attempt must not touch the stored secret"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gss794_share_rejects_wrong_recipient_non_admin_and_sender_mismatch() -> Gss794Result<()>
+    {
+        let f = gss794_share_fixture(None, 7).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let admin_hex = hex::encode(f.admin_id.as_bytes());
+
+        // Addressed to another agent: rejected without any crypto work.
+        let stranger = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let wrong_recipient = f.envelope(&stranger, 8, &admin_hex);
+        let result =
+            apply_named_group_metadata_event(&f.state, wrong_recipient, f.admin_id, true, None)
+                .await;
+        assert!(
+            !result.accepted,
+            "envelope for another recipient is ignored"
+        );
+        assert!(
+            f.stored_secret().await.is_none(),
+            "another recipient's envelope must install nothing"
+        );
+
+        // Non-admin actor: rejected.
+        let member_id = f.state.agent.agent_id();
+        let member_hex = local_hex.clone();
+        let non_admin = f.envelope(&local_hex, 8, &member_hex);
+        let result =
+            apply_named_group_metadata_event(&f.state, non_admin, member_id, true, None).await;
+        assert!(
+            !result.accepted,
+            "non-admin actor cannot distribute secrets"
+        );
+        assert!(f.stored_secret().await.is_none());
+
+        // Admin actor but a DIFFERENT authenticated sender: rejected — the
+        // actor claim must match the transport-authenticated sender.
+        let forged_sender = crate::identity::AgentKeypair::generate()?.agent_id();
+        let mismatched = f.envelope(&local_hex, 8, &admin_hex);
+        let result =
+            apply_named_group_metadata_event(&f.state, mismatched, forged_sender, true, None).await;
+        assert!(
+            !result.accepted,
+            "actor must equal the authenticated sender"
+        );
+        assert!(f.stored_secret().await.is_none());
+        Ok(())
+    }
+
+    /// Authority-side fixture: the LOCAL daemon is the inviter/creator of a
+    /// GSS MlsEncrypted group holding the real secret, a live one-time
+    /// invite is recorded, and the joiner signs a full MemberJoined
+    /// (outer signature + #794 KEM binding).
+    struct Gss794AuthorityFixture {
+        state: std::sync::Arc<crate::server::state::AppState>,
+        _dir: tempfile::TempDir,
+        joiner_kp: crate::identity::AgentKeypair,
+        joiner_kem: x0x::groups::kem_envelope::AgentKemKeypair,
+        group_id: String,
+        inviter_hex: String,
+        invite_secret: String,
+        secret: [u8; 32],
+    }
+
+    async fn gss794_authority_fixture() -> Gss794Result<Gss794AuthorityFixture> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let creator_id = state.agent.agent_id();
+        let creator_hex = hex::encode(creator_id.as_bytes());
+        let group_id = "d9".repeat(32);
+
+        let mut info = gss794_group_info_with_creator(x0x::mls::SecureGroupPlane::Gss, creator_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            group_id.clone(),
+            creator_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.mls_group_id = group_id.clone();
+        let secret = [0x71; 32];
+        info.shared_secret = Some(secret.to_vec());
+        info.secret_epoch = 4;
+        info.security_binding = Some("gss:epoch=4".to_string());
+        info.recompute_state_hash();
+
+        let invite_secret = format!(
+            "gss794-invite-{}",
+            &hex::encode(info.state_hash.as_bytes())[..16]
+        );
+        info.record_issued_invite(
+            invite_secret.clone(),
+            now_millis_u64() / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let joiner_kp = crate::identity::AgentKeypair::generate()?;
+        let joiner_kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        Ok(Gss794AuthorityFixture {
+            state,
+            _dir,
+            joiner_kp,
+            joiner_kem,
+            group_id,
+            inviter_hex: creator_hex,
+            invite_secret,
+            secret,
+        })
+    }
+
+    impl Gss794AuthorityFixture {
+        /// Build the joiner-signed MemberJoined. `tamper_kem_sig` corrupts
+        /// the binding signature so the authority must refuse to seal.
+        fn member_joined(&self, tamper_kem_sig: bool) -> Gss794Result<NamedGroupMetadataEvent> {
+            use base64::Engine as _;
+            let joiner_hex = self.joiner_hex();
+            let member_pubkey_b64 = BASE64.encode(self.joiner_kp.public_key().as_bytes());
+            let now_ms = now_millis_u64();
+            let canonical = canonical_member_joined_bytes(
+                &self.group_id,
+                Some(&self.group_id),
+                &joiner_hex,
+                &member_pubkey_b64,
+                x0x::groups::GroupRole::Member,
+                None,
+                &self.inviter_hex,
+                &self.invite_secret,
+                now_ms,
+                None,
+            );
+            let kem_b64 = BASE64.encode(&self.joiner_kem.public_bytes);
+            let mut kem_sig_b64 =
+                sign_member_joined_kem_binding(&self.joiner_kp, &canonical, &kem_b64)
+                    .expect("sign kem binding");
+            if tamper_kem_sig {
+                // Flip the first character while keeping it valid base64 —
+                // a well-formed but WRONG binding signature.
+                let replacement = if kem_sig_b64.starts_with('A') {
+                    "B"
+                } else {
+                    "A"
+                };
+                kem_sig_b64.replace_range(0..1, replacement);
+            }
+            let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                self.joiner_kp.secret_key(),
+                &canonical,
+            )
+            .map_err(|e| anyhow::anyhow!("sign member joined: {e:?}"))?;
+            Ok(NamedGroupMetadataEvent::MemberJoined {
+                group_id: self.group_id.clone(),
+                stable_group_id: Some(self.group_id.clone()),
+                member_agent_id: joiner_hex,
+                member_public_key_b64: member_pubkey_b64,
+                role: x0x::groups::GroupRole::Member,
+                display_name: None,
+                inviter_agent_id: self.inviter_hex.clone(),
+                invite_secret: self.invite_secret.clone(),
+                ts_ms: now_ms,
+                treekem_key_package_b64: None,
+                kem_public_key_b64: Some(kem_b64),
+                kem_signature_b64: Some(kem_sig_b64),
+                recovery_authority_agent_id: None,
+                recovery_authority_public_key_b64: None,
+                recovery_authority_signature_b64: None,
+                recovery_authority_commit: None,
+                signature_b64: BASE64.encode(sig.as_bytes()),
+            })
+        }
+
+        fn joiner_hex(&self) -> String {
+            hex::encode(self.joiner_kp.agent_id().as_bytes())
+        }
+
+        async fn secure_share_publishes_to_joiner(&self) -> bool {
+            let joiner_hex = self.joiner_hex();
+            let attempts = self
+                .state
+                .named_group_test_recorders
+                .publish_attempts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attempts.iter().any(|(_topic, _group, recipient)| {
+                recipient.as_deref() == Some(joiner_hex.as_str())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn gss794_authority_seals_real_secret_to_verified_invite_joiner() -> Gss794Result<()> {
+        let f = gss794_authority_fixture().await?;
+        let event = f.member_joined(false)?;
+        let result =
+            apply_named_group_metadata_event(&f.state, event, f.joiner_kp.agent_id(), true, None)
+                .await;
+        assert!(result.accepted, "valid invite join seats the member");
+
+        // The joiner is seated with the KEM key recorded on the roster seat.
+        let expected_kem_b64 = {
+            use base64::Engine as _;
+            BASE64.encode(&f.joiner_kem.public_bytes)
+        };
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).expect("group");
+            let seat = info.members_v2.get(&f.joiner_hex()).expect("joiner seated");
+            assert!(seat.is_active());
+            assert_eq!(
+                seat.kem_public_key_b64.as_deref(),
+                Some(expected_kem_b64.as_str()),
+                "verified KEM key must be recorded on the seat"
+            );
+            assert_eq!(info.shared_secret.as_deref(), Some(f.secret.as_slice()));
+            assert_eq!(info.secret_epoch, 4);
+        }
+
+        // The authority published a SecureShareDelivered addressed to the
+        // joiner (the recorder captures the envelope recipient).
+        assert!(
+            f.secure_share_publishes_to_joiner().await,
+            "authority must publish the real secret sealed to the joiner's KEM key"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gss794_authority_seats_but_never_seals_on_tampered_kem_binding() -> Gss794Result<()> {
+        let f = gss794_authority_fixture().await?;
+        let event = f.member_joined(true)?;
+        let result =
+            apply_named_group_metadata_event(&f.state, event, f.joiner_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            result.accepted,
+            "the join itself is invite-legitimate — the seat applies"
+        );
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).expect("group");
+            let seat = info.members_v2.get(&f.joiner_hex()).expect("joiner seated");
+            assert!(
+                seat.kem_public_key_b64.is_none(),
+                "an unverifiable KEM key must never reach the roster"
+            );
+        }
+        assert!(
+            !f.secure_share_publishes_to_joiner().await,
+            "no secret may be sealed to a tampered KEM binding"
+        );
+        Ok(())
     }
 }
 
