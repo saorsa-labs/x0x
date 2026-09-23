@@ -30,7 +30,7 @@ pub use self::churn::ChurnSnapshot;
 
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
-use saorsa_gossip_transport::GossipStreamType;
+use saorsa_gossip_transport::{AuthenticatedSession, GossipStreamType};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -49,11 +49,114 @@ type GossipPeerId = saorsa_gossip_types::PeerId;
 ///
 /// `enqueued_at` is intentionally carried with each frame so diagnostics can
 /// report queue dwell time. The wrapper never crosses the public API boundary.
+/// `session` is the SG-authenticated provenance token stamped at the receive
+/// boundary from the frame's *source* ant connection generation — never looked
+/// up again after dequeue — so a frame queued on connection A cannot acquire
+/// connection B's identity across a reconnect. Membership/Bulk frames carry
+/// `None` (SG's legacy three-tuple projection).
 #[derive(Debug)]
 struct GossipPayload {
     peer_id: AntPeerId,
     data: Bytes,
     enqueued_at: Instant,
+    session: Option<AuthenticatedSession>,
+}
+
+/// One retained live ant connection backing an SG session token.
+///
+/// The QUIC connection handle is retained so its stable id can never be
+/// aliased by a replacement connection for the same peer: a new connection
+/// has a different stable id and therefore must mint a new token.
+struct SessionEntry {
+    connection: ant_quic::high_level::Connection,
+    ant_generation: u64,
+    token: AuthenticatedSession,
+    last_used: Instant,
+}
+
+/// Bounded per-peer registry of live authenticated sessions.
+///
+/// `next` mints process-unique SG token generations; it is unrelated to ant's
+/// connection generation namespace stored alongside in each entry.
+#[derive(Default)]
+struct AuthenticatedSessions {
+    next: u64,
+    peers: HashMap<AntPeerId, SessionEntry>,
+}
+
+/// ant-quic stamps constrained/non-QUIC ingress with this sentinel.
+const STALE_GENERATION_SENTINEL: u64 = u64::MAX;
+
+fn source_generation_matches(source: u64, current: Option<u64>) -> bool {
+    source != STALE_GENERATION_SENTINEL && current == Some(source)
+}
+
+/// Resolve the SG token for a frame whose ant source generation is `source`.
+///
+/// Requires the source to be a non-sentinel generation that is still the
+/// peer's current generation both before and after registry resolution, and
+/// the registry entry to have been minted for exactly that generation. Any
+/// mismatch — reconnect between receive and enqueue, stale pre-auth data,
+/// unknown or evicted registry entry — yields `None` (unauthenticated
+/// provenance), never a relabel of the dequeued frame.
+fn stamped_receive_session(
+    source: u64,
+    before: Option<u64>,
+    registered: Option<(u64, AuthenticatedSession)>,
+    after: Option<u64>,
+) -> Option<AuthenticatedSession> {
+    if !source_generation_matches(source, before) || !source_generation_matches(source, after) {
+        return None;
+    }
+    registered.and_then(|(generation, session)| (generation == source).then_some(session))
+}
+
+/// Post-`open_uni` admission for a guarded gossip egress frame.
+///
+/// Runs synchronously after ant-quic has allocated the stream on the pinned
+/// generation. Every precondition — exact generation, unchanged live SG
+/// token, unsuppressed peer, cleared gossip plane — must still hold before
+/// SG's own `admit` callback is allowed to produce bytes; only then is the
+/// stream-type byte prepended. A refusal returns an error and ant-quic
+/// admits zero bytes without reconnect fallback.
+fn frame_guarded_admission(
+    stream_type: GossipStreamType,
+    expected_generation: u64,
+    actual_generation: u64,
+    expected_session: AuthenticatedSession,
+    current_session: Option<(u64, AuthenticatedSession)>,
+    policy_allows: bool,
+    admit: &saorsa_gossip_transport::SessionAdmission,
+) -> Result<Vec<u8>, ant_quic::EndpointError> {
+    if actual_generation != expected_generation
+        || current_session != Some((expected_generation, expected_session))
+    {
+        return Err(ant_quic::EndpointError::Connection(
+            "authenticated session changed while queued".to_owned(),
+        ));
+    }
+    if !policy_allows {
+        return Err(ant_quic::EndpointError::Connection(
+            "gossip plane policy refuses guarded send".to_owned(),
+        ));
+    }
+    let data = admit(expected_session)
+        .map_err(|error| ant_quic::EndpointError::Connection(error.to_string()))?;
+    let mut framed = Vec::with_capacity(1 + data.len());
+    framed.push(stream_type.to_byte());
+    framed.extend_from_slice(&data);
+    Ok(framed)
+}
+
+impl std::fmt::Debug for AuthenticatedSessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Connection handles are not meaningfully printable; report the
+        // bounded registry shape only.
+        f.debug_struct("AuthenticatedSessions")
+            .field("next", &self.next)
+            .field("live_entries", &self.peers.len())
+            .finish()
+    }
 }
 
 /// Default port for x0x nodes (when specified).
@@ -1533,6 +1636,7 @@ async fn forward_gossip_payload(
     peer_id: AntPeerId,
     stream_type: GossipStreamType,
     payload: Bytes,
+    session: Option<AuthenticatedSession>,
     channel_name: &'static str,
     diagnostics: &RecvPumpDiagnostics,
 ) -> Result<ForwardGossipOutcome, mpsc::error::SendError<GossipPayload>> {
@@ -1543,6 +1647,7 @@ async fn forward_gossip_payload(
         peer_id,
         data: payload,
         enqueued_at: Instant::now(),
+        session,
     };
 
     // #378 fix D: NO gossip class may block the single global receive pump.
@@ -1743,6 +1848,11 @@ pub struct NetworkNode {
     bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
     /// x0x-side connection pool tracking activity, caps, and idle eviction.
     connection_pool: Arc<ConnectionPool>,
+    /// Bounded registry of live authenticated sessions, mapping ant's
+    /// per-connection generations to SG session tokens (receive provenance
+    /// and guarded egress admission). Entries retain their QUIC connection
+    /// handle so a replacement connection can never alias a stable id.
+    authenticated_sessions: Arc<Mutex<AuthenticatedSessions>>,
     /// Per-peer liveness repair locks. Prevents concurrent fanout and
     /// maintenance tasks from repeatedly disconnecting/reconnecting the same
     /// stale connection.
@@ -2045,6 +2155,7 @@ impl NetworkNode {
             peer_id,
             bootstrap_cache,
             connection_pool,
+            authenticated_sessions: Arc::new(Mutex::new(AuthenticatedSessions::default())),
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
@@ -2341,6 +2452,85 @@ impl NetworkNode {
         }
         self.note_connection_pool_activity(*peer_id).await;
         Ok(())
+    }
+
+    /// Upper bound on tracked authenticated sessions. Mirrors the
+    /// connection-pool cap: a zero config falls back to the default.
+    fn session_registry_cap(&self) -> usize {
+        if self.config.max_connections == 0 {
+            DEFAULT_MAX_CONNECTIONS as usize
+        } else {
+            self.config.max_connections as usize
+        }
+    }
+
+    /// Current `(ant generation, SG token)` for a peer with a live, open QUIC
+    /// connection, minting/reusing a registry entry as needed.
+    ///
+    /// A returned entry proves: a non-sentinel current ant generation, a
+    /// non-closed retained QUIC connection whose stable id matches the one
+    /// recorded with the token, and the same ant generation observed before
+    /// and after the registry lock. Eviction is LRU over closed connections
+    /// first, then oldest-used, bounded by `max_peers`.
+    fn current_session_for_peer(
+        node: &Node,
+        registry: &Arc<Mutex<AuthenticatedSessions>>,
+        max_peers: usize,
+        ant_peer: &AntPeerId,
+    ) -> Option<(u64, AuthenticatedSession)> {
+        if max_peers == 0 {
+            return None;
+        }
+        let ant_generation = node.current_connection_generation(ant_peer)?;
+        if ant_generation == STALE_GENERATION_SENTINEL {
+            return None;
+        }
+        let connection = node
+            .inner_endpoint()
+            .get_quic_connection(ant_peer)
+            .ok()
+            .flatten()?;
+        if connection.close_reason().is_some()
+            || node.current_connection_generation(ant_peer) != Some(ant_generation)
+        {
+            return None;
+        }
+        let mut sessions = registry.lock().ok()?;
+        if let Some(entry) = sessions.peers.get_mut(ant_peer) {
+            if entry.connection.stable_id() == connection.stable_id()
+                && entry.ant_generation == ant_generation
+            {
+                entry.last_used = Instant::now();
+                return Some((ant_generation, entry.token));
+            }
+        }
+        let next = sessions.next.checked_add(1)?;
+        sessions
+            .peers
+            .retain(|_, entry| entry.connection.close_reason().is_none());
+        if sessions.peers.len() >= max_peers && !sessions.peers.contains_key(ant_peer) {
+            let oldest = sessions
+                .peers
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(peer, _)| *peer)?;
+            sessions.peers.remove(&oldest);
+        }
+        sessions.next = next;
+        let token = AuthenticatedSession {
+            peer: ant_to_gossip_peer_id(ant_peer),
+            generation: next,
+        };
+        sessions.peers.insert(
+            *ant_peer,
+            SessionEntry {
+                connection,
+                ant_generation,
+                token,
+                last_used: Instant::now(),
+            },
+        );
+        Some((ant_generation, token))
     }
 
     async fn disconnect_pool_candidates(&self, peer_ids: Vec<AntPeerId>, reason: &'static str) {
@@ -3892,6 +4082,7 @@ impl NetworkNode {
     pub async fn try_shutdown(&self) -> NetworkResult<()> {
         let node = Arc::clone(&self.node);
         let background_tasks = Arc::clone(&self.background_tasks);
+        let authenticated_sessions = Arc::clone(&self.authenticated_sessions);
         #[cfg(test)]
         let shutdown_failure = Arc::clone(&self.shutdown_failure_for_test);
         self.shutdown_state
@@ -3913,6 +4104,12 @@ impl NetworkNode {
                     let mut node_guard = node.write().await;
                     node_guard.take()
                 };
+                // Drop retained session-registry connections alongside the
+                authenticated_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .peers
+                    .clear();
                 let Some(node) = node else {
                     return Err(
                         "network node was absent before shutdown established a result".to_string(),
@@ -4222,24 +4419,64 @@ impl NetworkNode {
             .map_err(|e| NetworkError::ConnectionFailed(format!("inject direct: {e}")))
     }
 
-    async fn receive_from_gossip_channel(
+    async fn receive_from_gossip_channel_with_session(
         rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
         diagnostics: &RecvPumpDiagnostics,
         stream_type: GossipStreamType,
         stream_name: &'static str,
-    ) -> anyhow::Result<(GossipPeerId, Bytes)> {
+    ) -> anyhow::Result<(GossipPeerId, Bytes, Option<AuthenticatedSession>)> {
         let mut rx = rx.lock().await;
         let payload = rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("{stream_name} receive channel closed"))?;
         diagnostics.record_dequeued(stream_type, payload.enqueued_at.elapsed());
-        Ok((ant_to_gossip_peer_id(&payload.peer_id), payload.data))
+        let peer = ant_to_gossip_peer_id(&payload.peer_id);
+        // A token whose peer differs from the dequeued frame's peer is not
+        // provenance for this frame; drop it rather than relabel.
+        let session = payload.session.filter(|session| session.peer == peer);
+        Ok((peer, payload.data, session))
+    }
+
+    async fn receive_from_gossip_channel(
+        rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
+        diagnostics: &RecvPumpDiagnostics,
+        stream_type: GossipStreamType,
+        stream_name: &'static str,
+    ) -> anyhow::Result<(GossipPeerId, Bytes)> {
+        let (peer, data, _session) = Self::receive_from_gossip_channel_with_session(
+            rx,
+            diagnostics,
+            stream_type,
+            stream_name,
+        )
+        .await?;
+        Ok((peer, data))
     }
 
     /// Receive the next PubSub gossip message from the dedicated PubSub queue.
     pub async fn receive_pubsub_message(&self) -> anyhow::Result<(GossipPeerId, Bytes)> {
         Self::receive_from_gossip_channel(
+            &self.recv_pubsub_rx,
+            self.recv_pump_diagnostics.as_ref(),
+            GossipStreamType::PubSub,
+            "PubSub",
+        )
+        .await
+    }
+
+    /// Receive the next PubSub gossip message together with the SG session
+    /// token stamped from its source ant connection at the receive boundary.
+    ///
+    /// The token is carried from enqueue time — never re-derived here — so
+    /// frames queued before a reconnect keep their original (by then no
+    /// longer current) provenance, which SG's authenticated dispatcher
+    /// refuses. Returns `None` for frames whose provenance was constrained,
+    /// unknown, or evicted.
+    pub async fn receive_pubsub_message_with_session(
+        &self,
+    ) -> anyhow::Result<(GossipPeerId, Bytes, Option<AuthenticatedSession>)> {
+        Self::receive_from_gossip_channel_with_session(
             &self.recv_pubsub_rx,
             self.recv_pump_diagnostics.as_ref(),
             GossipStreamType::PubSub,
@@ -4278,6 +4515,8 @@ impl NetworkNode {
     /// - Gossip transport channel (for 0x00, 0x01, 0x02 gossip messages)
     fn spawn_receiver(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
+        let authenticated_sessions = Arc::clone(&self.authenticated_sessions);
+        let session_registry_cap = self.session_registry_cap();
         let recv_pubsub_tx = self.recv_pubsub_tx.clone();
         let recv_membership_tx = self.recv_membership_tx.clone();
         let recv_bulk_tx = self.recv_bulk_tx.clone();
@@ -4310,7 +4549,7 @@ impl NetworkNode {
                     }
                 };
 
-                let recv_result = node_ref.recv().await;
+                let recv_result = node_ref.recv_with_generation().await;
                 // Explicitly drop the read lock guard so we don't hold it
                 // across channel sends — otherwise a backpressured direct_tx
                 // or stream-specific gossip channel can stall every other caller
@@ -4318,7 +4557,7 @@ impl NetworkNode {
                 drop(node_guard);
 
                 match recv_result {
-                    Ok((peer_id, data)) => {
+                    Ok((peer_id, source_generation, data)) => {
                         if data.is_empty() {
                             continue;
                         }
@@ -4507,6 +4746,45 @@ impl NetworkNode {
                             peer_id
                         );
 
+                        // Stamp receive provenance *before* enqueue. The
+                        // frame's ant source generation (from
+                        // `recv_with_generation`) must still be the peer's
+                        // current generation both before and after registry
+                        // resolution; a reconnect in that window, sentinel
+                        // (constrained/pre-auth) provenance, or an
+                        // unknown/evicted registry entry all yield `None` —
+                        // the dequeued frame is never relabelled with a
+                        // later connection's identity. Only PubSub consumes
+                        // the token; Membership/Bulk keep the legacy
+                        // three-tuple projection.
+                        let session = {
+                            let guard = node.read().await;
+                            match guard.as_ref() {
+                                Some(n) => {
+                                    let before = n.current_connection_generation(&peer_id);
+                                    let registered =
+                                        source_generation_matches(source_generation, before)
+                                            .then(|| {
+                                                Self::current_session_for_peer(
+                                                    n,
+                                                    &authenticated_sessions,
+                                                    session_registry_cap,
+                                                    &peer_id,
+                                                )
+                                            })
+                                            .flatten();
+                                    let after = n.current_connection_generation(&peer_id);
+                                    stamped_receive_session(
+                                        source_generation,
+                                        before,
+                                        registered,
+                                        after,
+                                    )
+                                }
+                                None => None,
+                            }
+                        };
+
                         let forward_result = match stream_type {
                             GossipStreamType::PubSub => {
                                 forward_gossip_payload(
@@ -4514,6 +4792,7 @@ impl NetworkNode {
                                     peer_id,
                                     stream_type,
                                     payload,
+                                    session,
                                     "recv_pubsub_tx",
                                     recv_pump_diagnostics.as_ref(),
                                 )
@@ -4525,6 +4804,7 @@ impl NetworkNode {
                                     peer_id,
                                     stream_type,
                                     payload,
+                                    None,
                                     "recv_membership_tx",
                                     recv_pump_diagnostics.as_ref(),
                                 )
@@ -4536,6 +4816,7 @@ impl NetworkNode {
                                     peer_id,
                                     stream_type,
                                     payload,
+                                    None,
                                     "recv_bulk_tx",
                                     recv_pump_diagnostics.as_ref(),
                                 )
@@ -5565,6 +5846,86 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .collect()
     }
 
+    fn authenticated_session(&self, peer: GossipPeerId) -> Option<AuthenticatedSession> {
+        let ant_peer = gossip_to_ant_peer_id(&peer);
+        let node_guard = self.node.try_read().ok()?;
+        let node = node_guard.as_ref()?;
+        Self::current_session_for_peer(
+            node,
+            &self.authenticated_sessions,
+            self.session_registry_cap(),
+            &ant_peer,
+        )
+        .map(|(_, session)| session)
+    }
+
+    async fn send_to_peer_guarded(
+        &self,
+        peer: GossipPeerId,
+        stream_type: saorsa_gossip_transport::GossipStreamType,
+        admit: saorsa_gossip_transport::SessionAdmission,
+    ) -> anyhow::Result<()> {
+        let ant_peer = gossip_to_ant_peer_id(&peer);
+
+        // Capture the exact (ant generation, SG token) before any queue
+        // wait: the node read lock below can park behind shutdown's write
+        // lock, and ant-quic pins the same generation for stream
+        // allocation. Policy is *not* settled here — the authoritative
+        // rechecks run inside the post-`open_uni` callback below.
+        let (ant_generation, session) = {
+            let node_guard = self.node.read().await;
+            let node = node_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            Self::current_session_for_peer(
+                node,
+                &self.authenticated_sessions,
+                self.session_registry_cap(),
+                &ant_peer,
+            )
+            .ok_or_else(|| anyhow::anyhow!("authenticated session unavailable"))?
+        };
+
+        // Cheap pre-waits refusal: a suppressed or non-cleared peer fails
+        // the same policy the callback enforces, without allocating a
+        // stream first. Still an error with zero bytes admitted — guarded
+        // egress never silently holds like the ordinary path's `Ok(())`.
+        if self.is_reconnect_suppressed(ant_peer.0) || !self.plane_gate_allows(&ant_peer) {
+            return Err(anyhow::anyhow!(
+                "gossip plane policy refuses guarded send to peer {:?}",
+                peer
+            ));
+        }
+
+        {
+            let node_guard = self.node.read().await;
+            let node = node_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+            node.send_on_generation_with_admission(&ant_peer, ant_generation, |actual| {
+                frame_guarded_admission(
+                    stream_type,
+                    ant_generation,
+                    actual,
+                    session,
+                    Self::current_session_for_peer(
+                        node,
+                        &self.authenticated_sessions,
+                        self.session_registry_cap(),
+                        &ant_peer,
+                    ),
+                    !self.is_reconnect_suppressed(ant_peer.0) && self.plane_gate_allows(&ant_peer),
+                    &admit,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("guarded send failed: {}", e))?;
+        }
+        // Match the ordinary send path's pool bookkeeping on success.
+        self.note_connection_pool_activity(ant_peer).await;
+        Ok(())
+    }
+
     async fn receive_message(
         &self,
     ) -> anyhow::Result<(
@@ -5599,6 +5960,46 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         }
     }
 
+    async fn receive_message_with_session(
+        &self,
+    ) -> anyhow::Result<(
+        GossipPeerId,
+        saorsa_gossip_transport::GossipStreamType,
+        bytes::Bytes,
+        Option<AuthenticatedSession>,
+    )> {
+        // Same biased select as `receive_message`; only a PubSub-queued
+        // payload carries a stamped token (Bulk/Membership stay `None`),
+        // and a token whose peer differs from the dequeued frame is
+        // dropped rather than relabelled onto those bytes.
+        let mut bulk_rx = self.recv_bulk_rx.lock().await;
+        let mut membership_rx = self.recv_membership_rx.lock().await;
+        let mut pubsub_rx = self.recv_pubsub_rx.lock().await;
+
+        tokio::select! {
+            biased;
+            msg = bulk_rx.recv() => {
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("Bulk receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::Bulk, payload.enqueued_at.elapsed());
+                Ok((ant_to_gossip_peer_id(&payload.peer_id), GossipStreamType::Bulk, payload.data, None))
+            }
+            msg = membership_rx.recv() => {
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("Membership receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::Membership, payload.enqueued_at.elapsed());
+                Ok((ant_to_gossip_peer_id(&payload.peer_id), GossipStreamType::Membership, payload.data, None))
+            }
+            msg = pubsub_rx.recv() => {
+                let payload = msg.ok_or_else(|| anyhow::anyhow!("PubSub receive channel closed"))?;
+                self.recv_pump_diagnostics
+                    .record_dequeued(GossipStreamType::PubSub, payload.enqueued_at.elapsed());
+                let peer = ant_to_gossip_peer_id(&payload.peer_id);
+                let session = payload.session.filter(|session| session.peer == peer);
+                Ok((peer, GossipStreamType::PubSub, payload.data, session))
+            }
+        }
+    }
     fn local_peer_id(&self) -> GossipPeerId {
         ant_to_gossip_peer_id(&self.peer_id())
     }
@@ -5897,6 +6298,209 @@ mod map_gossip_send_error_tests {
                 .is_none(),
             "live-connection errors must keep the anyhow wrap"
         );
+    }
+}
+
+/// Pure receive-provenance and guarded-admission tests for the SG session
+/// seam. These exercise the decision helpers only — no sockets, no Node.
+#[cfg(test)]
+mod session_provenance_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn token(generation: u64) -> AuthenticatedSession {
+        AuthenticatedSession {
+            peer: GossipPeerId::new([9; 32]),
+            generation,
+        }
+    }
+
+    #[test]
+    fn old_queued_generation_stays_old_across_reconnect() {
+        // Frame read on generation 5; a reconnect (now 6) happened before
+        // the stamp completed. The frame must NOT inherit generation 6's
+        // token — provenance becomes None, not a relabel.
+        assert_eq!(
+            stamped_receive_session(5, Some(5), Some((5, token(41))), Some(6)),
+            None
+        );
+        // Reconnect observed before registry resolution: equally refused.
+        assert_eq!(
+            stamped_receive_session(5, Some(6), Some((6, token(42))), Some(6)),
+            None
+        );
+    }
+
+    #[test]
+    fn sentinel_or_unknown_source_generation_is_none() {
+        // ant-quic's u64::MAX sentinel denotes constrained / pre-auth
+        // ingress and must never authorize a session.
+        assert_eq!(
+            stamped_receive_session(
+                STALE_GENERATION_SENTINEL,
+                Some(STALE_GENERATION_SENTINEL),
+                Some((STALE_GENERATION_SENTINEL, token(1))),
+                Some(STALE_GENERATION_SENTINEL),
+            ),
+            None
+        );
+        // Unknown / evicted registry entry: no token.
+        assert_eq!(stamped_receive_session(3, Some(3), None, Some(3)), None);
+        // No live connection at all.
+        assert_eq!(stamped_receive_session(3, None, None, None), None);
+    }
+
+    #[test]
+    fn matching_source_generation_keeps_enqueued_token_identity() {
+        let enqueued = token(77);
+        let resolved = stamped_receive_session(5, Some(5), Some((5, enqueued)), Some(5))
+            .expect("live matching generation resolves to the enqueued token");
+        assert_eq!(resolved, enqueued);
+        // A registry entry minted for a *different* ant generation cannot
+        // vouch for this frame.
+        assert_eq!(
+            stamped_receive_session(5, Some(5), Some((6, token(78))), Some(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn frame_guarded_admission_refuses_generation_change_without_admitting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Bytes::from_static(b"payload"))
+            })
+        };
+        let err = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            5,
+            6,
+            token(1),
+            Some((6, token(2))),
+            true,
+            &admit,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ant_quic::EndpointError::Connection(_)),
+            "generation change must be a connection refusal, got {err:?}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "admit must not run");
+    }
+
+    #[test]
+    fn frame_guarded_admission_refuses_session_change_without_admitting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Bytes::from_static(b"payload"))
+            })
+        };
+        // Same ant generation, but the registry now holds a different SG
+        // token (connection was replaced under the same generation number):
+        // the queued token is stale.
+        let err = frame_guarded_admission(
+            GossipStreamType::Bulk,
+            5,
+            5,
+            token(1),
+            Some((5, token(2))),
+            true,
+            &admit,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ant_quic::EndpointError::Connection(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "admit must not run");
+    }
+
+    #[test]
+    fn frame_guarded_admission_refuses_policy_change_without_admitting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Bytes::from_static(b"payload"))
+            })
+        };
+        // Generation and session intact, but the peer became suppressed or
+        // lost plane clearance while the send waited.
+        let err = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            5,
+            5,
+            token(1),
+            Some((5, token(1))),
+            false,
+            &admit,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ant_quic::EndpointError::Connection(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "admit must not run");
+    }
+
+    #[test]
+    fn frame_guarded_admission_propagates_admit_refusal_as_error() {
+        let admit: saorsa_gossip_transport::SessionAdmission =
+            Arc::new(|_| anyhow::bail!("SG refused the session"));
+        let err = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            5,
+            5,
+            token(1),
+            Some((5, token(1))),
+            true,
+            &admit,
+        )
+        .unwrap_err();
+        let ant_quic::EndpointError::Connection(reason) = err else {
+            panic!("admit refusal must surface as a connection error");
+        };
+        assert_eq!(reason, "SG refused the session");
+    }
+    #[test]
+    fn frame_guarded_admission_prepends_stream_byte_after_checks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let expected = token(1);
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let calls = Arc::clone(&calls);
+            let seen = Arc::clone(&seen);
+            Arc::new(move |session| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(session);
+                Ok(Bytes::from_static(b"payload"))
+            })
+        };
+        let framed = frame_guarded_admission(
+            GossipStreamType::PubSub,
+            5,
+            5,
+            expected,
+            Some((5, expected)),
+            true,
+            &admit,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            framed,
+            std::iter::once(GossipStreamType::PubSub.to_byte())
+                .chain(b"payload".iter().copied())
+                .collect::<Vec<u8>>()
+        );
+        let observed = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(*observed, vec![expected]);
     }
 }
 
@@ -6983,6 +7587,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             Bytes::from_static(b"one"),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
         )
@@ -6993,6 +7598,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             Bytes::from_static(b"two"),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
         )
@@ -7026,6 +7632,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::Membership,
             Bytes::from_static(b"first"),
+            None,
             "recv_membership_tx",
             &diagnostics,
         )
@@ -7038,6 +7645,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::Membership,
             Bytes::from_static(b"second"),
+            None,
             "recv_membership_tx",
             &diagnostics,
         );
@@ -7073,6 +7681,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::Bulk,
             Bytes::from_static(b"first"),
+            None,
             "recv_bulk_tx",
             &diagnostics,
         )
@@ -7084,6 +7693,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::Bulk,
             Bytes::from_static(b"second"),
+            None,
             "recv_bulk_tx",
             &diagnostics,
         );
@@ -7184,6 +7794,7 @@ mod pressure_tests {
                 peer_id: peer,
                 data: Bytes::from_static(b"x"),
                 enqueued_at: Instant::now(),
+                session: None,
             })
             .expect("prefill should fit");
         }
@@ -7195,6 +7806,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             frame(MessageKind::IHave),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
         )
@@ -7213,6 +7825,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             frame(MessageKind::Eager),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
         )
@@ -7227,6 +7840,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             frame(MessageKind::Eager),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
         )
@@ -7319,6 +7933,7 @@ mod pressure_tests {
             peer,
             GossipStreamType::PubSub,
             Bytes::from_static(b"payload"),
+            None,
             "recv_pubsub_tx",
             &diagnostics,
         )
