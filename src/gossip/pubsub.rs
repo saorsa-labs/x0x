@@ -1079,7 +1079,7 @@ impl PubSubManager {
 
     /// Sample independently of HTTP reads, once per runtime peer-refresh tick.
     pub(crate) fn sample_egress(&self) {
-        let stages = serde_json::to_value(self.plumtree.stage_stats()).unwrap_or_default();
+        let outbound_by_topic = self.plumtree.outbound_by_topic_stats();
         let mut config = self.egress_config.clone();
         config.participation = self.participation;
         self.egress_meter
@@ -1087,7 +1087,7 @@ impl PubSubManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .sample(
                 Instant::now(),
-                &stages["outbound_by_topic"],
+                &outbound_by_topic,
                 &self.subscribed_topic_keys(),
                 &config,
             );

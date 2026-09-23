@@ -2,9 +2,10 @@
 use super::config::GossipConfig;
 use crate::network::NetworkNode;
 use bytes::Bytes;
+use saorsa_gossip_pubsub::OutboundTopicMeterSnapshot;
 use saorsa_gossip_transport::{AuthenticatedSession, GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -234,25 +235,21 @@ impl EgressMeter {
     pub fn sample(
         &mut self,
         now: Instant,
-        rows: &serde_json::Value,
+        rows: &BTreeMap<String, OutboundTopicMeterSnapshot>,
         subscribed: &HashSet<String>,
         config: &GossipConfig,
     ) {
         let mut delta = 0u64;
-        if let Some(rows) = rows.as_object() {
-            for (topic, kinds) in rows {
-                let bytes = kinds
-                    .as_object()
-                    .map(|kinds| {
-                        kinds.values().fold(0u64, |sum, kind| {
-                            sum.saturating_add(kind["bytes"].as_u64().unwrap_or(0))
-                        })
-                    })
-                    .unwrap_or(0);
-                let old = self.previous.insert(topic.clone(), bytes).unwrap_or(0);
-                if subscribed.contains(topic) {
-                    delta = delta.saturating_add(bytes.saturating_sub(old));
-                }
+        for (topic, kinds) in rows {
+            let bytes = kinds
+                .eager
+                .bytes
+                .saturating_add(kinds.ihave.bytes)
+                .saturating_add(kinds.iwant.bytes)
+                .saturating_add(kinds.anti_entropy.bytes);
+            let old = self.previous.insert(topic.clone(), bytes).unwrap_or(0);
+            if subscribed.contains(topic) {
+                delta = delta.saturating_add(bytes.saturating_sub(old));
             }
         }
         self.samples.push_back((now, delta));
@@ -288,7 +285,26 @@ impl EgressMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use saorsa_gossip_pubsub::OutboundKindMeterSnapshot;
+
+    fn topic_meter(
+        eager: u64,
+        ihave: u64,
+        iwant: u64,
+        anti_entropy: u64,
+    ) -> OutboundTopicMeterSnapshot {
+        let kind = |label, bytes| OutboundKindMeterSnapshot {
+            label,
+            msgs: 0,
+            bytes,
+        };
+        OutboundTopicMeterSnapshot {
+            eager: kind("eager", eager),
+            ihave: kind("ihave", ihave),
+            iwant: kind("iwant", iwant),
+            anti_entropy: kind("anti_entropy", anti_entropy),
+        }
+    }
 
     #[test]
     fn slice1_rate_window_exceed_counts_are_observe_only_and_expire() {
@@ -300,7 +316,10 @@ mod tests {
         let mut meter = EgressMeter::default();
         let now = Instant::now();
         let subscribed = HashSet::from(["bus".to_string()]);
-        let rows = json!({"bus": {"eager": {"bytes": 600}, "iwant": {"bytes": 60}}, "other": {"eager": {"bytes": 60_000}}});
+        let rows = BTreeMap::from([
+            ("bus".to_string(), topic_meter(600, 0, 60, 0)),
+            ("other".to_string(), topic_meter(60_000, 0, 0, 0)),
+        ]);
         meter.sample(now, &rows, &subscribed, &config);
         assert_eq!(meter.rate, 11.0);
         assert_eq!((meter.soft_exceeded, meter.hard_exceeded), (1, 1));
@@ -319,7 +338,7 @@ mod tests {
         };
         meter.sample(
             now + Duration::from_secs(61),
-            &json!({"bus":{"eager":{"bytes":60000}}}),
+            &BTreeMap::from([("bus".to_string(), topic_meter(60_000, 0, 0, 0))]),
             &subscribed,
             &disabled,
         );
@@ -330,6 +349,27 @@ mod tests {
         };
         meter.sample(now + Duration::from_secs(62), &rows, &subscribed, &full);
         assert_eq!((meter.soft_exceeded, meter.hard_exceeded), (2, 2));
+    }
+
+    #[test]
+    fn previously_unsubscribed_topic_counts_only_new_bytes_after_subscription() {
+        let mut meter = EgressMeter::default();
+        let config = GossipConfig::default();
+        let now = Instant::now();
+        let initial = BTreeMap::from([("bus".to_string(), topic_meter(100, 20, 3, 7))]);
+        meter.sample(now, &initial, &HashSet::new(), &config);
+        assert_eq!(meter.rate, 0.0);
+
+        let subscribed = HashSet::from(["bus".to_string()]);
+        meter.sample(now + Duration::from_secs(1), &initial, &subscribed, &config);
+        assert_eq!(
+            meter.rate, 0.0,
+            "earlier unsubscribed traffic is the baseline"
+        );
+
+        let later = BTreeMap::from([("bus".to_string(), topic_meter(105, 22, 4, 8))]);
+        meter.sample(now + Duration::from_secs(2), &later, &subscribed, &config);
+        assert_eq!(meter.rate, 9.0 / 60.0, "all four new wire-kind bytes count");
     }
 
     mod track_iwant {
