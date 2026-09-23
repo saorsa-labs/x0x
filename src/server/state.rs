@@ -928,6 +928,9 @@ pub(super) struct AppState {
     pub(super) pending_welcome_waiters: RwLock<HashMap<String, Vec<WelcomeFetchWaiter>>>,
     /// Per-active Welcome blob transfer ack slots.
     pub(super) pending_welcome_acks: RwLock<HashMap<String, Arc<FileChunkAckSlot>>>,
+    /// Bounded, process-local exact-byte transfers for oversized named-group
+    /// direct events and join results. No control payload is persisted.
+    pub(super) control_blobs: crate::server::routes::ControlBlobState,
     /// Bounded per-group queue for verified TreeKEM membership events that
     /// arrived before local TreeKEM readiness or ahead of our state frontier.
     pub(super) treekem_pending_events:
@@ -972,6 +975,15 @@ pub(super) struct AppState {
     /// verified) by the joiner's chain-verified adoption. Single-apply.
     pub(super) pending_head_attestations:
         StdMutex<HashMap<String, crate::server::routes::named_groups::HeadAttestation>>,
+    /// Serializes the per-joiner join-result context lifecycle
+    /// (chain/attestation insertion → apply → removal) keyed by
+    /// `join_result_key`, so a detached fetch task delivering a stale
+    /// bound result can never clobber the context of a concurrently
+    /// applying current result. Lock order: this mutex is always acquired
+    /// BEFORE the group membership lock inside apply; nothing acquires it
+    /// while holding the membership lock.
+    pub(super) pending_join_result_processing:
+        StdMutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
     /// arrived before their matching `JoinRequestCreated` predecessor. The
     /// approval is retained without mutating group state and drained after

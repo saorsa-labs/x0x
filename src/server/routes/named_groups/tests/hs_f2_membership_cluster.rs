@@ -5821,6 +5821,7 @@ async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> R
             None,
             &mut replay_group_id,
             &mut std::collections::BTreeSet::new(),
+            None,
             true,
             true,
         ),
