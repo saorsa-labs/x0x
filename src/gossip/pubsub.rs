@@ -1954,8 +1954,12 @@ impl PubSubManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // The transport plane is one snapshot for this pass. Rank it once:
+        // ant-quic's cache selectors clone and sort every cached peer.
+        let mut ordered_peers = None;
         for topic_id in &subscribed_ids {
-            self.apply_topic_peers(*topic_id, peers.clone()).await;
+            self.apply_topic_peers_from_snapshot(*topic_id, &peers, &mut ordered_peers)
+                .await;
         }
 
         // Full (bootstrap / relay / `--relay`): also refresh pass-through
@@ -1971,19 +1975,38 @@ impl PubSubManager {
         let all_plumtree_topics = self.known_plumtree_topics().await;
         for topic_id in all_plumtree_topics {
             if !subscribed_ids.contains(&topic_id) {
-                self.apply_topic_peers(topic_id, peers.clone()).await;
+                self.apply_topic_peers_from_snapshot(topic_id, &peers, &mut ordered_peers)
+                    .await;
             }
         }
     }
 
+    async fn apply_topic_peers_from_snapshot(
+        &self,
+        topic_id: TopicId,
+        connected_peers: &[PeerId],
+        ordered_peers: &mut Option<Vec<PeerId>>,
+    ) {
+        self.ensure_eager_ceiling().await;
+        let peers = refresh_ordered_peers(connected_peers, ordered_peers, |peers| {
+            self.ordered_topic_peers(peers)
+        })
+        .await;
+        self.set_ordered_topic_peers(topic_id, peers).await;
+    }
+
     async fn apply_topic_peers(&self, topic_id: TopicId, peers: Vec<PeerId>) {
         self.ensure_eager_ceiling().await;
+        let peers = self.ordered_topic_peers(peers).await;
+        self.set_ordered_topic_peers(topic_id, peers).await;
+    }
+
+    async fn set_ordered_topic_peers(&self, topic_id: TopicId, peers: Vec<PeerId>) {
         #[cfg(test)]
         self.refreshed_topic_ids
             .lock()
             .expect("refresh log")
             .push(topic_id);
-        let peers = self.ordered_topic_peers(peers).await;
         self.plumtree.set_topic_peers(topic_id, peers).await;
     }
 
@@ -2202,6 +2225,25 @@ impl PubSubManager {
                 self.egress_config.leaf_max_eager_degree
             },
         )
+    }
+}
+
+async fn refresh_ordered_peers<F, Fut>(
+    connected_peers: &[PeerId],
+    ordered_peers: &mut Option<Vec<PeerId>>,
+    order: F,
+) -> Vec<PeerId>
+where
+    F: FnOnce(Vec<PeerId>) -> Fut,
+    Fut: std::future::Future<Output = Vec<PeerId>>,
+{
+    match ordered_peers {
+        Some(peers) => peers.clone(),
+        None => {
+            let peers = order(connected_peers.to_vec()).await;
+            *ordered_peers = Some(peers.clone());
+            peers
+        }
     }
 }
 
@@ -5097,6 +5139,33 @@ mod tests {
         assert_eq!(snap.mode, ParticipationMode::Full);
         assert!(snap.passthrough_refresh_ran);
         assert_eq!(snap.passthrough_refresh_runs, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_order_snapshot_is_shared_within_pass_and_fresh_next_pass() {
+        // Pure peer ordering: no node, daemon, or socket is created.
+        let calls = std::cell::Cell::new(0);
+        let first_plane = vec![PeerId::new([3; 32]), PeerId::new([1; 32])];
+        let mut snapshot = None;
+        for _topic in 0..3 {
+            let ordered = refresh_ordered_peers(&first_plane, &mut snapshot, |peers| {
+                calls.set(calls.get() + 1);
+                std::future::ready(ordered_leaf_peers(peers, &[], &[], &HashSet::new(), 2))
+            })
+            .await;
+            assert_eq!(ordered, vec![PeerId::new([1; 32]), PeerId::new([3; 32])]);
+        }
+        assert_eq!(calls.get(), 1, "all topics share one ordering pass");
+
+        let second_plane = vec![PeerId::new([4; 32]), PeerId::new([2; 32])];
+        let mut next_pass_snapshot = None;
+        let ordered = refresh_ordered_peers(&second_plane, &mut next_pass_snapshot, |peers| {
+            calls.set(calls.get() + 1);
+            std::future::ready(ordered_leaf_peers(peers, &[], &[], &HashSet::new(), 2))
+        })
+        .await;
+        assert_eq!(ordered, vec![PeerId::new([2; 32]), PeerId::new([4; 32])]);
+        assert_eq!(calls.get(), 2, "next refresh recomputes from its new plane");
     }
 
     fn passthrough_frame(kind: MessageKind, topic: TopicId) -> Bytes {
