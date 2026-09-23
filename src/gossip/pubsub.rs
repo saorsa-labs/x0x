@@ -1166,7 +1166,15 @@ impl PubSubManager {
                     "iwant_matched_eager_attempt_bytes": self.transport.repair_bytes.load(Ordering::Relaxed),
                     "semantics": "subset of eager counters matching v2 in-flight IWANT peer/topic/message IDs (unverified frame fields; PlumTree verifies the IWANT itself, #656); includes coincident same-message forwards, not confirmed delivery; anti_entropy stays separate"
                 }
-            }
+            },
+            // SG76 key-cache runtime witness: cumulative outer-key wire
+            // accounting (Full vs Ref frames/bytes in and out), cache
+            // hits/misses/evictions, control batches emitted, pending
+            // high-water/timeouts/limit drops, and replay outcomes —
+            // serialized straight from the pinned producer's snapshot.
+            // Additive only; no policy input.
+            "key_cache": serde_json::to_value(self.plumtree.key_cache_stats())
+                .unwrap_or_default(),
         })
     }
 
