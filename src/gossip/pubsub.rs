@@ -3900,7 +3900,35 @@ mod tests {
         for _ in 0..2 {
             tokio::time::sleep(Duration::from_secs(31)).await;
         }
-        let frames = (3..=6)
+        // #807/#774: the whole connected plane is topic membership and only
+        // sg's ceiling caps eager. Which non-preferred peers are eager is
+        // sg's score choice (ties are not broken), so the unsolicited
+        // senders must be drawn from the LAZY members: sg never forwards an
+        // EAGER back to its sender, and a sender that happened to be eager
+        // would legitimately reach only one peer.
+        let plane: Vec<[u8; 32]> = (1..=8).map(|id| [id; 32]).collect();
+        let roles = plane_roles(&manager, topic, &plane);
+        assert!(
+            roles
+                .iter()
+                .all(|(_, role)| role == "eager" || role == "lazy"),
+            "every connected peer stays eager-or-lazy after maintenance: {roles:?}"
+        );
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "eager").count(),
+            2,
+            "maintenance keeps eager at the Leaf ceiling D=2: {roles:?}"
+        );
+        assert_eq!(role_for(&manager, topic, [8; 32]), "eager");
+        let senders: Vec<u8> = roles
+            .iter()
+            .filter(|(_, role)| role == "lazy")
+            .map(|(peer, _)| peer[0])
+            .take(4)
+            .collect();
+        assert_eq!(senders.len(), 4, "six lazy members exist: {roles:?}");
+        let frames = senders
+            .into_iter()
             .map(|peer| {
                 (
                     PeerId::new([peer; 32]),
