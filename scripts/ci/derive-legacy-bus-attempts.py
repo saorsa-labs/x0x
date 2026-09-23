@@ -18,6 +18,13 @@ PREFIX = b"ISSUE501_MEASUREMENT "
 SELECTOR = "legacy_bus_interop_tests::paired_controlled_load_bus_eager_attempts_default_vs_optout"
 KINDS = ("eager", "ihave", "iwant", "anti_entropy")
 BUS = "a746d680e31732d1"
+# Reserved SG key-cache control topic: blake3 hex8 of the Rust literal
+# SG_KEY_CACHE_CONTROL_TOPIC in src/legacy_bus_interop_tests.rs (saorsa-gossip
+# 7e395117 crates/pubsub/src/key_cache.rs CONTROL_DOMAIN, pub(crate) upstream).
+# Protected hop-local control egress only; its rows must carry zero msgs and
+# bytes in all four KINDS wherever they appear.
+KEY_CACHE_CONTROL_TOPIC = "saorsa-gossip/key-cache-control/v1"
+CONTROL = "87f4025bf2b9a4ad"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 REGISTRY_PUBSUB_VERSION = "0.5.84"
@@ -86,6 +93,7 @@ def validate_source_premise(cargo_bytes, rust_bytes):
         ("REGISTRY_PUBSUB_SHA", REGISTRY_PUBSUB_SHA),
         ("GIT_PUBSUB_VERSION", GIT_PUBSUB_VERSION),
         ("GIT_PUBSUB_SOURCE", GIT_PUBSUB_SOURCE),
+        ("SG_KEY_CACHE_CONTROL_TOPIC", KEY_CACHE_CONTROL_TOPIC),
     ):
         values = re.findall(rf'const {name}: &str =\s*"([^"]+)";', rust)
         require(values == [expected], f"RUST_{name}_MISMATCH")
@@ -288,6 +296,15 @@ def derive(record, lock_bytes):
                     y = counters[kind][field]
                     require(y >= x, "COUNTER_DECREASE")
                     deltas[key][kind][field] = y - x
+        # Match the Rust FAIL verdict after row and counter-continuity checks:
+        # protected control traffic is separate from these four data-plane
+        # kinds, and never contributes to the bus-only savings arithmetic.
+        for rows_by_topic in (before, after):
+            reserved = rows_by_topic.get(CONTROL)
+            if reserved is not None and any(reserved[kind][field] != 0
+                                            for kind in KINDS for field in ("msgs", "bytes")):
+                oracle_failures.append(arm + "_RESERVED_TOPIC_DATA_PLANE")
+                break
         if arm == "D5":
             require(BUS in after, "POSITIVE_BUS_ROW_ABSENT")
             # Endpoint peer_scores are retained diagnostics, not a send premise.

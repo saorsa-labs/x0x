@@ -612,6 +612,59 @@ jobs:
           path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
           if-no-files-found: error
 
+  # SG76: public application PubSub through the real x0x/QUIC adapter, with
+  # Full -> Ref counters and exact remote delivery before and after restart.
+  gossip-key-cache-transport:
+    name: Gossip key-cache transport proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144
+      - name: Run exact ignored public PubSub key-cache selector
+        env:
+          X0X_ISOLATION_ROLE: acceptance
+        run: |
+          bash scripts/ci/nextest-isolated.sh --all-features \
+            --test gossip_key_cache_transport -- \
+            --run-ignored ignored-only \
+            --no-tests=fail \
+            --test-threads 1 \
+            -E 'test(=public_pubsub_key_cache_full_ref_restart_recovery)'
+      - name: Collect isolation and build custody
+        id: collect_key_cache_custody
+        if: always()
+        env:
+          X0X_CUSTODY_EXPECT: ${{ job.status }}
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: gossip_key_cache_transport
+        run: >-
+          python3 scripts/ci/isolation-custody-collect.py
+          "$RUNNER_TEMP/x0x-custody-receipt"
+      - name: Upload isolation custody receipt
+        if: always() && steps.collect_key_cache_custody.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: gossip-key-cache-transport-isolation-custody
+          path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
+          if-no-files-found: error
+
   # ── Soak test (weekly, ~90min) ────────────────────────────────────────
   soak:
     name: Soak Test

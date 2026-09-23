@@ -598,6 +598,16 @@ async fn paired_controlled_load_bus_eager_attempts_default_vs_optout() {
     run(Case::Measurement).await;
 }
 
+/// SG-internal reserved key-cache control topic, blake3 hex8
+/// `87f4025bf2b9a4ad`. Literal from the saorsa-gossip pin 7e395117
+/// (Cargo.lock git rev) `crates/pubsub/src/key_cache.rs` `CONTROL_DOMAIN`
+/// (`pub(crate)`, so a symbol import is impossible; literal-by-design like
+/// the rest of the universe list). A universe member only because pinned SG
+/// spawns `spawn_key_cache_control_flusher` for every PubSub instance
+/// (pubsub lib.rs:6831): session-scoped control egress on authenticated
+/// sessions, never an x0x application topic.
+const SG_KEY_CACHE_CONTROL_TOPIC: &str = "saorsa-gossip/key-cache-control/v1";
+
 // Literal source-reviewed lifetime universe, not observed subscriptions. The
 // full Agent fixture starts only identity/machine/user listeners, revocation,
 // move listeners, capability services, blob service and the actual DM inboxes.
@@ -620,6 +630,10 @@ fn topic_universe(agents: &[Agent]) -> serde_json::Value {
         crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC,
         crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC,
         DM_BUS_TOPIC,
+        // Upstream-internal session-scoped control plane; see the const doc
+        // above. Its rows must carry zero data-plane bytes (premise in
+        // validate_measurement).
+        SG_KEY_CACHE_CONTROL_TOPIC,
     ];
     let mut universe = std::collections::BTreeMap::new();
     for name in fixed {
@@ -1885,6 +1899,12 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
     if !projected.contains(bus.as_str()) {
         return Err("bus missing from universe".into());
     }
+    // SG key-cache control topic: universe member (see
+    // SG_KEY_CACHE_CONTROL_TOPIC). Kept in one place with the row premise
+    // below so the two cannot drift apart.
+    let control = saorsa_gossip_types::TopicId::from_entity(SG_KEY_CACHE_CONTROL_TOPIC.as_bytes())
+        .to_string();
+
     // #613: the generator's machine ID keys the per-peer receive-pump rows.
     let generator_machine_hex = raw["identities"][0]["machine"]
         .as_str()
@@ -1927,6 +1947,27 @@ fn validate_measurement(raw: &serde_json::Value) -> Result<(), String> {
                     let y = new[kind][field].as_u64().ok_or("invalid new counter")?;
                     if y < x {
                         return Err("counter decrease".into());
+                    }
+                }
+            }
+        }
+        // Control-plane purity premise: the SG key-cache control topic is
+        // session-scoped protected control egress. When its row is present,
+        // it must carry zero data-plane msgs AND bytes in every one of the
+        // four kinds — non-zero eager/ihave/iwant/anti_entropy there is a
+        // control-plane leak (data-plane traffic riding the reserved topic)
+        // and fails the measurement outright, not merely inconclusives it.
+        // Deliberately not O5_BUS_ORACLE_KINDS: the reserved-topic premise
+        // must not silently change if an arm's oracle kinds ever diverge.
+        for rows in [&a, &b] {
+            if let Some(row) = rows.get(control.as_str()) {
+                for kind in ["eager", "ihave", "iwant", "anti_entropy"] {
+                    for field in ["msgs", "bytes"] {
+                        if row[kind][field].as_u64().ok_or("invalid control counter")? != 0 {
+                            return Err(format!(
+                                "FAIL: {arm}: control plane carried {kind} {field}"
+                            ));
+                        }
                     }
                 }
             }
@@ -3666,6 +3707,124 @@ fn validate_topology_accepts_stripped_observations() {
             assert!(
                 !e.contains("topology keys mismatch"),
                 "stripped observations must not trigger topology-key check; got: {e}"
+            );
+        }
+    }
+}
+
+fn reserved_measurement_row(topic: &str) -> serde_json::Value {
+    serde_json::json!({"topic_id_hex8":topic,"name":"unknown-hex","names":[],
+        "outbound":{"eager":{"msgs":0,"bytes":0},"ihave":{"msgs":0,"bytes":0},
+            "iwant":{"msgs":0,"bytes":0},"anti_entropy":{"msgs":0,"bytes":0}}})
+}
+
+// JSON-only measurement evidence: synthetic_diamond_evidence topology plus
+// the production fixed-topic declaration (without Agent-specific topics). D5
+// moves bus eager bytes; O5 is a clean opt-out; both arms carry the reserved
+// SG key-cache control row with zero data-plane counters — the exact live
+// shape since the SG 7e395117 pin (its control flusher runs per PubSub
+// instance for every authenticated session).
+fn synthetic_measurement_evidence() -> serde_json::Value {
+    use serde_json::json;
+    let hex8 = |name: &str| saorsa_gossip_types::TopicId::from_entity(name.as_bytes()).to_string();
+    let bus = hex8(DM_BUS_TOPIC);
+    let control = hex8(SG_KEY_CACHE_CONTROL_TOPIC);
+    let mut raw = synthetic_diamond_evidence();
+    raw["universe"] = topic_universe(&[]);
+    let sample = |begin: u64, rows: serde_json::Value, bus_subscribed: bool| {
+        json!({"begin_ns":begin,"end_ns":begin+1,
+            "egress":{
+                "subscribed_topics": if bus_subscribed {
+                    json!([{"name":DM_BUS_TOPIC,"topic_id_hex8":bus}])
+                } else { json!([]) },
+                "outbound_by_topic_named": rows,
+                "egress_budget":{"byte_policy":"observe_only","repair":{"tracking_overflow":0}}},
+            "participation":{"mode":"leaf","relay_bytes":7}})
+    };
+    let bus_row = serde_json::json!({"topic_id_hex8":bus,"name":DM_BUS_TOPIC,
+        "names":[DM_BUS_TOPIC],
+        "outbound":{"eager":{"msgs":1,"bytes":4096},"ihave":{"msgs":0,"bytes":0},
+            "iwant":{"msgs":0,"bytes":0},"anti_entropy":{"msgs":0,"bytes":0}}});
+    raw["samples"]["D5"] = json!({
+        "t0": sample(2_000_000_000, json!([reserved_measurement_row(&control)]), true),
+        "t1": sample(12_000_000_000, json!([bus_row, reserved_measurement_row(&control)]), true),
+    });
+    raw["samples"]["O5"] = json!({
+        "t0": sample(2_000_000_000, json!([reserved_measurement_row(&control)]), false),
+        "t1": sample(12_000_000_000, json!([reserved_measurement_row(&control)]), false),
+    });
+    raw
+}
+
+// Declared zero reserved control row (both arms, both cuts) is accepted:
+// admission of the reserved topic changes no verdict while its rows stay
+// pure control-plane.
+#[test]
+fn validate_measurement_accepts_declared_zero_reserved_control_row() {
+    let evidence = synthetic_measurement_evidence();
+    validate_measurement(&evidence)
+        .expect("declared zero reserved control row must not change the verdict");
+}
+
+// The same evidence minus the universe declaration must stay rejected: the
+// admission is a deliberate source-reviewed act, never an observed-row fact.
+#[test]
+fn validate_measurement_rejects_reserved_row_without_universe_declaration() {
+    let mut evidence = synthetic_measurement_evidence();
+    evidence["universe"]
+        .as_array_mut()
+        .expect("universe")
+        .retain(|row| row["name"].as_str() != Some(SG_KEY_CACHE_CONTROL_TOPIC));
+    let err = validate_measurement(&evidence)
+        .expect_err("undeclared reserved row must be rejected fail-closed");
+    assert!(
+        err.contains("D5: observed topic outside admitted universe"),
+        "expected universe rejection; got: {err}"
+    );
+}
+
+// Arbitrary unknown topics stay rejected — the admission is a single named
+// literal, never a blanket unknown-hex or zero-row exemption.
+#[test]
+fn validate_measurement_rejects_arbitrary_rogue_topic_row() {
+    let mut evidence = synthetic_measurement_evidence();
+    let rogue = saorsa_gossip_types::TopicId::from_entity(b"x0x-rogue-topic").to_string();
+    let mut row = reserved_measurement_row(&rogue);
+    row["name"] = serde_json::json!("rogue");
+    evidence["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"]
+        .as_array_mut()
+        .expect("rows")
+        .push(row);
+    let err = validate_measurement(&evidence).expect_err("rogue topic must stay rejected");
+    assert!(
+        err.contains("observed topic outside admitted universe"),
+        "expected universe rejection; got: {err}"
+    );
+}
+
+// Non-zero data-plane counters on the reserved topic fail the measurement.
+// Each of the four kinds x each field is violated alone (only msgs OR only
+// bytes set to 1), so a guard missing any single check is observable.
+#[test]
+fn validate_measurement_rejects_data_plane_traffic_on_reserved_control_topic() {
+    let control = saorsa_gossip_types::TopicId::from_entity(SG_KEY_CACHE_CONTROL_TOPIC.as_bytes())
+        .to_string();
+    for kind in ["eager", "ihave", "iwant", "anti_entropy"] {
+        for field in ["msgs", "bytes"] {
+            let mut evidence = synthetic_measurement_evidence();
+            for row in evidence["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"]
+                .as_array_mut()
+                .expect("rows")
+            {
+                if row["topic_id_hex8"].as_str() == Some(control.as_str()) {
+                    row["outbound"][kind][field] = serde_json::json!(1);
+                }
+            }
+            let err = validate_measurement(&evidence)
+                .expect_err("data-plane traffic on the reserved topic must fail");
+            assert!(
+                err.contains(&format!("FAIL: O5: control plane carried {kind} {field}")),
+                "expected reserved-topic purity failure for {kind} {field}; got: {err}"
             );
         }
     }

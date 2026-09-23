@@ -19,9 +19,11 @@ GIT_LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.GIT_P
 def fixture():
     def sample(at, eager, subscribed):
         counters = {k: {"msgs": int(eager > 0) if k == "eager" else 0, "bytes": eager if k == "eager" else 0} for k in module.KINDS}
+        control_row = {"topic_id_hex8": module.CONTROL,
+                       "outbound": {k: {"msgs": 0, "bytes": 0} for k in module.KINDS}}
         return {"begin_ns": at, "end_ns": at + 1,
                 "egress": {"subscribed_topics": [{"topic_id_hex8": module.BUS}] if subscribed else [],
-                           "outbound_by_topic_named": [{"topic_id_hex8": module.BUS, "outbound": counters}] if subscribed else [],
+                           "outbound_by_topic_named": ([{"topic_id_hex8": module.BUS, "outbound": counters}] if subscribed else []) + [control_row],
                            "egress_budget": {"byte_policy": "observe_only", "repair": {"tracking_overflow": 0}}},
                 "participation": {"mode": "leaf", "relay_bytes": 0},
                 "stages": {"peer_scores": [{"topic": module.BUS, "role": "eager", "eager_eligible": True, "peer_id": "44" * 8}]}}
@@ -29,7 +31,8 @@ def fixture():
             "identities": [{"agent": b * 32, "machine": b * 32} for b in ("11", "22", "33", "44")],
             "generator_peer_hex8": "11" * 8, "binary_sha256": "ab" * 32,
             "build_lock_sha256": hashlib.sha256(LOCK).hexdigest(),
-            "universe": [{"name": "synthetic-bus", "full_id_hex": module.BUS + "0" * 48, "topic_id_hex8": module.BUS}],
+            "universe": [{"name": "synthetic-bus", "full_id_hex": module.BUS + "0" * 48, "topic_id_hex8": module.BUS},
+                         {"name": module.KEY_CACHE_CONTROL_TOPIC, "full_id_hex": module.CONTROL + "0" * 48, "topic_id_hex8": module.CONTROL}],
             "samples": {"D5": {"t0": sample(2_000_000_000, 0, True), "t1": sample(12_000_000_000, 100, True)},
                         "O5": {"t0": sample(2_000_000_000, 0, False), "t1": sample(12_000_000_000, 0, False)}},
             "load": {"sent": 200, "payload_bytes": 4096, "period_ms": 50, "elapsed_ns": 10000000000, "fanouts": [3] * 200, "witness_observed_during_load": 170}}
@@ -96,6 +99,9 @@ class DerivationControls(unittest.TestCase):
             (cargo, rust.replace(b'const GIT_PUBSUB_VERSION: &str = "0.5.85"',
                                  b'const GIT_PUBSUB_VERSION: &str = "0.5.86"'), "RUST_GIT_PUBSUB_VERSION_MISMATCH"),
             (cargo, rust.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64, 1), "RUST_REGISTRY_PUBSUB_SHA_MISMATCH"),
+            (cargo, rust.replace(b'const SG_KEY_CACHE_CONTROL_TOPIC: &str = "saorsa-gossip/key-cache-control/v1";',
+                                 b'const SG_KEY_CACHE_CONTROL_TOPIC: &str = "other-control-topic";'),
+             "RUST_SG_KEY_CACHE_CONTROL_TOPIC_MISMATCH"),
         ):
             with self.subTest(code=code), self.assertRaisesRegex(module.Inconclusive, code):
                 module.validate_source_premise(cargo_input, rust_input)
@@ -185,8 +191,27 @@ class DerivationControls(unittest.TestCase):
                 r = fixture()
                 row = copy.deepcopy(r["samples"]["D5"]["t0"]["egress"]["outbound_by_topic_named"][0])
                 row["outbound"][kind] = {"msgs": 1, "bytes": 64}
-                r["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"] = [row]
+                r["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"].append(row)
                 self.assertEqual(module.derive(r, LOCK)["oracle_failures"], ["O5_BUS_EGRESS_ORACLE"])
+
+    def test_reserved_control_topic_is_declared_and_data_plane_zero(self):
+        self.assertEqual(module.derive(fixture(), LOCK)["derivation"], "CONSISTENT")
+
+        missing = fixture()
+        missing["universe"] = [row for row in missing["universe"] if row["topic_id_hex8"] != module.CONTROL]
+        with self.assertRaisesRegex(module.Inconclusive, "UNEXPECTED_OR_DUPLICATE_TOPIC"):
+            module.derive(missing, LOCK)
+
+        for arm in ("D5", "O5"):
+            for kind in module.KINDS:
+                for field in ("msgs", "bytes"):
+                    with self.subTest(arm=arm, kind=kind, field=field):
+                        r = fixture()
+                        control = r["samples"][arm]["t1"]["egress"]["outbound_by_topic_named"][-1]
+                        control["outbound"][kind][field] = 1
+                        result = module.derive(r, LOCK)
+                        self.assertEqual(result["derivation"], "FAIL")
+                        self.assertEqual(result["oracle_failures"], [arm + "_RESERVED_TOPIC_DATA_PLANE"])
 
     def test_unexpected_topic_cannot_be_counted_as_zero(self):
         r = fixture()

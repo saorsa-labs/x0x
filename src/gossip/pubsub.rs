@@ -926,10 +926,7 @@ impl PubSubManager {
         oracle: Option<Arc<dyn PeerHealthOracle>>,
     ) -> NetworkResult<Self> {
         let peer_id = saorsa_gossip_transport::GossipTransport::local_peer_id(network.as_ref());
-        let plumtree_signing_key =
-            saorsa_gossip_identity::MlDsaKeyPair::generate().map_err(|e| {
-                NetworkError::NodeCreation(format!("failed to create PlumTree signing key: {e}"))
-            })?;
+        let plumtree_signing_key = network.pubsub_signing_key();
 
         let transport = Arc::new(PubSubTransport::new(Arc::clone(&network)));
         let plumtree_inner =

@@ -45,6 +45,52 @@ type AntPeerId = ant_quic::PeerId;
 /// Saorsa gossip PeerId type alias
 type GossipPeerId = saorsa_gossip_types::PeerId;
 
+/// The transport's ML-DSA signer, shared with hop-local pub-sub controls.
+/// The upstream key type derives `Debug` over raw secret bytes, so keep it
+/// behind a redacted wrapper when `NetworkNode` is formatted.
+#[derive(Clone)]
+struct TransportSigningKey(Arc<saorsa_gossip_identity::MlDsaKeyPair>);
+
+impl std::fmt::Debug for TransportSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TransportSigningKey([redacted])")
+    }
+}
+
+/// Refuse a signer that cannot authenticate as the actual adjacent QUIC peer.
+fn bound_transport_signing_key(
+    peer_id: AntPeerId,
+    public_key: &ant_quic::MlDsaPublicKey,
+    secret_key: &ant_quic::MlDsaSecretKey,
+) -> NetworkResult<saorsa_gossip_identity::MlDsaKeyPair> {
+    let signer = saorsa_gossip_identity::MlDsaKeyPair::from_keypair_bytes(
+        public_key.as_bytes().to_vec(),
+        secret_key.as_bytes().to_vec(),
+    );
+    if signer.peer_id().to_bytes() != peer_id.0 {
+        return Err(NetworkError::NodeCreation(
+            "pub-sub signer does not match transport peer ID".to_string(),
+        ));
+    }
+
+    const BINDING_PROBE: &[u8] = b"x0x transport signer binding";
+    let signature = signer
+        .sign(BINDING_PROBE)
+        .map_err(|e| NetworkError::NodeCreation(format!("pub-sub transport signer failed: {e}")))?;
+    let valid = saorsa_gossip_identity::MlDsaKeyPair::verify(
+        signer.public_key(),
+        BINDING_PROBE,
+        &signature,
+    )
+    .map_err(|e| NetworkError::NodeCreation(format!("pub-sub signer verification failed: {e}")))?;
+    if !valid {
+        return Err(NetworkError::NodeCreation(
+            "pub-sub signer does not match transport public key".to_string(),
+        ));
+    }
+    Ok(signer)
+}
+
 /// Module-private gossip frame queued between ant-quic receive and gossip dispatch.
 ///
 /// `enqueued_at` is intentionally carried with each frame so diagnostics can
@@ -1844,6 +1890,8 @@ pub struct NetworkNode {
     relayed_dm_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<RelayedDmEvent>>>,
     /// Cached local peer ID (ant-quic PeerId).
     peer_id: AntPeerId,
+    /// Key bound to that peer ID for signed adjacent-peer PubSub controls.
+    transport_signing_key: TransportSigningKey,
     /// Bootstrap peer cache for recording connection outcomes.
     bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
     /// x0x-side connection pool tracking activity, caps, and idle eviction.
@@ -2018,6 +2066,21 @@ impl NetworkNode {
         bootstrap_cache_config: Option<ant_quic::BootstrapCacheConfig>,
         keypair: Option<(ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey)>,
     ) -> NetworkResult<Self> {
+        // Resolve the key before constructing ant-quic: its `None` path uses
+        // this same ML-DSA generator, but would keep the secret inside the
+        // endpoint and leave PubSub unable to sign as the transport peer.
+        let (public_key, secret_key) = match keypair {
+            Some(pair) => pair,
+            None => ant_quic::generate_ml_dsa_keypair().map_err(|e| {
+                NetworkError::NodeCreation(format!("failed to generate transport keypair: {e}"))
+            })?,
+        };
+        let expected_peer_id = ant_quic::derive_peer_id_from_public_key(&public_key);
+        let transport_signing_key = TransportSigningKey(Arc::new(bound_transport_signing_key(
+            expected_peer_id,
+            &public_key,
+            &secret_key,
+        )?));
         let mut builder = NodeConfig::builder()
             // Mitigation, not a correctness fix: give ant-quic's bounded
             // app-facing recv queue enough headroom to match x0x's forwarding
@@ -2067,10 +2130,8 @@ impl NetworkNode {
             builder = builder.known_peer(*peer_addr);
         }
 
-        // Pass the machine keypair to ant-quic so that transport PeerId == MachineId
-        if let Some((pk, sk)) = keypair {
-            builder = builder.keypair(pk, sk);
-        }
+        // The exact pair retained for PubSub must also identify the QUIC node.
+        builder = builder.keypair(public_key, secret_key);
 
         // X0X-0062 reviewer P2 #2: surface ant-quic's best-effort UPnP
         // port-mapping toggle so operators on networks without IGD support
@@ -2108,6 +2169,12 @@ impl NetworkNode {
         })?;
 
         let peer_id = node.peer_id();
+        if transport_signing_key.0.peer_id().to_bytes() != peer_id.0 {
+            node.shutdown().await;
+            return Err(NetworkError::NodeCreation(
+                "ant-quic peer ID does not match pub-sub signer".to_string(),
+            ));
+        }
         // Share the endpoint's cache instance (never a second handle on the
         // same file). The endpoint runs cache maintenance itself.
         let bootstrap_cache = Some(node.bootstrap_cache());
@@ -2153,6 +2220,7 @@ impl NetworkNode {
             relayed_dm_tx,
             relayed_dm_rx: Arc::new(tokio::sync::Mutex::new(relayed_dm_rx)),
             peer_id,
+            transport_signing_key,
             bootstrap_cache,
             connection_pool,
             authenticated_sessions: Arc::new(Mutex::new(AuthenticatedSessions::default())),
@@ -4160,6 +4228,11 @@ impl NetworkNode {
     /// The PeerId for this node.
     pub fn peer_id(&self) -> AntPeerId {
         self.peer_id
+    }
+
+    /// A copy of the signer bound to the authenticated transport identity.
+    pub(crate) fn pubsub_signing_key(&self) -> saorsa_gossip_identity::MlDsaKeyPair {
+        self.transport_signing_key.0.as_ref().clone()
     }
 
     // === Tailnet byte-streams (#132 T1) ===
@@ -6525,6 +6598,39 @@ mod tests {
 
     fn test_ant_peer(byte: u8) -> AntPeerId {
         ant_quic::PeerId([byte; 32])
+    }
+
+    #[test]
+    fn pubsub_signer_is_bound_to_transport_machine_not_agent_identity() {
+        let (machine_public, machine_secret) =
+            ant_quic::generate_ml_dsa_keypair().expect("machine keypair");
+        let (agent_public, agent_secret) =
+            ant_quic::generate_ml_dsa_keypair().expect("distinct agent keypair");
+        let machine_peer_id = ant_quic::derive_peer_id_from_public_key(&machine_public);
+
+        let signer = bound_transport_signing_key(machine_peer_id, &machine_public, &machine_secret)
+            .expect("matching transport signer");
+        assert_eq!(
+            format!("{:?}", TransportSigningKey(Arc::new(signer.clone()))),
+            "TransportSigningKey([redacted])"
+        );
+        assert_eq!(signer.peer_id().to_bytes(), machine_peer_id.0);
+        let signature = signer.sign(b"application frame").expect("sign frame");
+        assert!(saorsa_gossip_identity::MlDsaKeyPair::verify(
+            machine_public.as_bytes(),
+            b"application frame",
+            &signature,
+        )
+        .expect("verify against transport public key"));
+
+        assert!(
+            bound_transport_signing_key(machine_peer_id, &agent_public, &agent_secret).is_err(),
+            "an agent key must not impersonate the transport machine"
+        );
+        assert!(
+            bound_transport_signing_key(machine_peer_id, &machine_public, &agent_secret).is_err(),
+            "a transport public key paired with an unrelated secret must fail"
+        );
     }
 
     #[tokio::test]
