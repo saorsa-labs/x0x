@@ -193,22 +193,6 @@ members = [
     "tests/harness",
 ]
 
-# Candidate validation only: ant-quic now resolves from crates.io (0.27.53).
-# SG patched to 9c5e05d = the exact 0.5.85 release source (SG76 stack +
-# review fixes + ant-quic 0.27.53 registry pin), pending its crates.io publish.
-# Remove the git patches after the published-crate graph is available and verified.
-[patch.crates-io]
-saorsa-gossip-coordinator = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-crdt-sync = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-groups = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-identity = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-membership = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-presence = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-rendezvous = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-runtime = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-transport = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
-saorsa-gossip-types = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9c5e05d540512f6723991b4b941597fc57e19ad3" }
 
 # #703: the 100k signing-path test spends most CPU time in Keccak. Optimize
 # only its concrete crypto path and test target; dev and release stay unchanged.
