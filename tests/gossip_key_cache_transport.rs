@@ -55,7 +55,25 @@ struct Snapshot {
 struct PhaseBaseline {
     alice_before: Snapshot,
     bob_before: Snapshot,
-    full_before_application: bool,
+    alice_before_peer_start: Snapshot,
+}
+
+#[derive(Default)]
+struct FullPhaseWitness {
+    outbound_seen: bool,
+    inbound_seen: bool,
+}
+
+impl FullPhaseWitness {
+    fn observe(&mut self, alice_start: &Snapshot, alice_now: &Snapshot, bob_now: &Snapshot) {
+        self.outbound_seen |= alice_now.increase(alice_start, "full_out_frames");
+        // Bob is a fresh process in both phases, so its counter began at zero.
+        self.inbound_seen |= bob_now.count("full_in_frames") > 0;
+    }
+
+    fn complete(&self) -> bool {
+        self.outbound_seen && self.inbound_seen
+    }
 }
 
 impl Snapshot {
@@ -200,9 +218,11 @@ async fn prove_full_then_ref(
     let PhaseBaseline {
         alice_before,
         bob_before,
-        full_before_application,
+        alice_before_peer_start,
     } = baseline;
-    let mut saw_full = full_before_application;
+    let mut full = FullPhaseWitness::default();
+    full.observe(&alice_before_peer_start, &alice_before, &bob_before);
+    let mut saw_full = full.complete();
     let mut saw_ref_after_full = false;
     let mut alice_previous = alice_before.clone();
     let mut bob_previous = bob_before.clone();
@@ -210,15 +230,14 @@ async fn prove_full_then_ref(
         publish_and_receive(alice, receiver, topic, sender, label, sequence).await;
         let alice_after = diagnostics(alice).await;
         let bob_after = diagnostics(bob).await;
-        let full = alice_after.increase(&alice_previous, "full_out_frames")
-            && bob_after.increase(&bob_previous, "full_in_frames");
+        // Full may straddle the pre-application snapshot or two later polls.
+        // Ref still has to appear after a prior complete Full sample.
         let reference = alice_after.increase(&alice_previous, "ref_out_frames")
             && bob_after.increase(&bob_previous, "ref_in_frames")
             && bob_after.increase(&bob_previous, "cache_hits");
         let ref_after_full = saw_full && reference;
-        if full {
-            saw_full = true;
-        }
+        full.observe(&alice_before_peer_start, &alice_after, &bob_after);
+        saw_full = full.complete();
         if ref_after_full {
             saw_ref_after_full = true;
             eprintln!(
@@ -233,12 +252,53 @@ async fn prove_full_then_ref(
     }
     assert!(
         saw_full,
-        "{label}: no matched nonzero Full out/in counter delta"
+        "{label}: missing phase-wide Full counter evidence (out_seen={} in_seen={}) after {MAX_MESSAGES_PER_PHASE} exact deliveries; alice_start={alice_before_peer_start:?} alice_before={alice_before:?} bob_before={bob_before:?} alice_last={alice_previous:?} bob_last={bob_previous:?}",
+        full.outbound_seen,
+        full.inbound_seen,
     );
     assert!(
         saw_ref_after_full,
-        "{label}: no later matched nonzero Ref out/in and cache-hit delta after {MAX_MESSAGES_PER_PHASE} exact deliveries"
+        "{label}: no later Ref out/in and cache-hit delta after {MAX_MESSAGES_PER_PHASE} exact deliveries; alice_before={alice_before:?} bob_before={bob_before:?} alice_last={alice_previous:?} bob_last={bob_previous:?}"
     );
+}
+
+#[test]
+fn full_phase_witness_survives_pre_application_and_split_poll_boundaries() {
+    let baseline = Snapshot {
+        uptime_secs: 1,
+        key_cache: json!({"full_out_frames": 0, "full_in_frames": 0}),
+    };
+    let alice_sent = Snapshot {
+        uptime_secs: 1,
+        key_cache: json!({"full_out_frames": 1}),
+    };
+    let bob_before_receive = Snapshot {
+        uptime_secs: 1,
+        key_cache: json!({"full_in_frames": 0}),
+    };
+    let alice_unchanged = alice_sent.clone();
+    let bob_received = Snapshot {
+        uptime_secs: 1,
+        key_cache: json!({"full_in_frames": 1}),
+    };
+
+    // Alice sends before the application baseline; Bob receives afterward.
+    let mut witness = FullPhaseWitness::default();
+    witness.observe(&baseline, &alice_sent, &bob_before_receive);
+    assert!(witness.outbound_seen);
+    assert!(!witness.inbound_seen);
+    assert!(!witness.complete());
+    witness.observe(&baseline, &alice_unchanged, &bob_received);
+    assert!(witness.complete());
+
+    // The same split can occur entirely within the application phase.
+    let mut within_phase = FullPhaseWitness::default();
+    within_phase.observe(&baseline, &baseline, &bob_before_receive);
+    assert!(!within_phase.complete());
+    within_phase.observe(&baseline, &alice_sent, &bob_before_receive);
+    assert!(!within_phase.complete());
+    within_phase.observe(&baseline, &alice_unchanged, &bob_received);
+    assert!(within_phase.complete());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -259,11 +319,9 @@ async fn public_pubsub_key_cache_full_ref_restart_recovery() {
 
     let alice_before = diagnostics(&alice).await;
     let bob_before = diagnostics(&bob).await;
-    // Bob's fresh-process inbound count pairs with Alice's post-connection
-    // outbound delta. Full may be a normal startup frame rather than an app
-    // message; the app delivery and later Ref are separate assertions.
-    let initial_full = alice_before.increase(&alice_pre_connect, "full_out_frames")
-        && bob_before.count("full_in_frames") > 0;
+    // Full counters are process-wide. A fresh Bob inbound count and Alice's
+    // post-connection outbound delta show phase traffic, not frame identity.
+    // Full may be startup traffic; app delivery and later Ref are separate.
     let _alice_subscription = subscribe(&alice, &topic).await;
     let mut bob_subscription = subscribe(&bob, &topic).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -277,7 +335,7 @@ async fn public_pubsub_key_cache_full_ref_restart_recovery() {
         PhaseBaseline {
             alice_before,
             bob_before,
-            full_before_application: initial_full,
+            alice_before_peer_start: alice_pre_connect,
         },
     )
     .await;
@@ -298,8 +356,6 @@ async fn public_pubsub_key_cache_full_ref_restart_recovery() {
     wait_for_reconnect(&bob).await;
     let alice_before_recovery = diagnostics(&alice).await;
     let bob_before_recovery = diagnostics(&bob).await;
-    let recovery_full = alice_before_recovery.increase(&alice_before_restart, "full_out_frames")
-        && bob_before_recovery.count("full_in_frames") > 0;
     let mut bob_subscription = subscribe(&bob, &topic).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     prove_full_then_ref(
@@ -312,7 +368,7 @@ async fn public_pubsub_key_cache_full_ref_restart_recovery() {
         PhaseBaseline {
             alice_before: alice_before_recovery,
             bob_before: bob_before_recovery,
-            full_before_application: recovery_full,
+            alice_before_peer_start: alice_before_restart,
         },
     )
     .await;

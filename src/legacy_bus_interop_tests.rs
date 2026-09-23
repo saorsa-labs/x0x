@@ -599,7 +599,7 @@ async fn paired_controlled_load_bus_eager_attempts_default_vs_optout() {
 }
 
 /// SG-internal reserved key-cache control topic, blake3 hex8
-/// `87f4025bf2b9a4ad`. Literal from the saorsa-gossip pin 7e395117
+/// `87f4025bf2b9a4ad`. Literal from the saorsa-gossip pin 997abc75
 /// (Cargo.lock git rev) `crates/pubsub/src/key_cache.rs` `CONTROL_DOMAIN`
 /// (`pub(crate)`, so a symbol import is impossible; literal-by-design like
 /// the rest of the universe list). A universe member only because pinned SG
@@ -1547,12 +1547,12 @@ fn validate_topology_capture(
 // Producer semantics pinned by `reviewed_pubsub_producer` below: the meter
 // records exactly the four application kinds (eager/ihave/iwant/
 // anti_entropy) per topic, with `bytes` being the measured wire bytes for
-// each claimed peer — the SG93 producer (git 7e395117) records the actual
-// Full/Ref/legacy frame length per peer instead of one shared legacy
-// serialized length, so `msgs` stays one attempt per peer and `bytes`
-// becomes exact for mixed fan-out (reviewed meter comparison, luna
-// 2026-09-23). Hop-local key-cache control bytes ride a separate reserved
-// topic and never enter these four fields.
+// each claimed peer — the git 997abc75 producer uses the final Full/Ref/legacy
+// frame length per peer instead of one shared legacy serialized length, so
+// `msgs` stays one attempt per peer and `bytes` reflects mixed fan-out.
+// Its separate key-cache snapshot also counts ordinary legacy and v3 Full
+// outbound submissions by final frame length; hop-local control remains on
+// a reserved topic outside these four application fields.
 fn generator_topic_projection(
     rows: &std::collections::BTreeMap<String, saorsa_gossip_pubsub::OutboundTopicMeterSnapshot>,
     zero_fanout: &std::collections::BTreeMap<String, u64>,
@@ -2090,10 +2090,10 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
     const REGISTRY_PUBSUB_SHA: &str =
         "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
-    // SG93 candidate producer 7e395117 (reviewed meter comparison, luna
-    // 2026-09-23): the exact git source graph this measurement accepts.
+    // SG 997abc75: exact git graph with per-peer application wire bytes and
+    // ordinary legacy/v3 Full submission accounting (source reviewed 2026-09-23).
     // No checksum: git lock entries carry none.
-    const GIT_PUBSUB_SOURCE: &str = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9";
+    const GIT_PUBSUB_SOURCE: &str = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=997abc7560d9aabc1ca248b8c6774268aaf57867#997abc7560d9aabc1ca248b8c6774268aaf57867";
     let version = package.get("version").and_then(toml::Value::as_str);
     let source = package.get("source").and_then(toml::Value::as_str);
     let registry = version == Some(REGISTRY_PUBSUB_VERSION)
@@ -2112,7 +2112,7 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("registry fixture");
     let git: toml::Value = toml::from_str(
-        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9'",
+        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=997abc7560d9aabc1ca248b8c6774268aaf57867#997abc7560d9aabc1ca248b8c6774268aaf57867'",
     )
     .expect("git fixture");
     assert!(reviewed_pubsub_producer(&registry));
@@ -2123,12 +2123,12 @@ fn controlled_load_producer_allowlist_is_exact() {
     // Exactly one component wrong versus the accepted git source: the
     // revision query parameter.
     let mut wrong_revision = git.clone();
-    wrong_revision["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=0000000000000000000000000000000000000000#7e395117359d3ba19e7190f32c421befa36cc3e9".into());
+    wrong_revision["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=0000000000000000000000000000000000000000#997abc7560d9aabc1ca248b8c6774268aaf57867".into());
     assert!(!reviewed_pubsub_producer(&wrong_revision));
     // Exactly one component wrong versus the accepted git source: the URL
     // (a lookalike repository must not satisfy the premise).
     let mut wrong_url = git.clone();
-    wrong_url["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip-mirror.git?rev=7e395117359d3ba19e7190f32c421befa36cc3e9#7e395117359d3ba19e7190f32c421befa36cc3e9".into());
+    wrong_url["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip-mirror.git?rev=997abc7560d9aabc1ca248b8c6774268aaf57867#997abc7560d9aabc1ca248b8c6774268aaf57867".into());
     assert!(!reviewed_pubsub_producer(&wrong_url));
     let mut spurious_checksum = git.clone();
     spurious_checksum
@@ -3722,7 +3722,7 @@ fn reserved_measurement_row(topic: &str) -> serde_json::Value {
 // the production fixed-topic declaration (without Agent-specific topics). D5
 // moves bus eager bytes; O5 is a clean opt-out; both arms carry the reserved
 // SG key-cache control row with zero data-plane counters — the exact live
-// shape since the SG 7e395117 pin (its control flusher runs per PubSub
+// shape at the SG 997abc75 pin (its control flusher runs per PubSub
 // instance for every authenticated session).
 fn synthetic_measurement_evidence() -> serde_json::Value {
     use serde_json::json;

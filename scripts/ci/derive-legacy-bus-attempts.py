@@ -20,7 +20,7 @@ KINDS = ("eager", "ihave", "iwant", "anti_entropy")
 BUS = "a746d680e31732d1"
 # Reserved SG key-cache control topic: blake3 hex8 of the Rust literal
 # SG_KEY_CACHE_CONTROL_TOPIC in src/legacy_bus_interop_tests.rs (saorsa-gossip
-# 7e395117 crates/pubsub/src/key_cache.rs CONTROL_DOMAIN, pub(crate) upstream).
+# 997abc75 crates/pubsub/src/key_cache.rs CONTROL_DOMAIN, pub(crate) upstream).
 # Protected hop-local control egress only; its rows must carry zero msgs and
 # bytes in all four KINDS wherever they appear.
 KEY_CACHE_CONTROL_TOPIC = "saorsa-gossip/key-cache-control/v1"
@@ -32,10 +32,10 @@ REGISTRY_PUBSUB_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 REGISTRY_PUBSUB_SHA = "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"
 GIT_PUBSUB_VERSION = "0.5.85"
 GIT_PUBSUB_URL = "https://github.com/saorsa-labs/saorsa-gossip.git"
-# SG93 candidate producer (reviewed meter comparison, luna 2026-09-23):
-# per-peer wire-byte accounting via wire_bytes_for_peer; the per-topic
-# application snapshot still exposes exactly the four KINDS below.
-GIT_PUBSUB_REV = "7e395117359d3ba19e7190f32c421befa36cc3e9"
+# SG 997abc75: per-peer wire-byte accounting via wire_bytes_for_peer;
+# ordinary legacy/v3 Full outbound submissions use final frame lengths.
+# The per-topic application snapshot still exposes exactly four KINDS.
+GIT_PUBSUB_REV = "997abc7560d9aabc1ca248b8c6774268aaf57867"
 GIT_PUBSUB_SOURCE = f"git+{GIT_PUBSUB_URL}?rev={GIT_PUBSUB_REV}#{GIT_PUBSUB_REV}"
 
 
@@ -58,10 +58,12 @@ def reviewed_producer(package):
 
     Meter premise (reviewed comparison, luna 2026-09-23): both graphs expose
     exactly the four application KINDS per topic; `bytes` are the measured
-    wire bytes for each claimed peer (the git 7e395117 producer records the
+    wire bytes for each claimed peer (the git 997abc75 producer records the
     actual Full/Ref/legacy frame length per peer rather than one shared
-    legacy serialized length), and hop-local key-cache control bytes stay on
-    a separate reserved topic outside these fields. Source-bound acceptance
+    legacy serialized length). Its separate key-cache snapshot counts
+    ordinary legacy/v3 Full outbound submissions by final frame length;
+    hop-local key-cache control stays on a reserved topic outside the four
+    application fields. Source-bound acceptance
     only — never a wildcard on version, URL, revision, or checksum presence.
     """
     return (
