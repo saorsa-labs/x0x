@@ -2091,12 +2091,12 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
         "ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
-    // 7ebffa8d adds local delivery, cold-relay ID offers, and the
-    // ant-quic fatal-send pin.
+    // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
+    // fatal-send pin, and a typed view of the unchanged outbound meters.
     // Both pins keep the same 0.5.85 producer and meter definitions.
     // No checksum: git lock entries carry none.
     const GIT_PUBSUB_SOURCE_ACCOUNTING: &str = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=997abc7560d9aabc1ca248b8c6774268aaf57867#997abc7560d9aabc1ca248b8c6774268aaf57867";
-    const GIT_PUBSUB_SOURCE_CURRENT: &str = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0#7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0";
+    const GIT_PUBSUB_SOURCE_CURRENT: &str = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=9258cee9b5f30455675279d02730df1345e6aedc#9258cee9b5f30455675279d02730df1345e6aedc";
     let version = package.get("version").and_then(toml::Value::as_str);
     let source = package.get("source").and_then(toml::Value::as_str);
     let registry = version == Some(REGISTRY_PUBSUB_VERSION)
@@ -2120,27 +2120,32 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("accounting git fixture");
     let git: toml::Value = toml::from_str(
-        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0#7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0'",
+        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=9258cee9b5f30455675279d02730df1345e6aedc#9258cee9b5f30455675279d02730df1345e6aedc'",
     )
     .expect("current git fixture");
     assert!(reviewed_pubsub_producer(&registry));
     assert!(reviewed_pubsub_producer(&git_accounting));
     assert!(reviewed_pubsub_producer(&git));
+    let stale_current: toml::Value = toml::from_str(
+        "version = '0.5.85'\nsource = 'git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0#7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0'",
+    )
+    .expect("stale current git fixture");
+    assert!(!reviewed_pubsub_producer(&stale_current));
     let mut wrong_registry = registry.clone();
     wrong_registry["source"] = toml::Value::String("registry+https://example.invalid".into());
     assert!(!reviewed_pubsub_producer(&wrong_registry));
     // Exactly one component wrong versus the accepted git source: the
     // revision query parameter.
     let mut wrong_revision = git.clone();
-    wrong_revision["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=0000000000000000000000000000000000000000#7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0".into());
+    wrong_revision["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=0000000000000000000000000000000000000000#9258cee9b5f30455675279d02730df1345e6aedc".into());
     assert!(!reviewed_pubsub_producer(&wrong_revision));
     let mut wrong_hash = git.clone();
-    wrong_hash["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0#0000000000000000000000000000000000000000".into());
+    wrong_hash["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=9258cee9b5f30455675279d02730df1345e6aedc#0000000000000000000000000000000000000000".into());
     assert!(!reviewed_pubsub_producer(&wrong_hash));
     // Exactly one component wrong versus the accepted git source: the URL
     // (a lookalike repository must not satisfy the premise).
     let mut wrong_url = git.clone();
-    wrong_url["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip-mirror.git?rev=7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0#7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0".into());
+    wrong_url["source"] = toml::Value::String("git+https://github.com/saorsa-labs/saorsa-gossip-mirror.git?rev=9258cee9b5f30455675279d02730df1345e6aedc#9258cee9b5f30455675279d02730df1345e6aedc".into());
     assert!(!reviewed_pubsub_producer(&wrong_url));
     let mut spurious_checksum = git.clone();
     spurious_checksum

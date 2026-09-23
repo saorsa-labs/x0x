@@ -194,22 +194,23 @@ members = [
 ]
 
 # Candidate validation only: these exact source revisions are not registry releases.
-# SG 7ebffa8d retains the reviewed accounting and cold-relay offers;
+# SG 9258cee9 retains the reviewed accounting and cold-relay offers and
+# exposes the same bounded outbound topic meters without a full stage snapshot;
 # ant-quic 72822d2d retires fatal active-path send failures.
 # Remove the git patches after the published-crate graph is available and verified.
 [patch.crates-io]
 ant-quic = { git = "https://github.com/saorsa-labs/ant-quic.git", rev = "72822d2d271af9ebe23fc49cdfd961d31b70c6be" }
-saorsa-gossip-coordinator = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-crdt-sync = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-groups = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-identity = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-membership = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-presence = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-rendezvous = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-runtime = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-transport = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
-saorsa-gossip-types = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "7ebffa8d7bd6ebef9b2158b057455d80ed5cc8c0" }
+saorsa-gossip-coordinator = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-crdt-sync = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-groups = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-identity = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-membership = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-presence = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-rendezvous = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-runtime = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-transport = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
+saorsa-gossip-types = { git = "https://github.com/saorsa-labs/saorsa-gossip.git", rev = "9258cee9b5f30455675279d02730df1345e6aedc" }
 
 # #703: the 100k signing-path test spends most CPU time in Keccak. Optimize
 # only its concrete crypto path and test target; dev and release stay unchanged.
