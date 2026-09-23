@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -465,6 +466,150 @@ esac
         with self.assertRaises(ValueError):
             custody.copy_owner_key(owner, owner)
 
+    def test_witness_parser_accepts_exact_line_and_rejects_malformed(self):
+        """Locks the receipt grammar; any drift in the logged line must fail parsing."""
+        digest = "ab" * 32
+        good = (f"x0x_control_blob_witness stage={self.h.WITNESS_STAGE} kind=member_added "
+                f"byte_len=60000 digest={digest}")
+        self.assertEqual({"stage": self.h.WITNESS_STAGE, "kind": "member_added",
+                          "byte_len": 60000, "digest": digest},
+                         self.h.parse_witness_line(good))
+        for bad in (good + " ", good.replace(digest, digest[:63]),
+                    good.replace("byte_len=60000", "byte_len="),
+                    good.replace("x0x_control_blob_witness", "x0x_control_blob_witness2")):
+            with self.subTest(line=bad):
+                with self.assertRaises(RuntimeError): self.h.parse_witness_line(bad)
+
+    def test_witness_oracle_credits_only_right_stage_and_oversized_kinds(self):
+        """Wrong stage, at-limit size, missing or substitute kind must fail an acceptance row."""
+        def witness(kind, byte_len, stage=None):
+            return {"stage": stage or self.h.WITNESS_STAGE, "kind": kind, "byte_len": byte_len,
+                    "digest": "ab" * 32, "node": "writer"}
+        for name, receipts, passed in (
+            ("both kinds oversized", [witness("member_added", 49_153), witness("join_result", 60_000)], [True, True]),
+            ("member_added missing", [witness("join_result", 60_000)], [False, True]),
+            ("wrong stage", [witness("member_added", 60_000, stage="handler_applied"),
+                             witness("join_result", 60_000)], [False, True]),
+            ("byte_len at the DM limit", [witness("member_added", 49_152), witness("join_result", 60_000)], [False, True]),
+            ("named_group_event substitute", [witness("named_group_event", 60_000),
+                                              witness("join_result", 60_000)], [False, True]),
+        ):
+            with self.subTest(case=name):
+                rows = self.h.witness_assertions(receipts)
+                self.assertEqual(["oversized member_added reassembled and validated for handler",
+                                  "oversized join_result reassembled and validated for handler"],
+                                 [row["label"] for row in rows])
+                self.assertEqual(passed, [row["passed"] for row in rows])
+
+    def test_custody_collects_bounded_strictly_parsed_node_tagged_witnesses(self):
+        """Oversized, overlong or unparsable witness output must fail collection, not pass."""
+        remote = mock.Mock()
+        custody = self.h.SyntheticProcessCustody(remote, "/opt/x0x/x0xd", "m" * 32)
+        custody.started["writer"] = self.node("writer")
+        line = (f"x0x_control_blob_witness stage={self.h.WITNESS_STAGE} kind=member_added "
+                f"byte_len=60000 digest={'ab' * 32}\n").encode()
+        remote.run.return_value = line
+        self.assertEqual([{"stage": self.h.WITNESS_STAGE, "kind": "member_added",
+                           "byte_len": 60000, "digest": "ab" * 32, "node": "writer"}],
+                         custody.control_blob_witnesses())
+        self.assertTrue(remote.run.call_args.kwargs["capture"])
+        remote.run.return_value = line + b"x0x_control_blob_witness garbage\n"
+        with self.assertRaises(RuntimeError): custody.control_blob_witnesses()
+        remote.run.return_value = line * (self.h.WITNESS_LINES_PER_NODE + 1)
+        with self.assertRaises(RuntimeError): custody.control_blob_witnesses()
+        remote.run.return_value = b"x" * (self.h.WITNESS_BYTES_PER_NODE + 1)
+        with self.assertRaises(RuntimeError): custody.control_blob_witnesses()
+
+    def test_witness_script_emits_one_line_past_the_bound_so_overflow_fails_closed(self):
+        """Real overflow must fail closed: the remote head passes exactly N+1
+        lines through, N+1 raises in collection, and the at-bound output still
+        collects."""
+        def script_output(log_lines):
+            with tempfile.TemporaryDirectory(prefix="home-witness-bound-") as root:
+                Path(f"{root}/fixture.marker").write_text("marker\n")
+                logs = Path(root) / "logs"; logs.mkdir()
+                line = (f"x0x_control_blob_witness stage={self.h.WITNESS_STAGE} "
+                        f"kind=member_added byte_len=60000 digest={'ab' * 32}")
+                (logs / "daemon.log").write_text("\n".join([line] * log_lines) + "\n")
+                command = self.h.Remote.command(self.h.WITNESS_SCRIPT, [root, "marker"],
+                                                input_bytes=False)
+                return subprocess.run(command, shell=True,
+                                      input=self.h.WITNESS_SCRIPT.encode(),
+                                      capture_output=True, timeout=5, check=True).stdout
+        emitted = script_output(self.h.WITNESS_LINES_PER_NODE + 2)
+        self.assertEqual(self.h.WITNESS_LINES_PER_NODE + 1, len(emitted.splitlines()))
+        remote = mock.Mock(); remote.run.side_effect = lambda *_args, **_kwargs: emitted
+        custody = self.h.SyntheticProcessCustody(remote, "/opt/x0x/x0xd", "m" * 32)
+        custody.started["writer"] = self.node("writer")
+        with self.assertRaisesRegex(RuntimeError, "lines exceed the bound"):
+            custody.control_blob_witnesses()
+        remote.run.side_effect = lambda *_args, **_kwargs: script_output(
+            self.h.WITNESS_LINES_PER_NODE)
+        self.assertEqual(self.h.WITNESS_LINES_PER_NODE,
+                         len(custody.control_blob_witnesses()))
+
+    def test_rust_witness_line_format_still_matches_the_fixture_receipt_regex(self):
+        """If the control_blob.rs format literal or stage drifts, or the dm.rs
+        payload limit moves, the fixture must fail loudly."""
+        rust = (Path(__file__).resolve().parent.parent /
+                "src/server/routes/named_groups/control_blob.rs").read_text(encoding="utf-8")
+        template = re.search(r'fn witness_line\b.*?"([^"]*x0x_control_blob_witness[^"]*)"',
+                             rust, re.DOTALL)
+        stage = re.search(r'const WITNESS_STAGE: &str = "([^"]+)"', rust)
+        self.assertIsNotNone(template)
+        self.assertIsNotNone(stage)
+        values = iter(("60000", "ab" * 32))
+        rendered = re.sub(r"\{\}", lambda _m: next(values),
+                          template.group(1).replace("{WITNESS_STAGE}", stage.group(1))
+                                           .replace("{kind}", "member_added"))
+        self.assertEqual({"stage": self.h.WITNESS_STAGE, "kind": "member_added",
+                          "byte_len": 60000, "digest": "ab" * 32},
+                         self.h.parse_witness_line(rendered))
+        dm = (Path(__file__).resolve().parent.parent /
+              "src/dm.rs").read_text(encoding="utf-8")
+        limit = re.search(r"pub const MAX_PAYLOAD_BYTES: usize = ([0-9_]+);", dm)
+        self.assertIsNotNone(limit, "src/dm.rs MAX_PAYLOAD_BYTES anchor drifted")
+        self.assertEqual(self.h.DM_MAX_PAYLOAD_BYTES, int(limit.group(1).replace("_", "")))
+
+    def test_main_collects_witnesses_after_restore_and_fails_closed_without_them(self):
+        """Exit stays 1 without both receipts; collection must follow restore so logs are flushed."""
+        order: list[str] = []
+        custody = mock.Mock()
+        custody.restore.side_effect = lambda: (order.append("restore"), [])[1]
+        custody.control_blob_witnesses.side_effect = lambda: (order.append("witnesses"), [])[1]
+        def populated(_args, _remote, _evidence, resources):
+            resources["custody"] = custody
+            return True
+        def run_main(populate):
+            with tempfile.TemporaryDirectory(prefix="home-witness-") as root:
+                report = Path(root) / "report.json"
+                argv = ["fixture", "--network", "synthetic-home", "--hosts-file", "hosts",
+                        "--nodes", "a", "b", "c", "d", "e", "--daemon-binary", "/x0xd",
+                        "--cli-binary", "/x0x", "--report", str(report)]
+                with mock.patch.object(sys, "argv", argv), \
+                     mock.patch.object(self.h, "run_fixture", side_effect=populate):
+                    code = self.h.main()
+                return code, json.loads(report.read_text(encoding="utf-8"))
+        with self.subTest(case="missing receipts"):
+            code, data = run_main(populated)
+            self.assertEqual(1, code)
+            self.assertEqual(["restore", "witnesses"], order)
+            self.assertEqual(["oversized member_added reassembled and validated for handler",
+                              "oversized join_result reassembled and validated for handler"],
+                             [row["label"] for row in data["assertions"] if not row["passed"]])
+        with self.subTest(case="collection error"):
+            custody.control_blob_witnesses.side_effect = RuntimeError("witness ssh failure")
+            code, data = run_main(populated)
+            self.assertEqual(1, code)
+            self.assertEqual(["control blob witness collection RuntimeError"],
+                             [row["label"] for row in data["assertions"] if not row["passed"]])
+        with self.subTest(case="no custody"):
+            code, data = run_main(lambda _a, _r, _e, _res: True)
+            self.assertEqual(1, code)
+            self.assertEqual(["control blob witness collection unavailable"],
+                             [row["label"] for row in data["assertions"] if not row["passed"]])
+            self.assertEqual([], data["control_blob_witnesses"])
+
     def test_partial_provision_and_report_failure_still_cleanup_every_resource(self):
         custody = mock.Mock(); custody.restore.return_value = []
         tunnel = mock.Mock()
@@ -481,13 +626,22 @@ esac
         custody.restore.assert_called_once_with(); stop.assert_called_once_with(tunnel)
 
     def test_main_report_exports_stores_polls_and_custody_for_gui_acceptance(self):
+        """Exit 0 needs witness receipts in the report; GUI acceptance reads them from the file."""
         # Root GUI acceptance must work from the frozen report alone: group and
         # store IDs plus page keys from evidence.stores, convergence receipts
-        # from evidence.polls, custody hash receipts from the manifest.
+        # from evidence.polls, custody hash receipts from the manifest, and
+        # runtime control-blob witnesses collected after restore.
         manifest = {"run_id": "a" * 32, "network_id": f"x0x.home.e2e.{'a' * 32}",
                     "binary_sha256": "b" * 64, "config_sha256": {"owner": "c" * 64}}
+        witnesses = [{"stage": self.h.WITNESS_STAGE, "kind": "member_added", "byte_len": 60_000,
+                      "digest": "a" * 64, "node": "writer"},
+                     {"stage": self.h.WITNESS_STAGE, "kind": "join_result", "byte_len": 50_000,
+                      "digest": "b" * 64, "node": "late"}]
+        custody = mock.Mock()
+        custody.restore.return_value = []
+        custody.control_blob_witnesses.return_value = witnesses
         def populate(_args, _remote, evidence, resources):
-            resources["manifest"] = manifest
+            resources["manifest"], resources["custody"] = manifest, custody
             evidence.check("home writer remains Member role", True, role="member")
             for app in ("wiki", "web"):
                 evidence.record_store("writer", "home-gid", app,
@@ -504,9 +658,11 @@ esac
                  mock.patch.object(self.h, "run_fixture", side_effect=populate):
                 self.assertEqual(0, self.h.main())
             data = json.loads(report.read_text(encoding="utf-8"))
-        self.assertEqual({"scenario", "custody", "stores", "polls", "assertions"}, set(data))
+        self.assertEqual({"scenario", "custody", "stores", "polls", "control_blob_witnesses",
+                          "assertions"}, set(data))
         self.assertEqual("synthetic-home", data["scenario"])
         self.assertEqual(manifest, data["custody"])
+        self.assertEqual(witnesses, data["control_blob_witnesses"])
         self.assertEqual([{"node": "writer", "group_id": "home-gid", "app": app,
                            "topic": f"topic-{app}", "store_id": "0" * 64}
                           for app in ("wiki", "web")], data["stores"])
@@ -515,6 +671,10 @@ esac
                            "outcome": "accepted"}], data["polls"])
         self.assertTrue(data["assertions"])
         self.assertTrue(all(row["passed"] for row in data["assertions"]))
+        self.assertEqual(["oversized member_added reassembled and validated for handler",
+                          "oversized join_result reassembled and validated for handler"],
+                         [row["label"] for row in data["assertions"]
+                          if row["label"].startswith("oversized")])
 
     def test_home_join_seat_receipt_distinguishes_delayed_timeout_and_http_error(self):
         secret = "DO-NOT-RETAIN-CERT-OR-TOKEN"
