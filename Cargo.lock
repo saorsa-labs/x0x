@@ -3524,7 +3524,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-coordinator"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "ant-quic",
  "anyhow",
@@ -3547,7 +3547,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-crdt-sync"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3562,7 +3562,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-groups"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3575,7 +3575,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-identity"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3590,7 +3590,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-membership"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3608,7 +3608,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-presence"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3630,7 +3630,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-pubsub"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3653,7 +3653,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-rendezvous"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3669,7 +3669,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-runtime"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3695,7 +3695,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-transport"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "ant-quic",
  "anyhow",
@@ -3717,7 +3717,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-types"
 version = "0.5.85"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3734,7 +3734,7 @@ dependencies = [
 [[package]]
 name = "saorsa-gossip-workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a#32c0b5a1f8ef6bdc115ea77bad47d7cae8281a1a"
+source = "git+https://github.com/saorsa-labs/saorsa-gossip.git?rev=329694ae8b56ea46f655c499c7856fe6992742f2#329694ae8b56ea46f655c499c7856fe6992742f2"
 dependencies = [
  "bytes",
  "cc",
