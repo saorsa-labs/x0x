@@ -393,8 +393,23 @@ async fn run_pubsub_dispatcher(
             }
             continue;
         }
-        match network.receive_pubsub_message().await {
-            Ok((peer, data)) => {
+        match network.receive_pubsub_message_with_session().await {
+            Ok((peer, data, session)) => {
+                // A token whose peer differs from the dequeued frame's peer
+                // is not provenance for those bytes; refuse to dispatch it
+                // rather than relabel the frame.
+                let session = match session {
+                    Some(session) if session.peer == peer => Some(session),
+                    Some(mismatched) => {
+                        tracing::warn!(
+                            dequeued_peer = %peer,
+                            token_peer = %mismatched.peer,
+                            "dropping PubSub frame with peer-mismatched session token"
+                        );
+                        continue;
+                    }
+                    None => None,
+                };
                 let (recv_depth, recv_capacity) =
                     network.gossip_recv_queue_depth(GossipStreamType::PubSub);
                 dispatch_stats.record_dequeue(GossipStreamType::PubSub, recv_depth, recv_capacity);
@@ -413,7 +428,7 @@ async fn run_pubsub_dispatcher(
                 );
                 match tokio::time::timeout(
                     PUBSUB_MESSAGE_HANDLE_TIMEOUT,
-                    pubsub.handle_incoming(peer, data),
+                    pubsub.handle_incoming(peer, session, data),
                 )
                 .await
                 {

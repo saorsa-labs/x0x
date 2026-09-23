@@ -4213,7 +4213,7 @@ impl Agent {
         data: bytes::Bytes,
     ) {
         if let Some(rt) = &self.gossip_runtime {
-            rt.pubsub().handle_incoming(peer, data).await;
+            rt.pubsub().handle_incoming(peer, None, data).await;
         }
     }
 

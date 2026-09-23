@@ -2,7 +2,7 @@
 use super::config::GossipConfig;
 use crate::network::NetworkNode;
 use bytes::Bytes;
-use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
+use saorsa_gossip_transport::{AuthenticatedSession, GossipStreamType, GossipTransport};
 use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -172,6 +172,49 @@ impl GossipTransport for PubSubTransport {
             return Ok(());
         }
         self.network.send_to_peer(peer, stream, data).await
+    }
+
+    fn authenticated_session(&self, peer: PeerId) -> Option<AuthenticatedSession> {
+        self.network.authenticated_session(peer)
+    }
+
+    async fn send_to_peer_guarded(
+        &self,
+        peer: PeerId,
+        stream: GossipStreamType,
+        admit: saorsa_gossip_transport::SessionAdmission,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(recorder) = self.recorder.lock().expect("recorder").as_mut() {
+            // Test double mirrors the ordinary send intercept: a captured
+            // guarded frame never reaches the (socket-free) network.
+            let bytes = admit(
+                self.network
+                    .authenticated_session(peer)
+                    // Tests with the recorder installed have no live session;
+                    // mint a deterministic stand-in so SG's v3 egress still
+                    // produces observable bytes. Production never runs this.
+                    .unwrap_or(AuthenticatedSession {
+                        peer,
+                        generation: 0,
+                    }),
+            )
+            .map_err(|e| anyhow::anyhow!("test admit refused: {e}"))?;
+            recorder.sends.push((peer, bytes));
+            return Ok(());
+        }
+        self.network.send_to_peer_guarded(peer, stream, admit).await
+    }
+
+    async fn receive_message_with_session(
+        &self,
+    ) -> anyhow::Result<(
+        PeerId,
+        GossipStreamType,
+        Bytes,
+        Option<AuthenticatedSession>,
+    )> {
+        self.network.receive_message_with_session().await
     }
 }
 
