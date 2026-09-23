@@ -10,8 +10,8 @@ use crate::identity::AgentId;
 use crate::kv::encrypted::{bind_public_payload, sign_mutation_with_snapshot};
 use crate::kv::encrypted::{
     open_mutation, open_public_payload, open_signed_mutation, open_signed_mutation_bound,
-    AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind, SharedKvSecureContext,
-    SignedKvMutation,
+    AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind, PublicAuthorizationVersion,
+    SharedKvSecureContext, SignedKvMutation,
 };
 use crate::kv::retained_paging::{
     decode_page, RetainedPageBinding, RetainedPagePool, RetainedPageV1,
@@ -42,12 +42,16 @@ fn trace_group_signed_record(
         return;
     }
     let record_hash = blake3::hash(wire).to_hex();
+    let signed_revision = decode_delta::<SignedKvMutation>(wire)
+        .ok()
+        .map(|(_, mutation)| mutation.epoch);
     tracing::debug!(
         target: "x0x.kv.gss_trace",
         stage,
         record_kind,
         store_id = %store_id,
         record_hash = %record_hash,
+        ?signed_revision,
         "group-signed KV convergence trace"
     );
 }
@@ -108,6 +112,7 @@ const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
 /// a fresh schedule). Convergence — `StateServed` evidence matched against
 /// local state, see [`bootstrap_converged`] — is the only legitimate stop
 /// condition, and the requester loop owns that check.
+#[cfg(test)]
 fn state_request_delays() -> impl Iterator<Item = u64> {
     let tail = std::iter::successors(Some(STATE_REQUEST_TAIL_START_SECS), |d| {
         Some(d.saturating_mul(2).min(STATE_REQUEST_TAIL_CAP_SECS))
@@ -288,6 +293,8 @@ struct ServedState {
 /// convergence.
 #[derive(Debug, Default, Clone)]
 struct ServedEvidence {
+    /// Signed-public markers belong to exactly one authorization snapshot.
+    authorization: Option<PublicAuthorizationVersion>,
     /// A holder declared non-empty state.
     saw_nonempty: bool,
     /// The OWNER declared the store legitimately empty.
@@ -298,6 +305,228 @@ struct ServedEvidence {
     /// responder's newer declaration REPLACES its older one, so a replayed
     /// stale serve can never roll a verified full-replace adopt backwards).
     digests: std::collections::HashMap<PeerId, ServedState>,
+}
+
+fn reset_public_served_evidence(
+    evidence: &Arc<std::sync::Mutex<ServedEvidence>>,
+    authorization: Option<PublicAuthorizationVersion>,
+) {
+    *evidence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = ServedEvidence {
+        authorization,
+        ..ServedEvidence::default()
+    };
+}
+
+/// Returns `None` when the context became invalid, otherwise whether a new
+/// authorization generation needs a fresh fast request schedule.
+fn observe_public_authorization_change(
+    changes: &mut tokio::sync::watch::Receiver<PublicAuthorizationVersion>,
+    version: &mut Option<PublicAuthorizationVersion>,
+    evidence: &Arc<std::sync::Mutex<ServedEvidence>>,
+) -> Option<bool> {
+    let next = *changes.borrow_and_update();
+    if Some(next) == *version {
+        return Some(false);
+    }
+    if !next.valid {
+        return None;
+    }
+    *version = Some(next);
+    reset_public_served_evidence(evidence, *version);
+    Some(true)
+}
+
+fn served_evidence_for_authorization<'a>(
+    evidence: &'a Arc<std::sync::Mutex<ServedEvidence>>,
+    current: Option<&tokio::sync::watch::Receiver<PublicAuthorizationVersion>>,
+    verified: Option<PublicAuthorizationVersion>,
+) -> Option<std::sync::MutexGuard<'a, ServedEvidence>> {
+    if verified.is_some_and(|version| current.is_none_or(|changes| *changes.borrow() != version)) {
+        return None;
+    }
+    let guard = evidence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (guard.authorization == verified).then_some(guard)
+}
+
+fn state_request_delay_at(attempt: usize) -> u64 {
+    if let Some(delay) = STATE_REQUEST_RETRY_SECS.get(attempt) {
+        *delay
+    } else {
+        match attempt - STATE_REQUEST_RETRY_SECS.len() {
+            0 => STATE_REQUEST_TAIL_START_SECS,
+            1 => 60,
+            2 => 120,
+            3 => 240,
+            _ => STATE_REQUEST_TAIL_CAP_SECS,
+        }
+    }
+}
+
+/// Owns the request cadence shared by production and socket-free tests.
+/// Returning `true` grants one publication slot; `false` ends the task.
+struct RequestSlotScheduler {
+    changes: Option<tokio::sync::watch::Receiver<PublicAuthorizationVersion>>,
+    version: Option<PublicAuthorizationVersion>,
+    attempt: usize,
+    converged: bool,
+    initialized: bool,
+    refresh_tick: tokio::time::Interval,
+}
+
+struct RequestSlotContext<'a> {
+    cancel: &'a tokio_util::sync::CancellationToken,
+    bootstrap_cancel: &'a tokio_util::sync::CancellationToken,
+    stopped: &'a std::sync::atomic::AtomicBool,
+    refresh: Option<&'a SecureRefreshFn>,
+    evidence: &'a Arc<std::sync::Mutex<ServedEvidence>>,
+    store: &'a std::sync::Weak<RwLock<KvStore>>,
+    bootstrap_active: &'a std::sync::atomic::AtomicBool,
+}
+
+impl RequestSlotScheduler {
+    fn new(changes: Option<tokio::sync::watch::Receiver<PublicAuthorizationVersion>>) -> Self {
+        let version = changes.as_ref().map(|changes| *changes.borrow());
+        let mut refresh_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            changes,
+            version,
+            attempt: 0,
+            converged: false,
+            initialized: false,
+            refresh_tick,
+        }
+    }
+
+    fn observe_change(&mut self, evidence: &Arc<std::sync::Mutex<ServedEvidence>>) -> Option<bool> {
+        let changed = observe_public_authorization_change(
+            self.changes.as_mut()?,
+            &mut self.version,
+            evidence,
+        )?;
+        if changed {
+            self.attempt = 0;
+            self.converged = false;
+        }
+        Some(changed)
+    }
+
+    async fn next_slot(&mut self, context: RequestSlotContext<'_>) -> bool {
+        let RequestSlotContext {
+            cancel,
+            bootstrap_cancel,
+            stopped,
+            refresh,
+            evidence,
+            store,
+            bootstrap_active,
+        } = context;
+        if !self.initialized && self.version.is_some() {
+            reset_public_served_evidence(evidence, self.version);
+        }
+        self.initialized = true;
+        'schedule: loop {
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            if self.converged {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return false,
+                        () = bootstrap_cancel.cancelled() => return false,
+                        changed = async {
+                            match self.changes.as_mut() {
+                                Some(changes) => changes.changed().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            if changed.is_err() { return false; }
+                            match self.observe_change(evidence) {
+                                Some(true) => continue 'schedule,
+                                Some(false) => {},
+                                None => return false,
+                            }
+                        },
+                        _ = self.refresh_tick.tick() => {
+                            if stopped.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+                            if let Some(refresh) = refresh {
+                                tokio::select! {
+                                    biased;
+                                    () = cancel.cancelled() => return false,
+                                    () = bootstrap_cancel.cancelled() => return false,
+                                    () = refresh() => {},
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+            let wait = tokio::time::sleep(jittered_secs(state_request_delay_at(self.attempt)));
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return false,
+                    () = bootstrap_cancel.cancelled() => return false,
+                    changed = async {
+                        match self.changes.as_mut() {
+                            Some(changes) => changes.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if changed.is_err() { return false; }
+                        match self.observe_change(evidence) {
+                            Some(true) => continue 'schedule,
+                            Some(false) => {},
+                            None => return false,
+                        }
+                    },
+                    _ = self.refresh_tick.tick(), if self.changes.is_some() => {
+                        if let Some(refresh) = refresh {
+                            tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => return false,
+                                () = bootstrap_cancel.cancelled() => return false,
+                                () = refresh() => {},
+                            }
+                        }
+                    },
+                    () = &mut wait => break,
+                }
+            }
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            if self.attempt >= STATE_REQUEST_RETRY_SECS.len() {
+                let Some(store) = store.upgrade() else {
+                    return false;
+                };
+                let ev = evidence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let (is_empty, cp_hwm, local_digest) = {
+                    let s = store.read().await;
+                    (s.is_empty(), s.highest_checkpoint_seq, s.served_digest())
+                };
+                if bootstrap_converged(&ev, is_empty, cp_hwm, local_digest) {
+                    if self.changes.is_some() {
+                        bootstrap_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                        self.converged = true;
+                        continue 'schedule;
+                    }
+                    return false;
+                }
+            }
+            self.attempt = self.attempt.saturating_add(1);
+            return true;
+        }
+    }
 }
 
 /// Disarms the bootstrap-active flag on ANY requester exit path (converged,
@@ -404,6 +633,9 @@ pub struct KvStoreSync {
     /// serving (e.g. the deletion-test harness) — arms this without ending
     /// the listener/responder loops.
     stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes a resident public requester immediately when bootstrap is
+    /// explicitly silenced; the atomic remains the pre-publish guard.
+    bootstrap_cancel: tokio_util::sync::CancellationToken,
 
     /// Cancelled by [`cancel_sync`](Self::cancel_sync) / [`stop`](Self::stop).
     /// ALL background loops (delta listener, responder, requester) select on
@@ -640,6 +872,7 @@ impl KvStoreSync {
             persist: std::sync::Mutex::new(None),
             open_lease: std::sync::Mutex::new(None),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bootstrap_cancel: tokio_util::sync::CancellationToken::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             secure: None,
@@ -1384,9 +1617,14 @@ impl KvStoreSync {
         refresh: Option<&SecureRefreshFn>,
         store_id: &KvStoreId,
         payload: &[u8],
-    ) -> Option<(AgentId, KvSyncMessage)> {
+    ) -> Option<(AgentId, KvSyncMessage, Option<PublicAuthorizationVersion>)> {
         if let Some(refresh) = refresh {
             refresh().await;
+        }
+        let changes = ctx.public_authorization_changes();
+        let authorization = changes.as_ref().map(|changes| *changes.borrow());
+        if authorization.is_some_and(|version| !version.valid) {
+            return None;
         }
         let (_, record) = decode_delta::<SignedKvMutation>(payload).ok()?;
         let mutation = open_signed_mutation_bound(ctx.as_ref(), store_id, record).ok()?;
@@ -1408,7 +1646,10 @@ impl KvStoreSync {
         {
             return None;
         }
-        Some((mutation.author_id, msg))
+        if changes.as_ref().map(|changes| *changes.borrow()) != authorization {
+            return None;
+        }
+        Some((mutation.author_id, msg, authorization))
     }
 
     /// Enable on-disk snapshot persistence at `path`.
@@ -1701,6 +1942,14 @@ impl KvStoreSync {
                 self.local_agent_id.is_some() && s.owner() == self.local_agent_id.as_ref();
             store_is_encrypted || store_is_group_signed || !local_is_owner || s.is_empty()
         };
+        let public_changes = if store_is_group_signed {
+            self.secure
+                .as_ref()
+                .and_then(|ctx| ctx.public_authorization_changes())
+        } else {
+            None
+        };
+        let public_version = public_changes.as_ref().map(|changes| *changes.borrow());
         // Defense in depth against cross-topic replay: the v2 signature covers
         // the embedded topic, but pub/sub delivery does not re-check it against
         // this subscription, so a raw-mesh participant could place a valid
@@ -1727,7 +1976,10 @@ impl KvStoreSync {
         // the side-topic subscription), read by the listener (verified
         // full-replace adopt, issue #240) and the bootstrap requester
         // (convergence). Created BEFORE the loops so all three share it.
-        let served_evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        let served_evidence = Arc::new(std::sync::Mutex::new(ServedEvidence {
+            authorization: public_version,
+            ..ServedEvidence::default()
+        }));
         // Armed only while the bootstrap requester runs: the verified
         // full-replace adopt fires exclusively in that window — a converged
         // replica must never let a divergent holder's serve truncate state
@@ -1991,6 +2243,7 @@ impl KvStoreSync {
         // Encrypted-path handles (#341 Phase B): Some together whenever the
         // store is encrypted (enforced by the startup guard above).
         let responder_secure = self.secure.clone();
+        let responder_public_changes = public_changes.clone();
         let responder_treekem = self.treekem_secure.clone();
         let responder_refresh = self.secure_refresh.clone();
         let responder_signing = self.author_signing.clone();
@@ -2034,40 +2287,44 @@ impl KvStoreSync {
                 // too. The verified identity is then the INNER signature's
                 // author (a relay's transport sender proves nothing); the
                 // plaintext path keeps the pub/sub-verified sender.
-                let (sync_msg, verified_sender) = if let Some(protector) =
+                let (sync_msg, verified_sender, verified_authorization) = if let Some(protector) =
                     responder_treekem.as_ref()
                 {
                     match Self::open_treekem_control(protector, &responder_store_id, &msg.payload)
                         .await
                     {
-                        Some((author, message)) => (message, Some(author)),
+                        Some((author, message)) => (message, Some(author), None),
                         None => continue,
                     }
                 } else if let Some(ctx) = responder_secure.as_ref() {
-                    let opened = if responder_is_encrypted {
-                        Self::open_control_message(
+                    if responder_is_encrypted {
+                        match Self::open_control_message(
                             ctx,
                             responder_refresh.as_ref(),
                             &responder_store_id,
                             &msg.payload,
                         )
                         .await
+                        {
+                            Some((author, message)) => (message, Some(author), None),
+                            None => continue,
+                        }
                     } else {
-                        Self::open_public_control_message(
+                        match Self::open_public_control_message(
                             ctx,
                             responder_refresh.as_ref(),
                             &responder_store_id,
                             &msg.payload,
                         )
                         .await
-                    };
-                    match opened {
-                        Some((author, m)) => (m, Some(author)),
-                        None => continue,
+                        {
+                            Some((author, message, version)) => (message, Some(author), version),
+                            None => continue,
+                        }
                     }
                 } else {
                     match bincode::deserialize::<KvSyncMessage>(&msg.payload) {
-                        Ok(m) => (m, msg.sender),
+                        Ok(m) => (m, msg.sender, None),
                         Err(_) => continue,
                     }
                 };
@@ -2434,9 +2691,13 @@ impl KvStoreSync {
                             let anchored = responder_store.read().await.owner().copied();
                             anchored.is_some() && verified_sender.as_ref() == anchored.as_ref()
                         };
-                        let mut ev = responder_served
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let Some(mut ev) = served_evidence_for_authorization(
+                            &responder_served,
+                            responder_public_changes.as_ref(),
+                            verified_authorization,
+                        ) else {
+                            continue;
+                        };
                         if empty {
                             if owner_verified {
                                 ev.saw_owner_empty = true;
@@ -2465,17 +2726,20 @@ impl KvStoreSync {
                         // requires the full-delta SENDER to be an
                         // authorized writer (see the listener), so a
                         // marker alone can never truncate anything.
-                        responder_served
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .digests
-                            .insert(
-                                responder,
-                                ServedState {
-                                    digest,
-                                    entry_count,
-                                },
-                            );
+                        let Some(mut ev) = served_evidence_for_authorization(
+                            &responder_served,
+                            responder_public_changes.as_ref(),
+                            verified_authorization,
+                        ) else {
+                            continue;
+                        };
+                        ev.digests.insert(
+                            responder,
+                            ServedState {
+                                digest,
+                                entry_count,
+                            },
+                        );
                     }
                     KvSyncMessage::OwnerAnnounce {
                         owner,
@@ -2595,6 +2859,7 @@ impl KvStoreSync {
             // authoritative kill switch is the `stopped` flag below.)
             let requester_store = Arc::downgrade(&self.store);
             let stopped = Arc::clone(&self.stopped);
+            let bootstrap_cancel = self.bootstrap_cancel.clone();
             let requester_cancel = self.cancel.clone();
             let requester_served = Arc::clone(&served_evidence);
             let requester_bootstrap_active = Arc::clone(&bootstrap_active);
@@ -2606,6 +2871,7 @@ impl KvStoreSync {
             let requester_signing = self.author_signing.clone();
             let requester_store_id = { *self.store.read().await.id() };
             let requester_is_encrypted = store_is_encrypted;
+            let requester_public_changes = public_changes;
             #[cfg(test)]
             let requester_loop_exits = Arc::clone(&self.loop_exits);
             // #765 r4: the loop-exit tracker wraps the WHOLE loop future,
@@ -2616,45 +2882,20 @@ impl KvStoreSync {
                 // Disarms the adopt window on ANY exit (converged, silenced,
                 // cancelled, torn down) — the listener's verified
                 // full-replace adopt must never fire outside bootstrap.
-                let _guard = BootstrapGuard(requester_bootstrap_active);
-                for (attempt, delay_secs) in state_request_delays().enumerate() {
-                    tokio::select! {
-                        biased;
-                        // cancel_sync tears down every loop promptly, even
-                        // mid-sleep (round-4 review).
-                        () = requester_cancel.cancelled() => return,
-                        () = tokio::time::sleep(jittered_secs(delay_secs)) => {}
-                    }
-                    if stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                        return; // silenced — never chatter for a dead sync
-                    }
-                    // Tail attempts stop on convergence; front attempts
-                    // always run (see above — partial early state must not
-                    // cancel the request for full history). Convergence is
-                    // judged against StateServed evidence matched to local
-                    // state (`bootstrap_converged`) — NOT mere non-emptiness,
-                    // which a single incremental delta can fake while the
-                    // full historical state is still missing (round-2
-                    // review). v2 digest evidence makes the check exact for
-                    // checkpoint-less state (issue #240): the requester
-                    // stops only when its OWN content digest matches a
-                    // holder's declaration.
-                    if attempt >= STATE_REQUEST_RETRY_SECS.len() {
-                        let Some(store) = requester_store.upgrade() else {
-                            return; // sync torn down — nothing left to bootstrap
-                        };
-                        let ev = requester_served
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clone();
-                        let (is_empty, cp_hwm, local_digest) = {
-                            let s = store.read().await;
-                            (s.is_empty(), s.highest_checkpoint_seq, s.served_digest())
-                        };
-                        if bootstrap_converged(&ev, is_empty, cp_hwm, local_digest) {
-                            return; // a holder served us and local state matches
-                        }
-                    }
+                let _guard = BootstrapGuard(Arc::clone(&requester_bootstrap_active));
+                let mut schedule = RequestSlotScheduler::new(requester_public_changes);
+                while schedule
+                    .next_slot(RequestSlotContext {
+                        cancel: &requester_cancel,
+                        bootstrap_cancel: &bootstrap_cancel,
+                        stopped: &stopped,
+                        refresh: requester_refresh.as_ref(),
+                        evidence: &requester_served,
+                        store: &requester_store,
+                        bootstrap_active: &requester_bootstrap_active,
+                    })
+                    .await
+                {
                     let request = KvSyncMessage::StateRequest {
                         requester: local_peer_id,
                     };
@@ -2713,9 +2954,12 @@ impl KvStoreSync {
                             &wire,
                         );
                     }
-                    let result = requester_pubsub
-                        .publish(sync_topic.clone(), wire.clone())
-                        .await;
+                    let result = tokio::select! {
+                        biased;
+                        () = requester_cancel.cancelled() => return,
+                        () = bootstrap_cancel.cancelled() => return,
+                        result = requester_pubsub.publish(sync_topic.clone(), wire.clone()) => result,
+                    };
                     if requester_secure.is_some()
                         && requester_treekem.is_none()
                         && !requester_is_encrypted
@@ -2754,6 +2998,7 @@ impl KvStoreSync {
     pub fn silence_bootstrap(&self) {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.bootstrap_cancel.cancel();
     }
 
     /// Tear down ALL of this sync's background loops (delta listener,
@@ -3842,6 +4087,396 @@ mod tests {
         assert!(image.is_empty());
         assert!(image.has_retained_group_history());
         sync.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn group_signed_retained_recovery_requires_fresh_revision_without_sockets() {
+        let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = keypair.agent_id();
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "ab".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let source_ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("source context"),
+        );
+        let target_ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("target context"),
+        );
+        let id = store_id(91);
+        let source = Arc::new(RwLock::new(
+            KvStore::new_group_signed(
+                id,
+                "Wiki".to_string(),
+                owner,
+                group.stable_group_id().as_bytes().to_vec(),
+                source_ctx.clone(),
+            )
+            .expect("source store"),
+        ));
+        let target = Arc::new(RwLock::new(
+            KvStore::new_group_signed(
+                id,
+                "Wiki".to_string(),
+                owner,
+                group.stable_group_id().as_bytes().to_vec(),
+                target_ctx.clone(),
+            )
+            .expect("target store"),
+        ));
+        source
+            .write()
+            .await
+            .put(
+                "barrier".to_string(),
+                b"fresh".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("local durable candidate");
+        let image = bincode::serialize(&*source.read().await).expect("retained image");
+        let signing = Arc::new(AuthorSigning::from_keypair(&keypair).expect("signing"));
+        let source_secure = source_ctx.clone() as SharedKvSecureContext;
+        let target_secure = target_ctx.clone() as SharedKvSecureContext;
+        let old_wire = KvStoreSync::sign_publication(
+            &source,
+            &source_secure,
+            None,
+            &signing,
+            KvMutationKind::RetainedState,
+            peer(1),
+            image.clone(),
+        )
+        .await
+        .expect("old signed image");
+
+        group.state_revision += 1;
+        source_ctx.update_from_group(&group);
+        target_ctx.update_from_group(&group);
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        assert!(
+            !KvStoreSync::merge_group_signed_record(
+                &target_secure,
+                None,
+                &target,
+                &id,
+                peer(2),
+                &old_wire,
+                &pages,
+            )
+            .await,
+            "old signed image must not pass a new revision"
+        );
+        assert!(target.read().await.get("barrier").is_none());
+
+        let fresh_wire = KvStoreSync::sign_publication(
+            &source,
+            &source_secure,
+            None,
+            &signing,
+            KvMutationKind::RetainedState,
+            peer(1),
+            image,
+        )
+        .await
+        .expect("fresh signed image");
+        assert!(
+            KvStoreSync::merge_group_signed_record(
+                &target_secure,
+                None,
+                &target,
+                &id,
+                peer(2),
+                &fresh_wire,
+                &pages,
+            )
+            .await,
+            "freshly signed retained history must merge"
+        );
+        assert_eq!(
+            target.read().await.get("barrier").expect("recovered").value,
+            b"fresh"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_revision_wake_discards_old_serve_and_cancel_wins_without_sockets() {
+        let old = PublicAuthorizationVersion {
+            generation: 0,
+            revision: 2,
+            binding: [2; 32],
+            valid: true,
+        };
+        let (sender, mut changes) = tokio::sync::watch::channel(old);
+        let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence {
+            authorization: Some(old),
+            saw_nonempty: true,
+            ..ServedEvidence::default()
+        }));
+        let mut observed = Some(old);
+        let mut delays = state_request_delays();
+        for _ in 0..10 {
+            let _ = delays.next();
+        }
+        assert_eq!(delays.next(), Some(300), "pre-change capped tail");
+        assert!(!changes.has_changed().expect("watch open"));
+        let current = PublicAuthorizationVersion {
+            generation: 1,
+            revision: 3,
+            binding: [3; 32],
+            valid: true,
+        };
+        sender.send_replace(current);
+        tokio::time::timeout(Duration::from_secs(2), changes.changed())
+            .await
+            .expect("revision wake timeout")
+            .expect("revision wake");
+        assert_eq!(
+            observe_public_authorization_change(&mut changes, &mut observed, &evidence),
+            Some(true)
+        );
+        assert_eq!(observed, Some(current));
+        delays = state_request_delays();
+        assert_eq!(delays.next(), Some(1), "new revision restarts fast cadence");
+        assert!(served_evidence_for_authorization(&evidence, Some(&changes), Some(old)).is_none());
+        {
+            let current_evidence =
+                served_evidence_for_authorization(&evidence, Some(&changes), Some(current))
+                    .expect("new generation admitted");
+            assert!(
+                !current_evidence.saw_nonempty,
+                "old served proof was cleared"
+            );
+        }
+
+        sender.send_replace(current);
+        tokio::time::timeout(Duration::from_secs(2), changes.changed())
+            .await
+            .expect("same-value wake timeout")
+            .expect("same-value wake");
+        assert_eq!(
+            observe_public_authorization_change(&mut changes, &mut observed, &evidence),
+            Some(false),
+            "unchanged authorization cannot restart wire requests"
+        );
+
+        // The same cancellation token used by the resident requester must
+        // end a parked watch wait, even if no subsequent revision arrives.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let child = cancel.clone();
+        let parked = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = child.cancelled() => true,
+                _ = changes.changed() => false,
+            }
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(2), parked)
+            .await
+            .expect("parked cancel timeout")
+            .expect("parked task reaped"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_request_slot_loop_restarts_after_convergence_and_silences_without_sockets() {
+        let old = PublicAuthorizationVersion {
+            generation: 0,
+            revision: 2,
+            binding: [2; 32],
+            valid: true,
+        };
+        let (changes_tx, changes_rx) = tokio::sync::watch::channel(old);
+        let store = Arc::new(RwLock::new(
+            KvStore::new(
+                store_id(92),
+                "Wiki".to_string(),
+                agent(1),
+                AccessPolicy::Signed,
+            )
+            .expect("in-memory store"),
+        ));
+        let weak_store = Arc::downgrade(&store);
+        let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence {
+            authorization: Some(old),
+            ..ServedEvidence::default()
+        }));
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let bootstrap_cancel = tokio_util::sync::CancellationToken::new();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let worker_evidence = Arc::clone(&evidence);
+        let worker_active = Arc::clone(&active);
+        let worker_stopped = Arc::clone(&stopped);
+        let worker_cancel = cancel.clone();
+        let worker_bootstrap_cancel = bootstrap_cancel.clone();
+        let worker = tokio::spawn(async move {
+            let mut schedule = RequestSlotScheduler::new(Some(changes_rx));
+            while schedule
+                .next_slot(RequestSlotContext {
+                    cancel: &worker_cancel,
+                    bootstrap_cancel: &worker_bootstrap_cancel,
+                    stopped: &worker_stopped,
+                    refresh: None,
+                    evidence: &worker_evidence,
+                    store: &weak_store,
+                    bootstrap_active: &worker_active,
+                })
+                .await
+            {
+                sent.send(schedule.version.expect("public version").revision)
+                    .expect("in-memory publication");
+            }
+        });
+
+        // The test calls the production scheduler that gates the real
+        // signed publication. Four front slots occur before convergence is
+        // checked; no NetworkNode or OS socket is constructed here.
+        for _ in 0..4 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(45), received.recv())
+                    .await
+                    .expect("front request timeout"),
+                Some(2)
+            );
+        }
+        evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .saw_owner_empty = true;
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        tokio::task::yield_now().await;
+        assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err(), "no wire while unchanged");
+
+        changes_tx.send_replace(PublicAuthorizationVersion {
+            generation: 1,
+            revision: 3,
+            binding: [3; 32],
+            valid: true,
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), received.recv())
+                .await
+                .expect("new fast request timeout"),
+            Some(3),
+            "new fast request slot"
+        );
+        assert!(received.try_recv().is_err());
+        assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+        for _ in 0..3 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(45), received.recv())
+                    .await
+                    .expect("recovery front request timeout"),
+                Some(3)
+            );
+        }
+        evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .saw_owner_empty = true;
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        tokio::task::yield_now().await;
+        assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(received.try_recv().is_err(), "re-converged and parked");
+        // Silence only AFTER the second convergence has parked the real
+        // scheduler, so this covers the reviewed task-retention defect.
+        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+        bootstrap_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("parked silence timeout")
+            .expect("silenced requester reaped");
+        assert!(received.try_recv().is_err());
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_request_slot_loop_resets_capped_tail_without_sockets() {
+        let old = PublicAuthorizationVersion {
+            generation: 0,
+            revision: 2,
+            binding: [2; 32],
+            valid: true,
+        };
+        let (changes_tx, changes_rx) = tokio::sync::watch::channel(old);
+        let store = Arc::new(RwLock::new(
+            KvStore::new(
+                store_id(93),
+                "Wiki".to_string(),
+                agent(1),
+                AccessPolicy::Signed,
+            )
+            .expect("in-memory store"),
+        ));
+        let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let bootstrap_cancel = tokio_util::sync::CancellationToken::new();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let worker_cancel = cancel.clone();
+        let worker_bootstrap_cancel = bootstrap_cancel.clone();
+        let worker = tokio::spawn(async move {
+            let mut schedule = RequestSlotScheduler::new(Some(changes_rx));
+            let weak_store = Arc::downgrade(&store);
+            while schedule
+                .next_slot(RequestSlotContext {
+                    cancel: &worker_cancel,
+                    bootstrap_cancel: &worker_bootstrap_cancel,
+                    stopped: &stopped,
+                    refresh: None,
+                    evidence: &evidence,
+                    store: &weak_store,
+                    bootstrap_active: &active,
+                })
+                .await
+            {
+                sent.send(schedule.version.expect("public version").revision)
+                    .expect("in-memory publication");
+            }
+        });
+        for _ in 0..9 {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(370), received.recv())
+                    .await
+                    .expect("capped tail request timeout"),
+                Some(2)
+            );
+        }
+        tokio::task::yield_now().await;
+        let changed_at = tokio::time::Instant::now();
+        changes_tx.send_replace(PublicAuthorizationVersion {
+            generation: 1,
+            revision: 3,
+            binding: [3; 32],
+            valid: true,
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), received.recv())
+                .await
+                .expect("tail reset request timeout"),
+            Some(3)
+        );
+        assert!(
+            changed_at.elapsed() < Duration::from_secs(3),
+            "revision change must reset the 300-second tail"
+        );
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("requester cancel timeout")
+            .expect("cancelled requester reaped");
     }
 
     #[test]
@@ -6961,6 +7596,9 @@ mod tests {
     /// infinite capped tail (bounded chatter, unbounded patience).
     #[test]
     fn state_request_schedule_never_terminates_while_unconverged() {
+        for (attempt, delay) in state_request_delays().take(16).enumerate() {
+            assert_eq!(state_request_delay_at(attempt), delay);
+        }
         let front: Vec<u64> = state_request_delays().take(4).collect();
         assert_eq!(front, STATE_REQUEST_RETRY_SECS, "front burst unchanged");
         let tail: Vec<u64> = state_request_delays().skip(4).take(8).collect();
@@ -6996,6 +7634,7 @@ mod tests {
 
         // Checkpoint evidence is exact: local HWM must reach it.
         let cp = ServedEvidence {
+            authorization: None,
             saw_nonempty: true,
             saw_owner_empty: false,
             max_checkpoint_seq: 5,
@@ -7010,6 +7649,7 @@ mod tests {
 
         // Non-empty holder, no checkpoint: local non-emptiness required.
         let nonempty = ServedEvidence {
+            authorization: None,
             saw_nonempty: true,
             saw_owner_empty: false,
             max_checkpoint_seq: 0,
@@ -7020,6 +7660,7 @@ mod tests {
 
         // Owner-declared empty (and nothing stronger): converged even empty.
         let owner_empty = ServedEvidence {
+            authorization: None,
             saw_nonempty: false,
             saw_owner_empty: true,
             max_checkpoint_seq: 0,
@@ -7028,6 +7669,7 @@ mod tests {
         assert!(bootstrap_converged(&owner_empty, true, 0, D1));
         // A non-empty holder claim outranks owner-empty when both were seen.
         let mixed = ServedEvidence {
+            authorization: None,
             saw_nonempty: true,
             saw_owner_empty: true,
             max_checkpoint_seq: 0,
@@ -7040,6 +7682,7 @@ mod tests {
 
         // ---- v2 digest evidence (issue #240) ----
         let digest_ev = |decls: &[(&[u8; 32], u32)]| ServedEvidence {
+            authorization: None,
             saw_nonempty: false,
             saw_owner_empty: false,
             max_checkpoint_seq: 0,

@@ -132,6 +132,16 @@ pub struct SignedKvMutation {
     pub signature: Vec<u8>,
 }
 
+/// A local public-group authorization snapshot. `generation` distinguishes
+/// successive snapshots even if a revision/roster later returns to old bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicAuthorizationVersion {
+    pub generation: u64,
+    pub revision: u64,
+    pub binding: [u8; 32],
+    pub valid: bool,
+}
+
 impl SignedKvMutation {
     /// The exact bytes covered by the author's signature: everything except
     /// the signature itself, length-prefixed where variable-length.
@@ -222,6 +232,14 @@ pub trait KvSecureContext: Send + Sync {
 
     /// The current group secret epoch records are sealed under.
     fn current_epoch(&self) -> u64;
+
+    /// A nonblocking signal for changes to a signed-public group's local
+    /// authorization snapshot. Other security planes have no such signal.
+    fn public_authorization_changes(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<PublicAuthorizationVersion>> {
+        None
+    }
 
     /// Seal `plaintext` for this store under the current epoch.
     ///
@@ -655,10 +673,18 @@ pub fn open_signed_mutation_bound(
     expected_store_id: &KvStoreId,
     mutation: SignedKvMutation,
 ) -> Result<SignedKvMutation> {
-    if mutation.group_id != ctx.group_id()
-        || mutation.store_id != *expected_store_id.as_bytes()
-        || mutation.epoch != ctx.current_epoch()
-    {
+    let group_matches = mutation.group_id == ctx.group_id();
+    let store_matches = mutation.store_id == *expected_store_id.as_bytes();
+    let local_revision = ctx.current_epoch();
+    if !group_matches || !store_matches || mutation.epoch != local_revision {
+        tracing::debug!(
+            target: "x0x.kv.gss_trace",
+            group_matches,
+            store_matches,
+            signed_revision = mutation.epoch,
+            local_revision,
+            "signed mutation binding rejection"
+        );
         return Err(KvError::SecureRecord(
             "signed mutation bindings do not match current group/store/epoch".to_string(),
         ));
