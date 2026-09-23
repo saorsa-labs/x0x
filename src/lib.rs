@@ -19146,7 +19146,7 @@ mod tests {
         let topic = saorsa_gossip_types::TopicId::from_entity(IDENTITY_ANNOUNCE_TOPIC);
         let mut subscriptions = Vec::with_capacity(NODE_COUNT);
         for (node_index, node) in nodes.iter().enumerate() {
-            subscriptions.push(node.subscribe(topic));
+            subscriptions.push(node.subscribe_ready(topic).await);
             let connected = peers
                 .iter()
                 .copied()

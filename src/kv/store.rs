@@ -2695,6 +2695,27 @@ impl KvStore {
         if cp.store_id != self.id {
             return;
         }
+        // Adoption rejects a checkpoint that would downgrade a terminal
+        // policy, but an owner-authenticated delta then falls through to the
+        // entry merge path. Preserve that entry behavior while refusing to
+        // cache the rejected checkpoint or advance its high-water sequence.
+        let preserves_terminal_policy = match (&self.policy, &cp.policy) {
+            (AccessPolicy::AppendOnly, AccessPolicy::AppendOnly) => true,
+            (AccessPolicy::AppendOnly, _) => false,
+            (
+                AccessPolicy::Encrypted { group_id: current },
+                AccessPolicy::Encrypted { group_id: claimed },
+            )
+            | (
+                AccessPolicy::TreeKemEncrypted { group_id: current },
+                AccessPolicy::TreeKemEncrypted { group_id: claimed },
+            ) => current == claimed,
+            (AccessPolicy::Encrypted { .. } | AccessPolicy::TreeKemEncrypted { .. }, _) => false,
+            _ => true,
+        };
+        if !preserves_terminal_policy {
+            return;
+        }
         // Cache only if the resulting complete state matches the checkpoint.
         let matches = {
             let pairs = self.checkpoint_pairs();
