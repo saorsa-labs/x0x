@@ -19098,6 +19098,15 @@ async fn wipe_local_group_crypto_material(
         });
     }
     if !welcome_ids.is_empty() {
+        let mut streams = state.pending_welcome_streams.lock().await;
+        if let Some(streams) = streams.as_mut() {
+            for welcome_id in &welcome_ids {
+                if let Some(stream) = streams.remove(welcome_id) {
+                    stream.abort();
+                }
+            }
+        }
+        drop(streams);
         let mut waiters = state.pending_welcome_waiters.write().await;
         let mut acks = state.pending_welcome_acks.write().await;
         for welcome_id in welcome_ids {
@@ -31558,7 +31567,9 @@ const MEMBER_JOINED_RESEND_POLL_INTERVALS: u32 = 3;
 
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
 
-const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+// The TreeKEM join-result poll closes at 120s. All fetch retries and the
+// final receive wait must finish inside that window.
+const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(115);
 
 const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
     Duration::ZERO,
@@ -33863,7 +33874,24 @@ async fn stage_treekem_welcome(
         created_at: Instant::now(),
     };
     let mut welcomes = state.pending_welcomes.write().await;
-    welcomes.retain(|_, pending| pending.created_at.elapsed() < PENDING_WELCOME_TTL);
+    let mut expired_ids = Vec::new();
+    welcomes.retain(|id, pending| {
+        let live = pending.created_at.elapsed() < PENDING_WELCOME_TTL;
+        if !live {
+            expired_ids.push(id.clone());
+        }
+        live
+    });
+    // Keep the staging lock through stream pruning. A concurrent staging of
+    // the same content id must not be mistaken for the expired entry.
+    let mut streams = state.pending_welcome_streams.lock().await;
+    for id in expired_ids {
+        if let Some(stream) = streams.as_mut().and_then(|streams| streams.remove(&id)) {
+            stream.abort();
+            let _ = stream.await;
+        }
+        state.pending_welcome_acks.write().await.remove(&id);
+    }
     welcomes.insert(welcome_id.clone(), pending);
     WelcomeRef {
         welcome_id,
@@ -33914,11 +33942,21 @@ async fn send_welcome_blob_message(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug)]
 enum WelcomeFetchSendError {
     /// The request might have arrived; only its delivery receipt is missing.
     ReceiptUnconfirmed(String),
     /// The request could not be sent or encoded.
     Failed(String),
+}
+
+fn classify_welcome_fetch_send_error(error: x0x::dm::DmError) -> WelcomeFetchSendError {
+    match error {
+        x0x::dm::DmError::Timeout { .. } => {
+            WelcomeFetchSendError::ReceiptUnconfirmed(error.to_string())
+        }
+        _ => WelcomeFetchSendError::Failed(error.to_string()),
+    }
 }
 
 async fn send_welcome_fetch_request(
@@ -33932,12 +33970,7 @@ async fn send_welcome_fetch_request(
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
         .await
         .map(|_| ())
-        .map_err(|error| match error {
-            x0x::dm::DmError::Timeout { .. } => {
-                WelcomeFetchSendError::ReceiptUnconfirmed(error.to_string())
-            }
-            _ => WelcomeFetchSendError::Failed(error.to_string()),
-        })
+        .map_err(classify_welcome_fetch_send_error)
 }
 
 async fn notify_welcome_waiters(
@@ -33975,37 +34008,6 @@ async fn fetch_treekem_welcome_with_retries(
     group_id: &str,
     welcome_ref: &WelcomeRef,
 ) -> std::result::Result<Vec<u8>, String> {
-    let mut last_error = None;
-    for (attempt, delay) in WELCOME_FETCH_RETRY_DELAYS.iter().enumerate() {
-        if !delay.is_zero() {
-            tokio::time::sleep(*delay).await;
-        }
-        match fetch_treekem_welcome(state, group_id, welcome_ref).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                tracing::warn!(
-                    target: "welcome.trace",
-                    stage = "fetch_retry_failed",
-                    group_id,
-                    welcome_id = %welcome_ref.welcome_id,
-                    attempt,
-                    next_delay_ms = ?WELCOME_FETCH_RETRY_DELAYS
-                        .get(attempt + 1)
-                        .map(|d| d.as_millis() as u64),
-                    error = %e,
-                );
-                last_error = Some(e);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| "TreeKEM Welcome fetch did not run".to_string()))
-}
-
-async fn fetch_treekem_welcome(
-    state: &Arc<AppState>,
-    group_id: &str,
-    welcome_ref: &WelcomeRef,
-) -> std::result::Result<Vec<u8>, String> {
     let send_state = Arc::clone(state);
     fetch_treekem_welcome_via(state, group_id, welcome_ref, move |source, request| {
         let state = Arc::clone(&send_state);
@@ -34023,7 +34025,30 @@ async fn fetch_treekem_welcome_via<S, F>(
     send: S,
 ) -> std::result::Result<Vec<u8>, String>
 where
-    S: FnOnce(AgentId, WelcomeBlobMessage) -> F,
+    S: FnMut(AgentId, WelcomeBlobMessage) -> F,
+    F: std::future::Future<Output = std::result::Result<(), WelcomeFetchSendError>>,
+{
+    fetch_treekem_welcome_via_schedule(
+        state,
+        group_id,
+        welcome_ref,
+        send,
+        &WELCOME_FETCH_RETRY_DELAYS,
+        WELCOME_FETCH_TIMEOUT,
+    )
+    .await
+}
+
+async fn fetch_treekem_welcome_via_schedule<S, F>(
+    state: &Arc<AppState>,
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+    mut send: S,
+    retry_delays: &[Duration],
+    fetch_timeout: Duration,
+) -> std::result::Result<Vec<u8>, String>
+where
+    S: FnMut(AgentId, WelcomeBlobMessage) -> F,
     F: std::future::Future<Output = std::result::Result<(), WelcomeFetchSendError>>,
 {
     if welcome_ref.byte_len > x0x::files::MAX_TRANSFER_SIZE {
@@ -34032,7 +34057,7 @@ where
     let source = parse_agent_id_hex(&welcome_ref.source)?;
     let total_chunks =
         x0x::files::total_chunks_for_size(welcome_ref.byte_len, x0x::files::DEFAULT_CHUNK_SIZE);
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
     let should_send_fetch = {
         let mut receives = state.pending_welcome_receives.write().await;
         let should_send_fetch = match receives.get(&welcome_ref.welcome_id) {
@@ -34078,37 +34103,80 @@ where
         should_send_fetch
     };
 
-    if should_send_fetch {
-        let request = WelcomeBlobMessage::FetchRequest {
-            group_id: group_id.to_string(),
-            welcome_id: welcome_ref.welcome_id.clone(),
-        };
-        match send(source, request).await {
-            Ok(()) => {}
-            Err(WelcomeFetchSendError::ReceiptUnconfirmed(error)) => {
-                // The request may have reached the owner, and the completed
-                // Welcome may already be on `rx`. Its receipt timeout cannot
-                // invalidate the independently verified transfer.
-                tracing::warn!(
-                    target: "welcome.trace",
-                    stage = "fetch_request_receipt_unconfirmed",
-                    group_id,
-                    welcome_id = %welcome_ref.welcome_id,
-                    error = %error,
-                    "waiting for Welcome despite unconfirmed FetchRequest receipt",
-                );
+    let started = tokio::time::Instant::now();
+    let deadline = started + fetch_timeout;
+    let mut due = started;
+    let mut last_progress_bytes = 0;
+    let mut received = None;
+    for (attempt, delay) in retry_delays.iter().enumerate() {
+        due += *delay;
+        if due >= deadline {
+            break;
+        }
+        tokio::select! {
+            result = &mut rx => {
+                received = Some(result);
+                break;
             }
-            Err(WelcomeFetchSendError::Failed(error)) => {
-                cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
-                return Err(error);
+            () = tokio::time::sleep_until(due) => {}
+        }
+        if attempt > 0 {
+            let progress_bytes = state
+                .pending_welcome_receives
+                .read()
+                .await
+                .get(&welcome_ref.welcome_id)
+                .map_or(0, |receive| receive.received_bytes);
+            if progress_bytes > last_progress_bytes {
+                last_progress_bytes = progress_bytes;
+                tracing::debug!(
+                    target: "welcome.trace",
+                    stage = "fetch_retry_stream_progress",
+                    welcome_id = %welcome_ref.welcome_id,
+                    attempt,
+                    progress_bytes,
+                );
+                continue;
+            }
+            tracing::warn!(
+                target: "welcome.trace",
+                stage = "fetch_retry_stalled",
+                group_id,
+                welcome_id = %welcome_ref.welcome_id,
+                attempt,
+            );
+        }
+        if should_send_fetch || attempt > 0 {
+            let request = WelcomeBlobMessage::FetchRequest {
+                group_id: group_id.to_string(),
+                welcome_id: welcome_ref.welcome_id.clone(),
+            };
+            match send(source, request).await {
+                Ok(()) => {}
+                Err(WelcomeFetchSendError::ReceiptUnconfirmed(error)) => {
+                    tracing::warn!(
+                        target: "welcome.trace",
+                        stage = "fetch_request_receipt_unconfirmed",
+                        group_id,
+                        welcome_id = %welcome_ref.welcome_id,
+                        error = %error,
+                        "waiting for Welcome despite unconfirmed FetchRequest receipt",
+                    );
+                }
+                Err(WelcomeFetchSendError::Failed(error)) => {
+                    cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+                    return Err(error);
+                }
             }
         }
     }
-
-    let received = match tokio::time::timeout(WELCOME_FETCH_TIMEOUT, rx).await {
-        Ok(Ok(result)) => result?,
-        Ok(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
-        Err(_) => {
+    if received.is_none() {
+        received = tokio::time::timeout_at(deadline, &mut rx).await.ok();
+    }
+    let received = match received {
+        Some(Ok(result)) => result?,
+        Some(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
+        None => {
             cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
             return Err("timed out waiting for TreeKEM Welcome blob".to_string());
         }
@@ -34223,11 +34291,31 @@ async fn handle_welcome_fetch_request(
         tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sender = %LogHexId::agent(&sender_hex), "unauthorized Welcome fetch request");
         return;
     }
-    let state = Arc::clone(state);
+    let stream_state = Arc::clone(state);
     let recipient = *sender;
-    tokio::spawn(async move {
-        stream_welcome_blob(&state, &recipient, &welcome_id, pending).await;
-    });
+    let stream_id = welcome_id.clone();
+    replace_welcome_stream(state, &welcome_id, async move {
+        stream_welcome_blob(&stream_state, &recipient, &stream_id, pending).await;
+    })
+    .await;
+}
+
+async fn replace_welcome_stream<F>(state: &Arc<AppState>, welcome_id: &str, stream: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut streams = state.pending_welcome_streams.lock().await;
+    let Some(streams) = streams.as_mut() else {
+        return;
+    };
+    if let Some(previous) = streams.remove(welcome_id) {
+        previous.abort();
+        let _ = previous.await;
+    }
+    // An aborted sender cannot run its normal ack-slot cleanup. Clear its
+    // slot only after it has stopped so the replacement owns every ack.
+    state.pending_welcome_acks.write().await.remove(welcome_id);
+    streams.insert(welcome_id.to_string(), tokio::spawn(stream));
 }
 
 async fn stream_welcome_blob(
@@ -34376,7 +34464,7 @@ async fn handle_welcome_blob_chunk(
     };
     let mut receives = state.pending_welcome_receives.write().await;
     let Some(receive) = receives.get_mut(&welcome_id) else {
-        tracing::debug!(target: "welcome.trace", stage = "chunk_recv_no_pending", welcome_id = %welcome_id, seq = sequence);
+        tracing::warn!(target: "welcome.trace", stage = "chunk_recv_no_pending", welcome_id = %welcome_id, seq = sequence);
         return;
     };
     if receive.source != sender_hex {
@@ -35260,6 +35348,7 @@ pub(in crate::server) mod tests {
             pending_welcome_receives: RwLock::new(HashMap::new()),
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
+            pending_welcome_streams: Mutex::new(Some(HashMap::new())),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
@@ -45638,6 +45727,8 @@ pub(in crate::server) mod tests {
         let received =
             fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |source, request| {
                 let state = Arc::clone(&receive_state);
+                let welcome_id = welcome_id.clone();
+                let receive_bytes = receive_bytes.clone();
                 async move {
                     assert_eq!(source, owner_id);
                     assert!(matches!(request, WelcomeBlobMessage::FetchRequest { .. }));
@@ -45665,6 +45756,271 @@ pub(in crate::server) mod tests {
         assert_eq!(received, bytes);
         assert!(joiner.pending_welcome_receives.read().await.is_empty());
         assert!(joiner.pending_welcome_waiters.read().await.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn actual_dm_timeout_leaves_welcome_receipt_unconfirmed() {
+        let error = x0x::dm::DmError::Timeout {
+            retries: 1,
+            elapsed: Duration::from_secs(24),
+        };
+        assert!(matches!(
+            classify_welcome_fetch_send_error(error),
+            WelcomeFetchSendError::ReceiptUnconfirmed(message)
+                if message.contains("timed out after 1 retries")
+        ));
+    }
+
+    #[tokio::test]
+    async fn replacement_welcome_stream_stops_previous_before_starting() -> anyhow::Result<()> {
+        struct ActiveGuard(Arc<AtomicUsize>);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let active = Arc::new(AtomicUsize::new(0));
+        let welcome_id = "ab".repeat(32);
+        for _ in 0..2 {
+            let stream_active = Arc::clone(&active);
+            replace_welcome_stream(&owner, &welcome_id, async move {
+                stream_active.fetch_add(1, Ordering::SeqCst);
+                let _guard = ActiveGuard(stream_active);
+                std::future::pending::<()>().await;
+            })
+            .await;
+            tokio::task::yield_now().await;
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+        }
+        let stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|streams| streams.remove(&welcome_id));
+        if let Some(stream) = stream {
+            stream.abort();
+            let _ = stream.await;
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn welcome_receive_survives_retry_sleep() -> anyhow::Result<()> {
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let owner_id = owner.agent.agent_id();
+        let group_id = "cd".repeat(32);
+        let bytes = b"Welcome completed during retry sleep".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        let welcome_ref = WelcomeRef {
+            welcome_id: welcome_id.clone(),
+            byte_len: bytes.len() as u64,
+            source: hex::encode(owner_id.as_bytes()),
+        };
+        let sends = Arc::new(AtomicUsize::new(0));
+        let send_state = Arc::clone(&joiner);
+        let send_bytes = bytes.clone();
+        let send_id = welcome_id.clone();
+        let send_count = Arc::clone(&sends);
+        let received = fetch_treekem_welcome_via_schedule(
+            &joiner,
+            &group_id,
+            &welcome_ref,
+            move |_, _| {
+                let state = Arc::clone(&send_state);
+                let bytes = send_bytes.clone();
+                let id = send_id.clone();
+                let attempt = send_count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            let mut receives = state.pending_welcome_receives.write().await;
+                            let receive =
+                                receives.get_mut(&id).expect("receive remains registered");
+                            receive.chunks.insert(0, bytes.clone());
+                            receive.received_bytes = bytes.len() as u64;
+                            drop(receives);
+                            handle_welcome_blob_complete(&state, &owner_id, &id).await;
+                        });
+                    }
+                    Ok(())
+                }
+            },
+            &[Duration::ZERO, Duration::from_millis(40)],
+            Duration::from_millis(80),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(received, bytes);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn welcome_retry_uses_absolute_schedule_and_skips_progress() -> anyhow::Result<()> {
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let owner_id = owner.agent.agent_id();
+        let group_id = "ef".repeat(32);
+        let bytes = b"partially streamed Welcome".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        let welcome_ref = WelcomeRef {
+            welcome_id: welcome_id.clone(),
+            byte_len: bytes.len() as u64,
+            source: hex::encode(owner_id.as_bytes()),
+        };
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let sent_at = Arc::new(Mutex::new(Vec::new()));
+        let send_times = Arc::clone(&sent_at);
+        let send_state = Arc::clone(&joiner);
+        let send_id = welcome_id.clone();
+        let result = fetch_treekem_welcome_via_schedule(
+            &joiner,
+            &group_id,
+            &welcome_ref,
+            move |_, _| {
+                let times = Arc::clone(&send_times);
+                let state = Arc::clone(&send_state);
+                let id = send_id.clone();
+                async move {
+                    let mut sent = times.lock().await;
+                    sent.push(tokio::time::Instant::now() - started);
+                    if sent.len() == 1 {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            let mut receives = state.pending_welcome_receives.write().await;
+                            let receive = receives.get_mut(&id).expect("receive is registered");
+                            receive.chunks.insert(0, b"part".to_vec());
+                            receive.received_bytes = 4;
+                        });
+                    }
+                    Ok(())
+                }
+            },
+            &[
+                Duration::ZERO,
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+            ],
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ref error) if error == "timed out waiting for TreeKEM Welcome blob"
+        ));
+        let sent = sent_at.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0] <= Duration::from_millis(2));
+        assert_eq!(sent[1] - sent[0], Duration::from_millis(30));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_welcome_stream_releases_its_app_state() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let weak = Arc::downgrade(&owner);
+        let stream_owner = Arc::clone(&owner);
+        replace_welcome_stream(&owner, &"ab".repeat(32), async move {
+            let _keep_alive = stream_owner;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        tokio::task::yield_now().await;
+        let streams = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .take()
+            .unwrap_or_default();
+        for stream in streams.into_values() {
+            stream.abort();
+            let _ = stream.await;
+        }
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_welcome_stream_admission_for_waiting_fetch() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let weak = Arc::downgrade(&owner);
+        let mut streams = owner.pending_welcome_streams.lock().await;
+        let waiting_state = Arc::clone(&owner);
+        let stream_state = Arc::clone(&owner);
+        let late_stream_polled = Arc::new(AtomicBool::new(false));
+        let polled = Arc::clone(&late_stream_polled);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let waiting_fetch = tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            replace_welcome_stream(&waiting_state, &"ab".repeat(32), async move {
+                let _keep_alive = stream_state;
+                polled.store(true, Ordering::SeqCst);
+            })
+            .await;
+        });
+        entered_rx.await?;
+        tokio::task::yield_now().await;
+        assert!(streams.take().is_some(), "shutdown closes admission");
+        drop(streams);
+        waiting_fetch.await?;
+        assert!(!late_stream_polled.load(Ordering::SeqCst));
+        assert!(owner.pending_welcome_streams.lock().await.is_none());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restaging_expired_welcome_stops_old_stream_first() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let bytes = b"same content restaged after expiry".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        let group_id = "cd".repeat(32);
+        let joiner_id = "ab".repeat(32);
+        owner.pending_welcomes.write().await.insert(
+            welcome_id.clone(),
+            PendingWelcome {
+                group_id: group_id.clone(),
+                joiner_agent: joiner_id.clone(),
+                bytes: bytes.clone(),
+                created_at: Instant::now() - PENDING_WELCOME_TTL - Duration::from_secs(1),
+            },
+        );
+        let active = Arc::new(AtomicBool::new(false));
+        let stream_active = Arc::clone(&active);
+        replace_welcome_stream(&owner, &welcome_id, async move {
+            struct ActiveGuard(Arc<AtomicBool>);
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            stream_active.store(true, Ordering::SeqCst);
+            let _guard = ActiveGuard(stream_active);
+            std::future::pending::<()>().await;
+        })
+        .await;
+        tokio::task::yield_now().await;
+        assert!(active.load(Ordering::SeqCst));
+
+        let staged = stage_treekem_welcome(&owner, &group_id, &joiner_id, bytes).await;
+        assert_eq!(staged.welcome_id, welcome_id);
+        assert!(!active.load(Ordering::SeqCst));
+        assert!(!owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|streams| streams.contains_key(&welcome_id)));
         Ok(())
     }
 
