@@ -108,16 +108,15 @@ pub struct InviteLineage {
     /// `(revision, state_hash, committed_by)`; first evidence wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_evidence: Option<ForkEvidence>,
-    /// Audit record of served join chains that were NOT recorded as fork
-    /// evidence because the admission owner attested the exact terminal
-    /// (a stale-base GAP, not a fork). Non-gating: nothing reads it for a
-    /// decision; it exists so every use of that exemption is durable and
-    /// visible (`GET /groups/:id` → `invite_lineage`).
+    /// Non-gating audit of served join chains refused without fork evidence:
+    /// either the owner attested the exact terminal (a stale-base gap), or
+    /// only a v1 parent attestation was available (an ambiguous terminal).
+    /// Visible through `GET /groups/:id` → `invite_lineage`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchored_gap_refusal: Option<AnchoredGapRefusal>,
 }
 
-/// The latest owner-anchored stale-base refusal plus a running count
+/// The latest owner-attestation gap refusal plus a running count
 /// (see [`InviteLineage::anchored_gap_refusal`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchoredGapRefusal {
@@ -133,11 +132,29 @@ pub struct AnchoredGapRefusal {
     pub terminal_state_hash: String,
     /// The admin that committed the terminal (hex agent id).
     pub committed_by: String,
-    /// Total anchored refusals recorded on this lineage.
+    /// Total refusals recorded on this lineage, across reasons.
     pub occurrences: u64,
     /// Local time of the first recorded refusal (unix ms).
     pub first_observed_at_ms: u64,
     /// Local time of the latest recorded refusal (unix ms).
+    pub last_observed_at_ms: u64,
+    /// First authenticated evidence and count for each reason. A later
+    /// refusal cannot overwrite the first terminal or committer recorded
+    /// for another reason. Empty on older persisted records.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_reason: BTreeMap<String, GapRefusalReasonAudit>,
+}
+
+/// Durable first-seen evidence for one non-gating gap-refusal reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapRefusalReasonAudit {
+    pub first_head_revision: u64,
+    pub first_head_state_hash: String,
+    pub first_terminal_revision: u64,
+    pub first_terminal_state_hash: String,
+    pub first_committed_by: String,
+    pub occurrences: u64,
+    pub first_observed_at_ms: u64,
     pub last_observed_at_ms: u64,
 }
 
