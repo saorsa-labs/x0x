@@ -4121,6 +4121,7 @@ async fn record_fork_evidence_on_apply_error(
 /// `roster_lock_already_held`: the causal-replay path reaches this
 /// fn while HOLDING `named_groups_persistence_lock` (r2 review item 2
 /// — the locked persist self-deadlocks there).
+#[allow(clippy::too_many_arguments)]
 async fn classify_refused_joiner_fork_chain(
     state: &Arc<AppState>,
     group_key: &str,
@@ -4128,6 +4129,7 @@ async fn classify_refused_joiner_fork_chain(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     chain: &[x0x::groups::state_commit::RetainedCommit],
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
+    served_chain_owner_anchored: bool,
     persistence_lock_already_held: bool,
 ) {
     // Only a joiner with a served chain and stored lineage reaches the
@@ -4170,6 +4172,23 @@ async fn classify_refused_joiner_fork_chain(
         // authenticated evidence of anything this node can anchor.
         return;
     }
+    if served_chain_owner_anchored {
+        // The served chain DESCENDS from our invite base and the ADMISSION
+        // OWNER's head attestation CAS-binds the terminal to exactly this
+        // chain's head — the tier-1 anchor the adoption path accepts. That
+        // is a GAP (a stale-base invite: the authority sealed commits after
+        // the mint), not a divergence: the refusal came from somewhere
+        // other than the anchor (a TreeKEM joiner never adopts across a
+        // gap), so the joiner stays pending for ordinary catch-up. A
+        // removed/forked admin cannot forge the owner's user-key
+        // attestation, so a real fork still reaches the evidence below.
+        tracing::debug!(
+            group_id = %LogHexId::group(group_key),
+            revision = commit.revision,
+            "joiner served chain is owner-anchored — stale-base gap, not fork evidence"
+        );
+        return;
+    }
     let evidence = x0x::groups::ForkEvidence {
         revision: commit.revision,
         state_hash: commit.state_hash.clone(),
@@ -4202,6 +4221,50 @@ async fn classify_refused_joiner_fork_chain(
             "#468/ADR-0064: joiner fork chain walk-authenticated without an owner anchor — quarantined on evidence (no eviction)"
         );
     }
+}
+
+/// Is the joiner's SERVED chain + terminal anchored by the admission
+/// owner's head attestation — the identical tier-1 anchor
+/// [`try_adopt_member_added_across_gap`] requires (owner key from the
+/// ingress-verified committed certificate, owner-signed CAS on the
+/// terminal's parent, attested head == the served chain's head)?
+///
+/// `false` for groups without an owner axis, a missing/unverifiable
+/// attestation, or one that attests a different head: only the owner's
+/// USER key can make this `true`, which no member agent (removed admin
+/// included) holds.
+#[allow(clippy::too_many_arguments)]
+fn served_chain_owner_anchored(
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    chain: &[x0x::groups::state_commit::RetainedCommit],
+    member_agent_id: &str,
+    owner_certified_certificate: Option<&x0x::identity::AgentCertificate>,
+    head_attestation: Option<&HeadAttestation>,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
+    treekem_epoch: Option<u64>,
+) -> bool {
+    let Some(owner) = current.policy.admission.owner_certified_user_id() else {
+        return false;
+    };
+    let Some(attestation) = head_attestation else {
+        return false;
+    };
+    let Some(owner_public_key) = owner_certified_certificate
+        .and_then(|cert| ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok())
+    else {
+        return false;
+    };
+    attestation.group_id == commit.group_id
+        && attestation.verify_against_terminal(
+            &owner_public_key,
+            owner,
+            commit,
+            member_agent_id,
+            owner_mandate,
+            treekem_epoch,
+        )
+        && attestation.head_state_hash == previous_hash_initial(chain, current)
 }
 
 /// Separate fn + `Box::pin` at the call site: the giant apply fn's async
@@ -10026,6 +10089,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     // verified owner head attestation is TIER-1
                     // corroboration of the seat.
                     let attestation_corroborates = adopt_attestation.is_some();
+                    // Kept for the refused arm below: an owner-anchored
+                    // served chain is not fork evidence even when the
+                    // adoption itself is structurally unavailable (TreeKEM).
+                    let served_attestation = adopt_attestation.clone();
                     let adopted = Box::pin(try_adopt_member_added_across_gap(
                         &adopt_state,
                         &current,
@@ -10094,6 +10161,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             // when every link validates from our base but no
                             // owner anchor was reached, quarantine on the
                             // walk-authenticated evidence.
+                            let served_chain_owner_anchored = served_chain_owner_anchored(
+                                &current,
+                                &commit,
+                                &adopt_chain,
+                                &agent_id,
+                                owner_certified_certificate.as_ref(),
+                                served_attestation.as_ref(),
+                                owner_mandate.as_ref(),
+                                treekem_epoch,
+                            );
                             classify_refused_joiner_fork_chain(
                                 state,
                                 &resolved_group_key,
@@ -10101,6 +10178,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 &commit,
                                 &adopt_chain,
                                 owner_mandate.as_ref(),
+                                served_chain_owner_anchored,
                                 roster_lock_already_held,
                             )
                             .await;
