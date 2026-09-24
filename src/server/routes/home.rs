@@ -1304,7 +1304,7 @@ pub(in crate::server::routes::home) fn seat_selected_canonical_hook() -> &'stati
 
 /// #449 option (c): 409 body for a seat request this device cannot serve.
 /// `reason` is a TYPED token (`elsewhere` / `adoption_pending` /
-/// `unknown`), not prose — the CLI and the GUI branch on it.
+/// `unknown` / `ambiguous_home`), not prose — the CLI and the GUI branch on it.
 fn seat_conflict(reason: &str, canonical: Option<&str>, detail: &str) -> Response {
     (
         StatusCode::CONFLICT,
@@ -1366,7 +1366,7 @@ pub(in crate::server) async fn seat_home(
         )
             .into_response();
     }
-    if state.agent.identity().user_keypair().is_none() {
+    let Some(owner) = state.agent.identity().user_keypair().map(|kp| kp.user_id()) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -1375,7 +1375,7 @@ pub(in crate::server) async fn seat_home(
             })),
         )
             .into_response();
-    }
+    };
 
     let joiner = req.agent_id;
     if joiner.len() != 64
@@ -1434,6 +1434,29 @@ pub(in crate::server) async fn seat_home(
             return seat_conflict("unknown", None, "no Home provisioned on this device")
         }
     };
+    // #824: `Local` is NOT proof that the resolved group is the owner's Home.
+    // With no canonical pointer known yet, `resolve_home` falls back to
+    // `find_home`'s smallest-stable-id rule, and a device seated in both its
+    // own optimistically provisioned duplicate and the owner's real Home can
+    // resolve to the DUPLICATE. Minting there hands the joiner a seat in the
+    // wrong Home with a 200. When more than one Home-shaped group holds us,
+    // only the register can say which is canonical, so require it to name
+    // exactly the group we would mint into; anything else is ambiguous.
+    if !home_duplicates(&state, &group_id, &owner).await.is_empty() {
+        let canonical = effective_canonical_home(&state).await;
+        let matches = canonical
+            .as_deref()
+            .is_some_and(|c| c == group_id || c == info.stable_group_id());
+        if !matches {
+            return seat_conflict(
+                "ambiguous_home",
+                canonical.as_deref(),
+                "this device is seated in more than one Home and the owner's canonical Home \
+                 pointer does not identify which one is canonical yet; wait for owner sync \
+                 to deliver it, or run this on the device that holds the canonical Home",
+            );
+        }
+    }
     // The join pin the operator will type MUST be the owner axis of the group
     // the invite actually belongs to. Deriving it from the local user key
     // would echo what this device believes rather than what the group
@@ -3054,6 +3077,83 @@ pub(in crate::server::routes) mod tests {
             before,
             "a device that lost the election must mint nothing"
         );
+        Ok(())
+    }
+
+    /// WHY (#824): an owner-key-copied device provisions its OWN Home before
+    /// the owner's canonical pointer syncs, later joins the real Home, and is
+    /// then seated in two Home-shaped groups. With no pointer, `resolve_home`
+    /// picks the smallest stable id — which may be the duplicate — and the
+    /// seat used to MINT there with a 200, handing the joiner a seat in the
+    /// wrong Home. Neither group can be proven canonical locally, so the seat
+    /// must refuse with a typed reason and record no invite anywhere.
+    #[tokio::test]
+    async fn home_seat_refuses_ambiguous_duplicate_without_canonical_pointer() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x82; 32]).await?;
+        provision_home(&state).await;
+        provision_duplicate_home(&state).await?;
+        let owner = owner_of(&state);
+        let (resolved, _) = find_home(state.as_ref(), &owner)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("seated in a Home"))?;
+        anyhow::ensure!(
+            !home_duplicates(&state, &resolved, &owner).await.is_empty(),
+            "fixture must seat this device in two Home-shaped groups"
+        );
+        anyhow::ensure!(
+            effective_canonical_home(&state).await.is_none(),
+            "fixture must have no canonical pointer yet"
+        );
+        let before = issued_invite_count(&state).await;
+
+        let (status, body) = seat(&state, &"7c".repeat(32)).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "ambiguous_home");
+        assert!(body["canonical_group_id"].is_null(), "{body}");
+        assert_eq!(
+            issued_invite_count(&state).await,
+            before,
+            "an ambiguous Home must mint nothing into either group"
+        );
+        Ok(())
+    }
+
+    /// WHY (#824): the refusal must be precise, not a blanket "duplicates
+    /// exist, never seat". Once the register names one of the two Homes, that
+    /// Home is the owner's, and the seat must mint into IT — never into the
+    /// duplicate — whichever of the two sorts first. A pointer naming a Home
+    /// this device does not hold keeps refusing, and mints nothing.
+    #[tokio::test]
+    async fn home_seat_with_duplicates_mints_only_into_the_canonical_home() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x83; 32]).await?;
+        provision_home(&state).await;
+        provision_duplicate_home(&state).await?;
+        let owner = owner_of(&state);
+        let (smallest, _) = find_home(state.as_ref(), &owner)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("seated in a Home"))?;
+        let others = home_duplicates(&state, &smallest, &owner).await;
+        let largest = others
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("two Homes expected"))?;
+        // Name the group `find_home` would NOT pick, so a mint that ignored
+        // the pointer would land in the wrong Home and fail the assertion.
+        commit_canonical_home(&state, &largest).await?;
+
+        let (status, body) = seat(&state, &"7c".repeat(32)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["group_id"], largest.as_str());
+
+        // A pointer naming a Home this device holds no seat in stays refused.
+        let before = issued_invite_count(&state).await;
+        commit_canonical_home(&state, &"e1".repeat(16)).await?;
+        let (status, body) = seat(&state, &"7d".repeat(32)).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(issued_invite_count(&state).await, before);
         Ok(())
     }
 
