@@ -1560,17 +1560,26 @@ impl std::fmt::Debug for PubsubTopicPriorityResolver {
     }
 }
 
-/// #810: a recoverable PubSub control frame is shed under near-overload only
-/// when its topic is NOT Critical. Critical control traffic (e.g.
-/// `x0x/dm/v1/*` IHAVE/IWANT lazy repair) is protected on the sender side by
-/// `ShedNormal`; the receiver must not become the drop point that re-opens
-/// the #807 black hole under #656-class saturation. Normal/Bulk control
-/// shedding stays bounded exactly as before.
-fn should_shed_pubsub_control(
-    kind: saorsa_gossip_types::MessageKind,
-    priority: saorsa_gossip_types::TopicPriority,
+/// #810: true when an already-eligible pressured control frame's topic
+/// resolves Critical through the shared resolver slot. The slot is read
+/// lazily per frame (the receiver task is spawned before the runtime fills
+/// it), a missing resolver keeps the pre-#810 behaviour for every topic, and
+/// a structurally uninspectable header falls back to Normal — the shed
+/// decision itself never depended on that inspection pre-#810.
+fn is_critical_pubsub_control(
+    data: &[u8],
+    topic_priority: Option<&Arc<OnceLock<PubsubTopicPriorityResolver>>>,
 ) -> bool {
-    is_pubsub_shed_eligible(kind) && priority != saorsa_gossip_types::TopicPriority::Critical
+    let Some(slot) = topic_priority else {
+        return false;
+    };
+    let Some(resolver) = slot.get() else {
+        return false;
+    };
+    let Some(header) = saorsa_gossip_pubsub::inspect_message_header(data) else {
+        return false;
+    };
+    resolver.resolve(&header.topic) == saorsa_gossip_types::TopicPriority::Critical
 }
 
 fn channel_depth<T>(tx: &mpsc::Sender<T>) -> usize {
@@ -1730,7 +1739,7 @@ async fn forward_gossip_payload(
     session: Option<AuthenticatedSession>,
     channel_name: &'static str,
     diagnostics: &RecvPumpDiagnostics,
-    topic_priority: Option<&PubsubTopicPriorityResolver>,
+    topic_priority: Option<&Arc<OnceLock<PubsubTopicPriorityResolver>>>,
 ) -> Result<ForwardGossipOutcome, mpsc::error::SendError<GossipPayload>> {
     warn_forward_channel_pressure(tx, peer_id, Some(stream_type), channel_name);
     let max = tx.max_capacity();
@@ -1755,17 +1764,16 @@ async fn forward_gossip_payload(
         // EXCEPT when the frame's topic is Critical: sender-side `ShedNormal`
         // already protects Critical control on the wire, and dropping the
         // receiver-side IHAVE/IWANT repair under saturation would re-open the
-        // #807 black hole. The header inspection is gated on the shed
-        // threshold, so the steady-state path keeps ADR 0009's flat try_send
-        // behavior with no decode cost.
+        // #807 black hole. Both peeks are gated on the shed threshold, so
+        // the steady-state path keeps ADR 0009's flat try_send behavior with
+        // no decode cost. Kind eligibility keeps the cheap pre-#810 peek; the
+        // structural topic inspection only runs for already-eligible frames,
+        // and a frame whose header will not inspect falls back to the
+        // pre-#810 Normal treatment (review item 3).
         if channel_pressure_exceeds_shed_threshold(tx.capacity(), max)
-            && saorsa_gossip_pubsub::inspect_message_header(&message.data).is_some_and(|header| {
-                let priority = topic_priority
-                    .map_or(saorsa_gossip_types::TopicPriority::Normal, |resolve| {
-                        resolve.resolve(&header.topic)
-                    });
-                should_shed_pubsub_control(header.kind, priority)
-            })
+            && saorsa_gossip_pubsub::peek_message_kind(&message.data)
+                .is_some_and(is_pubsub_shed_eligible)
+            && !is_critical_pubsub_control(&message.data, topic_priority)
         {
             let depth = channel_depth(tx);
             diagnostics.record_shed_priority(stream_type, depth, max);
@@ -1932,7 +1940,10 @@ pub struct NetworkNode {
     /// #810: TopicId→priority resolver consulted by the receive pump before
     /// it proactively sheds a recoverable PubSub control frame. Set once by
     /// the gossip runtime after `PubSubManager` (and its registry) exists.
-    pubsub_topic_priority: OnceLock<PubsubTopicPriorityResolver>,
+    /// Shared via `Arc` (NetworkNode is Clone) and read lazily per pressured
+    /// frame by the already-spawned receiver task — a spawn-time snapshot
+    /// would always see it empty because the runtime is constructed later.
+    pubsub_topic_priority: Arc<OnceLock<PubsubTopicPriorityResolver>>,
     /// Connection-churn observation counters (#368 gate 2). Arc so the
     /// Clone derive shares state; fed by the spawn_observer task.
     churn: Arc<ChurnCounters>,
@@ -2273,7 +2284,7 @@ impl NetworkNode {
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
             recv_pump_diagnostics,
-            pubsub_topic_priority: OnceLock::new(),
+            pubsub_topic_priority: Arc::new(OnceLock::new()),
             churn: Arc::new(ChurnCounters::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
@@ -4640,6 +4651,13 @@ impl NetworkNode {
         .await
     }
 
+    /// The receive pump's shared TopicId→priority slot (#810). The receiver
+    /// task captures this handle at spawn; the gossip runtime fills the slot
+    /// afterwards, and the pump reads it lazily per pressured frame.
+    pub(crate) fn pubsub_topic_priority_slot(&self) -> Arc<OnceLock<PubsubTopicPriorityResolver>> {
+        Arc::clone(&self.pubsub_topic_priority)
+    }
+
     /// Install the #810 TopicId→priority resolver consulted by the receive
     /// pump before it proactively sheds a recoverable PubSub control frame.
     /// One-shot: the first resolver wins and later installs are ignored, so
@@ -4663,7 +4681,7 @@ impl NetworkNode {
         let session_registry_cap = self.session_registry_cap();
         let recv_pubsub_tx = self.recv_pubsub_tx.clone();
         let recv_membership_tx = self.recv_membership_tx.clone();
-        let pubsub_topic_priority = self.pubsub_topic_priority.get().cloned();
+        let pubsub_topic_priority = self.pubsub_topic_priority_slot();
         let recv_bulk_tx = self.recv_bulk_tx.clone();
         let recv_pump_diagnostics = Arc::clone(&self.recv_pump_diagnostics);
         // #378 fix D: DM classes go through lossless spill forwarders so the
@@ -4940,7 +4958,7 @@ impl NetworkNode {
                                     session,
                                     "recv_pubsub_tx",
                                     recv_pump_diagnostics.as_ref(),
-                                    pubsub_topic_priority.as_ref(),
+                                    Some(&pubsub_topic_priority),
                                 )
                                 .await
                             }
@@ -8059,34 +8077,200 @@ mod pressure_tests {
     #[test]
     fn pubsub_control_shed_decision_is_priority_aware() {
         // #810: under near-overload (pressure is checked by the caller), the
-        // shed decision must exempt Critical topics entirely while keeping
+        // shed decision — eligible kind via the cheap peek AND NOT a Critical
+        // topic — must exempt Critical control entirely while keeping
         // Normal/Bulk control shedding bounded exactly as before.
-        use saorsa_gossip_types::{MessageKind, TopicPriority};
+        use saorsa_gossip_pubsub::GossipMessage;
+        use saorsa_gossip_types::{MessageHeader, MessageKind, TopicId, TopicPriority};
 
+        fn frame(kind: MessageKind, topic: TopicId) -> Bytes {
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic,
+                    msg_id: [0u8; 32],
+                    kind,
+                    hop: 0,
+                    ttl: 10,
+                    payload_hash: None,
+                },
+                payload: None,
+                signature: vec![0u8; 3309],
+                public_key: vec![0u8; 1952],
+            };
+            postcard::to_stdvec(&msg).expect("frame serializes").into()
+        }
+
+        let critical_topic = TopicId::new([7u8; 32]);
+        let slot: Arc<OnceLock<PubsubTopicPriorityResolver>> = Arc::new(OnceLock::new());
         assert!(
-            !should_shed_pubsub_control(MessageKind::IHave, TopicPriority::Critical),
+            slot.get().is_none(),
+            "precondition: slot empty (pre-wiring state)"
+        );
+
+        // The exact composition the pressured pump applies, per frame.
+        let sheds = |data: &Bytes| -> bool {
+            saorsa_gossip_pubsub::peek_message_kind(data).is_some_and(is_pubsub_shed_eligible)
+                && !is_critical_pubsub_control(data, Some(&slot))
+        };
+
+        // Before the runtime wires the resolver, everything eligible sheds
+        // (the pre-#810 fail-safe default).
+        let critical_ihave = frame(MessageKind::IHave, critical_topic);
+        assert!(sheds(&critical_ihave), "unwired slot: pre-#810 behaviour");
+
+        // After wiring: Critical control is exempt, Normal/Bulk is not.
+        let normal_topic = TopicId::new([0u8; 32]);
+        let bulk_topic = TopicId::new([9u8; 32]);
+        assert!(slot
+            .set(PubsubTopicPriorityResolver::new(move |topic| {
+                if *topic == critical_topic {
+                    TopicPriority::Critical
+                } else if *topic == bulk_topic {
+                    TopicPriority::Bulk
+                } else {
+                    TopicPriority::Normal
+                }
+            }))
+            .is_ok());
+        assert!(
+            !sheds(&frame(MessageKind::IHave, critical_topic)),
             "Critical IHAVE is never proactively shed"
         );
         assert!(
-            !should_shed_pubsub_control(MessageKind::IWant, TopicPriority::Critical),
+            !sheds(&frame(MessageKind::IWant, critical_topic)),
             "Critical IWANT is never proactively shed"
         );
         assert!(
-            !should_shed_pubsub_control(MessageKind::AntiEntropy, TopicPriority::Critical),
+            !sheds(&frame(MessageKind::AntiEntropy, critical_topic)),
             "Critical anti-entropy is never proactively shed"
         );
         assert!(
-            should_shed_pubsub_control(MessageKind::IHave, TopicPriority::Normal),
+            sheds(&frame(MessageKind::IHave, normal_topic)),
             "Normal control shedding is unchanged"
         );
         assert!(
-            should_shed_pubsub_control(MessageKind::IWant, TopicPriority::Bulk),
+            sheds(&frame(MessageKind::IWant, bulk_topic)),
             "Bulk control shedding is unchanged"
         );
         assert!(
-            !should_shed_pubsub_control(MessageKind::Eager, TopicPriority::Bulk),
+            !sheds(&frame(MessageKind::Eager, bulk_topic)),
             "EAGER (data) is never proactively shed regardless of priority"
         );
+
+        // A structurally malformed control frame (bad signature/key sizes)
+        // keeps the cheap kind peek, and falls back to Normal for the topic:
+        // still shed, exactly as pre-#810 (review item 3).
+        let malformed = {
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic: critical_topic,
+                    msg_id: [0u8; 32],
+                    kind: MessageKind::IHave,
+                    hop: 0,
+                    ttl: 10,
+                    payload_hash: None,
+                },
+                payload: None,
+                signature: Vec::new(),
+                public_key: Vec::new(),
+            };
+            Bytes::from(postcard::to_stdvec(&msg).expect("frame serializes"))
+        };
+        assert!(
+            saorsa_gossip_pubsub::peek_message_kind(&malformed)
+                .is_some_and(is_pubsub_shed_eligible),
+            "kind peek still recognises the malformed control frame"
+        );
+        assert!(
+            !is_critical_pubsub_control(&malformed, Some(&slot)),
+            "uninspectable header falls back to Normal (not Critical)"
+        );
+        assert!(sheds(&malformed), "malformed control sheds as pre-#810");
+    }
+
+    #[tokio::test]
+    async fn recv_pump_topic_priority_slot_is_lazily_wired_by_the_runtime() {
+        // #810 wiring (review item 2): the receiver task is spawned inside
+        // `NetworkNode::new`, BEFORE `GossipRuntime` exists — so the pump
+        // must hold the SHARED resolver slot and read it lazily, not a
+        // spawn-time snapshot (a snapshot is always empty and the Critical
+        // exemption never runs). This test drives the real construction
+        // path: capture the pump's slot handle pre-runtime, construct the
+        // runtime, and assert the pre-captured handle now resolves a real
+        // statically-registered Critical topic.
+        use crate::gossip::runtime::GossipRuntime;
+        use crate::gossip::GossipConfig;
+        use saorsa_gossip_types::TopicId;
+
+        let network = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("network node");
+
+        // The exact handle `spawn_receiver` captured at node construction.
+        let pump_slot = network.pubsub_topic_priority_slot();
+        assert!(
+            pump_slot.get().is_none(),
+            "pre-runtime: the pump's slot is empty"
+        );
+
+        // The real wiring: GossipRuntime::new constructs PubSubManager and
+        // installs the registry-backed resolver into the shared slot.
+        let runtime = GossipRuntime::new(GossipConfig::default(), Arc::new(network), None)
+            .await
+            .expect("gossip runtime");
+        assert!(
+            pump_slot.get().is_some(),
+            "the already-spawned pump must observe the resolver the runtime installed"
+        );
+
+        // The resolver answers through the real registry: `x0x/dm/v1/bus` is
+        // statically registered Critical; an arbitrary unregistered topic
+        // reads Normal (the documented relay-side limit).
+        let resolver = pump_slot.get().expect("resolver installed");
+        let dm_bus = TopicId::from_entity(b"x0x/dm/v1/bus");
+        assert!(
+            is_critical_pubsub_control(&critical_topic_frame(dm_bus), Some(&pump_slot)),
+            "the pump's captured slot resolves a registered Critical topic"
+        );
+        assert_eq!(
+            resolver.resolve(&TopicId::new([42u8; 32])),
+            saorsa_gossip_types::TopicPriority::Normal,
+            "unregistered topics read Normal through the same slot"
+        );
+
+        runtime.shutdown().await.expect("runtime shutdown");
+
+        fn critical_topic_frame(topic: saorsa_gossip_types::TopicId) -> Bytes {
+            use saorsa_gossip_pubsub::GossipMessage;
+            use saorsa_gossip_types::{MessageHeader, MessageKind};
+            let msg = GossipMessage {
+                header: MessageHeader {
+                    version: 1,
+                    topic,
+                    msg_id: [0u8; 32],
+                    kind: MessageKind::IHave,
+                    hop: 0,
+                    ttl: 10,
+                    payload_hash: None,
+                },
+                payload: None,
+                signature: vec![0u8; 3309],
+                public_key: vec![0u8; 1952],
+            };
+            Bytes::from(postcard::to_stdvec(&msg).expect("frame serializes"))
+        }
     }
 
     #[tokio::test]
@@ -8122,15 +8306,18 @@ mod pressure_tests {
 
         let critical_topic = TopicId::new([7u8; 32]);
         let bulk_topic = TopicId::new([9u8; 32]);
-        let resolver = PubsubTopicPriorityResolver::new(move |topic| {
-            if *topic == critical_topic {
-                TopicPriority::Critical
-            } else if *topic == bulk_topic {
-                TopicPriority::Bulk
-            } else {
-                TopicPriority::Normal
-            }
-        });
+        let slot: Arc<OnceLock<PubsubTopicPriorityResolver>> = Arc::new(OnceLock::new());
+        assert!(slot
+            .set(PubsubTopicPriorityResolver::new(move |topic| {
+                if *topic == critical_topic {
+                    TopicPriority::Critical
+                } else if *topic == bulk_topic {
+                    TopicPriority::Bulk
+                } else {
+                    TopicPriority::Normal
+                }
+            }))
+            .is_ok());
         let peer = ant_quic::PeerId([11; 32]);
 
         fn prefill(tx: &tokio::sync::mpsc::Sender<GossipPayload>, peer: ant_quic::PeerId) {
@@ -8158,7 +8345,7 @@ mod pressure_tests {
             None,
             "recv_pubsub_tx",
             &diagnostics,
-            Some(&resolver),
+            Some(&slot),
         )
         .await
         .unwrap();
@@ -8187,7 +8374,7 @@ mod pressure_tests {
             None,
             "recv_pubsub_tx",
             &diagnostics,
-            Some(&resolver),
+            Some(&slot),
         )
         .await
         .unwrap();
@@ -8214,7 +8401,7 @@ mod pressure_tests {
             None,
             "recv_pubsub_tx",
             &diagnostics,
-            Some(&resolver),
+            Some(&slot),
         )
         .await
         .unwrap();
