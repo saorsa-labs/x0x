@@ -2176,6 +2176,17 @@ Server → client (complete outbound frame set):
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
 
+**Live `message` delivery is best-effort.** A notification may be duplicated
+when replay, restart, or overlapping subscriptions deliver the same content,
+and frames may be omitted, including when the bounded outbound queue drops
+topic frames. The event currently has no stable top-level transport `msg_id`,
+so it promises neither exactly-once delivery nor a complete feed; do not assume
+at-least-once delivery. Applications that need deduplication should include
+their own unique ID in the application payload, or use the decoded canonical
+signed-group message ID where that format provides one. `HistoryRecord.msg_id`
+identifies a local history-store record and is a separate identity; it is not
+the missing transport ID for this event.
+
 **Fork-quarantine annotation (ADR-0066 §3d).** When a group is
 fork-quarantined on this node, its group-scoped frames are **labelled, never
 refused and never dropped** — the WS plane is the live mirror of the
