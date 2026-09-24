@@ -16438,9 +16438,11 @@ fn build_signed_member_joined_resend(
                 treekem_key_package_b64: treekem_key_package_b64.clone(),
                 kem_public_key_b64: joiner_kem_b64,
                 kem_signature_b64,
-                certificate_b64: joiner_certificate.map(|cert| {
+                certificate_b64: joiner_certificate.and_then(|cert| {
                     use base64::Engine as _;
-                    BASE64.encode(bincode::serialize(cert).unwrap_or_default())
+                    bincode::serialize(cert)
+                        .ok()
+                        .map(|bytes| BASE64.encode(bytes))
                 }),
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
@@ -31902,11 +31904,11 @@ async fn refire_pending_join_volley(
             kem_signature_b64,
             // #842: the rebuilt resend carries the certificate too, so a
             // restarted joiner's retry volley is announce-independent.
-            certificate_b64: state
-                .agent
-                .identity()
-                .agent_certificate()
-                .map(|cert| BASE64.encode(bincode::serialize(cert).unwrap_or_default())),
+            certificate_b64: state.agent.identity().agent_certificate().and_then(|cert| {
+                bincode::serialize(cert)
+                    .ok()
+                    .map(|bytes| BASE64.encode(bytes))
+            }),
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,

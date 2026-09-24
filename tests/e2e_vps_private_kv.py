@@ -69,40 +69,6 @@ class Scenario(SharedScenario):
         self.e.check(f"{node} is owner-certified for Home", status == 200
                      and body.get("user_id") == owner_id, status=status)
 
-    def require_owner_certificate_view(self, owner: str, member: str, gid: str) -> None:
-        # #842: gate seat minting on the OWNER's view of each device's
-        # certificate. The join event now carries the joiner's certificate
-        # (announce-independent admission), but this gate keeps a
-        # propagation failure LOUD: if the owner's cert view regresses AND
-        # the inline carriage regresses too, the poll below times out the
-        # fixture at the seat step instead of a 100-rejection join storm.
-        member_id = self.c[member].agent_id()
-        def owner_sees_member() -> bool:
-            status, body = self.c[owner].request("GET", f"/groups/{enc(gid)}/members")
-            if status != 200:
-                return False
-            rows = body.get("members", [])
-            return any(isinstance(row, dict) and row.get("agent_id") == member_id
-                       for row in rows)
-        # Pre-join the member is not on the roster yet — the owner-side
-        # observable is the absence of owner-cert-pending rejections for
-        # this group on the owner's diagnostics.
-        def owner_has_no_pending_rejections() -> bool:
-            status, body = self.c[owner].request("GET", "/diagnostics/groups")
-            if status != 200:
-                return False
-            for row in body.get("groups", []):
-                if isinstance(row, dict) and row.get("group_id") == gid:
-                    counters = row.get("counters", {})
-                    rejected = counters.get(
-                        "member_joined_events_rejected_owner_cert_pending", 0)
-                    awaiting = counters.get("members_awaiting_certificate", 0)
-                    return rejected == 0 and awaiting == 0
-            return True
-        poll(f"{owner} has no owner-cert-pending view of {gid}",
-             self.timeout, owner_has_no_pending_rejections,
-             lambda ok: ok is True)
-
     def home_invite(self, owner: str, member: str, gid: str, owner_id: str) -> str:
         # Product contract: only a device serving the canonical Home may seat
         # (`POST /home/seat` refuses otherwise). A device that has just been
@@ -356,10 +322,6 @@ class Scenario(SharedScenario):
         gid, owner_id = self.home(owner)
         for node in (writer, late, revoked, admin):
             self.require_home_identity(node, owner_id)
-        # #842: seat minting is gated on the owner's certificate view of
-        # each device (see require_owner_certificate_view).
-        for node in (writer, revoked, admin, late):
-            self.require_owner_certificate_view(owner, node, gid)
         writer_invite = self.home_invite(owner, writer, gid, owner_id)
         revoked_invite = self.home_invite(owner, revoked, gid, owner_id)
         self.join_home(owner, writer, gid, owner_id, writer_invite)

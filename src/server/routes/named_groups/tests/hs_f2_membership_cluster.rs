@@ -6435,6 +6435,185 @@ async fn owner_certified_join_carried_certificate_admits_without_cache() -> Resu
             "the foreign-cert joiner is not seated"
         );
     }
+    // Admission-critical negatives (#850 review items a-d).
+    // Helper: a fresh authority group + invite + a join signed by the
+    // given joiner whose event carries the given certificate.
+    async fn neg_join_with_cert(
+        joiner: &AgentKeypair,
+        cert: &x0x::identity::AgentCertificate,
+    ) -> (Arc<AppState>, ApplyMetadataResult, String) {
+        let (auth, _d, okp) = owner_authority_state().await.expect("neg authority");
+        let gid = "b7".repeat(32);
+        let auth_hex = hex::encode(auth.agent.agent_id().as_bytes());
+        insert_owner_group(auth.as_ref(), &gid, owner_certified_policy(&okp), "seed").await;
+        let jh = hex::encode(joiner.agent_id().as_bytes());
+        let secret = format!("issue842-neg-{jh}");
+        {
+            let mut groups = auth.named_groups.write().await;
+            groups
+                .get_mut(&gid)
+                .expect("neg group")
+                .record_issued_invite(secret.clone(), 0, 0, x0x::groups::GroupRole::Member);
+        }
+        let (mid, _mh, _pk, mut ev) = signed_member_joined_event_for_test(
+            joiner,
+            &gid,
+            &auth_hex,
+            &secret,
+            x0x::groups::GroupRole::Member,
+        )
+        .expect("neg event");
+        use base64::Engine as _;
+        if let NamedGroupMetadataEvent::MemberJoined {
+            certificate_b64, ..
+        } = &mut ev
+        {
+            *certificate_b64 = Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(bincode::serialize(cert).expect("cert ser")),
+            );
+        }
+        let res = apply_named_group_metadata_event(&auth, ev, mid, true, None).await;
+        (auth, res, gid)
+    }
+
+    // (a) WRONG AGENT / replay: the joiner carries ANOTHER agent valid
+    // owner-signed certificate. AgentMismatch: refused, not seated, and
+    // the join is NOT retained as pending (definitive refusal).
+    {
+        let other_kp = AgentKeypair::generate()?;
+        let others_cert = issue_joiner_cert(&owner_kp, &other_kp)?;
+        let (auth, res, gid) = neg_join_with_cert(&joiner_kp, &others_cert).await;
+        assert!(!res.accepted, "wrong-agent certificate: refused");
+        let jh = hex::encode(joiner_kp.agent_id().as_bytes());
+        let groups = auth.named_groups.read().await;
+        assert!(
+            !groups
+                .get(&gid)
+                .expect("neg group a")
+                .has_active_member(&jh),
+            "wrong-agent joiner not seated"
+        );
+        drop(groups);
+        let pending = auth.owner_cert_pending_joins.read().await;
+        assert!(
+            pending.get(&join_result_key(&gid, &jh)).is_none(),
+            "a definitive AgentMismatch refusal is NOT retained as pending"
+        );
+    }
+
+    // (b) REVOKED: a valid owner-signed certificate for the joiner own
+    // agent, revoked in the local set BEFORE the join. Refused despite
+    // a valid cert, and not seated.
+    {
+        let (auth, _d, okp) = owner_authority_state().await?;
+        let gid = "b8".repeat(32);
+        let auth_hex = hex::encode(auth.agent.agent_id().as_bytes());
+        insert_owner_group(auth.as_ref(), &gid, owner_certified_policy(&okp), "seed").await;
+        let jh = hex::encode(joiner_kp.agent_id().as_bytes());
+        let secret = format!("issue842-neg-revoked-{jh}");
+        {
+            let mut groups = auth.named_groups.write().await;
+            groups
+                .get_mut(&gid)
+                .expect("neg group b")
+                .record_issued_invite(secret.clone(), 0, 0, x0x::groups::GroupRole::Member);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(joiner_kp.agent_id()),
+            joiner_kp.public_key(),
+            joiner_kp.secret_key(),
+            now,
+            Some("#850 negative: revoked joiner".to_string()),
+        )?;
+        auth.agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, Some(&joiner_cert))?;
+        let (mid, _mh, _pk, mut ev) = signed_member_joined_event_for_test(
+            &joiner_kp,
+            &gid,
+            &auth_hex,
+            &secret,
+            x0x::groups::GroupRole::Member,
+        )?;
+        use base64::Engine as _;
+        if let NamedGroupMetadataEvent::MemberJoined {
+            certificate_b64, ..
+        } = &mut ev
+        {
+            *certificate_b64 = Some(
+                base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+            );
+        }
+        let res = apply_named_group_metadata_event(&auth, ev, mid, true, None).await;
+        assert!(!res.accepted, "revoked agent: refused despite a valid cert");
+        let groups = auth.named_groups.read().await;
+        assert!(
+            !groups
+                .get(&gid)
+                .expect("neg group b")
+                .has_active_member(&jh),
+            "revoked joiner not seated"
+        );
+    }
+    // (c) EXPIRED: an owner-signed certificate with not_after in the
+    // past. Refused.
+    {
+        let expired = x0x::identity::AgentCertificate::issue_for_public_key(
+            &owner_kp,
+            joiner_kp.public_key().as_bytes(),
+            Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(2 * 24 * 60 * 60),
+            ),
+        )?;
+        let (_auth, res, _gid) = neg_join_with_cert(&joiner_kp, &expired).await;
+        assert!(!res.accepted, "expired certificate: refused");
+    }
+    Ok(())
+}
+
+/// #850 review item 3 (size): a REAL certificate adds ~9.8 KB base64 to
+/// the MemberJoined wire form. A cert-carrying join must still fit the
+/// 49,152-byte DM budget on the gossip/metadata path (the direct-DM
+/// path shares the budget; genuinely oversized payloads take the Home
+/// control-blob chunk path instead — see home_control_payload_size.rs).
+#[test]
+fn cert_carrying_member_joined_fits_dm_payload_budget() -> Result<()> {
+    let joiner_kp = AgentKeypair::generate()?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    let (_mid, _mh, _pk, mut event) = signed_member_joined_event_for_test(
+        &joiner_kp,
+        &"b9".repeat(32),
+        &"aa".repeat(32),
+        "size-check-secret",
+        x0x::groups::GroupRole::Member,
+    )?;
+    use base64::Engine as _;
+    if let NamedGroupMetadataEvent::MemberJoined {
+        certificate_b64, ..
+    } = &mut event
+    {
+        *certificate_b64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&cert)?));
+    }
+    let wire = serde_json::to_vec(&event)?;
+    assert!(
+        wire.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
+        "cert-carrying MemberJoined is {} bytes, must fit the {} DM budget",
+        wire.len(),
+        x0x::dm::MAX_PAYLOAD_BYTES
+    );
     Ok(())
 }
 
