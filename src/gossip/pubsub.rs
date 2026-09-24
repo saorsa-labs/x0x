@@ -2078,6 +2078,14 @@ impl PubSubManager {
         // safe: an already-eager preference is idempotent and
         // still-connected peers keep their roles and cooling/score state.
         let membership = self.topic_membership(peers).await;
+        if self.participation.forwards_passthrough() {
+            // Full: #807 is Leaf-only. Keep the pre-#807 add-only seed so a
+            // publish never prunes members or their IWANT/cooling state.
+            self.plumtree
+                .initialize_topic_peers(topic, membership.into_pre_807_order())
+                .await;
+            return;
+        }
         self.apply_topic_membership(topic, membership).await;
     }
 
@@ -2265,6 +2273,14 @@ impl PubSubManager {
     /// ineligible: saorsa-gossip's health and cooling choices win, and x0x
     /// must never retry the preference destructively.
     async fn apply_topic_membership(&self, topic_id: TopicId, membership: TopicMembership) {
+        if self.participation.forwards_passthrough() {
+            // Full: #807 is Leaf-only. Pre-#807 Full replaced membership with
+            // the untruncated plane and never forced a preferred eager peer.
+            self.plumtree
+                .set_topic_peers(topic_id, membership.into_pre_807_order())
+                .await;
+            return;
+        }
         let preferred = membership.preferred;
         let preferred_applied = self
             .plumtree
@@ -2288,6 +2304,19 @@ struct TopicMembership {
     full: Vec<PeerId>,
     /// The actual selected Full/bootstrap peer for C5b, when connected.
     preferred: Option<PeerId>,
+}
+
+impl TopicMembership {
+    /// The exact pre-#807 untruncated order: preferred first, then the
+    /// sorted plane. Full nodes hand this to the pre-#807 sg writers.
+    fn into_pre_807_order(self) -> Vec<PeerId> {
+        let mut peers = self.full;
+        if let Some(preferred) = self.preferred {
+            peers.retain(|peer| *peer != preferred);
+            peers.insert(0, preferred);
+        }
+        peers
+    }
 }
 
 async fn refresh_ordered_peers<T, F, Fut>(
@@ -4386,6 +4415,54 @@ mod tests {
             role_for(&manager, topic, other_eager),
             "excluded",
             "the disconnected eager peer must leave the topic"
+        );
+    }
+
+    /// WHY (#807 Full parity): #807 is a Leaf-only defect. The #808 port
+    /// made every Full writer, including the per-publish initialize, force
+    /// one preferred Full/bootstrap peer eager, displacing a working eager
+    /// peer that sg's score had chosen. Pre-#807 Full never forced a
+    /// preferred eager peer, and R10 saw Full-node KV delivery slow from
+    /// 0.7 s to 110 s. The switch from add-only to replace at publish time
+    /// is NOT observable on Full: sg's 1 s connected-peers refresh (sg
+    /// 0.5.85 lib.rs:2233-2280) prunes unconnected members on every version,
+    /// so this test does not assert add-only. Fails on b2b2a746: the publish
+    /// forces the pinned [8] eager over a full eager set.
+    #[tokio::test]
+    async fn full_publish_initialize_is_add_only_and_never_forces_preferred_eager() {
+        // Full, ceiling 6, pinned bootstrap [8]; six connected peers fill eager.
+        let manager = slice1_manager(2, true).await;
+        let initial: Vec<[u8; 32]> = (1..=6).map(|id| [id; 32]).collect();
+        set_plane(&manager, initial.clone());
+        let name = "x0x/dm/v1/inbox/807-full-parity";
+        let topic = TopicId::new([81; 32]);
+        let _sub = manager.subscribe_topic_id(name.into(), topic).await;
+        assert!(
+            plane_roles(&manager, topic, &initial)
+                .iter()
+                .all(|(_, role)| role == "eager"),
+            "six connected peers fill the Full eager ceiling"
+        );
+
+        // The pinned Full/bootstrap peer connects; the publish re-seeds.
+        let mut grown = initial.clone();
+        grown.push([8; 32]);
+        set_plane(&manager, grown);
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("full-parity"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            role_for(&manager, topic, [8; 32]),
+            "lazy",
+            "Full never forces the preferred peer eager over a full eager set"
+        );
+        assert!(
+            plane_roles(&manager, topic, &initial)
+                .iter()
+                .all(|(_, role)| role == "eager"),
+            "no working eager peer is displaced"
         );
     }
 
