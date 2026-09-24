@@ -4366,14 +4366,14 @@ async fn r6c_targeted_refusal(
         owner_mandate: None,
         commit: Some(terminal.clone()),
     };
-    let attestation = x0x::server::routes::named_groups::HeadAttestation::sign(
+    let attestation = x0x::server::routes::named_groups::HeadAttestation::sign_for_terminal(
         &stage.group_id,
-        terminal.revision - 1,
-        terminal.prev_state_hash.as_deref().unwrap_or_default(),
+        &terminal,
         &stage.joiner_hex,
+        None,
         &stage.owner_kp,
     )
-    .expect("fresh owner attestation for the mutated head");
+    .expect("fresh owner v1+v2 attestation for the mutated terminal");
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     stage
         .joiner_state
