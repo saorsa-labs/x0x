@@ -173,6 +173,16 @@ async fn publish_and_receive(
                 Some(Ok(Message::Text(text))) => {
                     let value: Value = serde_json::from_str(&text).expect("WebSocket JSON");
                     if value["type"] == "message" && value["topic"] == topic {
+                        // Anti-entropy legitimately re-serves earlier-phase
+                        // payloads (Alice's 60 s message cache) to a restarted
+                        // Bob whose dedupe state is gone; wait for this one.
+                        if value["payload"] != payload {
+                            eprintln!(
+                                "{label}/{sequence}: skipping earlier payload {}",
+                                value["payload"]
+                            );
+                            continue;
+                        }
                         return value;
                     }
                 }
