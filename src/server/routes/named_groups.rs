@@ -4407,12 +4407,45 @@ async fn record_anchored_gap_refusal(
         else {
             return false;
         };
-        let (occurrences, first_observed_at_ms) = lineage
-            .anchored_gap_refusal
-            .as_ref()
-            .map_or((0, now_ms), |prior| {
-                (prior.occurrences, prior.first_observed_at_ms)
+        let prior = lineage.anchored_gap_refusal.as_ref();
+        let (occurrences, first_observed_at_ms) = prior.map_or((0, now_ms), |record| {
+            (record.occurrences, record.first_observed_at_ms)
+        });
+        let mut by_reason = prior.map_or_else(BTreeMap::new, |record| record.by_reason.clone());
+        // Older persisted records have only the latest top-level slot. Before
+        // writing a new reason, preserve that original evidence and count.
+        if let Some(record) = prior {
+            by_reason.entry(record.reason.clone()).or_insert_with(|| {
+                x0x::groups::GapRefusalReasonAudit {
+                    first_head_revision: record.head_revision,
+                    first_head_state_hash: record.head_state_hash.clone(),
+                    first_terminal_revision: record.terminal_revision,
+                    first_terminal_state_hash: record.terminal_state_hash.clone(),
+                    first_committed_by: record.committed_by.clone(),
+                    occurrences: record.occurrences,
+                    first_observed_at_ms: record.first_observed_at_ms,
+                    last_observed_at_ms: record.last_observed_at_ms,
+                }
             });
+        }
+        if let Some(audit) = by_reason.get_mut(reason) {
+            audit.occurrences = audit.occurrences.saturating_add(1);
+            audit.last_observed_at_ms = now_ms;
+        } else {
+            by_reason.insert(
+                reason.to_string(),
+                x0x::groups::GapRefusalReasonAudit {
+                    first_head_revision: head_revision,
+                    first_head_state_hash: head_state_hash.clone(),
+                    first_terminal_revision: terminal_revision,
+                    first_terminal_state_hash: terminal_state_hash.clone(),
+                    first_committed_by: committed_by.clone(),
+                    occurrences: 1,
+                    first_observed_at_ms: now_ms,
+                    last_observed_at_ms: now_ms,
+                },
+            );
+        }
         lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
             reason: reason.to_string(),
             head_revision,
@@ -4423,6 +4456,7 @@ async fn record_anchored_gap_refusal(
             occurrences: occurrences.saturating_add(1),
             first_observed_at_ms,
             last_observed_at_ms: now_ms,
+            by_reason,
         });
         true
     };
@@ -4512,6 +4546,34 @@ fn served_chain_owner_anchored(
     head_attestation.is_some_and(|attestation| {
         attestation.verify_terminal_binding(&owner_public_key, commit, treekem_epoch)
     })
+}
+
+/// A genuine v1-only owner signature proves the parent but cannot distinguish
+/// this terminal from a same-parent sibling. This exact predicate is shared
+/// by the refused-join classifier and its regression tests.
+#[allow(clippy::too_many_arguments)]
+fn served_chain_owner_v1_only(
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    chain: &[x0x::groups::state_commit::RetainedCommit],
+    member_agent_id: &str,
+    owner_certified_certificate: Option<&x0x::identity::AgentCertificate>,
+    head_attestation: Option<&HeadAttestation>,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
+    treekem_epoch: Option<u64>,
+) -> bool {
+    head_attestation.is_some_and(|attestation| attestation.terminal_signature_b64.is_none())
+        && served_chain_owner_v1_key(
+            current,
+            commit,
+            chain,
+            member_agent_id,
+            owner_certified_certificate,
+            head_attestation,
+            owner_mandate,
+            treekem_epoch,
+        )
+        .is_some()
 }
 
 /// Separate fn + `Box::pin` at the call site: the giant apply fn's async
@@ -10419,20 +10481,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 owner_mandate.as_ref(),
                                 treekem_epoch,
                             );
-                            let served_chain_owner_v1_only = served_attestation
-                                .as_ref()
-                                .is_some_and(|attestation| attestation.terminal_signature_b64.is_none())
-                                && served_chain_owner_v1_key(
-                                    &current,
-                                    &commit,
-                                    &adopt_chain,
-                                    &agent_id,
-                                    owner_certified_certificate.as_ref(),
-                                    served_attestation.as_ref(),
-                                    owner_mandate.as_ref(),
-                                    treekem_epoch,
-                                )
-                                .is_some();
+                            let served_chain_owner_v1_only = served_chain_owner_v1_only(
+                                &current,
+                                &commit,
+                                &adopt_chain,
+                                &agent_id,
+                                owner_certified_certificate.as_ref(),
+                                served_attestation.as_ref(),
+                                owner_mandate.as_ref(),
+                                treekem_epoch,
+                            );
                             let anchored_gap = classify_refused_joiner_fork_chain(
                                 state,
                                 &resolved_group_key,
@@ -10445,14 +10503,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 roster_lock_already_held,
                             )
                             .await;
-                            // Convergence for the owner-anchored stale-base
-                            // gap: the frontier gate above missed it (the
+                            // Convergence only for the v2 owner-anchored
+                            // stale-base gap: the frontier gate above missed
+                            // it (the
                             // invite stub's roster clock is seeded from the
                             // base STATE revision), so queue the terminal
                             // exactly like that gate would and request
                             // TreeKEM catch-up; the response supplies the
                             // intervening commits and the queued terminal
-                            // replays gaplessly after them.
+                            // replays gaplessly after them. A v1-only chain
+                            // has no owner-bound terminal, so do not queue
+                            // that ambiguous event for replay or catch-up.
                             if anchored_gap
                                 && allow_queue
                                 && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem

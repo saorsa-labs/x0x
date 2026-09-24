@@ -5866,20 +5866,34 @@ async fn stale_base_treekem_joiner_owner_anchored_gap_is_not_fork_evidence() -> 
         );
         assert_eq!(record.committed_by, terminal.committed_by);
         assert_eq!(record.occurrences, 1);
+        let reason = record
+            .by_reason
+            .get("owner_attested_stale_base_gap")
+            .expect("owner-anchored reason audit");
+        assert_eq!(reason.first_terminal_state_hash, terminal.state_hash);
+        assert_eq!(reason.first_committed_by, terminal.committed_by);
+        assert_eq!(reason.occurrences, 1);
     }
     let reloaded = load_named_groups_merged(
         &_jdir.path().join("named_groups.json"),
         &_jdir.path().join(HOME_SUITE_GROUPS_FILE),
     )
     .await?;
-    assert!(
-        reloaded
-            .get(&stage.group_id)
-            .and_then(|info| info.invite_lineage.as_ref())
-            .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
-            .is_some(),
-        "the audit record survives a reload (durable)"
+    let reloaded_record = reloaded
+        .get(&stage.group_id)
+        .and_then(|info| info.invite_lineage.as_ref())
+        .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+        .expect("the audit record survives a reload (durable)");
+    let durable_reason = reloaded_record
+        .by_reason
+        .get("owner_attested_stale_base_gap")
+        .expect("the owner-anchored reason survives a reload");
+    assert_eq!(
+        durable_reason.first_terminal_state_hash,
+        terminal.state_hash
     );
+    assert_eq!(durable_reason.first_committed_by, terminal.committed_by);
+    assert_eq!(durable_reason.occurrences, 1);
     // Convergence: the terminal is queued and catch-up was requested from
     // the authority (the throttle entry is written per dispatched peer).
     let queued = joiner_state
@@ -6386,9 +6400,12 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
     .map_err(|e| anyhow::anyhow!(e))?;
     assert!(v1.terminal_signature_b64.is_none());
     assert!(v2.terminal_signature_b64.is_some());
+    let mut malformed_v2 = v2.clone();
+    malformed_v2.terminal_signature_b64 = Some("not base64 !!".to_string());
 
-    // The four wire combinations: a v1-only owner cannot anchor either
-    // terminal; v2 anchors only the exact terminal the owner signed.
+    // A v1-only owner cannot anchor either terminal; v2 anchors only the
+    // exact terminal the owner signed. A present but malformed v2 binding
+    // must not be downgraded to the ambiguous v1-only decision.
     for (label, terminal, cert, actor, attestation, should_adopt) in [
         (
             "sibling with replayed v1",
@@ -6420,6 +6437,14 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
             &sibling_cert,
             b_kp.agent_id(),
             &v2,
+            false,
+        ),
+        (
+            "sibling with malformed v2",
+            &sibling,
+            &sibling_cert,
+            b_kp.agent_id(),
+            &malformed_v2,
             false,
         ),
     ] {
@@ -6489,8 +6514,22 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
             None,
             None,
         );
-        let v1_only = v1_key.is_some() && attestation.terminal_signature_b64.is_none();
+        let v1_only = served_chain_owner_v1_only(
+            &stub,
+            terminal,
+            &chain,
+            &stage.joiner_hex,
+            Some(cert),
+            Some(attestation),
+            None,
+            None,
+        );
         assert!(!v2_anchored, "{label}: refused terminal is not v2 anchored");
+        assert_eq!(
+            v1_only,
+            attestation.terminal_signature_b64.is_none(),
+            "{label}: a present v2 binding cannot use the v1-only exemption"
+        );
         assert!(
             !classify_refused_joiner_fork_chain(
                 &joiner_state,
@@ -6527,6 +6566,16 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
                 .expect("v1-only audit recorded");
             assert_eq!(record.reason, "v1_only_unverifiable", "{label}");
             assert_eq!(record.terminal_state_hash, terminal.state_hash, "{label}");
+            let reason = record
+                .by_reason
+                .get("v1_only_unverifiable")
+                .expect("v1-only reason audit");
+            assert_eq!(
+                reason.first_terminal_state_hash, terminal.state_hash,
+                "{label}"
+            );
+            assert_eq!(reason.first_committed_by, terminal.committed_by, "{label}");
+            assert_eq!(reason.occurrences, 1, "{label}");
         } else {
             let marker = info
                 .fork_quarantine
@@ -6541,6 +6590,98 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
         }
         drop(groups);
         if v1_only {
+            if label == "sibling with replayed v1" {
+                let genuine_v1_only = served_chain_owner_v1_only(
+                    &stub,
+                    &genuine,
+                    &chain,
+                    &stage.joiner_hex,
+                    Some(&genuine_cert),
+                    Some(&v1),
+                    None,
+                    None,
+                );
+                assert!(
+                    genuine_v1_only,
+                    "the second v1 refusal uses the same decision"
+                );
+                assert!(
+                    !classify_refused_joiner_fork_chain(
+                        &joiner_state,
+                        &stage.group_id,
+                        &stub,
+                        &genuine,
+                        &chain,
+                        None,
+                        false,
+                        genuine_v1_only,
+                        false,
+                    )
+                    .await,
+                    "a second v1 refusal still cannot establish a fork"
+                );
+                let groups = joiner_state.named_groups.read().await;
+                let info = groups.get(&stage.group_id).expect("stub retained");
+                assert!(!info.is_fork_quarantined());
+                let record = info
+                    .invite_lineage
+                    .as_ref()
+                    .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                    .expect("both v1 refusals audited");
+                assert_eq!(record.occurrences, 2);
+                assert_eq!(record.terminal_state_hash, genuine.state_hash);
+                let reason = record
+                    .by_reason
+                    .get("v1_only_unverifiable")
+                    .expect("v1-only reason audit survives second refusal");
+                assert_eq!(reason.occurrences, 2);
+                assert_eq!(reason.first_terminal_state_hash, sibling.state_hash);
+                assert_eq!(reason.first_committed_by, sibling.committed_by);
+                assert!(reason.first_observed_at_ms <= reason.last_observed_at_ms);
+                drop(groups);
+
+                let genuine_v2_anchored = served_chain_owner_anchored(
+                    &stub,
+                    &genuine,
+                    &chain,
+                    &stage.joiner_hex,
+                    Some(&genuine_cert),
+                    Some(&v2),
+                    None,
+                    None,
+                );
+                assert!(genuine_v2_anchored);
+                assert!(
+                    classify_refused_joiner_fork_chain(
+                        &joiner_state,
+                        &stage.group_id,
+                        &stub,
+                        &genuine,
+                        &chain,
+                        None,
+                        genuine_v2_anchored,
+                        false,
+                        false,
+                    )
+                    .await,
+                    "the owner-anchored reason is recorded separately"
+                );
+                let groups = joiner_state.named_groups.read().await;
+                let info = groups.get(&stage.group_id).expect("stub retained");
+                assert!(!info.is_fork_quarantined());
+                let record = info
+                    .invite_lineage
+                    .as_ref()
+                    .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                    .expect("both reasons audited");
+                assert_eq!(record.occurrences, 3);
+                assert_eq!(record.reason, "owner_attested_stale_base_gap");
+                assert_eq!(record.by_reason["v1_only_unverifiable"].occurrences, 2);
+                let owner_reason = &record.by_reason["owner_attested_stale_base_gap"];
+                assert_eq!(owner_reason.occurrences, 1);
+                assert_eq!(owner_reason.first_terminal_state_hash, genuine.state_hash);
+                assert_eq!(owner_reason.first_committed_by, genuine.committed_by);
+            }
             let reloaded = load_named_groups_merged(
                 &_jdir.path().join("named_groups.json"),
                 &_jdir.path().join(HOME_SUITE_GROUPS_FILE),
@@ -6552,9 +6693,49 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
                     .and_then(|info| info.invite_lineage.as_ref())
                     .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
                     .map(|record| record.reason.as_str()),
-                Some("v1_only_unverifiable"),
+                Some(if label == "sibling with replayed v1" {
+                    "owner_attested_stale_base_gap"
+                } else {
+                    "v1_only_unverifiable"
+                }),
                 "{label}: non-gating audit survives reload"
             );
+            let durable_record = reloaded
+                .get(&stage.group_id)
+                .and_then(|info| info.invite_lineage.as_ref())
+                .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                .expect("durable refusal audit");
+            let durable_reason = durable_record
+                .by_reason
+                .get("v1_only_unverifiable")
+                .expect("durable v1-only reason audit");
+            assert_eq!(
+                durable_reason.first_terminal_state_hash, terminal.state_hash,
+                "{label}: first v1 terminal survives reload"
+            );
+            assert_eq!(
+                durable_reason.first_committed_by, terminal.committed_by,
+                "{label}: first v1 committer survives reload"
+            );
+            assert_eq!(
+                durable_reason.occurrences,
+                if label == "sibling with replayed v1" {
+                    2
+                } else {
+                    1
+                },
+                "{label}: per-reason count survives reload"
+            );
+            if label == "sibling with replayed v1" {
+                assert_eq!(durable_record.occurrences, 3);
+                let owner_reason = durable_record
+                    .by_reason
+                    .get("owner_attested_stale_base_gap")
+                    .expect("owner-anchored reason survives reload separately");
+                assert_eq!(owner_reason.occurrences, 1);
+                assert_eq!(owner_reason.first_terminal_state_hash, genuine.state_hash);
+                assert_eq!(owner_reason.first_committed_by, genuine.committed_by);
+            }
         }
     }
     Ok(())
