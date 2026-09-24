@@ -1282,6 +1282,11 @@ impl KvStoreSync {
                 return false;
             }
         };
+        // Capture before verification: even an A -> B -> A roster cycle
+        // during a later store-lock wait must invalidate this admission.
+        let verified_authorization = ctx
+            .public_authorization_changes()
+            .map(|changes| *changes.borrow());
         let mutation = match open_signed_mutation(ctx.as_ref(), store_id, record) {
             Ok(mutation) => mutation,
             Err(e) => {
@@ -1376,10 +1381,21 @@ impl KvStoreSync {
                     bincode::deserialize::<KvStore>(mutation_payload)
                         .map_err(|e| KvError::Gossip(format!("bad retained group image: {e}")))
                         .and_then(|image| {
-                            target.merge_group_retained_image(
-                                &image,
-                                mutation.author_id,
-                                local_peer,
+                            let verified = verified_authorization.ok_or_else(|| {
+                                KvError::Unauthorized(
+                                    "retained public image lacks authorization version".to_string(),
+                                )
+                            })?;
+                            ctx.apply_if_public_authorized(
+                                &mutation.author_id,
+                                verified,
+                                &mut || {
+                                    target.merge_group_retained_image(
+                                        &image,
+                                        mutation.author_id,
+                                        local_peer,
+                                    )
+                                },
                             )
                         })
                 }
@@ -4202,6 +4218,154 @@ mod tests {
             target.read().await.get("barrier").expect("recovered").value,
             b"fresh"
         );
+    }
+
+    #[tokio::test]
+    async fn group_signed_retained_revocation_while_waiting_for_store_write_rejects() {
+        let owner_keypair = crate::identity::AgentKeypair::generate().expect("owner keypair");
+        let writer_keypair = crate::identity::AgentKeypair::generate().expect("writer keypair");
+        let owner = owner_keypair.agent_id();
+        let writer = writer_keypair.agent_id();
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "cd".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        group.add_member(
+            hex::encode(writer.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        let context = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        assert!(context.is_authorized_writer(&writer));
+        let secure = context.clone() as SharedKvSecureContext;
+        let id = store_id(94);
+        let source = Arc::new(RwLock::new(
+            KvStore::new_group_signed(
+                id,
+                "Wiki".to_string(),
+                owner,
+                group.stable_group_id().as_bytes().to_vec(),
+                context.clone(),
+            )
+            .expect("source store"),
+        ));
+        let target = Arc::new(RwLock::new(
+            KvStore::new_group_signed(
+                id,
+                "Wiki".to_string(),
+                owner,
+                group.stable_group_id().as_bytes().to_vec(),
+                context.clone(),
+            )
+            .expect("target store"),
+        ));
+        source
+            .write()
+            .await
+            .put(
+                "revoked-image".to_string(),
+                b"must-not-merge".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("source put");
+        let image = bincode::serialize(&*source.read().await).expect("retained image");
+        let writer_signing =
+            Arc::new(AuthorSigning::from_keypair(&writer_keypair).expect("writer"));
+        let old_wire = KvStoreSync::sign_publication(
+            &source,
+            &secure,
+            None,
+            &writer_signing,
+            KvMutationKind::RetainedState,
+            peer(1),
+            image.clone(),
+        )
+        .await
+        .expect("valid old-revision writer image");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+
+        // This is the real merge future, not a recreated authorization
+        // helper. With no refresh hook, its first await is store.write(): a
+        // Pending poll while we hold that guard means old-revision signature,
+        // membership, payload binding, and page admission already passed.
+        let merge = KvStoreSync::merge_group_signed_record(
+            &secure,
+            None,
+            &target,
+            &id,
+            peer(2),
+            &old_wire,
+            &pages,
+        );
+        tokio::pin!(merge);
+        {
+            let _held_write = target.write().await;
+            assert!(futures::poll!(merge.as_mut()).is_pending());
+
+            group.remove_member(
+                &hex::encode(writer.as_bytes()),
+                Some(hex::encode(owner.as_bytes())),
+            );
+            group.state_revision += 1;
+            context.update_from_group(&group);
+            assert!(!context.is_authorized_writer(&writer));
+        }
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), merge.as_mut())
+                .await
+                .expect("blocked merge completion"),
+            "retained image from a now-revoked endorser must be rejected"
+        );
+        {
+            let after = target.read().await;
+            assert!(after.get("revoked-image").is_none());
+            assert_eq!(after.last_history_endorser(), None);
+        }
+
+        // Positive control: the same image, freshly signed by the still
+        // authorized owner at the current revision, remains mergeable.
+        let owner_signing = Arc::new(AuthorSigning::from_keypair(&owner_keypair).expect("owner"));
+        let current_wire = KvStoreSync::sign_publication(
+            &source,
+            &secure,
+            None,
+            &owner_signing,
+            KvMutationKind::RetainedState,
+            peer(1),
+            image,
+        )
+        .await
+        .expect("current authorized image");
+        assert!(tokio::time::timeout(
+            Duration::from_secs(2),
+            KvStoreSync::merge_group_signed_record(
+                &secure,
+                None,
+                &target,
+                &id,
+                peer(2),
+                &current_wire,
+                &pages,
+            ),
+        )
+        .await
+        .expect("positive merge completion"));
+        let after = target.read().await;
+        assert_eq!(
+            after.get("revoked-image").expect("current image").value,
+            b"must-not-merge"
+        );
+        assert_eq!(after.last_history_endorser(), Some(&owner));
     }
 
     #[tokio::test(start_paused = true)]
