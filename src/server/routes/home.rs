@@ -768,13 +768,14 @@ async fn strip_home_metadata(state: &AppState, group_id: &str) {
 /// #824: how long a startup with an owner but no canonical Home pointer
 /// waits for the owner's pointer before provisioning a Home of its own.
 ///
-/// The periodic Tier-1 loop's FIRST pass runs one
-/// [`crate::owner_sync::DEFAULT_SYNC_INTERVAL`] (60 s) after startup, unless
-/// an inbound record wakes it earlier. 90 s covers that first pass plus 30 s
-/// for its sessions with reachable devices to deliver the pointer. A peer
-/// that stalls for the full 60 s session budget runs past the wait, and this
-/// device then provisions as it did before #824: an unreachable owner device
-/// must not leave this one without a Home.
+/// The periodic Tier-1 loop passes every
+/// [`crate::owner_sync::DEFAULT_SYNC_INTERVAL`] (60 s), and an enrollment or
+/// merged record wakes it early. So a device enrolled during the wait is
+/// dialled at once, and a failed first dial is retried within 60 s. 90 s
+/// covers one full interval plus 30 s for that session to deliver the
+/// pointer. A device that reaches no owner device in time (a genuinely first
+/// or offline device) provisions as it did before #824: an unreachable owner
+/// device must not leave this one without a Home.
 pub(in crate::server) const HOME_POINTER_SYNC_WAIT: std::time::Duration =
     std::time::Duration::from_secs(90);
 
@@ -796,8 +797,8 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
 /// pointer. The one step that can fork the owner's Home is creating a fresh
 /// Home. An owned device that would create one while it knows NO canonical
 /// pointer may be the owner's second device before its first sync. That step
-/// is deferred to the returned task. The task waits for one completed
-/// owner-sync pass, a committed record that names a canonical Home, or
+/// is deferred to the returned task. The task waits for one successful
+/// owner-sync session, a committed record that names a canonical Home, or
 /// `wait`, whichever comes first, and then re-runs [`provision_home`] from
 /// the top. The API stays up throughout; `GET /home` reports
 /// `provisioning_pending` until the task finishes.
@@ -827,30 +828,17 @@ pub(in crate::server) async fn provision_home_at_startup(
     }))
 }
 
-/// Whether owner sync could deliver a canonical pointer to this device: at
-/// least one OTHER machine is enrolled for `owner`. Tier-1 sessions run only
-/// between mutually enrolled machines, in both directions.
-async fn has_enrolled_peer_device(state: &AppState, owner: &crate::identity::UserId) -> bool {
-    let Some(sync) = state.owner_sync.as_ref() else {
-        return false;
-    };
-    let local = state.agent.machine_id();
-    for device in sync.store().enrolled_devices().await {
-        let machine = crate::identity::MachineId(device.machine_id);
-        if machine != local && sync.store().is_enrolled(&machine, owner).await {
-            return true;
-        }
-    }
-    false
-}
-
-/// Resolve when one owner-sync pass completes after this call, when a
-/// committed record makes a canonical Home known, or after `wait`.
+/// Resolve when a session with an owner device completes after this call,
+/// when a committed record makes a canonical Home known, or after `wait`.
+///
+/// A pass that reached nobody does NOT count. Right after a restart, the
+/// owner's other devices are often not yet discovered, or not yet enrolled
+/// here, so an empty pass says nothing about whether the owner has a Home.
 async fn wait_for_owner_sync_round(state: &Arc<AppState>, wait: std::time::Duration) {
     let Some(sync) = state.owner_sync.as_ref() else {
         return;
     };
-    let mut rounds = sync.sync_rounds_rx();
+    let mut rounds = sync.store().successful_sessions_rx();
     rounds.borrow_and_update();
     let mut generation = sync.store().generation_rx();
     generation.borrow_and_update();
@@ -865,8 +853,8 @@ async fn wait_for_owner_sync_round(state: &Arc<AppState>, wait: std::time::Durat
                 );
                 return;
             }
-            // A completed pass either delivered the pointer or showed that no
-            // reachable owner device advertises one.
+            // A completed session merged that device's records: it either
+            // delivered the pointer or showed that the device advertises none.
             _ = rounds.changed() => return,
             changed = generation.changed() => {
                 if changed.is_err() || effective_canonical_home(state).await.is_some() {
@@ -1031,10 +1019,10 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
     //     second device before its first sync, as with a copied owner key.
     //     At startup, wait for owner sync before minting a Home the owner
     //     already has.
-    //     A device with no other enrolled owner device has no path for the
-    //     pointer to arrive by (SyncV1 refuses unenrolled peers both ways),
-    //     so waiting would only delay a first device's Home.
-    if defer_fresh && has_enrolled_peer_device(state, &owner).await {
+    //     This applies with or without enrolled peers: a new device is
+    //     enrolled only once it is running with the owner key, which is
+    //     during this wait. Without owner sync there is nothing to wait for.
+    if defer_fresh && state.owner_sync.is_some() {
         tracing::info!(
             "owned device knows no canonical Home pointer; deferring provisioning until owner sync (#824)"
         );
@@ -1094,6 +1082,12 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
         )
         .await;
         tracing::info!(group_id = %group_id, "provisioned Home (ADR-0038)");
+        // #824: publish the new Home's pointer now rather than at the next
+        // 60 s pass, so a device enrolled right after this one reads the
+        // pointer in its first session instead of minting a duplicate.
+        if let Some(sync) = state.owner_sync.as_ref() {
+            sync.kick();
+        }
     }
     ProvisionStep::Done
 }
@@ -3227,29 +3221,6 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
-    /// Enroll one other owner machine, so owner sync has a possible source
-    /// for the canonical pointer (#824). Offline agent: nothing is dialled.
-    async fn enroll_peer_device(state: &Arc<AppState>) -> anyhow::Result<()> {
-        let sync = state
-            .owner_sync
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))?;
-        let owner_kp = state
-            .agent
-            .identity()
-            .user_keypair()
-            .ok_or_else(|| anyhow::anyhow!("owned state has a user key"))?;
-        sync.store()
-            .enroll(crate::owner_sync::OwnerEnrollment::sign(
-                crate::identity::MachineId([0x99; 32]),
-                owner_kp,
-                1_000,
-                None,
-            )?)
-            .await?;
-        Ok(())
-    }
-
     async fn home_shaped_group_count(state: &Arc<AppState>) -> usize {
         let owner = owner_of(state);
         state
@@ -3279,7 +3250,6 @@ pub(in crate::server::routes) mod tests {
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = owned_state(dir.path(), [0x84; 32]).await?;
-        enroll_peer_device(&state).await?;
 
         let task = provision_home_at_startup(&state, std::time::Duration::from_secs(60)).await;
         assert_eq!(
@@ -3319,7 +3289,6 @@ pub(in crate::server::routes) mod tests {
     {
         let dir = tempfile::tempdir()?;
         let state = owned_state(dir.path(), [0x85; 32]).await?;
-        enroll_peer_device(&state).await?;
 
         let task = provision_home_at_startup(&state, std::time::Duration::from_millis(200))
             .await
@@ -3337,16 +3306,17 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
-    /// WHY (#824): "one completed owner-sync round" ends the wait, not only the
-    /// timeout. A round that reached every enrolled device and delivered no
-    /// pointer shows that no reachable device advertises a Home, so waiting
-    /// out the rest of the timeout would only delay a usable Home.
+    /// WHY (#824): only a session that actually reached an owner device may end
+    /// the wait early. Right after the restart that installs the owner key,
+    /// the owner's other devices are usually not yet discovered or enrolled,
+    /// so the first pass reaches nobody. Treating that empty pass as "the
+    /// owner has no Home" is exactly how the duplicate would still be minted.
+    /// A completed session that brought no pointer does show that the device
+    /// it reached advertises no Home, so provisioning may then go ahead.
     #[tokio::test]
-    async fn a_completed_owner_sync_round_ends_the_wait() -> anyhow::Result<()> {
+    async fn only_a_successful_owner_sync_session_ends_the_wait() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = owned_state(dir.path(), [0x86; 32]).await?;
-        enroll_peer_device(&state).await?;
-
         let task = provision_home_at_startup(&state, std::time::Duration::from_secs(600))
             .await
             .ok_or_else(|| anyhow::anyhow!("must defer"))?;
@@ -3354,21 +3324,54 @@ pub(in crate::server::routes) mod tests {
             .owner_sync
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))?;
-        // Offline agent: the enrolled peer is not in discovery, so the pass
-        // completes without opening any stream.
+        let peer = crate::identity::MachineId([0x99; 32]);
+
+        // An empty pass (offline agent, nothing enrolled) and a failed
+        // session must both leave the wait in place.
         sync.sync_all().await;
+        sync.store().set_session_status(&peer, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !task.is_finished(),
+            "an empty or failed pass ended the wait"
+        );
+        assert_eq!(home_shaped_group_count(&state).await, 0);
+        assert!(deferral_active(&state));
+
+        sync.store().set_session_status(&peer, true).await;
         tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
         assert_eq!(home_shaped_group_count(&state).await, 1);
         Ok(())
     }
 
-    /// WHY (#824): the wait applies only where owner sync could deliver a
-    /// pointer. An install with no owner is unchanged (nothing provisioned,
-    /// nothing deferred, the same 404). An owned device with no other enrolled
-    /// device has no path for a pointer to arrive by, so it provisions
-    /// immediately, as before.
+    /// WHY (#824): the owner's other devices learn the canonical Home only
+    /// from this device's Tier-1 pointer record, which is minted during a sync
+    /// pass. Waiting for the next 60 s pass would let a device enrolled right
+    /// after provisioning complete its first session with no pointer and mint
+    /// a duplicate Home. Provisioning must wake the sync loop immediately.
     #[tokio::test]
-    async fn startup_without_a_possible_pointer_source_is_unchanged() -> anyhow::Result<()> {
+    async fn provisioning_a_home_wakes_owner_sync_to_publish_its_pointer() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x88; 32]).await?;
+        let sync = state
+            .owner_sync
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))?;
+        let mut generation = sync.store().generation_rx();
+        generation.borrow_and_update();
+        provision_home(&state).await;
+        assert_eq!(home_shaped_group_count(&state).await, 1);
+        assert!(
+            generation.has_changed()?,
+            "a freshly provisioned Home must wake owner sync"
+        );
+        Ok(())
+    }
+
+    /// WHY (#824): the wait is for owner devices only. An install with no
+    /// owner provisions nothing, defers nothing, and still answers 404.
+    #[tokio::test]
+    async fn startup_on_an_unowned_install_is_unchanged() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let unowned = unowned_state(dir.path()).await?;
         assert!(
@@ -3381,15 +3384,6 @@ pub(in crate::server::routes) mod tests {
         let (status, _) =
             response_json(get_home(State(Arc::clone(&unowned))).await.into_response()).await?;
         assert_eq!(status, StatusCode::NOT_FOUND);
-
-        let dir = tempfile::tempdir()?;
-        let first = owned_state(dir.path(), [0x87; 32]).await?;
-        assert!(
-            provision_home_at_startup(&first, std::time::Duration::from_secs(60))
-                .await
-                .is_none()
-        );
-        assert_eq!(home_shaped_group_count(&first).await, 1);
         Ok(())
     }
 

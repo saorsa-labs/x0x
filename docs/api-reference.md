@@ -501,15 +501,20 @@ needs a certifiable founding member), and no other device of this owner may
 have already advertised a Home. If one has, this device provisions nothing
 and `GET /home` answers `state:"elsewhere"`. An absent register value means
 "none advertised yet", not "none exists", so a first or un-synced device
-still provisions. When at least one OTHER owner machine is enrolled for Tier-1
-sync (so the pointer has a way to arrive), startup does not create a fresh Home
-at once (#824). A background task waits for one completed owner-sync pass, a
-committed record that names a canonical Home, or 90 s, whichever comes first.
-It then re-runs provisioning: it yields to the pointer if one arrived, and
-otherwise creates the Home as before. The API stays up while it waits, and
-`GET /home` answers `state:"provisioning_pending"`. With no other enrolled
-machine, provisioning is immediate: Tier-1 refuses unenrolled peers in both
-directions, so no pointer could arrive. The daemon's own owner-certified agent is the founding member
+still provisions, but not at once (#824). When the owner key and
+certificate are live, owner sync is available and no pointer is known, startup
+defers creating a fresh Home to a background task. The task waits for one
+successful owner-sync session with another owner device, a committed record
+that names a canonical Home, or 90 s, whichever comes first. A pass that reaches
+no device does not end the wait. The task then re-runs provisioning: it yields
+to the pointer if one arrived, and otherwise creates the Home as before, so a
+genuinely first or offline device gets its Home up to 90 s later. The API stays
+up throughout, and `GET /home` answers `state:"provisioning_pending"` until the
+task finishes. To add an owner device without a duplicate Home, enroll it for
+owner sync while it is pending: enroll its machine on an existing owner device,
+install the owner key and certificate, restart it, then enroll the existing
+device's machine on it (see *Device sync* below; peer trust must be `trusted`
+both ways). The daemon's own owner-certified agent is the founding member
 and **primary agent** — the owner speaks *through* an agent; there is no human
 wire signer. Admission is cryptographic: joining requires an agent certificate
 chaining to the owner's user key, re-checked at every state seal. An
@@ -558,7 +563,7 @@ A `state:"local"` response (the settled case):
   | `"local"` | this device holds the canonical Home, or is uncontested | the full payload above; `canonical_group_id` is `null` |
   | `"adoption_pending"` | this device holds a Home that LOST the `("home")` election | the full payload above, `canonical_group_id` names the winner, **plus `next_step`** |
   | `"elsewhere"` | the owner's Home is on another device and this one is not a member | a **short** body — `ok`, `state`, `owner_user_id`, `canonical_group_id`, `local_group_id` (nullable), `detail`, **`next_step`** — and **no** `group_id`, `name`, `members`, `duplicates` or `warnings` |
-  | `"provisioning_pending"` | #824: startup provisioning is waiting for owner sync (≤ 90 s) before creating a Home | the `elsewhere` short body with `canonical_group_id` and `local_group_id` both `null` and **no** `next_step`; poll again |
+  | `"provisioning_pending"` | #824: startup provisioning is waiting for owner sync (≤ 90 s) before creating a Home; transient, so poll until another state | the `elsewhere` short body with `canonical_group_id` and `local_group_id` both `null` and **no** `next_step`; poll again |
 
   `next_step` is present on both `adoption_pending` and `elsewhere`, and absent
   from `local` and `provisioning_pending`. `"elsewhere"` is a `200` rather than a `404` so a second device
