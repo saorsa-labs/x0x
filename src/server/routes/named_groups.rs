@@ -4290,9 +4290,17 @@ async fn classify_refused_joiner_fork_chain(
         // authenticated evidence of anything this node can anchor.
         return false;
     }
-    // #818: why this walk-authenticated refusal is a GAP (queue + audit,
-    // no evidence) rather than fork evidence, if it is one.
-    let gap_reason: Option<&'static str> = if served_chain_owner_anchored {
+    // #818 design decision (Root, 2026-09-24): the gap exemption below is
+    // deliberately OWNER-ANCHORED ONLY. Without an owner attestation there
+    // is nothing that authenticates "gap" versus "fork" for a walk-clean
+    // chain — a creator/sealer check is not a terminal binding (a removed
+    // creator or admin can still sign from the stale base) — so for
+    // ORDINARY (ownerless) TreeKEM groups the walk-authenticated chain
+    // keeps the signer_only quarantine as the safe default. Mitigations
+    // for an ownerless stale-base join: mint just-in-time invites (after
+    // the intervening commits), or clear the marker via
+    // POST /groups/:id/quarantine/clear once canonical state is restored.
+    if served_chain_owner_anchored {
         // The served chain DESCENDS from our invite base and the ADMISSION
         // OWNER's head attestation CAS-binds the terminal to exactly this
         // chain's head — the tier-1 anchor the adoption path accepts. That
@@ -4303,34 +4311,7 @@ async fn classify_refused_joiner_fork_chain(
         // catch-up. A removed/forked admin cannot forge the owner's
         // user-key terminal binding, so a real fork (including a
         // same-parent sibling) still reaches the evidence below.
-        Some("owner_attested_stale_base_gap")
-    } else if current.policy.admission.owner_certified_user_id().is_none() {
-        // #818 Part B: an ORDINARY (ownerless) TreeKEM group has no owner
-        // head attestation to bind the terminal. The walk above has
-        // already proven the served chain descends from OUR invite base
-        // with every link signed by an admin active at its reconstructed
-        // predecessor. For a stale-base joiner whose terminal is sealed by
-        // the group CREATOR — the one authority the joiner provably holds,
-        // from its inviter-signed InviteV4 genesis — that is a GAP (the
-        // authority sealed intervening commits after the mint), not a
-        // divergence the joiner can distinguish: TreeKEM never adopts
-        // across a gap, so the joiner stays pending for catch-up exactly
-        // like the owner-anchored Home case. Any other walk-clean signer
-        // (a second admin's same-parent sibling, a removed admin's fork)
-        // keeps the signer_only evidence below — the pre-#818 behaviour.
-        // Known limit (follow-up): an ordinary group whose join result is
-        // staged by a non-creator admin still quarantines today; threading
-        // the exact expected inviter through the classifier can widen the
-        // exemption later.
-        current
-            .genesis
-            .as_ref()
-            .is_some_and(|genesis| genesis.creator_agent_id == commit.committed_by)
-            .then_some("walk_authenticated_stale_base_gap")
-    } else {
-        None
-    };
-    if let Some(reason) = gap_reason {
+        //
         // The exemption is RECORDED durably (non-gating) so every use of
         // it is auditable.
         record_anchored_gap_refusal(
@@ -4339,7 +4320,6 @@ async fn classify_refused_joiner_fork_chain(
             commit,
             chain,
             current,
-            reason,
             persistence_lock_already_held,
         )
         .await;
@@ -4347,8 +4327,7 @@ async fn classify_refused_joiner_fork_chain(
             group_id = %LogHexId::group(group_key),
             revision = commit.revision,
             committed_by = %LogHexId::agent(&commit.committed_by),
-            reason,
-            "joiner served chain is a walk-authenticated stale-base gap — queued for catch-up, not fork evidence"
+            "joiner served chain is owner-anchored to this exact terminal — stale-base gap, not fork evidence"
         );
         return true;
     }
@@ -4395,7 +4374,6 @@ async fn record_anchored_gap_refusal(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     chain: &[x0x::groups::state_commit::RetainedCommit],
     current: &x0x::groups::GroupInfo,
-    reason: &'static str,
     persistence_lock_already_held: bool,
 ) {
     let key = group_key.to_string();
@@ -4421,7 +4399,7 @@ async fn record_anchored_gap_refusal(
                 (prior.occurrences, prior.first_observed_at_ms)
             });
         lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
-            reason: reason.to_string(),
+            reason: "owner_attested_stale_base_gap".to_string(),
             head_revision,
             head_state_hash,
             terminal_revision,
@@ -16253,21 +16231,7 @@ fn invite_join_group_info(
     }
     if let Some(base_revision) = invite.base_state_revision {
         info.state_revision = base_revision;
-        // #818 Part A: `base_state_revision` is a STATE clock; seeding the
-        // ROSTER clock from it overstated the joiner's roster view. A
-        // stale-base event's `revision` is the sender's ROSTER clock,
-        // which lags its state clock (non-roster commits advance only the
-        // latter), so it could sit at/below the seeded roster clock and
-        // the frontier gate's roster limb then masked the state-chain gap:
-        // the event applied directly into a PrevHashMismatch refusal
-        // instead of being queued for catch-up. Seed the roster clock
-        // conservatively at zero — `roster_revision` is not committed by
-        // the state hash, and every apply path adopts event roster
-        // revisions through `adopt_roster_revision`'s +1 clamp, so a
-        // low seed only re-opens the gate's revision/hash checks; the
-        // signed state chain (adjacent revision + prev-hash) remains the
-        // sole admission authority.
-        info.roster_revision = 0;
+        info.roster_revision = base_revision;
     }
     // #469 A2/v6 E2: seat the stub from the PROJECTION. Members are
     // materialized with (id, role, state, treekem key-package hash,

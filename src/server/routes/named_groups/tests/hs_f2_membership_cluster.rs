@@ -6291,24 +6291,88 @@ async fn stale_base_treekem_sibling_terminal_with_genuine_owner_attestation_quar
     Ok(())
 }
 
-/// WHY (#818 Part A, Rule 9): a stale-base TreeKEM joiner in an ORDINARY
-/// (invite-only, ownerless) group must never be fork-quarantined for a
-/// legitimate gap, and the gap must be queued for catch-up. Before #818
-/// the InviteV4 stub seeded BOTH clocks from `base_state_revision`; the
-/// event's `revision` is the sender's ROSTER clock which lags its state
-/// clock, so the frontier gate saw "no gap", applied directly into the
-/// PrevHashMismatch refusal, and the walk-authenticated chain (no owner
-/// attestation exists for an ownerless group) quarantined `signer_only`
-/// — a marker only manual action can clear.
-#[tokio::test]
-async fn ordinary_treekem_stale_base_gap_queues_and_never_quarantines() -> Result<()> {
-    let stage = issue458_stage_with_policy(0xB1, true, invite_only_policy).await?;
-    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
-    let mut stub = stage.base_info.clone();
-    stub.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
-    // Mirror the #818 production seed: STATE clock from the invite base,
-    // ROSTER clock conservatively at zero.
-    stub.roster_revision = 0;
+/// Build a REAL invite-join stub for the two-admin stale-base shape: a
+/// sealed base containing the authority and admin B (so B walks validly
+/// from the base), a genuine authority link L and terminal T, and the
+/// production stub derived through `invite_join_group_info` — with the
+/// PRODUCTION clock seeding (both clocks from `base_state_revision`) and
+/// the roster-clock skew (#818) reproduced by carrying an event `revision`
+/// at/below the stub's roster clock. No hand-forced roster clock.
+async fn two_admin_real_invite_stub(
+    stage: &Issue458Stage,
+) -> Result<(
+    x0x::groups::GroupInfo,
+    AgentKeypair,
+    x0x::groups::state_commit::RetainedCommit,
+    x0x::groups::GroupStateCommit,
+)> {
+    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let b_kp = AgentKeypair::generate()?;
+    let b_hex = hex::encode(b_kp.agent_id().as_bytes());
+    let mut base = stage.base_info.clone();
+    base.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    base.add_member(
+        b_hex,
+        x0x::groups::GroupRole::Admin,
+        Some(authority_hex.clone()),
+        None,
+    );
+    let base_revision = base.state_revision.saturating_add(1);
+    let base_commit = x0x::groups::GroupStateCommit::sign(
+        base.stable_group_id().to_string(),
+        base_revision,
+        Some(base.state_hash.clone()),
+        x0x::groups::compute_roster_root(&base.members_v2),
+        x0x::groups::compute_policy_hash(&base.policy),
+        x0x::groups::compute_public_meta_hash(&base.public_meta()),
+        base.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    base.prev_state_hash = Some(base.state_hash.clone());
+    base.state_hash = base_commit.state_hash.clone();
+    base.state_revision = base_revision;
+    base.commit_log
+        .push(x0x::groups::state_commit::RetainedCommit {
+            commit: base_commit,
+            roster: x0x::groups::state_commit::roster_projection(&base.members_v2),
+            meta: Some(base.public_meta()),
+        });
+
+    // The REAL invite the authority mints at that base, and the REAL
+    // stub the join route derives from it.
+    let mut invite = x0x::groups::invite::SignedInvite::new(
+        base.mls_group_id.clone(),
+        base.name.clone(),
+        &stage.authority.agent.agent_id(),
+        0,
+    );
+    invite.stable_group_id = Some(base.stable_group_id().to_string());
+    invite.group_created_at = Some(base.created_at);
+    invite.group_description = Some(base.description.clone());
+    invite.policy = Some(base.policy.clone());
+    invite.genesis_creation_nonce = base.genesis.as_ref().map(|g| g.creation_nonce.clone());
+    invite.base_state_revision = Some(base.state_revision);
+    invite.base_state_hash = Some(base.state_hash.clone());
+    invite.base_members_v2 = Some(base.members_v2.clone());
+    invite.base_prev_state_hash = base.prev_state_hash.clone();
+    invite.secure_plane = Some(x0x::mls::SecureGroupPlane::TreeKem);
+    invite.base_secret_epoch = Some(base.secret_epoch);
+    invite.base_security_binding = base.security_binding.clone();
+    let joiner_hex = stage.joiner_hex.clone();
+    let mut stub = invite_join_group_info(
+        &invite,
+        stage.authority.agent.agent_id(),
+        &authority_hex,
+        &stage.group_id,
+        &joiner_hex,
+        None,
+        None,
+    );
+    // The real join caller attaches the #468 A5 lineage at stub creation.
     stub.invite_lineage = Some(x0x::groups::InviteLineage {
         base_revision: stub.state_revision,
         base_hash: stub.state_hash.clone(),
@@ -6318,65 +6382,143 @@ async fn ordinary_treekem_stale_base_gap_queues_and_never_quarantines() -> Resul
         fork_evidence: None,
         anchored_gap_refusal: None,
     });
+
+    // The genuine intervening link L (authority) and terminal T (seats the
+    // joiner as Member), chaining from the REAL stub's base hash.
+    let policy_hash = x0x::groups::compute_policy_hash(&stub.policy);
+    let mut meta = stub.public_meta();
+    meta.description = "genuine-intervening".to_string();
+    let link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        base_revision.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        meta.clone(),
+        &authority_kp,
+    );
+    let mut roster = stub.members_v2.clone();
+    roster.insert(stage.joiner_hex.clone(), {
+        let mut m = x0x::groups::GroupMember::new_member(
+            stage.joiner_hex.clone(),
+            None,
+            None,
+            now_millis_u64(),
+        );
+        m.role = x0x::groups::GroupRole::Member;
+        m
+    });
+    let genuine = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        base_revision.saturating_add(2),
+        Some(link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&roster),
+        policy_hash,
+        x0x::groups::compute_public_meta_hash(&meta),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    Ok((stub, b_kp, link, genuine))
+}
+
+/// WHY (#818 r2, Rule 9): a stale-base TreeKEM joiner built through the
+/// REAL invite path (production clock seeding, roster-clock skew) must be
+/// FORK-CLASSIFIED, not gate-queued: the refusal reaches the classifier,
+/// the owner's v2 terminal-bound attestation anchors the gap, and the
+/// terminal is queued for catch-up with no quarantine. The pre-r2 head
+/// (5f0560b) queued this event at the frontier gate instead — the audit
+/// record below is absent there, which is the fail-before.
+#[tokio::test]
+async fn real_invite_stale_base_gap_is_classified_anchored_and_queued() -> Result<()> {
+    let stage = issue458_stage(0xB3, true).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (stub, _b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
     joiner_state
         .named_groups
         .write()
         .await
         .insert(stage.group_id.clone(), stub.clone());
 
-    // Part A: with the NATURAL stub clocks (both seeded from the invite
-    // base — no roster forcing), the revision gap must be detected and
-    // the event queued for catch-up instead of applied directly.
-    let event = as_treekem_join_result(&stage.member_added);
-    let (terminal, event_revision) = match &event {
-        NamedGroupMetadataEvent::MemberAdded {
-            commit: Some(commit),
-            revision,
-            ..
-        } => (commit.clone(), *revision),
-        _ => panic!("stage carries a MemberAdded with a commit"),
+    // The genuine v2 owner attestation for T, epoch included.
+    let joiner_epoch = Some(1u64);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    // The stale-base event: commit T (base+2) with the ROSTER-clock skew —
+    // revision at the stub's roster clock, which is what production
+    // MemberAdded carries (the sender's roster clock lags its state clock).
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: stub.state_revision,
+        actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: joiner_epoch,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(genuine.clone()),
     };
-    assert!(
-        terminal.revision > stub.state_revision.saturating_add(1),
-        "the fixture must skip intervening commits (the stale-base shape)"
-    );
-    let _ = event_revision;
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
-    let chain = stage_intervening_chain(&stage, stub.state_revision).await;
-    assert!(!chain.is_empty(), "the stage carries intervening commits");
     joiner_state
         .pending_adoption_chains
         .lock()
         .unwrap()
-        .insert(key, chain);
+        .insert(key.clone(), vec![link]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+
     let result = apply_named_group_metadata_event(
         &joiner_state,
-        event,
+        as_treekem_join_result(&event),
         stage.authority.agent.agent_id(),
         true,
         None,
     )
     .await;
-    assert!(!result.accepted, "queued, not applied");
+    assert!(!result.accepted, "TreeKEM never adopts across the gap");
     {
         let groups = joiner_state.named_groups.read().await;
         let info = groups.get(&stage.group_id).expect("stub retained");
         assert!(
             !info.is_fork_quarantined(),
-            "an ordinary stale-base gap must never quarantine"
+            "the owner-anchored gap must not quarantine"
         );
         assert!(
             info.invite_lineage
                 .as_ref()
                 .is_some_and(|l| l.fork_evidence.is_none()),
-            "no fork evidence for the authority's own chain"
+            "no fork evidence for the owner-anchored chain"
         );
-        assert!(
-            info.invite_lineage
-                .as_ref()
-                .is_none_or(|l| l.anchored_gap_refusal.is_none()),
-            "the GATE queued the event before any apply — nothing was              refused, so no gap audit yet (that is the Part A observable:              with the pre-#818 roster seed this event was applied directly,              refused, and audited instead)"
-        );
+        let record = info
+            .invite_lineage
+            .as_ref()
+            .and_then(|l| l.anchored_gap_refusal.as_ref())
+            .expect("the refusal was CLASSIFIED (anchored gap audited)");
+        assert_eq!(record.reason, "owner_attested_stale_base_gap");
+        assert_eq!(record.terminal_state_hash, genuine.state_hash);
     }
     let queued = joiner_state
         .treekem_pending_events
@@ -6387,10 +6529,10 @@ async fn ordinary_treekem_stale_base_gap_queues_and_never_quarantines() -> Resul
             queue.iter().any(|pending| {
                 matches!(&pending.event, NamedGroupMetadataEvent::MemberAdded {
                     commit: Some(commit), ..
-                } if commit.state_hash == terminal.state_hash)
+                } if commit.state_hash == genuine.state_hash)
             })
         });
-    assert!(queued, "the stale-base terminal is queued for replay");
+    assert!(queued, "the anchored terminal is queued for replay");
     let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
     let prefix = format!("{}:{authority_hex}:", stage.group_id);
     assert!(
@@ -6402,89 +6544,38 @@ async fn ordinary_treekem_stale_base_gap_queues_and_never_quarantines() -> Resul
             .any(|k| k.starts_with(&prefix)),
         "TreeKEM catch-up was requested from the authority"
     );
-
-    // Part B: with the roster clock forced high (the #816 fixture idiom
-    // that bypasses the gate), the refusal reaches the classifier. An
-    // ORDINARY group has no owner attestation; the walk-authenticated
-    // CREATOR-sealed chain must be treated as a gap (audit + queue),
-    // never signer_only evidence.
-    let (joiner_state2, _jdir2) = joiner_state_for(&stage).await?;
-    let mut stub2 = stage.base_info.clone();
-    stub2.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
-    stub2.roster_revision = stub2
-        .roster_revision
-        .max(member_added_revision(&stage.member_added));
-    stub2.invite_lineage = Some(x0x::groups::InviteLineage {
-        base_revision: stub2.state_revision,
-        base_hash: stub2.state_hash.clone(),
-        base_roster_root: String::new(),
-        seated_at_revision: None,
-        corroborated: false,
-        fork_evidence: None,
-        anchored_gap_refusal: None,
-    });
-    joiner_state2
-        .named_groups
-        .write()
-        .await
-        .insert(stage.group_id.clone(), stub2.clone());
-    let chain2 = stage_intervening_chain(&stage, stub2.state_revision).await;
-    assert!(!chain2.is_empty());
-    let key2 = join_result_key(&stage.group_id, &stage.joiner_hex);
-    joiner_state2
-        .pending_adoption_chains
-        .lock()
-        .unwrap()
-        .insert(key2, chain2);
-    let result2 = apply_named_group_metadata_event(
-        &joiner_state2,
-        as_treekem_join_result(&stage.member_added),
-        stage.authority.agent.agent_id(),
-        true,
-        None,
-    )
-    .await;
-    assert!(!result2.accepted, "TreeKEM never adopts across the gap");
-    {
-        let groups = joiner_state2.named_groups.read().await;
-        let info = groups.get(&stage.group_id).expect("stub retained");
-        assert!(
-            !info.is_fork_quarantined(),
-            "the ownerless creator-sealed gap must not quarantine (Part B)"
-        );
-        assert!(
-            info.invite_lineage
-                .as_ref()
-                .is_some_and(|l| l.fork_evidence.is_none()),
-            "no fork evidence (Part B)"
-        );
-        let record = info
-            .invite_lineage
-            .as_ref()
-            .and_then(|l| l.anchored_gap_refusal.as_ref())
-            .expect("the creator-sealed gap is audited");
-        assert_eq!(record.reason, "walk_authenticated_stale_base_gap");
-        assert_eq!(record.terminal_state_hash, terminal.state_hash);
-    }
     Ok(())
 }
 
-/// WHY (#818 negative control): the ownerless gap exemption covers ONLY
-/// the chain sealed by the group CREATOR (the one authority a stale-base
-/// joiner provably holds, from its inviter-signed genesis). A second
-/// admin's internally-perfect same-parent sibling — the classic fork
-/// shape — must still quarantine `signer_only`, exactly as before #818.
+/// WHY (#818 r2 negative, Rule 9): a removed admin B's same-parent sibling
+/// delivered to a REAL-path stale-base joiner must STILL be classified and
+/// quarantined `signer_only` — even alongside the owner's GENUINE
+/// attestation (v2 binds the genuine terminal only). The pre-r2 head
+/// (5f0560b) queued this event at the frontier gate (B is an admin in the
+/// stub) so nothing was classified — the missing marker is the fail-before.
 #[tokio::test]
-async fn ordinary_treekem_admin_sibling_still_quarantines() -> Result<()> {
-    let stage = issue458_stage_with_policy(0xB2, false, invite_only_policy).await?;
+async fn real_invite_removed_admin_sibling_is_classified_and_quarantined() -> Result<()> {
+    let stage = issue458_stage(0xB4, false).await?;
     let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
-    let (stub, b_kp, link, genuine) = two_admin_treekem_stub(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (stub, b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
     let b_hex = hex::encode(b_kp.agent_id().as_bytes());
     joiner_state
         .named_groups
         .write()
         .await
         .insert(stage.group_id.clone(), stub.clone());
+
+    // The owner's GENUINE v2 attestation for T (binds T, not any sibling).
+    let joiner_epoch = Some(1u64);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     // B's divergent sibling: same parent (L), same revision, same joiner,
     // different roster (joiner seated as ADMIN), signed by B.
@@ -6506,28 +6597,32 @@ async fn ordinary_treekem_admin_sibling_still_quarantines() -> Result<()> {
         x0x::groups::compute_roster_root(&sibling_roster),
         genuine.policy_hash.clone(),
         genuine.public_meta_hash.clone(),
-        genuine.security_binding.clone(),
+        stub.security_binding.clone(),
         false,
         now_millis_u64(),
         &b_kp,
     )?;
     assert_ne!(sibling.state_hash, genuine.state_hash);
-    // ORDINARY group: no owner axis, so no owner-issued joiner certificate
-    // is required on this path.
+
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
         group_id: stage.group_id.clone(),
-        revision: sibling.revision,
+        revision: stub.state_revision,
         actor: b_hex.clone(),
         agent_id: stage.joiner_hex.clone(),
         display_name: None,
         treekem_commit_b64: None,
         treekem_welcome_b64: None,
         welcome_ref: None,
-        treekem_epoch: None,
+        treekem_epoch: joiner_epoch,
         treekem_key_package_hash: None,
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
-        certificate_b64: None,
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
         owner_mandate: None,
         commit: Some(sibling.clone()),
     };
@@ -6536,7 +6631,13 @@ async fn ordinary_treekem_admin_sibling_still_quarantines() -> Result<()> {
         .pending_adoption_chains
         .lock()
         .unwrap()
-        .insert(key, vec![link]);
+        .insert(key.clone(), vec![link]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+
     let result = apply_named_group_metadata_event(
         &joiner_state,
         as_treekem_join_result(&event),
@@ -6551,7 +6652,7 @@ async fn ordinary_treekem_admin_sibling_still_quarantines() -> Result<()> {
     let marker = info
         .fork_quarantine
         .as_ref()
-        .expect("a non-creator walk-clean chain is NOT the creator gap");
+        .expect("B's sibling is CLASSIFIED divergent evidence, not a gate-queued gap");
     assert_eq!(marker.state_hash, sibling.state_hash);
     assert_eq!(marker.committed_by, b_hex);
     assert_eq!(
