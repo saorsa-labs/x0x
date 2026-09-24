@@ -86,6 +86,15 @@ view of a foreign group). The GUI prompts for the durable token (kept
 in tab-scoped `sessionStorage`, never a URL) the first time an
 owner-act surface is used from a session.
 
+**Named-group read authorization (#821):** the durable API token may read
+`GET /groups/:id` and `GET /groups/:id/members` across the operator's local
+groups. A session bearer requires active membership by this daemon's local
+agent. For a known group without that seat, both endpoints return typed 403
+`reason: "group_membership_required"`; an unknown ID returns 404. A session
+joiner awaiting the authority commit receives only `ok`, `group_id`, and
+`membership_state: "pending_authority_commit"` from `GET /groups/:id`;
+`GET /groups/:id/members` remains 403. Rider tokens are denied on both routes.
+
 `GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept a
 **session token** as a `?token=` query parameter (browser constraint). The
 durable API token and rider tokens are **never** valid in a query string

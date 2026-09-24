@@ -5644,6 +5644,10 @@ async function nagRejectRequest(gid,rid){
 async function renderSpaceDetail(el,data){
   const g=await api('/groups/'+data.groupId);
   if(!g||!g.ok){el.innerHTML='<div class="detail-body" style="color:var(--tx3)">Space not found</div>';return}
+  if(g.membership_state==='pending_authority_commit'){
+    el.innerHTML='<div class="detail-header"><h3>Waiting to join</h3><button class="detail-close" onclick="hideDetail()">&#10005;</button></div><div class="detail-body" style="color:var(--tx3)">Waiting for the group authority to confirm your membership.</div>';
+    return;
+  }
   el.innerHTML=`<div class="detail-header">
     <h3>${esc(g.name)}</h3>
     <button class="detail-close" onclick="hideDetail()">&#10005;</button>

@@ -33,6 +33,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::Extension;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -13694,6 +13695,7 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
 pub(in crate::server) async fn get_named_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
 ) -> impl IntoResponse {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     // #447/#458: typed LOCAL membership state so a joiner in limbo (local
@@ -13710,6 +13712,28 @@ pub(in crate::server) async fn get_named_group(
             local_join_membership_state(state.as_ref(), &info, &local_agent_hex).await;
         (info, state_label)
     };
+    if !actor.is_durable_owner() {
+        if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
+            return forbidden("rider tokens cannot read named-group details");
+        }
+        if membership_state == "pending_authority_commit" {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "group_id": info.mls_group_id,
+                    "membership_state": "pending_authority_commit",
+                })),
+            );
+        }
+        if membership_state != "active" {
+            return api_error_with_reason(
+                StatusCode::FORBIDDEN,
+                "active local group membership required",
+                "group_membership_required",
+            );
+        }
+    }
     // #447: an operator reading the group is a natural moment to sweep
     // retained owner-cert-pending joins whose evidence may have landed.
     retry_pending_owner_cert_joins(&state, Some(&id)).await;
@@ -13984,11 +14008,25 @@ async fn local_join_membership_state(
 pub(in crate::server) async fn get_named_group_members(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
+    if !actor.is_durable_owner() {
+        if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
+            return forbidden("rider tokens cannot read named-group members");
+        }
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+        if local_join_membership_state(state.as_ref(), info, &local_agent_hex).await != "active" {
+            return api_error_with_reason(
+                StatusCode::FORBIDDEN,
+                "active local group membership required",
+                "group_membership_required",
+            );
+        }
+    }
     let members = named_group_member_values(info);
     (
         StatusCode::OK,
@@ -34724,6 +34762,7 @@ pub(in crate::server) mod tests {
     mod hs_r3_invite_auth;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
+    mod issue821_read_auth;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     mod wp_c;
@@ -42641,9 +42680,13 @@ pub(in crate::server) mod tests {
         );
 
         let (get_status, get_body) = response_json(
-            get_named_group(State(Arc::clone(&state)), Path(tombstone_id.clone()))
-                .await
-                .into_response(),
+            get_named_group(
+                State(Arc::clone(&state)),
+                Path(tombstone_id.clone()),
+                Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            )
+            .await
+            .into_response(),
         )
         .await?;
         assert_eq!(get_status, StatusCode::OK);
