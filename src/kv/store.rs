@@ -651,7 +651,16 @@ pub fn make_owner_checkpoint(params: OwnerCheckpointParams<'_>) -> Result<OwnerC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeOutcome {
     Applied,
-    Rejected,
+    SubsumedCheckpoint,
+    Rejected(MergeRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeRejection {
+    GroupSignedAuthority,
+    UnauthorizedWriter,
+    AnonymousWriter,
+    AmbiguousDelta,
 }
 
 /// A replicated key-value store using CRDTs with access control.
@@ -2225,7 +2234,7 @@ impl KvStore {
                 "rejected group-signed delta carrying non-content authority for store {}",
                 self.id
             );
-            return Ok(MergeOutcome::Rejected);
+            return Ok(MergeOutcome::Rejected(MergeRejection::GroupSignedAuthority));
         }
         // Authoritative full-snapshot checkpoint adoption (cold-recovery path):
         // if the checkpoint's content root matches the relayed entry set, adopt
@@ -2254,7 +2263,7 @@ impl KvStore {
                     self.highest_checkpoint_seq,
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected);
+                return Ok(MergeOutcome::SubsumedCheckpoint);
             }
         }
         // Access control: reject unauthorized writes
@@ -2265,7 +2274,7 @@ impl KvStore {
                     hex::encode(writer_id.as_bytes()),
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected); // Silent rejection — don't propagate errors for spam
+                return Ok(MergeOutcome::Rejected(MergeRejection::UnauthorizedWriter));
             }
         } else {
             // No writer identity applies nothing under ANY policy: the
@@ -2275,7 +2284,7 @@ impl KvStore {
             // sync is wired — it is no longer an anonymous-merge escape
             // hatch.
             tracing::warn!("rejected anonymous delta for store {}", self.id);
-            return Ok(MergeOutcome::Rejected);
+            return Ok(MergeOutcome::Rejected(MergeRejection::AnonymousWriter));
         }
 
         // Canonical-map gate, ALL policies: a delta carrying the same key in
@@ -2292,7 +2301,7 @@ impl KvStore {
                     "rejected ambiguous delta for store {}: key {key:?} appears in both added and updated",
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected);
+                return Ok(MergeOutcome::Rejected(MergeRejection::AmbiguousDelta));
             }
         }
 
@@ -6896,6 +6905,58 @@ mod tests {
             Some(b"x".to_vec()),
             "A keeps its observed history"
         );
+    }
+
+    #[test]
+    fn checkpoint_subsumption_is_distinct_from_admission_rejection() {
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/checkpoint-subsumption-outcome";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+        let stale = forged_snapshot(id, owner, &kp, topic, &[("deleted", b"old")], 1);
+        let current = forged_snapshot(id, owner, &kp, topic, &[("live", b"new")], 2);
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&current, peer(9), Some(&agent(9)))
+                .expect("current checkpoint"),
+            MergeOutcome::Applied
+        );
+        let version = replica.current_version();
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&stale, peer(1), Some(&owner))
+                .expect("stale checkpoint"),
+            MergeOutcome::SubsumedCheckpoint
+        );
+        assert_eq!(replica.current_version(), version);
+        assert!(
+            replica.get("deleted").is_none(),
+            "stale echo cannot resurrect a key"
+        );
+        assert!(replica.get("live").is_some());
+
+        let unauthorized = KvStoreDelta::new(0);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&unauthorized, peer(9), Some(&agent(9)))
+                .expect("unauthorized merge"),
+            MergeOutcome::Rejected(MergeRejection::UnauthorizedWriter)
+        );
+        let mut ambiguous = KvStoreDelta::new(0);
+        let entry = KvEntry::new("ambiguous".into(), b"value".to_vec(), "text/plain".into());
+        ambiguous
+            .added
+            .insert("ambiguous".into(), (entry.clone(), (peer(1), 1)));
+        ambiguous.updated.insert("ambiguous".into(), entry);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&ambiguous, peer(1), Some(&owner))
+                .expect("ambiguous merge"),
+            MergeOutcome::Rejected(MergeRejection::AmbiguousDelta)
+        );
+        assert!(replica.get("ambiguous").is_none());
     }
 
     #[test]

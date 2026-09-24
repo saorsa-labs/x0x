@@ -91,7 +91,12 @@ struct RetainedHistoryPublish<'a> {
 /// Delays between state-request retries for a first-time joiner whose
 /// store is still empty. Spread out so a slow mesh (peer discovery,
 /// subscription propagation) still converges without flooding.
-const STATE_REQUEST_RETRY_SECS: [u64; 4] = [1, 5, 15, 30];
+const STATE_REQUEST_RETRY_SECS: [u64; 8] = [1, 5, 15, 15, 15, 15, 15, 15];
+
+/// One holder can answer before the owner or another complete holder is
+/// discovered. Preserve the original four-request discovery window before
+/// accepting any served marker or digest as convergence evidence.
+const STATE_REQUEST_DISCOVERY_MIN_SLOTS: usize = 4;
 
 /// First persistent-tail delay after the front-loaded schedule exhausts.
 const STATE_REQUEST_TAIL_START_SECS: u64 = 30;
@@ -102,7 +107,9 @@ const STATE_REQUEST_TAIL_START_SECS: u64 = 30;
 const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
 
 /// The complete state-request delay schedule: the front-loaded burst, then
-/// an infinite exponential tail (30s doubling to a 300s ceiling).
+/// an infinite exponential tail (30s doubling to a 300s ceiling). The
+/// 15-second retries span the first 96 seconds, matching the responder's
+/// cooldown so one missed or incomplete encrypted serve gets another slot.
 ///
 /// Infinite BY DESIGN (issue #238): the owner answers state requests only
 /// reactively and never volunteers state to late subscribers, so a finite
@@ -502,7 +509,12 @@ impl RequestSlotScheduler {
             if stopped.load(std::sync::atomic::Ordering::Relaxed) {
                 return false;
             }
-            if self.attempt >= STATE_REQUEST_RETRY_SECS.len() {
+            // An empty holder's v2 digest is universal; a matching non-empty
+            // digest can still describe only partial state. Either can arrive
+            // before the owner or a complete holder is discovered. Keep the
+            // original four requests, then stop promptly when local state
+            // matches the strongest available evidence.
+            if self.attempt >= STATE_REQUEST_DISCOVERY_MIN_SLOTS {
                 let Some(store) = store.upgrade() else {
                     return false;
                 };
@@ -1358,6 +1370,7 @@ impl KvStoreSync {
             None
         };
         let mut target = store.write().await;
+        let mut merge_applied = true;
         let result = match mutation.kind {
             KvMutationKind::Delta => bincode::deserialize::<KvStoreDelta>(mutation_payload)
                 .map_err(|e| KvError::Gossip(format!("bad signed delta: {e}")))
@@ -1366,9 +1379,15 @@ impl KvStoreSync {
                         .merge_delta_with_outcome(&delta, sender_peer, Some(&mutation.author_id))
                         .and_then(|outcome| match outcome {
                             crate::kv::store::MergeOutcome::Applied => Ok(()),
-                            crate::kv::store::MergeOutcome::Rejected => Err(KvError::Merge(
-                                "group-signed delta rejected by content admission".to_string(),
-                            )),
+                            crate::kv::store::MergeOutcome::SubsumedCheckpoint => {
+                                merge_applied = false;
+                                Ok(())
+                            }
+                            crate::kv::store::MergeOutcome::Rejected(reason) => {
+                                Err(KvError::Merge(format!(
+                                    "group-signed delta rejected by content admission: {reason:?}"
+                                )))
+                            }
                         })
                 }),
             KvMutationKind::RetainedState => {
@@ -1405,6 +1424,15 @@ impl KvStoreSync {
             )),
         };
         match result {
+            Ok(()) if !merge_applied => {
+                trace_group_signed_record(
+                    "receive_checkpoint_subsumed",
+                    record_kind,
+                    store_id,
+                    payload,
+                );
+                false
+            }
             Ok(()) => {
                 trace_group_signed_record("receive_applied", record_kind, store_id, payload);
                 true
@@ -1452,7 +1480,8 @@ impl KvStoreSync {
             Ok(m) => m,
             Err(e) => {
                 // Reason is safe to log: never contains decrypted content.
-                tracing::warn!("rejected sealed record for store {store_id}: {e}");
+                tracing::warn!(store_id = %store_id, sender_peer = %sender_peer, reason = %e,
+                    "rejected sealed record before author verification");
                 return false;
             }
         };
@@ -1460,17 +1489,15 @@ impl KvStoreSync {
             mutation.kind,
             KvMutationKind::Delta | KvMutationKind::FullState | KvMutationKind::RetainedState
         ) {
-            tracing::warn!(
-                "rejected sealed main-topic record for store {store_id}: wrong kind {:?}",
-                mutation.kind
-            );
+            tracing::warn!(store_id = %store_id, sender_peer = %sender_peer,
+                verified_author = %hex::encode(mutation.author_id.as_bytes()),
+                kind = ?mutation.kind, "rejected sealed main-topic record with wrong kind");
             return false;
         }
         if !ctx.is_authorized_writer(&mutation.author_id) {
-            tracing::warn!(
-                "rejected sealed record for store {store_id}: author {} is not a current authorized writer",
-                hex::encode(mutation.author_id.as_bytes())
-            );
+            tracing::warn!(store_id = %store_id, sender_peer = %sender_peer,
+                verified_author = %hex::encode(mutation.author_id.as_bytes()),
+                "rejected sealed record: author is not a current authorized writer");
             return false;
         }
         let retained_image = if mutation.kind == KvMutationKind::RetainedState {
@@ -1486,9 +1513,19 @@ impl KvStoreSync {
                 pages,
             ) {
                 Ok(Some(image)) => Some(image),
-                Ok(None) => return false,
+                Ok(None) => {
+                    tracing::debug!(
+                        store_id = %store_id,
+                        sender_peer = %sender_peer,
+                        verified_author = %hex::encode(mutation.author_id.as_bytes()),
+                        "buffering incomplete retained encrypted page"
+                    );
+                    return false;
+                }
                 Err(error) => {
-                    tracing::warn!(%error, "rejected retained encrypted page");
+                    tracing::warn!(store_id = %store_id, sender_peer = %sender_peer,
+                        verified_author = %hex::encode(mutation.author_id.as_bytes()),
+                        reason = %error, "rejected retained encrypted page");
                     return false;
                 }
             }
@@ -1496,6 +1533,7 @@ impl KvStoreSync {
             None
         };
         let mut s = store.write().await;
+        let mut merge_outcome = MergeOutcome::Applied;
         let result = verified_generation
             .ok_or_else(|| {
                 KvError::Unauthorized("encrypted context lacks authorization version".to_string())
@@ -1550,26 +1588,44 @@ impl KvStoreSync {
                                         &mutation.author_id,
                                         ctx,
                                     )
-                                    .and_then(|outcome| {
-                                        match outcome {
-                                            crate::kv::store::MergeOutcome::Applied => Ok(()),
-                                            crate::kv::store::MergeOutcome::Rejected => {
-                                                Err(KvError::Merge(
-                                                    "encrypted delta rejected by content admission"
-                                                        .to_string(),
-                                                ))
-                                            }
-                                        }
-                                    })
+                                    .map(|outcome| merge_outcome = outcome)
                                 })
                         }
                     },
                 )
             });
         match result {
-            Ok(()) => true,
+            Ok(()) if merge_outcome == MergeOutcome::Applied => true,
+            Ok(()) if merge_outcome == MergeOutcome::SubsumedCheckpoint => {
+                tracing::debug!(
+                    store_id = %store_id,
+                    sender_peer = %sender_peer,
+                    verified_author = %hex::encode(mutation.author_id.as_bytes()),
+                    "ignored checkpoint-subsumed sealed delta"
+                );
+                false
+            }
+            Ok(()) => {
+                let MergeOutcome::Rejected(reason) = merge_outcome else {
+                    return false;
+                };
+                tracing::warn!(
+                    store_id = %store_id,
+                    sender_peer = %sender_peer,
+                    verified_author = %hex::encode(mutation.author_id.as_bytes()),
+                    ?reason,
+                    "rejected sealed delta by content admission"
+                );
+                false
+            }
             Err(e) => {
-                tracing::warn!("failed to merge sealed delta for store {store_id}: {e}");
+                tracing::warn!(
+                    store_id = %store_id,
+                    sender_peer = %sender_peer,
+                    verified_author = %hex::encode(mutation.author_id.as_bytes()),
+                    reason = %e,
+                    "failed to merge sealed delta"
+                );
                 false
             }
         }
@@ -2162,7 +2218,9 @@ impl KvStoreSync {
                             // The gossip V2 wire format includes a verified AgentId.
                             let writer = msg.sender.as_ref();
                             match s.merge_delta_with_outcome(&delta, peer_id, writer) {
-                                Ok(MergeOutcome::Rejected) => false,
+                                Ok(
+                                    MergeOutcome::Rejected(_) | MergeOutcome::SubsumedCheckpoint,
+                                ) => false,
                                 Ok(MergeOutcome::Applied) => {
                                     // Digest-verified full-replace adopt
                                     // (issue #240, checkpoint-less deletion
@@ -2907,10 +2965,10 @@ impl KvStoreSync {
         // store and has no other way to learn keys written before it
         // subscribed (the gossip message cache only replays ~60s, and
         // pruning on busy topics removes older deltas entirely). Ask
-        // holders to republish. The full FRONT schedule always runs — a
-        // partial state arriving early (for example fresh keys via cache
-        // replay) must not stop the request for the complete historical
-        // state. After the front schedule, an infinite backoff tail keeps
+        // holders to republish. The requester stops only after verified
+        // served evidence matches local state; a partial cache replay cannot
+        // satisfy that gate. After the cold retry window, an infinite
+        // backoff tail keeps
         // asking while the store is STILL EMPTY (issue #238): holders
         // answer only reactively, so a replica whose requests all fired
         // while the owner was offline would otherwise stay a zombie
@@ -4519,6 +4577,7 @@ mod tests {
             )
             .expect("in-memory store"),
         ));
+        let empty_digest = store.read().await.served_digest();
         let weak_store = Arc::downgrade(&store);
         let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence {
             authorization: Some(old),
@@ -4553,25 +4612,38 @@ mod tests {
             }
         });
 
-        // The test calls the production scheduler that gates the real
-        // signed publication. Four front slots occur before convergence is
-        // checked; no NetworkNode or OS socket is constructed here.
-        for _ in 0..4 {
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(45), received.recv())
-                    .await
-                    .expect("front request timeout"),
-                Some(2)
-            );
-        }
+        // The first request is necessary to discover an owner. A matching
+        // empty v2 digest still leaves the original four-request discovery
+        // window open for another holder with content.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), received.recv())
+                .await
+                .expect("first request timeout"),
+            Some(2)
+        );
         evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .saw_owner_empty = true;
-        tokio::time::sleep(Duration::from_secs(40)).await;
+            .digests
+            .insert(
+                peer(1),
+                ServedState {
+                    digest: empty_digest,
+                    entry_count: 0,
+                },
+            );
+        for _ in 1..STATE_REQUEST_DISCOVERY_MIN_SLOTS {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(25), received.recv())
+                    .await
+                    .expect("discovery request timeout"),
+                Some(2)
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(25)).await;
         tokio::task::yield_now().await;
         assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
-        tokio::time::sleep(Duration::from_secs(40)).await;
+        tokio::time::sleep(Duration::from_secs(25)).await;
         tokio::task::yield_now().await;
         assert!(received.try_recv().is_err(), "no wire while unchanged");
 
@@ -4590,19 +4662,26 @@ mod tests {
         );
         assert!(received.try_recv().is_err());
         assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
-        for _ in 0..3 {
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(45), received.recv())
-                    .await
-                    .expect("recovery front request timeout"),
-                Some(3)
-            );
-        }
         evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .saw_owner_empty = true;
-        tokio::time::sleep(Duration::from_secs(40)).await;
+            .digests
+            .insert(
+                peer(1),
+                ServedState {
+                    digest: empty_digest,
+                    entry_count: 0,
+                },
+            );
+        for _ in 1..STATE_REQUEST_DISCOVERY_MIN_SLOTS {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(25), received.recv())
+                    .await
+                    .expect("recovery discovery request timeout"),
+                Some(3)
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(25)).await;
         tokio::task::yield_now().await;
         assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
         assert!(received.try_recv().is_err(), "re-converged and parked");
@@ -4616,6 +4695,135 @@ mod tests {
             .expect("silenced requester reaped");
         assert!(received.try_recv().is_err());
         cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_slots_keep_four_request_discovery_window_for_v1_and_v2() {
+        assert_eq!(STATE_REQUEST_DISCOVERY_MIN_SLOTS, 4);
+        let mut partial = KvStore::new(
+            store_id(94),
+            "Wiki".to_string(),
+            agent(1),
+            AccessPolicy::Signed,
+        )
+        .expect("local store");
+        partial
+            .put(
+                "cached-only".to_string(),
+                b"partial".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("partial cache replay");
+        let store = Arc::new(RwLock::new(partial));
+        let weak_store = Arc::downgrade(&store);
+        let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        let active = std::sync::atomic::AtomicBool::new(true);
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let bootstrap_cancel = tokio_util::sync::CancellationToken::new();
+        let context = || RequestSlotContext {
+            cancel: &cancel,
+            bootstrap_cancel: &bootstrap_cancel,
+            stopped: &stopped,
+            refresh: None,
+            evidence: &evidence,
+            store: &weak_store,
+            bootstrap_active: &active,
+        };
+
+        let mut legacy = RequestSlotScheduler::new(None);
+        assert!(legacy.next_slot(context()).await, "initial request");
+        evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .saw_nonempty = true;
+        for slot in 1..STATE_REQUEST_DISCOVERY_MIN_SLOTS {
+            assert!(
+                legacy.next_slot(context()).await,
+                "v1 marker and partial local state must not stop request {slot}"
+            );
+        }
+        assert!(
+            !legacy.next_slot(context()).await,
+            "v1 fallback can retire only after the original four requests"
+        );
+
+        *evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ServedEvidence::default();
+        let mut matching_partial_v2 = RequestSlotScheduler::new(None);
+        assert!(
+            matching_partial_v2.next_slot(context()).await,
+            "initial v2 request"
+        );
+        let digest = store.read().await.served_digest();
+        evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .digests
+            .insert(
+                peer(1),
+                ServedState {
+                    digest,
+                    entry_count: 1,
+                },
+            );
+        for slot in 1..STATE_REQUEST_DISCOVERY_MIN_SLOTS {
+            assert!(
+                matching_partial_v2.next_slot(context()).await,
+                "partial holder's matching v2 digest cannot stop request {slot}"
+            );
+        }
+        assert!(
+            !matching_partial_v2.next_slot(context()).await,
+            "matching v2 digest stops before request five"
+        );
+
+        let empty_store = Arc::new(RwLock::new(
+            KvStore::new(
+                store_id(95),
+                "Empty".to_string(),
+                agent(1),
+                AccessPolicy::Signed,
+            )
+            .expect("empty local store"),
+        ));
+        let empty_digest = empty_store.read().await.served_digest();
+        let empty_weak_store = Arc::downgrade(&empty_store);
+        let empty_evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        let empty_context = || RequestSlotContext {
+            cancel: &cancel,
+            bootstrap_cancel: &bootstrap_cancel,
+            stopped: &stopped,
+            refresh: None,
+            evidence: &empty_evidence,
+            store: &empty_weak_store,
+            bootstrap_active: &active,
+        };
+        let mut matching_empty_v2 = RequestSlotScheduler::new(None);
+        assert!(matching_empty_v2.next_slot(empty_context()).await);
+        empty_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .digests
+            .insert(
+                peer(3),
+                ServedState {
+                    digest: empty_digest,
+                    entry_count: 0,
+                },
+            );
+        for slot in 1..STATE_REQUEST_DISCOVERY_MIN_SLOTS {
+            assert!(
+                matching_empty_v2.next_slot(empty_context()).await,
+                "empty non-owner's v2 digest cannot stop request {slot}"
+            );
+        }
+        assert!(
+            !matching_empty_v2.next_slot(empty_context()).await,
+            "matching empty v2 digest stops before request five"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -8041,9 +8249,22 @@ mod tests {
         for (attempt, delay) in state_request_delays().take(16).enumerate() {
             assert_eq!(state_request_delay_at(attempt), delay);
         }
-        let front: Vec<u64> = state_request_delays().take(4).collect();
-        assert_eq!(front, STATE_REQUEST_RETRY_SECS, "front burst unchanged");
-        let tail: Vec<u64> = state_request_delays().skip(4).take(8).collect();
+        let front: Vec<u64> = state_request_delays()
+            .take(STATE_REQUEST_RETRY_SECS.len())
+            .collect();
+        assert_eq!(front, STATE_REQUEST_RETRY_SECS);
+        assert_eq!(front.iter().sum::<u64>(), 96);
+        assert!(
+            front
+                .iter()
+                .skip(2)
+                .all(|delay| *delay >= STATE_RESPONSE_COOLDOWN_SECS),
+            "cold retries cannot demand more full responses than the responder cooldown"
+        );
+        let tail: Vec<u64> = state_request_delays()
+            .skip(STATE_REQUEST_RETRY_SECS.len())
+            .take(8)
+            .collect();
         assert_eq!(
             tail,
             [30, 60, 120, 240, 300, 300, 300, 300],
