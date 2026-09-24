@@ -108,8 +108,8 @@ const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
 
 /// The complete state-request delay schedule: the front-loaded burst, then
 /// an infinite exponential tail (30s doubling to a 300s ceiling). The
-/// 15-second retries span the first 96 seconds, matching the responder's
-/// cooldown so one missed or incomplete encrypted serve gets another slot.
+/// 15-second retries nominally span the first 96 seconds. Their jittered waits are
+/// clamped to the responder cooldown so a suppressed request gets another slot.
 ///
 /// Infinite BY DESIGN (issue #238): the owner answers state requests only
 /// reactively and never volunteers state to late subscribers, so a finite
@@ -192,6 +192,15 @@ fn treekem_page_authorization(binding: [u8; 32], epoch: u64) -> [u8; 32] {
 fn jittered_secs(secs: u64) -> std::time::Duration {
     let factor = 0.8 + rand::random::<f64>() * 0.4;
     std::time::Duration::from_secs_f64(secs as f64 * factor)
+}
+
+fn state_request_wait(attempt: usize) -> std::time::Duration {
+    let wait = jittered_secs(state_request_delay_at(attempt));
+    if attempt >= 2 {
+        wait.max(std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS))
+    } else {
+        wait
+    }
 }
 
 /// Message exchanged on the state-sync side topic.
@@ -377,6 +386,9 @@ fn state_request_delay_at(attempt: usize) -> u64 {
 /// Returning `true` grants one publication slot; `false` ends the task.
 struct RequestSlotScheduler {
     changes: Option<tokio::sync::watch::Receiver<PublicAuthorizationVersion>>,
+    membership_changes: Option<tokio::sync::watch::Receiver<u64>>,
+    reader: Option<(SharedKvSecureContext, AgentId)>,
+    waiting_for_membership: bool,
     version: Option<PublicAuthorizationVersion>,
     attempt: usize,
     converged: bool,
@@ -401,12 +413,28 @@ impl RequestSlotScheduler {
         refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Self {
             changes,
+            membership_changes: None,
+            reader: None,
+            waiting_for_membership: false,
             version,
             attempt: 0,
             converged: false,
             initialized: false,
             refresh_tick,
         }
+    }
+
+    fn with_encrypted_reader(mut self, ctx: SharedKvSecureContext, reader: AgentId) -> Self {
+        self.membership_changes = ctx.encrypted_authorization_changes();
+        self.reader = Some((ctx, reader));
+        self
+    }
+
+    fn request_unavailable(&mut self) {
+        self.waiting_for_membership = true;
+        // A denied slot is not a broadcast. Continue checking membership at
+        // the bounded front cadence instead of drifting into the 300s tail.
+        self.attempt = self.attempt.min(2);
     }
 
     fn observe_change(&mut self, evidence: &Arc<std::sync::Mutex<ServedEvidence>>) -> Option<bool> {
@@ -473,7 +501,7 @@ impl RequestSlotScheduler {
                     }
                 }
             }
-            let wait = tokio::time::sleep(jittered_secs(state_request_delay_at(self.attempt)));
+            let wait = tokio::time::sleep(state_request_wait(self.attempt));
             tokio::pin!(wait);
             loop {
                 tokio::select! {
@@ -491,6 +519,26 @@ impl RequestSlotScheduler {
                             Some(true) => continue 'schedule,
                             Some(false) => {},
                             None => return false,
+                        }
+                    },
+                    changed = async {
+                        match self.membership_changes.as_mut() {
+                            Some(changes) => changes.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if changed.is_err() {
+                            self.membership_changes = None;
+                        } else if self.waiting_for_membership
+                            && self.reader.as_ref().is_some_and(|(ctx, reader)|
+                                ctx.is_authorized_reader(reader))
+                        {
+                            // Only a previously denied requester gets the
+                            // immediate slot. Ordinary epoch changes add no
+                            // traffic, and subsequent retries use cooldown.
+                            self.waiting_for_membership = false;
+                            self.attempt = 2;
+                            break;
                         }
                     },
                     _ = self.refresh_tick.tick(), if self.changes.is_some() => {
@@ -3011,6 +3059,14 @@ impl KvStoreSync {
                 // full-replace adopt must never fire outside bootstrap.
                 let _guard = BootstrapGuard(Arc::clone(&requester_bootstrap_active));
                 let mut schedule = RequestSlotScheduler::new(requester_public_changes);
+                if requester_is_encrypted {
+                    if let (Some(ctx), Some(signing)) =
+                        (requester_secure.as_ref(), requester_signing.as_ref())
+                    {
+                        schedule =
+                            schedule.with_encrypted_reader(Arc::clone(ctx), signing.agent_id);
+                    }
+                }
                 while schedule
                     .next_slot(RequestSlotContext {
                         cancel: &requester_cancel,
@@ -3067,8 +3123,18 @@ impl KvStoreSync {
                         bincode::serialize(&request).ok()
                     };
                     let Some(serialized) = serialized else {
-                        return;
+                        // The store can open before its group membership is
+                        // learned. A failed seal uses this slot, but the next
+                        // slot must retry against the refreshed context.
+                        tracing::debug!(
+                            store_id = %requester_store_id,
+                            requester = %local_peer_id,
+                            "state request unavailable; waiting for reader authorization or sealing context"
+                        );
+                        schedule.request_unavailable();
+                        continue;
                     };
+                    schedule.waiting_for_membership = false;
                     let wire = bytes::Bytes::from(serialized);
                     if requester_secure.is_some()
                         && requester_treekem.is_none()
@@ -8175,6 +8241,154 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn encrypted_bootstrap_recovers_when_membership_arrives_after_open() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let owner_kp = AgentKeypair::generate().expect("owner keypair");
+        let joiner_kp = AgentKeypair::generate().expect("joiner keypair");
+        let owner = owner_kp.agent_id();
+        let joiner = joiner_kp.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[owner]);
+        let owner_ctx = contexts.pop().expect("owner context");
+        let joiner_ctx =
+            Arc::new(GssKvSecureContext::from_group(&group).expect("pre-membership group context"));
+        assert!(!joiner_ctx.is_active_member(&joiner));
+
+        let topic = "store/enc-late-membership";
+        let owner_sync = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            71,
+            owner,
+            owner,
+            &owner_kp,
+            Arc::clone(&owner_ctx),
+            group_id.clone(),
+            peer(1),
+        )
+        .await;
+        // Seed the holder before starting either subscription. The joiner's
+        // only path to this key is a new sealed state request.
+        owner_sync
+            .write()
+            .await
+            .put(
+                "before-join".to_string(),
+                b"history".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed owner state");
+        owner_sync.start().await.expect("start owner");
+        // The holder serves joiner requests, but must not self-request and
+        // broadcast the key before the joiner's membership arrives.
+        owner_sync.silence_bootstrap();
+        let joiner_sync = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            71,
+            owner,
+            joiner,
+            &joiner_kp,
+            Arc::clone(&joiner_ctx),
+            group_id,
+            peer(2),
+        )
+        .await;
+        joiner_sync.start().await.expect("open joiner store");
+        // The first request slot has fired while sealing is denied.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(joiner_sync.read().await.get("before-join").is_none());
+
+        group.add_member(
+            hex::encode(joiner.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        let _ = group.rotate_shared_secret();
+        owner_ctx.update_from_group(&group);
+        joiner_ctx.update_from_group(&group);
+        assert!(joiner_ctx.is_active_member(&joiner));
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if joiner_sync.read().await.get("before-join").is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok(),
+            "late membership must restart sealed requests and converge within 30 seconds"
+        );
+        joiner_sync.stop().await.expect("stop joiner");
+        owner_sync.stop().await.expect("stop owner");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn encrypted_membership_wakes_pending_request_before_backoff_tail() {
+        let owner = agent(1);
+        let joiner = agent(2);
+        let (mut group, _, _) = encrypted_group(&[owner]);
+        let ctx = Arc::new(GssKvSecureContext::from_group(&group).expect("group context"));
+        let shared: SharedKvSecureContext = ctx.clone();
+        let store = Arc::new(RwLock::new(
+            KvStore::new(
+                store_id(72),
+                "cold".to_string(),
+                owner,
+                AccessPolicy::Signed,
+            )
+            .expect("store"),
+        ));
+        let weak = Arc::downgrade(&store);
+        let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        let active = std::sync::atomic::AtomicBool::new(true);
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let bootstrap_cancel = tokio_util::sync::CancellationToken::new();
+        let mut schedule = RequestSlotScheduler::new(None).with_encrypted_reader(shared, joiner);
+        schedule.attempt = 100;
+        schedule.waiting_for_membership = true;
+
+        let pending = schedule.next_slot(RequestSlotContext {
+            cancel: &cancel,
+            bootstrap_cancel: &bootstrap_cancel,
+            stopped: &stopped,
+            refresh: None,
+            evidence: &evidence,
+            store: &weak,
+            bootstrap_active: &active,
+        });
+        tokio::pin!(pending);
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                pending.as_mut(),
+                cx
+            )))
+            .await,
+            std::task::Poll::Pending
+        ));
+        group.add_member(
+            hex::encode(joiner.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        let _ = group.rotate_shared_secret();
+        ctx.update_from_group(&group);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .expect("membership must wake before the 300s backoff tail"),
+            "a newly authorized reader gets a request slot"
+        );
+    }
+
     // ------------------------------------------------------------------
     // stop(): returns Ok and is idempotent
     // ------------------------------------------------------------------
@@ -8261,6 +8475,15 @@ mod tests {
                 .all(|delay| *delay >= STATE_RESPONSE_COOLDOWN_SECS),
             "cold retries cannot demand more full responses than the responder cooldown"
         );
+        for attempt in 2..STATE_REQUEST_RETRY_SECS.len() + 8 {
+            for _ in 0..100 {
+                assert!(
+                    state_request_wait(attempt)
+                        >= Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS),
+                    "jitter must never shrink a retry below the responder cooldown"
+                );
+            }
+        }
         let tail: Vec<u64> = state_request_delays()
             .skip(STATE_REQUEST_RETRY_SECS.len())
             .take(8)
