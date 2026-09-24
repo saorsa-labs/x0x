@@ -253,6 +253,8 @@ class RunnerInfo:
     node: str
     agent_id: str
     machine_id: str
+    request_id: Optional[str] = None
+    received_at_monotonic: Optional[float] = None
 
 
 @dataclass
@@ -424,11 +426,15 @@ def _enqueue_result_envelope(
     details.setdefault("via_sse", source)
     body["details"] = details
     if kind == "discover_reply" or kind == "runner_ready":
+        received_at_monotonic = time.monotonic()
+        request_id = body.get("request_id")
         bus.discover.put(
             RunnerInfo(
                 node=body.get("node", "?"),
                 agent_id=body.get("agent_id", ""),
                 machine_id=body.get("machine_id", ""),
+                request_id=request_id if isinstance(request_id, str) else None,
+                received_at_monotonic=received_at_monotonic,
             )
         )
     elif kind == "send_result":
@@ -619,10 +625,18 @@ def discover_runners(
     retry_interval = min(republish_every_secs, max(0.1, timeout_secs / 4))
     runner_agent_ids = runner_agent_ids or {}
     direct_attempted = set()
+    announcements: Dict[str, Tuple[str, str, float]] = {}
+
+    def send_direct_discover(node: str, aid: str, command: Dict[str, Any],
+                             budget: float) -> Optional[Dict[str, Any]]:
+        request_id = command["params"]["request_id"]
+        announcements[request_id] = (node, "direct", time.monotonic())
+        return send_command_dm(
+            client, aid, command, log, http_timeout_secs=budget,
+        )
+
     while time.time() < deadline and len(found) < len(expected_nodes):
         if time.time() >= next_republish:
-            request_id = str(uuid.uuid4())
-            cmd = discover_command(anchor_aid, request_id, no_pubsub_after_discover)
             fallback_nodes = []
             direct_targets = []
             for node in dict.fromkeys(expected_nodes):
@@ -660,9 +674,11 @@ def discover_runners(
                 try:
                     futures = {
                         executor.submit(
-                            send_command_dm, client, aid,
-                            dict(cmd, target_node=node), log,
-                            http_timeout_secs=direct_budget,
+                            send_direct_discover, node, aid,
+                            discover_command(
+                                anchor_aid, str(uuid.uuid4()),
+                                no_pubsub_after_discover, target_node=node,
+                            ), direct_budget,
                         ): node
                         for node, aid in direct_targets
                     }
@@ -686,6 +702,8 @@ def discover_runners(
                     # wait for all workers to exit before another cycle.
                     executor.shutdown(wait=True, cancel_futures=True)
             for node in fallback_nodes:
+                request_id = str(uuid.uuid4())
+                announcements[request_id] = (node, "pubsub", time.monotonic())
                 try:
                     publish_discover(
                         client, anchor_aid, request_id,
@@ -704,9 +722,21 @@ def discover_runners(
             continue
         if info.node in expected_nodes and info.node not in found:
             found[info.node] = info
+            announcement = announcements.get(info.request_id or "")
+            channel = "unknown"
+            latency = "unknown"
+            if (announcement is not None and announcement[0] == info.node
+                    and info.received_at_monotonic is not None):
+                elapsed_ms = (info.received_at_monotonic - announcement[2]) * 1000
+                if elapsed_ms >= 0:
+                    channel = announcement[1]
+                    latency = f"{elapsed_ms:.3f}"
             log.info(
-                "  ✓ %-12s agent=%s… machine=%s…",
+                "  ✓ node=%s channel=%s announce_reply_latency_ms=%s "
+                "agent=%s… machine=%s…",
                 info.node,
+                channel,
+                latency,
                 info.agent_id[:16],
                 info.machine_id[:16],
             )

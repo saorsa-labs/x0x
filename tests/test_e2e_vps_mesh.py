@@ -153,6 +153,117 @@ class E2eVpsMeshTests(unittest.TestCase):
         self.assertEqual("sfo", fallback_cmd["target_node"])
         self.assertEqual(direct_cmd["anchor_aid"], fallback_cmd["anchor_aid"])
 
+    def test_discovery_attributes_reply_to_fallback_after_direct_ack(self):
+        bus = self.mesh.ResultsBus()
+
+        class ReplyOnFallback(FakeClient):
+            def publish(self, topic, payload):
+                super().publish(topic, payload)
+                command = json.loads(payload)
+                self_reply = {
+                    "kind": "discover_reply",
+                    "node": "sfo",
+                    "agent_id": "b" * 64,
+                    "machine_id": "machine-sfo",
+                    "request_id": command["params"]["request_id"],
+                }
+                self_mesh._enqueue_result_envelope(self_reply, bus, "direct")
+
+        self_mesh = self.mesh
+        client = ReplyOnFallback()
+        with self.assertLogs("discovery-attribution", level=logging.INFO) as logs:
+            found = self.mesh.discover_runners(
+                client, bus, ["sfo"], "a" * 64, 1,
+                logging.getLogger("discovery-attribution"),
+                republish_every_secs=0.05,
+                runner_agent_ids={"sfo": "c" * 64},
+            )
+        direct_wire = client.direct_sent[0][1]
+        direct_command = json.loads(base64.b64decode(
+            direct_wire[len(self.mesh.PREFIX_CMD):]
+        ))
+        fallback_command = json.loads(client.published[0][1])
+        self.assertNotEqual(
+            direct_command["params"]["request_id"],
+            fallback_command["params"]["request_id"],
+        )
+        self.assertEqual(
+            fallback_command["params"]["request_id"],
+            found["sfo"].request_id,
+        )
+        self.assertIn("node=sfo channel=pubsub", "\n".join(logs.output))
+        self.assertRegex("\n".join(logs.output), r"announce_reply_latency_ms=[0-9]+")
+
+    def test_discovery_direct_replies_have_unique_ids_and_positive_latency(self):
+        bus = self.mesh.ResultsBus()
+
+        class ReplyOnDirect(FakeClient):
+            def direct_send(self, target_aid, payload, **kwargs):
+                result = super().direct_send(target_aid, payload, **kwargs)
+                command = json.loads(base64.b64decode(
+                    payload[len(self_mesh.PREFIX_CMD):]
+                ))
+                time.sleep(0.002)
+                self_mesh._enqueue_result_envelope({
+                    "kind": "discover_reply",
+                    "node": command["target_node"],
+                    "agent_id": target_aid,
+                    "machine_id": "machine-" + command["target_node"],
+                    "request_id": command["params"]["request_id"],
+                }, bus, "direct")
+                return result
+
+        self_mesh = self.mesh
+        client = ReplyOnDirect()
+        with self.assertLogs("discovery-direct-latency", level=logging.INFO) as logs:
+            found = self.mesh.discover_runners(
+                client, bus, ["sfo", "sydney"], "a" * 64, 1,
+                logging.getLogger("discovery-direct-latency"),
+                runner_agent_ids={"sfo": "b" * 64, "sydney": "c" * 64},
+            )
+        ids = [info.request_id for info in found.values()]
+        self.assertEqual(2, len(set(ids)))
+        self.assertEqual(2, len(client.direct_sent))
+        matched = [line for line in logs.output if "channel=direct" in line]
+        self.assertEqual(2, len(matched))
+        for line in matched:
+            self.assertRegex(line, r"announce_reply_latency_ms=[1-9][0-9]*")
+
+    def test_unsolicited_runner_ready_has_unknown_channel_and_latency(self):
+        bus = self.mesh.ResultsBus()
+
+        class UnsolicitedReady(FakeClient):
+            def publish(self, topic, payload):
+                super().publish(topic, payload)
+                self_mesh._enqueue_result_envelope({
+                    "kind": "runner_ready",
+                    "node": "sfo",
+                    "agent_id": "b" * 64,
+                    "machine_id": "machine-sfo",
+                }, bus, "pubsub")
+
+        self_mesh = self.mesh
+        with self.assertLogs("discovery-unsolicited", level=logging.INFO) as logs:
+            self.mesh.discover_runners(
+                UnsolicitedReady(), bus, ["sfo"], "a" * 64, 1,
+                logging.getLogger("discovery-unsolicited"),
+            )
+        self.assertIn(
+            "node=sfo channel=unknown announce_reply_latency_ms=unknown",
+            "\n".join(logs.output),
+        )
+
+    def test_malformed_discover_request_id_cannot_break_attribution(self):
+        bus = self.mesh.ResultsBus()
+        self.mesh._enqueue_result_envelope({
+            "kind": "discover_reply",
+            "node": "sfo",
+            "agent_id": "b" * 64,
+            "machine_id": "machine-sfo",
+            "request_id": {"unhashable": True},
+        }, bus, "direct")
+        self.assertIsNone(bus.discover.get_nowait().request_id)
+
     def test_slow_direct_sends_leave_time_for_fallback_and_finish_workers(self):
         nodes = ["sfo", "helsinki", "nuremberg", "singapore", "sydney"]
         aids = {node: format(index + 1, "x") * 64
