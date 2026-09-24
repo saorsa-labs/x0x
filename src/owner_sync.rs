@@ -577,6 +577,27 @@ pub enum SyncError {
     Poisoned(String),
 }
 
+impl SyncError {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::MalformedFrame(_) => "malformed_frame",
+            Self::ProtocolVersion { .. } => "protocol_version",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::NotEnrolled { .. } => "not_enrolled",
+            Self::ChallengeFailed(_) => "challenge_failed",
+            Self::SessionTimeout => "session_timeout",
+            Self::SelfSync => "self_sync",
+            Self::BadSignature(_) => "bad_signature",
+            Self::KindMismatch => "kind_mismatch",
+            Self::UnknownKind { .. } => "unknown_kind",
+            Self::StoreLimit(_) => "store_limit",
+            Self::TooManyRecords(_) => "too_many_records",
+            Self::Poisoned(_) => "poisoned",
+        }
+    }
+}
+
 impl std::fmt::Display for SyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1815,6 +1836,10 @@ where
     summary.shipped = to_ship.len();
     write_paged_records(send, &to_ship).await?;
     write_frame(send, &SyncFrame::Done).await?;
+    // Done ends the application frames; FIN ends the transport send half.
+    // An unfinished ant-quic SendStream resets on drop, so the peer can
+    // otherwise observe a reset after an otherwise successful exchange.
+    send.shutdown().await?;
 
     // Receive the peer's paged records (terminated by their Done or an
     // Abort); verify EVERY record before returning — one forgery aborts
@@ -2303,6 +2328,7 @@ impl OwnerSyncService {
                 tracing::warn!(
                     target: "x0x::owner_sync",
                     machine = %hex::encode(peer.0),
+                    error_class = e.class(),
                     error = %e,
                     "Tier-1 sync session failed (fail closed)"
                 );
@@ -2311,16 +2337,21 @@ impl OwnerSyncService {
         }
     }
 
-    /// Dial `machine` and run one session as the initiator. Errors are
-    /// strings by design: dial outcomes are logged, never fatal to the pass.
-    async fn dial_and_sync(&self, machine: &MachineId) -> Result<SessionSummary, String> {
-        let owner_kp = self.owner_kp().ok_or_else(|| "no owner key".to_string())?;
+    /// Dial `machine` and run one session as the initiator. Errors retain a
+    /// stable class for the pass log; a failed dial never aborts the pass.
+    async fn dial_and_sync(
+        &self,
+        machine: &MachineId,
+    ) -> Result<SessionSummary, (&'static str, String)> {
+        let owner_kp = self
+            .owner_kp()
+            .ok_or_else(|| ("no_owner_key", "no owner key".to_string()))?;
         let owner_id = owner_kp.user_id();
         let local_machine = self.agent.machine_id();
         if !self.store.is_enrolled(machine, &owner_id).await {
-            return Err(format!(
-                "machine {} is not enrolled",
-                hex::encode(machine.0)
+            return Err((
+                "not_enrolled",
+                format!("machine {} is not enrolled", hex::encode(machine.0)),
             ));
         }
         // Resolve the deterministic first agent on the target machine —
@@ -2329,17 +2360,17 @@ impl OwnerSyncService {
             .agent
             .discovered_agents()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| ("discovery", e.to_string()))?
             .into_iter()
             .filter(|d| d.machine_id == *machine)
             .min_by_key(|d| d.agent_id.as_bytes().to_vec())
-            .ok_or_else(|| "machine not in discovery cache".to_string())?
+            .ok_or_else(|| ("discovery", "machine not in discovery cache".to_string()))?
             .agent_id;
         let stream = self
             .agent
             .open_peer_stream(&target_agent, crate::streams::StreamProtocol::SyncV1)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ("open_stream", e.to_string()))?;
         let peer = stream.peer();
         let (mut send, mut recv) = stream.into_split();
         let _permit = self
@@ -2347,7 +2378,7 @@ impl OwnerSyncService {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ("session_limit", e.to_string()))?;
         let result = run_sync_session(
             &mut send,
             &mut recv,
@@ -2359,7 +2390,7 @@ impl OwnerSyncService {
         )
         .await;
         self.store.set_session_status(&peer, result.is_ok()).await;
-        result.map_err(|e| e.to_string())
+        result.map_err(|e| (e.class(), e.to_string()))
     }
 
     /// #824: wait for every in-flight owner-sync session to finish and hold
@@ -2401,12 +2432,13 @@ impl OwnerSyncService {
             if !self.store.is_enrolled(&machine, &owner).await {
                 continue;
             }
-            if let Err(e) = self.dial_and_sync(&machine).await {
-                tracing::debug!(
+            if let Err((error_class, error)) = self.dial_and_sync(&machine).await {
+                tracing::warn!(
                     target: "x0x::owner_sync",
                     machine = %hex::encode(machine.0),
-                    error = %e,
-                    "Tier-1 dial skipped/failed until next pass"
+                    error_class,
+                    error = %error,
+                    "Tier-1 dial or sync failed until next pass"
                 );
             }
         }
