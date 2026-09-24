@@ -1617,6 +1617,18 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// share ONLY when this sub-signature verifies.
         #[serde(default)]
         kem_signature_b64: Option<String>,
+        /// #842: the joiner's OWN `AgentCertificate` (base64 bincode),
+        /// carried so the authority can admit an OwnerCertified join even
+        /// when the joiner's certificate ANNOUNCE has not propagated to the
+        /// authority's caches. Self-verifying via
+        /// `verify_cert_against_owner` against the policy owner — the
+        /// certificate must bind THIS member's agent id and the group
+        /// owner's user id, so no extra trust is added and the legacy
+        /// `signature_b64` canonical bytes stay unchanged (#794
+        /// precedent: additive, `serde(default)`, both directions
+        /// compatible).
+        #[serde(default)]
+        certificate_b64: Option<String>,
         /// Inviter countersignature added only after authoritative acceptance.
         #[serde(default)]
         recovery_authority_agent_id: Option<String>,
@@ -12252,6 +12264,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             treekem_key_package_b64,
             kem_public_key_b64,
             kem_signature_b64,
+            certificate_b64,
             recovery_authority_signature_b64,
             signature_b64,
             ..
@@ -12535,38 +12548,54 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             //     propagated yet; it retries on the next volley). The
             //     verified certificate is bound INTO the roster entry below
             //     so the MemberAdded commit covers it (constraint 2).
-            let owner_certified_admission =
-                match owner_certified_admission_check(state, &info, &member_agent_id).await {
-                    Ok(cert) => cert,
-                    Err(failure) => {
-                        state
-                            .groups_diagnostics
-                            .record_member_joined_rejected_owner_cert_pending(&resolved_group_key);
-                        // #447: NoCertificate is EVIDENCE-IN-FLIGHT, not a
-                        // fact about the joiner — the async announce-blob
-                        // fetch may complete (or the 600 s heartbeat land)
-                        // after the joiner's retry volley has already given
-                        // up. Retain the fully member-signed event so a later
-                        // evidence resolution can re-apply it; every other
-                        // failure is definitive and earns no retention.
-                        if failure == x0x::groups::owner_cert::OwnerCertFailure::NoCertificate {
-                            retain_pending_owner_cert_join(
-                                state,
-                                &resolved_group_key,
-                                &member_agent_id,
-                                &event_for_log,
-                            )
-                            .await;
-                        }
-                        tracing::info!(
-                            group_id = %resolved_group_key,
-                            member = %member_agent_id,
-                            reason = %failure,
-                            "MemberJoined: rejecting uncertified joiner (ADR-0038 OwnerCertified)"
-                        );
-                        return ApplyMetadataResult::REJECTED;
+            // #842: the join event may carry the joiner's certificate
+            // directly (announce-independent admission). Decode it here;
+            // verification happens inside the admission check — a
+            // present-but-invalid certificate fails definitively there.
+            let inline_joiner_certificate = certificate_b64.as_deref().and_then(|b64| {
+                use base64::Engine as _;
+                BASE64.decode(b64).ok().and_then(|bytes| {
+                    bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes).ok()
+                })
+            });
+            let owner_certified_admission = match owner_certified_admission_check(
+                state,
+                &info,
+                &member_agent_id,
+                inline_joiner_certificate.as_ref(),
+            )
+            .await
+            {
+                Ok(cert) => cert,
+                Err(failure) => {
+                    state
+                        .groups_diagnostics
+                        .record_member_joined_rejected_owner_cert_pending(&resolved_group_key);
+                    // #447: NoCertificate is EVIDENCE-IN-FLIGHT, not a
+                    // fact about the joiner — the async announce-blob
+                    // fetch may complete (or the 600 s heartbeat land)
+                    // after the joiner's retry volley has already given
+                    // up. Retain the fully member-signed event so a later
+                    // evidence resolution can re-apply it; every other
+                    // failure is definitive and earns no retention.
+                    if failure == x0x::groups::owner_cert::OwnerCertFailure::NoCertificate {
+                        retain_pending_owner_cert_join(
+                            state,
+                            &resolved_group_key,
+                            &member_agent_id,
+                            &event_for_log,
+                        )
+                        .await;
                     }
-                };
+                    tracing::info!(
+                        group_id = %resolved_group_key,
+                        member = %member_agent_id,
+                        reason = %failure,
+                        "MemberJoined: rejecting uncertified joiner (ADR-0038 OwnerCertified)"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+            };
 
             // #469 A4: an ADDRESSED invite is consumed only by its
             // intended joiner. The compare happens BEFORE consumption —
@@ -12659,6 +12688,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         member_public_key_b64: member_public_key_b64.clone(),
                         role,
                         display_name: display_name.clone(),
+                        certificate_b64: certificate_b64.clone(),
                         inviter_agent_id: inviter_agent_id.clone(),
                         invite_secret: invite_secret.clone(),
                         ts_ms,
@@ -13342,6 +13372,7 @@ pub(in crate::server) async fn create_named_group(
                     treekem_key_package_b64: Some(creator_package),
                     kem_public_key_b64: None,
                     kem_signature_b64: None,
+                    certificate_b64: None,
                     recovery_authority_agent_id: None,
                     recovery_authority_public_key_b64: None,
                     recovery_authority_signature_b64: None,
@@ -16466,6 +16497,7 @@ pub(in crate::server) const JOIN_DISPLAY_NAME_MAX_BYTES: usize = 128;
 /// to this join, so the authority can later `publish_secure_share` the
 /// REAL group secret to the invite-joined member (Gap 2). The legacy
 /// signature bytes above are unchanged.
+#[allow(clippy::too_many_arguments)] // matches the targeted allow used elsewhere in this file
 fn build_signed_member_joined_resend(
     info: &x0x::groups::GroupInfo,
     joiner_hex: &str,
@@ -16474,6 +16506,7 @@ fn build_signed_member_joined_resend(
     treekem_key_package_b64: &Option<String>,
     signing_kp: &crate::identity::AgentKeypair,
     joiner_kem: Option<&x0x::groups::kem_envelope::AgentKemKeypair>,
+    joiner_certificate: Option<&x0x::identity::AgentCertificate>,
 ) -> Option<MemberJoinedResend> {
     let now_ms = now_millis_u64();
     use base64::Engine as _;
@@ -16529,6 +16562,12 @@ fn build_signed_member_joined_resend(
                 treekem_key_package_b64: treekem_key_package_b64.clone(),
                 kem_public_key_b64: joiner_kem_b64,
                 kem_signature_b64,
+                certificate_b64: joiner_certificate.and_then(|cert| {
+                    use base64::Engine as _;
+                    bincode::serialize(cert)
+                        .ok()
+                        .map(|bytes| BASE64.encode(bytes))
+                }),
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -17170,6 +17209,10 @@ pub(in crate::server) async fn join_group_via_invite(
                     &treekem_key_package_b64,
                     signing_kp,
                     joiner_kem,
+                    // #842: carry the joiner's own certificate so the
+                    // authority can admit this join even when the cert
+                    // announce has not reached its caches yet.
+                    state.agent.identity().agent_certificate(),
                 )
             };
             let Some(member_joined_resend) = signed_resend else {
@@ -17804,7 +17847,7 @@ pub(in crate::server) async fn add_named_group_member(
         // this runs after the role gate and decides alone. The verified
         // certificate is bound into the roster entry (constraint 2).
         let owner_certified_admission =
-            match owner_certified_admission_check(state.as_ref(), info, &agent_hex).await {
+            match owner_certified_admission_check(state.as_ref(), info, &agent_hex, None).await {
                 Ok(cert) => cert,
                 Err(failure) => {
                     return forbidden(format!(
@@ -18010,7 +18053,7 @@ async fn add_treekem_named_group_member(
         // of the admin role that authorized them. Verified certificate is
         // returned for roster binding below (constraint 2).
         let owner_certified_admission =
-            match owner_certified_admission_check(state.as_ref(), info, &agent_hex).await {
+            match owner_certified_admission_check(state.as_ref(), info, &agent_hex, None).await {
                 Ok(cert) => cert,
                 Err(failure) => {
                     return forbidden(format!(
@@ -18064,6 +18107,7 @@ async fn add_treekem_named_group_member(
         treekem_key_package_b64: Some(kp_b64.clone()),
         kem_public_key_b64: None,
         kem_signature_b64: None,
+        certificate_b64: None,
         recovery_authority_agent_id: None,
         recovery_authority_public_key_b64: None,
         recovery_authority_signature_b64: None,
@@ -21297,10 +21341,35 @@ async fn owner_certified_admission_check(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
     member_hex: &str,
+    inline_certificate: Option<&x0x::identity::AgentCertificate>,
 ) -> Result<Option<x0x::identity::AgentCertificate>, x0x::groups::owner_cert::OwnerCertFailure> {
     let Some(owner) = info.policy.admission.owner_certified_user_id().copied() else {
         return Ok(None);
     };
+    // #842: a certificate carried by the join event itself is verified
+    // INLINE — exactly the check the cache-backed evidence path applies,
+    // without depending on the joiner's announce having propagated. A
+    // PRESENT-but-invalid certificate is a definitive failure (forged,
+    // foreign-owner, wrong agent, expired): unlike NoCertificate it is not
+    // evidence-in-flight and earns no retention. An absent certificate
+    // keeps the evidence path unchanged.
+    if let Some(cert) = inline_certificate {
+        let revoked = {
+            let revoked_set = state.agent.revocation_set();
+            let revoked = revoked_set.read().await;
+            parse_agent_id_hex(member_hex)
+                .map(|agent| revoked.is_agent_revoked(&agent))
+                .unwrap_or(false)
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        return x0x::groups::owner_cert::verify_cert_against_owner(
+            &owner, member_hex, cert, revoked, now_unix,
+        )
+        .map(|()| Some(cert.clone()));
+    }
     let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
     x0x::groups::owner_cert::verify_owner_certified_member(&owner, member_hex, &evidence)
         .map(|()| evidence.cert_for(member_hex).cloned())
@@ -23802,6 +23871,7 @@ async fn approve_treekem_join_request(
         invite_secret: String::new(),
         kem_public_key_b64: None,
         kem_signature_b64: None,
+        certificate_b64: None,
         ts_ms: now_ms,
         treekem_key_package_b64: Some(BASE64.encode(&kp_bytes)),
         recovery_authority_agent_id: None,
@@ -31967,6 +32037,13 @@ async fn refire_pending_join_volley(
             treekem_key_package_b64,
             kem_public_key_b64: joiner_kem_b64,
             kem_signature_b64,
+            // #842: the rebuilt resend carries the certificate too, so a
+            // restarted joiner's retry volley is announce-independent.
+            certificate_b64: state.agent.identity().agent_certificate().and_then(|cert| {
+                bincode::serialize(cert)
+                    .ok()
+                    .map(|bytes| BASE64.encode(bytes))
+            }),
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -35800,6 +35877,8 @@ pub(in crate::server) mod tests {
                 recovery_authority_signature_b64: None,
                 recovery_authority_commit: None,
                 signature_b64: BASE64.encode(sig.as_bytes()),
+
+                certificate_b64: None,
             };
             let stored = MemberJoinedResend {
                 metadata_topic: "t9b-topic".into(),
@@ -35956,6 +36035,8 @@ pub(in crate::server) mod tests {
                     recovery_authority_signature_b64: None,
                     recovery_authority_commit: None,
                     signature_b64: BASE64.encode(sig.as_bytes()),
+
+                    certificate_b64: None,
                 },
                 sender_id,
             )
@@ -43080,6 +43161,8 @@ pub(in crate::server) mod tests {
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
+
+            certificate_b64: None,
         };
         let (recovery_commit, retained_commit) = {
             let groups = state.named_groups.read().await;
@@ -43249,6 +43332,7 @@ pub(in crate::server) mod tests {
             treekem_key_package_b64: None,
             kem_public_key_b64: None,
             kem_signature_b64: None,
+            certificate_b64: None,
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -47582,6 +47666,8 @@ pub(in crate::server) mod tests {
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: "sig".to_string(),
+
+            certificate_b64: None,
         };
         let (key, _) = member_joined_kp_cache_entry(&with_kp).expect("kp-bearing event extracted");
         assert_eq!(key, join_result_key(&group_id, &member));
@@ -47735,6 +47821,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 ..
             } => NamedGroupMetadataEvent::MemberJoined {
                 group_id,
@@ -47747,6 +47834,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 kem_public_key_b64: None,
                 kem_signature_b64: None,
                 recovery_authority_agent_id: None,
@@ -47813,6 +47901,8 @@ pub(in crate::server) mod tests {
                 recovery_authority_signature_b64: None,
                 recovery_authority_commit: None,
                 signature_b64,
+
+                certificate_b64: None,
             },
             _ => unreachable!("fixture is MemberJoined"),
         };
@@ -47868,6 +47958,7 @@ pub(in crate::server) mod tests {
                 ts_ms,
                 treekem_key_package_b64,
                 signature_b64,
+                certificate_b64,
                 ..
             } => NamedGroupMetadataEvent::MemberJoined {
                 group_id: group_b.clone(),
@@ -47880,6 +47971,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 kem_public_key_b64: None,
                 kem_signature_b64: None,
                 recovery_authority_agent_id: None,
@@ -48649,6 +48741,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 ..
             } => NamedGroupMetadataEvent::MemberJoined {
                 group_id,
@@ -48661,6 +48754,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 kem_public_key_b64: None,
                 kem_signature_b64: None,
                 recovery_authority_agent_id: None,
@@ -48739,6 +48833,8 @@ pub(in crate::server) mod tests {
                     recovery_authority_signature_b64: None,
                     recovery_authority_commit: None,
                     signature_b64: BASE64.encode(sig.as_bytes()),
+
+                    certificate_b64: None,
                 }
             }
             _ => unreachable!("fixture is MemberJoined"),
@@ -48777,6 +48873,7 @@ pub(in crate::server) mod tests {
                 ts_ms,
                 treekem_key_package_b64,
                 signature_b64,
+                certificate_b64,
                 ..
             } => NamedGroupMetadataEvent::MemberJoined {
                 group_id: group_b.clone(),
@@ -48789,6 +48886,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 kem_public_key_b64: None,
                 kem_signature_b64: None,
                 recovery_authority_agent_id: None,
@@ -49542,6 +49640,8 @@ pub(in crate::server) mod tests {
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
+
+            certificate_b64: None,
         };
         let _ = apply_named_group_metadata_event(state, later_join, later_id, true, None).await;
 
@@ -50038,6 +50138,8 @@ pub(in crate::server) mod tests {
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
+
+            certificate_b64: None,
         };
         Ok((join_result_key(group_id, &member_hex), event))
     }
@@ -50266,6 +50368,7 @@ pub(in crate::server) mod tests {
             &None,
             &joiner_kp,
             Some(&kem),
+            None,
         )
         .expect("resend");
         let NamedGroupMetadataEvent::MemberJoined {
@@ -50324,6 +50427,7 @@ pub(in crate::server) mod tests {
             &None,
             &joiner_kp,
             Some(&kem),
+            None,
         )
         .expect("resend");
         let NamedGroupMetadataEvent::MemberJoined {
@@ -50346,6 +50450,7 @@ pub(in crate::server) mod tests {
             &None,
             &joiner_kp,
             Some(&kem),
+            None,
         )
         .expect("resend");
         let NamedGroupMetadataEvent::MemberJoined {
@@ -50792,6 +50897,8 @@ pub(in crate::server) mod tests {
                 recovery_authority_signature_b64: None,
                 recovery_authority_commit: None,
                 signature_b64: BASE64.encode(sig.as_bytes()),
+
+                certificate_b64: None,
             })
         }
 
