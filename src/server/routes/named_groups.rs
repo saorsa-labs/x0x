@@ -34284,7 +34284,25 @@ async fn handle_welcome_fetch_request(
         return;
     };
     if pending.created_at.elapsed() >= PENDING_WELCOME_TTL {
-        state.pending_welcomes.write().await.remove(&welcome_id);
+        let mut welcomes = state.pending_welcomes.write().await;
+        // A concurrent restage can replace this content id between the read
+        // above and this write. Only tear down the stream for an entry that is
+        // still expired while holding the same lock as staging.
+        if welcomes
+            .get(&welcome_id)
+            .is_some_and(|current| current.created_at.elapsed() >= PENDING_WELCOME_TTL)
+        {
+            welcomes.remove(&welcome_id);
+            let mut streams = state.pending_welcome_streams.lock().await;
+            if let Some(stream) = streams
+                .as_mut()
+                .and_then(|streams| streams.remove(&welcome_id))
+            {
+                stream.abort();
+                let _ = stream.await;
+            }
+            state.pending_welcome_acks.write().await.remove(&welcome_id);
+        }
         return;
     }
     if pending.group_id != group_id || pending.joiner_agent != sender_hex {
@@ -34337,6 +34355,11 @@ async fn stream_welcome_blob(
     .await;
 }
 
+#[cfg(test)]
+static WELCOME_STREAM_TEST_GATES: std::sync::OnceLock<
+    StdMutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+> = std::sync::OnceLock::new();
+
 /// Stream one staged Welcome blob to `recipient`, sending every frame through
 /// `send` (production: [`send_welcome_blob_message`]; tests inject a lossy
 /// transport).
@@ -34365,6 +34388,14 @@ async fn stream_welcome_blob_via<S, F>(
             return;
         }
         acks.insert(welcome_id.to_string(), Arc::clone(&ack_slot));
+    }
+    #[cfg(test)]
+    if let Some(gate) = WELCOME_STREAM_TEST_GATES
+        .get()
+        .and_then(|gates| gates.lock().ok())
+        .and_then(|gates| gates.get(welcome_id).cloned())
+    {
+        gate.notified().await;
     }
 
     let offer = WelcomeBlobMessage::Offer {
@@ -45806,6 +45837,186 @@ pub(in crate::server) mod tests {
             let _ = stream.await;
         }
         assert_eq!(active.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn welcome_fetch_handler_replaces_only_for_authorized_joiner() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let (stranger, _stranger_dir) = secure_endpoint_test_state().await?;
+        let joiner_id = joiner.agent.agent_id();
+        let stranger_id = stranger.agent.agent_id();
+        let group_id = "a1".repeat(32);
+        let bytes = b"handler authorization and replacement Welcome".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        owner.pending_welcomes.write().await.insert(
+            welcome_id.clone(),
+            PendingWelcome {
+                group_id: group_id.clone(),
+                joiner_agent: hex::encode(joiner_id.as_bytes()),
+                bytes,
+                created_at: Instant::now(),
+            },
+        );
+        // Hold the real stream just after ACK-slot registration. This gives
+        // the handler test a deterministic view of the live stream and slot
+        // without depending on network delivery timing.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gates = WELCOME_STREAM_TEST_GATES.get_or_init(|| StdMutex::new(HashMap::new()));
+        gates
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Welcome test gate poisoned"))?
+            .insert(welcome_id.clone(), Arc::clone(&gate));
+
+        let request = |group_id: String| WelcomeBlobMessage::FetchRequest {
+            group_id,
+            welcome_id: welcome_id.clone(),
+        };
+        handle_welcome_blob_message(&owner, &joiner_id, request(group_id.clone())).await;
+        let first_slot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(slot) = owner.pending_welcome_acks.read().await.get(&welcome_id) {
+                    break Arc::clone(slot);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let first_stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|streams| streams.get(&welcome_id))
+            .ok_or_else(|| anyhow::anyhow!("first Welcome stream missing"))?
+            .id();
+
+        handle_welcome_blob_message(&owner, &stranger_id, request(group_id.clone())).await;
+        handle_welcome_blob_message(&owner, &joiner_id, request("wrong-group".into())).await;
+        let unchanged_slot = owner
+            .pending_welcome_acks
+            .read()
+            .await
+            .get(&welcome_id)
+            .cloned();
+        assert!(unchanged_slot
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(slot, &first_slot)));
+        let unchanged_stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|streams| streams.get(&welcome_id))
+            .map(tokio::task::JoinHandle::id);
+        assert_eq!(unchanged_stream, Some(first_stream));
+
+        handle_welcome_blob_message(&owner, &joiner_id, request(group_id)).await;
+        let fresh_slot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(slot) = owner.pending_welcome_acks.read().await.get(&welcome_id) {
+                    if !Arc::ptr_eq(slot, &first_slot) {
+                        break Arc::clone(slot);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(!Arc::ptr_eq(&fresh_slot, &first_slot));
+        let replacement_stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|streams| streams.get(&welcome_id))
+            .map(tokio::task::JoinHandle::id);
+        assert_ne!(replacement_stream, Some(first_stream));
+
+        gates
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Welcome test gate poisoned"))?
+            .remove(&welcome_id);
+        let stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|streams| streams.remove(&welcome_id));
+        if let Some(stream) = stream {
+            stream.abort();
+            let _ = stream.await;
+        }
+        owner.pending_welcome_acks.write().await.remove(&welcome_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_welcome_fetch_clears_live_stream_and_ack_slot() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let joiner_id = joiner.agent.agent_id();
+        let group_id = "b2".repeat(32);
+        let bytes = b"expired Welcome with an active stream".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        owner.pending_welcomes.write().await.insert(
+            welcome_id.clone(),
+            PendingWelcome {
+                group_id: group_id.clone(),
+                joiner_agent: hex::encode(joiner_id.as_bytes()),
+                bytes,
+                created_at: Instant::now() - PENDING_WELCOME_TTL - Duration::from_secs(1),
+            },
+        );
+        let active = Arc::new(AtomicBool::new(false));
+        let stream_active = Arc::clone(&active);
+        replace_welcome_stream(&owner, &welcome_id, async move {
+            struct ActiveGuard(Arc<AtomicBool>);
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            stream_active.store(true, Ordering::SeqCst);
+            let _guard = ActiveGuard(stream_active);
+            std::future::pending::<()>().await;
+        })
+        .await;
+        tokio::task::yield_now().await;
+        assert!(active.load(Ordering::SeqCst));
+        owner
+            .pending_welcome_acks
+            .write()
+            .await
+            .insert(welcome_id.clone(), Arc::new(FileChunkAckSlot::new()));
+
+        handle_welcome_blob_message(
+            &owner,
+            &joiner_id,
+            WelcomeBlobMessage::FetchRequest {
+                group_id,
+                welcome_id: welcome_id.clone(),
+            },
+        )
+        .await;
+        assert!(!owner
+            .pending_welcomes
+            .read()
+            .await
+            .contains_key(&welcome_id));
+        assert!(!owner
+            .pending_welcome_acks
+            .read()
+            .await
+            .contains_key(&welcome_id));
+        assert!(!owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|streams| streams.contains_key(&welcome_id)));
+        assert!(!active.load(Ordering::SeqCst));
         Ok(())
     }
 
