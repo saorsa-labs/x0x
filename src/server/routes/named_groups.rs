@@ -474,9 +474,125 @@ pub(in crate::server) struct HeadAttestation {
     pub head_state_hash: String,
     pub member_agent_id: String,
     pub signature_b64: String,
+    /// v2 TERMINAL binding (stale-base fork-evidence anchor): the owner's
+    /// signature over the v1 fields PLUS the exact staged terminal's
+    /// `state_hash`, `committed_by` and TreeKEM epoch
+    /// ([`Self::terminal_canonical_bytes`]). The v1 `signature_b64` signs
+    /// only the PARENT head, so it cannot tell the owner's staged terminal
+    /// from a same-parent sibling another admin signed; only this binding
+    /// can exempt a served chain from fork evidence. Optional on the wire:
+    /// an older owner omits it (and an older joiner ignores it), which
+    /// fails the anchor CLOSED — the joiner quarantines exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_signature_b64: Option<String>,
 }
 
 impl HeadAttestation {
+    /// v2 preimage: `x0x.join-terminal-attest.v2\0 ‖ group_id ‖ 0 ‖
+    /// head_revision(LE) ‖ head_state_hash ‖ 0 ‖ member ‖ 0 ‖
+    /// terminal_state_hash ‖ 0 ‖ terminal_committed_by ‖ 0 ‖ epoch_tag ‖
+    /// [epoch(LE)]` — a distinct domain from v1 and the quarantine clear.
+    fn terminal_canonical_bytes(
+        &self,
+        terminal_state_hash: &str,
+        terminal_committed_by: &str,
+        terminal_epoch: Option<u64>,
+    ) -> Vec<u8> {
+        let mut buf = Self::canonical_bytes_with_domain(
+            b"x0x.join-terminal-attest.v2\0",
+            &self.group_id,
+            self.head_revision,
+            &self.head_state_hash,
+            &self.member_agent_id,
+        );
+        buf.push(0);
+        buf.extend_from_slice(terminal_state_hash.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(terminal_committed_by.as_bytes());
+        buf.push(0);
+        match terminal_epoch {
+            Some(epoch) => {
+                buf.push(1);
+                buf.extend_from_slice(&epoch.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        buf
+    }
+
+    /// Owner side: sign the v1 head attestation for `terminal` AND its v2
+    /// terminal binding. The head is the terminal's parent.
+    fn sign_for_terminal(
+        group_id: &str,
+        terminal: &x0x::groups::GroupStateCommit,
+        member_agent_id: &str,
+        terminal_epoch: Option<u64>,
+        owner_kp: &crate::identity::UserKeypair,
+    ) -> Result<Self, String> {
+        use base64::Engine as _;
+        let head_hash = terminal
+            .prev_state_hash
+            .as_deref()
+            .ok_or_else(|| "terminal has no parent head".to_string())?;
+        let head_revision = terminal
+            .revision
+            .checked_sub(1)
+            .ok_or_else(|| "terminal has no parent revision".to_string())?;
+        let mut attestation = Self::sign(
+            group_id,
+            head_revision,
+            head_hash,
+            member_agent_id,
+            owner_kp,
+        )?;
+        let canonical = attestation.terminal_canonical_bytes(
+            &terminal.state_hash,
+            &terminal.committed_by,
+            terminal_epoch,
+        );
+        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            owner_kp.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| format!("owner terminal attestation sign: {e:?}"))?;
+        attestation.terminal_signature_b64 = Some(BASE64.encode(sig.as_bytes()));
+        Ok(attestation)
+    }
+
+    /// Joiner side: does the v2 binding verify for EXACTLY this terminal
+    /// (state hash, committer, epoch) under the owner key? Absent or
+    /// malformed ⇒ `false` (fail closed).
+    fn verify_terminal_binding(
+        &self,
+        owner_public_key: &ant_quic::MlDsaPublicKey,
+        terminal: &x0x::groups::GroupStateCommit,
+        terminal_epoch: Option<u64>,
+    ) -> bool {
+        use base64::Engine as _;
+        let Some(sig_b64) = self.terminal_signature_b64.as_deref() else {
+            return false;
+        };
+        let Ok(sig_bytes) = BASE64.decode(sig_b64) else {
+            return false;
+        };
+        let Ok(sig) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        else {
+            return false;
+        };
+        let canonical = self.terminal_canonical_bytes(
+            &terminal.state_hash,
+            &terminal.committed_by,
+            terminal_epoch,
+        );
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            owner_public_key,
+            &canonical,
+            &sig,
+        )
+        .is_ok()
+    }
+
     fn canonical_bytes(
         group_id: &str,
         head_revision: u64,
@@ -537,6 +653,7 @@ impl HeadAttestation {
             head_state_hash: head_state_hash.to_string(),
             member_agent_id: member_agent_id.to_string(),
             signature_b64: BASE64.encode(sig.as_bytes()),
+            terminal_signature_b64: None,
         })
     }
 
@@ -638,6 +755,7 @@ impl HeadAttestation {
             head_state_hash: head_state_hash.to_string(),
             member_agent_id: local_agent_hex.to_string(),
             signature_b64: BASE64.encode(sig.as_bytes()),
+            terminal_signature_b64: None,
         })
     }
 
@@ -4131,21 +4249,21 @@ async fn classify_refused_joiner_fork_chain(
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     served_chain_owner_anchored: bool,
     persistence_lock_already_held: bool,
-) {
+) -> bool {
     // Only a joiner with a served chain and stored lineage reaches the
     // walk; already-installed evidence (the hook's classification) wins.
     if chain.is_empty() || current.invite_lineage.is_none() {
-        return;
+        return false;
     }
     if current
         .invite_lineage
         .as_ref()
         .is_some_and(|lineage| lineage.fork_evidence.is_some())
     {
-        return;
+        return false;
     }
     if commit.verify_structure().is_err() {
-        return;
+        return false;
     }
     // The owner-anchor clear (outcome (a)) ran inside the apply hook with
     // this same mandate; if it produced a successor, the lineage gate
@@ -4156,7 +4274,7 @@ async fn classify_refused_joiner_fork_chain(
         owner_mandate,
     ) {
         if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
-            return;
+            return false;
         }
     }
     let base = x0x::groups::state_commit::AlternateChainBase {
@@ -4170,7 +4288,7 @@ async fn classify_refused_joiner_fork_chain(
     if x0x::groups::state_commit::validate_alternate_chain(&base, chain, commit).is_err() {
         // A chain that does not validate from OUR base is not
         // authenticated evidence of anything this node can anchor.
-        return;
+        return false;
     }
     if served_chain_owner_anchored {
         // The served chain DESCENDS from our invite base and the ADMISSION
@@ -4179,15 +4297,29 @@ async fn classify_refused_joiner_fork_chain(
         // is a GAP (a stale-base invite: the authority sealed commits after
         // the mint), not a divergence: the refusal came from somewhere
         // other than the anchor (a TreeKEM joiner never adopts across a
-        // gap), so the joiner stays pending for ordinary catch-up. A
-        // removed/forked admin cannot forge the owner's user-key
-        // attestation, so a real fork still reaches the evidence below.
-        tracing::debug!(
+        // gap). The caller queues the terminal and requests TreeKEM
+        // catch-up. A removed/forked admin cannot forge the owner's
+        // user-key terminal binding, so a real fork (including a
+        // same-parent sibling) still reaches the evidence below.
+        //
+        // The exemption is RECORDED durably (non-gating) so every use of
+        // it is auditable.
+        record_anchored_gap_refusal(
+            state,
+            group_key,
+            commit,
+            chain,
+            current,
+            persistence_lock_already_held,
+        )
+        .await;
+        tracing::info!(
             group_id = %LogHexId::group(group_key),
             revision = commit.revision,
-            "joiner served chain is owner-anchored — stale-base gap, not fork evidence"
+            committed_by = %LogHexId::agent(&commit.committed_by),
+            "joiner served chain is owner-anchored to this exact terminal — stale-base gap, not fork evidence"
         );
-        return;
+        return true;
     }
     let evidence = x0x::groups::ForkEvidence {
         revision: commit.revision,
@@ -4221,18 +4353,89 @@ async fn classify_refused_joiner_fork_chain(
             "#468/ADR-0064: joiner fork chain walk-authenticated without an owner anchor — quarantined on evidence (no eviction)"
         );
     }
+    false
+}
+
+/// Durably record (non-gating) one owner-anchored stale-base refusal on the
+/// group's invite lineage: the latest terminal/head plus a running count.
+async fn record_anchored_gap_refusal(
+    state: &Arc<AppState>,
+    group_key: &str,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    chain: &[x0x::groups::state_commit::RetainedCommit],
+    current: &x0x::groups::GroupInfo,
+    persistence_lock_already_held: bool,
+) {
+    let key = group_key.to_string();
+    let now_ms = now_millis_u64();
+    let head_state_hash = previous_hash_initial(chain, current);
+    let head_revision = commit.revision.saturating_sub(1);
+    let terminal_revision = commit.revision;
+    let terminal_state_hash = commit.state_hash.clone();
+    let committed_by = commit.committed_by.clone();
+    let mutate = move |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
+        // ADR0066-LOOKUP-WAIVER: `key` is the already-resolved map key the
+        // apply path was called with (same as `install_fork_evidence`).
+        let Some(lineage) = groups
+            .get_mut(&key)
+            .and_then(|info| info.invite_lineage.as_mut())
+        else {
+            return false;
+        };
+        let (occurrences, first_observed_at_ms) = lineage
+            .anchored_gap_refusal
+            .as_ref()
+            .map_or((0, now_ms), |prior| {
+                (prior.occurrences, prior.first_observed_at_ms)
+            });
+        lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+            reason: "owner_attested_stale_base_gap".to_string(),
+            head_revision,
+            head_state_hash,
+            terminal_revision,
+            terminal_state_hash,
+            committed_by,
+            occurrences: occurrences.saturating_add(1),
+            first_observed_at_ms,
+            last_observed_at_ms: now_ms,
+        });
+        true
+    };
+    let outcome = if persistence_lock_already_held {
+        persist_named_groups_mutation_unlocked(state, mutate).await
+    } else {
+        persist_named_groups_mutation(state, mutate).await
+    };
+    if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            "anchored stale-base refusal record did not persist durably (audit only; nothing gated)"
+        );
+    }
 }
 
 /// Is the joiner's SERVED chain + terminal anchored by the admission
-/// owner's head attestation — the identical tier-1 anchor
-/// [`try_adopt_member_added_across_gap`] requires (owner key from the
-/// ingress-verified committed certificate, owner-signed CAS on the
-/// terminal's parent, attested head == the served chain's head)?
+/// owner's attestation of EXACTLY this terminal? All must hold:
+/// - owner key from the ingress-verified committed certificate;
+/// - the v1 head attestation verifies and CAS-binds the terminal's parent
+///   ([`HeadAttestation::verify_against_terminal`]);
+/// - the v2 terminal binding verifies for this terminal's `state_hash`,
+///   `committed_by` and TreeKEM epoch
+///   ([`HeadAttestation::verify_terminal_binding`]) — the v1 signature
+///   covers only the parent, so without v2 a same-parent SIBLING terminal
+///   signed by any other active admin would replay the owner's genuine
+///   attestation (#816 security review);
+/// - the attested head is the served chain's head.
 ///
-/// `false` for groups without an owner axis, a missing/unverifiable
-/// attestation, or one that attests a different head: only the owner's
-/// USER key can make this `true`, which no member agent (removed admin
-/// included) holds.
+/// `false` for groups without an owner axis, a missing/v1-only/malformed
+/// attestation, or any mismatch: only the owner's USER key can make this
+/// `true`, which no member agent (removed admin included) holds.
+///
+/// Owner-key model (named decision): the anchor trusts the admission
+/// owner's USER key, fixed by the immutable `OwnerCertified` policy — the
+/// same root the tier-1 adoption and owner mandates trust. Revoking an
+/// owner DEVICE (agent key) does not revoke that user key; compromise of
+/// the user key itself is outside this anchor's threat model.
 #[allow(clippy::too_many_arguments)]
 fn served_chain_owner_anchored(
     current: &x0x::groups::GroupInfo,
@@ -4255,16 +4458,23 @@ fn served_chain_owner_anchored(
     else {
         return false;
     };
-    attestation.group_id == commit.group_id
-        && attestation.verify_against_terminal(
-            &owner_public_key,
-            owner,
-            commit,
-            member_agent_id,
-            owner_mandate,
-            treekem_epoch,
-        )
-        && attestation.head_state_hash == previous_hash_initial(chain, current)
+    if attestation.group_id != commit.group_id {
+        return false;
+    }
+    if !attestation.verify_against_terminal(
+        &owner_public_key,
+        owner,
+        commit,
+        member_agent_id,
+        owner_mandate,
+        treekem_epoch,
+    ) {
+        return false;
+    }
+    if attestation.head_state_hash != previous_hash_initial(chain, current) {
+        return false;
+    }
+    attestation.verify_terminal_binding(&owner_public_key, commit, treekem_epoch)
 }
 
 /// Separate fn + `Box::pin` at the call site: the giant apply fn's async
@@ -10171,7 +10381,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 owner_mandate.as_ref(),
                                 treekem_epoch,
                             );
-                            classify_refused_joiner_fork_chain(
+                            let anchored_gap = classify_refused_joiner_fork_chain(
                                 state,
                                 &resolved_group_key,
                                 &current,
@@ -10182,6 +10392,27 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 roster_lock_already_held,
                             )
                             .await;
+                            // Convergence for the owner-anchored stale-base
+                            // gap: the frontier gate above missed it (the
+                            // invite stub's roster clock is seeded from the
+                            // base STATE revision), so queue the terminal
+                            // exactly like that gate would and request
+                            // TreeKEM catch-up; the response supplies the
+                            // intervening commits and the queued terminal
+                            // replays gaplessly after them.
+                            if anchored_gap
+                                && allow_queue
+                                && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                            {
+                                queue_treekem_membership_event(
+                                    state,
+                                    &resolved_group_key,
+                                    event_for_log.clone(),
+                                    sender,
+                                    "anchored_stale_base_gap",
+                                )
+                                .await;
+                            }
                             tracing::debug!(
                                 target: "treekem.trace",
                                 stage = "apply_metadata_event_reject",
@@ -16729,6 +16960,7 @@ pub(in crate::server) async fn join_group_via_invite(
                 seated_at_revision: None,
                 corroborated: false,
                 fork_evidence: None,
+                anchored_gap_refusal: None,
             });
 
             // ADR-0064 slice 2 (§1b capability predicate): an owner-axis
@@ -31336,13 +31568,11 @@ async fn stage_join_result(
             } => commit,
             _ => return None,
         };
-        let head_hash = terminal.prev_state_hash.clone()?;
-        let head_revision = terminal.revision.checked_sub(1)?;
-        HeadAttestation::sign(
+        HeadAttestation::sign_for_terminal(
             info.stable_group_id(),
-            head_revision,
-            &head_hash,
+            terminal,
             member_agent_id,
+            treekem_epoch,
             owner_kp,
         )
         .ok()
