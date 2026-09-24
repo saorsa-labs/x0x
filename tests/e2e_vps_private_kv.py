@@ -20,6 +20,27 @@ from e2e_vps_groups import NODES_DEFAULT, load_tokens
 from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier
 
 
+# #824: the documented transient `GET /home` state while startup provisioning
+# waits (at most 90 s) for owner sync. Readers poll through it, and only it.
+HOME_PROVISIONING_PENDING = "provisioning_pending"
+
+
+def settled_home(client: Api, label: str, timeout: float) -> tuple[int, dict[str, Any]]:
+    """`GET /home` once provisioning has left the transient pending state."""
+    return poll(f"{label} Home provisioning settles", timeout,
+                lambda: client.request("GET", "/home"),
+                lambda result: not (result[0] == 200
+                                    and result[1].get("state") == HOME_PROVISIONING_PENDING))
+
+
+def machine_id(client: Api) -> str:
+    status, body = client.request("GET", "/agent")
+    value = body.get("machine_id")
+    if status != 200 or not isinstance(value, str) or len(value) != 64:
+        raise RuntimeError("/agent did not return a 64-hex machine_id")
+    return value
+
+
 class Scenario(SharedScenario):
     def join_private(self, owner: str, member: str, gid: str, invite: str | None = None) -> None:
         invite = invite or self.invite(owner, member, gid)
@@ -30,7 +51,7 @@ class Scenario(SharedScenario):
             operation="private_join_readiness")
 
     def home(self, owner: str) -> tuple[str, str]:
-        status, body = self.c[owner].request("GET", "/home")
+        status, body = settled_home(self.c[owner], owner, self.timeout)
         self.e.check("canonical Home is locally available", status == 200 and body.get("state") == "local",
                      status=status, state=body.get("state"))
         gid, owner_id = body.get("group_id"), body.get("owner_user_id")
@@ -49,6 +70,15 @@ class Scenario(SharedScenario):
                      and body.get("user_id") == owner_id, status=status)
 
     def home_invite(self, owner: str, member: str, gid: str, owner_id: str) -> str:
+        # Product contract: only a device serving the canonical Home may seat
+        # (`POST /home/seat` refuses otherwise). A device that has just been
+        # seated reaches `local` with the canonical gid only once its own join
+        # completes, so waiting for exactly that is readiness, not masking. A
+        # device stuck on a duplicate never matches and the poll fails.
+        poll(f"{owner} serves the canonical Home before seating {member}", self.timeout,
+             lambda: self.c[owner].request("GET", "/home"),
+             lambda result: result[0] == 200 and result[1].get("state") == "local"
+             and result[1].get("group_id") == gid)
         aid = self.c[member].agent_id()
         status, body = self.c[owner].request("POST", "/home/seat", {"agent_id": aid})
         self.e.check(f"Home seat invite for {member}", status == 200 and body.get("ok") is True

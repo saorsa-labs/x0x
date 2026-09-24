@@ -774,6 +774,11 @@ pub struct OwnerSyncStore {
     devices: tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>,
     last_session: tokio::sync::RwLock<BTreeMap<[u8; 32], DeviceSyncStatus>>,
     generation_tx: tokio::sync::watch::Sender<u64>,
+    /// #824: count of successful sessions with an owner device, inbound or
+    /// outbound. Home provisioning waits for one before minting, because a
+    /// completed session means that device's records, including any
+    /// canonical Home pointer, have been merged.
+    sessions_ok_tx: tokio::sync::watch::Sender<u64>,
     /// Set when a durable write crossed the rename but could not be
     /// synced: memory/disk agreement is no longer reconstructable by
     /// rollback, so every further mutation and session fails until the
@@ -880,6 +885,7 @@ impl OwnerSyncStore {
             devices: tokio::sync::RwLock::new(devices),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
             generation_tx,
+            sessions_ok_tx: tokio::sync::watch::channel(0).0,
             poisoned: std::sync::Mutex::new(None),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             canonical_home_gate: tokio::sync::RwLock::new(()),
@@ -1535,6 +1541,18 @@ impl OwnerSyncStore {
                 last_session_ok: ok,
             },
         );
+        drop(last);
+        if ok {
+            self.sessions_ok_tx
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
+    }
+
+    /// Successful-session counter (#824): changes once per session with an
+    /// owner device that completed, in either direction.
+    #[must_use]
+    pub fn successful_sessions_rx(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sessions_ok_tx.subscribe()
     }
 
     /// Last-session status per device (for `GET /sync/devices`).
@@ -2138,9 +2156,6 @@ pub struct OwnerSyncService {
     view: std::sync::RwLock<Option<Arc<dyn SyncDaemonView>>>,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     session_permits: Arc<tokio::sync::Semaphore>,
-    /// #824: count of completed [`Self::sync_all`] passes, so Home
-    /// provisioning can wait for "one owner-sync round" before minting.
-    rounds_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl OwnerSyncService {
@@ -2169,7 +2184,6 @@ impl OwnerSyncService {
             view: std::sync::RwLock::new(None),
             tasks: tokio::sync::Mutex::new(Vec::new()),
             session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
-            rounds_tx: tokio::sync::watch::channel(0).0,
         });
         service.spawn_acceptor_loop(acceptor).await;
         Ok(service)
@@ -2348,22 +2362,9 @@ impl OwnerSyncService {
         result.map_err(|e| e.to_string())
     }
 
-    /// Completed-pass counter (#824): changes once per finished
-    /// [`Self::sync_all`], whether or not any peer was reachable.
-    #[must_use]
-    pub fn sync_rounds_rx(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.rounds_tx.subscribe()
-    }
-
     /// One full pass: mint local Tier-1 records from live daemon state,
     /// then sync with every enrolled machine we can resolve.
     pub async fn sync_all(&self) {
-        self.sync_all_pass().await;
-        self.rounds_tx
-            .send_modify(|rounds| *rounds = rounds.wrapping_add(1));
-    }
-
-    async fn sync_all_pass(&self) {
         if let Err(e) = self.reconcile_local_state().await {
             tracing::warn!(target: "x0x::owner_sync", error = %e, "local reconcile failed");
         }

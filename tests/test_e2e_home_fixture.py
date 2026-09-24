@@ -226,7 +226,10 @@ esac
         The model encodes the product facts the harness depends on: a Home join is
         admitted only by an online inviter, POST /home/seat needs the owner key and an
         Admin seat, user-identity announce needs the owner key, and an uncertified,
-        keyless device is refused (403).
+        keyless device is refused (403). #824: a keyed device that restarts
+        without bilateral owner-sync enrollment and trust with the owner device
+        provisions a DUPLICATE Home (`local` with another gid); only a paired
+        device yields (`elsewhere`, canonical gid) until it is seated.
         """
         h = fixture or self.h
         args = self.args(); evidence = self.h.Evidence(); resources = {}
@@ -235,7 +238,10 @@ esac
         public_keys = {n: f"{i:02x}" * 1952 for i, n in enumerate(args.nodes, 1)}
         owner_user, gid, owner_key = "f" * 64, "home-gid", "k" * 64
         events: list[tuple] = []
-        world = {"seats": {"owner": "admin"}, "certs": set(), "announced": set(), "invites": {}, "kv": {}}
+        world = {"seats": {"owner": "admin"}, "certs": set(), "announced": set(), "invites": {}, "kv": {},
+                 "enrolled": set(), "trusted": set(), "keyed_at_start": set()}
+        machines = {n: (f"{i:x}" * 64)[:64][::-1] for i, n in enumerate(args.nodes, 10)}
+        world["machines"] = machines
 
         class Custody:
             instance = None
@@ -245,6 +251,7 @@ esac
             def create_owner_key(self, node, *_args): self.keys[node.label] = owner_key
             def start(self, node):
                 self.offline.discard(node.label); self.started.add(node.label); events.append(("start", node.label))
+                if node.label in self.keys: world["keyed_at_start"].add(node.label)
             def stop(self, label):
                 if label not in self.started: raise RuntimeError("unowned")
                 self.offline.add(label); events.append(("stop", label))
@@ -274,8 +281,25 @@ esac
                 events.append(("req", me, method, path))
                 seats = world["seats"]
                 keyed = me in Custody.instance.keys
-                if path == "/home": return 200, {"state": "local", "group_id": gid, "owner_user_id": owner_user,
-                                                    "primary_agent": {"verified": True}}
+                def paired(label):
+                    return ({("owner", machines[label]), (label, machines["owner"])} <= world["enrolled"]
+                            and {("owner", ids[label]), (label, ids["owner"])} <= world["trusted"])
+                if path == "/home":
+                    if me == "owner" or me in seats:
+                        return 200, {"state": "local", "group_id": gid, "owner_user_id": owner_user,
+                                     "primary_agent": {"verified": True}}
+                    if me not in world["keyed_at_start"]: return 404, {"ok": False, "error": "no Home provisioned"}
+                    if paired(me): return 200, {"state": "elsewhere", "canonical_group_id": gid,
+                                                "owner_user_id": owner_user}
+                    return 200, {"state": "local", "group_id": f"dup-{me}", "owner_user_id": owner_user}
+                if path == "/agent": return 200, {"ok": True, "agent_id": ids[me], "machine_id": machines[me]}
+                if path == "/contacts/trust":
+                    if body.get("level") != "trusted": return 400, {"ok": False}
+                    world["trusted"].add((me, body["agent_id"])); return 200, {"ok": True}
+                if path == "/sync/devices/enroll":
+                    if not keyed: return 409, {"ok": False, "error": "no owner identity configured"}
+                    world["enrolled"].add((me, body.get("machine_id") or machines[me]))
+                    return 200, {"ok": True}
                 if path == "/health": return 200, {"ok": True}
                 if path == "/agent/card":
                     if card_reply is not None: return 200, card_reply
@@ -350,6 +374,14 @@ esac
                 error = caught
         return events, Custody.instance, world, evidence, error
 
+    def test_devices_without_owner_sync_pairing_are_caught_provisioning_a_duplicate(self):
+        # #824, Rule 9: the pairing is what prevents the duplicate Home. Without
+        # it, the fixture must FAIL on the device's own Home, not pass on it.
+        with mock.patch.object(self.h, "enroll_peer", lambda *_args, **_kwargs: None):
+            _events, _custody, _world, evidence, _error = self.run_model()
+        failed = [row["label"] for row in evidence.assertions if not row["passed"]]
+        self.assertIn("writer yields to the canonical Home instead of provisioning a duplicate", failed)
+
     def test_full_preparation_certifies_same_owner_devices_and_proves_outsider_denial(self):
         events, custody, world, evidence, error = self.run_model()
         self.assertIsNone(error)
@@ -364,6 +396,12 @@ esac
         self.assertLess(denial, events.index(("copy", "outsider")))
         labels = [row["label"] for row in evidence.assertions]
         self.assertIn("uncertified outsider is refused Home", labels)
+        # #824: every additional owner device is paired for owner sync both
+        # ways and yields to the canonical Home rather than provisioning one.
+        for label in ("writer", "late", "revoked", "outsider"):
+            self.assertIn(f"{label} yields to the canonical Home instead of provisioning a duplicate", labels)
+            self.assertIn(("owner", world["machines"][label]), world["enrolled"])
+            self.assertIn((label, world["machines"]["owner"]), world["enrolled"])
         self.assertIn("original owner device offline during admission", labels)
         self.assertIn("owner and admin devices offline during history; "
                       "history served by same-owner Member-role device", labels)

@@ -39,12 +39,12 @@ import re
 import time
 import uuid
 from typing import Any, Callable
-from e2e_home_fixture import Node, Remote, SyntheticProcessCustody, config_bytes
+from e2e_home_fixture import Node, Remote, SyntheticProcessCustody, config_bytes, enroll_peer, trust_peer
 from e2e_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import load_tokens
 from e2e_vps_kv import Api, Evidence, enc, poll
 from e2e_vps_legacy_import import LegacyScenario
-from e2e_vps_private_kv import Scenario
+from e2e_vps_private_kv import Scenario, machine_id, settled_home
 
 REQUIRED_SCENARIOS = (
     "home-wiki-read", "home-wiki-save", "home-web-read", "home-web-save",
@@ -237,6 +237,14 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
     owner_key_sha = custody.key_fingerprint(nodes[owner])
     evidence.check("synthetic owner key fingerprint recorded", owner_key_sha is not None,
                    owner_key_sha256=owner_key_sha)
+    # #824: the owner's Home must exist (and its pointer be published) before
+    # a second owner device joins owner sync, or both would provision one.
+    owner_home_status, owner_home = settled_home(clients[owner], owner, args.poll_timeout)
+    evidence.check("synthetic owner Home settles before a second owner device",
+                   owner_home_status == 200 and owner_home.get("state") == "local",
+                   status=owner_home_status, state=owner_home.get("state"))
+    owner_agent, owner_machine = clients[owner].agent_id(), machine_id(clients[owner])
+    enroll_peer(evidence, clients[owner], owner, owner, None)
     card_status, response = clients[writer].request("GET", "/agent/card")
     card = response.get("card") if isinstance(response, dict) else None
     public_key = card.get("agent_public_key") if isinstance(card, dict) else None
@@ -248,6 +256,8 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
                    and isinstance(signature, str)
                    and re.fullmatch(r"[0-9a-f]{6618}", signature) is not None,
                    status=card_status)
+    writer_agent, writer_machine = clients[writer].agent_id(), machine_id(clients[writer])
+    trust_peer(evidence, clients[writer], writer, owner, owner_agent)
     custody.stop(writer)
     issue_status, issued = clients[owner].request("POST", "/owner/agents/issue",
                                                   {"agent_public_key": public_key, "mode": "acp",
@@ -255,6 +265,8 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
     certificate = (issued.get("certificate") or {}).get("storage_b64")
     evidence.check(f"owner certifies {writer}", issue_status == 200
                    and isinstance(certificate, str), status=issue_status)
+    trust_peer(evidence, clients[owner], owner, writer, writer_agent)
+    enroll_peer(evidence, clients[owner], owner, writer, writer_machine)
     custody.write_certificate(nodes[writer], certificate)
     fingerprint = custody.copy_owner_key(nodes[owner], nodes[writer])
     evidence.check(f"{writer} holds the synthetic owner key", fingerprint == owner_key_sha,
@@ -263,6 +275,13 @@ def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,
     poll(f"{writer} restarts certified", args.poll_timeout,
          lambda: clients[writer].request("GET", "/health"),
          lambda result: result[0] == 200 and result[1].get("ok") is True)
+    enroll_peer(evidence, clients[writer], writer, owner, owner_machine)
+    enroll_peer(evidence, clients[writer], writer, writer, None)
+    writer_home_status, writer_home = settled_home(clients[writer], writer, args.poll_timeout)
+    evidence.check(f"{writer} yields to the canonical Home instead of provisioning a duplicate",
+                   writer_home_status == 200 and writer_home.get("state") == "elsewhere"
+                   and writer_home.get("canonical_group_id") == owner_home.get("group_id"),
+                   status=writer_home_status, state=writer_home.get("state"))
     announce_status, _ = clients[writer].request("POST", "/announce",
                                                  {"include_user_identity": True,
                                                   "human_consent": True})
