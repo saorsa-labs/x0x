@@ -715,6 +715,8 @@ async fn issue457_treekem_unavailable_rejection_is_counted() -> Result<()> {
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: BASE64.encode(signature.as_bytes()),
+
+        certificate_b64: None,
     };
     state.treekem_groups.write().await.remove(&group_id);
 
@@ -6288,6 +6290,151 @@ async fn stale_base_treekem_sibling_terminal_with_genuine_owner_attestation_quar
         marker.snapshot.classification.as_deref(),
         Some("signer_only")
     );
+    Ok(())
+}
+
+/// WHY #842 (Rule 9): the authority's certificate caches can miss a
+/// joiner whose announce has not propagated (the R12 Home blocker — 100
+/// rejections across the whole 120 s window). The join event now carries
+/// the joiner's AgentCertificate, verified inline against the policy
+/// owner, so admission no longer depends on announce propagation. A
+/// PRESENT-but-invalid certificate (wrong owner) is a definitive refusal.
+#[tokio::test]
+async fn owner_certified_join_carried_certificate_admits_without_cache() -> Result<()> {
+    // #842 (Rule 9): the authority's certificate caches can miss a joiner
+    // whose announce has not propagated (the R12 Home blocker — 100
+    // rejections across the whole 120 s window). The join event now
+    // carries the joiner's AgentCertificate, verified inline against the
+    // policy owner, so admission no longer depends on announce
+    // propagation. A PRESENT-but-invalid certificate (foreign owner) is a
+    // definitive refusal.
+    let (authority, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "b5".repeat(32);
+    let authority_hex = hex::encode(authority.agent.agent_id().as_bytes());
+    insert_owner_group(
+        authority.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused-stage-secret",
+    )
+    .await;
+    // A FRESH invite for a FRESH joiner.
+    let joiner_kp = AgentKeypair::generate()?;
+    let member_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+    let invite_secret = format!("issue842-{member_hex}");
+    {
+        let mut groups = authority.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("authority group");
+        info.record_issued_invite(invite_secret.clone(), 0, 0, x0x::groups::GroupRole::Member);
+    }
+    // The joiner's certificate exists, but the authority's cached view of
+    // it is STRIPPED — the announce-propagation gap.
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    announce_full_cert(authority.as_ref(), joiner_cert.clone()).await;
+    {
+        let cache = authority.agent.identity_discovery_cache();
+        let mut cache = cache.write().await;
+        cache.retain(|agent, _| hex::encode(agent.as_bytes()) != member_hex);
+    }
+
+    // BASE behavior: a join WITHOUT the carried certificate is refused.
+    let (member_id, _mh, _pk, mut event) = signed_member_joined_event_for_test(
+        &joiner_kp,
+        &group_id,
+        &authority_hex,
+        &invite_secret,
+        x0x::groups::GroupRole::Member,
+    )?;
+    let result =
+        apply_named_group_metadata_event(&authority, event.clone(), member_id, true, None).await;
+    assert!(
+        !result.accepted,
+        "cache-stripped: the plain join is refused (the R12 failure)"
+    );
+    {
+        let row = diagnostics_row(authority.as_ref(), &group_id).await;
+        assert_eq!(
+            row.counters
+                .member_joined_events_rejected_owner_cert_pending,
+            1,
+            "the plain refusal is the owner-cert-pending rejection"
+        );
+    }
+
+    // #842: the same join WITH the carried certificate is admitted.
+    use base64::Engine as _;
+    if let NamedGroupMetadataEvent::MemberJoined {
+        certificate_b64, ..
+    } = &mut event
+    {
+        *certificate_b64 = Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        );
+    }
+    let result = apply_named_group_metadata_event(&authority, event, member_id, true, None).await;
+    assert!(
+        result.accepted,
+        "the carried certificate admits the join (#842)"
+    );
+    {
+        let groups = authority.named_groups.read().await;
+        let info = groups.get(&group_id).expect("authority group");
+        assert!(
+            info.has_active_member(&member_hex),
+            "the joiner is seated after the carried-cert admission"
+        );
+    }
+
+    // Negative: a certificate signed by a DIFFERENT user key (foreign
+    // owner) is a definitive refusal — not evidence-in-flight.
+    let (authority2, _dir2, owner2_kp) = owner_authority_state().await?;
+    let group2 = "b6".repeat(32);
+    let authority2_hex = hex::encode(authority2.agent.agent_id().as_bytes());
+    insert_owner_group(
+        authority2.as_ref(),
+        &group2,
+        owner_certified_policy(&owner2_kp),
+        "unused-stage-secret-2",
+    )
+    .await;
+    let joiner2_kp = AgentKeypair::generate()?;
+    let member2_hex = hex::encode(joiner2_kp.agent_id().as_bytes());
+    let secret2 = format!("issue842-{member2_hex}");
+    {
+        let mut groups = authority2.named_groups.write().await;
+        let info = groups.get_mut(&group2).expect("authority group 2");
+        info.record_issued_invite(secret2.clone(), 0, 0, x0x::groups::GroupRole::Member);
+    }
+    let foreign_kp = UserKeypair::from_seed(&[0xF7u8; 32])?;
+    let foreign_cert = issue_joiner_cert(&foreign_kp, &joiner2_kp)?;
+    let (member2, _mh2, _pk2, mut event2) = signed_member_joined_event_for_test(
+        &joiner2_kp,
+        &group2,
+        &authority2_hex,
+        &secret2,
+        x0x::groups::GroupRole::Member,
+    )?;
+    if let NamedGroupMetadataEvent::MemberJoined {
+        certificate_b64, ..
+    } = &mut event2
+    {
+        *certificate_b64 = Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&foreign_cert)?),
+        );
+    }
+    let result2 = apply_named_group_metadata_event(&authority2, event2, member2, true, None).await;
+    assert!(
+        !result2.accepted,
+        "a foreign-owner certificate is refused definitively"
+    );
+    {
+        let groups = authority2.named_groups.read().await;
+        let info = groups.get(&group2).expect("authority group 2");
+        assert!(
+            !info.has_active_member(&member2_hex),
+            "the foreign-cert joiner is not seated"
+        );
+    }
     Ok(())
 }
 

@@ -228,6 +228,8 @@ async fn canonical_alias_records_collapse_and_keep_highest_authority_revision() 
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
+
+            certificate_b64: None,
         };
         let mut info =
             treekem_metadata_group_info(authority_kp.agent_id(), alias_group_id, stable_group_id);
@@ -413,6 +415,8 @@ fn synthetic_member_joined(
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: BASE64.encode([0xA5u8; 64]),
+
+        certificate_b64: None,
     }
 }
 
