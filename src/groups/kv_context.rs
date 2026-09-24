@@ -302,6 +302,32 @@ impl KvSecureContext for PublicGroupKvContext {
         )
     }
 
+    fn apply_if_public_authorized(
+        &self,
+        writer: &AgentId,
+        verified: PublicAuthorizationVersion,
+        apply: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // update_from_group publishes the generation while holding its state
+        // write guard, so this read guard keeps the version and writer policy
+        // stable until the retained image has been applied.
+        if *self.changes.borrow() != verified
+            || state.state_revision != verified.revision
+            || state.authorization_binding() != verified.binding
+            || state.valid != verified.valid
+            || !state.authorizes(writer)
+        {
+            return Err(KvError::Unauthorized(
+                "retained public image authorization changed before merge".to_string(),
+            ));
+        }
+        apply()
+    }
+
     fn sign_authorized(
         &self,
         signing: &AuthorSigning,

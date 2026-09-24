@@ -319,6 +319,22 @@ pub trait KvSecureContext: Send + Sync {
         None
     }
 
+    /// Apply a retained public image only while its verified authorization
+    /// snapshot still holds. Public contexts keep their snapshot read guard
+    /// across `apply`, preventing a concurrent roster update from racing the
+    /// final admission decision. Other contexts fail closed.
+    fn apply_if_public_authorized(
+        &self,
+        writer: &AgentId,
+        verified: PublicAuthorizationVersion,
+        apply: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let _ = (writer, verified, apply);
+        Err(KvError::Unauthorized(
+            "secure context lacks guarded public authorization".to_string(),
+        ))
+    }
+
     /// Atomically admit an author and sign a plaintext group mutation from
     /// one roster/epoch snapshot. Public contexts override this; encrypted
     /// contexts fail closed.
