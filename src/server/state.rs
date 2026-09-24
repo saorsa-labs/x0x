@@ -943,7 +943,7 @@ pub(super) struct AppState {
     /// on restart (the set is memory-only; the stub was never on disk).
     pub(super) pending_join_stubs: StdMutex<std::collections::HashSet<String>>,
     /// #824: true while startup Home provisioning is deferred, waiting for
-    /// one owner-sync round (or its timeout) to deliver the canonical Home
+    /// a successful owner-sync session (or its rank-scaled deadline) to deliver the canonical Home
     /// pointer. `GET /home` reports `provisioning_pending` meanwhile.
     pub(super) home_provisioning_deferred: AtomicBool,
     /// #477: authority-side staged join refusals, keyed
