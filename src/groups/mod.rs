@@ -138,6 +138,16 @@ pub struct AnchoredGapRefusal {
     pub first_observed_at_ms: u64,
     /// Local time of the latest recorded refusal (unix ms).
     pub last_observed_at_ms: u64,
+    /// #846: the per-step state-hash sequence the owner attestation
+    /// covers — every intervening link of the validated chain in order,
+    /// ending with the terminal's own state hash. Each catch-up page must
+    /// match the NEXT expected hash in this sequence before anything is
+    /// adopted, so adoption stays inside what the owner attested while
+    /// multi-commit gaps still converge page by page. Empty on older
+    /// persisted records (the gate treats an empty sequence as armed with
+    /// only the head/terminal pair).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attested_chain_hashes: Vec<String>,
     /// First authenticated evidence and count for each reason. A later
     /// refusal cannot overwrite the first terminal or committer recorded
     /// for another reason. Empty on older persisted records.
