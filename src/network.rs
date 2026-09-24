@@ -4661,7 +4661,8 @@ impl NetworkNode {
     /// The receive pump's shared TopicId→priority slot (#810). The receiver
     /// task captures this handle at spawn; the gossip runtime fills the slot
     /// afterwards, and the pump reads it lazily per pressured frame.
-    pub(crate) fn pubsub_topic_priority_slot(&self) -> Arc<OnceLock<PubsubTopicPriorityResolver>> {
+    #[cfg(test)]
+    fn pubsub_topic_priority_slot(&self) -> Arc<OnceLock<PubsubTopicPriorityResolver>> {
         Arc::clone(&self.pubsub_topic_priority)
     }
 
