@@ -144,8 +144,9 @@ pub struct AnchoredGapRefusal {
     /// match the NEXT expected hash in this sequence before anything is
     /// adopted, so adoption stays inside what the owner attested while
     /// multi-commit gaps still converge page by page. Empty on older
-    /// persisted records (the gate treats an empty sequence as armed with
-    /// only the head/terminal pair).
+    /// persisted records: the gate still ARMS on them and then refuses
+    /// EVERY page (fail-closed — an attestation whose steps were never
+    /// recorded admits nothing) until the record retires.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attested_chain_hashes: Vec<String>,
     /// First authenticated evidence and count for each reason. A later

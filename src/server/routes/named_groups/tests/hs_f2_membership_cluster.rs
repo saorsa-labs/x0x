@@ -753,10 +753,6 @@ struct Issue458Stage {
     joiner_hex: String,
 }
 
-async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458Stage> {
-    issue458_stage_with_policy(group_byte, rename_first, owner_certified_policy_owner_f3).await
-}
-
 /// The r6b tier-2 fixtures use an ORDINARY (invite-only, no owner axis)
 /// policy — #458 was reproduced on exactly these groups.
 fn owner_certified_policy_owner_f3(owner_kp: &UserKeypair) -> x0x::groups::GroupPolicy {
@@ -766,10 +762,31 @@ fn owner_certified_policy_owner_f3(owner_kp: &UserKeypair) -> x0x::groups::Group
 fn invite_only_policy(_owner_kp: &UserKeypair) -> x0x::groups::GroupPolicy {
     x0x::groups::GroupPolicy::default()
 }
+async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458Stage> {
+    issue458_stage_with_policy_n(
+        group_byte,
+        usize::from(rename_first),
+        owner_certified_policy_owner_f3,
+    )
+    .await
+}
 
 async fn issue458_stage_with_policy<F>(
     group_byte: u8,
     rename_first: bool,
+    policy_fn: F,
+) -> Result<Issue458Stage>
+where
+    F: Fn(&UserKeypair) -> x0x::groups::GroupPolicy,
+{
+    issue458_stage_with_policy_n(group_byte, usize::from(rename_first), policy_fn).await
+}
+
+/// #846 r3: the stage builder with N intervening commits between the
+/// invite base and the join (the single-rename stage is `renames = 1`).
+async fn issue458_stage_with_policy_n<F>(
+    group_byte: u8,
+    renames: usize,
     policy_fn: F,
 ) -> Result<Issue458Stage>
 where
@@ -810,20 +827,30 @@ where
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner)?;
     announce_full_cert(authority.as_ref(), joiner_cert).await;
 
-    // The intermediate commit between invite base and join: a rename
-    // (exactly the E1 P1/P4 sequence — POST /home/rename between invite
-    // mint and join accept).
-    if rename_first {
+    // The intervening commits between invite base and join: the first is
+    // the E1 rename (exactly the P1/P4 sequence — POST /home/rename
+    // between invite mint and join accept); each further one varies the
+    // description (a distinct state hash per step, so multi-commit gaps
+    // can be staged for #846).
+    for step in 0..renames {
+        let request = if step == 0 {
+            UpdateGroupRequest {
+                name: Some("Renamed mid-join".to_string()),
+                description: None,
+            }
+        } else {
+            UpdateGroupRequest {
+                name: None,
+                description: Some(format!("genuine-intervening-{step}")),
+            }
+        };
         let response = update_named_group(
             State(Arc::clone(&authority)),
             axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
                 durable: true,
             }),
             Path(group_id.clone()),
-            Json(UpdateGroupRequest {
-                name: Some("Renamed mid-join".to_string()),
-                description: None,
-            }),
+            Json(request),
         )
         .await
         .into_response();
@@ -6924,7 +6951,7 @@ fn catchup_page_within_attested_sequence_table() {
     ));
     // Page 1 of a multi-commit gap (prefix ending mid-sequence): admitted.
     assert!(catchup_page_within_attested_sequence(
-        &[ev(l1)],
+        &[ev(l1.clone())],
         &base,
         &seq
     ));
@@ -6948,90 +6975,171 @@ fn catchup_page_within_attested_sequence_table() {
         &base,
         &seq,
     ));
+    // Page 2 ALONE, after page 1 applied (current == sequence[0]): the
+    // cursor must pick sequence[1] — the r2 bug restarted at
+    // sequence[0] every page, so the multi-commit gap never converged
+    // (review item 1).
+    assert!(catchup_page_within_attested_sequence(
+        &[ev(l2.clone()), ev(l3.clone())],
+        &h1,
+        &seq
+    ));
+    // A fork served as page 2 of the same gap (links from the advanced
+    // cursor but the wrong next hash): refused.
+    assert!(!catchup_page_within_attested_sequence(
+        &[ev(mk(2, &h1, &"f".repeat(64)))],
+        &h1,
+        &seq
+    ));
+    // Replaying page 1 after it applied (its prev no longer links):
+    // refused.
+    assert!(!catchup_page_within_attested_sequence(
+        &[ev(l1.clone())],
+        &h1,
+        &seq
+    ));
 }
 
-/// #846 (review item 1): an HONEST multi-commit gap converges page by page
-/// through handle_treekem_catchup_response with the gate ARMED — one
-/// event per page (the production cap), each page a prefix of the
-/// attested sequence. On 2b5acf1 every prefix page was refused and the
-/// joiner never converged (the fail-before for this test).
+/// #846 r3 (review item 2): an HONEST multi-commit gap converges page by
+/// page through handle_treekem_catchup_response with the gate PROVABLY
+/// ARMED before every page — one event per page (the production cap).
+/// The authority's REAL chain (two intervening commits, then the sealed
+/// terminal) is served link by link; each intervening page must be
+/// ADMITTED by the armed gate AND APPLIED (state_revision and
+/// state_hash advance to the served commit), which is exactly the
+/// cursor state the next page's admission is derived from. The terminal
+/// page must clear the gate too. Its APPLY needs real TreeKEM Welcome
+/// material and stays refused at this unit level — only the gate's
+/// admission is asserted there. On the r2 head (1ead6c7) page 2 was
+/// gate-refused (the walker restarted at sequence[0] every page) and,
+/// once the terminal queue drained without retention, page 2 only
+/// passed because the gate had DISARMED — this test fails on both
+/// counts there (the fail-before).
 #[tokio::test]
 async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()> {
-    let stage = issue458_stage(0xBD, true).await?;
+    // TWO intervening commits between the invite base and the join, so
+    // page 2 is an intervening commit, not just the terminal.
+    let stage = issue458_stage_with_policy_n(0xBD, 2, owner_certified_policy_owner_f3).await?;
     let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
-    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
-    let (stub, _b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
+
+    // The joiner stub: the REAL invite-base state on the TreeKEM plane,
+    // roster clock at the terminal's revision so the frontier gate lets
+    // the terminal through to the refused-adoption arm (the #818/R10
+    // fixture shape — that arm writes the durable record and queues the
+    // terminal this gate protects).
+    let mut stub = stage.base_info.clone();
+    stub.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    stub.roster_revision = stub
+        .roster_revision
+        .max(member_added_revision(&stage.member_added));
+    stub.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: stub.state_revision,
+        base_hash: stub.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+        anchored_gap_refusal: None,
+    });
     joiner_state
         .named_groups
         .write()
         .await
         .insert(stage.group_id.clone(), stub.clone());
-    let joiner_epoch = Some(1u64);
+
+    let chain = stage_intervening_chain(&stage, stub.state_revision).await;
+    assert_eq!(chain.len(), 2, "the stage carries two intervening commits");
+    let treekem_event = as_treekem_join_result(&stage.member_added);
+    let (terminal_commit, terminal_epoch) = match &treekem_event {
+        NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            treekem_epoch,
+            ..
+        } => (commit.clone(), *treekem_epoch),
+        _ => panic!("stage carries a MemberAdded with a commit"),
+    };
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
     let attestation = HeadAttestation::sign_for_terminal(
         stub.stable_group_id(),
-        &genuine,
+        &terminal_commit,
         &stage.joiner_hex,
-        joiner_epoch,
+        terminal_epoch,
         &owner_kp,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
-    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
-    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
-    use base64::Engine as _;
-    let terminal_event = NamedGroupMetadataEvent::MemberAdded {
-        group_id: stage.group_id.clone(),
-        revision: stub.state_revision,
-        actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
-        agent_id: stage.joiner_hex.clone(),
-        display_name: None,
-        treekem_commit_b64: None,
-        treekem_welcome_b64: None,
-        welcome_ref: None,
-        treekem_epoch: joiner_epoch,
-        treekem_key_package_hash: None,
-        member_joined_recovery: None,
-        member_recovery_history: Vec::new(),
-        certificate_b64: Some(
-            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
-        ),
-        owner_mandate: None,
-        commit: Some(genuine.clone()),
-    };
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     joiner_state
         .pending_adoption_chains
         .lock()
         .unwrap()
-        .insert(key.clone(), vec![link.clone()]);
+        .insert(key.clone(), chain.clone());
     joiner_state
         .pending_head_attestations
         .lock()
         .unwrap()
         .insert(key, attestation);
+
+    // The terminal arrives while the joiner is still at the base: the
+    // gap is refused and the durable record is written (gate arms).
+    let authority = stage.authority.agent.agent_id();
     let result = apply_named_group_metadata_event(
         &joiner_state,
-        as_treekem_join_result(&terminal_event),
-        stage.authority.agent.agent_id(),
+        treekem_event.clone(),
+        authority,
         true,
         None,
     )
     .await;
-    assert!(!result.accepted, "the gap is open");
+    assert!(!result.accepted, "TreeKEM never adopts across the gap");
+
+    // The record's attested sequence: every intervening link's hash,
+    // ending with the terminal's own.
+    let mut sequence: Vec<String> = chain
+        .iter()
+        .map(|link| link.commit.state_hash.clone())
+        .collect();
+    sequence.push(terminal_commit.state_hash.clone());
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        let record = info
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+            .expect("the refused gap wrote the durable record");
+        assert_eq!(record.attested_chain_hashes, sequence);
+        assert_eq!(record.terminal_state_hash, terminal_commit.state_hash);
+        assert_eq!(record.terminal_revision, terminal_commit.revision);
+        assert!(
+            crate::server::routes::named_groups::catchup_846_gate_armed(info),
+            "the gate is armed off the durable record before any page"
+        );
+    }
 
     // Serve the attested sequence ONE EVENT PER PAGE (the production
-    // cap): every prefix page must be admitted by the gate and applied,
-    // so the joiner converges step by step.
-    let authority = stage.authority.agent.agent_id();
-    let served = [link.commit.clone(), genuine.clone()];
-    for commit in served {
+    // cap): every intervening page must be admitted by the STILL-ARMED
+    // gate AND applied — revision and hash advance to the served
+    // commit, which is the cursor the next page is derived from.
+    for link in &chain {
+        let meta = link.meta.clone().expect("sealed meta retained");
         let page_event = NamedGroupMetadataEvent::GroupMetadataUpdated {
             group_id: stage.group_id.clone(),
-            revision: commit.revision,
+            revision: link.commit.revision,
             actor: hex::encode(authority.as_bytes()),
-            name: None,
-            description: Some("genuine-intervening".to_string()),
-            commit: Some(commit),
+            name: Some(meta.name.clone()),
+            description: Some(meta.description.clone()),
+            commit: Some(link.commit.clone()),
         };
+        {
+            let groups = joiner_state.named_groups.read().await;
+            let info = groups.get(&stage.group_id).expect("stub retained");
+            assert!(
+                crate::server::routes::named_groups::catchup_846_gate_armed(info),
+                "the gate is STILL ARMED before revision {} (durable record, \
+                 not the drained queue)",
+                link.commit.revision
+            );
+        }
         crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
             .store(false, std::sync::atomic::Ordering::SeqCst);
         handle_treekem_catchup_response(
@@ -7051,15 +7159,49 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the honest page passed the gate"
         );
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert_eq!(
+            info.state_revision, link.commit.revision,
+            "the honest page was ADOPTED (revision advanced)"
+        );
+        assert_eq!(
+            info.state_hash, link.commit.state_hash,
+            "the honest page was ADOPTED (hash advanced)"
+        );
     }
-    // The gate admitted EVERY honest prefix page (on 2b5acf1 page 1 of a
-    // multi-commit gap was gate-refused). Full state adoption through the
-    // apply path is fixture-bound (the forged fixture commits do not
-    // carry event shapes the apply accepts); the per-page admission walk
-    // that decides adoption is unit-proven above, and retirement-on-link
-    // is exercised via the direct revision check in the arm check
-    // (armed_anchored_gap_sequence returns None once
-    // state_revision >= terminal_revision).
+
+    // Terminal page: the cursor (now at the last applied link's hash)
+    // must reach the terminal hash and ADMIT the page. The seat itself
+    // needs real TreeKEM Welcome material and stays refused at this
+    // unit level — the gate's admission is the assertion.
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert!(
+            crate::server::routes::named_groups::catchup_846_gate_armed(info),
+            "the gate is still armed before the terminal page (the seat has not applied)"
+        );
+    }
+    crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    handle_treekem_catchup_response(
+        &joiner_state,
+        &authority,
+        true,
+        TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: stage.group_id.clone(),
+            events: vec![treekem_event],
+            truncated: false,
+        },
+    )
+    .await;
+    assert!(
+        !crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the terminal page passed the gate (cursor derived from the applied links)"
+    );
     Ok(())
 }
 
