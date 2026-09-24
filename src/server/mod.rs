@@ -1047,6 +1047,7 @@ pub async fn serve_with_options(
         treekem_pending_events: RwLock::new(HashMap::new()),
         owner_cert_pending_joins: RwLock::new(HashMap::new()),
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
+        home_provisioning_deferred: std::sync::atomic::AtomicBool::new(false),
         pending_join_refusals: StdMutex::new(HashMap::new()),
         pending_join_attempts: StdMutex::new(HashMap::new()),
         last_join_outcomes: StdMutex::new(HashMap::new()),
@@ -1321,7 +1322,14 @@ pub async fn serve_with_options(
     // ADR-0038: auto-provision the Home space for an owned install. Runs
     // AFTER restore so an existing Home is adopted (marker + roster scan)
     // instead of duplicated; best-effort — never fails startup.
-    routes::home::provision_home(&state).await;
+    // #824: creating a FRESH Home with no canonical pointer known is deferred
+    // to a background task that first waits for owner sync, so the API
+    // stays up while it waits.
+    if let Some(task) =
+        routes::home::provision_home_at_startup(&state, routes::home::HOME_POINTER_SYNC_WAIT).await
+    {
+        bg_tasks.push(task);
+    }
 
     // #449 P4: automatic retirement of duplicate Homes is DELIBERATELY NOT
     // wired here. Independent review found this call site ran before

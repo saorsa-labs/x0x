@@ -501,7 +501,15 @@ needs a certifiable founding member), and no other device of this owner may
 have already advertised a Home. If one has, this device provisions nothing
 and `GET /home` answers `state:"elsewhere"`. An absent register value means
 "none advertised yet", not "none exists", so a first or un-synced device
-still provisions. The daemon's own owner-certified agent is the founding member
+still provisions. When at least one OTHER owner machine is enrolled for Tier-1
+sync (so the pointer has a way to arrive), startup does not create a fresh Home
+at once (#824). A background task waits for one completed owner-sync pass, a
+committed record that names a canonical Home, or 90 s, whichever comes first.
+It then re-runs provisioning: it yields to the pointer if one arrived, and
+otherwise creates the Home as before. The API stays up while it waits, and
+`GET /home` answers `state:"provisioning_pending"`. With no other enrolled
+machine, provisioning is immediate: Tier-1 refuses unenrolled peers in both
+directions, so no pointer could arrive. The daemon's own owner-certified agent is the founding member
 and **primary agent** — the owner speaks *through* an agent; there is no human
 wire signer. Admission is cryptographic: joining requires an agent certificate
 chaining to the owner's user key, re-checked at every state seal. An
@@ -541,7 +549,7 @@ A `state:"local"` response (the settled case):
 
 - `owner_user_id` is the Home's `OwnerCertified` admission axis — the value a
   joining device must pin (`x0x group join … --home --owner <owner_user_id>`).
-- **There are three distinct `200` shapes**, keyed by `state`, plus two `404`s.
+- **There are four distinct `200` shapes**, keyed by `state`, plus two `404`s.
   `get_home` matches on `resolve_home` and calls `home_elsewhere_response`
   directly for the third:
 
@@ -550,9 +558,10 @@ A `state:"local"` response (the settled case):
   | `"local"` | this device holds the canonical Home, or is uncontested | the full payload above; `canonical_group_id` is `null` |
   | `"adoption_pending"` | this device holds a Home that LOST the `("home")` election | the full payload above, `canonical_group_id` names the winner, **plus `next_step`** |
   | `"elsewhere"` | the owner's Home is on another device and this one is not a member | a **short** body — `ok`, `state`, `owner_user_id`, `canonical_group_id`, `local_group_id` (nullable), `detail`, **`next_step`** — and **no** `group_id`, `name`, `members`, `duplicates` or `warnings` |
+  | `"provisioning_pending"` | #824: startup provisioning is waiting for owner sync (≤ 90 s) before creating a Home | the `elsewhere` short body with `canonical_group_id` and `local_group_id` both `null` and **no** `next_step`; poll again |
 
   `next_step` is present on both `adoption_pending` and `elsewhere`, and absent
-  from `local`. `"elsewhere"` is a `200` rather than a `404` so a second device
+  from `local` and `provisioning_pending`. `"elsewhere"` is a `200` rather than a `404` so a second device
   is not misread as Home-less and does not provision a duplicate.
 
   The two `404`s are distinct: `no Home provisioned (un-owned install)` when no

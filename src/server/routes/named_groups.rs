@@ -35025,6 +35025,7 @@ pub(in crate::server) mod tests {
             expected_join_result_inviters: StdMutex::new(HashMap::new()),
             owner_cert_pending_joins: RwLock::new(HashMap::new()),
             pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
+            home_provisioning_deferred: std::sync::atomic::AtomicBool::new(false),
             pending_adoption_chains: StdMutex::new(HashMap::new()),
             pending_head_attestations: StdMutex::new(HashMap::new()),
             pending_join_result_processing: StdMutex::new(HashMap::new()),

@@ -2138,6 +2138,9 @@ pub struct OwnerSyncService {
     view: std::sync::RwLock<Option<Arc<dyn SyncDaemonView>>>,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     session_permits: Arc<tokio::sync::Semaphore>,
+    /// #824: count of completed [`Self::sync_all`] passes, so Home
+    /// provisioning can wait for "one owner-sync round" before minting.
+    rounds_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl OwnerSyncService {
@@ -2166,6 +2169,7 @@ impl OwnerSyncService {
             view: std::sync::RwLock::new(None),
             tasks: tokio::sync::Mutex::new(Vec::new()),
             session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
+            rounds_tx: tokio::sync::watch::channel(0).0,
         });
         service.spawn_acceptor_loop(acceptor).await;
         Ok(service)
@@ -2344,9 +2348,22 @@ impl OwnerSyncService {
         result.map_err(|e| e.to_string())
     }
 
+    /// Completed-pass counter (#824): changes once per finished
+    /// [`Self::sync_all`], whether or not any peer was reachable.
+    #[must_use]
+    pub fn sync_rounds_rx(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.rounds_tx.subscribe()
+    }
+
     /// One full pass: mint local Tier-1 records from live daemon state,
     /// then sync with every enrolled machine we can resolve.
     pub async fn sync_all(&self) {
+        self.sync_all_pass().await;
+        self.rounds_tx
+            .send_modify(|rounds| *rounds = rounds.wrapping_add(1));
+    }
+
+    async fn sync_all_pass(&self) {
         if let Err(e) = self.reconcile_local_state().await {
             tracing::warn!(target: "x0x::owner_sync", error = %e, "local reconcile failed");
         }
