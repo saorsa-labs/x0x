@@ -4368,14 +4368,14 @@ async fn r6c_targeted_refusal(
         owner_mandate: None,
         commit: Some(terminal.clone()),
     };
-    let attestation = x0x::server::routes::named_groups::HeadAttestation::sign(
+    let attestation = x0x::server::routes::named_groups::HeadAttestation::sign_for_terminal(
         &stage.group_id,
-        terminal.revision - 1,
-        terminal.prev_state_hash.as_deref().unwrap_or_default(),
+        &terminal,
         &stage.joiner_hex,
+        None,
         &stage.owner_kp,
     )
-    .expect("fresh owner attestation for the mutated head");
+    .expect("fresh owner v1+v2 attestation for the mutated terminal");
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     stage
         .joiner_state
@@ -5868,20 +5868,34 @@ async fn stale_base_treekem_joiner_owner_anchored_gap_is_not_fork_evidence() -> 
         );
         assert_eq!(record.committed_by, terminal.committed_by);
         assert_eq!(record.occurrences, 1);
+        let reason = record
+            .by_reason
+            .get("owner_attested_stale_base_gap")
+            .expect("owner-anchored reason audit");
+        assert_eq!(reason.first_terminal_state_hash, terminal.state_hash);
+        assert_eq!(reason.first_committed_by, terminal.committed_by);
+        assert_eq!(reason.occurrences, 1);
     }
     let reloaded = load_named_groups_merged(
         &_jdir.path().join("named_groups.json"),
         &_jdir.path().join(HOME_SUITE_GROUPS_FILE),
     )
     .await?;
-    assert!(
-        reloaded
-            .get(&stage.group_id)
-            .and_then(|info| info.invite_lineage.as_ref())
-            .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
-            .is_some(),
-        "the audit record survives a reload (durable)"
+    let reloaded_record = reloaded
+        .get(&stage.group_id)
+        .and_then(|info| info.invite_lineage.as_ref())
+        .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+        .expect("the audit record survives a reload (durable)");
+    let durable_reason = reloaded_record
+        .by_reason
+        .get("owner_attested_stale_base_gap")
+        .expect("the owner-anchored reason survives a reload");
+    assert_eq!(
+        durable_reason.first_terminal_state_hash,
+        terminal.state_hash
     );
+    assert_eq!(durable_reason.first_committed_by, terminal.committed_by);
+    assert_eq!(durable_reason.occurrences, 1);
     // Convergence: the terminal is queued and catch-up was requested from
     // the authority (the throttle entry is written per dispatched peer).
     let queued = joiner_state
@@ -6592,6 +6606,442 @@ async fn owner_certified_join_carried_certificate_admits_without_cache() -> Resu
     Ok(())
 }
 
+/// #820: a v1 owner signature authenticates the parent head only. On the
+/// non-TreeKEM adoption path, an active second admin can sign a different
+/// same-parent terminal and replay that genuine signature. The two terminals
+/// use valid owner-issued certificates for the same joiner with different
+/// expiry fields, so their committed roster roots and state hashes differ.
+#[tokio::test]
+async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> Result<()> {
+    let stage = issue458_stage(0xB0, false).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (mut stub, b_kp, mut link, _) = two_admin_treekem_stub(&stage).await?;
+    stub.secure_plane = stage.base_info.secure_plane;
+    // The TreeKEM fixture advances this clock to drive its direct-apply
+    // frontier. A non-TreeKEM joiner must retain its invite-base clock so
+    // the terminal is processed through the across-gap adoption path.
+    stub.roster_revision = stub.state_revision;
+    assert_ne!(stub.secure_plane, x0x::mls::SecureGroupPlane::TreeKem);
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    // The shared TreeKEM helper uses forge_retained_link, which signs with
+    // no security binding. On the non-TreeKEM Home, preserve the invite
+    // base's GSS binding across the metadata-only gap.
+    link.commit = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        link.commit.revision,
+        link.commit.prev_state_hash.clone(),
+        link.commit.roster_root.clone(),
+        link.commit.policy_hash.clone(),
+        link.commit.public_meta_hash.clone(),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let genuine_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    let sibling_cert = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner_kp.public_key().as_bytes(),
+        Some(u64::MAX),
+    )?;
+    assert_ne!(
+        x0x::groups::owner_cert::certificate_digest_hex(&genuine_cert),
+        x0x::groups::owner_cert::certificate_digest_hex(&sibling_cert),
+        "the sibling changes committed roster content"
+    );
+
+    let terminal_for = |cert: &x0x::identity::AgentCertificate,
+                        signer: &AgentKeypair|
+     -> Result<x0x::groups::GroupStateCommit> {
+        let mut roster = stub.members_v2.clone();
+        let mut member = x0x::groups::GroupMember::new_member(
+            stage.joiner_hex.clone(),
+            None,
+            None,
+            now_millis_u64(),
+        );
+        member.certificate = Some(cert.clone());
+        roster.insert(stage.joiner_hex.clone(), member);
+        Ok(x0x::groups::GroupStateCommit::sign(
+            stage.group_id.clone(),
+            link.commit.revision + 1,
+            Some(link.commit.state_hash.clone()),
+            x0x::groups::compute_roster_root(&roster),
+            link.commit.policy_hash.clone(),
+            link.commit.public_meta_hash.clone(),
+            link.commit.security_binding.clone(),
+            false,
+            now_millis_u64(),
+            signer,
+        )?)
+    };
+    let genuine = terminal_for(&genuine_cert, &authority_kp)?;
+    let sibling = terminal_for(&sibling_cert, &b_kp)?;
+    assert_eq!(genuine.prev_state_hash, sibling.prev_state_hash);
+    assert_ne!(genuine.roster_root, sibling.roster_root);
+    assert_ne!(genuine.state_hash, sibling.state_hash);
+
+    let v1 = HeadAttestation::sign(
+        stub.stable_group_id(),
+        link.commit.revision,
+        &link.commit.state_hash,
+        &stage.joiner_hex,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let v2 = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        None,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    assert!(v1.terminal_signature_b64.is_none());
+    assert!(v2.terminal_signature_b64.is_some());
+    let mut malformed_v2 = v2.clone();
+    malformed_v2.terminal_signature_b64 = Some("not base64 !!".to_string());
+
+    // A v1-only owner cannot anchor either terminal; v2 anchors only the
+    // exact terminal the owner signed. A present but malformed v2 binding
+    // must not be downgraded to the ambiguous v1-only decision.
+    for (label, terminal, cert, actor, attestation, should_adopt) in [
+        (
+            "sibling with replayed v1",
+            &sibling,
+            &sibling_cert,
+            b_kp.agent_id(),
+            &v1,
+            false,
+        ),
+        (
+            "genuine terminal with v2",
+            &genuine,
+            &genuine_cert,
+            authority_kp.agent_id(),
+            &v2,
+            true,
+        ),
+        (
+            "genuine terminal with v1 only",
+            &genuine,
+            &genuine_cert,
+            authority_kp.agent_id(),
+            &v1,
+            false,
+        ),
+        (
+            "sibling with replayed v2",
+            &sibling,
+            &sibling_cert,
+            b_kp.agent_id(),
+            &v2,
+            false,
+        ),
+        (
+            "sibling with malformed v2",
+            &sibling,
+            &sibling_cert,
+            b_kp.agent_id(),
+            &malformed_v2,
+            false,
+        ),
+    ] {
+        let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(stage.group_id.clone(), stub.clone());
+        let actor_hex = hex::encode(actor.as_bytes());
+        let adopted = try_adopt_member_added_across_gap(
+            &joiner_state,
+            &stub,
+            terminal,
+            &stub,
+            &actor_hex,
+            true,
+            &stage.joiner_hex,
+            None,
+            None,
+            Some(cert.clone()),
+            None,
+            None,
+            terminal.revision,
+            x0x::groups::state_commit::ApplyError::PrevHashMismatch {
+                expected: Some(stub.state_hash.clone()),
+                got: terminal.prev_state_hash.clone(),
+            },
+            &[link.clone()],
+            Some(attestation.clone()),
+        )
+        .await;
+        assert_eq!(adopted.is_some(), should_adopt, "{label}: adoption helper");
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("invite stub retained");
+        assert!(!info.has_active_member(&stage.joiner_hex), "{label}");
+        assert_eq!(info.state_revision, stub.state_revision, "{label}");
+        assert_eq!(info.state_hash, stub.state_hash, "{label}");
+        drop(groups);
+        if should_adopt {
+            let seated = adopted.expect("positive control returns an adopted copy");
+            assert!(seated.has_active_member(&stage.joiner_hex), "{label}");
+            assert_eq!(seated.state_hash, terminal.state_hash, "{label}");
+            assert!(seated.state_hash_is_current(), "{label}");
+            continue;
+        }
+
+        let chain = [link.clone()];
+        let v1_key = served_chain_owner_v1_key(
+            &stub,
+            terminal,
+            &chain,
+            &stage.joiner_hex,
+            Some(cert),
+            Some(attestation),
+            None,
+            None,
+        );
+        assert!(v1_key.is_some(), "{label}: genuine owner v1 signature");
+        let v2_anchored = served_chain_owner_anchored(
+            &stub,
+            terminal,
+            &chain,
+            &stage.joiner_hex,
+            Some(cert),
+            Some(attestation),
+            None,
+            None,
+        );
+        let v1_only = served_chain_owner_v1_only(
+            &stub,
+            terminal,
+            &chain,
+            &stage.joiner_hex,
+            Some(cert),
+            Some(attestation),
+            None,
+            None,
+        );
+        assert!(!v2_anchored, "{label}: refused terminal is not v2 anchored");
+        assert_eq!(
+            v1_only,
+            attestation.terminal_signature_b64.is_none(),
+            "{label}: a present v2 binding cannot use the v1-only exemption"
+        );
+        assert!(
+            !classify_refused_joiner_fork_chain(
+                &joiner_state,
+                &stage.group_id,
+                &stub,
+                terminal,
+                &chain,
+                None,
+                v2_anchored,
+                v1_only,
+                false,
+            )
+            .await
+        );
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups
+            .get(&stage.group_id)
+            .expect("stub retained after refusal");
+        assert!(!info.has_active_member(&stage.joiner_hex), "{label}");
+        assert_eq!(info.state_revision, stub.state_revision, "{label}");
+        assert_eq!(info.state_hash, stub.state_hash, "{label}");
+        if v1_only {
+            assert!(!info.is_fork_quarantined(), "{label}: v1 remains pending");
+            assert!(
+                info.invite_lineage
+                    .as_ref()
+                    .is_some_and(|lineage| lineage.fork_evidence.is_none()),
+                "{label}: v1 is ambiguous, not fork evidence"
+            );
+            let record = info
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                .expect("v1-only audit recorded");
+            assert_eq!(record.reason, "v1_only_unverifiable", "{label}");
+            assert_eq!(record.terminal_state_hash, terminal.state_hash, "{label}");
+            let reason = record
+                .by_reason
+                .get("v1_only_unverifiable")
+                .expect("v1-only reason audit");
+            assert_eq!(
+                reason.first_terminal_state_hash, terminal.state_hash,
+                "{label}"
+            );
+            assert_eq!(reason.first_committed_by, terminal.committed_by, "{label}");
+            assert_eq!(reason.occurrences, 1, "{label}");
+        } else {
+            let marker = info
+                .fork_quarantine
+                .as_ref()
+                .expect("v2 sibling quarantined");
+            assert_eq!(marker.state_hash, terminal.state_hash, "{label}");
+            assert_eq!(
+                marker.snapshot.classification.as_deref(),
+                Some("signer_only"),
+                "{label}"
+            );
+        }
+        drop(groups);
+        if v1_only {
+            if label == "sibling with replayed v1" {
+                let genuine_v1_only = served_chain_owner_v1_only(
+                    &stub,
+                    &genuine,
+                    &chain,
+                    &stage.joiner_hex,
+                    Some(&genuine_cert),
+                    Some(&v1),
+                    None,
+                    None,
+                );
+                assert!(
+                    genuine_v1_only,
+                    "the second v1 refusal uses the same decision"
+                );
+                assert!(
+                    !classify_refused_joiner_fork_chain(
+                        &joiner_state,
+                        &stage.group_id,
+                        &stub,
+                        &genuine,
+                        &chain,
+                        None,
+                        false,
+                        genuine_v1_only,
+                        false,
+                    )
+                    .await,
+                    "a second v1 refusal still cannot establish a fork"
+                );
+                let groups = joiner_state.named_groups.read().await;
+                let info = groups.get(&stage.group_id).expect("stub retained");
+                assert!(!info.is_fork_quarantined());
+                let record = info
+                    .invite_lineage
+                    .as_ref()
+                    .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                    .expect("both v1 refusals audited");
+                assert_eq!(record.occurrences, 2);
+                assert_eq!(record.terminal_state_hash, genuine.state_hash);
+                let reason = record
+                    .by_reason
+                    .get("v1_only_unverifiable")
+                    .expect("v1-only reason audit survives second refusal");
+                assert_eq!(reason.occurrences, 2);
+                assert_eq!(reason.first_terminal_state_hash, sibling.state_hash);
+                assert_eq!(reason.first_committed_by, sibling.committed_by);
+                assert!(reason.first_observed_at_ms <= reason.last_observed_at_ms);
+                drop(groups);
+
+                let genuine_v2_anchored = served_chain_owner_anchored(
+                    &stub,
+                    &genuine,
+                    &chain,
+                    &stage.joiner_hex,
+                    Some(&genuine_cert),
+                    Some(&v2),
+                    None,
+                    None,
+                );
+                assert!(genuine_v2_anchored);
+                assert!(
+                    classify_refused_joiner_fork_chain(
+                        &joiner_state,
+                        &stage.group_id,
+                        &stub,
+                        &genuine,
+                        &chain,
+                        None,
+                        genuine_v2_anchored,
+                        false,
+                        false,
+                    )
+                    .await,
+                    "the owner-anchored reason is recorded separately"
+                );
+                let groups = joiner_state.named_groups.read().await;
+                let info = groups.get(&stage.group_id).expect("stub retained");
+                assert!(!info.is_fork_quarantined());
+                let record = info
+                    .invite_lineage
+                    .as_ref()
+                    .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                    .expect("both reasons audited");
+                assert_eq!(record.occurrences, 3);
+                assert_eq!(record.reason, "owner_attested_stale_base_gap");
+                assert_eq!(record.by_reason["v1_only_unverifiable"].occurrences, 2);
+                let owner_reason = &record.by_reason["owner_attested_stale_base_gap"];
+                assert_eq!(owner_reason.occurrences, 1);
+                assert_eq!(owner_reason.first_terminal_state_hash, genuine.state_hash);
+                assert_eq!(owner_reason.first_committed_by, genuine.committed_by);
+            }
+            let reloaded = load_named_groups_merged(
+                &_jdir.path().join("named_groups.json"),
+                &_jdir.path().join(HOME_SUITE_GROUPS_FILE),
+            )
+            .await?;
+            assert_eq!(
+                reloaded
+                    .get(&stage.group_id)
+                    .and_then(|info| info.invite_lineage.as_ref())
+                    .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                    .map(|record| record.reason.as_str()),
+                Some(if label == "sibling with replayed v1" {
+                    "owner_attested_stale_base_gap"
+                } else {
+                    "v1_only_unverifiable"
+                }),
+                "{label}: non-gating audit survives reload"
+            );
+            let durable_record = reloaded
+                .get(&stage.group_id)
+                .and_then(|info| info.invite_lineage.as_ref())
+                .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                .expect("durable refusal audit");
+            let durable_reason = durable_record
+                .by_reason
+                .get("v1_only_unverifiable")
+                .expect("durable v1-only reason audit");
+            assert_eq!(
+                durable_reason.first_terminal_state_hash, terminal.state_hash,
+                "{label}: first v1 terminal survives reload"
+            );
+            assert_eq!(
+                durable_reason.first_committed_by, terminal.committed_by,
+                "{label}: first v1 committer survives reload"
+            );
+            assert_eq!(
+                durable_reason.occurrences,
+                if label == "sibling with replayed v1" {
+                    2
+                } else {
+                    1
+                },
+                "{label}: per-reason count survives reload"
+            );
+            if label == "sibling with replayed v1" {
+                assert_eq!(durable_record.occurrences, 3);
+                let owner_reason = durable_record
+                    .by_reason
+                    .get("owner_attested_stale_base_gap")
+                    .expect("owner-anchored reason survives reload separately");
+                assert_eq!(owner_reason.occurrences, 1);
+                assert_eq!(owner_reason.first_terminal_state_hash, genuine.state_hash);
+                assert_eq!(owner_reason.first_committed_by, genuine.committed_by);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// #850 review item 3 (size): a REAL certificate adds ~9.8 KB base64 to
 /// the MemberJoined wire form. A cert-carrying join must still fit the
 /// 49,152-byte DM budget on the gossip/metadata path (the direct-DM
@@ -6623,6 +7073,377 @@ fn cert_carrying_member_joined_fits_dm_payload_budget() -> Result<()> {
         "cert-carrying MemberJoined is {} bytes, must fit the {} DM budget",
         wire.len(),
         x0x::dm::MAX_PAYLOAD_BYTES
+    );
+    Ok(())
+}
+
+/// Build a REAL invite-join stub for the two-admin stale-base shape: a
+/// sealed base containing the authority and admin B (so B walks validly
+/// from the base), a genuine authority link L and terminal T, and the
+/// production stub derived through `invite_join_group_info` — with the
+/// PRODUCTION clock seeding (both clocks from `base_state_revision`) and
+/// the roster-clock skew (#818) reproduced by carrying an event `revision`
+/// at/below the stub's roster clock. No hand-forced roster clock.
+async fn two_admin_real_invite_stub(
+    stage: &Issue458Stage,
+) -> Result<(
+    x0x::groups::GroupInfo,
+    AgentKeypair,
+    x0x::groups::state_commit::RetainedCommit,
+    x0x::groups::GroupStateCommit,
+)> {
+    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let b_kp = AgentKeypair::generate()?;
+    let b_hex = hex::encode(b_kp.agent_id().as_bytes());
+    let mut base = stage.base_info.clone();
+    base.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    base.add_member(
+        b_hex,
+        x0x::groups::GroupRole::Admin,
+        Some(authority_hex.clone()),
+        None,
+    );
+    let base_revision = base.state_revision.saturating_add(1);
+    let base_commit = x0x::groups::GroupStateCommit::sign(
+        base.stable_group_id().to_string(),
+        base_revision,
+        Some(base.state_hash.clone()),
+        x0x::groups::compute_roster_root(&base.members_v2),
+        x0x::groups::compute_policy_hash(&base.policy),
+        x0x::groups::compute_public_meta_hash(&base.public_meta()),
+        base.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    base.prev_state_hash = Some(base.state_hash.clone());
+    base.state_hash = base_commit.state_hash.clone();
+    base.state_revision = base_revision;
+    base.commit_log
+        .push(x0x::groups::state_commit::RetainedCommit {
+            commit: base_commit,
+            roster: x0x::groups::state_commit::roster_projection(&base.members_v2),
+            meta: Some(base.public_meta()),
+        });
+
+    // The REAL invite the authority mints at that base, and the REAL
+    // stub the join route derives from it.
+    let mut invite = x0x::groups::invite::SignedInvite::new(
+        base.mls_group_id.clone(),
+        base.name.clone(),
+        &stage.authority.agent.agent_id(),
+        0,
+    );
+    invite.stable_group_id = Some(base.stable_group_id().to_string());
+    invite.group_created_at = Some(base.created_at);
+    invite.group_description = Some(base.description.clone());
+    invite.policy = Some(base.policy.clone());
+    invite.genesis_creation_nonce = base.genesis.as_ref().map(|g| g.creation_nonce.clone());
+    invite.base_state_revision = Some(base.state_revision);
+    invite.base_state_hash = Some(base.state_hash.clone());
+    invite.base_members_v2 = Some(base.members_v2.clone());
+    invite.base_prev_state_hash = base.prev_state_hash.clone();
+    invite.secure_plane = Some(x0x::mls::SecureGroupPlane::TreeKem);
+    invite.base_secret_epoch = Some(base.secret_epoch);
+    invite.base_security_binding = base.security_binding.clone();
+    let joiner_hex = stage.joiner_hex.clone();
+    let mut stub = invite_join_group_info(
+        &invite,
+        stage.authority.agent.agent_id(),
+        &authority_hex,
+        &stage.group_id,
+        &joiner_hex,
+        None,
+        None,
+    );
+    // The real join caller attaches the #468 A5 lineage at stub creation.
+    stub.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: stub.state_revision,
+        base_hash: stub.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+        anchored_gap_refusal: None,
+    });
+
+    // The genuine intervening link L (authority) and terminal T (seats the
+    // joiner as Member), chaining from the REAL stub's base hash.
+    let policy_hash = x0x::groups::compute_policy_hash(&stub.policy);
+    let mut meta = stub.public_meta();
+    meta.description = "genuine-intervening".to_string();
+    let link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        base_revision.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        meta.clone(),
+        &authority_kp,
+    );
+    let mut roster = stub.members_v2.clone();
+    roster.insert(stage.joiner_hex.clone(), {
+        let mut m = x0x::groups::GroupMember::new_member(
+            stage.joiner_hex.clone(),
+            None,
+            None,
+            now_millis_u64(),
+        );
+        m.role = x0x::groups::GroupRole::Member;
+        m
+    });
+    let genuine = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        base_revision.saturating_add(2),
+        Some(link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&roster),
+        policy_hash,
+        x0x::groups::compute_public_meta_hash(&meta),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &authority_kp,
+    )?;
+    Ok((stub, b_kp, link, genuine))
+}
+
+/// WHY (#818 r2, Rule 9): a stale-base TreeKEM joiner built through the
+/// REAL invite path (production clock seeding, roster-clock skew) must be
+/// FORK-CLASSIFIED, not gate-queued: the refusal reaches the classifier,
+/// the owner's v2 terminal-bound attestation anchors the gap, and the
+/// terminal is queued for catch-up with no quarantine. The pre-r2 head
+/// (5f0560b) queued this event at the frontier gate instead — the audit
+/// record below is absent there, which is the fail-before.
+#[tokio::test]
+async fn real_invite_stale_base_gap_is_classified_anchored_and_queued() -> Result<()> {
+    let stage = issue458_stage(0xB3, true).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (stub, _b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    // The genuine v2 owner attestation for T, epoch included.
+    let joiner_epoch = Some(1u64);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    // The stale-base event: commit T (base+2) with the ROSTER-clock skew —
+    // revision at the stub's roster clock, which is what production
+    // MemberAdded carries (the sender's roster clock lags its state clock).
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: stub.state_revision,
+        actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: joiner_epoch,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(genuine.clone()),
+    };
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![link]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        as_treekem_join_result(&event),
+        stage.authority.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(!result.accepted, "TreeKEM never adopts across the gap");
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert!(
+            !info.is_fork_quarantined(),
+            "the owner-anchored gap must not quarantine"
+        );
+        assert!(
+            info.invite_lineage
+                .as_ref()
+                .is_some_and(|l| l.fork_evidence.is_none()),
+            "no fork evidence for the owner-anchored chain"
+        );
+        let record = info
+            .invite_lineage
+            .as_ref()
+            .and_then(|l| l.anchored_gap_refusal.as_ref())
+            .expect("the refusal was CLASSIFIED (anchored gap audited)");
+        assert_eq!(record.reason, "owner_attested_stale_base_gap");
+        assert_eq!(record.terminal_state_hash, genuine.state_hash);
+    }
+    let queued = joiner_state
+        .treekem_pending_events
+        .read()
+        .await
+        .get(&stage.group_id)
+        .is_some_and(|queue| {
+            queue.iter().any(|pending| {
+                matches!(&pending.event, NamedGroupMetadataEvent::MemberAdded {
+                    commit: Some(commit), ..
+                } if commit.state_hash == genuine.state_hash)
+            })
+        });
+    assert!(queued, "the anchored terminal is queued for replay");
+    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+    let prefix = format!("{}:{authority_hex}:", stage.group_id);
+    assert!(
+        joiner_state
+            .treekem_catchup_throttle
+            .read()
+            .await
+            .keys()
+            .any(|k| k.starts_with(&prefix)),
+        "TreeKEM catch-up was requested from the authority"
+    );
+    Ok(())
+}
+
+/// WHY (#818 r2 negative, Rule 9): a removed admin B's same-parent sibling
+/// delivered to a REAL-path stale-base joiner must STILL be classified and
+/// quarantined `signer_only` — even alongside the owner's GENUINE
+/// attestation (v2 binds the genuine terminal only). The pre-r2 head
+/// (5f0560b) queued this event at the frontier gate (B is an admin in the
+/// stub) so nothing was classified — the missing marker is the fail-before.
+#[tokio::test]
+async fn real_invite_removed_admin_sibling_is_classified_and_quarantined() -> Result<()> {
+    let stage = issue458_stage(0xB4, false).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (stub, b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
+    let b_hex = hex::encode(b_kp.agent_id().as_bytes());
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    // The owner's GENUINE v2 attestation for T (binds T, not any sibling).
+    let joiner_epoch = Some(1u64);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    // B's divergent sibling: same parent (L), same revision, same joiner,
+    // different roster (joiner seated as ADMIN), signed by B.
+    let mut sibling_roster = stub.members_v2.clone();
+    sibling_roster.insert(stage.joiner_hex.clone(), {
+        let mut m = x0x::groups::GroupMember::new_member(
+            stage.joiner_hex.clone(),
+            None,
+            None,
+            now_millis_u64(),
+        );
+        m.role = x0x::groups::GroupRole::Admin;
+        m
+    });
+    let sibling = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        genuine.revision,
+        genuine.prev_state_hash.clone(),
+        x0x::groups::compute_roster_root(&sibling_roster),
+        genuine.policy_hash.clone(),
+        genuine.public_meta_hash.clone(),
+        stub.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        &b_kp,
+    )?;
+    assert_ne!(sibling.state_hash, genuine.state_hash);
+
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: stub.state_revision,
+        actor: b_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: joiner_epoch,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(sibling.clone()),
+    };
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![link]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        as_treekem_join_result(&event),
+        b_kp.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(!result.accepted, "the sibling is refused");
+    let groups = joiner_state.named_groups.read().await;
+    let info = groups.get(&stage.group_id).expect("stub retained");
+    let marker = info
+        .fork_quarantine
+        .as_ref()
+        .expect("B's sibling is CLASSIFIED divergent evidence, not a gate-queued gap");
+    assert_eq!(marker.state_hash, sibling.state_hash);
+    assert_eq!(marker.committed_by, b_hex);
+    assert_eq!(
+        marker.snapshot.classification.as_deref(),
+        Some("signer_only")
     );
     Ok(())
 }

@@ -126,6 +126,15 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
     is the §5 shape; `reason` is `fork_quarantined`. Nothing is seated and
     nothing is written. **It is retryable:** a retry re-reads the group and
     either seats cleanly or refuses with the ordinary §1 gate.
+  - **Ownerless TreeKEM stale-base joins (#818 design decision).** The
+    walk-authenticated stale-base exemption from #816 is owner-anchored
+    ONLY: without an owner head attestation nothing authenticates "gap"
+    versus "fork" for a walk-clean chain, so an ORDINARY (ownerless)
+    TreeKEM group keeps the `signer_only` quarantine as the safe default
+    when a join result skips intervening commits. Mitigations: mint
+    just-in-time invites (after the intervening commits land), or clear
+    the marker via `POST /groups/:id/quarantine/clear` once canonical
+    state is restored.
   - **Encrypted (GSS) KvStore routes** now refuse with 409 `fork_quarantined`
     while the group is quarantined — previously the cached authorization
     context was blind to a marker installed after the store bound, so writes

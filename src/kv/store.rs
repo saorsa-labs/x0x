@@ -2166,6 +2166,40 @@ impl KvStore {
         peer_id: PeerId,
         writer: Option<&AgentId>,
     ) -> Result<MergeOutcome> {
+        self.merge_delta_with_outcome_inner(delta, peer_id, writer, false)
+    }
+
+    /// Merge an encrypted delta while the caller holds this store's write
+    /// guard and the attached GSS context's authorization read guard. This
+    /// skips only the duplicate writer lookup, which would recursively take
+    /// the context read lock and can deadlock behind a waiting updater.
+    pub(crate) fn merge_guarded_encrypted_delta(
+        &mut self,
+        delta: &KvStoreDelta,
+        peer_id: PeerId,
+        writer: &AgentId,
+        verified_context: &Arc<dyn KvSecureContext>,
+    ) -> Result<MergeOutcome> {
+        if !matches!(self.policy, AccessPolicy::Encrypted { .. })
+            || !self
+                .secure
+                .as_ref()
+                .is_some_and(|attached| Arc::ptr_eq(attached, verified_context))
+        {
+            return Err(KvError::Unauthorized(
+                "guarded encrypted merge requires its attached secure context".to_string(),
+            ));
+        }
+        self.merge_delta_with_outcome_inner(delta, peer_id, Some(writer), true)
+    }
+
+    fn merge_delta_with_outcome_inner(
+        &mut self,
+        delta: &KvStoreDelta,
+        peer_id: PeerId,
+        writer: Option<&AgentId>,
+        writer_pre_authorized: bool,
+    ) -> Result<MergeOutcome> {
         // SelfKeyed directories take the per-key path: no owner gate, no
         // checkpoint adoption — the store has no owner for life (I3/I8), so
         // both owner-anchored blocks below would no-op anyway.
@@ -2225,7 +2259,7 @@ impl KvStore {
         }
         // Access control: reject unauthorized writes
         if let Some(writer_id) = writer {
-            if !self.is_authorized(writer_id) {
+            if !writer_pre_authorized && !self.is_authorized(writer_id) {
                 tracing::warn!(
                     "rejected delta from unauthorized writer {} for store {}",
                     hex::encode(writer_id.as_bytes()),

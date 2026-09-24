@@ -2059,6 +2059,15 @@ impl PubSubManager {
             .register(topic_id, priority);
     }
 
+    /// #810: the admission priority for a topic, read from the same registry
+    /// the substrate admission uses. Consumed by the receive pump's
+    /// proactive control-frame shed exemption so Critical topics (e.g.
+    /// `x0x/dm/v1/*` lazy repair) are never shed before classification.
+    /// Unregistered topics read as `TopicPriority::Normal`.
+    pub(crate) fn topic_priority_for(&self, topic: &TopicId) -> TopicPriority {
+        self.plumtree.admission().registry().priority_for(topic)
+    }
+
     /// Initialize PlumTree peers for a topic from currently connected peers.
     async fn initialize_topic_peers(&self, topic: TopicId) {
         // #674 C2/C3: the pre-subscribe warm path also creates the topic,
