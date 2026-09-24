@@ -391,6 +391,7 @@ struct RequestSlotScheduler {
     waiting_for_membership: bool,
     version: Option<PublicAuthorizationVersion>,
     attempt: usize,
+    published_requests: usize,
     converged: bool,
     initialized: bool,
     refresh_tick: tokio::time::Interval,
@@ -418,6 +419,7 @@ impl RequestSlotScheduler {
             waiting_for_membership: false,
             version,
             attempt: 0,
+            published_requests: 0,
             converged: false,
             initialized: false,
             refresh_tick,
@@ -432,9 +434,14 @@ impl RequestSlotScheduler {
 
     fn request_unavailable(&mut self) {
         self.waiting_for_membership = true;
+        self.published_requests = 0;
         // A denied slot is not a broadcast. Continue checking membership at
         // the bounded front cadence instead of drifting into the 300s tail.
         self.attempt = self.attempt.min(2);
+    }
+
+    fn request_published(&mut self) {
+        self.published_requests = self.published_requests.saturating_add(1);
     }
 
     fn observe_change(&mut self, evidence: &Arc<std::sync::Mutex<ServedEvidence>>) -> Option<bool> {
@@ -445,6 +452,7 @@ impl RequestSlotScheduler {
         )?;
         if changed {
             self.attempt = 0;
+            self.published_requests = 0;
             self.converged = false;
         }
         Some(changed)
@@ -538,6 +546,7 @@ impl RequestSlotScheduler {
                             // traffic, and subsequent retries use cooldown.
                             self.waiting_for_membership = false;
                             self.attempt = 2;
+                            self.published_requests = 0;
                             break;
                         }
                     },
@@ -562,7 +571,7 @@ impl RequestSlotScheduler {
             // before the owner or a complete holder is discovered. Keep the
             // original four requests, then stop promptly when local state
             // matches the strongest available evidence.
-            if self.attempt >= STATE_REQUEST_DISCOVERY_MIN_SLOTS {
+            if self.published_requests >= STATE_REQUEST_DISCOVERY_MIN_SLOTS {
                 let Some(store) = store.upgrade() else {
                     return false;
                 };
@@ -3170,6 +3179,8 @@ impl KvStoreSync {
                     }
                     if let Err(e) = result {
                         tracing::debug!("KvStore state-request publish failed: {e}");
+                    } else {
+                        schedule.request_published();
                     }
                 }
             };
@@ -4561,7 +4572,7 @@ mod tests {
         }));
         let mut observed = Some(old);
         let mut delays = state_request_delays();
-        for _ in 0..10 {
+        for _ in 0..STATE_REQUEST_RETRY_SECS.len() + 4 {
             let _ = delays.next();
         }
         assert_eq!(delays.next(), Some(300), "pre-change capped tail");
@@ -4675,6 +4686,7 @@ mod tests {
             {
                 sent.send(schedule.version.expect("public version").revision)
                     .expect("in-memory publication");
+                schedule.request_published();
             }
         });
 
@@ -4800,6 +4812,7 @@ mod tests {
 
         let mut legacy = RequestSlotScheduler::new(None);
         assert!(legacy.next_slot(context()).await, "initial request");
+        legacy.request_published();
         evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4809,6 +4822,7 @@ mod tests {
                 legacy.next_slot(context()).await,
                 "v1 marker and partial local state must not stop request {slot}"
             );
+            legacy.request_published();
         }
         assert!(
             !legacy.next_slot(context()).await,
@@ -4823,6 +4837,7 @@ mod tests {
             matching_partial_v2.next_slot(context()).await,
             "initial v2 request"
         );
+        matching_partial_v2.request_published();
         let digest = store.read().await.served_digest();
         evidence
             .lock()
@@ -4840,6 +4855,7 @@ mod tests {
                 matching_partial_v2.next_slot(context()).await,
                 "partial holder's matching v2 digest cannot stop request {slot}"
             );
+            matching_partial_v2.request_published();
         }
         assert!(
             !matching_partial_v2.next_slot(context()).await,
@@ -4869,6 +4885,7 @@ mod tests {
         };
         let mut matching_empty_v2 = RequestSlotScheduler::new(None);
         assert!(matching_empty_v2.next_slot(empty_context()).await);
+        matching_empty_v2.request_published();
         empty_evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4885,6 +4902,7 @@ mod tests {
                 matching_empty_v2.next_slot(empty_context()).await,
                 "empty non-owner's v2 digest cannot stop request {slot}"
             );
+            matching_empty_v2.request_published();
         }
         assert!(
             !matching_empty_v2.next_slot(empty_context()).await,
@@ -4935,6 +4953,7 @@ mod tests {
             {
                 sent.send(schedule.version.expect("public version").revision)
                     .expect("in-memory publication");
+                schedule.request_published();
             }
         });
         for _ in 0..9 {
@@ -8386,6 +8405,114 @@ mod tests {
                 .await
                 .expect("membership must wake before the 300s backoff tail"),
             "a newly authorized reader gets a request slot"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_membership_keeps_four_published_requests_for_multiple_holders() {
+        let owner = agent(1);
+        let joiner = agent(2);
+        let (mut group, _, _) = encrypted_group(&[owner]);
+        let ctx = Arc::new(GssKvSecureContext::from_group(&group).expect("group context"));
+        let shared: SharedKvSecureContext = ctx.clone();
+        let mut partial = KvStore::new(
+            store_id(73),
+            "cold".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        )
+        .expect("partial store");
+        partial
+            .put(
+                "cached".to_string(),
+                b"partial".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("partial entry");
+        let partial_digest = partial.served_digest();
+        let mut complete = partial.clone();
+        complete
+            .put(
+                "history".to_string(),
+                b"complete".to_vec(),
+                "text/plain".to_string(),
+                peer(3),
+            )
+            .expect("complete holder entry");
+        let complete_digest = complete.served_digest();
+        let store = Arc::new(RwLock::new(partial));
+        let weak = Arc::downgrade(&store);
+        let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        let active = std::sync::atomic::AtomicBool::new(true);
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let bootstrap_cancel = tokio_util::sync::CancellationToken::new();
+        let context = || RequestSlotContext {
+            cancel: &cancel,
+            bootstrap_cancel: &bootstrap_cancel,
+            stopped: &stopped,
+            refresh: None,
+            evidence: &evidence,
+            store: &weak,
+            bootstrap_active: &active,
+        };
+        let mut schedule = RequestSlotScheduler::new(None).with_encrypted_reader(shared, joiner);
+
+        for _ in 0..2 {
+            assert!(schedule.next_slot(context()).await, "denied seal slot");
+            schedule.request_unavailable();
+        }
+        assert_eq!(schedule.published_requests, 0);
+        group.add_member(
+            hex::encode(joiner.as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(owner.as_bytes())),
+            None,
+        );
+        let _ = group.rotate_shared_secret();
+        ctx.update_from_group(&group);
+
+        for publication in 1..=STATE_REQUEST_DISCOVERY_MIN_SLOTS {
+            assert!(
+                schedule.next_slot(context()).await,
+                "partial holder must not close discovery before publication {publication}"
+            );
+            // Model a successful publish API call. The preceding denied
+            // slots never enter this count.
+            schedule.request_published();
+            assert_eq!(schedule.published_requests, publication);
+            if publication == 1 {
+                evidence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .digests
+                    .insert(
+                        peer(1),
+                        ServedState {
+                            digest: partial_digest,
+                            entry_count: 1,
+                        },
+                    );
+            }
+            if publication == 3 {
+                evidence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .digests
+                    .insert(
+                        peer(3),
+                        ServedState {
+                            digest: complete_digest,
+                            entry_count: 2,
+                        },
+                    );
+            }
+        }
+        *store.write().await = complete;
+        assert!(
+            !schedule.next_slot(context()).await,
+            "matching complete holder evidence may close only after four real publications"
         );
     }
 
