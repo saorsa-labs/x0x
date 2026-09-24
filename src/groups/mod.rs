@@ -108,6 +108,37 @@ pub struct InviteLineage {
     /// `(revision, state_hash, committed_by)`; first evidence wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_evidence: Option<ForkEvidence>,
+    /// Audit record of served join chains that were NOT recorded as fork
+    /// evidence because the admission owner attested the exact terminal
+    /// (a stale-base GAP, not a fork). Non-gating: nothing reads it for a
+    /// decision; it exists so every use of that exemption is durable and
+    /// visible (`GET /groups/:id` → `invite_lineage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchored_gap_refusal: Option<AnchoredGapRefusal>,
+}
+
+/// The latest owner-anchored stale-base refusal plus a running count
+/// (see [`InviteLineage::anchored_gap_refusal`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchoredGapRefusal {
+    /// Why the chain was exempted from fork evidence.
+    pub reason: String,
+    /// Revision of the attested head (the terminal's parent).
+    pub head_revision: u64,
+    /// State hash of the attested head.
+    pub head_state_hash: String,
+    /// Revision of the refused terminal commit.
+    pub terminal_revision: u64,
+    /// State hash of the refused terminal commit.
+    pub terminal_state_hash: String,
+    /// The admin that committed the terminal (hex agent id).
+    pub committed_by: String,
+    /// Total anchored refusals recorded on this lineage.
+    pub occurrences: u64,
+    /// Local time of the first recorded refusal (unix ms).
+    pub first_observed_at_ms: u64,
+    /// Local time of the latest recorded refusal (unix ms).
+    pub last_observed_at_ms: u64,
 }
 
 /// One authenticated fork-evidence record (#468 A5).
