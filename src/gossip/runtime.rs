@@ -3,7 +3,7 @@
 use super::config::GossipConfig;
 use super::pubsub::{PubSubManager, SigningContext};
 use crate::error::NetworkResult;
-use crate::network::NetworkNode;
+use crate::network::{NetworkNode, PubsubTopicPriorityResolver};
 use crate::presence::PresenceWrapper;
 use saorsa_gossip_membership::{HyParViewMembership, MembershipConfig};
 use saorsa_gossip_transport::GossipStreamType;
@@ -967,6 +967,22 @@ impl GossipRuntime {
         )?;
         pubsub.configure_egress(&config).await?;
         let pubsub = Arc::new(pubsub);
+        // #810: hand the receive pump a TopicId→priority resolver so the
+        // >90% proactive control-frame shed exempts Critical topics (e.g.
+        // `x0x/dm/v1/*` IHAVE/IWANT lazy repair). Weak reference: the
+        // PubSubManager (via its transport) holds the network Arc, so a
+        // strong handle here would create a shutdown leak cycle. While the
+        // manager is gone the pump falls back to the pre-#810 shed behaviour.
+        let weak_pubsub = Arc::downgrade(&pubsub);
+        network.set_pubsub_topic_priority_resolver(PubsubTopicPriorityResolver::new(
+            move |topic| {
+                weak_pubsub
+                    .upgrade()
+                    .map_or(saorsa_gossip_types::TopicPriority::Normal, |manager| {
+                        manager.topic_priority_for(topic)
+                    })
+            },
+        ));
         let dispatch_workers = config.dispatch_workers;
 
         Ok(Self {
