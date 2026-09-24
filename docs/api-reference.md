@@ -561,7 +561,7 @@ A `state:"local"` response (the settled case):
   see. Neither is the `elsewhere` case.
 
   `POST /home/seat`'s `409 reason` values (`adoption_pending`, `elsewhere`,
-  `unknown`) are the **seat** endpoint's refusals, a separate surface from
+  `unknown`, `ambiguous_home`) are the **seat** endpoint's refusals, a separate surface from
   these `GET` shapes — do not read one as documentation of the other.
 - `placement` per member: `"roaming"` | `"pinned"` (from Home metadata).
 - `primary_agent.verified` is the fail-closed trust check that the primary's
@@ -607,8 +607,12 @@ mint seats into its duplicate. A successful `200` response has this shape:
 `400` covers a malformed or self-targeting `agent_id`; `404` means an un-owned
 install with no loaded owner key. An owned install with unresolved Home state
 returns `409 unknown`, not `404`. `409` includes typed `reason` values
-`adoption_pending`, `elsewhere`, or `unknown`, with a nullable
-`canonical_group_id`. The underlying invite authority can additionally return
+`adoption_pending`, `elsewhere`, `unknown`, or `ambiguous_home`, with a nullable
+`canonical_group_id`. `ambiguous_home` (#824) means this device is seated in
+more than one Home-shaped group (`GET /home` lists the others in `duplicates`)
+and the canonical `("home")` pointer is unknown or does not name the group the
+seat would mint into; the seat mints nothing rather than guess, and succeeds
+once owner sync delivers a pointer naming a Home this device holds. The underlying invite authority can additionally return
 its documented errors, including `409 owner_key_unavailable`, `413
 invite_too_large`, `429 invite_cap_reached`, and persistence failures. A
 successful call is **not idempotent**: it records a new single-use invite and
