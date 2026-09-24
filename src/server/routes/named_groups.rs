@@ -4291,6 +4291,16 @@ async fn classify_refused_joiner_fork_chain(
         // authenticated evidence of anything this node can anchor.
         return false;
     }
+    // #818 design decision (Root, 2026-09-24): the gap exemption below is
+    // deliberately OWNER-ANCHORED ONLY. Without an owner attestation there
+    // is nothing that authenticates "gap" versus "fork" for a walk-clean
+    // chain — a creator/sealer check is not a terminal binding (a removed
+    // creator or admin can still sign from the stale base) — so for
+    // ORDINARY (ownerless) TreeKEM groups the walk-authenticated chain
+    // keeps the signer_only quarantine as the safe default. Mitigations
+    // for an ownerless stale-base join: mint just-in-time invites (after
+    // the intervening commits), or clear the marker via
+    // POST /groups/:id/quarantine/clear once canonical state is restored.
     if served_chain_owner_anchored {
         // The served chain DESCENDS from our invite base and the ADMISSION
         // OWNER's head attestation CAS-binds the terminal to exactly this
