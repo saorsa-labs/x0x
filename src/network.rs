@@ -4658,6 +4658,17 @@ impl NetworkNode {
         Arc::clone(&self.pubsub_topic_priority)
     }
 
+    /// The resolver handle the receiver PUMP captures at spawn (#810).
+    /// Extracted as the single capture site so the wiring test observes the
+    /// pump's actual handle — reintroducing a spawn-time snapshot here (the
+    /// original #830 blocker) disconnects the pump from the runtime wiring
+    /// and fails that test.
+    fn receiver_topic_priority_handle(
+        slot: &Arc<OnceLock<PubsubTopicPriorityResolver>>,
+    ) -> Arc<OnceLock<PubsubTopicPriorityResolver>> {
+        Arc::clone(slot)
+    }
+
     /// Install the #810 TopicId→priority resolver consulted by the receive
     /// pump before it proactively sheds a recoverable PubSub control frame.
     /// One-shot: the first resolver wins and later installs are ignored, so
@@ -4681,7 +4692,8 @@ impl NetworkNode {
         let session_registry_cap = self.session_registry_cap();
         let recv_pubsub_tx = self.recv_pubsub_tx.clone();
         let recv_membership_tx = self.recv_membership_tx.clone();
-        let pubsub_topic_priority = self.pubsub_topic_priority_slot();
+        let pubsub_topic_priority =
+            Self::receiver_topic_priority_handle(&self.pubsub_topic_priority);
         let recv_bulk_tx = self.recv_bulk_tx.clone();
         let recv_pump_diagnostics = Arc::clone(&self.recv_pump_diagnostics);
         // #378 fix D: DM classes go through lossless spill forwarders so the
@@ -8192,14 +8204,16 @@ mod pressure_tests {
 
     #[tokio::test]
     async fn recv_pump_topic_priority_slot_is_lazily_wired_by_the_runtime() {
-        // #810 wiring (review item 2): the receiver task is spawned inside
-        // `NetworkNode::new`, BEFORE `GossipRuntime` exists — so the pump
-        // must hold the SHARED resolver slot and read it lazily, not a
-        // spawn-time snapshot (a snapshot is always empty and the Critical
-        // exemption never runs). This test drives the real construction
-        // path: capture the pump's slot handle pre-runtime, construct the
-        // runtime, and assert the pre-captured handle now resolves a real
-        // statically-registered Critical topic.
+        // #810 wiring (review item 2, r2 form): the receiver task is spawned
+        // inside `NetworkNode::new`, BEFORE `GossipRuntime` exists. The
+        // pump's captured handle must therefore be the SHARED resolver slot
+        // (read lazily per pressured frame), never a spawn-time snapshot —
+        // a snapshot is always empty, so the Critical exemption never runs
+        // and every node still sheds Critical IHAVE/IWANT. This test takes
+        // its handle from the pump's single capture site
+        // (`receiver_topic_priority_handle`, exactly what `spawn_receiver`
+        // captures) around the REAL construction path, so reintroducing the
+        // snapshot at that site fails here.
         use crate::gossip::runtime::GossipRuntime;
         use crate::gossip::GossipConfig;
         use saorsa_gossip_types::TopicId;
@@ -8218,10 +8232,11 @@ mod pressure_tests {
         .await
         .expect("network node");
 
-        // The exact handle `spawn_receiver` captured at node construction.
-        let pump_slot = network.pubsub_topic_priority_slot();
+        // The exact handle the spawned pump captured.
+        let pump_handle =
+            NetworkNode::receiver_topic_priority_handle(&network.pubsub_topic_priority);
         assert!(
-            pump_slot.get().is_none(),
+            pump_handle.get().is_none(),
             "pre-runtime: the pump's slot is empty"
         );
 
@@ -8231,26 +8246,38 @@ mod pressure_tests {
             .await
             .expect("gossip runtime");
         assert!(
-            pump_slot.get().is_some(),
+            Arc::ptr_eq(&pump_handle, &runtime_network_slot(&runtime)),
+            "the pump's captured handle IS the slot the runtime filled"
+        );
+        assert!(
+            pump_handle.get().is_some(),
             "the already-spawned pump must observe the resolver the runtime installed"
         );
 
         // The resolver answers through the real registry: `x0x/dm/v1/bus` is
         // statically registered Critical; an arbitrary unregistered topic
         // reads Normal (the documented relay-side limit).
-        let resolver = pump_slot.get().expect("resolver installed");
         let dm_bus = TopicId::from_entity(b"x0x/dm/v1/bus");
         assert!(
-            is_critical_pubsub_control(&critical_topic_frame(dm_bus), Some(&pump_slot)),
-            "the pump's captured slot resolves a registered Critical topic"
+            is_critical_pubsub_control(&critical_topic_frame(dm_bus), Some(&pump_handle)),
+            "the pump's captured handle resolves a registered Critical topic"
         );
         assert_eq!(
-            resolver.resolve(&TopicId::new([42u8; 32])),
+            pump_handle
+                .get()
+                .expect("resolver installed")
+                .resolve(&TopicId::new([42u8; 32])),
             saorsa_gossip_types::TopicPriority::Normal,
             "unregistered topics read Normal through the same slot"
         );
 
         runtime.shutdown().await.expect("runtime shutdown");
+
+        fn runtime_network_slot(
+            runtime: &GossipRuntime,
+        ) -> Arc<OnceLock<PubsubTopicPriorityResolver>> {
+            runtime.network().pubsub_topic_priority_slot()
+        }
 
         fn critical_topic_frame(topic: saorsa_gossip_types::TopicId) -> Bytes {
             use saorsa_gossip_pubsub::GossipMessage;
