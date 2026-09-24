@@ -942,6 +942,10 @@ pub(super) struct AppState {
     /// group's next durable persist happens (the confirmation itself) and
     /// on restart (the set is memory-only; the stub was never on disk).
     pub(super) pending_join_stubs: StdMutex<std::collections::HashSet<String>>,
+    /// #824: true while startup Home provisioning is deferred, waiting for
+    /// one owner-sync round (or its timeout) to deliver the canonical Home
+    /// pointer. `GET /home` reports `provisioning_pending` meanwhile.
+    pub(super) home_provisioning_deferred: AtomicBool,
     /// #477: authority-side staged join refusals, keyed
     /// `(group_id, member_agent_id, attempt_id)` — terminal facts with a
     /// lazy ML-DSA signature materialized on first capable serve. Bounded
