@@ -1944,6 +1944,11 @@ pub struct NetworkNode {
     /// frame by the already-spawned receiver task — a spawn-time snapshot
     /// would always see it empty because the runtime is constructed later.
     pubsub_topic_priority: Arc<OnceLock<PubsubTopicPriorityResolver>>,
+    /// #810 test-only: the exact resolver handle `spawn_receiver` moved
+    /// into the pump task, so the wiring test observes the PUMP's captured
+    /// local rather than re-deriving it. Set once at spawn.
+    #[cfg(test)]
+    receiver_captured_priority: Arc<OnceLock<Arc<OnceLock<PubsubTopicPriorityResolver>>>>,
     /// Connection-churn observation counters (#368 gate 2). Arc so the
     /// Clone derive shares state; fed by the spawn_observer task.
     churn: Arc<ChurnCounters>,
@@ -2285,6 +2290,8 @@ impl NetworkNode {
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
             recv_pump_diagnostics,
             pubsub_topic_priority: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            receiver_captured_priority: Arc::new(OnceLock::new()),
             churn: Arc::new(ChurnCounters::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
@@ -4694,6 +4701,12 @@ impl NetworkNode {
         let recv_membership_tx = self.recv_membership_tx.clone();
         let pubsub_topic_priority =
             Self::receiver_topic_priority_handle(&self.pubsub_topic_priority);
+        #[cfg(test)]
+        {
+            let _ = self
+                .receiver_captured_priority
+                .set(Arc::clone(&pubsub_topic_priority));
+        }
         let recv_bulk_tx = self.recv_bulk_tx.clone();
         let recv_pump_diagnostics = Arc::clone(&self.recv_pump_diagnostics);
         // #378 fix D: DM classes go through lossless spill forwarders so the
@@ -8233,8 +8246,11 @@ mod pressure_tests {
         .expect("network node");
 
         // The exact handle the spawned pump captured.
-        let pump_handle =
-            NetworkNode::receiver_topic_priority_handle(&network.pubsub_topic_priority);
+        let pump_handle = network
+            .receiver_captured_priority
+            .get()
+            .expect("spawn_receiver recorded the handle it moved into the pump")
+            .clone();
         assert!(
             pump_handle.get().is_none(),
             "pre-runtime: the pump's slot is empty"
