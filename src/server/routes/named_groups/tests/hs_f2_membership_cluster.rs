@@ -6294,9 +6294,10 @@ async fn stale_base_treekem_sibling_terminal_with_genuine_owner_attestation_quar
 /// WHY (#816 review, untested helper branches): the anchor is a pure
 /// predicate and every refusal branch must fail CLOSED. Exercised directly
 /// over the two-admin fixture: exact v2 attestation ⇒ anchored; each
-/// single deviation (v1-only wire form, sibling terminal, served chain
-/// head ≠ attested head, cross-group attestation, no owner axis, no
-/// trusted owner key) ⇒ not anchored.
+/// single deviation (no attestation, v1-only wire form, malformed v1/v2
+/// base64 or signature bytes, unattested epoch, sibling terminal, served
+/// chain head ≠ attested head, cross-group attestation, no trusted owner
+/// key, no owner axis) ⇒ not anchored.
 #[tokio::test]
 async fn served_chain_owner_anchored_fails_closed_on_every_deviation() -> Result<()> {
     let stage = issue458_stage(0xAA, false).await?;
@@ -6344,6 +6345,59 @@ async fn served_chain_owner_anchored_fails_closed_on_every_deviation() -> Result
         &chain,
         Some(&cert),
         &v1_only,
+        epoch
+    ));
+    // No attestation at all.
+    assert!(!served_chain_owner_anchored(
+        &stub,
+        &genuine,
+        &chain,
+        &stage.joiner_hex,
+        Some(&cert),
+        None,
+        None,
+        epoch,
+    ));
+    // Malformed v2 binding: not base64, and base64 of non-signature bytes.
+    let mut bad_b64 = attestation.clone();
+    bad_b64.terminal_signature_b64 = Some("not base64 !!".to_string());
+    assert!(!anchored(
+        &stub,
+        &genuine,
+        &chain,
+        Some(&cert),
+        &bad_b64,
+        epoch
+    ));
+    let mut bad_sig = attestation.clone();
+    bad_sig.terminal_signature_b64 = Some("AAAA".to_string());
+    assert!(!anchored(
+        &stub,
+        &genuine,
+        &chain,
+        Some(&cert),
+        &bad_sig,
+        epoch
+    ));
+    // Malformed v1 signature with a valid v2 binding.
+    let mut bad_v1 = attestation.clone();
+    bad_v1.signature_b64 = "not base64 !!".to_string();
+    assert!(!anchored(
+        &stub,
+        &genuine,
+        &chain,
+        Some(&cert),
+        &bad_v1,
+        epoch
+    ));
+    let mut bad_v1_sig = attestation.clone();
+    bad_v1_sig.signature_b64 = "AAAA".to_string();
+    assert!(!anchored(
+        &stub,
+        &genuine,
+        &chain,
+        Some(&cert),
+        &bad_v1_sig,
         epoch
     ));
     // Epoch the owner did not attest.
