@@ -1447,6 +1447,7 @@ impl KvStoreSync {
                 return false;
             }
         };
+        let verified_generation = ctx.encrypted_authorization_generation();
         let mutation = match open_mutation(ctx.as_ref(), store_id, &record) {
             Ok(m) => m,
             Err(e) => {
@@ -1495,24 +1496,76 @@ impl KvStoreSync {
             None
         };
         let mut s = store.write().await;
-        let result = if mutation.kind == KvMutationKind::RetainedState {
-            let payload = retained_image.as_deref().unwrap_or_default();
-            if payload.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
-                Err(KvError::Gossip(
-                    "retained encrypted group image exceeds size limit".to_string(),
-                ))
-            } else {
-                bincode::deserialize::<KvStore>(payload)
-                    .map_err(|e| KvError::Gossip(format!("bad retained encrypted image: {e}")))
-                    .and_then(|image| {
-                        s.merge_group_retained_image(&image, mutation.author_id, local_peer)
-                    })
-            }
-        } else {
-            bincode::deserialize::<KvStoreDelta>(&mutation.payload)
-                .map_err(|e| KvError::Gossip(format!("bad sealed delta payload: {e}")))
-                .and_then(|delta| s.merge_delta(&delta, sender_peer, Some(&mutation.author_id)))
-        };
+        let result = verified_generation
+            .ok_or_else(|| {
+                KvError::Unauthorized("encrypted context lacks authorization version".to_string())
+            })
+            .and_then(|generation| {
+                ctx.apply_if_encrypted_authorized(
+                    &mutation.author_id,
+                    mutation.epoch,
+                    generation,
+                    &mut || {
+                        if mutation.kind == KvMutationKind::RetainedState {
+                            let payload = retained_image.as_deref().unwrap_or_default();
+                            if !matches!(
+                                s.policy(),
+                                crate::kv::store::AccessPolicy::Encrypted { .. }
+                            ) || !s
+                                .secure_context()
+                                .is_some_and(|attached| Arc::ptr_eq(attached, ctx))
+                            {
+                                Err(KvError::Unauthorized(
+                                    "guarded retained merge requires its attached encrypted context"
+                                        .to_string(),
+                                ))
+                            } else if payload.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
+                                Err(KvError::Gossip(
+                                    "retained encrypted group image exceeds size limit".to_string(),
+                                ))
+                            } else {
+                                bincode::deserialize::<KvStore>(payload)
+                                    .map_err(|e| {
+                                        KvError::Gossip(format!(
+                                            "bad retained encrypted image: {e}"
+                                        ))
+                                    })
+                                    .and_then(|image| {
+                                        s.merge_group_retained_image(
+                                            &image,
+                                            mutation.author_id,
+                                            local_peer,
+                                        )
+                                    })
+                            }
+                        } else {
+                            bincode::deserialize::<KvStoreDelta>(&mutation.payload)
+                                .map_err(|e| {
+                                    KvError::Gossip(format!("bad sealed delta payload: {e}"))
+                                })
+                                .and_then(|delta| {
+                                    s.merge_guarded_encrypted_delta(
+                                        &delta,
+                                        sender_peer,
+                                        &mutation.author_id,
+                                        ctx,
+                                    )
+                                    .and_then(|outcome| {
+                                        match outcome {
+                                            crate::kv::store::MergeOutcome::Applied => Ok(()),
+                                            crate::kv::store::MergeOutcome::Rejected => {
+                                                Err(KvError::Merge(
+                                                    "encrypted delta rejected by content admission"
+                                                        .to_string(),
+                                                ))
+                                            }
+                                        }
+                                    })
+                                })
+                        }
+                    },
+                )
+            });
         match result {
             Ok(()) => true,
             Err(e) => {
@@ -6511,6 +6564,231 @@ mod tests {
             .await
         );
         assert!(store.read().await.get("wrong-kind").is_none());
+    }
+
+    #[tokio::test]
+    async fn encrypted_admin_withdrawn_during_store_lock_wait_cannot_merge() {
+        let keypair = AgentKeypair::generate().expect("admin keypair");
+        let admin = keypair.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[admin]);
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let context = contexts.pop().expect("context");
+        context.update_from_group(&group);
+        assert!(context.is_authorized_writer(&admin));
+        let secure = context.clone() as SharedKvSecureContext;
+        let id = store_id(95);
+        let target = Arc::new(RwLock::new(
+            KvStore::new_encrypted(id, "Enc".to_string(), admin, group_id, context.clone())
+                .expect("target store"),
+        ));
+        let signing = AuthorSigning::from_keypair(&keypair).expect("admin signer");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+
+        let current_delta = KvStoreDelta::for_put(
+            "current-admin".to_string(),
+            KvEntry::new(
+                "current-admin".to_string(),
+                b"accepted".to_vec(),
+                "text/plain".to_string(),
+            ),
+            (peer(1), 1),
+            1,
+        );
+        let current_record = secure
+            .seal_authorized(
+                &signing,
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&current_delta).expect("current delta"),
+            )
+            .expect("current admin record");
+        let current_wire = encode_delta(peer(1), &current_record).expect("current wire");
+        assert!(
+            KvStoreSync::merge_encrypted_record(
+                &secure,
+                None,
+                &target,
+                &id,
+                peer(2),
+                &current_wire,
+                &pages,
+            )
+            .await
+        );
+        assert!(target.read().await.get("current-admin").is_some());
+
+        let old_delta = KvStoreDelta::for_put(
+            "withdrawn-admin".to_string(),
+            KvEntry::new(
+                "withdrawn-admin".to_string(),
+                b"must-not-merge".to_vec(),
+                "text/plain".to_string(),
+            ),
+            (peer(1), 2),
+            2,
+        );
+        let old_record = secure
+            .seal_authorized(
+                &signing,
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&old_delta).expect("old delta"),
+            )
+            .expect("pre-withdrawal admin record");
+        let old_wire = encode_delta(peer(1), &old_record).expect("old wire");
+
+        // Poll the real receive future through opening, signature verification,
+        // and its first writer check, stopping only at the held store lock.
+        let merge = KvStoreSync::merge_encrypted_record(
+            &secure,
+            None,
+            &target,
+            &id,
+            peer(2),
+            &old_wire,
+            &pages,
+        );
+        tokio::pin!(merge);
+        {
+            let _held_write = target.write().await;
+            assert!(futures::poll!(merge.as_mut()).is_pending());
+            group.withdrawn = true;
+            context.update_from_group(&group);
+            assert!(!context.is_active_member(&admin));
+        }
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), merge.as_mut())
+                .await
+                .expect("blocked merge completion"),
+            "withdrawn admin's already-opened delta must be rejected"
+        );
+        let after = target.read().await;
+        assert!(after.get("current-admin").is_some());
+        assert!(after.get("withdrawn-admin").is_none());
+    }
+
+    #[tokio::test]
+    async fn encrypted_retained_revocation_and_reauthorization_cycle_reject() {
+        let owner_keypair = AgentKeypair::generate().expect("owner keypair");
+        let writer_keypair = AgentKeypair::generate().expect("writer keypair");
+        let owner = owner_keypair.agent_id();
+        let writer = writer_keypair.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[owner, writer]);
+        let original_group = group.clone();
+        let context = contexts.pop().expect("context");
+        let secure = context.clone() as SharedKvSecureContext;
+        let id = store_id(96);
+        let make_store = || {
+            Arc::new(RwLock::new(
+                KvStore::new_encrypted(
+                    id,
+                    "Enc".to_string(),
+                    owner,
+                    group_id.clone(),
+                    context.clone(),
+                )
+                .expect("encrypted store"),
+            ))
+        };
+        let source = make_store();
+        source
+            .write()
+            .await
+            .put(
+                "retained".to_string(),
+                b"current".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("source put");
+        let image = bincode::serialize(&*source.read().await).expect("retained image");
+        let writer_signing = AuthorSigning::from_keypair(&writer_keypair).expect("writer signer");
+        let old_record = secure
+            .seal_authorized(&writer_signing, KvMutationKind::RetainedState, &id, &image)
+            .expect("writer image");
+        let old_wire = encode_delta(peer(1), &old_record).expect("writer wire");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        let target = make_store();
+        let merge = KvStoreSync::merge_encrypted_record(
+            &secure,
+            None,
+            &target,
+            &id,
+            peer(2),
+            &old_wire,
+            &pages,
+        );
+        tokio::pin!(merge);
+        {
+            let _held_write = target.write().await;
+            assert!(futures::poll!(merge.as_mut()).is_pending());
+            group.remove_member(
+                &hex::encode(writer.as_bytes()),
+                Some(hex::encode(owner.as_bytes())),
+            );
+            let _ = group.rotate_shared_secret();
+            context.update_from_group(&group);
+            assert!(!context.is_authorized_writer(&writer));
+        }
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), merge.as_mut())
+                .await
+                .expect("revoked merge completion"),
+            "revoked retained-image writer must be rejected"
+        );
+        assert!(target.read().await.get("retained").is_none());
+
+        let owner_signing = AuthorSigning::from_keypair(&owner_keypair).expect("owner signer");
+        let current_record = secure
+            .seal_authorized(&owner_signing, KvMutationKind::RetainedState, &id, &image)
+            .expect("current owner image");
+        let current_wire = encode_delta(peer(1), &current_record).expect("owner wire");
+        assert!(
+            KvStoreSync::merge_encrypted_record(
+                &secure,
+                None,
+                &target,
+                &id,
+                peer(2),
+                &current_wire,
+                &pages,
+            )
+            .await
+        );
+        let after = target.read().await;
+        assert!(after.get("retained").is_some());
+        assert_eq!(after.last_history_endorser(), Some(&owner));
+        drop(after);
+
+        // Restore the identical authorization bytes, then cycle away and
+        // back while another old record waits. The generation must still
+        // reject it even though the final secret, epoch, and roster match.
+        context.update_from_group(&original_group);
+        let aba_target = make_store();
+        let aba_merge = KvStoreSync::merge_encrypted_record(
+            &secure,
+            None,
+            &aba_target,
+            &id,
+            peer(2),
+            &old_wire,
+            &pages,
+        );
+        tokio::pin!(aba_merge);
+        {
+            let _held_write = aba_target.write().await;
+            assert!(futures::poll!(aba_merge.as_mut()).is_pending());
+            context.update_from_group(&group);
+            context.update_from_group(&original_group);
+            assert!(context.is_authorized_writer(&writer));
+        }
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), aba_merge.as_mut())
+                .await
+                .expect("ABA merge completion"),
+            "authorization A-B-A during the lock wait must reject"
+        );
+        assert!(aba_target.read().await.get("retained").is_none());
     }
 
     #[tokio::test]
