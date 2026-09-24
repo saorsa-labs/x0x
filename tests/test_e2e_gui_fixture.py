@@ -218,6 +218,12 @@ class World:
         self.skip_legacy_observer_bind = False
         self.wrong_legacy_observer_id = False
         self.certified = []
+        # #824: owner-sync pairing; an unpaired second owner device mints a
+        # duplicate Home instead of yielding to the canonical one.
+        self.machines = {label: (str(index + 5) * 64)[:64] for index, label in enumerate(labels)}
+        self.owner = labels[0]
+        self.enrolled: set[tuple[str, str]] = set()
+        self.trusted: set[tuple[str, str]] = set()
         self.import_attempts: list[tuple[str, str, str]] = []
 
     def roster(self, gid):
@@ -237,10 +243,23 @@ class World:
 
     def route(self, label, method, path, body):
         if path == "/home" and method == "GET":
-            return 200, {"state": "local", "group_id": HOME_GID, "owner_user_id": OWNER_ID,
-                         "primary_agent": {"verified": True}}
+            if label in self.members[HOME_GID]:
+                return 200, {"state": "local", "group_id": HOME_GID, "owner_user_id": OWNER_ID,
+                             "primary_agent": {"verified": True}}
+            owner = self.owner
+            paired = ({(owner, self.machines[label]), (label, self.machines[owner])} <= self.enrolled
+                      and {(owner, self.aids[label]), (label, self.aids[owner])} <= self.trusted)
+            if paired:
+                return 200, {"state": "elsewhere", "canonical_group_id": HOME_GID, "owner_user_id": OWNER_ID}
+            return 200, {"state": "local", "group_id": f"dup-{label}", "owner_user_id": OWNER_ID}
         if path == "/agent" and method == "GET":
-            return 200, {"agent_id": self.aids[label]}
+            return 200, {"agent_id": self.aids[label], "machine_id": self.machines[label]}
+        if path == "/contacts/trust" and method == "POST":
+            self.trusted.add((label, body["agent_id"]))
+            return 200, {"ok": True}
+        if path == "/sync/devices/enroll" and method == "POST":
+            self.enrolled.add((label, body.get("machine_id") or self.machines[label]))
+            return 200, {"ok": True}
         if path == "/agent/card" and method == "GET":
             return 200, {"ok": True, "card": {"agent_public_key": "a" * 3904,
                                                 "signature": "b" * 6618}}

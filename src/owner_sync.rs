@@ -774,6 +774,11 @@ pub struct OwnerSyncStore {
     devices: tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>,
     last_session: tokio::sync::RwLock<BTreeMap<[u8; 32], DeviceSyncStatus>>,
     generation_tx: tokio::sync::watch::Sender<u64>,
+    /// #824: count of successful sessions with an owner device, inbound or
+    /// outbound. Home provisioning waits for one before minting, because a
+    /// completed session means that device's records, including any
+    /// canonical Home pointer, have been merged.
+    sessions_ok_tx: tokio::sync::watch::Sender<u64>,
     /// Set when a durable write crossed the rename but could not be
     /// synced: memory/disk agreement is no longer reconstructable by
     /// rollback, so every further mutation and session fails until the
@@ -880,6 +885,7 @@ impl OwnerSyncStore {
             devices: tokio::sync::RwLock::new(devices),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
             generation_tx,
+            sessions_ok_tx: tokio::sync::watch::channel(0).0,
             poisoned: std::sync::Mutex::new(None),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             canonical_home_gate: tokio::sync::RwLock::new(()),
@@ -1535,6 +1541,18 @@ impl OwnerSyncStore {
                 last_session_ok: ok,
             },
         );
+        drop(last);
+        if ok {
+            self.sessions_ok_tx
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
+    }
+
+    /// Successful-session counter (#824): changes once per session with an
+    /// owner device that completed, in either direction.
+    #[must_use]
+    pub fn successful_sessions_rx(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sessions_ok_tx.subscribe()
     }
 
     /// Last-session status per device (for `GET /sync/devices`).
@@ -2342,6 +2360,28 @@ impl OwnerSyncService {
         .await;
         self.store.set_session_status(&peer, result.is_ok()).await;
         result.map_err(|e| e.to_string())
+    }
+
+    /// #824: wait for every in-flight owner-sync session to finish and hold
+    /// off new ones while the returned guard lives.
+    ///
+    /// Home provisioning creates a fresh Home under this guard. Remote records,
+    /// including a canonical Home pointer, arrive only inside sessions, so no
+    /// pointer can be merged between its final pointer check and the create.
+    /// Outbound sessions queue behind the guard. Inbound streams are dropped
+    /// while it is held, and the peer retries on its next pass. Sessions are
+    /// bounded by [`SESSION_TIMEOUT`], so the wait is too.
+    pub async fn quiesce_sessions(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        let all = u32::try_from(MAX_CONCURRENT_SESSIONS).ok()?;
+        self.session_permits.acquire_many(all).await.ok()
+    }
+
+    /// Test hook (#824): occupy one session slot, as an in-flight session does.
+    #[cfg(test)]
+    pub(crate) fn hold_session_slot_for_testing(
+        &self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.session_permits).try_acquire_owned().ok()
     }
 
     /// One full pass: mint local Tier-1 records from live daemon state,

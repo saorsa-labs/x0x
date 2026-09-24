@@ -510,7 +510,31 @@ needs a certifiable founding member), and no other device of this owner may
 have already advertised a Home. If one has, this device provisions nothing
 and `GET /home` answers `state:"elsewhere"`. An absent register value means
 "none advertised yet", not "none exists", so a first or un-synced device
-still provisions. The daemon's own owner-certified agent is the founding member
+still provisions, but not at once (#824). When the owner key and
+certificate are live, owner sync is available and no pointer is known, startup
+defers creating a fresh Home to a background task. The API stays up throughout,
+and `GET /home` answers `state:"provisioning_pending"` until the task finishes.
+The task re-runs provisioning, and yields to the pointer if one arrived, on the
+first of:
+
+- a committed record that names a canonical Home;
+- a successful owner-sync session, but only on the device whose machine id is
+  the lowest among the owner's enrolled machines (its *rank* is 0). A session
+  that brought no pointer does not release other devices, so two fresh,
+  mutually enrolled devices create one Home, not two. A pass that reaches no
+  device never counts;
+- `(rank + 1) × 90 s` after startup, where rank counts the enrolled machines
+  with a lower machine id. A genuinely first or offline device (rank 0) gets
+  its Home up to 90 s later.
+
+Before creating, the daemon waits out any in-flight owner-sync session, holds
+off new ones, and re-checks the pointer under the same gate that every pointer
+writer takes, so a pointer that lands during the wait is honoured rather than
+duplicated. To add an owner device without a duplicate Home, enroll it for
+owner sync while it is pending: enroll its machine on an existing owner device,
+install the owner key and certificate, restart it, then enroll the existing
+device's machine on it (see *Device sync* below; peer trust must be `trusted`
+both ways). The daemon's own owner-certified agent is the founding member
 and **primary agent** — the owner speaks *through* an agent; there is no human
 wire signer. Admission is cryptographic: joining requires an agent certificate
 chaining to the owner's user key, re-checked at every state seal. An
@@ -550,7 +574,7 @@ A `state:"local"` response (the settled case):
 
 - `owner_user_id` is the Home's `OwnerCertified` admission axis — the value a
   joining device must pin (`x0x group join … --home --owner <owner_user_id>`).
-- **There are three distinct `200` shapes**, keyed by `state`, plus two `404`s.
+- **There are four distinct `200` shapes**, keyed by `state`, plus two `404`s.
   `get_home` matches on `resolve_home` and calls `home_elsewhere_response`
   directly for the third:
 
@@ -559,9 +583,10 @@ A `state:"local"` response (the settled case):
   | `"local"` | this device holds the canonical Home, or is uncontested | the full payload above; `canonical_group_id` is `null` |
   | `"adoption_pending"` | this device holds a Home that LOST the `("home")` election | the full payload above, `canonical_group_id` names the winner, **plus `next_step`** |
   | `"elsewhere"` | the owner's Home is on another device and this one is not a member | a **short** body — `ok`, `state`, `owner_user_id`, `canonical_group_id`, `local_group_id` (nullable), `detail`, **`next_step`** — and **no** `group_id`, `name`, `members`, `duplicates` or `warnings` |
+  | `"provisioning_pending"` | #824: startup provisioning is waiting for owner sync (at most `(rank + 1) × 90 s`) before creating a Home; transient, so poll until another state | the `elsewhere` short body with `canonical_group_id` and `local_group_id` both `null` and **no** `next_step`; poll again |
 
   `next_step` is present on both `adoption_pending` and `elsewhere`, and absent
-  from `local`. `"elsewhere"` is a `200` rather than a `404` so a second device
+  from `local` and `provisioning_pending`. `"elsewhere"` is a `200` rather than a `404` so a second device
   is not misread as Home-less and does not provision a duplicate.
 
   The two `404`s are distinct: `no Home provisioned (un-owned install)` when no
@@ -570,7 +595,7 @@ A `state:"local"` response (the settled case):
   see. Neither is the `elsewhere` case.
 
   `POST /home/seat`'s `409 reason` values (`adoption_pending`, `elsewhere`,
-  `unknown`) are the **seat** endpoint's refusals, a separate surface from
+  `unknown`, `ambiguous_home`) are the **seat** endpoint's refusals, a separate surface from
   these `GET` shapes — do not read one as documentation of the other.
 - `placement` per member: `"roaming"` | `"pinned"` (from Home metadata).
 - `primary_agent.verified` is the fail-closed trust check that the primary's
@@ -616,8 +641,15 @@ mint seats into its duplicate. A successful `200` response has this shape:
 `400` covers a malformed or self-targeting `agent_id`; `404` means an un-owned
 install with no loaded owner key. An owned install with unresolved Home state
 returns `409 unknown`, not `404`. `409` includes typed `reason` values
-`adoption_pending`, `elsewhere`, or `unknown`, with a nullable
-`canonical_group_id`. The underlying invite authority can additionally return
+`adoption_pending`, `elsewhere`, `unknown`, or `ambiguous_home`, with a nullable
+`canonical_group_id`. `ambiguous_home` (#824) means this device is seated in
+more than one Home-shaped group (`GET /home` lists the others in `duplicates`)
+and the canonical `("home")` pointer is unknown or does not name the group the
+seat would mint into; the seat mints nothing rather than guess, and succeeds
+once owner sync delivers a pointer naming a Home this device holds. The guard is
+local: it never mints against an ambiguous or non-canonical view this device
+knows about. It is not a distributed invariant, because a second Home that
+arrives after the duplicate scan and before the invite is written is not fenced. The underlying invite authority can additionally return
 its documented errors, including `409 owner_key_unavailable`, `413
 invite_too_large`, `429 invite_cap_reached`, and persistence failures. A
 successful call is **not idempotent**: it records a new single-use invite and
@@ -2317,8 +2349,9 @@ not a contract.**
 The `x0x` CLI renders a reason-bearing error as
 `<message> (HTTP <code>, reason: <reason>)`, and one with no `reason` as
 `<message> (HTTP <code>)`. The reason-bearing responses today are the 409
-`fork_quarantined` below and the 409 `recipient_not_active` on group key
-sealing.
+`fork_quarantined` below, the 409 `recipient_not_active` on group key
+sealing, and the `POST /home/seat` 409s (`adoption_pending`, `elsewhere`,
+`unknown`, `ambiguous_home`).
 
 ### 409 `fork_quarantined` (ADR-0064 / ADR-0066 §5)
 

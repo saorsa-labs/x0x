@@ -150,6 +150,7 @@ class PrivateKvHarnessTests(unittest.TestCase):
     def test_home_uses_real_seat_and_pinned_join_shapes(self):
         owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
         owner.request = mock.Mock(side_effect=[
+            (200, {"ok": True, "state": "local", "group_id": "home-id"}),
             (200, {"ok": True, "group_id": "home-id", "owner_user_id": "f" * 64,
                    "intended_joiner": "2" * 64, "seated": False,
                    "invite": "x0x://invite/real"}),
@@ -162,9 +163,67 @@ class PrivateKvHarnessTests(unittest.TestCase):
         invite = scenario.home_invite("owner", "member", "home-id", "f" * 64)
         with mock.patch.object(self.h, "poll", return_value=(200, {"members": [{"agent_id": "2" * 64}]})):
             scenario.join_home("owner", "member", "home-id", "f" * 64, invite)
-        self.assertEqual(("POST", "/home/seat", {"agent_id": "2" * 64}), owner.request.call_args_list[0].args)
+        self.assertEqual(("GET", "/home"), owner.request.call_args_list[0].args)
+        self.assertEqual(("POST", "/home/seat", {"agent_id": "2" * 64}), owner.request.call_args_list[1].args)
         self.assertEqual({"invite": "x0x://invite/real", "mode": "home",
                           "expected_owner_user_id": "f" * 64}, member.request.call_args_list[0].args[2])
+
+    def _fake_clock(self):
+        clock = [100.0]
+        return (mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]),
+                mock.patch.object(self.h.time, "sleep",
+                                  side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+
+    def test_home_seat_waits_until_the_minter_serves_the_canonical_home(self):
+        # #824: a device that was just seated (an admin) reaches `local` with the
+        # canonical gid only after its own join completes. Seating before then
+        # is refused by the product, so the harness waits for exactly that.
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(side_effect=[
+            (200, {"ok": True, "state": "elsewhere", "canonical_group_id": "home-id"}),
+            (200, {"ok": True, "state": "local", "group_id": "home-id"}),
+            (200, {"ok": True, "group_id": "home-id", "owner_user_id": "f" * 64,
+                   "intended_joiner": "2" * 64, "seated": False, "invite": "x0x://invite/real"})])
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=5)
+        monotonic, sleep = self._fake_clock()
+        with monotonic, sleep:
+            scenario.home_invite("owner", "member", "home-id", "f" * 64)
+        self.assertEqual(("POST", "/home/seat", {"agent_id": "2" * 64}), owner.request.call_args_list[2].args)
+        self.assertTrue(all(item["passed"] for item in scenario.e.assertions))
+
+    def test_home_seat_never_mints_from_a_device_serving_a_duplicate_home(self):
+        # #824: a `local` Home with a DIFFERENT gid is the duplicate. The wait
+        # must not accept it and must never reach `POST /home/seat`.
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(return_value=(200, {"ok": True, "state": "local", "group_id": "dup-id"}))
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=3)
+        monotonic, sleep = self._fake_clock()
+        with monotonic, sleep, self.assertRaises(AssertionError):
+            scenario.home_invite("owner", "member", "home-id", "f" * 64)
+        self.assertNotIn("/home/seat", [call.args[1] for call in owner.request.call_args_list])
+
+    def test_home_reader_polls_only_through_provisioning_pending(self):
+        # #824: `provisioning_pending` is the one documented transient state.
+        # The reader waits through it and then applies the unchanged checks.
+        owner = FakeApi("1" * 64)
+        owner.request = mock.Mock(side_effect=[
+            (200, {"ok": True, "state": "provisioning_pending"}),
+            (200, {"ok": True, "state": "local", "group_id": "home-id", "owner_user_id": "f" * 64}),
+            (200, {"members": [{"agent_id": "1" * 64, "state": "active"}]})])
+        scenario = self.h.Scenario({"owner": owner}, self.h.Evidence(), timeout=5)
+        monotonic, sleep = self._fake_clock()
+        with monotonic, sleep:
+            gid, _ = scenario.home("owner")
+        self.assertEqual("home-id", gid)
+        self.assertEqual(("GET", "/home"), owner.request.call_args_list[1].args[:2])
+        self.assertTrue(all(item["passed"] for item in scenario.e.assertions))
+
+    def test_home_reader_does_not_wait_on_a_terminal_state(self):
+        owner = FakeApi("1" * 64)
+        owner.request = mock.Mock(return_value=(404, {"ok": False, "error": "no Home provisioned"}))
+        status, _ = self.h.settled_home(owner, "owner", 5)
+        self.assertEqual(404, status)
+        self.assertEqual(1, owner.request.call_count)
 
     def test_private_join_waits_for_exact_local_group_after_owner_roster(self):
         owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
