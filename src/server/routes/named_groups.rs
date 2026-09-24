@@ -33765,11 +33765,7 @@ fn welcome_blob_send_config(msg: &WelcomeBlobMessage) -> x0x::dm::DmSendConfig {
     }
 }
 
-async fn send_welcome_blob_message(
-    state: &Arc<AppState>,
-    agent_id: &AgentId,
-    msg: &WelcomeBlobMessage,
-) -> std::result::Result<x0x::dm::DmReceipt, String> {
+fn welcome_blob_payload(msg: &WelcomeBlobMessage) -> std::result::Result<Vec<u8>, String> {
     let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
     if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
         return Err(format!(
@@ -33778,11 +33774,46 @@ async fn send_welcome_blob_message(
             x0x::dm::MAX_PAYLOAD_BYTES
         ));
     }
+    Ok(payload)
+}
+
+async fn send_welcome_blob_message(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    msg: &WelcomeBlobMessage,
+) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    let payload = welcome_blob_payload(msg)?;
     state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(msg))
         .await
         .map_err(|e| e.to_string())
+}
+
+enum WelcomeFetchSendError {
+    /// The request might have arrived; only its delivery receipt is missing.
+    ReceiptUnconfirmed(String),
+    /// The request could not be sent or encoded.
+    Failed(String),
+}
+
+async fn send_welcome_fetch_request(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    request: &WelcomeBlobMessage,
+) -> std::result::Result<(), WelcomeFetchSendError> {
+    let payload = welcome_blob_payload(request).map_err(WelcomeFetchSendError::Failed)?;
+    state
+        .agent
+        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
+        .await
+        .map(|_| ())
+        .map_err(|error| match error {
+            x0x::dm::DmError::Timeout { .. } => {
+                WelcomeFetchSendError::ReceiptUnconfirmed(error.to_string())
+            }
+            _ => WelcomeFetchSendError::Failed(error.to_string()),
+        })
 }
 
 async fn notify_welcome_waiters(
@@ -33851,6 +33882,26 @@ async fn fetch_treekem_welcome(
     group_id: &str,
     welcome_ref: &WelcomeRef,
 ) -> std::result::Result<Vec<u8>, String> {
+    let send_state = Arc::clone(state);
+    fetch_treekem_welcome_via(state, group_id, welcome_ref, move |source, request| {
+        let state = Arc::clone(&send_state);
+        async move { send_welcome_fetch_request(&state, &source, &request).await }
+    })
+    .await
+}
+
+/// Fetch a Welcome with an injectable request sender so the receive path can
+/// be tested when the FetchRequest's delivery receipt is lost.
+async fn fetch_treekem_welcome_via<S, F>(
+    state: &Arc<AppState>,
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+    send: S,
+) -> std::result::Result<Vec<u8>, String>
+where
+    S: FnOnce(AgentId, WelcomeBlobMessage) -> F,
+    F: std::future::Future<Output = std::result::Result<(), WelcomeFetchSendError>>,
+{
     if welcome_ref.byte_len > x0x::files::MAX_TRANSFER_SIZE {
         return Err("TreeKEM Welcome blob exceeds maximum transfer size".to_string());
     }
@@ -33908,9 +33959,25 @@ async fn fetch_treekem_welcome(
             group_id: group_id.to_string(),
             welcome_id: welcome_ref.welcome_id.clone(),
         };
-        if let Err(e) = send_welcome_blob_message(state, &source, &request).await {
-            cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
-            return Err(e);
+        match send(source, request).await {
+            Ok(()) => {}
+            Err(WelcomeFetchSendError::ReceiptUnconfirmed(error)) => {
+                // The request may have reached the owner, and the completed
+                // Welcome may already be on `rx`. Its receipt timeout cannot
+                // invalidate the independently verified transfer.
+                tracing::warn!(
+                    target: "welcome.trace",
+                    stage = "fetch_request_receipt_unconfirmed",
+                    group_id,
+                    welcome_id = %welcome_ref.welcome_id,
+                    error = %error,
+                    "waiting for Welcome despite unconfirmed FetchRequest receipt",
+                );
+            }
+            Err(WelcomeFetchSendError::Failed(error)) => {
+                cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+                return Err(error);
+            }
         }
     }
 
@@ -45423,6 +45490,57 @@ pub(in crate::server) mod tests {
             owner.pending_welcome_acks.read().await.is_empty(),
             "the finished stream must release its ack slot so a later FetchRequest can restart it"
         );
+        Ok(())
+    }
+
+    /// WHY (#841): the FetchRequest can reach the owner and its Welcome can
+    /// complete even when the joiner's delivery receipt times out. The send
+    /// result must not discard a completed receive result or its waiter.
+    #[tokio::test]
+    async fn lost_welcome_fetch_receipt_keeps_completed_welcome() -> anyhow::Result<()> {
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let owner_id = owner.agent.agent_id();
+        let group_id = "cd".repeat(32);
+        let bytes = b"Welcome received while the FetchRequest receipt is pending".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        let welcome_ref = WelcomeRef {
+            welcome_id: welcome_id.clone(),
+            byte_len: bytes.len() as u64,
+            source: hex::encode(owner_id.as_bytes()),
+        };
+        let receive_state = Arc::clone(&joiner);
+        let receive_bytes = bytes.clone();
+        let received =
+            fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |source, request| {
+                let state = Arc::clone(&receive_state);
+                async move {
+                    assert_eq!(source, owner_id);
+                    assert!(matches!(request, WelcomeBlobMessage::FetchRequest { .. }));
+                    // The signed WelcomeRef registered the receive entry
+                    // before the request was sent. Finish it through the
+                    // production completion handler while the send is still
+                    // awaiting its receipt.
+                    {
+                        let mut receives = state.pending_welcome_receives.write().await;
+                        let receive = receives
+                            .get_mut(&welcome_id)
+                            .expect("fetch registered Welcome receive state");
+                        assert_eq!(receive.total_chunks, 1);
+                        receive.chunks.insert(0, receive_bytes.clone());
+                        receive.received_bytes = receive_bytes.len() as u64;
+                    }
+                    handle_welcome_blob_complete(&state, &owner_id, &welcome_id).await;
+                    Err(WelcomeFetchSendError::ReceiptUnconfirmed(
+                        "timed out after 1 retries over 24.0s".to_string(),
+                    ))
+                }
+            })
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(received, bytes);
+        assert!(joiner.pending_welcome_receives.read().await.is_empty());
+        assert!(joiner.pending_welcome_waiters.read().await.is_empty());
         Ok(())
     }
 
