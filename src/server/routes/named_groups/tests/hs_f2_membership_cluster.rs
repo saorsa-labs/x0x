@@ -6741,6 +6741,210 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
     Ok(())
 }
 
+/// WHY #846 (Rule 9): while an owner-anchored stale-base gap is pending
+/// (queued terminal + owner v2 head attestation), a catch-up responder
+/// that is an ACTIVE MEMBER of the joiner current view may still be a
+/// FORKING responder. Its divergent intervening commits must NOT be
+/// adopted: the served chain must lead to the pending owner-attested
+/// head before anything applies. Genuine chain control included.
+#[tokio::test]
+async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result<()> {
+    let stage = issue458_stage(0xBC, true).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (stub, b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+    let joiner_epoch = Some(1u64);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let terminal_event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: stub.state_revision,
+        actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: joiner_epoch,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(genuine.clone()),
+    };
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![link.clone()]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        as_treekem_join_result(&terminal_event),
+        stage.authority.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(!result.accepted, "TreeKEM never adopts across the gap");
+    let revision_before = {
+        let groups = joiner_state.named_groups.read().await;
+        groups
+            .get(&stage.group_id)
+            .expect("stub retained")
+            .state_revision
+    };
+    assert!(revision_before < genuine.revision, "the gap is open");
+
+    // B (active admin in the stub) serves a DIVERGENT intermediate: a
+    // correctly-signed commit linking from the stub head but on its OWN
+    // chain — never reaching the attested head (the parent of genuine).
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let _ = &authority_kp;
+    let policy_hash = x0x::groups::compute_policy_hash(&stub.policy);
+    let mut fork_meta = stub.public_meta();
+    fork_meta.description = "forking-responder-intermediate".to_string();
+    let fork_link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        revision_before.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        fork_meta,
+        &b_kp,
+    );
+    let b_hex = hex::encode(b_kp.agent_id().as_bytes());
+    let fork_event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: stage.group_id.clone(),
+        revision: revision_before.saturating_add(1),
+        actor: b_hex.clone(),
+        agent_id: b_hex,
+        treekem_commit_b64: None,
+        treekem_epoch: joiner_epoch,
+        secret_epoch: None,
+        commit: Some(fork_link.commit.clone()),
+    };
+    crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    handle_treekem_catchup_response(
+        &joiner_state,
+        &b_kp.agent_id(),
+        true,
+        TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: stage.group_id.clone(),
+            events: vec![fork_event],
+            truncated: false,
+        },
+    )
+    .await;
+    assert!(
+        crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "#846: the ATTESTATION GATE refused the divergent response (not merely an apply refusal)"
+    );
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert_eq!(
+            info.state_revision, revision_before,
+            "#846: a forking responder divergent intermediate adopts NOTHING"
+        );
+        assert!(
+            !info.is_fork_quarantined(),
+            "the refusal is a silent gate, not a quarantine"
+        );
+    }
+
+    Ok(())
+}
+/// #846 unit: the catch-up chain walk is pure hash-chain simulation.
+#[test]
+fn catchup_chain_walk_binds_to_attested_head() {
+    let mk = |rev: u64, prev: &str| x0x::groups::GroupStateCommit {
+        group_id: "c1".repeat(32),
+        revision: rev,
+        prev_state_hash: Some(prev.to_string()),
+        state_hash: format!("{rev:064x}"),
+        roster_root: String::new(),
+        policy_hash: String::new(),
+        public_meta_hash: String::new(),
+        security_binding: None,
+        withdrawn: false,
+        committed_by: "aa".repeat(32),
+        signer_public_key: String::new(),
+        signature: String::new(),
+        committed_at: 0,
+    };
+    let ev =
+        |commit: x0x::groups::GroupStateCommit| NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: "c1".repeat(32),
+            revision: commit.revision,
+            actor: "aa".repeat(32),
+            name: None,
+            description: None,
+            commit: Some(commit),
+        };
+    let base = "b".repeat(64);
+    let l1 = mk(1, &base);
+    let l2 = mk(2, &l1.state_hash);
+    // Genuine chain base -> l1 -> l2 (attested head = l2): reaches.
+    assert!(catchup_chain_reaches_attested_head(
+        &[ev(l1.clone()), ev(l2.clone())],
+        &base,
+        &l2.state_hash,
+    ));
+    // Divergent intermediate (own chain off base): never reaches.
+    let fork = mk(1, &base);
+    assert!(!catchup_chain_reaches_attested_head(
+        &[ev(fork)],
+        &base,
+        &l2.state_hash,
+    ));
+    // Prefix that stops before the head: does not reach (held).
+    assert!(!catchup_chain_reaches_attested_head(
+        &[ev(l1)],
+        &base,
+        &l2.state_hash,
+    ));
+    // Broken linking mid-chain: rejected.
+    let orphan = mk(2, &"f".repeat(64));
+    let l1b = mk(1, &base);
+    assert!(!catchup_chain_reaches_attested_head(
+        &[ev(l1b), ev(orphan)],
+        &base,
+        &l2.state_hash,
+    ));
+    // Already at the head: trivially reaches (empty page).
+    assert!(catchup_chain_reaches_attested_head(
+        &[],
+        &l2.state_hash,
+        &l2.state_hash
+    ));
+}
 /// Build a REAL invite-join stub for the two-admin stale-base shape: a
 /// sealed base containing the authority and admin B (so B walks validly
 /// from the base), a genuine authority link L and terminal T, and the
