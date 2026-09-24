@@ -47,6 +47,7 @@ struct GssState {
     stable_group_id: String,
     shared_secret: Option<Vec<u8>>,
     secret_epoch: u64,
+    generation: u64,
     active_members: HashSet<AgentId>,
     member_roles: std::collections::HashMap<AgentId, GroupRole>,
     write_access: GroupWriteAccess,
@@ -66,21 +67,29 @@ impl GssState {
             stable_group_id: info.stable_group_id().to_string(),
             shared_secret: info.shared_secret.clone(),
             secret_epoch: info.secret_epoch,
+            generation: 0,
             active_members,
             member_roles,
             write_access: info.policy.write_access,
         }
     }
 
-    fn authorizes_writer(&self, agent: &AgentId) -> bool {
+    fn roster_authorizes_writer(&self, agent: &AgentId) -> bool {
+        if !self.active_members.contains(agent) {
+            return false;
+        }
         match self.write_access {
-            GroupWriteAccess::MembersOnly => self.active_members.contains(agent),
+            GroupWriteAccess::MembersOnly => true,
             GroupWriteAccess::AdminOnly => self
                 .member_roles
                 .get(agent)
                 .is_some_and(|role| role.at_least(GroupRole::Admin)),
             GroupWriteAccess::ModeratedPublic => false,
         }
+    }
+
+    fn authorizes_writer(&self, agent: &AgentId) -> bool {
+        self.shared_secret.is_some() && self.roster_authorizes_writer(agent)
     }
 }
 
@@ -492,7 +501,7 @@ impl KvSecureContext for TreeKemKvAuthorizationContext {
         self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .authorizes_writer(agent)
+            .roster_authorizes_writer(agent)
     }
 
     fn invalidate(&self) {
@@ -552,6 +561,8 @@ impl GssKvSecureContext {
             );
             state.shared_secret = None;
             state.active_members.clear();
+            state.member_roles.clear();
+            state.generation = state.generation.wrapping_add(1);
             return;
         }
         // ADR-0066 §4 / ADR-0067 — make a marker a REFRESH TRIGGER for this
@@ -585,9 +596,10 @@ impl GssKvSecureContext {
             state.shared_secret = None;
             state.active_members.clear();
             state.member_roles.clear();
+            state.generation = state.generation.wrapping_add(1);
             return;
         }
-        let next = GssState::from_group(info);
+        let mut next = GssState::from_group(info);
         let changed = state.shared_secret != next.shared_secret
             || state.secret_epoch != next.secret_epoch
             || state.active_members != next.active_members
@@ -603,6 +615,7 @@ impl GssKvSecureContext {
                 state.active_members.len(),
                 next.active_members.len()
             );
+            next.generation = state.generation.wrapping_add(1);
             *state = next;
         }
     }
@@ -694,6 +707,37 @@ impl KvSecureContext for GssKvSecureContext {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .secret_epoch
+    }
+
+    fn encrypted_authorization_generation(&self) -> Option<u64> {
+        Some(
+            self.state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .generation,
+        )
+    }
+
+    fn apply_if_encrypted_authorized(
+        &self,
+        writer: &AgentId,
+        epoch: u64,
+        verified_generation: u64,
+        apply: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != verified_generation
+            || state.secret_epoch != epoch
+            || !state.authorizes_writer(writer)
+        {
+            return Err(KvError::Unauthorized(
+                "encrypted record authorization changed before merge".to_string(),
+            ));
+        }
+        apply()
     }
 
     fn seal(&self, store_id: &KvStoreId, plaintext: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)> {
@@ -806,6 +850,7 @@ impl KvSecureContext for GssKvSecureContext {
         state.shared_secret = None;
         state.active_members.clear();
         state.member_roles.clear();
+        state.generation = state.generation.wrapping_add(1);
     }
 }
 

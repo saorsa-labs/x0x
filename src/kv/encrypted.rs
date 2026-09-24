@@ -241,6 +241,29 @@ pub trait KvSecureContext: Send + Sync {
         None
     }
 
+    /// Generation of the current GSS authorization snapshot. Capturing this
+    /// before opening a record lets the final merge reject even an A-B-A
+    /// roster or secret cycle during a store-lock wait.
+    fn encrypted_authorization_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// Apply an opened encrypted record only while the verified GSS snapshot
+    /// remains current. Implementations hold their authorization read guard
+    /// through `apply`; contexts without this capability fail closed.
+    fn apply_if_encrypted_authorized(
+        &self,
+        writer: &AgentId,
+        epoch: u64,
+        verified_generation: u64,
+        apply: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let _ = (writer, epoch, verified_generation, apply);
+        Err(KvError::Unauthorized(
+            "secure context lacks guarded encrypted authorization".to_string(),
+        ))
+    }
+
     /// Seal `plaintext` for this store under the current epoch.
     ///
     /// Returns `(epoch, nonce, ciphertext)`; the nonce is freshly random
