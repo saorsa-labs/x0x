@@ -34045,6 +34045,32 @@ async fn stream_welcome_blob(
     welcome_id: &str,
     pending: PendingWelcome,
 ) {
+    let send_state = Arc::clone(state);
+    let send_recipient = *recipient;
+    stream_welcome_blob_via(state, recipient, welcome_id, pending, move |msg| {
+        let state = Arc::clone(&send_state);
+        async move {
+            send_welcome_blob_message(&state, &send_recipient, &msg)
+                .await
+                .map(|_| ())
+        }
+    })
+    .await;
+}
+
+/// Stream one staged Welcome blob to `recipient`, sending every frame through
+/// `send` (production: [`send_welcome_blob_message`]; tests inject a lossy
+/// transport).
+async fn stream_welcome_blob_via<S, F>(
+    state: &Arc<AppState>,
+    recipient: &AgentId,
+    welcome_id: &str,
+    pending: PendingWelcome,
+    mut send: S,
+) where
+    S: FnMut(WelcomeBlobMessage) -> F,
+    F: std::future::Future<Output = std::result::Result<(), String>>,
+{
     let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
     let total_chunks = x0x::files::total_chunks_for_size(pending.bytes.len() as u64, chunk_size);
     let ack_slot = Arc::new(FileChunkAckSlot::new());
@@ -34070,10 +34096,20 @@ async fn stream_welcome_blob(
         total_chunks,
         blake3_hex: welcome_id.to_string(),
     };
-    if let Err(e) = send_welcome_blob_message(state, recipient, &offer).await {
-        tracing::warn!(welcome_id, "failed to send Welcome blob offer: {e}");
-        state.pending_welcome_acks.write().await.remove(welcome_id);
-        return;
+    // #825: the Offer is advisory. The joiner registered its receive state
+    // (source, byte_len, total_chunks) from the signed WelcomeRef BEFORE it
+    // sent the FetchRequest, accepts chunks without an Offer, dedupes them
+    // by sequence and verifies length + blake3 on Complete. A lost Offer
+    // receipt (the gossip-inbox ACK timing out under load while the Offer
+    // itself may well have landed) therefore must not abort the stream:
+    // doing so left the joiner stuck pending although the owner had already
+    // committed MemberAdded. Chunk sends keep their own bounded failure
+    // handling below, so an unreachable joiner still ends the stream.
+    if let Err(e) = send(offer).await {
+        tracing::warn!(
+            welcome_id,
+            "Welcome blob offer receipt not confirmed, streaming chunks anyway: {e}"
+        );
     }
     tracing::debug!(
         target: "welcome.trace",
@@ -34096,7 +34132,7 @@ async fn stream_welcome_blob(
             sequence,
             data: BASE64.encode(chunk),
         };
-        if let Err(e) = send_welcome_blob_message(state, recipient, &msg).await {
+        if let Err(e) = send(msg).await {
             tracing::warn!(
                 welcome_id,
                 sequence,
@@ -34121,7 +34157,7 @@ async fn stream_welcome_blob(
     let complete = WelcomeBlobMessage::Complete {
         welcome_id: welcome_id.to_string(),
     };
-    if let Err(e) = send_welcome_blob_message(state, recipient, &complete).await {
+    if let Err(e) = send(complete).await {
         tracing::warn!(welcome_id, "failed to send Welcome blob complete: {e}");
     }
     state.pending_welcome_acks.write().await.remove(welcome_id);
@@ -45264,6 +45300,129 @@ pub(in crate::server) mod tests {
             "unexpected_actor"
         );
         assert!(validate_join_result_inviter(Some(&expected), &expected, &expected).is_ok());
+    }
+
+    /// WHY (#825): the owner has already committed MemberAdded when it
+    /// streams the joiner's TreeKEM Welcome, so the Welcome is the joiner's
+    /// only way to seat. On the live testnet the Offer's gossip-inbox receipt
+    /// timed out under load and the owner abandoned the stream before any
+    /// chunk, leaving the joiner pending forever. The Offer is advisory — the
+    /// joiner derives the transfer shape from the signed WelcomeRef — so a
+    /// lost Offer receipt (here: the Offer is dropped AND its send reports a
+    /// timeout) must still deliver the exact, blake3-verified Welcome bytes.
+    #[tokio::test]
+    async fn lost_welcome_offer_receipt_still_delivers_complete_welcome() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let owner_id = owner.agent.agent_id();
+        let joiner_id = joiner.agent.agent_id();
+
+        // Multi-chunk blob so reassembly order and the final-ack wait matter.
+        let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
+        let bytes: Vec<u8> = (0..(chunk_size * 2 + chunk_size / 2))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let group_id = "cd".repeat(32);
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        let total_chunks = x0x::files::total_chunks_for_size(bytes.len() as u64, chunk_size);
+        assert!(total_chunks >= 3);
+
+        // Joiner side: exactly the state `fetch_treekem_welcome` registers
+        // from the WelcomeRef before it sends its FetchRequest.
+        joiner.pending_welcome_receives.write().await.insert(
+            welcome_id.clone(),
+            PendingWelcomeReceive {
+                group_id: group_id.clone(),
+                source: hex::encode(owner_id.as_bytes()),
+                byte_len: bytes.len() as u64,
+                total_chunks,
+                chunks: BTreeMap::new(),
+                received_bytes: 0,
+            },
+        );
+        let (tx, rx) = oneshot::channel();
+        joiner
+            .pending_welcome_waiters
+            .write()
+            .await
+            .insert(welcome_id.clone(), vec![tx]);
+
+        // In-process transport: the Offer is lost and its receipt times out;
+        // every other frame is delivered to the peer's real handler, with
+        // the joiner's ChunkAcks carried back to the owner.
+        let offers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = {
+            let joiner = Arc::clone(&joiner);
+            let owner = Arc::clone(&owner);
+            let offers = Arc::clone(&offers);
+            move |msg: WelcomeBlobMessage| {
+                let joiner = Arc::clone(&joiner);
+                let owner = Arc::clone(&owner);
+                let offers = Arc::clone(&offers);
+                async move {
+                    match msg {
+                        WelcomeBlobMessage::Offer { .. } => {
+                            offers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Err("timed out after 1 retries over 24.0s".to_string())
+                        }
+                        WelcomeBlobMessage::Chunk {
+                            welcome_id,
+                            sequence,
+                            data,
+                        } => {
+                            handle_welcome_blob_chunk(
+                                &joiner,
+                                &owner_id,
+                                welcome_id.clone(),
+                                sequence,
+                                data,
+                            )
+                            .await;
+                            handle_welcome_blob_message(
+                                &owner,
+                                &joiner_id,
+                                WelcomeBlobMessage::ChunkAck {
+                                    welcome_id,
+                                    sequence,
+                                },
+                            )
+                            .await;
+                            Ok(())
+                        }
+                        other => {
+                            handle_welcome_blob_message(&joiner, &owner_id, other).await;
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        };
+
+        let pending = PendingWelcome {
+            group_id: group_id.clone(),
+            joiner_agent: hex::encode(joiner_id.as_bytes()),
+            bytes: bytes.clone(),
+            created_at: Instant::now(),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            stream_welcome_blob_via(&owner, &joiner_id, &welcome_id, pending, transport),
+        )
+        .await?;
+
+        assert_eq!(offers.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let received = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("joiner never received the Welcome after a lost Offer receipt")
+            })??
+            .map_err(|e| anyhow::anyhow!("Welcome transfer failed: {e}"))?;
+        assert_eq!(received, bytes, "joiner must reassemble the exact Welcome");
+        assert!(
+            owner.pending_welcome_acks.read().await.is_empty(),
+            "the finished stream must release its ack slot so a later FetchRequest can restart it"
+        );
+        Ok(())
     }
 
     #[test]
