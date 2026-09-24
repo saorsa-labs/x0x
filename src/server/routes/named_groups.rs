@@ -4248,6 +4248,7 @@ async fn classify_refused_joiner_fork_chain(
     chain: &[x0x::groups::state_commit::RetainedCommit],
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     served_chain_owner_anchored: bool,
+    served_chain_owner_v1_only: bool,
     persistence_lock_already_held: bool,
 ) -> bool {
     // Only a joiner with a served chain and stored lineage reaches the
@@ -4310,6 +4311,7 @@ async fn classify_refused_joiner_fork_chain(
             commit,
             chain,
             current,
+            "owner_attested_stale_base_gap",
             persistence_lock_already_held,
         )
         .await;
@@ -4320,6 +4322,28 @@ async fn classify_refused_joiner_fork_chain(
             "joiner served chain is owner-anchored to this exact terminal — stale-base gap, not fork evidence"
         );
         return true;
+    }
+    if served_chain_owner_v1_only {
+        // A genuine v1 signature authenticates the parent, but cannot
+        // distinguish the owner's terminal from an admin-signed sibling.
+        // Refuse adoption without treating this ambiguous old-owner result
+        // as authenticated fork evidence. The audit record is non-gating.
+        record_anchored_gap_refusal(
+            state,
+            group_key,
+            commit,
+            chain,
+            current,
+            "v1_only_unverifiable",
+            persistence_lock_already_held,
+        )
+        .await;
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            revision = commit.revision,
+            "joiner served a v1-only owner-attested chain — pending without fork quarantine"
+        );
+        return false;
     }
     let evidence = x0x::groups::ForkEvidence {
         revision: commit.revision,
@@ -4356,7 +4380,7 @@ async fn classify_refused_joiner_fork_chain(
     false
 }
 
-/// Durably record (non-gating) one owner-anchored stale-base refusal on the
+/// Durably record (non-gating) an owner-attestation gap refusal on the
 /// group's invite lineage: the latest terminal/head plus a running count.
 async fn record_anchored_gap_refusal(
     state: &Arc<AppState>,
@@ -4364,6 +4388,7 @@ async fn record_anchored_gap_refusal(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     chain: &[x0x::groups::state_commit::RetainedCommit],
     current: &x0x::groups::GroupInfo,
+    reason: &'static str,
     persistence_lock_already_held: bool,
 ) {
     let key = group_key.to_string();
@@ -4389,7 +4414,7 @@ async fn record_anchored_gap_refusal(
                 (prior.occurrences, prior.first_observed_at_ms)
             });
         lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
-            reason: "owner_attested_stale_base_gap".to_string(),
+            reason: reason.to_string(),
             head_revision,
             head_state_hash,
             terminal_revision,
@@ -4414,28 +4439,53 @@ async fn record_anchored_gap_refusal(
     }
 }
 
-/// Is the joiner's SERVED chain + terminal anchored by the admission
-/// owner's attestation of EXACTLY this terminal? All must hold:
-/// - owner key from the ingress-verified committed certificate;
-/// - the v1 head attestation verifies and CAS-binds the terminal's parent
-///   ([`HeadAttestation::verify_against_terminal`]);
-/// - the v2 terminal binding verifies for this terminal's `state_hash`,
-///   `committed_by` and TreeKEM epoch
-///   ([`HeadAttestation::verify_terminal_binding`]) — the v1 signature
-///   covers only the parent, so without v2 a same-parent SIBLING terminal
-///   signed by any other active admin would replay the owner's genuine
-///   attestation (#816 security review);
-/// - the attested head is the served chain's head.
-///
-/// `false` for groups without an owner axis, a missing/v1-only/malformed
-/// attestation, or any mismatch: only the owner's USER key can make this
-/// `true`, which no member agent (removed admin included) holds.
+/// Verify the owner's v1 signature on the terminal's parent and match that
+/// parent to the served chain. A v1-only result is ambiguous: an active admin
+/// can sign a different same-parent terminal, so this key cannot authorize
+/// adoption or prove a fork by itself.
 ///
 /// Owner-key model (named decision): the anchor trusts the admission
 /// owner's USER key, fixed by the immutable `OwnerCertified` policy — the
 /// same root the tier-1 adoption and owner mandates trust. Revoking an
 /// owner DEVICE (agent key) does not revoke that user key; compromise of
 /// the user key itself is outside this anchor's threat model.
+#[allow(clippy::too_many_arguments)]
+fn served_chain_owner_v1_key(
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    chain: &[x0x::groups::state_commit::RetainedCommit],
+    member_agent_id: &str,
+    owner_certified_certificate: Option<&x0x::identity::AgentCertificate>,
+    head_attestation: Option<&HeadAttestation>,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
+    treekem_epoch: Option<u64>,
+) -> Option<ant_quic::MlDsaPublicKey> {
+    let owner = current.policy.admission.owner_certified_user_id()?;
+    let attestation = head_attestation?;
+    let owner_public_key = owner_certified_certificate
+        .and_then(|cert| ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok())?;
+    if attestation.group_id != commit.group_id {
+        return None;
+    }
+    if !attestation.verify_against_terminal(
+        &owner_public_key,
+        owner,
+        commit,
+        member_agent_id,
+        owner_mandate,
+        treekem_epoch,
+    ) {
+        return None;
+    }
+    if attestation.head_state_hash != previous_hash_initial(chain, current) {
+        return None;
+    }
+    Some(owner_public_key)
+}
+
+/// The full owner anchor also verifies the v2 signature over this exact
+/// terminal's state hash, committer, and TreeKEM epoch. Only the owner's
+/// USER key can make this true; a member's agent key cannot.
 #[allow(clippy::too_many_arguments)]
 fn served_chain_owner_anchored(
     current: &x0x::groups::GroupInfo,
@@ -4447,34 +4497,21 @@ fn served_chain_owner_anchored(
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     treekem_epoch: Option<u64>,
 ) -> bool {
-    let Some(owner) = current.policy.admission.owner_certified_user_id() else {
-        return false;
-    };
-    let Some(attestation) = head_attestation else {
-        return false;
-    };
-    let Some(owner_public_key) = owner_certified_certificate
-        .and_then(|cert| ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok())
-    else {
-        return false;
-    };
-    if attestation.group_id != commit.group_id {
-        return false;
-    }
-    if !attestation.verify_against_terminal(
-        &owner_public_key,
-        owner,
+    let Some(owner_public_key) = served_chain_owner_v1_key(
+        current,
         commit,
+        chain,
         member_agent_id,
+        owner_certified_certificate,
+        head_attestation,
         owner_mandate,
         treekem_epoch,
-    ) {
+    ) else {
         return false;
-    }
-    if attestation.head_state_hash != previous_hash_initial(chain, current) {
-        return false;
-    }
-    attestation.verify_terminal_binding(&owner_public_key, commit, treekem_epoch)
+    };
+    head_attestation.is_some_and(|attestation| {
+        attestation.verify_terminal_binding(&owner_public_key, commit, treekem_epoch)
+    })
 }
 
 /// Separate fn + `Box::pin` at the call site: the giant apply fn's async
@@ -4555,12 +4592,10 @@ async fn try_adopt_member_added_across_gap(
     // #458 r5/r6b — THE ANCHOR, in TWO TIERS.
     //
     // TIER 1 (OwnerCertified groups — the Home shape): the terminal commit
-    // MUST be CAS-anchored to the ADMISSION OWNER's signed attestation of
-    // the authority's real current head. A forked/removed admin can sign
-    // arbitrary internally consistent commits with its agent key, but it
-    // never holds the owner's USER key, so its fork is either unattested
-    // (unanchorable gap → refuse) or fails the CAS against the terminal's
-    // parent.
+    // MUST carry the ADMISSION OWNER's v1 signature on the real parent AND
+    // v2 signature on this exact terminal. A forked/removed admin can sign
+    // a same-parent sibling with its agent key, but cannot forge the owner
+    // USER key's terminal binding. A v1-only old-owner result stays pending.
     //
     // TIER SELECTION TRUST (r7 item 7.3 / follow-up #469): the tier is
     // chosen from the JOINER's invite-supplied policy — the same
@@ -4605,6 +4640,9 @@ async fn try_adopt_member_added_across_gap(
             return refuse(
                 "owner head attestation fails verification, CAS, or mandate-epoch check against the terminal",
             );
+        }
+        if !attestation.verify_terminal_binding(&owner_public_key, commit, treekem_epoch) {
+            return refuse("owner terminal attestation missing or invalid for this terminal");
         }
         // The attested head must ALSO be the head the served chain reaches.
         if attestation.head_state_hash != previous_hash_initial(chain, current) {
@@ -10381,6 +10419,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 owner_mandate.as_ref(),
                                 treekem_epoch,
                             );
+                            let served_chain_owner_v1_only = served_attestation
+                                .as_ref()
+                                .is_some_and(|attestation| attestation.terminal_signature_b64.is_none())
+                                && served_chain_owner_v1_key(
+                                    &current,
+                                    &commit,
+                                    &adopt_chain,
+                                    &agent_id,
+                                    owner_certified_certificate.as_ref(),
+                                    served_attestation.as_ref(),
+                                    owner_mandate.as_ref(),
+                                    treekem_epoch,
+                                )
+                                .is_some();
                             let anchored_gap = classify_refused_joiner_fork_chain(
                                 state,
                                 &resolved_group_key,
@@ -10389,6 +10441,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 &adopt_chain,
                                 owner_mandate.as_ref(),
                                 served_chain_owner_anchored,
+                                served_chain_owner_v1_only,
                                 roster_lock_already_held,
                             )
                             .await;
