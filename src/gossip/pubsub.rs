@@ -4418,15 +4418,16 @@ mod tests {
         );
     }
 
-    /// WHY (#807 Full parity): #807 is a Leaf-only defect. A Full relay
-    /// initializes topic peers on every publish; if that write replaced
-    /// membership it would prune members missing from the momentary
-    /// connected snapshot (with their pending IWANTs and cooling state), and
-    /// a forced preferred eager would displace a working eager peer. R10 saw
-    /// Full-node KV delivery slow from 0.7 s to 110 s. Pre-#807 Full seeded
-    /// add-only and let sg's score choose eager, so both must still hold.
-    /// Fails on b2b2a746: the publish replaced membership (the seeded [42]
-    /// left the topic) and forced the pinned [8] eager.
+    /// WHY (#807 Full parity): #807 is a Leaf-only defect. The #808 port
+    /// made every Full writer, including the per-publish initialize, force
+    /// one preferred Full/bootstrap peer eager, displacing a working eager
+    /// peer that sg's score had chosen. Pre-#807 Full never forced a
+    /// preferred eager peer, and R10 saw Full-node KV delivery slow from
+    /// 0.7 s to 110 s. The switch from add-only to replace at publish time
+    /// is NOT observable on Full: sg's 1 s connected-peers refresh (sg
+    /// 0.5.85 lib.rs:2233-2280) prunes unconnected members on every version,
+    /// so this test does not assert add-only. Fails on b2b2a746: the publish
+    /// forces the pinned [8] eager over a full eager set.
     #[tokio::test]
     async fn full_publish_initialize_is_add_only_and_never_forces_preferred_eager() {
         // Full, ceiling 6, pinned bootstrap [8]; six connected peers fill eager.
@@ -4442,12 +4443,6 @@ mod tests {
                 .all(|(_, role)| role == "eager"),
             "six connected peers fill the Full eager ceiling"
         );
-        // A member sg holds that is absent from the next connected snapshot.
-        manager
-            .plumtree
-            .initialize_topic_peers(topic, vec![PeerId::new([42; 32])])
-            .await;
-        assert_eq!(role_for(&manager, topic, [42; 32]), "lazy");
 
         // The pinned Full/bootstrap peer connects; the publish re-seeds.
         let mut grown = initial.clone();
@@ -4458,11 +4453,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            role_for(&manager, topic, [42; 32]),
-            "lazy",
-            "Full publish-time initialize is add-only: no member is pruned"
-        );
         assert_eq!(
             role_for(&manager, topic, [8; 32]),
             "lazy",
