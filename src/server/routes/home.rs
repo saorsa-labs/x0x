@@ -809,10 +809,9 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
 /// pointer. The one step that can fork the owner's Home is creating a fresh
 /// Home. An owned device that would create one while it knows NO canonical
 /// pointer may be the owner's second device before its first sync. That step
-/// is deferred to the returned task. The task waits for one successful
-/// owner-sync session, a committed record that names a canonical Home, or
-/// `wait`, whichever comes first, and then re-runs [`provision_home`] from
-/// the top. The API stays up throughout; `GET /home` reports
+/// is deferred to the returned task, which waits as described on
+/// `wait_for_owner_sync_round` and then re-runs [`provision_home`] from the
+/// top. Creation there is linearized against pointer arrival (step 3a). The API stays up throughout; `GET /home` reports
 /// `provisioning_pending` until the task finishes.
 pub(in crate::server) async fn provision_home_at_startup(
     state: &Arc<AppState>,
@@ -840,36 +839,76 @@ pub(in crate::server) async fn provision_home_at_startup(
     }))
 }
 
-/// Resolve when a session with an owner device completes after this call,
-/// when a committed record makes a canonical Home known, or after `wait`.
+/// This device's rank among the owner's enrolled machines (#824): how many
+/// OTHER enrolled machines have a smaller machine id. Every device computes
+/// the same order, so at most one of a set of mutually enrolled, pointerless
+/// devices has rank 0.
+async fn home_creator_rank(state: &AppState) -> u32 {
+    let (Some(sync), Some(owner)) = (
+        state.owner_sync.as_ref(),
+        state.agent.identity().user_keypair().map(|kp| kp.user_id()),
+    ) else {
+        return 0;
+    };
+    let local = state.agent.machine_id();
+    let mut rank: u32 = 0;
+    for device in sync.store().enrolled_devices().await {
+        let machine = crate::identity::MachineId(device.machine_id);
+        if machine.0 < local.0 && sync.store().is_enrolled(&machine, &owner).await {
+            rank = rank.saturating_add(1);
+        }
+    }
+    rank
+}
+
+/// Resolve when this device should re-run provisioning (#824):
 ///
-/// A pass that reached nobody does NOT count. Right after a restart, the
-/// owner's other devices are often not yet discovered, or not yet enrolled
-/// here, so an empty pass says nothing about whether the owner has a Home.
+/// - a committed record makes a canonical Home known (it will then yield);
+/// - a session with an owner device completes and this device is the
+///   designated creator (rank 0): that session either delivered the pointer
+///   or showed that the device it reached advertises none;
+/// - or `(rank + 1) × wait` has passed since the wait began.
+///
+/// A completed session that brought no pointer releases ONLY the rank-0
+/// device. Two fresh, mutually enrolled devices would otherwise both wake on
+/// the same empty session and both create a Home. A non-leader keeps waiting
+/// for the leader's pointer, and its own deadline is one `wait` later per
+/// lower-ranked machine, so it creates only if every lower-ranked device
+/// failed to publish in time (a partition or an offline leader). A pass that
+/// reached nobody never counts.
 async fn wait_for_owner_sync_round(state: &Arc<AppState>, wait: std::time::Duration) {
     let Some(sync) = state.owner_sync.as_ref() else {
         return;
     };
-    let mut rounds = sync.store().successful_sessions_rx();
-    rounds.borrow_and_update();
+    let started = tokio::time::Instant::now();
+    let mut sessions = sync.store().successful_sessions_rx();
+    sessions.borrow_and_update();
     let mut generation = sync.store().generation_rx();
     generation.borrow_and_update();
-    let deadline = tokio::time::sleep(wait);
-    tokio::pin!(deadline);
     loop {
+        if effective_canonical_home(state).await.is_some() {
+            return;
+        }
+        let rank = home_creator_rank(state).await;
+        let deadline = started + wait.saturating_mul(rank.saturating_add(1));
         tokio::select! {
-            () = &mut deadline => {
+            () = tokio::time::sleep_until(deadline) => {
                 tracing::info!(
+                    rank,
                     wait_secs = wait.as_secs(),
-                    "no canonical Home pointer arrived before the wait expired; provisioning locally (#824)"
+                    "no canonical Home pointer arrived before this device's deadline; provisioning locally (#824)"
                 );
                 return;
             }
-            // A completed session merged that device's records: it either
-            // delivered the pointer or showed that the device advertises none.
-            _ = rounds.changed() => return,
+            changed = sessions.changed() => {
+                if changed.is_err() || home_creator_rank(state).await == 0 {
+                    return;
+                }
+            }
+            // Enrollment and merged records both land here; re-evaluate the
+            // pointer and this device's rank.
             changed = generation.changed() => {
-                if changed.is_err() || effective_canonical_home(state).await.is_some() {
+                if changed.is_err() {
                     return;
                 }
             }
@@ -1033,6 +1072,35 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
         }
         return ProvisionStep::Done;
     }
+
+    // 3a) #824: linearize the pointer check against the create. Every writer
+    //     of the canonical pointer takes `canonical_home_gate` for write, so
+    //     holding it for read from the check below to the end of creation and
+    //     stamping means no pointer can commit locally in between. A pointer
+    //     from another device arrives only inside an owner-sync session, so
+    //     before creating we also wait out every in-flight session and hold
+    //     off new ones. This covers a session still running when the wait's
+    //     timer expires. Lock order: session slots, then the gate, then
+    //     group state. Sessions take a slot before the gate.
+    let _sessions_quiesced = match (defer_fresh, state.owner_sync.as_ref()) {
+        (false, Some(sync)) => {
+            let bound = crate::owner_sync::SESSION_TIMEOUT + std::time::Duration::from_secs(30);
+            match tokio::time::timeout(bound, sync.quiesce_sessions()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    tracing::warn!(
+                        "owner-sync sessions did not drain before Home creation; relying on the pointer gate alone (#824)"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let _canonical_gate = match state.owner_sync.as_ref() {
+        Some(sync) => Some(sync.store().canonical_home_gate_read().await),
+        None => None,
+    };
 
     // 3) #449: another owner device has already advertised the owner's Home.
     //    Minting a second one here is exactly the reported bug — N devices
@@ -3698,28 +3766,114 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
-    /// WHY (#824): only a session that actually reached an owner device may end
-    /// the wait early. Right after the restart that installs the owner key,
-    /// the owner's other devices are usually not yet discovered or enrolled,
-    /// so the first pass reaches nobody. Treating that empty pass as "the
-    /// owner has no Home" is exactly how the duplicate would still be minted.
-    /// A completed session that brought no pointer does show that the device
-    /// it reached advertises no Home, so provisioning may then go ahead.
-    #[tokio::test]
-    async fn only_a_successful_owner_sync_session_ends_the_wait() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let state = owned_state(dir.path(), [0x86; 32]).await?;
-        let task = provision_home_at_startup(&state, std::time::Duration::from_secs(600))
-            .await
-            .ok_or_else(|| anyhow::anyhow!("must defer"))?;
+    /// Enroll `machine` for this state's owner (offline agent: nothing dials).
+    async fn enroll_machine(state: &Arc<AppState>, machine: [u8; 32]) -> anyhow::Result<()> {
         let sync = state
             .owner_sync
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))?;
-        let peer = crate::identity::MachineId([0x99; 32]);
+        let owner_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .ok_or_else(|| anyhow::anyhow!("owned state has a user key"))?;
+        sync.store()
+            .enroll(crate::owner_sync::OwnerEnrollment::sign(
+                crate::identity::MachineId(machine),
+                owner_kp,
+                1_000,
+                None,
+            )?)
+            .await?;
+        Ok(())
+    }
 
-        // An empty pass (offline agent, nothing enrolled) and a failed
-        // session must both leave the wait in place.
+    fn sync_of(state: &AppState) -> anyhow::Result<&Arc<crate::owner_sync::OwnerSyncService>> {
+        state
+            .owner_sync
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))
+    }
+
+    /// WHY (#824 OMP D1): two fresh, mutually enrolled owner devices with no
+    /// pointer complete one successful but EMPTY session with each other. If
+    /// that session released both, both would create a Home: the #824
+    /// duplicate. Exactly one (the lowest machine id) may create. The other
+    /// must keep waiting and yield once the creator's pointer reaches it.
+    #[tokio::test]
+    async fn two_fresh_devices_sharing_an_empty_session_create_exactly_one_home(
+    ) -> anyhow::Result<()> {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let a = owned_state(dir_a.path(), [0x89; 32]).await?;
+        let b = owned_state(dir_b.path(), [0x89; 32]).await?;
+        let (ma, mb) = (a.agent.machine_id(), b.agent.machine_id());
+        anyhow::ensure!(ma != mb, "distinct machines");
+        enroll_machine(&a, mb.0).await?;
+        enroll_machine(&b, ma.0).await?;
+        let (leader, follower) = if ma.0 < mb.0 { (&a, &b) } else { (&b, &a) };
+        let (leader_machine, follower_machine) =
+            (leader.agent.machine_id(), follower.agent.machine_id());
+
+        let wait = std::time::Duration::from_secs(600);
+        let leader_task = provision_home_at_startup(leader, wait)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("leader must defer"))?;
+        let follower_task = provision_home_at_startup(follower, wait)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("follower must defer"))?;
+
+        // Let both waiters subscribe before the session is recorded.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // One successful session, no pointer on either side: both record it.
+        sync_of(leader)?
+            .store()
+            .set_session_status(&follower_machine, true)
+            .await;
+        sync_of(follower)?
+            .store()
+            .set_session_status(&leader_machine, true)
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), leader_task).await??;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(home_shaped_group_count(leader).await, 1);
+        assert_eq!(
+            home_shaped_group_count(follower).await,
+            0,
+            "an empty session released the follower too: two Homes for one owner"
+        );
+        assert!(!follower_task.is_finished());
+
+        // The leader's pointer reaches the follower; it yields.
+        let (leader_gid, _) = find_home(leader.as_ref(), &owner_of(leader))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("leader Home"))?;
+        commit_canonical_home(follower, &leader_gid).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), follower_task).await??;
+        assert_eq!(home_shaped_group_count(follower).await, 0);
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(follower))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        Ok(())
+    }
+
+    /// WHY (#824): a pass that reached nobody, or a failed session, says
+    /// nothing about whether the owner already has a Home. Right after the
+    /// key-bearing restart that is the normal case, so neither may end the
+    /// wait. A successful session releases the designated creator (here the
+    /// only candidate, since the one enrolled peer has a higher machine id).
+    #[tokio::test]
+    async fn only_a_successful_session_releases_the_designated_creator() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x86; 32]).await?;
+        let peer = [0xff; 32];
+        enroll_machine(&state, peer).await?;
+        let task = provision_home_at_startup(&state, std::time::Duration::from_secs(600))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("must defer"))?;
+        let sync = sync_of(&state)?;
+        let peer = crate::identity::MachineId(peer);
+
         sync.sync_all().await;
         sync.store().set_session_status(&peer, false).await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -3736,27 +3890,65 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
-    /// WHY (#824): the owner's other devices learn the canonical Home only
-    /// from this device's Tier-1 pointer record, which is minted during a sync
-    /// pass. Waiting for the next 60 s pass would let a device enrolled right
-    /// after provisioning complete its first session with no pointer and mint
-    /// a duplicate Home. Provisioning must wake the sync loop immediately.
+    /// WHY (#824 OMP D2): the final pointer check and the create must be one
+    /// step. A pointer merged by a session after the check but before the
+    /// create would leave this device holding a duplicate. Creation waits out
+    /// in-flight sessions, then re-checks under the pointer gate.
     #[tokio::test]
-    async fn provisioning_a_home_wakes_owner_sync_to_publish_its_pointer() -> anyhow::Result<()> {
+    async fn a_pointer_landing_while_creation_waits_is_honoured() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = owned_state(dir.path(), [0x88; 32]).await?;
-        let sync = state
-            .owner_sync
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("owned state wires sync"))?;
-        let mut generation = sync.store().generation_rx();
-        generation.borrow_and_update();
-        provision_home(&state).await;
-        assert_eq!(home_shaped_group_count(&state).await, 1);
-        assert!(
-            generation.has_changed()?,
-            "a freshly provisioned Home must wake owner sync"
+        let state = owned_state(dir.path(), [0x8a; 32]).await?;
+        let slot = sync_of(&state)?
+            .hold_session_slot_for_testing()
+            .ok_or_else(|| anyhow::anyhow!("slot"))?;
+        let task = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { provision_home(&state).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            home_shaped_group_count(&state).await,
+            0,
+            "created a Home while a session that could carry the pointer was in flight"
         );
+        // The in-flight session merges the owner's pointer, then ends.
+        let canonical = "e1".repeat(16);
+        commit_canonical_home(&state, &canonical).await?;
+        drop(slot);
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+        assert_eq!(home_shaped_group_count(&state).await, 0);
+        Ok(())
+    }
+
+    /// WHY (#824 OMP D3): the wait's timer is not a safety boundary by itself.
+    /// A 60 s session can still be running when it fires, and could merge the
+    /// owner's pointer just after. Expiry must not create until that session
+    /// has finished, and then must honour what it brought.
+    #[tokio::test]
+    async fn timer_expiry_during_an_in_flight_session_creates_no_duplicate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x8b; 32]).await?;
+        let slot = sync_of(&state)?
+            .hold_session_slot_for_testing()
+            .ok_or_else(|| anyhow::anyhow!("slot"))?;
+        let task = provision_home_at_startup(&state, std::time::Duration::from_millis(100))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("must defer"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            home_shaped_group_count(&state).await,
+            0,
+            "timer expiry created a Home while a session was still in flight"
+        );
+        let canonical = "e2".repeat(16);
+        commit_canonical_home(&state, &canonical).await?;
+        drop(slot);
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+        assert_eq!(home_shaped_group_count(&state).await, 0);
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
         Ok(())
     }
 

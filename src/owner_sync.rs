@@ -2362,6 +2362,28 @@ impl OwnerSyncService {
         result.map_err(|e| e.to_string())
     }
 
+    /// #824: wait for every in-flight owner-sync session to finish and hold
+    /// off new ones while the returned guard lives.
+    ///
+    /// Home provisioning creates a fresh Home under this guard. Remote records,
+    /// including a canonical Home pointer, arrive only inside sessions, so no
+    /// pointer can be merged between its final pointer check and the create.
+    /// Outbound sessions queue behind the guard. Inbound streams are dropped
+    /// while it is held, and the peer retries on its next pass. Sessions are
+    /// bounded by [`SESSION_TIMEOUT`], so the wait is too.
+    pub async fn quiesce_sessions(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        let all = u32::try_from(MAX_CONCURRENT_SESSIONS).ok()?;
+        self.session_permits.acquire_many(all).await.ok()
+    }
+
+    /// Test hook (#824): occupy one session slot, as an in-flight session does.
+    #[cfg(test)]
+    pub(crate) fn hold_session_slot_for_testing(
+        &self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.session_permits).try_acquire_owned().ok()
+    }
+
     /// One full pass: mint local Tier-1 records from live daemon state,
     /// then sync with every enrolled machine we can resolve.
     pub async fn sync_all(&self) {

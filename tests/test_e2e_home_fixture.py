@@ -871,6 +871,9 @@ esac
 
     def test_failed_home_seat_poll_still_reports_and_cleans_up(self):
         custody = mock.Mock(); custody.restore.return_value = []
+        # Witness rows are appended after restore, so they follow the
+        # fixture's own failure row; give the collector a real (empty) list.
+        custody.control_blob_witnesses.return_value = []
         tunnel = mock.Mock()
         def fail(_args, _remote, evidence, resources):
             resources["custody"] = custody
@@ -892,8 +895,9 @@ esac
         self.assertEqual("timeout", data["polls"][0]["outcome"])
         self.assertEqual(200, data["polls"][0]["last_http_status"])
         self.assertFalse(data["polls"][0]["expected_member_present"])
-        self.assertEqual("fixture AssertionError", data["assertions"][-1]["label"])
-        self.assertFalse(data["assertions"][-1]["passed"])
+        failure = [row for row in data["assertions"] if row["label"] == "fixture AssertionError"]
+        self.assertEqual(1, len(failure), data["assertions"])
+        self.assertFalse(failure[0]["passed"])
 
 
 if __name__ == "__main__": unittest.main()
