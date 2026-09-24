@@ -6502,23 +6502,16 @@ async fn owner_certified_join_carried_certificate_admits_without_cache() -> Resu
         );
     }
 
-    // (b) REVOKED: a valid owner-signed certificate for the joiner own
-    // agent, revoked in the local set BEFORE the join. Refused despite
-    // a valid cert, and not seated.
+    // (b) REVOKED: the revocation lookup inside the INLINE admission
+    // path. The revoked joiner as event SENDER is refused earlier
+    // (Enforcement point 4), so this drives owner_certified_admission_
+    // check DIRECTLY with a revoked member + the carried cert and
+    // asserts Err(Revoked) — the only test that catches removal of the
+    // revocation lookup in the inline branch.
     {
         let (auth, _d, okp) = owner_authority_state().await?;
         let gid = "b8".repeat(32);
-        let auth_hex = hex::encode(auth.agent.agent_id().as_bytes());
         insert_owner_group(auth.as_ref(), &gid, owner_certified_policy(&okp), "seed").await;
-        let jh = hex::encode(joiner_kp.agent_id().as_bytes());
-        let secret = format!("issue842-neg-revoked-{jh}");
-        {
-            let mut groups = auth.named_groups.write().await;
-            groups
-                .get_mut(&gid)
-                .expect("neg group b")
-                .record_issued_invite(secret.clone(), 0, 0, x0x::groups::GroupRole::Member);
-        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -6535,31 +6528,48 @@ async fn owner_certified_join_carried_certificate_admits_without_cache() -> Resu
             .write()
             .await
             .verify_and_insert(record, Some(&joiner_cert))?;
-        let (mid, _mh, _pk, mut ev) = signed_member_joined_event_for_test(
-            &joiner_kp,
-            &gid,
-            &auth_hex,
-            &secret,
-            x0x::groups::GroupRole::Member,
-        )?;
-        use base64::Engine as _;
-        if let NamedGroupMetadataEvent::MemberJoined {
-            certificate_b64, ..
-        } = &mut ev
         {
-            *certificate_b64 = Some(
-                base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+            let mut groups = auth.named_groups.write().await;
+            groups.get_mut(&gid).expect("neg group b").add_member(
+                hex::encode(joiner_kp.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(auth.agent.agent_id().as_bytes())),
+                None,
             );
         }
-        let res = apply_named_group_metadata_event(&auth, ev, mid, true, None).await;
-        assert!(!res.accepted, "revoked agent: refused despite a valid cert");
-        let groups = auth.named_groups.read().await;
+        let info = {
+            let groups = auth.named_groups.read().await;
+            groups.get(&gid).expect("neg group b").clone()
+        };
+        let outcome = owner_certified_admission_check(
+            &auth,
+            &info,
+            &hex::encode(joiner_kp.agent_id().as_bytes()),
+            Some(&joiner_cert),
+        )
+        .await;
+        assert_eq!(
+            outcome.map(|_| ()),
+            Err(x0x::groups::owner_cert::OwnerCertFailure::Revoked),
+            "a revoked agent is refused by the INLINE admission check despite a valid cert"
+        );
+    }
+
+    // Control: the same neg_join_with_cert setup ADMITS a fresh joiner
+    // with a valid owner-signed cert, so a setup fault cannot make (a)
+    // or (c) pass vacuously.
+    {
+        let fresh_kp = AgentKeypair::generate()?;
+        let fresh_cert = issue_joiner_cert(&owner_kp, &fresh_kp)?;
+        let (_auth, res, gid) = neg_join_with_cert(&fresh_kp, &fresh_cert).await;
+        assert!(res.accepted, "control: a valid cert is admitted");
+        let groups = _auth.named_groups.read().await;
         assert!(
-            !groups
+            groups
                 .get(&gid)
-                .expect("neg group b")
-                .has_active_member(&jh),
-            "revoked joiner not seated"
+                .expect("control group")
+                .has_active_member(&hex::encode(fresh_kp.agent_id().as_bytes())),
+            "control: the fresh joiner is seated"
         );
     }
     // (c) EXPIRED: an owner-signed certificate with not_after in the
