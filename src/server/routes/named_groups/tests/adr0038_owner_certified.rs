@@ -561,7 +561,7 @@ async fn admission_oracle_fails_closed_on_blob_cache_miss_and_recovers() -> Resu
     };
 
     // 1. Miss: no cache entry at all → typed failure, denied.
-    let denied = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex).await;
+    let denied = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex, None).await;
     assert_eq!(
         denied,
         Err(x0x::groups::owner_cert::OwnerCertFailure::NoCertificate),
@@ -572,7 +572,7 @@ async fn admission_oracle_fails_closed_on_blob_cache_miss_and_recovers() -> Resu
     //    promotion) and the SAME check now returns the cert for binding.
     let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &joiner)?;
     announce_cert_for(state.as_ref(), cert.clone()).await;
-    let admitted = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex).await;
+    let admitted = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex, None).await;
     assert_eq!(
         admitted,
         Ok(Some(cert)),

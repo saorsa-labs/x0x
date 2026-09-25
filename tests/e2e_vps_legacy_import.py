@@ -18,6 +18,20 @@ from e2e_vps_groups import load_tokens
 from e2e_vps_kv import Api, Evidence, ServiceCustody, enc, poll
 
 
+def removed_group_refusal(result: tuple[int, dict[str, Any]]) -> bool:
+    # Membership removal may delete the local group rather than retain a
+    # forbidden row. Only the route's explicit group absence is evidence;
+    # an unrelated 404 (missing source/route) must not satisfy the oracle.
+    return result[0] == 404 and result[1].get("error") == "group not found"
+
+
+def revoked_listing_refusal(result: tuple[int, dict[str, Any]]) -> bool:
+    status, body = result
+    return (status in (403, 409) or removed_group_refusal(result)
+            or (status == 200 and bool(body.get("candidates"))
+                and body["candidates"][0].get("can_import") is False))
+
+
 class LegacyScenario:
     def __init__(self, clients: dict[str, Api], evidence: Evidence, timeout: float) -> None:
         self.c, self.e, self.timeout = clients, evidence, timeout
@@ -121,13 +135,16 @@ class LegacyScenario:
         self.e.check("owner removes source holder", self.c[owner].request("DELETE", f"/groups/{enc(gid)}/members/{revoked_aid}")[0] == 200)
         denied = poll("revoked import refusal", self.timeout,
                       lambda: self.c[revoked].request("GET", f"/groups/{enc(gid)}/stores/wiki/legacy-imports"),
-                      lambda r: r[0] in (403, 409) or (r[0] == 200 and r[1].get("candidates") and r[1]["candidates"][0].get("can_import") is False))
-        self.e.check("revoked writer cannot endorse", denied[0] in (200, 403, 409), status=denied[0])
-        revoked_post, _ = self.c[revoked].request(
+                      revoked_listing_refusal,
+                      lambda facts, last: self.e.record_poll(
+                          facts, operation="revoked_import_refusal", node=revoked, group_id=gid,
+                          response_class="group_not_found" if last and removed_group_refusal(last) else "other"))
+        self.e.check("revoked writer cannot endorse", revoked_listing_refusal(denied), status=denied[0])
+        revoked_post, revoked_body = self.c[revoked].request(
             "POST", f"/groups/{enc(gid)}/stores/wiki/legacy-imports/{enc(revoked_candidate['source_store_id'])}",
             {"source_digest": revoked_candidate["source_digest"], "idempotency_key": f"revoked-{uuid.uuid4().hex}"},
         )
-        self.e.check("revoked import mutation refused", revoked_post == 403, status=revoked_post)
+        self.e.check("revoked import mutation refused", revoked_post == 403 or removed_group_refusal((revoked_post, revoked_body)), status=revoked_post)
         self.barrier_absence(observer, writer, revoked_destination, "revoked-imported")
 
         announce = self.call(owner, "POST", "/groups", {"name": f"legacy-reader-{uuid.uuid4().hex[:8]}", "preset": "public_announce"})
@@ -247,7 +264,7 @@ def main() -> int:
             try: stop_ssh_tunnel(tunnel)
             except Exception as error: success = False; evidence.assertions.append({"label": f"cleanup {node} {type(error).__name__}", "passed": False})
         try:
-            with open(a.report, "w", encoding="utf-8") as out: json.dump({"scenario": "legacy-normal-success", "assertions": evidence.assertions}, out, indent=2)
+            with open(a.report, "w", encoding="utf-8") as out: json.dump({"scenario": "legacy-normal-success", "assertions": evidence.assertions, "polls": evidence.polls}, out, indent=2)
         except Exception: success = False
     return 0 if success and all(x["passed"] for x in evidence.assertions) else 1
 
