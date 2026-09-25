@@ -87,6 +87,7 @@ async fn sealed_group_with_lineage(
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups
@@ -1059,6 +1060,7 @@ async fn adr0064_explicit_seal_without_owner_user_key_does_not_clear() -> Result
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups
@@ -1148,6 +1150,7 @@ async fn cert_sealed_group_with_lineage(
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups
@@ -2713,6 +2716,7 @@ fn lineage_for(info: &x0x::groups::GroupInfo) -> x0x::groups::InviteLineage {
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     }
 }
 
@@ -3008,6 +3012,7 @@ async fn issue732_startup_quarantines_a_lineage_free_ordinary_group() -> Result<
     let (status, body) = secure_group_decrypt(
         State(Arc::clone(&state)),
         Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(serde_json::from_value::<SecureDecryptRequest>(
             serde_json::json!({ "ciphertext_b64": "aGVsbG8=" }),
         )?),
@@ -3018,6 +3023,7 @@ async fn issue732_startup_quarantines_a_lineage_free_ordinary_group() -> Result<
     let (status, body) = secure_group_reseal(
         State(Arc::clone(&state)),
         Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(serde_json::from_value::<ResealRequest>(
             serde_json::json!({ "recipient": "ab".repeat(32) }),
         )?),
@@ -4708,6 +4714,7 @@ async fn issue732_mixed_lineage_aliases_keep_retained_evidence_and_refuse_the_id
             seated_at_revision: None,
             corroborated: false,
             fork_evidence: Some(evidence.clone()),
+            anchored_gap_refusal: None,
         });
         let mut disk = std::collections::HashMap::new();
         disk.insert(first_key.clone(), lineage_less);
@@ -4859,6 +4866,7 @@ async fn issue732_install_refuses_when_a_marker_already_exists_despite_an_empty_
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
+        anchored_gap_refusal: None,
     });
     state
         .named_groups

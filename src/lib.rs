@@ -3720,6 +3720,113 @@ fn raw_dm_history_record(
     })
 }
 
+struct RawDirectDelivery {
+    sender: identity::AgentId,
+    machine_id: identity::MachineId,
+    data: Vec<u8>,
+    verified: bool,
+    trust_decision: Option<trust::TrustDecision>,
+    observed_origin: Option<connectivity::ObservedOrigin>,
+    digest: String,
+}
+
+/// The post-validation raw-QUIC delivery path. The listener calls this only
+/// after the revocation, pairing, and expiry gates have passed.
+async fn dispatch_raw_direct_after_gates(
+    dm: &direct::DirectMessaging,
+    history_handle: Option<&history::HistoryHandle>,
+    typed_routes: &[dm_inbox::DmTypedPayloadRoute],
+    delivery: RawDirectDelivery,
+) {
+    let RawDirectDelivery {
+        sender,
+        machine_id,
+        data,
+        verified,
+        trust_decision,
+        observed_origin,
+        digest,
+    } = delivery;
+
+    // The raw transport has verified the AgentId→MachineId binding by this
+    // point. A recognized typed payload follows the same prefix order as the
+    // gossip inbox and never enters the generic direct-message/history path.
+    // Raw transport ACKs remain transport receipts, regardless of whether a
+    // bounded typed-route channel accepts or its handler processes the item.
+    if verified
+        && !matches!(
+            trust_decision,
+            Some(trust::TrustDecision::RejectBlocked | trust::TrustDecision::RejectMachineMismatch)
+        )
+    {
+        let hash = blake3::hash(&data);
+        let mut request_id = [0u8; 16];
+        request_id.copy_from_slice(&hash.as_bytes()[..16]);
+        if dm_inbox::InboxPipeline::try_route_typed_payload(
+            typed_routes,
+            dm,
+            dm_inbox::DmTypedPayload {
+                sender,
+                machine_id,
+                payload: data.clone(),
+                verified: true,
+                trust_decision,
+                received_at_unix_ms: dm::now_unix_ms(),
+                request_id,
+                completion: None,
+            },
+        ) {
+            return;
+        }
+    }
+
+    if let (Some(history), Some(record)) = (
+        history_handle,
+        raw_dm_history_record(
+            sender,
+            machine_id,
+            &data,
+            verified,
+            trust_decision,
+            i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
+        ),
+    ) {
+        history.record(record);
+    }
+
+    let payload_bytes = data.len();
+    let delivered = dm
+        .handle_incoming(
+            machine_id,
+            sender,
+            data,
+            verified,
+            trust_decision,
+            observed_origin,
+        )
+        .await;
+
+    tracing::debug!(
+        target: "dm.trace",
+        stage = "inbound_broadcast_published",
+        sender = %hex::encode(sender.as_bytes()),
+        machine_id = %hex::encode(machine_id.as_bytes()),
+        path = "raw_quic",
+        delivered,
+        subscribers = dm.subscriber_count(),
+        digest = %digest,
+    );
+
+    tracing::debug!(
+        target: "x0x::direct",
+        stage = "recv",
+        sender_prefix = %network::hex_prefix(&sender.0, 4),
+        payload_bytes,
+        subscriber_count = dm.subscriber_count(),
+        "direct message dispatched"
+    );
+}
+
 // ─── ADR 0030: strict capability refresh ───────────────────────────────────
 
 /// Cap on concurrent refresh flights, so a burst of strict sends to distinct
@@ -4166,6 +4273,20 @@ impl Agent {
         self.gossip_runtime.as_ref().map(|rt| rt.pubsub().stats())
     }
 
+    /// Refresh preferred eager peers from committed named-group rosters.
+    /// Agent ids are never used as transport peer ids: pub/sub resolves each
+    /// member through retained authenticated machine bindings, then checks
+    /// live transport connectivity and the current security vetoes.
+    pub async fn replace_group_rosters_for_gossip(
+        &self,
+        rosters: Vec<(String, String, Vec<identity::AgentId>)>,
+    ) {
+        let Some(runtime) = self.gossip_runtime.as_ref() else {
+            return;
+        };
+        runtime.pubsub().replace_group_rosters(rosters).await;
+    }
+
     /// Leaf vs Full participation snapshot (issue #380).
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
@@ -4213,7 +4334,7 @@ impl Agent {
         data: bytes::Bytes,
     ) {
         if let Some(rt) = &self.gossip_runtime {
-            rt.pubsub().handle_incoming(peer, data).await;
+            rt.pubsub().handle_incoming(peer, None, data).await;
         }
     }
 
@@ -5761,7 +5882,7 @@ impl Agent {
     /// teardown step, so an aborted leader can neither wedge a snapshot
     /// path in `Retiring` nor let a follower return while the drained
     /// writer is still running.
-    pub async fn shutdown(&self) {
+    pub async fn try_shutdown(&self) -> error::NetworkResult<()> {
         // #765 r4 test instrument: this future was polled. Counted before
         // anything else so a caller parked on the serialize lock below
         // still counts as entered.
@@ -5927,16 +6048,39 @@ impl Agent {
         // keepalive tasks hold the transport (and thus the ant-quic endpoint)
         // alive; the daemon binary survives only by process exit, but an
         // embedded host needs these released to re-`serve()` on the same port.
+        let mut shutdown_errors = Vec::new();
         if let Some(ref runtime) = self.gossip_runtime {
             if let Err(e) = runtime.shutdown().await {
                 tracing::warn!("Gossip runtime shutdown error: {e}");
+                shutdown_errors.push(format!("gossip runtime: {e}"));
             } else {
                 tracing::info!("Gossip runtime shut down");
             }
         }
         if let Some(ref network) = self.network {
-            network.shutdown().await;
-            tracing::info!("Network node shut down");
+            if let Err(e) = network.try_shutdown().await {
+                tracing::warn!("Network node shutdown error: {e}");
+                shutdown_errors.push(format!("network node: {e}"));
+            } else {
+                tracing::info!("Network node shut down");
+            }
+        }
+
+        if shutdown_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(error::NetworkError::NodeError(format!(
+                "agent shutdown incomplete: {}",
+                shutdown_errors.join("; ")
+            )))
+        }
+    }
+
+    /// Compatibility shutdown for callers that cannot consume a typed result.
+    /// Release-sensitive callers must use [`try_shutdown`](Self::try_shutdown).
+    pub async fn shutdown(&self) {
+        if let Err(error) = self.try_shutdown().await {
+            tracing::warn!(%error, "agent shutdown did not fully release its resources");
         }
     }
 
@@ -11575,7 +11719,9 @@ impl Agent {
                 retired.push(this_move);
             }
             retired.sort_by_key(|b| (b.agent.0, b.machine.0, b.move_epoch));
-            // The certificate: journal/discovery evidence for coherence.
+            // The certificate: journal/discovery evidence for coherence —
+            // and, since #797, the identity-dir certificate when the
+            // activating agent is this daemon's own.
             let cert = self.agent_certificate_for(agent_id).await.ok_or_else(|| {
                 error::IdentityError::Revocation(
                     "no certificate known for the agent — cannot activate".to_string(),
@@ -11960,6 +12106,21 @@ impl Agent {
                 "no certificate known for the agent — binding revocation requires it".to_string(),
             )
         })?;
+
+        // #797 review item 4: a binding tombstone never expires (ADR-0043
+        // grow-only set) — revoking the LOCAL machine's own binding
+        // permanently bars this daemon's agent from signing here until the
+        // owner re-issues the certificate. That is a legitimate retirement
+        // action, so it proceeds — but never silently.
+        if *machine == self.machine_id() {
+            tracing::warn!(
+                agent = %hex::encode(agent.as_bytes()),
+                move_epoch,
+                "revoking the LOCAL machine's own binding — the tombstone never \
+                 expires; this daemon's agent cannot sign from this machine \
+                 again until re-issued"
+            );
+        }
         let subject =
             revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
                 agent: *agent,
@@ -11997,12 +12158,41 @@ impl Agent {
         Ok(record)
     }
 
+    /// #797: the identity-held certificate for the daemon's own agent, but
+    /// ONLY when its issuer is the currently loaded owner user key — a
+    /// cert issued by an earlier owner key is NOT authoritative here and
+    /// must not short-circuit the peer/journal certificate lookups
+    /// (review item 3).
+    fn local_agent_certificate_if_current_issuer(
+        identity: &identity::Identity,
+    ) -> Option<identity::AgentCertificate> {
+        let cert = identity.agent_certificate()?;
+        let user = identity.user_keypair()?;
+        cert.user_id()
+            .is_ok_and(|uid| uid == user.user_id())
+            .then(|| cert.clone())
+    }
+
     /// The newest certificate known for an agent: discovery cache first,
     /// then the owner journal's retained bytes.
     async fn agent_certificate_for(
         &self,
         agent: &identity::AgentId,
     ) -> Option<identity::AgentCertificate> {
+        // #797: the daemon's OWN agent. Self-issuance deliberately keeps the
+        // cert journal lean (agent.cert is the durable copy) and the peer
+        // discovery cache never contains ourselves, so neither source below
+        // can resolve the local agent — the identity accessor is
+        // authoritative for it, but ONLY when the held certificate was
+        // issued by the LOADED owner user key: a cert left behind by an
+        // earlier owner key must fall through to the peer/journal lookups
+        // instead of failing the caller's authority check with the
+        // less-actionable "issuer is neither..." (review item 3).
+        if *agent == self.agent_id() {
+            if let Some(cert) = Self::local_agent_certificate_if_current_issuer(self.identity()) {
+                return Some(cert);
+            }
+        }
         if let Ok(Some(entry)) = self.discovered_agent(*agent).await {
             if let Some(cert) = entry.agent_certificate {
                 return Some(cert);
@@ -13125,58 +13315,31 @@ impl Agent {
                     None
                 };
 
-                // ADR-0023: the gossip-inbox path records after its envelope
-                // verification gates, but the receive-ACK raw-QUIC path joins
-                // the same application stream here. Persist an artifact-less
-                // row only when the transport AgentId->MachineId binding was
-                // verified and trust did not reject the sender. Buzz message
-                // envelopes carry a per-send clientId in their payload, so
-                // payload-derived ids remain distinct for repeated user text.
-                if let (Some(history), Some(record)) = (
+                let typed_routes = {
+                    let inbox = dm_inbox_service.lock().await;
+                    // Before the inbox starts there are no registered routes;
+                    // retain the existing generic raw delivery in that case.
+                    inbox
+                        .as_ref()
+                        .map(dm_inbox::DmInboxService::typed_payload_routes)
+                        .unwrap_or_default()
+                        .to_vec()
+                };
+                dispatch_raw_direct_after_gates(
+                    &dm,
                     history_handle.as_ref(),
-                    raw_dm_history_record(
+                    &typed_routes,
+                    RawDirectDelivery {
                         sender,
                         machine_id,
-                        &data,
-                        verified,
-                        trust_decision,
-                        i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
-                    ),
-                ) {
-                    history.record(record);
-                }
-
-                // Fan out to all subscribe_direct() receivers with verification info.
-                let delivered = dm
-                    .handle_incoming(
-                        machine_id,
-                        sender,
                         data,
                         verified,
                         trust_decision,
                         observed_origin,
-                    )
-                    .await;
-
-                tracing::debug!(
-                    target: "dm.trace",
-                    stage = "inbound_broadcast_published",
-                    sender = %hex::encode(sender.as_bytes()),
-                    machine_id = %hex::encode(machine_id.as_bytes()),
-                    path = "raw_quic",
-                    delivered,
-                    subscribers = dm.subscriber_count(),
-                    digest = %digest,
-                );
-
-                tracing::debug!(
-                    target: "x0x::direct",
-                    stage = "recv",
-                    sender_prefix = %network::hex_prefix(&sender.0, 4),
-                    payload_bytes,
-                    subscriber_count = dm.subscriber_count(),
-                    "direct message dispatched"
-                );
+                        digest,
+                    },
+                )
+                .await;
             }
         });
     }
@@ -15561,6 +15724,16 @@ impl AgentBuilder {
 
         // Initialize direct messaging infrastructure
         let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
+        let authenticated_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+            dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        if let Some(runtime) = gossip_runtime.as_ref() {
+            runtime.pubsub().set_group_identity_context(
+                std::sync::Arc::clone(&authenticated_machine_bindings),
+                std::sync::Arc::clone(&revocation_set),
+                std::sync::Arc::clone(&move_state),
+            );
+        }
 
         // Create presence wrapper if network exists
         let presence = if let Some(ref net) = network {
@@ -15649,9 +15822,7 @@ impl AgentBuilder {
             gossip_cache_adapter,
             machine_kem,
             identity_discovery_cache,
-            authenticated_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
-                dm_inbox::AuthenticatedMachineBindingCache::default(),
-            )),
+            authenticated_machine_bindings,
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -18066,6 +18237,28 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<kv::KvStoreDelta> {
+        Ok(self.put_with_outcome(key, value, content_type).await?.delta)
+    }
+
+    /// Put a key-value pair and return the published delta together with
+    /// the writer's own keys that the put evicted.
+    ///
+    /// Under [`kv::AccessPolicy::SelfKeyed`], ADR-0047 lowest-N admission can
+    /// evict the writer's lexicographically highest live keys when a put
+    /// takes it over the quota. That rule is unchanged. This method only
+    /// reports the eviction so the writer sees it (issue #849). A put whose
+    /// own key would fall outside the admitted set is refused before
+    /// anything changes, as with [`put_with_delta`](Self::put_with_delta).
+    ///
+    /// # Errors
+    ///
+    /// As [`put_with_delta`](Self::put_with_delta).
+    pub async fn put_with_outcome(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+    ) -> error::Result<KvPutOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
             .await
@@ -18083,18 +18276,21 @@ impl KvStoreHandle {
                  local writes refused until a snapshot succeeds"
             )))
         })?;
-        let delta = {
+        let (delta, evicted_keys) = {
             let mut store = self.sync.write().await;
             let would_mutate =
                 Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
             let version_before = store.current_version();
             if !would_mutate {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                });
             }
             let first_seq = store.reserve_sequences(2).map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!("kv put failed: {e}")))
             })?;
-            store
+            let evicted_keys = store
                 .put_with_reserved_sequence(
                     key.clone(),
                     value.clone(),
@@ -18115,7 +18311,10 @@ impl KvStoreHandle {
             // must not advance for a non-mutation), publish nothing, and
             // persist nothing. Retries stay observationally silent.
             if store.current_version() == version_before {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                });
             }
             let entry = store.get(&key).cloned();
             let version = store.current_version();
@@ -18155,7 +18354,7 @@ impl KvStoreHandle {
                 // (content_root binds the store name).
                 delta.name_update = Some(store.name_register().clone());
             }
-            delta
+            (delta, evicted_keys)
         };
         // Durability before announcement: persist the committed mutation and
         // DO NOT publish if the snapshot fails — announcing state the disk
@@ -18174,7 +18373,10 @@ impl KvStoreHandle {
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
         }
-        Ok(delta)
+        Ok(KvPutOutcome {
+            delta,
+            evicted_keys,
+        })
     }
 
     /// Get a value by key.
@@ -18349,6 +18551,16 @@ impl KvStoreHandle {
         let store = self.sync.read().await;
         Ok(store.name().to_string())
     }
+}
+
+/// Result of a local KV put: the published delta plus any keys it evicted.
+#[derive(Debug, Clone)]
+pub struct KvPutOutcome {
+    /// The CRDT delta that was published for this put.
+    pub delta: kv::KvStoreDelta,
+    /// The writer's own keys that this put evicted under the `SelfKeyed`
+    /// lowest-N quota (ADR-0047), sorted. Empty when nothing was evicted.
+    pub evicted_keys: Vec<String>,
 }
 
 /// Read-only snapshot of a KvStore entry.
@@ -18838,6 +19050,133 @@ fn spawn_relay_dm_listener(
 
 #[cfg(test)]
 mod tests {
+    mod own_agent_certificate_lookup_797 {
+        use super::*;
+
+        /// #797: revoking the daemon's OWN agent binding must work from the
+        /// identity certificate when neither secondary source can answer —
+        /// the discovery cache never contains ourselves, and the issuance
+        /// journal is stripped here. FAIL-BEFORE (the local-identity
+        /// fallback in `agent_certificate_for` removed): revoke_binding
+        /// errors "no certificate known for the agent".
+        #[tokio::test]
+        async fn revoke_own_agent_binding_uses_identity_certificate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let agent = Agent::builder()
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_identity_dir(dir.path())
+                .with_user_key(identity::UserKeypair::generate().expect("owner user key"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            let own = agent.agent_id();
+            let user_kp = agent
+                .identity()
+                .user_keypair()
+                .expect("owner user key (self-issuance implies one)");
+            // Strip the issuance journal the journal source would answer
+            // from (the builder appends the self-issuance record next to
+            // agent.cert); the discovery cache is empty by construction.
+            std::fs::remove_file(dir.path().join(profile::CERT_JOURNAL_FILE))
+                .expect("issuance journal stripped");
+
+            // Seed the placement the revocation epoch order needs.
+            let owner_pk = user_kp.public_key().as_bytes().to_vec();
+            let secret = user_kp.secret_key();
+            let record = key_move::PlacementRecord::sign(
+                own,
+                &owner_pk,
+                key_move::Placement::Roaming,
+                1,
+                1,
+                secret,
+            )
+            .expect("placement sign");
+            {
+                let mut state = agent.move_state.write().await;
+                let cert = agent.identity().agent_certificate().expect("cert");
+                let authority = key_move::PlacementAuthority::cert_issuer(cert).expect("authority");
+                state
+                    .cache_placement(record, authority)
+                    .expect("placement cached");
+            }
+
+            let machine = agent.machine_id();
+            let outcome = agent.revoke_binding(&own, &machine, 1, None).await;
+            assert!(
+                outcome.is_ok(),
+                "own-agent binding revocation must use the identity certificate: {outcome:?}"
+            );
+            // Review item 2: the tombstone actually LANDED — is_ok alone
+            // could hide a silent no-op. The tombstone never expires, so
+            // this pairing is barred for peers from here on.
+            {
+                let revocation_set = agent.revocation_set();
+                let revoked = revocation_set.read().await;
+                assert!(
+                    revoked.is_binding_revoked(&own, &machine),
+                    "the (own agent, local machine) tombstone is in the grow-only set"
+                );
+            }
+        }
+
+        /// #797 review item 1 (negative): a STRANGER agent resolves to NO
+        /// certificate — the local-identity fallback must not widen
+        /// resolution beyond the daemon's own agent id, and with the
+        /// journal stripped and the discovery cache empty there is no
+        /// other source. (Through revoke_binding the refusal surfaces as
+        /// "no certificate known for the agent".)
+        #[tokio::test]
+        async fn stranger_agent_still_gets_no_certificate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let agent = Agent::builder()
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_identity_dir(dir.path())
+                .with_user_key(identity::UserKeypair::generate().expect("owner user key"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            std::fs::remove_file(dir.path().join(profile::CERT_JOURNAL_FILE))
+                .expect("issuance journal stripped");
+            let stranger = identity::AgentId([0xEE; 32]);
+            assert!(
+                agent.agent_certificate_for(&stranger).await.is_none(),
+                "a stranger resolves to no certificate; the local-identity \
+                 fallback is scoped to the daemon's own agent id"
+            );
+        }
+
+        /// #797 review items 1+3 (negative): a local agent.cert issued by a
+        /// DIFFERENT user key than the loaded owner must NOT short-circuit
+        /// the lookup — it falls through to the (here empty) peer/journal
+        /// sources instead of poisoning the caller's authority check.
+        #[test]
+        fn local_certificate_from_a_previous_issuer_falls_through() {
+            let machine_kp = identity::MachineKeypair::generate().expect("machine keypair");
+            let agent_kp = identity::AgentKeypair::generate().expect("agent keypair");
+            let previous_owner = identity::UserKeypair::generate().expect("previous owner");
+            let current_owner = identity::UserKeypair::generate().expect("current owner");
+            let stale_cert =
+                identity::AgentCertificate::issue(&previous_owner, &agent_kp).expect("cert");
+            let identity =
+                identity::Identity::new_with_user(machine_kp, agent_kp, current_owner, stale_cert);
+            assert!(
+                Agent::local_agent_certificate_if_current_issuer(&identity).is_none(),
+                "a cert issued by a previous owner key must fall through"
+            );
+            // Control: with the MATCHING owner loaded, the same accessor
+            // answers the local cert.
+            let machine_kp = identity::MachineKeypair::generate().expect("machine keypair");
+            let agent_kp = identity::AgentKeypair::generate().expect("agent keypair");
+            let owner = identity::UserKeypair::generate().expect("owner");
+            let cert = identity::AgentCertificate::issue(&owner, &agent_kp).expect("cert");
+            let identity = identity::Identity::new_with_user(machine_kp, agent_kp, owner, cert);
+            assert!(Agent::local_agent_certificate_if_current_issuer(&identity).is_some());
+        }
+    }
+
     mod announcement_role_honesty {
         use super::*;
 
@@ -19046,6 +19385,125 @@ mod tests {
         record.validate().expect("raw DM history record is valid");
     }
 
+    #[tokio::test]
+    async fn raw_post_validation_routes_verified_typed_before_generic_broadcast() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(4);
+        let routes = vec![dm_inbox::DmTypedPayloadRoute {
+            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            sender: typed_tx,
+            durable_completion: false,
+        }];
+        let sender = identity::AgentId([0x81; 32]);
+        let machine_id = identity::MachineId([0x82; 32]);
+        let typed_bytes = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nsigned-event".to_vec();
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        let routed = typed_rx
+            .try_recv()
+            .expect("verified typed payload reaches route");
+        assert_eq!(routed.payload, typed_bytes);
+        assert!(routed.verified);
+        assert_eq!(routed.sender, sender);
+        assert_eq!(routed.machine_id, machine_id);
+        assert!(
+            generic.try_recv().is_none(),
+            "typed payload bypasses generic bus"
+        );
+
+        let ordinary = b"ordinary direct message".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: ordinary.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        assert_eq!(
+            generic
+                .try_recv()
+                .expect("ordinary payload is broadcast")
+                .payload,
+            ordinary
+        );
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: false,
+                trust_decision: Some(trust::TrustDecision::Unknown),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        let unverified = generic
+            .try_recv()
+            .expect("unverified retains generic handling");
+        assert_eq!(unverified.payload, typed_bytes);
+        assert!(!unverified.verified);
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "unverified payload never reaches typed route"
+        );
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::RejectMachineMismatch),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        let rejected = generic
+            .try_recv()
+            .expect("rejected trust retains existing generic handling");
+        assert_eq!(rejected.payload, typed_bytes);
+        assert_eq!(
+            rejected.trust_decision,
+            Some(trust::TrustDecision::RejectMachineMismatch)
+        );
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "rejected trust never reaches typed route"
+        );
+    }
+
     #[test]
     fn raw_dm_history_rejects_unverified_blocked_and_plumbing_payloads() {
         let sender = identity::AgentId([7; 32]);
@@ -19123,7 +19581,7 @@ mod tests {
         let topic = saorsa_gossip_types::TopicId::from_entity(IDENTITY_ANNOUNCE_TOPIC);
         let mut subscriptions = Vec::with_capacity(NODE_COUNT);
         for (node_index, node) in nodes.iter().enumerate() {
-            subscriptions.push(node.subscribe(topic));
+            subscriptions.push(node.subscribe_ready(topic).await);
             let connected = peers
                 .iter()
                 .copied()
@@ -20014,6 +20472,39 @@ mod tests {
             mdns_enabled: false,
             ..network::NetworkConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn typed_shutdown_returns_and_caches_network_release_failure() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("networked agent");
+        let network = agent.network().expect("network");
+        network.fail_shutdown_for_test("injected socket release failure");
+
+        let first = agent
+            .try_shutdown()
+            .await
+            .expect_err("typed shutdown must propagate the network failure")
+            .to_string();
+        assert!(first.contains("injected socket release failure"));
+        let second = agent
+            .try_shutdown()
+            .await
+            .expect_err("later callers must observe the cached failure")
+            .to_string();
+        assert_eq!(second, first);
+
+        // Source-compatible wrapper remains idempotent and callable after a
+        // typed failure; it logs the same cached outcome.
+        agent.shutdown().await;
     }
 
     #[tokio::test]
