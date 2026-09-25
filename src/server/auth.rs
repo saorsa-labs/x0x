@@ -1108,22 +1108,38 @@ mod tests {
 
     #[test]
     fn session_refresh_is_refused_past_the_hard_cap() {
-        // Refresh every 8 min (as the GUI does); the chain must be refused
-        // once 12 h have passed since the ORIGINAL mint.
+        // Refresh every 8 min (as the GUI does) on a simulated clock. The
+        // chain must be refused at original mint + 12 h even though the
+        // LAST refresh was only minutes earlier and the token is still live:
+        // the cap counts from the ORIGINAL issue time, not the last refresh.
         let store = SessionStore::new(SESSION_TOKEN_TTL);
         let t0 = Instant::now();
         let step = Duration::from_secs(8 * 60);
         let mut token = store.issue(t0);
         let mut now = t0;
+        let mut refreshes = 0u32;
         while now + step <= t0 + SESSION_MAX_LIFETIME {
             now += step;
             token = store.refresh(&token, now).expect("within the cap");
+            refreshes += 1;
             assert_eq!(store.minted_at(&token, now), Some(t0));
         }
-        now += step;
-        assert!(now - t0 > SESSION_MAX_LIFETIME);
+        let last_refresh = now;
+        assert!(refreshes > 80, "the chain must span many refreshes");
+        // Exactly at original + 12 h a refresh is still allowed.
+        let at_cap = t0 + SESSION_MAX_LIFETIME;
+        assert!(at_cap - last_refresh < SESSION_TOKEN_TTL);
+        token = store.refresh(&token, at_cap).expect("at the cap boundary");
+        // One second past original + 12 h: refused, although only seconds
+        // have passed since the last refresh and the token is still valid.
+        let attempt = at_cap + Duration::from_secs(1);
+        assert!(attempt - at_cap < SESSION_MAX_LIFETIME);
+        assert!(
+            store.is_valid(&token, attempt),
+            "refusal must be the cap, not expiry"
+        );
         assert_eq!(
-            store.refresh(&token, now),
+            store.refresh(&token, attempt),
             Err(SessionRefreshError::LifetimeCapReached)
         );
     }

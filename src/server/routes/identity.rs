@@ -1799,6 +1799,106 @@ mod owner_act_tests {
         Ok(())
     }
 
+    /// Echoes whether the middleware resolved the request to the session
+    /// actor (`Owner { durable: false }`) that the #866/#874/#877/#879
+    /// membership gates key on.
+    async fn echo_actor(
+        axum::Extension(actor): axum::Extension<ActorContext>,
+    ) -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "session_actor": matches!(actor, ActorContext::Owner { durable: false }),
+        }))
+    }
+
+    async fn get_status(
+        app: &axum::Router,
+        path: &str,
+        bearer: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().method("GET").uri(path);
+        if let Some(bearer) = bearer {
+            builder = builder.header("authorization", format!("Bearer {bearer}"));
+        }
+        let req = builder
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    // #893: after a refresh the replaced token must fail on EVERY route
+    // class — REST (bearer), WS connect and SSE connect (`?token=`) — and the
+    // fresh token must pass all three as the SAME session actor, so the
+    // session-vs-durable membership gates see no change across a refresh.
+    // The echo handlers stand in for the real WS/SSE handlers: the auth
+    // decision is made by the real middleware before any handler runs.
+    #[tokio::test]
+    async fn refreshed_session_revokes_old_token_on_rest_ws_and_sse() -> anyhow::Result<()> {
+        use crate::server::auth::{auth_middleware, refresh_session};
+        use axum::routing::get;
+        let (state, _dir) = matrix_state().await?;
+        let app = axum::Router::new()
+            .route("/auth/session/refresh", post(refresh_session))
+            .route("/agent", get(echo_actor))
+            .route("/ws/direct", get(echo_actor))
+            .route("/peers/events", get(echo_actor))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let old = session_token(&state).await;
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/auth/session/refresh",
+            &old,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "refresh: {json}");
+        let fresh = json["session_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(!fresh.is_empty());
+
+        for (label, token) in [("old", old.as_str()), ("fresh", fresh.as_str())] {
+            let checks = [
+                ("REST", get_status(&app, "/agent", Some(token)).await),
+                (
+                    "WS",
+                    get_status(&app, &format!("/ws/direct?token={token}"), None).await,
+                ),
+                (
+                    "SSE",
+                    get_status(&app, &format!("/peers/events?token={token}"), None).await,
+                ),
+            ];
+            for (class, (status, json)) in checks {
+                if label == "old" {
+                    assert_eq!(
+                        status,
+                        StatusCode::UNAUTHORIZED,
+                        "old token on {class}: {json}"
+                    );
+                } else {
+                    assert_eq!(status, StatusCode::OK, "fresh token on {class}: {json}");
+                    assert_eq!(
+                        json["session_actor"], true,
+                        "{class}: actor must stay the session actor"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn owner_act_matrix_agent_sign() -> anyhow::Result<()> {
         let (state, _dir) = matrix_state().await?;
