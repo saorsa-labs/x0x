@@ -53,7 +53,7 @@ pub use provenance::{
 };
 pub use sealed::{TaskDeltaProtector, TaskSealRejection};
 pub use sync::{
-    AuthorizedRoster, TaskIngestGate, TaskIngestGateSlot, TaskListSync,
+    AuthorizedRoster, StateServeGate, TaskIngestGate, TaskIngestGateSlot, TaskListSync,
     TASK_QUARANTINE_BUFFER_MAX_BYTES, TASK_QUARANTINE_BUFFER_MAX_DELTAS,
     TASK_QUARANTINE_DRAIN_POLL_SECS,
 };

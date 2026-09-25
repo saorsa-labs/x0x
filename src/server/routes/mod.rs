@@ -133,7 +133,7 @@ pub(super) use stores::{
 pub(super) use sync::{enroll_device, get_sync_devices, unenroll_device, DaemonView};
 pub(super) use tasks::{
     add_task, apply_group_authorization, create_task_list, group_task_list_binding,
-    list_task_lists, list_tasks, update_task,
+    legacy_space_board_retired, list_task_lists, list_tasks, update_task,
 };
 pub(super) use trust::evaluate_trust;
 pub(super) use upgrade::{

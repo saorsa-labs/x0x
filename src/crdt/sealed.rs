@@ -118,6 +118,11 @@ pub trait TaskDeltaProtector: Send + Sync + 'static {
 
     /// Record a refusal (diagnostics counter).
     fn on_rejected(&self, reason: TaskSealRejection);
+
+    /// This node's agent — the gossip-verified sender of its own publishes.
+    /// The listener skips a sealed record as our own echo only when the
+    /// envelope sender is this agent (the outer peer tag is unauthenticated).
+    fn local_agent(&self) -> Option<AgentId>;
 }
 
 /// Deterministic id a group task list seals under, shared by every member.

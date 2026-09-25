@@ -294,6 +294,13 @@ pub(in crate::server) async fn group_task_list_binding(
     id: &str,
 ) -> x0x::TaskListBinding {
     let mut binding = x0x::TaskListBinding::default();
+    if legacy_space_board_prefix(id).is_some() {
+        // #895 (omp finding 1): a legacy plaintext board answers state
+        // requests only from members of its group, and not at all once
+        // this node has migrated it.
+        binding.state_serve_gate = Some(legacy_board_serve_gate(state, id));
+        return binding;
+    }
     let Some(scoped) = parse_group_scoped_task_list_id(id) else {
         return binding;
     };
@@ -471,6 +478,10 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                 .record_task_delta_seal_rejected(&self.group_id);
             tracing::debug!(group_id = %self.group_id, ?reason, "[tasks] task delta refused (#895)");
         }
+    }
+
+    fn local_agent(&self) -> Option<x0x::identity::AgentId> {
+        self.state.upgrade().map(|state| state.agent.agent_id())
     }
 }
 
@@ -854,6 +865,14 @@ pub(in crate::server) async fn create_task_list(
         return denied;
     }
     let id = req.topic.clone();
+    // #895: a legacy board this node migrated stays retired — an old GUI tab
+    // must not bring its plaintext sync back.
+    if legacy_space_board_retired(&state, &id).await {
+        return api_error(
+            StatusCode::GONE,
+            "this space board moved to the group's encrypted list (#895)",
+        );
+    }
     // Reserve the entire handle+manifest transaction for this (kind,id) so
     // a concurrent create/rehydrate for the same id cannot interleave handle
     // insertion with failure rollback, or spawn a duplicate listener.
@@ -962,12 +981,71 @@ pub(in crate::server) fn legacy_space_board_id(id: &str) -> Option<String> {
     Some(format!("x0x-board-{prefix}"))
 }
 
-/// #895: the durable "this node has migrated this board" marker.
-fn space_board_migration_marker(state: &AppState, id: &str) -> std::path::PathBuf {
+/// #895: the durable "this node has migrated this board" marker, keyed by
+/// the LEGACY board id so both the migration and the legacy list's
+/// retirement (serve gate, rehydration, re-creation) can find it.
+fn space_board_migration_marker(state: &AppState, legacy_id: &str) -> std::path::PathBuf {
     state.task_list_state_dir.join(format!(
         "board-migration-{}.done",
-        blake3::hash(id.as_bytes()).to_hex()
+        blake3::hash(legacy_id.as_bytes()).to_hex()
     ))
+}
+
+/// #895: the group-id prefix of a legacy plaintext space board id
+/// (`x0x-board-<first 16 chars of the group id>`), or `None`.
+fn legacy_space_board_prefix(id: &str) -> Option<&str> {
+    id.strip_prefix("x0x-board-")
+        .filter(|prefix| !prefix.is_empty())
+}
+
+/// #895: whether this node has migrated — and so retired — the legacy
+/// plaintext board `id`. `false` for any other list.
+pub(in crate::server) async fn legacy_space_board_retired(state: &AppState, id: &str) -> bool {
+    legacy_space_board_prefix(id).is_some()
+        && tokio::fs::try_exists(space_board_migration_marker(state, id))
+            .await
+            .unwrap_or(false)
+}
+
+/// #895: whether `sender` is an ACTIVE member of the group a legacy board id
+/// abbreviates (a group whose map key or stable id starts with the prefix).
+/// An unsigned request, an unknown group or a non-member answers `false`.
+pub(in crate::server) fn legacy_board_requester_is_member(
+    groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    legacy_id: &str,
+    sender: Option<&x0x::identity::AgentId>,
+) -> bool {
+    let (Some(prefix), Some(sender)) = (legacy_space_board_prefix(legacy_id), sender) else {
+        return false;
+    };
+    let sender_hex = hex::encode(sender.as_bytes());
+    groups.iter().any(|(key, info)| {
+        (key.starts_with(prefix) || info.stable_group_id().starts_with(prefix))
+            && info.has_active_member(&sender_hex)
+    })
+}
+
+/// #895: the state-serve gate for a legacy plaintext board. It answers a
+/// `StateRequest` only from an active member of the board's group, and
+/// never once this node has migrated (retired) the board — so a non-member
+/// that derives the topic cannot make a holder broadcast the list.
+fn legacy_board_serve_gate(state: &Arc<AppState>, legacy_id: &str) -> x0x::crdt::StateServeGate {
+    let weak = Arc::downgrade(state);
+    let legacy_id = legacy_id.to_string();
+    Arc::new(move |sender: Option<x0x::identity::AgentId>| {
+        let weak = weak.clone();
+        let legacy_id = legacy_id.clone();
+        Box::pin(async move {
+            let Some(state) = weak.upgrade() else {
+                return false;
+            };
+            if legacy_space_board_retired(&state, &legacy_id).await {
+                return false;
+            }
+            let groups = state.named_groups.read().await;
+            legacy_board_requester_is_member(&groups, &legacy_id, sender.as_ref())
+        })
+    })
 }
 
 /// #895 (David, 2026-09-25): whether `agent` may write under the group's
@@ -991,8 +1069,9 @@ fn may_write_group(info: &x0x::groups::GroupInfo, agent: &x0x::identity::AgentId
 }
 
 /// #895: copy the legacy plaintext space Board into its group-scoped
-/// (sealed) list exactly once. Returns `true` when the board needs no
-/// migration on this node (not a board, already migrated, or migrated now).
+/// (sealed) list exactly once, then RETIRE the legacy list on this node.
+/// Returns `true` when the board needs no migration on this node (not a
+/// board, already migrated, or migrated now).
 ///
 /// - Only a member with write permission migrates; anyone else gets `false`
 ///   and the caller reports `board_migration_pending`.
@@ -1001,14 +1080,18 @@ fn may_write_group(info: &x0x::groups::GroupInfo, agent: &x0x::identity::AgentId
 ///   migrating concurrently, converge instead of duplicating.
 /// - A node that does not hold the legacy list has nothing to copy and
 ///   records the marker.
-/// - The legacy list and its local snapshot are left untouched (retiring
-///   them is a follow-up); the GUI no longer reads or writes it.
+/// - Retirement (omp review finding 1): once the marker is durable, the
+///   legacy sync is cancelled (no more state serves, publishes or listening;
+///   its subscriptions drop with its loops) and its handle deregistered. The
+///   marker also keeps it from being rehydrated at boot or re-created via
+///   REST. Its local snapshot and manifest row stay on disk.
 pub(in crate::server) async fn migrate_space_board_once(state: &Arc<AppState>, id: &str) -> bool {
     let Some(legacy) = legacy_space_board_id(id) else {
         return true;
     };
-    let marker = space_board_migration_marker(state, id);
+    let marker = space_board_migration_marker(state, &legacy);
     if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+        retire_legacy_space_board(state, &legacy).await;
         return true;
     }
     let Some(scoped) = parse_group_scoped_task_list_id(id) else {
@@ -1047,7 +1130,23 @@ pub(in crate::server) async fn migrate_space_board_once(state: &Arc<AppState>, i
         tracing::warn!(board = %id, "space board migration marker write failed: {e}");
         return false;
     }
+    retire_legacy_space_board(state, &legacy).await;
     true
+}
+
+/// #895: stop the legacy plaintext board's sync on this node and deregister
+/// its live handle. The snapshot and manifest row are kept (local data is
+/// not deleted in this slice). Idempotent.
+async fn retire_legacy_space_board(state: &AppState, legacy: &str) {
+    // Read first: this runs on every board poll once migrated.
+    if !state.task_lists.read().await.contains_key(legacy) {
+        return;
+    }
+    let retired = state.task_lists.write().await.remove(legacy);
+    if let Some(handle) = retired {
+        handle.cancel_sync_and_drain().await;
+        tracing::info!(legacy = %legacy, "[tasks] retired the legacy plaintext space board (#895)");
+    }
 }
 
 /// GET /task-lists/:id/tasks

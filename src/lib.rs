@@ -14418,6 +14418,9 @@ impl Agent {
         if let Some(protector) = binding.delta_protector {
             sync.install_protector(protector);
         }
+        if let Some(gate) = binding.state_serve_gate {
+            sync.install_serve_gate(gate);
+        }
         let sync = std::sync::Arc::new(sync);
         if storage.is_some() {
             // Fail closed at registration: refuse to run a "persistent"
@@ -14518,6 +14521,9 @@ pub struct TaskListBinding {
     /// #895: the group-key protector for a list bound to a named group.
     /// `None` for a personal list (plaintext wire format, unchanged).
     pub delta_protector: Option<std::sync::Arc<dyn crdt::TaskDeltaProtector>>,
+    /// #895: who may trigger a full-state serve of this list. `None` answers
+    /// any requester (the pre-#895 behaviour).
+    pub state_serve_gate: Option<crdt::StateServeGate>,
 }
 
 impl std::fmt::Debug for TaskListBinding {
@@ -14532,6 +14538,7 @@ impl std::fmt::Debug for TaskListBinding {
             )
             .field("ingest_gate", &self.ingest_gate.is_some())
             .field("delta_protector", &self.delta_protector.is_some())
+            .field("state_serve_gate", &self.state_serve_gate.is_some())
             .finish()
     }
 }
@@ -22447,6 +22454,10 @@ mod tests {
         }
 
         fn on_rejected(&self, _reason: crate::crdt::TaskSealRejection) {}
+
+        fn local_agent(&self) -> Option<crate::identity::AgentId> {
+            Some(self.signing.agent_id)
+        }
     }
 
     /// #895 (David, 2026-09-25) WHY: the space Board moves from its legacy

@@ -5140,6 +5140,88 @@ mod tests {
         );
     }
 
+    /// omp review finding 1 (#895) WHY: the legacy plaintext space board must
+    /// not keep serving its content. Before migration it answers state
+    /// requests only from members of its group; after migration this node has
+    /// retired it — its sync is gone and even a member's request is refused —
+    /// while the copied tasks live on in the sealed board.
+    #[tokio::test]
+    async fn legacy_space_board_is_member_gated_then_retired_by_migration() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let member = state.agent.agent_id();
+        let outsider = AgentId([5; 32]);
+        let group_key = "47".repeat(16);
+        seed_group(&state, &group_key, member).await;
+        let legacy = format!("x0x-board-{}", &group_key[..16]);
+        let board = format!("x0x.group.{group_key}.symphony.board");
+
+        let gate = crate::server::routes::group_task_list_binding(&state, &legacy)
+            .await
+            .state_serve_gate
+            .expect("a legacy board gets a serve gate");
+        assert!(
+            !gate(Some(outsider)).await,
+            "non-member served before migration"
+        );
+        assert!(!gate(None).await, "unsigned request served");
+        assert!(gate(Some(member)).await, "control: a member is served");
+
+        let legacy_binding = crate::server::routes::group_task_list_binding(&state, &legacy).await;
+        let legacy_handle = state
+            .agent
+            .create_task_list_persistent_bound(
+                "Board",
+                &legacy,
+                &state.task_list_state_dir,
+                legacy_binding,
+            )
+            .await
+            .expect("legacy board");
+        legacy_handle
+            .add_task("legacy task".to_string(), "d".to_string())
+            .await
+            .expect("legacy task");
+        state
+            .task_lists
+            .write()
+            .await
+            .insert(legacy.clone(), legacy_handle);
+        let board_binding = crate::server::routes::group_task_list_binding(&state, &board).await;
+        let board_handle = state
+            .agent
+            .create_task_list_persistent_bound(
+                "Board",
+                &board,
+                &state.task_list_state_dir,
+                board_binding,
+            )
+            .await
+            .expect("sealed board");
+        state
+            .task_lists
+            .write()
+            .await
+            .insert(board.clone(), board_handle.clone());
+
+        assert!(crate::server::routes::tasks::migrate_space_board_once(&state, &board).await);
+        assert_eq!(board_handle.list_tasks().await.expect("tasks").len(), 1);
+        assert!(
+            !state.task_lists.read().await.contains_key(&legacy),
+            "the legacy sync must be retired on this node"
+        );
+        assert!(crate::server::routes::legacy_space_board_retired(&state, &legacy).await);
+        assert!(
+            !gate(Some(outsider)).await,
+            "non-member served after migration"
+        );
+        assert!(!gate(Some(member)).await, "a retired board serves nobody");
+        assert!(
+            crate::server::routes::tasks::migrate_space_board_once(&state, &board).await,
+            "re-run is a no-op"
+        );
+        assert_eq!(board_handle.list_tasks().await.expect("tasks").len(), 1);
+    }
+
     #[tokio::test]
     async fn create_group_kv_store_route_creates_encrypted_store() {
         let (state, _dir) = encrypted_store_test_state().await;

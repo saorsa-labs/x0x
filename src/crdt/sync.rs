@@ -246,6 +246,17 @@ async fn open_sealed(
     Some(opened.payload)
 }
 
+/// #895: decides whether a `StateRequest` may trigger a full-state serve,
+/// given the request's gossip-verified sender (`None` when unsigned).
+///
+/// Installed for the legacy plaintext space board: without it, any peer that
+/// derives the topic could ask a holder to broadcast the whole list.
+pub type StateServeGate = Arc<
+    dyn Fn(Option<AgentId>) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Synchronization wrapper for a TaskList.
 ///
 /// Manages automatic background synchronization of a TaskList using gossip
@@ -334,6 +345,10 @@ pub struct TaskListSync {
     /// the protector reports a signed-public group. Empty for a personal
     /// list, whose wire format is unchanged.
     protector: std::sync::OnceLock<Arc<dyn TaskDeltaProtector>>,
+
+    /// #895: set-once gate on answering `StateRequest`s (see
+    /// [`StateServeGate`]). Installed before [`start`](Self::start).
+    serve_gate: std::sync::OnceLock<StateServeGate>,
 }
 
 /// ADR-0068 D2: maximum inbound deltas one task list buffers while its group
@@ -1321,7 +1336,15 @@ impl TaskListSync {
                 TASK_QUARANTINE_DRAIN_POLL_SECS.saturating_mul(1_000),
             )),
             protector: std::sync::OnceLock::new(),
+            serve_gate: std::sync::OnceLock::new(),
         })
+    }
+
+    /// #895: install the state-serve gate. Must precede
+    /// [`start`](Self::start), which captures it. Returns `false` if one was
+    /// already installed (set-once).
+    pub fn install_serve_gate(&self, gate: StateServeGate) -> bool {
+        self.serve_gate.set(gate).is_ok()
     }
 
     /// #895: install the group-key protector. Must precede
@@ -1589,10 +1612,18 @@ impl TaskListSync {
                             }
                             std::borrow::Cow::Borrowed(&msg.payload[..])
                         }
-                        Some((peer, _)) if peer == listener_local_peer => {
+                        Some((peer, _))
+                            if peer == listener_local_peer
+                                && msg.sender.is_some()
+                                && msg.sender == protector.local_agent() =>
+                        {
                             // Our own echo: applied locally before it was
                             // published, and a TreeKEM sender cannot open
-                            // its own ciphertext.
+                            // its own ciphertext. The outer peer tag is NOT
+                            // authenticated, so the skip also requires the
+                            // gossip-verified sender to be this agent — a
+                            // peer re-tagging a captured record with our
+                            // peer id cannot make us drop it.
                             continue;
                         }
                         Some((_, body)) => match hold_sealed_if_held(
@@ -1778,6 +1809,7 @@ impl TaskListSync {
         let responder_cancel = self.cancel.clone();
         let local_peer_id = self.local_peer_id;
         let responder_protector = self.protector.get().cloned();
+        let responder_serve_gate = self.serve_gate.get().cloned();
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
             // response per cooldown window — the response is a broadcast,
@@ -1815,6 +1847,13 @@ impl TaskListSync {
                     TaskListSyncMessage::StateRequest { requester } => {
                         if requester == local_peer_id {
                             continue;
+                        }
+                        // #895: a gated list answers only a sender the gate
+                        // admits — no broadcast and no marker otherwise.
+                        if let Some(gate) = &responder_serve_gate {
+                            if !gate(msg.sender).await {
+                                continue;
+                            }
                         }
                         let mut markers: Vec<TaskListSyncMessage> = Vec::new();
                         if responder_list.read().await.task_count() == 0 {
@@ -2612,6 +2651,8 @@ mod tests {
         /// Simulates the TreeKEM protector while the group is quarantined:
         /// it refuses to open at all.
         refuse_open: std::sync::atomic::AtomicBool,
+        /// Simulates a seal failure (no group key, author not a writer).
+        fail_seal: std::sync::atomic::AtomicBool,
     }
 
     impl GssFixtureProtector {
@@ -2627,6 +2668,7 @@ mod tests {
                 public: false,
                 rejected: std::sync::atomic::AtomicU64::new(0),
                 refuse_open: std::sync::atomic::AtomicBool::new(false),
+                fail_seal: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -2645,6 +2687,9 @@ mod tests {
             Option<crate::crdt::sealed::SealedTaskRecordBody>,
         > {
             Box::pin(async move {
+                if self.fail_seal.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(crate::crdt::CrdtError::Gossip("no group key".to_string()));
+                }
                 if self.public {
                     return Ok(None);
                 }
@@ -2690,6 +2735,10 @@ mod tests {
         fn on_rejected(&self, _reason: TaskSealRejection) {
             self.rejected
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn local_agent(&self) -> Option<AgentId> {
+            Some(self.signing.agent_id)
         }
     }
 
@@ -2959,6 +3008,174 @@ mod tests {
         assert!(receiver.read().await.get_task(&task_id).is_some());
         assert_eq!(receiver.quarantined_buffer_len(), 0);
         assert_eq!(protector.rejected(), 0);
+    }
+
+    /// omp review finding 2(i) WHY: a sealed record must be merged only when
+    /// its sealed (signed) author IS the gossip-verified sender. Member A's
+    /// record re-broadcast under B's envelope is refused and counted.
+    ///
+    /// Mutation check: deleting the `SenderMismatch` refusal in `open_sealed`
+    /// lets the task merge (B is a signed writer and the list has no writer
+    /// allow-list), so the `get_task(..).is_none()` assertion fails, and the
+    /// `rejected() == 1` assertion fails too.
+    #[tokio::test]
+    async fn sealed_author_must_be_the_gossip_sender() {
+        let topic = "x0x.group.g895.symphony.mismatch";
+        let author = crate::identity::AgentKeypair::generate().expect("author");
+        let relayer = crate::identity::AgentKeypair::generate().expect("relayer");
+        let info = gss_group(author.agent_id());
+        // Every publish on this pubsub carries B's (the relayer's) envelope.
+        let pubsub = pubsub_signed_by(&relayer).await;
+        let sender = TaskListSync::new(
+            TaskList::new(list_id(1), "L".to_string(), peer(1)),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+        )
+        .expect("sender");
+        let receiver = TaskListSync::new(
+            TaskList::new(list_id(1), "L".to_string(), peer(2)),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+        )
+        .expect("receiver");
+        // The record is sealed and signed as A.
+        assert!(sender.install_protector(GssFixtureProtector::new(info.clone(), topic, &author)));
+        let protector = GssFixtureProtector::new(info, topic, &author);
+        assert!(receiver.install_protector(protector.clone()));
+        receiver.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (task_id, delta) = secret_task_delta(peer(1));
+        sender.publish_delta(peer(1), delta).await.expect("publish");
+        assert!(
+            eventually(Duration::from_secs(3), || async {
+                protector.rejected() >= 1
+            })
+            .await,
+            "the mismatched record must be refused and counted"
+        );
+        assert_eq!(protector.rejected(), 1);
+        assert!(
+            receiver.read().await.get_task(&task_id).is_none(),
+            "a record whose sealed author is not the sender must never merge"
+        );
+    }
+
+    /// omp review finding 2(ii) WHY: when sealing fails there is NO plaintext
+    /// fallback — `publish_delta` returns the error and nothing reaches the
+    /// wire, and the state-sync responder serves nothing (no broadcast, no
+    /// marker).
+    ///
+    /// Mutation check: `Err(_) => Ok(plain)` in `seal_for_wire` makes
+    /// `publish_delta` return `Ok` (the `is_err()` assertion fails) and puts
+    /// the plaintext pair on the topic (the "nothing published" assertion
+    /// fails); the responder would broadcast the full list and its markers.
+    #[tokio::test]
+    async fn seal_failure_publishes_nothing() {
+        let topic = "x0x.group.g895.symphony.sealfail";
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let (sync, pubsub) = make_sync_with_pubsub(topic).await;
+        let protector = GssFixtureProtector::new(gss_group(kp.agent_id()), topic, &kp);
+        protector
+            .fail_seal
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(sync.install_protector(protector.clone()));
+        {
+            let (_, delta) = secret_task_delta(peer(1));
+            let (task, _) = delta.added_tasks.into_values().next().expect("task");
+            sync.write().await.add_task(task, peer(1), 1).expect("seed");
+        }
+        sync.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut main = pubsub.subscribe(topic.to_string()).await;
+        let mut side = pubsub.subscribe(sync.state_sync_topic()).await;
+
+        let (_, delta) = secret_task_delta(peer(1));
+        assert!(
+            sync.publish_delta(peer(1), delta).await.is_err(),
+            "a seal failure must surface as an error"
+        );
+        let request = bincode::serialize(&TaskListSyncMessage::StateRequest { requester: peer(9) })
+            .expect("request");
+        pubsub
+            .publish(sync.state_sync_topic(), bytes::Bytes::from(request))
+            .await
+            .expect("publish request");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1_000), main.recv())
+                .await
+                .is_err(),
+            "nothing may be published on the list topic when sealing fails"
+        );
+        // The side topic also carries state REQUESTS (ours, and the sync's
+        // own bootstrap requester); only a served marker is a failure.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, side.recv()).await {
+            let marker = matches!(
+                bincode::deserialize::<TaskListSyncMessage>(&msg.payload),
+                Ok(TaskListSyncMessage::StateServed { .. }
+                    | TaskListSyncMessage::StateServedV2 { .. })
+            );
+            assert!(
+                !marker,
+                "no served marker without a real (sealed) broadcast"
+            );
+        }
+    }
+
+    /// omp review finding 1 WHY (crdt half): a list with a serve gate
+    /// answers a `StateRequest` only when the gate admits the requester — a
+    /// denied (non-member / retired) request produces no broadcast at all.
+    /// The control shows the same list DOES serve an admitted requester.
+    #[tokio::test]
+    async fn serve_gate_denies_state_requests_it_does_not_admit() {
+        let topic = "x0x-board-servegate895";
+        let (sync, pubsub, _signer) = make_signed_sync_with_pubsub(topic).await;
+        let admit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate_admit = Arc::clone(&admit);
+        assert!(sync.install_serve_gate(Arc::new(move |_sender| {
+            let admit = gate_admit.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { admit })
+        })));
+        {
+            let (_, delta) = secret_task_delta(peer(1));
+            let (task, _) = delta.added_tasks.into_values().next().expect("task");
+            sync.write().await.add_task(task, peer(1), 1).expect("seed");
+        }
+        sync.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut main = pubsub.subscribe(topic.to_string()).await;
+        let ask = |requester: PeerId| {
+            let pubsub = Arc::clone(&pubsub);
+            let side = sync.state_sync_topic();
+            async move {
+                let request = bincode::serialize(&TaskListSyncMessage::StateRequest { requester })
+                    .expect("request");
+                pubsub
+                    .publish(side, bytes::Bytes::from(request))
+                    .await
+                    .expect("publish request");
+            }
+        };
+
+        ask(peer(9)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), main.recv())
+                .await
+                .is_err(),
+            "a denied requester must get no full-state broadcast"
+        );
+
+        admit.store(true, std::sync::atomic::Ordering::SeqCst);
+        ask(peer(8)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), main.recv())
+                .await
+                .is_ok(),
+            "control: an admitted requester is served"
+        );
     }
 
     /// WHY: personal (non-group) lists keep their plaintext wire format; the

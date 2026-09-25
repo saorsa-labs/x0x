@@ -83,7 +83,10 @@ All notable changes to this project will be documented in this file.
   from the plaintext `x0x-board-<gid16>` list to `x0x.group.<gid>.symphony.board`;
   the first access by a member with write permission copies the legacy
   board's tasks in once (same ids, durable marker; claims/completions are not
-  carried). Other members see `board_migration_pending` until then.
+  carried). Other members see `board_migration_pending` until then. The
+  legacy board answers state requests only from members of its group, and
+  once a node has migrated it that node retires it (sync stopped, not
+  rehydrated, re-creation refused with 410); its local data is kept.
 
 - **`Agent::shutdown` now retires persistent kv snapshot paths, so an owner
   restart re-opens them instead of being fenced off (#765, follow-up to
