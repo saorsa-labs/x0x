@@ -14,6 +14,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/network_gate.rs"]
+mod network_gate;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -30,13 +33,6 @@ fn loopback_network_config() -> NetworkConfig {
     }
 }
 
-fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("Operation not permitted")
-        && (message.contains("bind UDP socket")
-            || message.contains("network initialization failed"))
-}
-
 async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
     match x0x::Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
@@ -48,7 +44,7 @@ async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
         .await
     {
         Ok(agent) => Some(agent),
-        Err(e) if is_network_bind_permission_error(&e) => None,
+        Err(e) if network_gate::skip_on_refused_network(&e) => None,
         Err(e) => panic!("agent build failed: {e}"),
     }
 }

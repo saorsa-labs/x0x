@@ -132,12 +132,15 @@ jobs:
   # The ninth ignored tailnet test (forward.rs port-zero regression) already
   # runs in integration-core. --test-threads 1 keeps the backpressure and
   # bounded-acceptor timing proofs from contending with each other.
+  # X0X_REQUIRE_NETWORK_TESTS=1 turns a refused loopback bind into a failure
+  # instead of a silent early-return pass (tests/common/network_gate.rs).
   tailnet:
     name: Integration (tailnet)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+      X0X_REQUIRE_NETWORK_TESTS: '1'
     steps:
       - uses: actions/checkout@v5
         with:
