@@ -86,10 +86,9 @@ impl SyncDaemonView for DaemonView {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<SyncValue>, ()>> + Send>>
     {
         // #863 r2 (review finding 2): the AWAITED read — lock contention
-        // is never mistaken for "no Home". `Err(())` only when there is
-        // no owner key (an anonymous install genuinely has nothing to
-        // publish) or the lock is poisoned; the session path treats Err
-        // as fail-closed.
+        // waits and is never mistaken for "no Home" (tokio's RwLock does
+        // not poison). `Err(())` survives only for the no-owner-key
+        // case; the session path treats Err as fail-closed.
         let state = std::sync::Arc::clone(&self.state);
         Box::pin(async move {
             let owner = match state.agent.identity().user_keypair() {

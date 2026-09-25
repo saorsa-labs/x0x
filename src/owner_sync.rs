@@ -2423,9 +2423,9 @@ impl OwnerSyncService {
     /// read under an AWAITED `named_groups` lock (the view's boxed
     /// future) — unlike the trait's `home_pointer()` (a `try_read`
     /// best-effort the reconcile pass tolerates), this never mistakes
-    /// lock contention for "no Home". `Err(())` only on a poisoned
-    /// lock; the session path fails CLOSED on it rather than advertise
-    /// an empty vector.
+    /// lock contention for "no Home" (the awaited read simply waits).
+    /// `Err(())` survives only for the no-owner-key case; the session
+    /// path fails CLOSED on it rather than advertise an empty vector.
     async fn definitive_local_home_pointer(&self) -> Result<Option<SyncValue>, ()> {
         let Some(view) = self.view() else {
             // No view attached (tests / library use): nothing to publish,
@@ -2470,6 +2470,15 @@ impl OwnerSyncService {
     /// This is the seam the #863 guarantee is proven on: with the
     /// publication removed, a Home-holding peer advertises an empty
     /// HomePointer vector (the fail-before).
+    ///
+    /// MIXED VERSIONS (review finding 3): this guarantee is one-sided.
+    /// A PEER on a pre-#863 build holding an unpublished Home still
+    /// answers the version-vector exchange with an EMPTY HomePointer
+    /// kind — SyncV1 carries no capability signal to detect that — so
+    /// the local rank-0 wait can still be released into a duplicate
+    /// until BOTH ends run this build. #863 stays open in a
+    /// mixed-version owner fleet by design; the fix closes it fleet-wide
+    /// as the rollout completes.
     pub(crate) async fn session_with_home_publication<S, R>(
         &self,
         send: &mut S,
