@@ -55,6 +55,9 @@ pub struct OwnerTrust {
     /// The agent's authenticated agent→machine bindings (#890). The default
     /// is an empty cache, which owner-trusts nothing.
     bindings: AuthenticatedMachineBindings,
+    /// ADR-0070 §2 share-grant store (slice 3). Shared slot like `devices`:
+    /// until the daemon installs it, no pair holds any grant.
+    grants: Arc<std::sync::RwLock<Option<Arc<crate::share_grant::ShareGrantStore>>>>,
 }
 
 impl std::fmt::Debug for OwnerTrust {
@@ -87,7 +90,26 @@ impl OwnerTrust {
             local_owner,
             devices: Arc::new(std::sync::RwLock::new(None)),
             bindings,
+            grants: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the ADR-0070 share-grant store. Every clone sees it.
+    pub fn install_share_grant_store(&self, store: Arc<crate::share_grant::ShareGrantStore>) {
+        let mut slot = self
+            .grants
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(store);
+    }
+
+    /// The installed share-grant store, if any.
+    #[must_use]
+    pub fn share_grant_store(&self) -> Option<Arc<crate::share_grant::ShareGrantStore>> {
+        self.grants
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The local owner, if this install has one.

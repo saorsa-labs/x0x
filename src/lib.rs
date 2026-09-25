@@ -85,6 +85,8 @@ pub mod key_move;
 /// records over `SyncV1` streams between the owner's enrolled machines).
 pub mod owner_sync;
 pub mod owner_trust;
+/// ADR-0070 §2 share grants: owner-signed, scoped, expiring, revocable access.
+pub mod share_grant;
 
 pub mod announce_blob;
 /// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
