@@ -73,11 +73,10 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0005: mDNS Local Network Discovery](./0005-mdns-local-network-discovery.md) — superseded; LAN discovery now lives in ant-quic
 - [ADR 0056: Voice Link Transport and Signaling (Historical Record)](./0056-voice-link-transport-and-signaling.md) (proposed 2026-08-29; superseded by ADR 0042 2026-09-25) — records the pre-0042 shipped design: WebRtcV1 lane framing with `u32`-BE records, no voice-specific gate bypass, negotiated datagram lane with reliable fallback, `x0x-voice-sig-v1` DM signaling; media nesting ratified by ADR-0042
+- [ADR 0065: Duplicate Homes Are Inventoried, Not Retired](./0065-duplicate-home-inventory-retirement-deferred.md) (proposed 2026-09-06; superseded by ADR 0060 2026-09-25) — interim position for #449 P4: duplicate Homes left by the ADR-0060 election are reported read-only via `GET /home` `duplicates[]` with `evidence_against_deletion[]`, and **nothing is deleted automatically**. An earlier provable-emptiness gate was withdrawn after independent review found the proof unsound — the startup pass ran before the CRDT manifest loaded, the proof was neither held nor revalidated through the terminal withdrawal, and the manifest/rider loaders map read failure to empty. Evidence probes now fail closed; `safe_to_retire` is deliberately not reported. Conditions for a safe fence: `docs/design/449-p4-retirement-fence.md`
 
 ## Proposed
 - [ADR 0051: Peer Relay (X0X-0070) Is a Default-Off, One-Hop DM Fallback](./0051-application-level-peer-relay.md) (proposed 2026-08-29) — signed `RelayHeader` routing (version/dst/src/pubkey/timestamp — no inner-envelope digest, substitution tracked as #437), inner `DmEnvelope` sealed end-to-end, one hop; policy default disabled, contact-required, rate/byte caps; first-eligible selection pending ADR-0035's spread model
-- [ADR 0065: Duplicate Homes Are Inventoried, Not Retired](./0065-duplicate-home-inventory-retirement-deferred.md) (proposed 2026-09-06) — interim position for #449 P4: duplicate Homes left by the ADR-0060 election are reported read-only via `GET /home` `duplicates[]` with `evidence_against_deletion[]`, and **nothing is deleted automatically**. An earlier provable-emptiness gate was withdrawn after independent review found the proof unsound — the startup pass ran before the CRDT manifest loaded, the proof was neither held nor revalidated through the terminal withdrawal, and the manifest/rider loaders map read failure to empty. Evidence probes now fail closed; `safe_to_retire` is deliberately not reported. Conditions for a safe fence: `docs/design/449-p4-retirement-fence.md`
-
 - [ADR 0063: Signed KV legacy gossip compatibility adoption boundary](./0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md) — draft; V3 pairing preparation only, G0 met and G1–G8 open; disabled pending audited adoption
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
@@ -108,6 +107,27 @@ correct stale facts and pointers:
   scheme tried in review proved grindable. Deferred pending a
   non-grindable scheme — see
   [`docs/design/adr-0040-mechanics.md`](../design/adr-0040-mechanics.md).
+
+Vision-alignment corrections, 2026-09-25. These were recorded at David
+Irvine's direction ("errata + short superseding ADRs"). The ADR files stay
+unchanged:
+
+- **ADR 0004**: this corrects the 2026-07-19 entry above. The shipped
+  `max_concurrent_uni_streams` is now **256** (`src/network.rs:1873`), not
+  4,096.
+- **ADR 0020**: the note that the `src/api/mod.rs` endpoint registry is not
+  extended is out of date. The registry carries `/forwards` and
+  `/forwards/:local_addr` (`src/api/mod.rs:1706-1722`).
+- **ADR 0064**: it builds on ADR 0059, which was still Proposed when 0064 was
+  accepted. That is resolved: ADR 0059 was Accepted on 2026-09-25.
+- **Design contradictions.** Three contradictions are not fixed here, because
+  each needs a new decision rather than an erratum:
+  - ADR 0020 and ADR 0035 describe the relay story differently.
+  - ADRs 0037, 0038 and 0043 describe agent roaming, and roaming is disabled
+    in code.
+  - ADR 0010 calls GSS superseded, yet it is still a first-class plane.
+
+  Short superseding ADRs are proposed alongside this PR.
 
 Audit-trim relocations, 2026-08-29. Per the 2026-08-23 ADR audit, the
 mutable mechanics named below were relocated **verbatim** from the
