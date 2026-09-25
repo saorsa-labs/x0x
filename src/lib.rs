@@ -13418,8 +13418,11 @@ impl Agent {
                     }
                 }
 
-                // Register and mark the sender as connected for future reverse direct sends.
-                dm.mark_connected(sender, machine_id).await;
+                // Register and mark the sender as connected for future reverse
+                // direct sends — only for a VERIFIED binding (#898): an
+                // unverified sender claim never marks connected or rebinds.
+                dm.mark_raw_direct_sender_connected(sender, machine_id, verified)
+                    .await;
 
                 // Issue #120: opt-in coarsened origin token from the live
                 // connection table (the same source add_from_connection()
