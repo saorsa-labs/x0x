@@ -66,6 +66,20 @@ All notable changes to this project will be documented in this file.
   `docs/diagnostics.md`.
 ### Fixed
 
+- **Group task-list deltas are now sealed with the group key (#895, security).**
+  A group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) used to publish
+  its deltas and its `/state-sync` full-state serve as plaintext on a topic
+  any peer knowing the group id could derive, while the same group's KV
+  stores were encrypted. For an `MlsEncrypted` group both are now sealed with
+  the group's current key through the same envelopes group KV stores use
+  (GSS epoch secret or the live TreeKEM ratchet; AAD binds group, list and
+  epoch). Receivers refuse plaintext and unopenable records on such a list —
+  never merged — and count them in the new per-group diagnostics counter
+  `task_deltas_seal_rejected`. **Compatibility:** an un-upgraded peer cannot
+  read the new records and its plaintext deltas are refused, so a group's
+  lists only replicate between upgraded members. Personal lists and
+  `SignedPublic` groups are unchanged.
+
 - **`Agent::shutdown` now retires persistent kv snapshot paths, so an owner
   restart re-opens them instead of being fenced off (#765, follow-up to
   #760).** The #760 snapshot fence refuses to arm persistence for any open

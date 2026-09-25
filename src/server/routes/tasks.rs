@@ -301,11 +301,177 @@ pub(in crate::server) async fn group_task_list_binding(
         return binding;
     }
     binding.authorized_agents = active_group_members(state, &scoped.group_id).await;
+    // #895: installed for EVERY group-scoped id, including one whose group
+    // this node cannot resolve yet — the protector resolves live and fails
+    // closed (no publish, no merge) until the group is known.
+    binding.delta_protector = Some(std::sync::Arc::new(GroupTaskDeltaProtector {
+        state: Arc::downgrade(state),
+        group_id: scoped.group_id.clone(),
+        topic: id.to_string(),
+    }));
     binding.ingest_gate = Some(std::sync::Arc::new(TaskQuarantineIngestGate {
         state: Arc::downgrade(state),
         group_id: scoped.group_id,
     }));
     binding
+}
+
+/// #895: seals a group-scoped task list's wire payloads with its group's
+/// CURRENT key, using exactly the mechanism the group's KV stores use:
+///
+/// - `MlsEncrypted` on the GSS plane: [`x0x::crdt::sealed::seal_gss_task_payload`]
+///   (current shared-secret epoch; AAD binds group, record id and epoch).
+/// - `MlsEncrypted` on the TreeKEM plane: the live TreeKEM store protector
+///   ([`super::stores::treekem_task_list_protector`]).
+/// - `SignedPublic`: plaintext, as before (the group's content is public).
+/// - Unresolvable group: fail closed — nothing is sealed, opened or admitted.
+///
+/// Resolved on EVERY call, through the one both-spellings resolver, so a GSS
+/// rotation or TreeKEM commit (e.g. on member removal) applies to the very
+/// next delta.
+struct GroupTaskDeltaProtector {
+    state: std::sync::Weak<AppState>,
+    /// The group as spelled in the list id.
+    group_id: String,
+    /// The list id, which is also its gossip topic.
+    topic: String,
+}
+
+/// The group a task list is bound to, as this node holds it right now.
+enum TaskListPlane {
+    Public,
+    Gss(Box<x0x::groups::GroupInfo>),
+    TreeKem(x0x::kv::SharedTreeKemKvProtector, String),
+}
+
+impl GroupTaskDeltaProtector {
+    async fn plane(&self) -> x0x::crdt::Result<(Arc<AppState>, TaskListPlane)> {
+        let unavailable =
+            |why: &str| x0x::crdt::CrdtError::Gossip(format!("group task list sealing: {why}"));
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| unavailable("daemon is shutting down"))?;
+        let (group_key, info) = {
+            let groups = state.named_groups.read().await;
+            let (key, info) = crate::server::resolve_group_entry_locked(&groups, &self.group_id)
+                .ok_or_else(|| unavailable("group is not known on this node"))?;
+            (key.to_string(), info.clone())
+        };
+        if info.withdrawn {
+            return Err(unavailable("group is withdrawn"));
+        }
+        let plane = match info.policy.confidentiality {
+            x0x::groups::GroupConfidentiality::SignedPublic => TaskListPlane::Public,
+            x0x::groups::GroupConfidentiality::MlsEncrypted => match info.secure_plane {
+                x0x::mls::SecureGroupPlane::Gss => TaskListPlane::Gss(Box::new(info)),
+                x0x::mls::SecureGroupPlane::TreeKem => {
+                    let stable = info.stable_group_id().to_string();
+                    let protector =
+                        super::stores::treekem_task_list_protector(&state, &group_key, &info)
+                            .ok_or_else(|| unavailable("TreeKEM group is not eligible"))?;
+                    TaskListPlane::TreeKem(protector, stable)
+                }
+            },
+        };
+        Ok((state, plane))
+    }
+}
+
+impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
+    fn seal<'a>(
+        &'a self,
+        kind: x0x::kv::KvMutationKind,
+        payload: &'a [u8],
+    ) -> x0x::crdt::sealed::TaskSealFuture<'a, Option<x0x::crdt::sealed::SealedTaskRecordBody>>
+    {
+        Box::pin(async move {
+            let (state, plane) = self.plane().await?;
+            let signing =
+                x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+                    .map_err(|e| {
+                        x0x::crdt::CrdtError::Gossip(format!("task author signing: {e}"))
+                    })?;
+            match plane {
+                TaskListPlane::Public => Ok(None),
+                TaskListPlane::Gss(info) => x0x::crdt::sealed::seal_gss_task_payload(
+                    &info,
+                    &signing,
+                    kind,
+                    &self.topic,
+                    payload,
+                )
+                .map(Some),
+                TaskListPlane::TreeKem(protector, stable) => {
+                    let record_id =
+                        x0x::crdt::sealed::group_task_list_record_id(&stable, &self.topic);
+                    protector
+                        .seal_record(&signing, kind, &record_id, payload, false)
+                        .await
+                        .map(|record| {
+                            Some(x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record))
+                        })
+                        .map_err(|e| {
+                            x0x::crdt::CrdtError::Gossip(format!("TreeKEM task seal: {e}"))
+                        })
+                }
+            }
+        })
+    }
+
+    fn open<'a>(
+        &'a self,
+        body: &'a x0x::crdt::sealed::SealedTaskRecordBody,
+    ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::sealed::OpenedTaskPayload> {
+        Box::pin(async move {
+            let (_, plane) = self.plane().await?;
+            match (plane, body) {
+                (
+                    TaskListPlane::Gss(info),
+                    x0x::crdt::sealed::SealedTaskRecordBody::Gss(record),
+                ) => x0x::crdt::sealed::open_gss_task_record(&info, &self.topic, record),
+                (
+                    TaskListPlane::TreeKem(protector, stable),
+                    x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record),
+                ) => {
+                    let record_id =
+                        x0x::crdt::sealed::group_task_list_record_id(&stable, &self.topic);
+                    let opened = protector
+                        .open_record(&record_id, record)
+                        .await
+                        .map_err(|e| {
+                            x0x::crdt::CrdtError::Gossip(format!("TreeKEM task open: {e}"))
+                        })?;
+                    // `open_record` already required a current WRITER for a
+                    // non-read-only record; a read-only one is never content.
+                    x0x::crdt::sealed::accept_opened(
+                        opened.mutation.kind,
+                        !opened.reader_only,
+                        opened.mutation.author_id,
+                        opened.mutation.payload,
+                    )
+                }
+                _ => Err(x0x::crdt::CrdtError::Gossip(
+                    "sealed task record does not match the group's current plane".to_string(),
+                )),
+            }
+        })
+    }
+
+    fn admits_plaintext(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move { matches!(self.plane().await, Ok((_, TaskListPlane::Public))) })
+    }
+
+    fn on_rejected(&self, reason: x0x::crdt::TaskSealRejection) {
+        if let Some(state) = self.state.upgrade() {
+            state
+                .groups_diagnostics
+                .record_task_delta_seal_rejected(&self.group_id);
+            tracing::debug!(group_id = %self.group_id, ?reason, "[tasks] task delta refused (#895)");
+        }
+    }
 }
 
 /// ADR-0068 D2: the inbound-delta admission gate for a group-scoped task list.

@@ -14398,6 +14398,12 @@ impl Agent {
         if let Some(gate) = binding.ingest_gate {
             sync.ingest_gate().install(gate);
         }
+        // #895: the protector is captured by the loops at start, so it too
+        // must be in place first — otherwise a group list would publish and
+        // merge plaintext until it was installed.
+        if let Some(protector) = binding.delta_protector {
+            sync.install_protector(protector);
+        }
         let sync = std::sync::Arc::new(sync);
         if storage.is_some() {
             // Fail closed at registration: refuse to run a "persistent"
@@ -14495,6 +14501,9 @@ pub struct TaskListBinding {
     /// The ADR-0068 D2 inbound-delta gate. `None` for a list with no group
     /// binding.
     pub ingest_gate: Option<std::sync::Arc<dyn crdt::TaskIngestGate>>,
+    /// #895: the group-key protector for a list bound to a named group.
+    /// `None` for a personal list (plaintext wire format, unchanged).
+    pub delta_protector: Option<std::sync::Arc<dyn crdt::TaskDeltaProtector>>,
 }
 
 impl std::fmt::Debug for TaskListBinding {
@@ -14508,6 +14517,7 @@ impl std::fmt::Debug for TaskListBinding {
                     .map(std::collections::HashSet::len),
             )
             .field("ingest_gate", &self.ingest_gate.is_some())
+            .field("delta_protector", &self.delta_protector.is_some())
             .finish()
     }
 }

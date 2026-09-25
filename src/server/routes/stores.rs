@@ -782,6 +782,27 @@ struct TreeKemGroupStoreProtector {
     invalid: std::sync::atomic::AtomicBool,
 }
 
+/// #895: the live TreeKEM protector for a group-scoped task list — the same
+/// adapter this group's encrypted KV stores seal with, so a task list rides
+/// the same ratchet, roster/policy binding and durability rules. `None` when
+/// the group is not an eligible TreeKEM group.
+pub(in crate::server) fn treekem_task_list_protector(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) -> Option<x0x::kv::SharedTreeKemKvProtector> {
+    let authorization = Arc::new(x0x::groups::TreeKemKvAuthorizationContext::from_group(
+        info,
+    )?);
+    Some(Arc::new(TreeKemGroupStoreProtector {
+        state: Arc::clone(state),
+        group_key: group_key.to_string(),
+        stable_group_id: info.stable_group_id().to_string(),
+        authorization,
+        invalid: std::sync::atomic::AtomicBool::new(false),
+    }))
+}
+
 impl TreeKemGroupStoreProtector {
     fn new(
         state: &Arc<AppState>,

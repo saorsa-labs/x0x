@@ -14,10 +14,14 @@
 //! This provides eventual consistency across all peers sharing the same topic.
 
 use crate::crdt::persistence::TaskListStorage;
+use crate::crdt::sealed::{
+    decode_sealed_task_record, encode_sealed_task_record, TaskDeltaProtector, TaskSealRejection,
+};
 use crate::crdt::{Result, TaskList, TaskListDelta, TaskListId};
 use crate::gossip::wire::{decode_delta, encode_delta};
 use crate::gossip::PubSubManager;
 use crate::identity::AgentId;
+use crate::kv::encrypted::KvMutationKind;
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -185,6 +189,65 @@ impl Drop for BootstrapGuard {
     }
 }
 
+/// #895: the main-topic bytes for `plain` (an encoded `(PeerId, delta)`).
+/// Without a protector, or for a signed-public group, that is `plain` itself;
+/// otherwise a sealed record. Never falls back to plaintext on a seal error.
+async fn seal_for_wire(
+    protector: Option<&Arc<dyn TaskDeltaProtector>>,
+    local_peer_id: PeerId,
+    kind: KvMutationKind,
+    plain: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let Some(protector) = protector else {
+        return Ok(plain);
+    };
+    match protector.seal(kind, &plain).await? {
+        None => Ok(plain),
+        Some(body) => encode_sealed_task_record(local_peer_id, body),
+    }
+}
+
+/// #895: the plaintext `(PeerId, delta)` bytes of one inbound main-topic
+/// message on a group-bound list, or `None` when it must be dropped.
+///
+/// Our own sealed echo is skipped: the local mutation was applied before it
+/// was published, and a TreeKEM sender cannot open its own ciphertext.
+async fn open_inbound(
+    protector: &Arc<dyn TaskDeltaProtector>,
+    payload: &[u8],
+    sender: Option<&AgentId>,
+    local_peer_id: PeerId,
+) -> Option<Vec<u8>> {
+    let Some((peer, body)) = decode_sealed_task_record(payload) else {
+        if protector.admits_plaintext().await {
+            return Some(payload.to_vec());
+        }
+        protector.on_rejected(TaskSealRejection::PlaintextRefused);
+        tracing::warn!(
+            "refused plaintext task delta on a group-encrypted list (#895): \
+             the sender has not upgraded, or is not a member"
+        );
+        return None;
+    };
+    if peer == local_peer_id {
+        return None;
+    }
+    let opened = match protector.open(&body).await {
+        Ok(opened) => opened,
+        Err(e) => {
+            protector.on_rejected(TaskSealRejection::OpenFailed);
+            tracing::warn!("refused sealed task record (#895): {e}");
+            return None;
+        }
+    };
+    if sender.is_some_and(|s| *s != opened.author) {
+        protector.on_rejected(TaskSealRejection::SenderMismatch);
+        tracing::warn!("refused sealed task record: sealed author is not the gossip sender");
+        return None;
+    }
+    Some(opened.payload)
+}
+
 /// Synchronization wrapper for a TaskList.
 ///
 /// Manages automatic background synchronization of a TaskList using gossip
@@ -266,6 +329,13 @@ pub struct TaskListSync {
     /// hook: the poll fixtures must not sleep for whole seconds, and a
     /// process-global knob would couple concurrently running tests.
     drain_poll_millis: Arc<std::sync::atomic::AtomicU64>,
+
+    /// #895: set-once group-key protector for a list bound to a named group.
+    /// Installed BEFORE [`start`](Self::start) (via `TaskListBinding`); with
+    /// it, every main-topic publish is sealed and plaintext is refused unless
+    /// the protector reports a signed-public group. Empty for a personal
+    /// list, whose wire format is unchanged.
+    protector: std::sync::OnceLock<Arc<dyn TaskDeltaProtector>>,
 }
 
 /// ADR-0068 D2: maximum inbound deltas one task list buffers while its group
@@ -1053,7 +1123,16 @@ impl TaskListSync {
             drain_poll_millis: Arc::new(std::sync::atomic::AtomicU64::new(
                 TASK_QUARANTINE_DRAIN_POLL_SECS.saturating_mul(1_000),
             )),
+            protector: std::sync::OnceLock::new(),
         })
+    }
+
+    /// #895: install the group-key protector. Must precede
+    /// [`start`](Self::start): the loops capture it when they are spawned, so
+    /// a protector installed later would leave them publishing and merging
+    /// plaintext. Returns `false` if one was already installed (set-once).
+    pub fn install_protector(&self, protector: Arc<dyn TaskDeltaProtector>) -> bool {
+        self.protector.set(protector).is_ok()
     }
 
     /// Shorten the ADR-0068 D2 drain poll for a fixture. `cfg(test)` only and
@@ -1213,6 +1292,9 @@ impl TaskListSync {
         let listener_buffer = Arc::clone(&self.quarantine_buffer);
         let listener_poll_millis = Arc::clone(&self.drain_poll_millis);
         let listener_lifecycle = Arc::clone(&self.lifecycle);
+        // #895: captured once — installed before start by contract.
+        let listener_protector = self.protector.get().cloned();
+        let listener_local_peer = self.local_peer_id;
 
         spawn(Box::pin(async move {
             // #732 finding 5: the drain deadline lives ACROSS receives. It used
@@ -1291,7 +1373,25 @@ impl TaskListSync {
                     listener_cancel.cancel();
                     return;
                 };
-                match decode_delta::<TaskListDelta>(&msg.payload) {
+                // #895: a group-bound list opens sealed records with the
+                // group's current key and refuses plaintext (fail closed,
+                // counted) — before any lock, since opening a TreeKEM record
+                // takes the group membership lock.
+                let payload: std::borrow::Cow<'_, [u8]> = match &listener_protector {
+                    None => std::borrow::Cow::Borrowed(&msg.payload[..]),
+                    Some(protector) => match open_inbound(
+                        protector,
+                        &msg.payload,
+                        msg.sender.as_ref(),
+                        listener_local_peer,
+                    )
+                    .await
+                    {
+                        Some(opened) => std::borrow::Cow::Owned(opened),
+                        None => continue,
+                    },
+                };
+                match decode_delta::<TaskListDelta>(&payload) {
                     Ok((peer_id, delta)) => {
                         // #759 lifecycle fence: held to the end of this
                         // iteration, so the (optional) pre-admission drain,
@@ -1342,7 +1442,7 @@ impl TaskListSync {
                             peer_id,
                             delta,
                             msg.sender.as_ref(),
-                            msg.payload.len(),
+                            payload.len(),
                         )
                         .await
                         {
@@ -1434,6 +1534,7 @@ impl TaskListSync {
         let responder_served = Arc::clone(&served_evidence);
         let responder_cancel = self.cancel.clone();
         let local_peer_id = self.local_peer_id;
+        let responder_protector = self.protector.get().cloned();
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
             // response per cooldown window — the response is a broadcast,
@@ -1519,8 +1620,24 @@ impl TaskListSync {
                                     list.task_count() as u32,
                                 )
                             };
-                            let Ok(serialized) = encode_delta(local_peer_id, &full) else {
+                            let Ok(plain) = encode_delta(local_peer_id, &full) else {
                                 continue;
+                            };
+                            // #895: the cold-start serve carries the whole
+                            // list, so it is sealed exactly like a delta.
+                            let serialized = match seal_for_wire(
+                                responder_protector.as_ref(),
+                                local_peer_id,
+                                KvMutationKind::FullState,
+                                plain,
+                            )
+                            .await
+                            {
+                                Ok(sealed) => sealed,
+                                Err(e) => {
+                                    tracing::warn!("TaskList state-response seal failed: {e}");
+                                    continue;
+                                }
                             };
                             if let Err(e) = responder_pubsub
                                 .publish(responder_topic.clone(), bytes::Bytes::from(serialized))
@@ -1824,9 +1941,18 @@ impl TaskListSync {
     ///
     /// Returns an error if serialization or publishing fails.
     pub async fn publish_delta(&self, local_peer_id: PeerId, delta: TaskListDelta) -> Result<()> {
-        let serialized = encode_delta(local_peer_id, &delta).map_err(|e| {
+        let plain = encode_delta(local_peer_id, &delta).map_err(|e| {
             crate::crdt::CrdtError::Gossip(format!("failed to serialize delta: {e}"))
         })?;
+        // #895: sealed under the group key when a protector is installed; a
+        // seal failure publishes nothing rather than falling back to plaintext.
+        let serialized = seal_for_wire(
+            self.protector.get(),
+            local_peer_id,
+            KvMutationKind::Delta,
+            plain,
+        )
+        .await?;
 
         self.pubsub
             .publish(self.topic.clone(), bytes::Bytes::from(serialized))
@@ -2223,6 +2349,320 @@ mod tests {
             "published delta must carry the task"
         );
         assert_eq!(msg.topic, "tasks/D");
+    }
+
+    // ------------------------------------------------------------------
+    // #895: group-key sealing of group-scoped task lists
+    // ------------------------------------------------------------------
+
+    const SEALED_TITLE: &str = "SEALED-TITLE-895";
+    const SEALED_DESCRIPTION: &str = "SEALED-DESCRIPTION-895";
+
+    /// A GSS-plane protector over a fixed `GroupInfo` snapshot, built from the
+    /// same library seal/open functions the daemon's protector calls.
+    struct GssFixtureProtector {
+        info: crate::groups::GroupInfo,
+        topic: String,
+        signing: crate::kv::encrypted::AuthorSigning,
+        public: bool,
+        rejected: std::sync::atomic::AtomicU64,
+    }
+
+    impl GssFixtureProtector {
+        fn new(
+            info: crate::groups::GroupInfo,
+            topic: &str,
+            kp: &crate::identity::AgentKeypair,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                info,
+                topic: topic.to_string(),
+                signing: crate::kv::encrypted::AuthorSigning::from_keypair(kp).expect("signing"),
+                public: false,
+                rejected: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+
+        fn rejected(&self) -> u64 {
+            self.rejected.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl TaskDeltaProtector for GssFixtureProtector {
+        fn seal<'a>(
+            &'a self,
+            kind: KvMutationKind,
+            payload: &'a [u8],
+        ) -> crate::crdt::sealed::TaskSealFuture<
+            'a,
+            Option<crate::crdt::sealed::SealedTaskRecordBody>,
+        > {
+            Box::pin(async move {
+                if self.public {
+                    return Ok(None);
+                }
+                crate::crdt::sealed::seal_gss_task_payload(
+                    &self.info,
+                    &self.signing,
+                    kind,
+                    &self.topic,
+                    payload,
+                )
+                .map(Some)
+            })
+        }
+
+        fn open<'a>(
+            &'a self,
+            body: &'a crate::crdt::sealed::SealedTaskRecordBody,
+        ) -> crate::crdt::sealed::TaskSealFuture<'a, crate::crdt::sealed::OpenedTaskPayload>
+        {
+            Box::pin(async move {
+                match body {
+                    crate::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
+                        crate::crdt::sealed::open_gss_task_record(&self.info, &self.topic, record)
+                    }
+                    crate::crdt::sealed::SealedTaskRecordBody::TreeKem(_) => Err(
+                        crate::crdt::CrdtError::Gossip("fixture is GSS-only".to_string()),
+                    ),
+                }
+            })
+        }
+
+        fn admits_plaintext(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(async move { self.public })
+        }
+
+        fn on_rejected(&self, _reason: TaskSealRejection) {
+            self.rejected
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// An MlsEncrypted GSS group whose creator (and only active member) is
+    /// `member`, holding a rotated shared secret.
+    fn gss_group(member: AgentId) -> crate::groups::GroupInfo {
+        let mut info =
+            crate::groups::GroupInfo::new("g895".to_string(), String::new(), member, "g895".into());
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        info
+    }
+
+    fn secret_task_delta(from: PeerId) -> (TaskId, TaskListDelta) {
+        let task = TaskItem::new(
+            TaskId::from_bytes([95; 32]),
+            TaskMetadata::new(SEALED_TITLE, SEALED_DESCRIPTION, 128, agent(1), 1000),
+            from,
+        );
+        let id = *task.id();
+        let mut delta = TaskListDelta::new(1);
+        delta.added_tasks.insert(id, (task, (from, 1)));
+        (id, delta)
+    }
+
+    fn carries(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+    }
+
+    /// A pubsub whose publishes are signed by `kp`, so the listener sees
+    /// `kp`'s agent as the gossip-verified sender.
+    async fn pubsub_signed_by(kp: &crate::identity::AgentKeypair) -> Arc<PubSubManager> {
+        let signing = Arc::new(crate::gossip::SigningContext::from_keypair(kp));
+        Arc::new(PubSubManager::new(make_node().await, Some(signing)).expect("pubsub"))
+    }
+
+    /// Lead requirement 3 (WHY): the exact bytes handed to the gossip publish
+    /// call for a group task-list update must not carry the task's title or
+    /// description — a non-member who derives the topic learns nothing.
+    #[tokio::test]
+    async fn group_list_publish_hands_gossip_only_sealed_bytes() {
+        let topic = "x0x.group.g895.symphony.wire";
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let (sync, pubsub) = make_sync_with_pubsub(topic).await;
+        let protector = GssFixtureProtector::new(gss_group(kp.agent_id()), topic, &kp);
+        assert!(sync.install_protector(protector.clone()));
+        let mut probe = pubsub.subscribe(topic.to_string()).await;
+
+        let (task_id, delta) = secret_task_delta(peer(1));
+        sync.publish_delta(peer(1), delta).await.expect("publish");
+        let msg = tokio::time::timeout(Duration::from_secs(2), probe.recv())
+            .await
+            .expect("published record")
+            .expect("probe open");
+
+        assert!(!carries(&msg.payload, SEALED_TITLE), "title on the wire");
+        assert!(
+            !carries(&msg.payload, SEALED_DESCRIPTION),
+            "description on the wire"
+        );
+        assert!(
+            decode_delta::<TaskListDelta>(&msg.payload)
+                .map_or(true, |(_, d)| !d.added_tasks.contains_key(&task_id)),
+            "the published bytes must not decode as a plaintext delta"
+        );
+        // Control: the sealed record is the member's delta, not noise.
+        let (_, body) =
+            crate::crdt::sealed::decode_sealed_task_record(&msg.payload).expect("sealed record");
+        let opened = protector.open(&body).await.expect("member opens");
+        let (_, inner) = decode_delta::<TaskListDelta>(&opened.payload).expect("inner delta");
+        assert!(inner.added_tasks.contains_key(&task_id));
+    }
+
+    /// WHY: the `/state-sync` cold-start serve republishes the WHOLE list, so
+    /// it must be sealed too — otherwise a non-member could just ask for it.
+    #[tokio::test]
+    async fn group_list_state_serve_is_sealed() {
+        let topic = "x0x.group.g895.symphony.serve";
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let (sync, pubsub) = make_sync_with_pubsub(topic).await;
+        assert!(sync.install_protector(GssFixtureProtector::new(
+            gss_group(kp.agent_id()),
+            topic,
+            &kp
+        )));
+        {
+            let (_, delta) = secret_task_delta(peer(1));
+            let (task, _) = delta.added_tasks.into_values().next().expect("task");
+            sync.write().await.add_task(task, peer(1), 1).expect("seed");
+        }
+        sync.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut probe = pubsub.subscribe(topic.to_string()).await;
+        let request = bincode::serialize(&TaskListSyncMessage::StateRequest { requester: peer(9) })
+            .expect("request");
+        pubsub
+            .publish(sync.state_sync_topic(), bytes::Bytes::from(request))
+            .await
+            .expect("publish request");
+        let msg = tokio::time::timeout(Duration::from_secs(2), probe.recv())
+            .await
+            .expect("full-state serve")
+            .expect("probe open");
+        assert!(crate::crdt::sealed::decode_sealed_task_record(&msg.payload).is_some());
+        assert!(!carries(&msg.payload, SEALED_TITLE));
+        assert!(!carries(&msg.payload, SEALED_DESCRIPTION));
+    }
+
+    /// WHY: sealing must not break replication — a current member opens the
+    /// record with the group key and the task lands.
+    #[tokio::test]
+    async fn member_opens_and_applies_sealed_delta() {
+        let topic = "x0x.group.g895.symphony.member";
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let info = gss_group(kp.agent_id());
+        let pubsub = pubsub_signed_by(&kp).await;
+        let sender = TaskListSync::new(
+            TaskList::new(list_id(1), "L".to_string(), peer(1)),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+        )
+        .expect("sender");
+        let receiver = TaskListSync::new(
+            TaskList::new(list_id(1), "L".to_string(), peer(2)),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+        )
+        .expect("receiver");
+        assert!(sender.install_protector(GssFixtureProtector::new(info.clone(), topic, &kp)));
+        let receiver_protector = GssFixtureProtector::new(info, topic, &kp);
+        assert!(receiver.install_protector(receiver_protector.clone()));
+        receiver.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (task_id, delta) = secret_task_delta(peer(1));
+        sender.publish_delta(peer(1), delta).await.expect("publish");
+        let landed = eventually(Duration::from_secs(3), || async {
+            receiver.read().await.get_task(&task_id).is_some()
+        })
+        .await;
+        assert!(landed, "a member must apply the sealed delta");
+        assert_eq!(receiver_protector.rejected(), 0);
+    }
+
+    /// Lead requirements 1 and 2 (WHY): a removed member still holding the
+    /// epoch-N key cannot apply a delta sealed at N+1, and a plaintext delta
+    /// (an un-upgraded peer) is refused and counted — neither is merged.
+    #[tokio::test]
+    async fn removed_member_and_plaintext_fail_closed() {
+        let topic = "x0x.group.g895.symphony.removed";
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let at_n = gss_group(kp.agent_id());
+        let mut at_n1 = at_n.clone();
+        let _ = at_n1.rotate_shared_secret();
+        let pubsub = pubsub_signed_by(&kp).await;
+        let sender = TaskListSync::new(
+            TaskList::new(list_id(1), "L".to_string(), peer(1)),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+        )
+        .expect("sender");
+        let removed = TaskListSync::new(
+            TaskList::new(list_id(1), "L".to_string(), peer(2)),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+        )
+        .expect("removed member");
+        assert!(sender.install_protector(GssFixtureProtector::new(at_n1, topic, &kp)));
+        let stale = GssFixtureProtector::new(at_n, topic, &kp);
+        assert!(removed.install_protector(stale.clone()));
+        removed.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (sealed_id, delta) = secret_task_delta(peer(1));
+        sender.publish_delta(peer(1), delta).await.expect("publish");
+        let plain_task = make_task(42, peer(3));
+        let plain_id = *plain_task.id();
+        let mut plain = TaskListDelta::new(2);
+        plain
+            .added_tasks
+            .insert(plain_id, (plain_task, (peer(3), 1)));
+        pubsub
+            .publish(
+                topic.to_string(),
+                bytes::Bytes::from(encode_delta(peer(3), &plain).expect("encode")),
+            )
+            .await
+            .expect("publish plaintext");
+
+        let both_refused =
+            eventually(Duration::from_secs(3), || async { stale.rejected() >= 2 }).await;
+        assert!(both_refused, "both deltas must be refused and counted");
+        let list = removed.read().await;
+        assert!(
+            list.get_task(&sealed_id).is_none(),
+            "N+1 record applied with N key"
+        );
+        assert!(
+            list.get_task(&plain_id).is_none(),
+            "plaintext applied to a group list"
+        );
+    }
+
+    /// WHY: personal (non-group) lists keep their plaintext wire format; the
+    /// fix must not change them. No protector ⇒ the bytes are the plain pair.
+    #[tokio::test]
+    async fn personal_list_wire_format_is_unchanged() {
+        let (sync, pubsub) = make_sync_with_pubsub("tasks/personal-895").await;
+        let mut probe = pubsub.subscribe("tasks/personal-895".to_string()).await;
+        let (task_id, delta) = secret_task_delta(peer(1));
+        sync.publish_delta(peer(1), delta).await.expect("publish");
+        let msg = tokio::time::timeout(Duration::from_secs(2), probe.recv())
+            .await
+            .expect("published")
+            .expect("probe open");
+        assert!(crate::crdt::sealed::decode_sealed_task_record(&msg.payload).is_none());
+        let (_, observed) = decode_delta::<TaskListDelta>(&msg.payload).expect("plain pair");
+        assert!(observed.added_tasks.contains_key(&task_id));
+        assert!(carries(&msg.payload, SEALED_TITLE));
     }
 
     // ------------------------------------------------------------------
