@@ -98,7 +98,23 @@ It matches any **owner-trusted** requester: the agent presents a valid, unexpire
 - Owner trust **does not open exec by itself.** With no `principal = "owner"` entry an owner-trusted requester is denied (`agent_machine_not_in_acl`). The shipped defaults contain no owner entry.
 - Argv stays an exact allowlist; caps and `max_duration_secs` apply as for pair entries.
 - An owner entry must not also set `agent_id` or `machine_id`; an entry with neither a principal nor both ids, or with any other principal value, is a load-time error.
-- The ACL is still loaded once at startup; there is no REST/CLI editing or reload yet (ADR-0070 slice 2).
+- Owner entries can be added at runtime; see below.
+
+### Managing the ACL at runtime (ADR-0070 §3)
+
+The TOML file is the **floor**. The daemon never rewrites it, and its entries cannot be removed through the API (`409`). The owner can add entries through REST/CLI (durable API token only; session and rider tokens get `403`). They persist in `<data_dir>/acl/exec-overlay.json`. The effective ACL is the floor plus the overlay.
+
+```bash
+x0x acl exec list
+x0x acl exec add '{"principal":"owner","commands":[{"argv":["uptime"]}]}'
+x0x acl exec rm api-0123456789abcdef
+x0x acl reload                  # also SIGHUP
+```
+
+- The JSON body is the `[[exec.allow]]` entry schema. It is validated by the same parser as the file. Caps, audit settings and `enabled` come only from the floor.
+- API entries are refused with `409` while the floor disables exec. `principal = "owner"` entries are refused with `409` on an install with no owner key.
+- A reload is rejected, and the last good ACL kept, when the file or overlay is malformed or invalid, when it would switch exec on or off, or when it would change `audit_log_path`/`audit_tasklist_id` (the audit sink is bound at start). The reason and counters appear under `acl_reload` in `GET /diagnostics/exec`. Caps and allow entries do hot-reload.
+- Requests already admitted keep the policy they were checked against.
 
 Every request argv token is also checked for shell metacharacters (`;`, `|`, `&`, `>`, `<`, backtick, `$`, newline, and NUL). This is defence in depth; commands are still spawned without a shell.
 

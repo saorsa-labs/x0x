@@ -9,6 +9,8 @@
 // crate to itself so those paths resolve unchanged inside the library.
 use crate as x0x;
 
+mod acl_admin;
+pub use acl_admin::AclReloadTrigger;
 mod api_watchdog;
 pub(crate) use api_watchdog::ApiWatchdogConfig;
 mod auth;
@@ -34,34 +36,36 @@ use routes::public_group_bootstrap_outbox::{
     PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX,
 };
 use routes::{
-    ack_diagnostics, add_contact, add_machine, add_mls_member, add_named_group_member, add_task,
-    agent_info, agent_reachability, agent_sign, agent_user_id_handler, agent_verify,
-    agents_by_user_handler, announce_identity, apply_direct_kv_store_delta,
-    apply_named_group_metadata_event, apply_named_group_metadata_event_inner_serialized,
-    apply_upgrade, approve_join_request, ban_group_member, bootstrap_cache_stats,
-    broadcast_current_manifest, cancel_join_request, causal_relay_step, check_upgrade,
-    clear_group_quarantine, connect_agent, connect_diagnostics_handler, connect_machine,
-    connectivity_diagnostics, create_discovery_subscription, create_group_invite,
-    create_group_kv_store, create_join_request, create_kv_store, create_mls_group,
-    create_mls_welcome, create_named_group, create_task_list, daemon_shutdown_hook, delete_contact,
-    delete_discovery_subscription, delete_kv_value, delete_machine, direct_connections,
-    direct_message_send_config, direct_send, discover_groups, discover_groups_nearby,
-    discovered_agent, discovered_agents, discovered_machine, discovered_machines, dm_diagnostics,
-    enroll_device, ensure_named_group_listeners, evaluate_trust, exec_cancel, exec_diagnostics,
-    exec_run, exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
-    file_transfer_status_handler, file_transfers_handler, find_agent, forward_add, forward_list,
-    forward_remove, get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
-    get_group_card, get_group_join_status, get_group_public_messages, get_group_state,
-    get_group_state_commits, get_kv_value, get_mls_group, get_named_group, get_named_group_members,
-    get_profile, get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
-    handle_control_blob_message, handle_file_message, handle_join_result_message,
-    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
-    health, history_diagnostics, history_list, history_message, history_purge, history_scopes,
-    history_search, history_stats, identity_revocations, identity_revoke, import_agent_card,
-    import_group_card, ingest_public_message, introduction, join_group_via_invite, join_kv_store,
-    leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
-    list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
-    list_task_lists, list_tasks, load_causal_approval_queue, load_named_groups_merged,
+    ack_diagnostics, acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add,
+    acl_exec_list, acl_exec_remove, acl_reload, add_contact, add_machine, add_mls_member,
+    add_named_group_member, add_task, agent_info, agent_reachability, agent_sign,
+    agent_user_id_handler, agent_verify, agents_by_user_handler, announce_identity,
+    apply_direct_kv_store_delta, apply_named_group_metadata_event,
+    apply_named_group_metadata_event_inner_serialized, apply_upgrade, approve_join_request,
+    ban_group_member, bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request,
+    causal_relay_step, check_upgrade, clear_group_quarantine, connect_agent,
+    connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
+    create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
+    create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
+    daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
+    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
+    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
+    discovered_machines, dm_diagnostics, enroll_device, ensure_named_group_listeners,
+    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
+    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
+    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    get_constitution, get_constitution_json, get_group_card, get_group_join_status,
+    get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
+    get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
+    gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
+    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
+    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
+    history_list, history_message, history_purge, history_scopes, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
+    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
+    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
+    list_tasks, load_causal_approval_queue, load_named_groups_merged,
     load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
     machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
@@ -789,6 +793,18 @@ pub async fn serve_with_options(
     // needed.
     enforce_owner_singleton_prebuild(&config, &identity_dir).await?;
 
+    // ADR-0070 §3: compose the API-managed ACL overlay (daemon data dir)
+    // over the operator TOML floors. Fail-closed like the floors: a
+    // malformed overlay refuses startup. Everything below consumes the
+    // effective (floor ∪ overlay) policies.
+    let acl_admin = Arc::new(
+        acl_admin::AclAdmin::load(&config.data_dir, connect_policy, exec_policy)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to load API-managed ACL entries: {e}"))?,
+    );
+    let exec_policy = (*acl_admin.effective_exec().await).clone();
+    let connect_policy = (*acl_admin.effective_connect().await).clone();
+
     // All agent-independent fallible startup has succeeded. Build the agent now
     // (this spawns the network tasks and binds the QUIC socket). From here on,
     // any fallible step must run typed Agent shutdown on the error path so a
@@ -992,6 +1008,16 @@ pub async fn serve_with_options(
         None
     };
 
+    // ADR-0070 §3: from here on ACL edits and reloads swap the policies the
+    // agent (connect accept + forwarder) and the exec service consult.
+    acl_admin
+        .attach(acl_admin::AclSink {
+            agent: Arc::clone(&agent),
+            exec_service: Arc::clone(&exec_service),
+            connect_diagnostics: Arc::clone(&connect_diagnostics),
+        })
+        .await;
+
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         key_move_ceremony_enabled: config.key_move.ceremony_enabled,
@@ -1103,6 +1129,7 @@ pub async fn serve_with_options(
         cert_journal_lock: tokio::sync::Mutex::new(()),
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
+        acl_admin: Arc::clone(&acl_admin),
         connect_diagnostics,
         forward_service,
         owner_sync,
@@ -2287,6 +2314,12 @@ pub async fn serve_with_options(
         .route("/forwards", post(forward_add).get(forward_list))
         .route("/forwards/:local_addr", delete(forward_remove))
         .route("/streams", get(streams_diagnostics))
+        // ADR-0070 §3: connect/exec ACL management + hot reload
+        .route("/acl/connect", get(acl_connect_list).post(acl_connect_add))
+        .route("/acl/connect/:id", delete(acl_connect_remove))
+        .route("/acl/exec", get(acl_exec_list).post(acl_exec_add))
+        .route("/acl/exec/:id", delete(acl_exec_remove))
+        .route("/acl/reload", post(acl_reload))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
@@ -2527,6 +2560,7 @@ pub async fn serve_with_options(
     Ok(ServerHandle {
         local_addr: actual_api_addr,
         cancel,
+        acl_admin,
         task: Some(task),
     })
 }

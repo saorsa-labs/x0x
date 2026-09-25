@@ -36079,6 +36079,15 @@ pub(in crate::server) mod tests {
             reason: "test".to_string(),
             loaded_at_unix_ms: 0,
         };
+        let acl_admin = Arc::new(
+            crate::server::acl_admin::AclAdmin::load(
+                data_dir,
+                x0x::connect::ConnectPolicy::default(),
+                exec_policy.clone(),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?,
+        );
         let exec_service =
             x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
@@ -36201,6 +36210,7 @@ pub(in crate::server) mod tests {
             cert_journal_lock: tokio::sync::Mutex::new(()),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
+            acl_admin,
             connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
                 x0x::connect::ConnectPolicy::default().summary(),
             )),

@@ -158,6 +158,8 @@ pub(super) const fn effective_self_update_enabled(
 pub struct ServerHandle {
     pub(super) local_addr: SocketAddr,
     pub(super) cancel: tokio_util::sync::CancellationToken,
+    /// ADR-0070 §3 ACL manager, for [`ServerHandle::acl_reload_trigger`].
+    pub(super) acl_admin: Arc<super::acl_admin::AclAdmin>,
     // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
     // handle out without conflicting with the `Drop` impl (which only cancels).
     pub(super) task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
@@ -182,6 +184,13 @@ impl ServerHandle {
     /// handle to observe run-to-completion.
     pub fn shutdown(&self) {
         self.cancel.cancel();
+    }
+
+    /// Handle that re-reads the connect/exec ACL floors and API overlays
+    /// (ADR-0070 §3) — what `x0xd` runs on `SIGHUP`.
+    #[must_use]
+    pub fn acl_reload_trigger(&self) -> super::AclReloadTrigger {
+        super::AclReloadTrigger(Arc::clone(&self.acl_admin))
     }
 
     /// Await the server's run-to-completion, returning its supervisor result.
@@ -1158,6 +1167,9 @@ pub(super) struct AppState {
     pub(super) exec_service: Arc<x0x::exec::ExecService>,
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.
     pub(super) groups_diagnostics: Arc<x0x::groups::GroupsDiagnostics>,
+    /// ADR-0070 §3: API-managed connect/exec ACL entries over the TOML
+    /// floor, and hot reload (`/acl/*`).
+    pub(super) acl_admin: Arc<super::acl_admin::AclAdmin>,
     /// Connect-ACL allow/deny counters + policy summary for
     /// `/diagnostics/connect`. Counters reflect live forwards when connect is
     /// enabled (the forwarder calls `record_allowed`/`record_denied`) and read

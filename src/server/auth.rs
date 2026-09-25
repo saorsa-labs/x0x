@@ -299,6 +299,11 @@ fn accepts_query_token(path: &str) -> bool {
 /// exec-prefix egress check is likewise payload-conditional and lives
 /// in the handlers.
 pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
+    // ADR-0070 §3: every ACL management surface — reads included — is
+    // owner/durable-token only; session bearers and riders are refused.
+    if is_acl_admin_path(path) {
+        return true;
+    }
     match *method {
         Method::POST => {
             matches!(
@@ -316,6 +321,21 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
         Method::DELETE => is_sync_device_path(path),
         _ => false,
     }
+}
+
+/// `true` for the ADR-0070 §3 ACL routes: `/acl/reload`, `/acl/connect`,
+/// `/acl/exec`, and `/acl/{connect,exec}/<nonempty-id>`.
+fn is_acl_admin_path(path: &str) -> bool {
+    if path == "/acl/reload" {
+        return true;
+    }
+    ["/acl/connect", "/acl/exec"].iter().any(|base| {
+        path == *base
+            || path
+                .strip_prefix(base)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    })
 }
 
 /// `true` for exactly `/groups/<nonempty-id>/delegate`.
@@ -1010,5 +1030,35 @@ mod tests {
         );
         assert!(extract_query_token(Some("no_token_here")).is_none());
         assert!(extract_query_token(None).is_none());
+    }
+
+    #[test]
+    fn acl_routes_require_durable_owner_for_every_method() {
+        // ADR-0070 §3: ACL management — including listing, which reveals
+        // who may connect/exec — is durable-owner only. A session bearer
+        // must not read or edit it, whatever the method.
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for path in [
+                "/acl/connect",
+                "/acl/exec",
+                "/acl/reload",
+                "/acl/connect/api-0011223344556677",
+                "/acl/exec/file-0011223344556677",
+            ] {
+                assert!(
+                    requires_durable_owner(&method, path),
+                    "{method} {path} must be durable-owner"
+                );
+            }
+        }
+        for path in [
+            "/acl",
+            "/acl/connect/",
+            "/acl/connect/a/b",
+            "/aclx/connect",
+            "/acl/connectx",
+        ] {
+            assert!(!is_acl_admin_path(path), "{path} must not be classified");
+        }
     }
 }

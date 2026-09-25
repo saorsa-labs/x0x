@@ -63,7 +63,27 @@ It matches any **owner-trusted** requester: the agent presents a valid, unexpire
 - Targets stay explicit and exact, as for pair entries.
 - An owner entry must not also set `agent_id` or `machine_id`; an entry with neither a principal nor both ids, or with any other principal value, is a load-time error.
 - Owner entries apply to the inbound stream gate and to attested `ForwardV2` forwards. The legacy `ForwardV1` path (`require_attestation = false`) matches exact pairs only.
-- The ACL is still loaded once at startup; there is no REST/CLI editing or reload yet (ADR-0070 slice 2).
+- Owner entries can be added at runtime; see [Managing the ACL at runtime](#managing-the-acl-at-runtime-adr-0070-3).
+
+## Managing the ACL at runtime (ADR-0070 §3)
+
+The TOML file above is the **floor**. The daemon never rewrites it, and its entries cannot be removed through the API. The owner can add further entries through REST/CLI. They persist in a daemon-owned overlay file, `<data_dir>/acl/connect-overlay.json`. The effective ACL is the floor plus the overlay.
+
+```bash
+x0x acl connect list                       # floor (origin: file) + API (origin: api) entries, with ids
+x0x acl connect add '{"principal":"owner","targets":["127.0.0.1:22"]}'
+x0x acl connect add @entry.json            # or `-` for stdin
+x0x acl connect rm api-0123456789abcdef    # API entries only; a file entry answers 409
+x0x acl reload                             # re-read the TOML floor and the overlay
+```
+
+- **Authorization:** every `/acl/*` route requires the durable API token. Session tokens and rider tokens get `403`.
+- **Validation:** the JSON body is the `[[connect.allow]]` entry schema, and it is checked by the same parser as the TOML file (`deny_unknown_fields`, loopback-only exact targets, principal rules). Invalid input returns `400` and nothing is written.
+- **Owner entries:** adding a `principal = "owner"` entry returns `409` on an install with no owner key, because such an install has no owner trust.
+- **Disabled floor:** if the TOML floor disables connect (or the file is missing), adding an entry returns `409`. API entries never turn a plane on.
+- **Reload:** `POST /acl/reload` (`x0x acl reload`) or `SIGHUP` re-reads the floor file and the overlay, then swaps the effective ACL atomically. The reload is rejected, and the last good ACL stays active, when the file or overlay is malformed or invalid, or when the reload would switch connect between enabled and disabled (that needs a restart). A rejected reload answers `422`. Its reason, plus the `reloads_ok`/`reloads_failed` counters, appears under `acl_reload` in `GET /diagnostics/connect`.
+- **In-flight streams** keep the policy they were admitted under. Each new stream is gated against the current ACL.
+- **Startup is fail-closed:** a malformed overlay stops the daemon from starting, just like a malformed floor.
 
 ## Target validation rules
 
