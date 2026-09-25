@@ -9242,6 +9242,11 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     }
 
     let mut still_pending = VecDeque::new();
+    // #878 r4 (finding 1): a JoinRequestApproved landing seats the
+    // requester — the drain must fire for parked role updates, but only
+    // AFTER this function's guards drop (the drain re-enters the apply
+    // path, which takes the membership lock).
+    let mut member_landed = false;
     for pending in entries {
         // ADR 0028: skip conflicted entries (reject-both, Kimi blocker 5).
         if pending.conflicted {
@@ -9421,6 +9426,9 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                 "ADR 0028 B5: queued approval drained and applied (group state durable)"
             );
             state.groups_diagnostics.record_causal_applied(group_id);
+            if applied_member_add(&pending.event) {
+                member_landed = true;
+            }
             continue;
         }
         if applied.accepted && visible_not_durable {
@@ -9486,6 +9494,15 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             let mut queue_lock = state.causal_approval_queue.write().await;
             queue_lock.insert(group_id.to_string(), queue_snapshot);
         }
+    }
+
+    // #878 r4 (finding 1): a queued JoinRequestApproved seated a member —
+    // drain this group's parked role updates now that every guard of this
+    // replay (membership, persistence, per-iteration roster) has dropped.
+    if member_landed {
+        drop(_replay_membership_guard);
+        drop(_persistence_guard);
+        Box::pin(replay_parked_role_updates(state, group_id)).await;
     }
 }
 
@@ -9961,9 +9978,13 @@ async fn apply_named_group_metadata_event_with_binding(
 fn applied_member_add(event: &NamedGroupMetadataEvent) -> bool {
     // #876 r2 (review item 2): a member can also be seated through an
     // accepted MemberJoined (self-joins) — both release parked updates.
+    // #878 r4 (finding 1): JoinRequestApproved seats the requester too
+    // (its mutate add_member's the requester) — the third landing path.
     matches!(
         event,
-        NamedGroupMetadataEvent::MemberAdded { .. } | NamedGroupMetadataEvent::MemberJoined { .. }
+        NamedGroupMetadataEvent::MemberAdded { .. }
+            | NamedGroupMetadataEvent::MemberJoined { .. }
+            | NamedGroupMetadataEvent::JoinRequestApproved { .. }
     )
 }
 
@@ -10106,6 +10127,25 @@ async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
             named_group_metadata_event_kind(&evicted.event)
         );
     }
+}
+
+/// #878 r4 (review finding 2): acquire the single in-flight permit for
+/// an oversized join-result staging task for this (group, recipient).
+/// `None` while one is already running (the duplicate is dropped).
+fn acquire_join_result_staging_permit(
+    state: &AppState,
+    group_id: &str,
+    recipient: &AgentId,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let mut guards = state
+        .join_result_staging_guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let semaphore = guards
+        .entry((group_id.to_string(), *recipient))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    semaphore.try_acquire_owned().ok()
 }
 
 /// #876 r3: the `agent_id` a `MemberRoleUpdated` targets, if the event
@@ -21090,6 +21130,15 @@ pub(in crate::server) async fn leave_group(
     }
     // #341 Phase B: left/removed group — retire its encrypted stores.
     super::retire_group_kv_stores(&state, &id).await;
+    // #878 r4 (review finding 3): the non-TreeKEM leave deletes the
+    // group — its parked role updates die with it.
+    for alias in &cache_aliases {
+        state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(alias);
+    }
     let mut cache = state.group_card_cache.write().await;
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
@@ -33598,10 +33647,23 @@ async fn handle_join_result_message_bound(
                     );
                     return;
                 }
-                // #876 r2 (review item 3): the bounded staging retry must
-                // NOT run inside the single join-result listener loop — a
-                // busy budget would stall every joiner's result handling
-                // up to 12 s. Deliver on a task; the loop stays free.
+                // #876 r2 (review item 3) + #878 r4 (finding 2): the
+                // bounded staging retry must NOT run inside the single
+                // join-result listener loop, and repeated requests from
+                // the same (group, recipient) must not stack overlapping
+                // staging tasks. One 1-permit semaphore per pair: a
+                // duplicate while a staging runs is DROPPED (the
+                // reference it would stage is byte-identical; the
+                // recipient's retry fetches the live one).
+                let Some(permit) = acquire_join_result_staging_permit(state, &group_id, sender)
+                else {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&group_id),
+                        member = %LogHexId::agent(&member_agent_id),
+                        "join-result staging already in flight for this recipient; dropping the duplicate (#878 r4)"
+                    );
+                    return;
+                };
                 let control_blobs = state.control_blobs.clone();
                 let agent = Arc::clone(&state.agent);
                 let group_id_for_task = group_id.clone();
@@ -33609,6 +33671,7 @@ async fn handle_join_result_message_bound(
                 let member_for_log = member_agent_id.clone();
                 let recipient = *sender;
                 tokio::spawn(async move {
+                    let _staging_permit = permit;
                     if let Err(e) = control_blob::send_reference(
                         &control_blobs,
                         &agent,
@@ -35766,6 +35829,7 @@ pub(in crate::server) mod tests {
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
             parked_role_updates: StdMutex::new(HashMap::new()),
+            join_result_staging_guards: StdMutex::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
             public_group_bootstrap_outbox: RwLock::new(HashMap::new()),
@@ -41819,6 +41883,146 @@ pub(in crate::server) mod tests {
                 .is_none_or(|list| list.is_empty()),
             "#878 r3: the INNER-path landing drains the parked lot"
         );
+        Ok(())
+    }
+
+    /// #878 r4 (review finding 1): a `JoinRequestApproved` landing ALSO
+    /// seats a member — the causal-approval replay path (and the direct
+    /// apply) must drain the parked lot. Removing the
+    /// JoinRequestApproved arm from `applied_member_add` (or the
+    /// replay's post-guard drain) leaves the lot populated (the
+    /// fail-before).
+    #[tokio::test]
+    async fn join_request_approved_landing_drains_parked_updates() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-join-approval-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-join-approval".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        // The pending join request the approval resolves.
+        info.join_requests.insert(
+            "req-878".to_string(),
+            x0x::groups::JoinRequest::new(
+                group_id.to_string(),
+                "99".repeat(32),
+                None,
+                now_millis_u64(),
+            ),
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // Park a role update for the requester BEFORE approval.
+        let requester = "99".repeat(32);
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: requester.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // The approval seats the requester.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            requester.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        let approval = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-878".to_string(),
+            revision: seated.roster_revision,
+            actor: admin_hex.clone(),
+            requester_agent_id: requester,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            commit: Some(commit_add),
+        };
+        let applied_approval =
+            apply_named_group_metadata_event(&state, approval, state.agent.agent_id(), true, None)
+                .await;
+        assert!(
+            applied_approval.accepted,
+            "the approval lands: {applied_approval:?}"
+        );
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r4: the JoinRequestApproved landing drains the parked lot"
+        );
+        Ok(())
+    }
+
+    /// #878 r4 (review finding 2): a second concurrent oversized
+    /// join-result staging for the same (group, recipient) does NOT start
+    /// a second task — the 1-permit guard drops the duplicate. Removing
+    /// the guard lets the second acquire succeed (the fail-before: the
+    /// assert on None fails).
+    #[tokio::test]
+    async fn concurrent_join_result_staging_is_bounded_per_recipient() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "staging-bound-878".to_string();
+        let recipient = crate::identity::AgentId([0x5A; 32]);
+        let first = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(first.is_some(), "the first staging acquires the permit");
+        let second = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(
+            second.is_none(),
+            "#878 r4: the duplicate staging is dropped while the first runs"
+        );
+        drop(first);
+        let third = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(
+            third.is_some(),
+            "the permit is released when the staging task ends"
+        );
+        // A DIFFERENT recipient is unaffected.
+        let other = crate::identity::AgentId([0x5B; 32]);
+        assert!(acquire_join_result_staging_permit(&state, &group_id, &other).is_some());
         Ok(())
     }
 

@@ -939,6 +939,13 @@ pub(super) struct AppState {
     /// arrived before local TreeKEM readiness or ahead of our state frontier.
     pub(super) treekem_pending_events:
         RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// #878 r4 (review finding 2): one in-flight oversized join-result
+    /// staging task per (group, recipient) — a 1-permit semaphore each;
+    /// duplicates are dropped while a staging is running (the recipient
+    /// can re-request; the reference it fetches is byte-identical).
+    pub(super) join_result_staging_guards: StdMutex<
+        HashMap<(String, crate::identity::AgentId), std::sync::Arc<tokio::sync::Semaphore>>,
+    >,
     /// #876: signed `MemberRoleUpdated` events that arrived before their
     /// target member was seated locally (the member's `MemberAdded` blob
     /// was still in flight behind the control-blob staging budget). Parked,
