@@ -1,6 +1,7 @@
 # ADR 0075: Collaborative Notes Use a yrs Text CRDT in the Group Store; Agent Scratchpads Are a Rider-Reachable Group Store
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-25 by David Irvine (decisions Q1–Q6; status change applied by Claude at his instruction)
 - **Date:** 2026-09-25
 - **Decision owners:** David Irvine (acceptance); Claude (drafting)
 - **Reviewers:** cross-model (omp) review required; acceptance by David Irvine only
@@ -8,10 +9,8 @@
 - **Superseded by:** none
 - **Extends:** ADR 0047 (KV store) and ADR 0039 (rider boundary). It edits neither: it adds
   a value encoding on top of 0047 and one named allow-list entry to 0039.
-- **Vision requirement:** R9, "CRDT data sharing works, for humans to have shared
-  notes/projects etc and agents have scratchpads for collaboration". Also R6 (agents
-  collaborate across machines, via scratchpads) and R10 (an agent shows a note to its
-  human, via #893 deep links).
+- **Vision requirement:** R9 (CRDT shared notes for humans, scratchpads for agents);
+  also R6 (cross-machine scratchpads) and R10 (#893 deep links to a note).
 - **Related:** #895 / PR #914 (sealed group task lists), #893 (GUI deep links), ADR 0010
   (GSS plane), 0048 (task lists), 0052 (embedded GUI), 0072 (scope freeze);
   `docs/design/encrypted-kvstore.md`; `.planning/adr-vision-alignment-2026-09-25.md`
@@ -21,14 +20,11 @@
 On `origin/main` today:
 
 - **Notes lose concurrent edits.** The GUI Wiki (`saveWikiPage`, `src/gui/x0x-gui.html`)
-  PUTs the whole page as one value (`PUT /stores/:id/:slug`, `text/markdown`). ADR 0047
-  makes each key an LWW register (highest `updated_at`, hash tie-break), so when two
-  members edit the same page, one member's edit is discarded without notice. ADR 0047
-  names this as a trade-off.
+  PUTs the whole page as one value (`PUT /stores/:id/:slug`). ADR 0047 makes each key an
+  LWW register, so when two members edit one page, one edit is discarded without notice.
 - **There is no sequence or text CRDT.** saorsa-gossip `crdt-sync` (pinned `=0.5.84`)
-  ships `OrSet`, `LwwRegister` and `VectorClock`. `CrdtType::Rga` is an enum tag with no
-  implementation. `src/crdt/task_list.rs` says so and orders tasks with
-  `LwwRegister<Vec<TaskId>>`. Neither `yrs` nor `automerge` is in the lock file.
+  ships `OrSet`, `LwwRegister` and `VectorClock`; `CrdtType::Rga` is an unimplemented
+  enum tag (`src/crdt/task_list.rs` says so). Neither `yrs` nor `automerge` is a dependency.
 - **Group stores are already sealed.** `POST /groups/:id/stores {name}` opens a group
   store. For `MlsEncrypted` groups, every publication is sign-then-encrypt
   (`EncryptedKvStoreRecordV1` on GSS, `TreeKemGroupStoreProtector` on TreeKEM; see
@@ -44,10 +40,8 @@ On `origin/main` today:
 
 - R9: concurrent edits to one note must converge **with no silent loss**, including
   edits inside the same paragraph.
-- Confidentiality must match group stores and #914: same envelope, same epoch rules,
-  no new crypto.
-- Reuse the shipped replication (0047 OR-Set + delta gossip + state-sync). Do not build a
-  second sync engine during the R17 freeze aftermath.
+- Confidentiality must match group stores and #914: same envelope, no new crypto.
+- Reuse the shipped 0047 replication; do not build a second sync engine.
 - Keep ADR 0039 deny-by-default. Any rider widening must be named, scoped and testable.
 - Keep the embedded GUI a single file with no JS bundler (ADR 0052).
 
@@ -70,9 +64,8 @@ On `origin/main` today:
    agents multiply the copies, and the text never converges to one version.
 
 **Scratchpads:** (S1) a dedicated `scratch` group store that riders can reach with a new
-per-group scope; (S2) let riders reach any group store of a granted group; (S3) a new
-non-KV scratchpad type. S2 would expose the human Wiki and Notes to every rider. S3
-duplicates 0047.
+per-group scope; (S2) riders reach any store of a granted group (exposes the human Wiki
+and notes); (S3) a new non-KV scratchpad type (duplicates 0047).
 
 ## Decision
 
@@ -136,29 +129,25 @@ store, and S1 for scratchpads.**
 once a browser `yrs`/Yjs binding can be vendored without a bundler, over the update
 records defined here); rich media embeds (later: reference ADR 0055 file transfers by
 hash, never inline); note compaction and history UI (later, before any note nears the
-cap); rider access to notes (an open question for David).
+cap); rider access to notes (not granted; Decision Q4).
 
 ## Consequences
 
 ### Positive
 
-- Concurrent note edits converge and nothing is dropped silently. This closes the R9 gap
-  the audit found.
+- Concurrent note edits converge and nothing is dropped silently (the R9 audit gap).
 - There is no new transport, sync engine or crypto: the change is a value encoding and
   some routes on shipped stores, and it inherits #914's epoch and rekey behaviour.
-- Scratchpads give agents a shared, cross-machine working area under an explicit,
-  revocable, per-group scope.
+- Scratchpads give agents a cross-machine working area under an explicit, revocable scope.
 
 ### Negative / Trade-offs
 
 - It adds a new dependency (`yrs` and its transitive crates). The binary-size increase
   must be measured in slice 1, with a stop rule: if release `x0xd` grows by more than
   2 MiB, re-evaluate A2 before continuing.
-- Diff-based merge can place an ambiguous insert (for example, inside repeated
-  characters) differently from where the user meant. The text is preserved, but the
-  position may be surprising.
-- Keeping full history grows notes until compaction ships. The 4 MiB cap turns this into
-  an explicit error, not a silent failure.
+- Diff-based merge can place an ambiguous insert (e.g. inside repeated characters)
+  away from where the user meant. The text is preserved; the position may surprise.
+- Full history grows notes until compaction ships; the 4 MiB cap makes this an explicit error.
 - This is the first widening of the rider allow-list since ADR 0039. A bug in the
   store-name check would expose human stores, so the scope test below is mandatory.
 - Wiki migration has a mixed-version window: old GUIs still write the legacy LWW store.
@@ -194,6 +183,17 @@ cap); rider access to notes (an open question for David).
   `rider_routes_allow_exactly_send_secure_encrypt_and_history`.
 - **Cross-machine e2e (R6):** a rider on machine B writes scratch; an agent on A reads it.
 - **Review trigger:** a live-cursor editor is scheduled, or a note reaches the cap.
+
+## Decisions (David Irvine, 2026-09-25)
+
+These answers settle the drafting open questions. David accepted the ADR with them.
+
+1. **Text CRDT:** `yrs` (with the 2 MiB binary-growth stop rule).
+2. **Plain-text editing:** the daemon performs the three-way merge from `base_version`.
+3. **Wiki:** one-time import of each legacy page as a note; the old store stays read-only.
+4. **Riders:** scratchpads only, per-group scope defaulting to `none`; no note access.
+5. **Scratchpad model:** plain LWW KV (0047).
+6. **Note size:** 4 MiB cap (413 beyond it); compaction deferred to a later slice.
 
 ## Notes for AI-assisted work
 
