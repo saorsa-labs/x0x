@@ -331,6 +331,42 @@ async fn owner_trust_without_owner_acl_entry_is_denied_by_connect_acl() {
     assert_eq!(f.inbound_gate().await.expect("gate"), vec![f.agent_id]);
 }
 
+// Invariant (Root, #911): an agent with NO valid owner certificate that
+// self-announces the machine_id of a CURRENTLY ENROLLED owner machine gets
+// nothing — not owner-trusted, refused by the stream gate, and not matched by
+// a `principal = "owner"` connect entry. Enrollment vouches for the machine
+// only; without the owner cert on the agent it must never confer trust.
+// Covers both a foreign-owner agent and an owner-less (uncertified) agent.
+#[tokio::test]
+async fn uncertified_agent_claiming_enrolled_machine_gets_nothing() {
+    let owner = UserKeypair::generate().expect("owner keygen");
+    let stranger = UserKeypair::generate().expect("stranger keygen");
+    for signer in [Some(&stranger), None] {
+        let f = Fixture::new(&owner, signer, None, Enrollment::Current).await;
+        // Precondition: the claimed machine really is currently enrolled.
+        let devices = f.trust.device_store().expect("device store installed");
+        assert!(devices.is_enrolled(&f.machine_id, &owner.user_id()).await);
+
+        assert!(!f.pair().await.owner_trusted);
+        assert!(matches!(
+            f.inbound_gate().await,
+            Err(NetworkError::PeerTrustRejected { .. })
+        ));
+
+        // With an owner entry in force (and a Trusted contact so only the ACL
+        // can refuse), the owner selector still does not match.
+        f.set_connect_policy(true);
+        f.contacts
+            .write()
+            .await
+            .set_trust(&f.agent_id, TrustLevel::Trusted);
+        assert!(matches!(
+            f.inbound_gate().await,
+            Err(NetworkError::PeerNotInConnectAcl { .. })
+        ));
+    }
+}
+
 // (5) The owner entry matches owner pairs only: a different owner's agent
 // on an enrolled machine is refused even with the entry present.
 #[tokio::test]
