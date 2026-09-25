@@ -144,7 +144,11 @@ impl ControlBlobState {
         f(&mut guard)
     }
 
-    fn stage(&self, reference: ControlBlobRef, bytes: Vec<u8>) -> Result<(), &'static str> {
+    pub(super) fn stage(
+        &self,
+        reference: ControlBlobRef,
+        bytes: Vec<u8>,
+    ) -> Result<(), &'static str> {
         if bytes.len() as u64 != reference.byte_len
             || reference.byte_len <= x0x::dm::MAX_PAYLOAD_BYTES as u64
             || reference.byte_len > MAX_BLOB_BYTES
@@ -342,6 +346,12 @@ impl ControlBlobState {
                 );
             }
         });
+    }
+
+    /// #878 r3 (review 4a): test inspection — entries still staged.
+    #[cfg(test)]
+    pub(super) fn staged_len(&self) -> usize {
+        self.with_registry(|registry| registry.staged.len())
     }
 
     pub(super) fn cancel_attempt(&self, group_id: &str, recipient: &str, attempt_id: &str) {
@@ -828,6 +838,26 @@ fn witness_line(kind: &str, reference: &ControlBlobRef) -> String {
 /// keys or invites: the digest was already verified against the bytes.
 fn log_validated_for_handler(kind: &'static str, reference: &ControlBlobRef) {
     tracing::info!("{}", witness_line(kind, reference));
+}
+
+/// #878 r3: build a fully-valid reference (digest/length bound) for a
+/// would-be transfer, for tests that stage it directly.
+#[cfg(test)]
+pub(in crate::server) fn test_reference(
+    bytes: &[u8],
+    group_id: &str,
+    source_hex: &str,
+    recipient_hex: &str,
+) -> ControlBlobRef {
+    ControlBlobRef {
+        kind: ControlBlobKind::NamedGroupEvent,
+        group_id: group_id.to_string(),
+        source: source_hex.to_string(),
+        recipient: recipient_hex.to_string(),
+        digest: hex::encode(blake3::hash(bytes).as_bytes()),
+        byte_len: bytes.len() as u64,
+        join_attempt_id: None,
+    }
 }
 
 /// Drives the actual stage/chunk/frame/incoming/digest functions without a
