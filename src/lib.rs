@@ -18207,9 +18207,6 @@ impl KvStoreHandle {
     /// If the key already exists, the value is updated. Changes are
     /// automatically replicated to peers via gossip.
     ///
-    /// Returns the writer's own keys that this put evicted under the
-    /// `SelfKeyed` lowest-N quota (issue #849), sorted; empty otherwise.
-    ///
     /// # Errors
     ///
     /// Returns an error if the value exceeds the maximum inline size (64 KB).
@@ -18218,11 +18215,9 @@ impl KvStoreHandle {
         key: String,
         value: Vec<u8>,
         content_type: String,
-    ) -> error::Result<Vec<String>> {
-        Ok(self
-            .put_with_outcome(key, value, content_type)
-            .await?
-            .evicted_keys)
+    ) -> error::Result<()> {
+        let _ = self.put_with_delta(key, value, content_type).await?;
+        Ok(())
     }
 
     /// Put a key-value pair and return the CRDT delta that was published.
