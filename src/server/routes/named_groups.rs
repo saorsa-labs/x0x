@@ -13979,6 +13979,18 @@ pub(in crate::server) async fn get_named_group(
 /// (no owner axis to attest with). A group without a marker answers 409 —
 /// nothing to clear.
 ///
+/// #871: the SAME escape retires an ARMED #846 catch-up gate (the
+/// durable `anchored_gap_refusal` record with reason
+/// `owner_attested_stale_base_gap` that the revision check has not yet
+/// reached). A node whose head is genuinely forked would otherwise be
+/// wedged forever — the record arms from durable state and nothing
+/// unattested adopts. There is deliberately NO automatic expiry (an
+/// expiry is a wait-out-the-gate win for a forking responder); the
+/// operator path above — owner-key attestation or force+reason — is
+/// the only exit, and it AUDITS: the record's terminal revision/hash
+/// and the capped reason are logged, and
+/// `anchored_gap_manual_clears` is counted in /diagnostics/groups.
+///
 /// ADR-0066 §2: this endpoint is now LOAD-BEARING rather than a niche
 /// override. An ordinary (non-owner-axis) group receives a `no_anchor`
 /// marker that NO commit ever clears, and such a group has no owner axis
@@ -14014,11 +14026,28 @@ pub(in crate::server) async fn clear_group_quarantine(
     // from the spelling the refusal messages had taught the operator. The
     // resolved MAP KEY is carried forward so the mutation below writes to the
     // record this read decided about.
-    let (map_key, stable_group_id, head_revision, head_state_hash, owner, marker_present) = {
+    let (
+        map_key,
+        stable_group_id,
+        head_revision,
+        head_state_hash,
+        owner,
+        marker_present,
+        gap_armed,
+        gap_terminal,
+    ) = {
         let groups = state.named_groups.read().await;
         let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, &id) else {
             return not_found("group not found");
         };
+        // #871: the armed #846 catch-up gate is an EScape-worthy marker
+        // too — same route, same authorisation, same audit.
+        let gap = info
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+            .filter(|record| record.reason == "owner_attested_stale_base_gap")
+            .filter(|record| info.state_revision < record.terminal_revision);
         (
             key.to_string(),
             info.stable_group_id().to_string(),
@@ -14026,10 +14055,14 @@ pub(in crate::server) async fn clear_group_quarantine(
             info.state_hash.clone(),
             info.policy.admission.owner_certified_user_id().copied(),
             info.fork_quarantine.is_some(),
+            gap.is_some(),
+            gap.map(|record| (record.terminal_revision, record.terminal_state_hash.clone())),
         )
     };
-    if !marker_present {
-        return conflict("group is not quarantined (no fork_quarantine marker)");
+    if !marker_present && !gap_armed {
+        return conflict(
+            "group is not quarantined (no fork_quarantine marker) and no              anchored-gap catch-up gate is armed",
+        );
     }
     // Path (b): the operator override. `force` without a reason is a
     // malformed override — it never silently falls back to the
@@ -14109,13 +14142,25 @@ pub(in crate::server) async fn clear_group_quarantine(
         // decided about, and the invariant above spreads it. A concurrent rename
         // of the key is the only way it misses, and then it is a no-op that
         // leaves the marker in place — never a clear of the wrong group.
+        let mut retired_gap = None;
         if let Some(info) = groups.get_mut(&map_key) {
             info.fork_quarantine = None;
+            // #871: retire the armed #846 catch-up gate with the same
+            // manual clear (either authorisation path) — the audit below
+            // carries the retired terminal.
+            if gap_armed {
+                if let Some(lineage) = info.invite_lineage.as_mut() {
+                    retired_gap = lineage.anchored_gap_refusal.take().map(|record| {
+                        (record.terminal_revision, record.terminal_state_hash.clone())
+                    });
+                }
+            }
             // ADR-0064 slice 4: the manual clear also re-arms the
             // evidence gate — the next authenticated conflict
             // re-quarantines (containment is not one-shot).
             info.reset_fork_evidence_after_quarantine_clear();
         }
+        let _ = retired_gap;
         true
     })
     .await;
@@ -14128,6 +14173,22 @@ pub(in crate::server) async fn clear_group_quarantine(
     state
         .groups_diagnostics
         .record_fork_quarantine_manual_clear(&stable_group_id);
+    // #871: the anchored-gap retirement is audited with the retired
+    // terminal (revision + hash) and the capped operator reason.
+    if gap_armed {
+        if let Some((terminal_revision, terminal_state_hash)) = gap_terminal {
+            tracing::warn!(
+                group_id = %LogHexId::group(&stable_group_id),
+                terminal_revision,
+                terminal_state_hash = %terminal_state_hash,
+                reason = %req.reason.chars().take(256).collect::<String>(),
+                "#871: armed anchored-gap catch-up gate manually retired (local node only)"
+            );
+        }
+        state
+            .groups_diagnostics
+            .record_anchored_gap_manual_clear(&stable_group_id);
+    }
     // ADR-0068 D2: the marker is gone and durable, so the task deltas held
     // under it can apply NOW rather than at the listener's next poll. Run
     // after `persist_named_groups_mutation` has released the roster lock: the
