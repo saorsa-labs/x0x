@@ -1109,6 +1109,9 @@ pub(in crate::server) struct HistoryPurgeParams {
 /// leaves the store untouched.
 pub(in crate::server) async fn history_purge(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Query(params): Query<HistoryPurgeParams>,
 ) -> impl IntoResponse {
     let Some(history) = state.agent.history() else {
@@ -1133,7 +1136,9 @@ pub(in crate::server) async fn history_purge(
         let refusal = {
             let groups = state.named_groups.read().await;
             crate::server::resolve_group_entry_locked(&groups, group_id).and_then(|(key, info)| {
-                crate::server::routes::named_groups::reject_fork_quarantined(&state, key, info)
+                crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+                    &state, key, info, &actor,
+                )
             })
         };
         if let Some(refusal) = refusal {
