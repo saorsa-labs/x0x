@@ -684,8 +684,8 @@ jobs:
             - SFO, US: `quic://147.182.234.192:5483`
             - Helsinki, FI: `quic://65.21.157.229:5483`
             - Nuremberg, DE: `quic://116.203.101.172:5483`
-            - Singapore, SG: `quic://149.28.156.231:5483`
-            - Tokyo, JP: `quic://45.77.176.184:5483`
+            - Singapore, SG: `quic://152.42.210.67:5483`
+            - Sydney, AU: `quic://170.64.176.102:5483`
 
             ---
 
