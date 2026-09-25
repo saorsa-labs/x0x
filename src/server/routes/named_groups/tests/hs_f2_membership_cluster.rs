@@ -7576,6 +7576,9 @@ async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
             last_observed_at_ms: 0,
             attested_chain_hashes: vec![link.commit.state_hash.clone(), genuine.state_hash.clone()],
             by_reason: Default::default(),
+            retired_at_ms: None,
+            retired_by: None,
+            reseat: None,
         });
     }
     let mut queue = std::collections::VecDeque::new();

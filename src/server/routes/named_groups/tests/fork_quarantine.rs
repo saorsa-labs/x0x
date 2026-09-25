@@ -2426,10 +2426,14 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
 
     // Path (a) is unreachable for this population, and says so.
     let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
@@ -2450,10 +2454,14 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
         "force": true,
         "reason": "benign split confirmed by both operators",
     }))?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "the override clears: {body}");
     assert_eq!(body["cleared_by"].as_str(), Some("force"));
@@ -2490,12 +2498,18 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
     Ok(())
 }
 
-/// WHY #871: the durable #846 anchored-gap record has no TTL/queue
-/// disarm, so a forked-head node is wedged forever. The manual clear
-/// is the escape (documented on the route): it retires the armed
-/// record with the same authorisation paths and audits it.
+/// WHY #871 r2: the armed #846 anchored-gap record has no TTL/queue
+/// disarm, so a forked-head node is wedged forever. The escape is an
+/// OWNER-KEY RE-SEAT, not a clear — and on an ordinary (ownerless)
+/// group neither exists: an armed record is owner-anchored, so a group
+/// without an owner axis can only be a hand-planted fixture. This test
+/// pins the r2 contract on such a group: the escape is REFUSED
+/// (`force` cannot disarm the gate), the record stays armed, and no
+/// counter fires. The positive re-seat path lives in
+/// `owner_mandate.rs::manual_clear_reseats_an_armed_anchored_gap_gate`
+/// (the fixture whose install actually holds the owner user key).
 #[tokio::test]
-async fn manual_clear_retires_an_armed_anchored_gap_record() -> Result<()> {
+async fn manual_clear_cannot_force_retire_an_armed_anchored_gap_record() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
     let group_id = "871".repeat(16);
     let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
@@ -2521,14 +2535,26 @@ async fn manual_clear_retires_an_armed_anchored_gap_record() -> Result<()> {
             last_observed_at_ms: 0,
             attested_chain_hashes: vec!["871-step".to_string()],
             by_reason: Default::default(),
+            retired_at_ms: None,
+            retired_by: None,
+            reseat: None,
         });
     }
-    // Path (a) unavailable (no owner axis) -> force_required.
+    assert!(
+        catchup_846_gate_armed(&live_record(&state, &group_id).await),
+        "fixture: the gate is armed"
+    );
+    // No owner axis ⇒ the re-seat has nothing to attest with: typed
+    // refusal, record untouched.
     let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
@@ -2538,44 +2564,132 @@ async fn manual_clear_retires_an_armed_anchored_gap_record() -> Result<()> {
             .contains("force_required"),
         "same authorisation contract as the quarantine clear: {body}"
     );
-    assert!(
-        live_record(&state, &group_id)
-            .await
-            .invite_lineage
-            .as_ref()
-            .is_some_and(|lineage| lineage.anchored_gap_refusal.is_some()),
-        "the refused clear leaves the armed record in place"
-    );
-    // Path (b): the operator override retires the record, audits it.
+    // #871 r2: force is REFUSED for the armed gate — a keyless
+    // override would re-open the ungated catch-up path #846 closed.
     let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({
         "force": true,
         "reason": "forked head confirmed; re-seat from the new invite",
     }))?;
-    let response =
-        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "the override retires the gate: {body}"
+        StatusCode::CONFLICT,
+        "force cannot retire an armed anchored-gap gate: {body}"
     );
     let record = live_record(&state, &group_id).await;
     assert!(
+        catchup_846_gate_armed(&record),
+        "#871 r2: the refused clear leaves the gate ARMED"
+    );
+    assert_eq!(
         record
             .invite_lineage
             .as_ref()
-            .is_some_and(|lineage| { lineage.anchored_gap_refusal.is_none() }),
-        "#871: the armed anchored-gap record is retired"
+            .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+            .and_then(|record| record.retired_at_ms),
+        None,
+        "nothing marked the record retired"
     );
     assert_eq!(
         diag_row(&state, &group_id)
             .await
             .counters
             .anchored_gap_manual_clears,
-        1,
-        "the retirement is attributable in /diagnostics/groups"
+        0,
+        "a refused escape authorizes nothing — no counter"
+    );
+    Ok(())
+}
+
+/// WHY #871 r2 (B3): retirement KEEPS the record and disarms the gate.
+/// A retired record (marked by the catch-up path once the attested
+/// terminal installs) must read as UNARMED, and convergence at the
+/// terminal disarms without deleting the audit either.
+#[tokio::test]
+async fn retired_and_converged_anchored_gap_records_are_unarmed() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "871b".repeat(16);
+    let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
+    let mut armed = x0x::groups::AnchoredGapRefusal {
+        reason: "owner_attested_stale_base_gap".to_string(),
+        head_revision: 0,
+        head_state_hash: base.state_hash.clone(),
+        terminal_revision: base.state_revision + 9,
+        terminal_state_hash: "871b-terminal".to_string(),
+        committed_by: "aa".repeat(32),
+        occurrences: 1,
+        first_observed_at_ms: 0,
+        last_observed_at_ms: 0,
+        attested_chain_hashes: vec!["871b-step".to_string()],
+        by_reason: Default::default(),
+        retired_at_ms: None,
+        retired_by: None,
+        reseat: None,
+    };
+    {
+        let mut groups = state.named_groups.write().await;
+        let lineage = groups
+            .get_mut(&group_id)
+            .expect("sealed group")
+            .invite_lineage
+            .as_mut()
+            .expect("lineage");
+        lineage.anchored_gap_refusal = Some(armed.clone());
+    }
+    assert!(
+        catchup_846_gate_armed(&live_record(&state, &group_id).await),
+        "a live record below the terminal arms the gate"
+    );
+    // Convergence (revision reached the terminal) disarms WITHOUT
+    // deleting: the record stays for audit.
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("sealed group");
+        info.state_revision = armed.terminal_revision;
+    }
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        !catchup_846_gate_armed(&record),
+        "a converged head disarms the gate"
+    );
+    assert!(
+        record.invite_lineage.is_some_and(|lineage| {
+            lineage.anchored_gap_refusal.as_ref().is_some_and(|r| {
+                r.reason == "owner_attested_stale_base_gap" && r.retired_at_ms.is_none()
+            })
+        }),
+        "convergence alone leaves the record in place (the catch-up arm marks it retired)"
+    );
+    // A MARKED-retired record is unarmed even while the head is still
+    // below the terminal.
+    armed.retired_at_ms = Some(1);
+    armed.retired_by = Some("owner-key-reseat".to_string());
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("sealed group");
+        info.state_revision = base.state_revision;
+        let lineage = info.invite_lineage.as_mut().expect("lineage");
+        lineage.anchored_gap_refusal = Some(armed);
+    }
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        !catchup_846_gate_armed(&record),
+        "a retired record is UNARMED (B3: keep the audit, stop the gate)"
+    );
+    assert!(
+        record.invite_lineage.is_some_and(|lineage| lineage
+            .anchored_gap_refusal
+            .as_ref()
+            .is_some_and(|r| r.retired_by.as_deref() == Some("owner-key-reseat"))),
+        "the retired record keeps its audit trail (who retired it)"
     );
     Ok(())
 }

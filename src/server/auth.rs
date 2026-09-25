@@ -312,9 +312,28 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/home/seat"
                     | "/upgrade/apply"
             ) || is_two_segment_action(path, "delegate")
+                // #871 r2: the quarantine clear (fork marker or the
+                // owner-anchored-gap re-seat) disarms OWNER-ATTESTED
+                // security gates. A 10-minute browser session bearer is
+                // a read-only principal (#446) and must not reach it.
+                || is_quarantine_clear_path(path)
         }
         Method::DELETE => is_sync_device_path(path),
         _ => false,
+    }
+}
+
+/// `true` for exactly `/groups/<nonempty-id>/quarantine/clear`.
+fn is_quarantine_clear_path(path: &str) -> bool {
+    match path.strip_prefix("/groups/") {
+        Some(rest) => {
+            let mut segs = rest.split('/');
+            segs.next().is_some_and(|id| !id.is_empty())
+                && segs.next() == Some("quarantine")
+                && segs.next() == Some("clear")
+                && segs.next().is_none()
+        }
+        None => false,
     }
 }
 
@@ -654,6 +673,7 @@ mod tests {
                 "/sync/devices/00112233445566778899aabbccddeeff",
             ),
             (Method::POST, "/groups/some-group/delegate"),
+            (Method::POST, "/groups/some-group/quarantine/clear"),
             (Method::POST, "/home/rename"),
             (Method::POST, "/home/seat"),
             (Method::POST, "/upgrade/apply"),
@@ -687,6 +707,9 @@ mod tests {
             (Method::POST, "/agent/sign/extra"),
             (Method::POST, "/groups/some-group/delegate/x"),
             (Method::POST, "/groups/delegate"),
+            (Method::POST, "/groups/some-group/quarantine/clear/x"),
+            (Method::POST, "/groups/quarantine/clear"),
+            (Method::POST, "/groups/some-group/quarantine"),
             (Method::DELETE, "/sync/devices/with/extra"),
             (Method::GET, "/exec/sessions"),
             (Method::GET, "/sync/devices"),

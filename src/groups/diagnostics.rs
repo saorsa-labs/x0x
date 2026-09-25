@@ -194,8 +194,11 @@ pub struct GroupCounters {
     /// through `POST /groups/:id/quarantine/clear` (owner-key node clear
     /// or `force` + non-empty reason).
     pub fork_quarantine_manual_clears: u64,
-    /// #871: armed #846 anchored-gap catch-up gates retired through the
-    /// manual clear (the forked-head escape) — attributable per group.
+    /// #871 r2: owner-key RE-SEAT authorizations for armed #846
+    /// anchored-gap catch-up gates through the manual clear — the
+    /// forked-head escape. The gate itself retires (marked on the
+    /// durable record, kept for audit) only when the attested terminal
+    /// installs; attributable per group.
     pub anchored_gap_manual_clears: u64,
     /// ADR-0064 slice 4 (#472 decision 3): fork evidence classified as
     /// `signer_only` — the signer was an active admin at the conflicting

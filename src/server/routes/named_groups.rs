@@ -807,6 +807,115 @@ impl HeadAttestation {
         )
         .is_ok()
     }
+
+    /// #871 r2 (owner-key re-seat authorization): the admission owner's
+    /// v2 TERMINAL-BOUND attestation over the fields an armed
+    /// [`x0x::groups::AnchoredGapRefusal`] records — the RECORDED head
+    /// `(head_revision, head_state_hash)`, the authorizing local agent,
+    /// and the v2 terminal binding over the RECORDED terminal
+    /// `(terminal_state_hash, terminal_committed_by)` — the same
+    /// `x0x.join-terminal-attest.v2` canonical bytes the join path's
+    /// terminal binding signs, so the exemption root that authenticated
+    /// the chain authenticates the escape. The node's CURRENT (possibly
+    /// forked) head is deliberately NOT attested: the operator accepts
+    /// exactly the recorded terminal as the re-seat target. The epoch tag
+    /// is `None` on both the sign and the verify side — the refusal
+    /// record carries no TreeKEM epoch.
+    fn sign_reseat_authorization(
+        stable_group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        terminal_state_hash: &str,
+        terminal_committed_by: &str,
+        local_agent_hex: &str,
+        owner_kp: &crate::identity::UserKeypair,
+    ) -> Result<Self, String> {
+        use base64::Engine as _;
+        let mut attestation = Self::sign(
+            stable_group_id,
+            head_revision,
+            head_state_hash,
+            local_agent_hex,
+            owner_kp,
+        )?;
+        let canonical =
+            attestation.terminal_canonical_bytes(terminal_state_hash, terminal_committed_by, None);
+        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            owner_kp.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| format!("re-seat authorization terminal binding sign: {e:?}"))?;
+        attestation.terminal_signature_b64 = Some(BASE64.encode(sig.as_bytes()));
+        Ok(attestation)
+    }
+
+    /// Verify counterpart of [`Self::sign_reseat_authorization`]: the
+    #[allow(clippy::too_many_arguments)]
+    fn verify_reseat_authorization(
+        &self,
+        owner_public_key: &ant_quic::MlDsaPublicKey,
+        expected_owner: &crate::identity::UserId,
+        stable_group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        terminal_state_hash: &str,
+        terminal_committed_by: &str,
+        local_agent_hex: &str,
+    ) -> bool {
+        use base64::Engine as _;
+        if &crate::identity::UserId::from_public_key(owner_public_key) != expected_owner {
+            return false;
+        }
+        if self.group_id != stable_group_id
+            || self.head_revision != head_revision
+            || self.head_state_hash != head_state_hash
+            || self.member_agent_id != local_agent_hex
+        {
+            return false;
+        }
+        let Ok(sig_bytes) = BASE64.decode(&self.signature_b64) else {
+            return false;
+        };
+        let Ok(sig) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        else {
+            return false;
+        };
+        let canonical = Self::canonical_bytes(
+            &self.group_id,
+            self.head_revision,
+            &self.head_state_hash,
+            &self.member_agent_id,
+        );
+        if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            owner_public_key,
+            &canonical,
+            &sig,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let Some(binding_b64) = self.terminal_signature_b64.as_deref() else {
+            return false;
+        };
+        let Ok(binding_bytes) = BASE64.decode(binding_b64) else {
+            return false;
+        };
+        let Ok(binding) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&binding_bytes)
+        else {
+            return false;
+        };
+        let binding_canonical =
+            self.terminal_canonical_bytes(terminal_state_hash, terminal_committed_by, None);
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            owner_public_key,
+            &binding_canonical,
+            &binding,
+        )
+        .is_ok()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4495,6 +4604,11 @@ async fn record_anchored_gap_refusal(
             last_observed_at_ms: now_ms,
             attested_chain_hashes,
             by_reason,
+            // #871 r2: the gate starts LIVE; retirement (converged or
+            // owner-key re-seat) is a later, audited transition.
+            retired_at_ms: None,
+            retired_by: None,
+            reseat: None,
         });
         true
     };
@@ -9676,6 +9790,13 @@ fn armed_anchored_gap_sequence(
     if record.reason != "owner_attested_stale_base_gap" {
         return None;
     }
+    // #871 r2: a RETIRED record is unarmed. Retirement keeps the record
+    // for audit (occurrences, by_reason, who retired it and when) while
+    // the gate stops firing — the durable audit is never destroyed to
+    // disarm the gate.
+    if record.retired_at_ms.is_some() {
+        return None;
+    }
     // Already converged: the terminal (or something past it) applied.
     if info.state_revision >= record.terminal_revision {
         return None;
@@ -9803,12 +9924,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         }
     }
     replay_pending_treekem_events(state, &response.group_id).await;
-    // #846: retire the armed record once the attested terminal actually
-    // LINKED (the group reached its revision) — a stale record must never
-    // arm the gate against a head the current hash is already past. The
-    // map key is resolved ONCE (register key, else the stable-id match)
-    // and the retire mutation runs against that SAME key, so the check
-    // and the mutation cannot disagree about which entry they touched.
+    // #846 + #871 r2: RETIRE the armed record once the attested terminal
+    // actually LINKED (the group reached its revision) — a stale record
+    // must never arm the gate against a head the current hash is already
+    // past. Retirement MARKS the record (`retired_at_ms`/`retired_by`)
+    // instead of deleting it: the refusal evidence, per-reason audit and
+    // the escape trail stay durable, and `armed_anchored_gap_sequence`
+    // treats a retired record as unarmed. The map key is resolved ONCE
+    // (register key, else the stable-id match) and the retire mutation
+    // runs against that SAME key, so the check and the mutation cannot
+    // disagree about which entry they touched.
     let retire_key: Option<String> = {
         let groups = state.named_groups.read().await;
         groups
@@ -9826,18 +9951,35 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
                     .is_some_and(|record| {
                         record.reason == "owner_attested_stale_base_gap"
+                            && record.retired_at_ms.is_none()
                             && info.state_revision >= record.terminal_revision
                     })
             })
             .map(|(key, _)| key)
     };
     if let Some(key) = retire_key {
+        let now_ms = now_millis_u64();
         let mutate = move |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
             groups
                 .get_mut(&key)
                 .and_then(|info| info.invite_lineage.as_mut())
-                .is_some_and(|lineage| {
-                    lineage.anchored_gap_refusal = None;
+                .and_then(|lineage| lineage.anchored_gap_refusal.as_mut())
+                .is_some_and(|record| {
+                    if record.retired_at_ms.is_some() {
+                        return false;
+                    }
+                    record.retired_at_ms = Some(now_ms);
+                    // #871 r2: if the manual owner-key re-seat authorized
+                    // this convergence, the audit names it; otherwise the
+                    // terminal arrived through ordinary gated catch-up.
+                    record.retired_by = Some(
+                        if record.reseat.is_some() {
+                            "owner-key-reseat"
+                        } else {
+                            "converged"
+                        }
+                        .to_string(),
+                    );
                     true
                 })
         };
@@ -13979,36 +14121,78 @@ pub(in crate::server) async fn get_named_group(
 /// (no owner axis to attest with). A group without a marker answers 409 —
 /// nothing to clear.
 ///
-/// #871: the SAME escape retires an ARMED #846 catch-up gate (the
-/// durable `anchored_gap_refusal` record with reason
+/// #871 r2: the armed #846 catch-up gate (the durable
+/// `anchored_gap_refusal` record with reason
 /// `owner_attested_stale_base_gap` that the revision check has not yet
-/// reached). A node whose head is genuinely forked would otherwise be
-/// wedged forever — the record arms from durable state and nothing
-/// unattested adopts. There is deliberately NO automatic expiry (an
-/// expiry is a wait-out-the-gate win for a forking responder); the
-/// operator path above — owner-key attestation or force+reason — is
-/// the only exit, and it AUDITS: the record's terminal revision/hash
-/// and the capped reason are logged, and
-/// `anchored_gap_manual_clears` is counted in /diagnostics/groups.
+/// reached) is NOT cleared by this route — the escape is a RE-SEAT, and
+/// it is owner-key-only:
+///
+/// 1. The actor must be the DURABLE owner (the route is in
+///    `auth::requires_durable_owner`; a 10-minute browser session
+///    bearer or a rider token cannot reach it, and the handler
+///    re-checks as defense in depth).
+/// 2. The local install must hold the group's ADMISSION OWNER user
+///    key. It mints the owner v2 TERMINAL-BOUND attestation over the
+///    RECORDED terminal (`HeadAttestation::sign_reseat_authorization`
+///    — the same `x0x.join-terminal-attest.v2` binding that
+///    authenticated the chain the gate is armed on, never the node's
+///    current, possibly forked head) and self-verifies it before
+///    anything mutates. `force` is REFUSED for this branch: a keyless
+///    override would re-open exactly the ungated catch-up exposure
+///    (#846) the gate exists to close.
+/// 3. The mutation REPLACES the local head with the owner-attested
+///    head: `state_revision`/`state_hash` re-anchor at the record's
+///    `(head_revision, head_state_hash)` — the terminal's parent, an
+///    interior link of the attested sequence — and the re-seat
+///    authorization (timestamp, authorizing agent, capped reason, the
+///    terminal-binding signature) is stored ON the record. The gate
+///    STAYS ARMED: it retires (marked `retired_by:
+///    "owner-key-reseat"`, never deleted) only once the attested
+///    terminal itself installs through catch-up that stays inside the
+///    attested sequence — so post-escape catch-up validates against
+///    the attested head instead of reopening the ungated path.
+/// 4. The re-seat then asks every active member for catch-up FROM the
+///    attested head, so the terminal (and what follows it) is fetched
+///    and installed rather than assumed.
+///
+/// Residual, deliberate: the re-seat discards the forked head's CHAIN
+/// claims (revision/hash bookkeeping) but does not replay the roster
+/// effects of the discarded segment — the group's state hash now tracks
+/// the attested chain, and the roster re-converges through the
+/// authority's subsequent committed events. This is the honest
+/// available re-seat without a full state snapshot; the alternative is
+/// the permanently wedged node the gate otherwise produces. There is
+/// deliberately NO automatic expiry (an expiry is a wait-out-the-gate
+/// win for a forking responder).
+///
+/// The retirement AUDITS: the record is kept (occurrences, by_reason,
+/// the re-seat authorization) and marked retired; the capped reason is
+/// logged with the terminal; `anchored_gap_manual_clears` (now counting
+/// re-seat authorizations) is in /diagnostics/groups.
 ///
 /// ADR-0066 §2: this endpoint is now LOAD-BEARING rather than a niche
 /// override. An ordinary (non-owner-axis) group receives a `no_anchor`
 /// marker that NO commit ever clears, and such a group has no owner axis
 /// to attest with, so path (b) — `force: true` plus a non-empty reason —
 /// is its ONLY exit. Path (b) is deliberately not gated on `no_anchor`:
-/// the operator override is the remedy the §5 refusal message names.
+/// the operator override is the remedy the §5 refusal message names. It
+/// remains valid for the FORK-MARKER branch only; the armed anchored-gap
+/// gate always requires the owner key.
 ///
 /// `:id` accepts EITHER spelling (#732): the roster map key or the group's
 /// stable id. It used to accept the map key alone, which made the one exit
 /// ADR-0066 §2 promises unreachable from the stable id every other surface
 /// shows the operator. Refusal bodies may still name the map key — that is
 /// the spelling the roster is filed under — but both now clear.
-/// Requires the local API token (same auth layer as
-/// every `/groups` route). Increments `fork_quarantine_manual_clears`
-/// and returns the updated `fork_quarantine: null` view.
+/// Requires the DURABLE local API token (the route is in
+/// `auth::requires_durable_owner`). A fork-marker clear increments
+/// `fork_quarantine_manual_clears`; a re-seat authorization increments
+/// `anchored_gap_manual_clears`. A gap-only clear fires NO fork-quarantine
+/// side effects (no marker counter, no fork-evidence reset).
 pub(in crate::server) async fn clear_group_quarantine(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Json(req): Json<ClearQuarantineRequest>,
 ) -> impl IntoResponse {
     let conflict = |reason: &str| {
@@ -14017,6 +14201,13 @@ pub(in crate::server) async fn clear_group_quarantine(
             Json(serde_json::json!({ "ok": false, "error": reason })),
         )
     };
+    // #871 r2 (B2): disarming an owner-attested security gate is an
+    // owner act. The middleware owns the real gate (the route is in
+    // `requires_durable_owner`); this is defense in depth for direct
+    // handler wiring.
+    if !actor.is_durable_owner() {
+        return forbidden("the quarantine clear requires the durable API token (owner authority)");
+    }
     // #732: BOTH SPELLINGS. The roster map is keyed by whichever alias this
     // daemon learned the group under, while every id an operator can actually
     // SEE elsewhere — a history scope, a WS/SSE `fork_quarantine` annotation,
@@ -14026,56 +14217,128 @@ pub(in crate::server) async fn clear_group_quarantine(
     // from the spelling the refusal messages had taught the operator. The
     // resolved MAP KEY is carried forward so the mutation below writes to the
     // record this read decided about.
-    let (
-        map_key,
-        stable_group_id,
-        head_revision,
-        head_state_hash,
-        owner,
-        marker_present,
-        gap_armed,
-        gap_terminal,
-    ) = {
+    let (map_key, stable_group_id, owner, marker_present, gap) = {
         let groups = state.named_groups.read().await;
         let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, &id) else {
             return not_found("group not found");
         };
-        // #871: the armed #846 catch-up gate is an EScape-worthy marker
-        // too — same route, same authorisation, same audit.
+        // #871 r2: the armed #846 catch-up gate is escaped by an
+        // owner-key RE-SEAT, not by a clear.
         let gap = info
             .invite_lineage
             .as_ref()
             .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
             .filter(|record| record.reason == "owner_attested_stale_base_gap")
-            .filter(|record| info.state_revision < record.terminal_revision);
+            .filter(|record| record.retired_at_ms.is_none())
+            .filter(|record| info.state_revision < record.terminal_revision)
+            .cloned();
         (
             key.to_string(),
             info.stable_group_id().to_string(),
-            info.state_revision,
-            info.state_hash.clone(),
             info.policy.admission.owner_certified_user_id().copied(),
             info.fork_quarantine.is_some(),
-            gap.is_some(),
-            gap.map(|record| (record.terminal_revision, record.terminal_state_hash.clone())),
+            gap,
         )
     };
+    let gap_armed = gap.is_some();
     if !marker_present && !gap_armed {
         return conflict(
-            "group is not quarantined (no fork_quarantine marker) and no              anchored-gap catch-up gate is armed",
+            "group is not quarantined (no fork_quarantine marker) and no anchored-gap catch-up gate is armed",
         );
     }
-    // Path (b): the operator override. `force` without a reason is a
-    // malformed override — it never silently falls back to the
-    // owner-key path.
+    // Path (b): the operator override — VALID FOR THE FORK MARKER ONLY.
+    // `force` without a reason is a malformed override; `force` on an
+    // armed anchored-gap gate is refused outright (#871 r2: the escape
+    // is an owner-key re-seat, and a keyless force would re-open the
+    // ungated catch-up exposure #846 closed).
     if req.force && req.reason.trim().is_empty() {
         return conflict("force=true requires a non-empty reason (the audit trail)");
     }
-    let force_ok = req.force;
-    // Path (a): the local install holds the OWNER user key (#469 A1b
-    // fence) — mint a fresh quarantine-clear attestation over the
-    // CURRENT head and verify it before clearing.
-    let mut owner_key_ok = false;
-    if !force_ok {
+    if req.force && gap_armed {
+        return conflict(
+            "force cannot retire an armed anchored-gap catch-up gate: the escape is an \
+             owner-key re-seat at the attested terminal — run the clear without force \
+             from an install holding the group's owner user key",
+        );
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut cleared_by = "force";
+    // #871 r2: an armed gap gate ALWAYS runs the owner-key re-seat,
+    // which also authorizes a co-present fork marker — the marker's own
+    // current-head attestation would add nothing. A fork marker alone
+    // keeps the r1 paths: owner-key over the CURRENT head, or force.
+    let mut reseat = None;
+    if let Some(record) = gap.as_ref() {
+        let Some(owner) = owner.as_ref() else {
+            // Unreachable in production (an armed record is owner-anchored);
+            // kept fail-closed.
+            return conflict(
+                "force_required: the armed anchored-gap gate has no owner axis to attest with",
+            );
+        };
+        let Some(owner_kp) = state
+            .agent
+            .identity()
+            .user_keypair()
+            .filter(|kp| crate::identity::UserId::from_public_key(kp.public_key()) == *owner)
+        else {
+            return conflict(
+                "owner_key_unavailable: re-seating the anchored-gap gate requires an \
+                 install holding the group's owner user key",
+            );
+        };
+        let attestation = match HeadAttestation::sign_reseat_authorization(
+            &stable_group_id,
+            record.head_revision,
+            &record.head_state_hash,
+            &record.terminal_state_hash,
+            &record.committed_by,
+            &local_hex,
+            owner_kp,
+        ) {
+            Ok(attestation) => attestation,
+            Err(error) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&stable_group_id),
+                    "quarantine clear: failed to mint the re-seat authorization: {error}"
+                );
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to mint the re-seat authorization",
+                );
+            }
+        };
+        if !attestation.verify_reseat_authorization(
+            owner_kp.public_key(),
+            owner,
+            &stable_group_id,
+            record.head_revision,
+            &record.head_state_hash,
+            &record.terminal_state_hash,
+            &record.committed_by,
+            &local_hex,
+        ) {
+            // Our own fresh mint failed verification — key/signing
+            // material inconsistency, not an operator error.
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "re-seat authorization failed self-verification",
+            );
+        }
+        reseat = Some(attestation);
+        cleared_by = "owner-key-reseat";
+    } else if !req.force {
+        // Path (a) for a fork marker alone: the local install holds the
+        // OWNER user key (#469 A1b fence) — mint a fresh
+        // quarantine-clear attestation over the CURRENT head and verify
+        // it before clearing.
+        let (head_revision, head_state_hash) = {
+            let groups = state.named_groups.read().await;
+            let Some(info) = groups.get(&map_key) else {
+                return not_found("group not found");
+            };
+            (info.state_revision, info.state_hash.clone())
+        };
         let Some(owner) = owner.as_ref() else {
             return conflict(
                 "force_required: group has no owner axis to attest with — \
@@ -14093,7 +14356,6 @@ pub(in crate::server) async fn clear_group_quarantine(
                  owner user key — clear with force=true and a non-empty reason",
             );
         };
-        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let attestation = match HeadAttestation::sign_quarantine_clear(
             &stable_group_id,
             head_revision,
@@ -14128,9 +14390,20 @@ pub(in crate::server) async fn clear_group_quarantine(
                 "quarantine-clear attestation failed self-verification",
             );
         }
-        owner_key_ok = true;
+        cleared_by = "owner-key";
     }
-    let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
+    let reseat_attestation = reseat.clone();
+    let authorized_reason: String = req.reason.chars().take(256).collect();
+    let authorized_by = local_hex.clone();
+    let authorized_at_ms = now_millis_u64();
+    // What the durable mutation ACTUALLY did — computed inside the
+    // closure (re-evaluated against live state, fixing the r1 TOCTOU
+    // where the log named a record the write never retired) and
+    // consumed for the counters and logs below.
+    let mut marker_cleared = false;
+    let mut gap_reseat_authorized = false;
+    let mut gap_rebased = false;
+    let mut gap_terminal: Option<(u64, String)> = None;
     let outcome = persist_named_groups_mutation(&state, |groups| {
         // #732 r8: one slot is enough. An alias sibling used to stay quarantined
         // after a successful clear; `enforce_containment_invariant` now copies
@@ -14142,26 +14415,65 @@ pub(in crate::server) async fn clear_group_quarantine(
         // decided about, and the invariant above spreads it. A concurrent rename
         // of the key is the only way it misses, and then it is a no-op that
         // leaves the marker in place — never a clear of the wrong group.
-        let mut retired_gap = None;
-        if let Some(info) = groups.get_mut(&map_key) {
+        let Some(info) = groups.get_mut(&map_key) else {
+            return false;
+        };
+        if marker_present {
             info.fork_quarantine = None;
-            // #871: retire the armed #846 catch-up gate with the same
-            // manual clear (either authorisation path) — the audit below
-            // carries the retired terminal.
-            if gap_armed {
-                if let Some(lineage) = info.invite_lineage.as_mut() {
-                    retired_gap = lineage.anchored_gap_refusal.take().map(|record| {
-                        (record.terminal_revision, record.terminal_state_hash.clone())
-                    });
-                }
-            }
             // ADR-0064 slice 4: the manual clear also re-arms the
             // evidence gate — the next authenticated conflict
             // re-quarantines (containment is not one-shot).
             info.reset_fork_evidence_after_quarantine_clear();
+            marker_cleared = true;
         }
-        let _ = retired_gap;
-        true
+        // #871 r2: install the re-seat authorization on the LIVE record
+        // (re-checked: a concurrent refusal may have rewritten or
+        // retired it since the read above) and REPLACE the local head
+        // with the owner-attested head. The gate stays ARMED — it
+        // retires only when the attested terminal installs.
+        if let Some(attestation) = reseat_attestation.as_ref() {
+            let armed_now = info
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                .is_some_and(|record| {
+                    record.reason == "owner_attested_stale_base_gap"
+                        && record.retired_at_ms.is_none()
+                        && info.state_revision < record.terminal_revision
+                });
+            if armed_now {
+                if let Some(record) = info
+                    .invite_lineage
+                    .as_mut()
+                    .and_then(|lineage| lineage.anchored_gap_refusal.as_mut())
+                {
+                    record.reseat = Some(x0x::groups::GapReseatAuthorization {
+                        authorized_at_ms,
+                        authorized_by: authorized_by.clone(),
+                        reason: authorized_reason.clone(),
+                        terminal_signature_b64: attestation
+                            .terminal_signature_b64
+                            .clone()
+                            .unwrap_or_default(),
+                    });
+                    // REPLACE the local head with the owner-attested head
+                    // (the terminal's parent — an interior link of the
+                    // attested sequence, so the gate's cursor picks up at
+                    // the terminal).
+                    if info.state_revision != record.head_revision
+                        || info.state_hash != record.head_state_hash
+                    {
+                        info.state_revision = record.head_revision;
+                        info.state_hash = record.head_state_hash.clone();
+                        gap_rebased = true;
+                    }
+                    gap_terminal =
+                        Some((record.terminal_revision, record.terminal_state_hash.clone()));
+                    gap_reseat_authorized = true;
+                }
+            }
+        }
+        marker_cleared || gap_reseat_authorized
     })
     .await;
     if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
@@ -14170,24 +14482,40 @@ pub(in crate::server) async fn clear_group_quarantine(
             "named-group state is not directory-durable",
         );
     }
-    state
-        .groups_diagnostics
-        .record_fork_quarantine_manual_clear(&stable_group_id);
-    // #871: the anchored-gap retirement is audited with the retired
-    // terminal (revision + hash) and the capped operator reason.
-    if gap_armed {
-        if let Some((terminal_revision, terminal_state_hash)) = gap_terminal {
+    // #871 r2 / N3: the fork-marker side effects fire only when a
+    // marker actually cleared; the re-seat authorization is counted and
+    // logged on its own.
+    if marker_cleared {
+        state
+            .groups_diagnostics
+            .record_fork_quarantine_manual_clear(&stable_group_id);
+    }
+    if gap_reseat_authorized {
+        if let Some((terminal_revision, terminal_state_hash)) = gap_terminal.clone() {
             tracing::warn!(
                 group_id = %LogHexId::group(&stable_group_id),
                 terminal_revision,
                 terminal_state_hash = %terminal_state_hash,
-                reason = %req.reason.chars().take(256).collect::<String>(),
-                "#871: armed anchored-gap catch-up gate manually retired (local node only)"
+                head_rebased = gap_rebased,
+                reason = %authorized_reason,
+                "#871 r2: owner-key re-seat authorized for the armed anchored-gap gate \
+                 (gate stays armed until the attested terminal installs; local node only)"
             );
         }
         state
             .groups_diagnostics
             .record_anchored_gap_manual_clear(&stable_group_id);
+        // Fetch + install: ask every active member for catch-up FROM
+        // the attested head, so the terminal arrives through the still-
+        // armed gate and retires it (marked, never deleted).
+        request_anchored_gap_reseat_catchup(
+            &state,
+            &map_key,
+            &stable_group_id,
+            gap.as_ref()
+                .map(|record| (record.head_revision, record.head_state_hash.clone())),
+        )
+        .await;
     }
     // ADR-0068 D2: the marker is gone and durable, so the task deltas held
     // under it can apply NOW rather than at the listener's next poll. Run
@@ -14196,24 +14524,126 @@ pub(in crate::server) async fn clear_group_quarantine(
     // `named_groups` inside that lock, so the order is `TaskList` →
     // `named_groups` and holding the roster lock here would invert it. The
     // listener's poll still covers every other way a marker clears.
-    let task_deltas_resumed =
-        super::tasks::resume_group_task_ingest(&state, &stable_group_id).await;
-    tracing::info!(
-        group_id = %LogHexId::group(&stable_group_id),
-        cleared_by,
-        task_deltas_resumed,
-        reason = %req.reason.chars().take(256).collect::<String>(),
-        "ADR-0064: fork quarantine manually cleared (local node only)"
-    );
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "group_id": stable_group_id,
-            "cleared_by": cleared_by,
-            "fork_quarantine": serde_json::Value::Null,
-        })),
-    )
+    let mut task_deltas_resumed = 0usize;
+    if marker_cleared {
+        task_deltas_resumed =
+            super::tasks::resume_group_task_ingest(&state, &stable_group_id).await;
+        tracing::info!(
+            group_id = %LogHexId::group(&stable_group_id),
+            cleared_by,
+            task_deltas_resumed,
+            reason = %authorized_reason,
+            "ADR-0064: fork quarantine manually cleared (local node only)"
+        );
+    }
+    let mut body = serde_json::json!({
+        "ok": true,
+        "group_id": stable_group_id,
+        "cleared_by": cleared_by,
+        "fork_quarantine": serde_json::Value::Null,
+        "task_deltas_resumed": task_deltas_resumed,
+    });
+    if let Some(record) = gap.as_ref() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "anchored_gap".to_string(),
+                serde_json::json!({
+                    "reseat_authorized": gap_reseat_authorized,
+                    "head_revision": record.head_revision,
+                    "head_state_hash": record.head_state_hash,
+                    "terminal_revision": record.terminal_revision,
+                    "terminal_state_hash": record.terminal_state_hash,
+                    "head_rebased": gap_rebased,
+                    "gate": if gap_reseat_authorized {
+                        "armed-until-terminal-installs"
+                    } else {
+                        "armed"
+                    },
+                }),
+            );
+        }
+    }
+    (StatusCode::OK, Json(body))
+}
+
+/// #871 r2: ask every ACTIVE member of `map_key`'s group for TreeKEM
+/// catch-up FROM the owner-attested head the re-seat anchored at, so
+/// the attested terminal is fetched and installs through the still-
+/// armed #846 gate (which retires it, marked, on arrival). Best-effort:
+/// a failed send leaves the gate armed and the operator can re-run the
+/// clear; the ordinary catch-up paths keep asking too.
+async fn request_anchored_gap_reseat_catchup(
+    state: &Arc<AppState>,
+    map_key: &str,
+    stable_group_id: &str,
+    anchor: Option<(u64, String)>,
+) {
+    let Some((from_revision, current_state_hash)) = anchor else {
+        return;
+    };
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (from_epoch, members) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(map_key) else {
+            return;
+        };
+        (
+            info.secret_epoch,
+            info.members_v2
+                .iter()
+                .filter(|(aid, m)| {
+                    !aid.eq_ignore_ascii_case(&local_agent_hex)
+                        && m.state == x0x::groups::GroupMemberState::Active
+                })
+                .map(|(aid, _)| aid.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    if members.is_empty() {
+        tracing::warn!(
+            group_id = %LogHexId::group(stable_group_id),
+            "#871 r2: re-seat authorized but the group has no other active member to \
+             fetch the attested chain from — the gate stays armed; re-run the clear \
+             once a holder is reachable"
+        );
+    }
+    for member_hex in members {
+        let Ok(peer) = parse_agent_id_hex(&member_hex) else {
+            continue;
+        };
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: stable_group_id.to_string(),
+            requester_agent_id: local_agent_hex.clone(),
+            from_revision,
+            from_treekem_epoch: from_epoch,
+            current_state_hash: current_state_hash.clone(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let payload = match serde_json::to_vec(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(stable_group_id),
+                    "failed to serialize the re-seat catch-up request: {e}"
+                );
+                continue;
+            }
+        };
+        if let Err(e) = state
+            .agent
+            .send_direct_with_config(&peer, payload, direct_message_send_config())
+            .await
+        {
+            tracing::debug!(
+                group_id = %LogHexId::group(stable_group_id),
+                peer = %LogHexId::agent(&member_hex),
+                "re-seat catch-up request failed: {e}"
+            );
+        }
+    }
 }
 
 /// #447/#458: the LOCAL agent's membership state in `info`, for
