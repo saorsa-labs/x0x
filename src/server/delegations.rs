@@ -1129,6 +1129,8 @@ pub(in crate::server) async fn list_group_delegations(
         }
         let is_member = info.has_active_member(&local_hex);
         let read_open = info.policy.read_access == x0x::groups::GroupReadAccess::Public;
+        // Keep the existing group read policy for the durable operator too:
+        // #870 only tightens session visibility of delegation metadata.
         if !is_member && !read_open {
             return forbidden("members-only read policy");
         }

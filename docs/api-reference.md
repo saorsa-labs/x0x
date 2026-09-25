@@ -2219,6 +2219,12 @@ refused and never dropped** — the WS plane is the live mirror of the
 annotated history reads, and an operator watching an incident must not lose
 the stream. Two frame classes carry the label:
 
+For a session bearer without active local membership in the group, backfill
+`message` and `live` frames and structured `mention` frames still arrive, but
+omit `fork_quarantined` and `fork_quarantine`. Durable operator connections
+and sessions with an active local seat keep the annotation. Raw live gossip
+`message` frames remain unchanged.
+
 - `mention` frames on the group's topic channel;
 - ADR-0023 `subscribe` **backfill** frames for a group topic — the replayed
   `message` rows and the `live` boundary frame that closes the backfill.

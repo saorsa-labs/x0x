@@ -63,6 +63,7 @@ mod issue870_session_read_tests {
                 get(crate::server::routes::named_groups::get_group_public_messages),
             )
             .route("/history", get(history_list))
+            .route("/history/message/:msg_id", get(history_message))
             .route("/history/scopes", get(history_scopes))
             .route("/history/search", get(history_search))
             .route("/history/stats", get(history_stats))
@@ -251,6 +252,23 @@ mod issue870_session_read_tests {
         assert_eq!(status, StatusCode::OK, "{durable}");
         assert_eq!(durable["fork_quarantined"], true);
         assert_eq!(durable["records"][0]["fork_quarantined_at_ingest"], true);
+        let msg_id =
+            x0x::history::HistoryRecord::compute_msg_id(None, b"retained incident content");
+        let point_path = format!("/history/message/{}", hex::encode(msg_id));
+        let (status, point) = read(&app, &point_path, &session).await?;
+        assert_eq!(status, StatusCode::OK, "{point}");
+        assert_eq!(
+            point["record"]["payload"],
+            BASE64.encode("retained incident content")
+        );
+        assert!(point.get("fork_quarantine").is_none(), "{point}");
+        assert!(
+            point["record"].get("fork_quarantined_at_ingest").is_none(),
+            "{point}"
+        );
+        let (_, durable_point) = read(&app, &point_path, DURABLE).await?;
+        assert_eq!(durable_point["fork_quarantined"], true, "{durable_point}");
+        assert_eq!(durable_point["record"]["fork_quarantined_at_ingest"], true);
         let (_, rider_body) = read(&app, &path, &rider(&state).await?).await?;
         assert_eq!(rider_body["fork_quarantined"], true, "{rider_body}");
 
@@ -291,6 +309,8 @@ mod issue870_session_read_tests {
         assert_eq!(body["fork_quarantined"], true);
         let (_, messages) = read(&app, &messages_path, &session).await?;
         assert_eq!(messages["fork_quarantined"], true, "{messages}");
+        let (_, point) = read(&app, &point_path, &session).await?;
+        assert_eq!(point["fork_quarantined"], true, "{point}");
         Ok(())
     }
 }
