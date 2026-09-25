@@ -194,6 +194,9 @@ pub struct GroupCounters {
     /// through `POST /groups/:id/quarantine/clear` (owner-key node clear
     /// or `force` + non-empty reason).
     pub fork_quarantine_manual_clears: u64,
+    /// #871: armed #846 anchored-gap catch-up gates retired through the
+    /// manual clear (the forked-head escape) — attributable per group.
+    pub anchored_gap_manual_clears: u64,
     /// ADR-0064 slice 4 (#472 decision 3): fork evidence classified as
     /// `signer_only` — the signer was an active admin at the conflicting
     /// commit's claimed parent (or the joiner's served chain validated
@@ -398,6 +401,9 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.task_deltas_quarantine_applied = dst
         .task_deltas_quarantine_applied
         .saturating_add(src.task_deltas_quarantine_applied);
+    dst.anchored_gap_manual_clears = dst
+        .anchored_gap_manual_clears
+        .saturating_add(src.anchored_gap_manual_clears);
     dst.owner_mandate_minted = dst
         .owner_mandate_minted
         .saturating_add(src.owner_mandate_minted);
@@ -582,6 +588,13 @@ impl GroupsDiagnostics {
     pub fn record_fork_quarantine_manual_clear(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.fork_quarantine_manual_clears = c.fork_quarantine_manual_clears.saturating_add(1);
+        });
+    }
+    /// #871: an armed anchored-gap catch-up gate was retired via the
+    /// manual clear — same audit surface as the quarantine clear.
+    pub fn record_anchored_gap_manual_clear(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.anchored_gap_manual_clears = c.anchored_gap_manual_clears.saturating_add(1);
         });
     }
 
@@ -1394,6 +1407,7 @@ mod tests {
             task_deltas_quarantine_buffered: base + 47,
             task_deltas_quarantine_dropped: base + 48,
             task_deltas_quarantine_applied: base + 49,
+            anchored_gap_manual_clears: base + 50,
         };
         let src = counters_with(1_000);
         let dst = counters_with(7);
@@ -1552,6 +1566,10 @@ mod tests {
         assert_eq!(
             merged.task_deltas_quarantine_applied,
             dst.task_deltas_quarantine_applied + src.task_deltas_quarantine_applied
+        );
+        assert_eq!(
+            merged.anchored_gap_manual_clears,
+            dst.anchored_gap_manual_clears + src.anchored_gap_manual_clears
         );
         assert_eq!(
             merged.fork_quarantine_refusals,

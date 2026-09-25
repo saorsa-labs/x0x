@@ -2487,6 +2487,96 @@ async fn adr0066_manual_clear_is_the_exit_for_a_no_anchor_marker() -> Result<()>
     Ok(())
 }
 
+/// WHY #871: the durable #846 anchored-gap record has no TTL/queue
+/// disarm, so a forked-head node is wedged forever. The manual clear
+/// is the escape (documented on the route): it retires the armed
+/// record with the same authorisation paths and audits it.
+#[tokio::test]
+async fn manual_clear_retires_an_armed_anchored_gap_record() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "871".repeat(16);
+    let base = sealed_group_with_lineage(&state, &group_id, invite_only_policy()).await?;
+    // Arm the gate directly: the durable record with the #846 reason,
+    // revision below the terminal (the forked-head wedge).
+    {
+        let mut groups = state.named_groups.write().await;
+        let lineage = groups
+            .get_mut(&group_id)
+            .expect("sealed group")
+            .invite_lineage
+            .as_mut()
+            .expect("lineage");
+        lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+            reason: "owner_attested_stale_base_gap".to_string(),
+            head_revision: 0,
+            head_state_hash: base.state_hash.clone(),
+            terminal_revision: base.state_revision + 9,
+            terminal_state_hash: "871-terminal".to_string(),
+            committed_by: "aa".repeat(32),
+            occurrences: 1,
+            first_observed_at_ms: 0,
+            last_observed_at_ms: 0,
+            attested_chain_hashes: vec!["871-step".to_string()],
+            by_reason: Default::default(),
+        });
+    }
+    // Path (a) unavailable (no owner axis) -> force_required.
+    let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
+    let response =
+        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("force_required"),
+        "same authorisation contract as the quarantine clear: {body}"
+    );
+    assert!(
+        live_record(&state, &group_id)
+            .await
+            .invite_lineage
+            .as_ref()
+            .is_some_and(|lineage| lineage.anchored_gap_refusal.is_some()),
+        "the refused clear leaves the armed record in place"
+    );
+    // Path (b): the operator override retires the record, audits it.
+    let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({
+        "force": true,
+        "reason": "forked head confirmed; re-seat from the new invite",
+    }))?;
+    let response =
+        clear_group_quarantine(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the override retires the gate: {body}"
+    );
+    let record = live_record(&state, &group_id).await;
+    assert!(
+        record
+            .invite_lineage
+            .as_ref()
+            .is_some_and(|lineage| { lineage.anchored_gap_refusal.is_none() }),
+        "#871: the armed anchored-gap record is retired"
+    );
+    assert_eq!(
+        diag_row(&state, &group_id)
+            .await
+            .counters
+            .anchored_gap_manual_clears,
+        1,
+        "the retirement is attributable in /diagnostics/groups"
+    );
+    Ok(())
+}
+
 /// WHY (ADR-0066 §2 clear-arm table, asserted as a PREDICATE): the three
 /// owner-anchored clear arms differ in their surroundings — one is fenced
 /// by policy, one is not fenced at all, one lives on `GroupInfo` — but they
