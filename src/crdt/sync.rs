@@ -15,7 +15,8 @@
 
 use crate::crdt::persistence::TaskListStorage;
 use crate::crdt::sealed::{
-    decode_sealed_task_record, encode_sealed_task_record, TaskDeltaProtector, TaskSealRejection,
+    decode_sealed_task_record, encode_sealed_task_record, SealedTaskRecordBody, TaskDeltaProtector,
+    TaskSealRejection,
 };
 use crate::crdt::{Result, TaskList, TaskListDelta, TaskListId};
 use crate::gossip::wire::{decode_delta, encode_delta};
@@ -207,32 +208,29 @@ async fn seal_for_wire(
     }
 }
 
-/// #895: the plaintext `(PeerId, delta)` bytes of one inbound main-topic
-/// message on a group-bound list, or `None` when it must be dropped.
-///
-/// Our own sealed echo is skipped: the local mutation was applied before it
-/// was published, and a TreeKEM sender cannot open its own ciphertext.
-async fn open_inbound(
-    protector: &Arc<dyn TaskDeltaProtector>,
-    payload: &[u8],
-    sender: Option<&AgentId>,
-    local_peer_id: PeerId,
-) -> Option<Vec<u8>> {
-    let Some((peer, body)) = decode_sealed_task_record(payload) else {
-        if protector.admits_plaintext().await {
-            return Some(payload.to_vec());
-        }
-        protector.on_rejected(TaskSealRejection::PlaintextRefused);
-        tracing::warn!(
-            "refused plaintext task delta on a group-encrypted list (#895): \
-             the sender has not upgraded, or is not a member"
-        );
-        return None;
-    };
-    if peer == local_peer_id {
-        return None;
+/// #895: whether a plaintext delta may be merged on a protected list — only
+/// for a signed-public group. Anything else is refused and counted.
+async fn admit_plaintext(protector: &Arc<dyn TaskDeltaProtector>) -> bool {
+    if protector.admits_plaintext().await {
+        return true;
     }
-    let opened = match protector.open(&body).await {
+    protector.on_rejected(TaskSealRejection::PlaintextRefused);
+    tracing::warn!(
+        "refused plaintext task delta on a group-encrypted list (#895): \
+         the sender has not upgraded, or is not a member"
+    );
+    false
+}
+
+/// #895: the plaintext `(PeerId, delta)` bytes inside a sealed record, or
+/// `None` (refused and counted) when it cannot be opened with the group's
+/// current key or its sealed author is not the gossip-verified sender.
+async fn open_sealed(
+    protector: &Arc<dyn TaskDeltaProtector>,
+    body: &SealedTaskRecordBody,
+    sender: Option<&AgentId>,
+) -> Option<Vec<u8>> {
+    let opened = match protector.open(body).await {
         Ok(opened) => opened,
         Err(e) => {
             protector.on_rejected(TaskSealRejection::OpenFailed);
@@ -498,16 +496,34 @@ impl TaskIngestGateSlot {
 /// merge needs so the replay is the SAME call the listener would have made.
 #[derive(Debug, Clone)]
 struct BufferedDelta {
-    /// OR-Set tag identity from the payload (issue #349 I3).
-    peer_id: PeerId,
-    /// The delta itself.
-    delta: TaskListDelta,
+    /// Arrival sequence number, assigned by [`QuarantineDeltaBuffer::push`].
+    /// Identifies a held SEALED entry across the unlocked open step (#895).
+    seq: u64,
+    /// The held payload: a decoded delta, or a sealed record not yet opened.
+    held: HeldDelta,
     /// The V2-envelope-verified sender — the writer identity content policy
     /// admits on. `None` for an unverified sender, exactly as the live path
     /// passes it.
     writer: Option<crate::identity::AgentId>,
     /// Encoded size, for the byte bound.
     bytes: usize,
+}
+
+/// What a held entry carries.
+#[derive(Debug, Clone)]
+enum HeldDelta {
+    /// A decoded delta, ready to merge.
+    Open {
+        /// OR-Set tag identity from the payload (issue #349 I3).
+        peer_id: PeerId,
+        /// The delta itself (boxed: it dwarfs the sealed variant).
+        delta: Box<TaskListDelta>,
+    },
+    /// #895: a group-sealed record held UNOPENED while the group is
+    /// quarantined — the TreeKEM protector refuses to open during quarantine,
+    /// so it is opened after the clear ([`open_held_sealed`]) and merged in
+    /// its arrival position. Never merged while still sealed.
+    Sealed(SealedTaskRecordBody),
 }
 
 /// ADR-0068 D2: bounded, arrival-ordered hold for one task list's inbound
@@ -522,6 +538,7 @@ struct BufferedDelta {
 pub struct QuarantineDeltaBuffer {
     entries: std::collections::VecDeque<BufferedDelta>,
     bytes: usize,
+    next_seq: u64,
 }
 
 impl QuarantineDeltaBuffer {
@@ -531,7 +548,9 @@ impl QuarantineDeltaBuffer {
     /// Oldest-first because the newest deltas carry the most recent state, and
     /// anything dropped is recoverable: merges are idempotent and the
     /// state-sync side channel re-serves full state after the clear.
-    fn push(&mut self, entry: BufferedDelta) -> u64 {
+    fn push(&mut self, mut entry: BufferedDelta) -> u64 {
+        entry.seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
         let mut dropped = 0u64;
         // A delta that cannot fit the byte bound on its own is dropped rather
         // than retained (review nit 4): keeping it would let the transport's
@@ -559,6 +578,49 @@ impl QuarantineDeltaBuffer {
     fn take(&mut self) -> Vec<BufferedDelta> {
         self.bytes = 0;
         self.entries.drain(..).collect()
+    }
+
+    /// Put entries taken by [`take`](Self::take) back at the FRONT, in their
+    /// original order (#895: the drain stops at a still-sealed entry rather
+    /// than merge anything after it out of order).
+    fn restore_front(&mut self, entries: Vec<BufferedDelta>) {
+        for entry in entries.into_iter().rev() {
+            self.bytes = self.bytes.saturating_add(entry.bytes);
+            self.entries.push_front(entry);
+        }
+    }
+
+    /// #895: the held sealed entries, oldest first, for the unlocked open step.
+    fn sealed(&self) -> Vec<(u64, SealedTaskRecordBody, Option<AgentId>)> {
+        self.entries
+            .iter()
+            .filter_map(|e| match &e.held {
+                HeldDelta::Sealed(body) => Some((e.seq, body.clone(), e.writer)),
+                HeldDelta::Open { .. } => None,
+            })
+            .collect()
+    }
+
+    /// #895: replace held sealed entry `seq` with its opened delta, in place.
+    fn resolve(&mut self, seq: u64, peer_id: PeerId, delta: TaskListDelta) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.seq == seq) {
+            entry.held = HeldDelta::Open {
+                peer_id,
+                delta: Box::new(delta),
+            };
+        }
+    }
+
+    /// #895: remove held entry `seq` (it can never be opened). Returns whether
+    /// it was still held.
+    fn remove(&mut self, seq: u64) -> bool {
+        let Some(index) = self.entries.iter().position(|e| e.seq == seq) else {
+            return false;
+        };
+        if let Some(entry) = self.entries.remove(index) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+        true
     }
 
     fn len(&self) -> usize {
@@ -685,15 +747,38 @@ pub(crate) async fn admit_or_buffer<'a>(
     }
     // Still holding the write guard: a merge cannot slip between this verdict
     // and the buffering below, and a concurrent drain cannot interleave.
-    let (depth, bytes, dropped) = {
-        let mut held = lock_buffer(buffer);
-        let dropped = held.push(BufferedDelta {
+    hold(
+        gate,
+        buffer,
+        HeldDelta::Open {
             peer_id,
-            delta,
+            delta: Box::new(delta),
+        },
+        writer,
+        encoded_bytes,
+    );
+    drop(list);
+    Admission::Held
+}
+
+/// Append one entry to the hold and report it (buffered depth, overflow drops).
+/// Callers hold the list write guard.
+fn hold(
+    gate: &Arc<dyn TaskIngestGate>,
+    buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
+    held: HeldDelta,
+    writer: Option<&crate::identity::AgentId>,
+    encoded_bytes: usize,
+) {
+    let (depth, bytes, dropped) = {
+        let mut buffered = lock_buffer(buffer);
+        let dropped = buffered.push(BufferedDelta {
+            seq: 0,
+            held,
             writer: writer.copied(),
             bytes: encoded_bytes,
         });
-        (held.len(), held.bytes(), dropped)
+        (buffered.len(), buffered.bytes(), dropped)
     };
     gate.on_buffered(depth, bytes);
     if dropped > 0 {
@@ -706,8 +791,100 @@ pub(crate) async fn admit_or_buffer<'a>(
              (ADR-0068 D2; anti-entropy refills after the clear)"
         );
     }
+}
+
+/// #895 + ADR-0068 D2: whether a SEALED inbound record was held unopened.
+///
+/// The same decision [`admit_or_buffer`] takes (marker live, or older deltas
+/// pending — read as one fact under the list write guard), taken BEFORE the
+/// record is opened: the TreeKEM protector refuses to open while the group is
+/// quarantined, so opening first would turn "buffer" into "drop".
+/// [`SealedHold::Proceed`] means not held — the caller opens it and admits it
+/// as usual.
+pub(crate) enum SealedHold {
+    /// Not held: open and admit.
+    Proceed(SealedTaskRecordBody),
+    /// Held. `suspended` says whether the marker is live; when it is not, the
+    /// caller drains now (older pending deltas, then this one).
+    Held { suspended: bool },
+}
+
+/// See [`SealedHold`].
+pub(crate) async fn hold_sealed_if_held(
+    gate: Option<&Arc<dyn TaskIngestGate>>,
+    buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
+    task_list: &RwLock<TaskList>,
+    body: SealedTaskRecordBody,
+    writer: Option<&crate::identity::AgentId>,
+    encoded_bytes: usize,
+) -> SealedHold {
+    let Some(gate) = gate else {
+        return SealedHold::Proceed(body);
+    };
+    let list = task_list.write().await;
+    let suspended = gate.suspended().await;
+    let pending = !lock_buffer(buffer).is_empty();
+    if !suspended && !pending {
+        return SealedHold::Proceed(body);
+    }
+    hold(gate, buffer, HeldDelta::Sealed(body), writer, encoded_bytes);
     drop(list);
-    Admission::Held
+    SealedHold::Held { suspended }
+}
+
+/// #895: open every held SEALED entry now that the marker has cleared,
+/// replacing each with its decoded delta in place (arrival order kept).
+///
+/// Runs with NO list guard held while opening — a TreeKEM open takes the
+/// group membership lock and `named_groups` — and mutates the hold under the
+/// list write guard afterwards, as every other buffer writer does. An entry
+/// that fails to open is removed and counted, UNLESS the gate reports the
+/// marker live again (the failure is then the quarantine, not the record):
+/// the pass stops and leaves it held for the next drain.
+async fn open_held_sealed(
+    gate: Option<&Arc<dyn TaskIngestGate>>,
+    protector: Option<&Arc<dyn TaskDeltaProtector>>,
+    buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
+    task_list: &RwLock<TaskList>,
+) {
+    let Some(protector) = protector else {
+        return;
+    };
+    let sealed = lock_buffer(buffer).sealed();
+    for (seq, body, writer) in sealed {
+        if let Some(gate) = gate {
+            if gate.suspended().await {
+                return;
+            }
+        }
+        let outcome = match protector.open(&body).await {
+            Ok(opened) if writer.is_some_and(|w| w != opened.author) => {
+                Err(TaskSealRejection::SenderMismatch)
+            }
+            Ok(opened) => decode_delta::<TaskListDelta>(&opened.payload)
+                .map_err(|_| TaskSealRejection::OpenFailed),
+            Err(e) => {
+                if let Some(gate) = gate {
+                    if gate.suspended().await {
+                        return;
+                    }
+                }
+                tracing::warn!("refused held sealed task record after the clear (#895): {e}");
+                Err(TaskSealRejection::OpenFailed)
+            }
+        };
+        let _list = task_list.write().await;
+        let mut held = lock_buffer(buffer);
+        match outcome {
+            Ok((peer_id, delta)) => held.resolve(seq, peer_id, delta),
+            Err(reason) => {
+                if held.remove(seq) {
+                    drop(held);
+                    protector.on_rejected(reason);
+                }
+            }
+        }
+    }
 }
 
 /// ADR-0068 D2: apply every buffered delta, in arrival order, once the marker
@@ -835,8 +1012,18 @@ pub(crate) async fn drain_quarantine_buffer(
                         return;
                     }
                     list.set_authorized_agents(roster.agents.clone());
-                    let pending = lock_buffer(buffer).take();
-                    for entry in pending {
+                    let mut pending = lock_buffer(buffer).take().into_iter();
+                    while let Some(entry) = pending.next() {
+                        // #895: a still-sealed entry (it arrived after the
+                        // open step, or could not be opened yet) stops the
+                        // batch; it and everything after it stay held, in
+                        // order, for the next drain.
+                        let HeldDelta::Open { peer_id, delta } = &entry.held else {
+                            let mut rest = vec![entry];
+                            rest.extend(pending);
+                            lock_buffer(buffer).restore_front(rest);
+                            break;
+                        };
                         // #732 finding 4: a writer the pinned roster no longer
                         // seats is not merged at all, and the drop is counted.
                         // `merge_delta` would already drop the delta's CONTENT for
@@ -855,7 +1042,7 @@ pub(crate) async fn drain_quarantine_buffer(
                             refused += 1;
                             continue;
                         }
-                        match list.merge_delta(&entry.delta, entry.peer_id, entry.writer.as_ref()) {
+                        match list.merge_delta(delta, *peer_id, entry.writer.as_ref()) {
                             Ok(()) => applied += 1,
                             Err(e) => tracing::warn!(
                                 "failed to merge task delta buffered under fork quarantine: {e}"
@@ -868,9 +1055,15 @@ pub(crate) async fn drain_quarantine_buffer(
             // No gate at all (a list with no group binding): no roster to pin and
             // no authorization to refresh — merge the hold as it stands.
             _ => {
-                let pending = lock_buffer(buffer).take();
-                for entry in pending {
-                    match list.merge_delta(&entry.delta, entry.peer_id, entry.writer.as_ref()) {
+                let mut pending = lock_buffer(buffer).take().into_iter();
+                while let Some(entry) = pending.next() {
+                    let HeldDelta::Open { peer_id, delta } = &entry.held else {
+                        let mut rest = vec![entry];
+                        rest.extend(pending);
+                        lock_buffer(buffer).restore_front(rest);
+                        break;
+                    };
+                    match list.merge_delta(delta, *peer_id, entry.writer.as_ref()) {
                         Ok(()) => applied += 1,
                         Err(e) => tracing::warn!(
                             "failed to merge task delta buffered under fork quarantine: {e}"
@@ -1056,10 +1249,14 @@ async fn persist_snapshot(task_list: &RwLock<TaskList>, ctx: &TaskPersistCtx) ->
 /// a single gate read while the marker is still live.
 async fn drain_and_persist(
     gate: &TaskIngestGateSlot,
+    protector: Option<&Arc<dyn TaskDeltaProtector>>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
     task_list: &RwLock<TaskList>,
     persist: Option<&Arc<TaskPersistCtx>>,
 ) -> usize {
+    // #895: sealed deltas held during the quarantine are opened first (no
+    // list guard held), so the pinned drain below merges them in order.
+    open_held_sealed(gate.gate(), protector, buffer, task_list).await;
     let applied = drain_quarantine_buffer(gate.gate(), buffer, task_list).await;
     if applied > 0 {
         if let Some(ctx) = persist {
@@ -1174,6 +1371,7 @@ impl TaskListSync {
         }
         drain_and_persist(
             &self.ingest_gate,
+            self.protector.get(),
             &self.quarantine_buffer,
             &self.task_list,
             self.persist_ctx().as_ref(),
@@ -1356,6 +1554,7 @@ impl TaskListSync {
                     }
                     drain_and_persist(
                         &listener_gate,
+                        listener_protector.as_ref(),
                         &listener_buffer,
                         &task_list,
                         listener_persist.as_ref(),
@@ -1377,18 +1576,61 @@ impl TaskListSync {
                 // group's current key and refuses plaintext (fail closed,
                 // counted) — before any lock, since opening a TreeKEM record
                 // takes the group membership lock.
+                //
+                // ADR-0068 D2 is kept: while the group is quarantined (or
+                // older deltas are still held) a sealed record is HELD
+                // unopened and opened after the clear, in arrival order.
                 let payload: std::borrow::Cow<'_, [u8]> = match &listener_protector {
                     None => std::borrow::Cow::Borrowed(&msg.payload[..]),
-                    Some(protector) => match open_inbound(
-                        protector,
-                        &msg.payload,
-                        msg.sender.as_ref(),
-                        listener_local_peer,
-                    )
-                    .await
-                    {
-                        Some(opened) => std::borrow::Cow::Owned(opened),
-                        None => continue,
+                    Some(protector) => match decode_sealed_task_record(&msg.payload) {
+                        None => {
+                            if !admit_plaintext(protector).await {
+                                continue;
+                            }
+                            std::borrow::Cow::Borrowed(&msg.payload[..])
+                        }
+                        Some((peer, _)) if peer == listener_local_peer => {
+                            // Our own echo: applied locally before it was
+                            // published, and a TreeKEM sender cannot open
+                            // its own ciphertext.
+                            continue;
+                        }
+                        Some((_, body)) => match hold_sealed_if_held(
+                            listener_gate.gate(),
+                            &listener_buffer,
+                            &task_list,
+                            body,
+                            msg.sender.as_ref(),
+                            msg.payload.len(),
+                        )
+                        .await
+                        {
+                            SealedHold::Held { suspended } => {
+                                if !suspended {
+                                    // Marker already cleared: drain the older
+                                    // held deltas and this one now.
+                                    let _section = listener_lifecycle.lock().await;
+                                    if listener_cancel.is_cancelled() {
+                                        return;
+                                    }
+                                    drain_and_persist(
+                                        &listener_gate,
+                                        Some(protector),
+                                        &listener_buffer,
+                                        &task_list,
+                                        listener_persist.as_ref(),
+                                    )
+                                    .await;
+                                }
+                                continue;
+                            }
+                            SealedHold::Proceed(body) => {
+                                match open_sealed(protector, &body, msg.sender.as_ref()).await {
+                                    Some(opened) => std::borrow::Cow::Owned(opened),
+                                    None => continue,
+                                }
+                            }
+                        },
                     },
                 };
                 match decode_delta::<TaskListDelta>(&payload) {
@@ -1421,6 +1663,7 @@ impl TaskListSync {
                         if !lock_buffer(&listener_buffer).is_empty() {
                             drain_and_persist(
                                 &listener_gate,
+                                listener_protector.as_ref(),
                                 &listener_buffer,
                                 &task_list,
                                 listener_persist.as_ref(),
@@ -2366,6 +2609,9 @@ mod tests {
         signing: crate::kv::encrypted::AuthorSigning,
         public: bool,
         rejected: std::sync::atomic::AtomicU64,
+        /// Simulates the TreeKEM protector while the group is quarantined:
+        /// it refuses to open at all.
+        refuse_open: std::sync::atomic::AtomicBool,
     }
 
     impl GssFixtureProtector {
@@ -2380,6 +2626,7 @@ mod tests {
                 signing: crate::kv::encrypted::AuthorSigning::from_keypair(kp).expect("signing"),
                 public: false,
                 rejected: std::sync::atomic::AtomicU64::new(0),
+                refuse_open: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -2418,6 +2665,11 @@ mod tests {
         ) -> crate::crdt::sealed::TaskSealFuture<'a, crate::crdt::sealed::OpenedTaskPayload>
         {
             Box::pin(async move {
+                if self.refuse_open.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(crate::crdt::CrdtError::Gossip(
+                        "group is fork-quarantined".to_string(),
+                    ));
+                }
                 match body {
                     crate::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
                         crate::crdt::sealed::open_gss_task_record(&self.info, &self.topic, record)
@@ -2645,6 +2897,68 @@ mod tests {
             list.get_task(&plain_id).is_none(),
             "plaintext applied to a group list"
         );
+    }
+
+    /// ADR-0068 D2 (Accepted) WHY: a sealed delta that arrives while the
+    /// group is fork-quarantined must be BUFFERED, not dropped — even though
+    /// the protector cannot open it during the quarantine (the TreeKEM
+    /// protector refuses) — and applied once the marker clears.
+    #[tokio::test]
+    async fn sealed_delta_during_quarantine_is_buffered_then_applied() {
+        let topic = "x0x.group.g895.symphony.quarantine";
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let info = gss_group(kp.agent_id());
+        let pubsub = pubsub_signed_by(&kp).await;
+        let sender = TaskListSync::new(
+            TaskList::new(list_id(1), "L".to_string(), peer(1)),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(1),
+        )
+        .expect("sender");
+        let receiver = TaskListSync::new(
+            TaskList::new(list_id(1), "L".to_string(), peer(2)),
+            Arc::clone(&pubsub),
+            topic.to_string(),
+            peer(2),
+        )
+        .expect("receiver");
+        assert!(sender.install_protector(GssFixtureProtector::new(info.clone(), topic, &kp)));
+        let protector = GssFixtureProtector::new(info, topic, &kp);
+        protector
+            .refuse_open
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(receiver.install_protector(protector.clone()));
+        let gate = Arc::new(ListenerGate::seating(kp.agent_id()));
+        gate.suspend(true);
+        assert!(receiver
+            .ingest_gate()
+            .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
+        receiver.set_drain_poll_millis(600_000);
+        receiver.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (task_id, delta) = secret_task_delta(peer(1));
+        sender.publish_delta(peer(1), delta).await.expect("publish");
+        assert!(
+            eventually(Duration::from_secs(5), || async {
+                receiver.quarantined_buffer_len() == 1
+            })
+            .await,
+            "the sealed delta must be HELD during the quarantine"
+        );
+        assert_eq!(protector.rejected(), 0, "held, not refused");
+        assert!(receiver.read().await.get_task(&task_id).is_none());
+
+        // The marker clears; the protector can open again.
+        gate.suspend(false);
+        protector
+            .refuse_open
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(receiver.resume_quarantined_ingest().await, 1);
+        assert!(receiver.read().await.get_task(&task_id).is_some());
+        assert_eq!(receiver.quarantined_buffer_len(), 0);
+        assert_eq!(protector.rejected(), 0);
     }
 
     /// WHY: personal (non-group) lists keep their plaintext wire format; the

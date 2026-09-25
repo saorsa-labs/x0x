@@ -5005,6 +5005,141 @@ mod tests {
             .is_err());
     }
 
+    /// #895 (TreeKEM mirror of the GSS tests in `crdt/sealed.rs`): a
+    /// group-scoped task list on a TreeKEM group, through the PRODUCTION
+    /// binding (`group_task_list_binding`), seals with the live ratchet so the
+    /// wire bytes carry no task text, a current member opens it, and a member
+    /// whose ratchet is at a different epoch cannot.
+    #[tokio::test]
+    async fn treekem_group_task_list_seals_opens_and_rejects_wrong_epoch() {
+        const TITLE: &str = "TREEKEM-TASK-TITLE-895";
+        let (writer_state, _writer_dir) = encrypted_store_test_state().await;
+        let (reader_state, _reader_dir) = encrypted_store_test_state().await;
+        let owner = AgentId([78; 32]);
+        let writer = writer_state.agent.agent_id();
+        let reader = reader_state.agent.agent_id();
+        let group_key = "46".repeat(16);
+        let group_id = hex::decode(&group_key).expect("group id");
+        let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            writer_state.agent.as_ref(),
+            &group_id,
+        );
+        let reader_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            reader_state.agent.as_ref(),
+            &group_id,
+        );
+        let mut owner_group = x0x::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[78; 32])
+            .expect("owner group");
+        let writer_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(reader, &reader_seed).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances for reader");
+        let reader_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+        assert_eq!(writer_group.epoch(), reader_group.epoch());
+
+        let mut info = GroupInfo::new("tasks".to_string(), String::new(), owner, group_key.clone());
+        info.migrate_from_v1();
+        info.secure_plane = SecureGroupPlane::TreeKem;
+        info.shared_secret = None;
+        for member in [writer, reader] {
+            info.add_member(
+                hex::encode(member.as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(owner.as_bytes())),
+                None,
+            );
+        }
+        info.secret_epoch = writer_group.epoch();
+        info.security_binding = Some(format!("treekem:epoch={}", writer_group.epoch()));
+        info.recompute_state_hash();
+        for (state, live) in [(&writer_state, writer_group), (&reader_state, reader_group)] {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(group_key.clone(), Arc::new(tokio::sync::Mutex::new(live)));
+        }
+
+        let topic = format!("x0x.group.{group_key}.symphony.board");
+        let sealer = crate::server::routes::group_task_list_binding(&writer_state, &topic)
+            .await
+            .delta_protector
+            .expect("group list gets a protector");
+        let opener = crate::server::routes::group_task_list_binding(&reader_state, &topic)
+            .await
+            .delta_protector
+            .expect("group list gets a protector");
+        let payload = format!("plaintext-delta:{TITLE}").into_bytes();
+
+        let body = sealer
+            .seal(x0x::kv::KvMutationKind::Delta, &payload)
+            .await
+            .expect("seal")
+            .expect("an MlsEncrypted group is sealed, never plaintext");
+        assert!(matches!(
+            body,
+            x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(_)
+        ));
+        let wire = x0x::crdt::sealed::encode_sealed_task_record(
+            saorsa_gossip_types::PeerId::new([1; 32]),
+            body.clone(),
+        )
+        .expect("wire");
+        assert!(!wire.windows(TITLE.len()).any(|w| w == TITLE.as_bytes()));
+        assert!(!opener.admits_plaintext().await);
+        let opened = opener.open(&body).await.expect("member opens");
+        assert_eq!(opened.payload, payload);
+        assert_eq!(opened.author, writer);
+
+        // Wrong epoch: the writer's ratchet advances (a third member is
+        // added and only the writer processes the commit), the reader's does
+        // not — a record sealed at the new epoch must not open at the old one.
+        let third = AgentId([79; 32]);
+        let third_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(third, &[79; 32]).expect("third kp");
+        let third_add = owner_group
+            .add_member(third, third_prepared.key_package_bytes())
+            .expect("add third");
+        writer_state
+            .treekem_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("writer ratchet")
+            .lock()
+            .await
+            .process_commit(&third_add.commit)
+            .expect("writer advances");
+        let next_epoch = sealer
+            .seal(x0x::kv::KvMutationKind::Delta, &payload)
+            .await
+            .expect("seal at the new epoch")
+            .expect("sealed");
+        assert!(
+            opener.open(&next_epoch).await.is_err(),
+            "a record from another epoch must fail closed"
+        );
+    }
+
     #[tokio::test]
     async fn create_group_kv_store_route_creates_encrypted_store() {
         let (state, _dir) = encrypted_store_test_state().await;
