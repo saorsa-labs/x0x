@@ -815,6 +815,16 @@ Durable-owner only — a session token answers `403`; a missing
 `move_epoch` answers `400`. The one-id forms remain the agent/machine
 self- or user-authority revocations.
 
+Revoking the daemon's OWN agent binding (#797) resolves the certificate
+from the identity dir (`agent.cert`) when it was issued by the loaded
+owner user key — the discovery cache never contains the local agent and
+self-issuance keeps the journal lean. **Warning:** the tombstone is
+grow-only and never expires. Pointing it at the LOCAL machine
+(`machine_id` = this daemon's) permanently bars this daemon's agent from
+signing here until the owner re-issues its certificate; the daemon logs
+a `warn` when that case is taken — it is a legitimate retirement action,
+but never a silent one.
+
 `GET /owner/placement` lazily mints epoch-0 records on first read and
 returns `owner_user_id`, `minted_now`, `roaming_count`, `home_invariant_ok`
 (≥ 1 Roaming agent), and `placements[]` (`agent_id`, `kind`
