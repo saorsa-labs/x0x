@@ -221,12 +221,19 @@ pub(crate) async fn record_authenticated_machine_binding(
         .record(agent_id, machine_id, announced_at);
 }
 
+pub(crate) async fn authenticated_machine_binding(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: &AgentId,
+) -> Option<MachineId> {
+    bindings.write().await.resolve(agent_id)
+}
+
 #[cfg(test)]
 pub(crate) async fn authenticated_machine_binding_for_testing(
     bindings: &AuthenticatedMachineBindings,
     agent_id: &AgentId,
 ) -> Option<MachineId> {
-    bindings.write().await.resolve(agent_id)
+    authenticated_machine_binding(bindings, agent_id).await
 }
 
 #[derive(Clone, Default)]
@@ -590,6 +597,10 @@ impl DmInboxService {
         &self.topic
     }
 
+    pub(crate) fn typed_payload_routes(&self) -> &[DmTypedPayloadRoute] {
+        &self.pipeline.typed_payload_routes
+    }
+
     pub fn abort(&self) {
         for handle in &self.handles {
             handle.abort();
@@ -948,7 +959,7 @@ where
 }
 
 #[derive(Clone)]
-struct InboxPipeline {
+pub(crate) struct InboxPipeline {
     pubsub: Arc<PubSubManager>,
     signing: Arc<SigningContext>,
     self_agent_id: AgentId,
@@ -2124,28 +2135,39 @@ impl InboxPipeline {
         payload: Vec<u8>,
         trust_decision: Option<TrustDecision>,
     ) -> bool {
-        let Some(route) = self
-            .typed_payload_routes
+        Self::try_route_typed_payload(
+            &self.typed_payload_routes,
+            &self.dm,
+            DmTypedPayload {
+                sender: sender_agent_id,
+                machine_id: sender_machine_id,
+                payload,
+                verified: true,
+                trust_decision,
+                received_at_unix_ms: now_unix_ms(),
+                request_id,
+                completion: None,
+            },
+        )
+    }
+
+    /// Shared prefix dispatch for verified gossip and post-validation raw direct
+    /// payloads. Recognition suppresses generic fan-out even if the bounded
+    /// channel is unavailable; it does not establish handler acceptance.
+    pub(crate) fn try_route_typed_payload(
+        routes: &[DmTypedPayloadRoute],
+        dm: &DirectMessaging,
+        typed: DmTypedPayload,
+    ) -> bool {
+        let Some(route) = routes
             .iter()
-            .find(|route| payload.starts_with(&route.prefix))
+            .find(|route| typed.payload.starts_with(&route.prefix))
         else {
             return false;
         };
-        let typed = DmTypedPayload {
-            sender: sender_agent_id,
-            machine_id: sender_machine_id,
-            payload,
-            verified: true,
-            trust_decision,
-            received_at_unix_ms: now_unix_ms(),
-            request_id,
-            // v1 payloads make no durability promise, so there is nothing for
-            // a handler to report; the ACK is level-2 enqueue either way.
-            completion: None,
-        };
-        // Best-effort, NON-BLOCKING hand-off. These typed routes (the
-        // group-public-message and KvStore-delta gossip-DM fallbacks) are
-        // redundant delivery paths — primary fan-out is per-group/store pubsub.
+        let sender_agent_id = typed.sender;
+        // Best-effort, NON-BLOCKING hand-off. Some routes have other delivery
+        // paths; others, including predecessor relay, depend on this channel.
         // We must not `send().await`: this runs inline in the single DM-inbox
         // subscription loop that also publishes ACKs, so a slow or
         // lock-contended route consumer filling the bounded channel would block
@@ -2155,10 +2177,10 @@ impl InboxPipeline {
         match route.sender.try_send(typed) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dm.record_incoming_typed_route_dropped();
+                dm.record_incoming_typed_route_dropped();
                 tracing::warn!(
                     sender = %crate::logging::LogAgentId::from(&sender_agent_id),
-                    "typed DM payload route channel full; dropping redundant fallback payload"
+                    "typed DM payload route channel full; dropping payload"
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {

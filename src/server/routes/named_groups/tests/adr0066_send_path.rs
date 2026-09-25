@@ -979,6 +979,7 @@ async fn row6_marker_installed_before_return_hands_out_no_envelope() -> Result<(
     let (status, body) = secure_group_reseal(
         State(Arc::clone(&state)),
         Path(control.to_string()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(ResealRequest {
             recipient: control_recipient,
         }),
@@ -1010,6 +1011,7 @@ async fn row6_marker_installed_before_return_hands_out_no_envelope() -> Result<(
     let (status, body) = secure_group_reseal(
         State(Arc::clone(&state)),
         Path(armed.to_string()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(ResealRequest {
             recipient: armed_recipient,
         }),
@@ -1086,6 +1088,7 @@ async fn row6_alias_keyed_group_is_not_exempt() -> Result<()> {
     let (status, body) = secure_group_reseal(
         State(Arc::clone(&state)),
         Path(key.to_string()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(ResealRequest { recipient }),
     )
     .await;
