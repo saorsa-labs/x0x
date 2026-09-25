@@ -154,6 +154,50 @@ pub struct AnchoredGapRefusal {
     /// for another reason. Empty on older persisted records.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_reason: BTreeMap<String, GapRefusalReasonAudit>,
+    /// #871 r2: when this gate RETIRED (unix ms). A retired record is
+    /// KEPT for audit — [`AnchoredGapRefusal::retired_by`] names the
+    /// path — and the catch-up gate treats it as unarmed. `None` while
+    /// the gate is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at_ms: Option<u64>,
+    /// #871 r2: which path retired the gate — `"converged"` (the
+    /// attested terminal installed through gated catch-up) or
+    /// `"owner-key-reseat"` (the manual owner-key re-seat, whose
+    /// authorization is [`AnchoredGapRefusal::reseat`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_by: Option<String>,
+    /// #871 r2: the owner-key RE-SEAT authorization for this gate — the
+    /// admission owner's v2 terminal-bound signature over the RECORDED
+    /// terminal (never the node's current, possibly forked head),
+    /// installed by `POST /groups/:id/quarantine/clear`. Authorizing a
+    /// re-seat does NOT disarm the gate: the head re-anchors at the
+    /// attested head and the gate retires only once the attested
+    /// terminal installs through catch-up validated against the
+    /// attested sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reseat: Option<GapReseatAuthorization>,
+}
+
+/// #871 r2: the durable owner-key re-seat authorization recorded on an
+/// armed [`AnchoredGapRefusal`] (see [`AnchoredGapRefusal::reseat`]).
+///
+/// The signature is the ADMISSION OWNER's user-key signature over the
+/// same `x0x.join-terminal-attest.v2` canonical bytes the join path's
+/// terminal binding uses — `(group, head_revision, head_state_hash,
+/// authorizing member, terminal_state_hash, terminal_committed_by,
+/// epoch = None)` — minted over the RECORDED terminal. It proves the
+/// operator held the owner key and accepted exactly this terminal as
+/// the re-seat target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapReseatAuthorization {
+    /// Local time the operator authorized the re-seat (unix ms).
+    pub authorized_at_ms: u64,
+    /// The local agent whose request the operator authorized (hex).
+    pub authorized_by: String,
+    /// The capped operator reason (the audit trail).
+    pub reason: String,
+    /// The owner's v2 terminal-binding signature (base64 ML-DSA).
+    pub terminal_signature_b64: String,
 }
 
 /// Durable first-seen evidence for one non-gating gap-refusal reason.

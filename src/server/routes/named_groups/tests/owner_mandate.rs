@@ -1665,6 +1665,7 @@ async fn call_clear(
     let response = clear_group_quarantine(
         State(Arc::clone(state)),
         Path(group_id.to_string()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(req),
     )
     .await
@@ -1748,6 +1749,153 @@ async fn manual_clear_owner_key_and_force_paths() -> Result<()> {
     let row = diag_row(state.as_ref(), &group_id).await;
     assert_eq!(row.counters.fork_quarantine_manual_clears, 2);
     let _ = (&info, &owner_kp);
+    Ok(())
+}
+
+/// WHY #871 r2: the armed #846 anchored-gap gate's ONLY escape is an
+/// owner-key RE-SEAT — the r1 "clear" (delete the record) reopened the
+/// ungated catch-up path #846 closed. The re-seat contract:
+/// - a SESSION actor is refused (403) even before the owner-key checks;
+/// - `force` is refused (409): no keyless disarm;
+/// - the owner-key path authorizes a re-seat BOUND TO THE RECORDED
+///   terminal (the v2 terminal binding), REPLACES the local head with
+///   the recorded attested head (the wedge: the head had forked past
+///   it), keeps the gate ARMED (it retires only when the terminal
+///   installs through catch-up), keeps the record for audit, and
+///   counts `anchored_gap_manual_clears`.
+#[tokio::test]
+async fn manual_clear_reseats_an_armed_anchored_gap_gate() -> Result<()> {
+    let (state, _dir, _owner_kp, group_id, _j, _p, _c) = receiver_stage().await?;
+    let (head_revision, head_state_hash) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("live record");
+        (info.state_revision, info.state_hash.clone())
+    };
+    // Arm the gate: the owner-attested stale-base record whose head is
+    // the CURRENT head and whose terminal is 9 revisions past it.
+    let terminal_revision = head_revision + 9;
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("live record");
+        let lineage = info.invite_lineage.get_or_insert_with(Default::default);
+        lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+            reason: "owner_attested_stale_base_gap".to_string(),
+            head_revision,
+            head_state_hash: head_state_hash.clone(),
+            terminal_revision,
+            terminal_state_hash: "871r2-terminal".to_string(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            occurrences: 1,
+            first_observed_at_ms: 0,
+            last_observed_at_ms: 0,
+            attested_chain_hashes: vec![head_state_hash.clone(), "871r2-terminal".to_string()],
+            by_reason: Default::default(),
+            retired_at_ms: None,
+            retired_by: None,
+            reseat: None,
+        });
+        // The wedge: the head FORKED PAST the anchor (a commit this
+        // node should not have applied landed), so no attested page can
+        // ever link from the current head — the gate stays armed
+        // forever without the re-seat.
+        info.state_revision = head_revision + 1;
+        info.state_hash = "871r2-forked-head".to_string();
+    }
+    assert!(
+        catchup_846_gate_armed(&live_record(state.as_ref(), &group_id).await),
+        "fixture: the gate is armed on the forked head"
+    );
+    // A session actor is refused at the handler (the middleware owns
+    // the real route gate — proven in
+    // `quarantine_clear_route_through_real_middleware`).
+    let req: ClearQuarantineRequest = serde_json::from_value(serde_json::json!({}))?;
+    let response = clear_group_quarantine(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: false }),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // force is refused for the armed gate.
+    let (status, body) = call_clear(
+        &state,
+        &group_id,
+        ClearQuarantineRequest {
+            force: true,
+            reason: "operator override".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "no keyless disarm of the anchored-gap gate: {body}"
+    );
+    // The owner-key re-seat (no force).
+    let (status, body) = call_clear(
+        &state,
+        &group_id,
+        ClearQuarantineRequest {
+            force: false,
+            reason: "forked head confirmed; re-seat at the owner-attested terminal".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the re-seat authorizes: {body}");
+    assert_eq!(body["cleared_by"], "owner-key-reseat");
+    assert_eq!(
+        body["anchored_gap"]["gate"], "armed-until-terminal-installs",
+        "the response says the gate is NOT disarmed: {body}"
+    );
+    assert_eq!(body["anchored_gap"]["head_rebased"], true);
+    let record = live_record(state.as_ref(), &group_id).await;
+    // The head was REPLACED with the owner-attested head.
+    assert_eq!(record.state_revision, head_revision);
+    assert_eq!(record.state_hash, head_state_hash);
+    // The gate is STILL ARMED and the record is KEPT (B3) with the
+    // authorization bound to the recorded terminal.
+    assert!(
+        catchup_846_gate_armed(&record),
+        "#871 r2: the re-seat does not disarm the gate — only the terminal's install retires it"
+    );
+    let gap = record
+        .invite_lineage
+        .as_ref()
+        .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+        .expect("the record is kept for audit");
+    assert_eq!(gap.retired_at_ms, None, "not retired yet");
+    let reseat = gap.reseat.as_ref().expect("the authorization is durable");
+    assert_eq!(
+        reseat.authorized_by,
+        hex::encode(state.agent.agent_id().as_bytes())
+    );
+    assert!(
+        !reseat.terminal_signature_b64.is_empty(),
+        "the owner's v2 terminal binding is stored"
+    );
+    assert_eq!(
+        diag_row(state.as_ref(), &group_id)
+            .await
+            .counters
+            .anchored_gap_manual_clears,
+        1,
+        "the re-seat is attributable in /diagnostics/groups"
+    );
+    assert_eq!(
+        diag_row(state.as_ref(), &group_id)
+            .await
+            .counters
+            .fork_quarantine_manual_clears,
+        0,
+        "#871 r2 / N3: a gap-only re-seat fires NO fork-quarantine side effects"
+    );
+    assert!(
+        record.fork_quarantine.is_none(),
+        "no marker was touched (there was none)"
+    );
     Ok(())
 }
 
@@ -1846,6 +1994,7 @@ async fn quarantine_clear_route_through_real_middleware() -> Result<()> {
     // Durable token + owner-key node → the owner-key clear path.
     let token = state.api_token.clone();
     let response = app
+        .clone()
         .oneshot(
             Request::post(format!("/groups/{group_id}/quarantine/clear"))
                 .header("authorization", format!("Bearer {token}"))
@@ -1864,6 +2013,43 @@ async fn quarantine_clear_route_through_real_middleware() -> Result<()> {
         .await
         .fork_quarantine
         .is_none());
+
+    // #871 r2 (B2): a 10-minute SESSION bearer is a read-only principal
+    // (#446) and must get the typed durable-required 403 — the route is
+    // in `auth::requires_durable_owner`, so the refusal fires in the
+    // middleware BEFORE any handler logic.
+    quarantine_live(state.as_ref(), &group_id).await;
+    let session = state.sessions.issue(std::time::Instant::now());
+    let response = app
+        .oneshot(
+            Request::post(format!("/groups/{group_id}/quarantine/clear"))
+                .header("authorization", format!("Bearer {session}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("body builds"),
+        )
+        .await
+        .unwrap_or_else(|never| match never {});
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a session token cannot disarm an owner-attested gate"
+    );
+    let body = to_bytes(response.into_body(), 1 << 20).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("durable")),
+        "typed durable-required refusal: {body}"
+    );
+    assert!(
+        live_record(state.as_ref(), &group_id)
+            .await
+            .fork_quarantine
+            .is_some(),
+        "the session refusal cleared nothing"
+    );
     Ok(())
 }
 

@@ -81,7 +81,11 @@ pub async fn decrypt(
 /// `x0x groups quarantine clear` — POST /groups/:id/quarantine/clear
 /// (ADR-0064 slice 3): clear the LOCAL fork-quarantine marker. Clears on
 /// a node holding the group's owner user key (no flags needed);
-/// otherwise requires the operator `--force --reason` override.
+/// otherwise requires the operator `--force --reason` override. An
+/// armed #871 anchored-gap catch-up gate is NOT cleared — the owner-key
+/// call authorizes an owner-key RE-SEAT at the attested terminal (the
+/// gate retires once the terminal installs); `--force` is refused for
+/// that gate.
 pub async fn quarantine_clear(
     client: &DaemonClient,
     group_id: &str,
