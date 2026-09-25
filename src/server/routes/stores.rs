@@ -68,13 +68,7 @@ struct LoadedLegacyStore {
 }
 
 pub(in crate::server) const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(in crate::server) struct KvStoreDirectDelta {
-    store_id: String,
-    peer_id: saorsa_gossip_types::PeerId,
-    delta: x0x::kv::KvStoreDelta,
-}
+pub(in crate::server) use x0x::kv::KvStoreDirectDelta;
 
 fn encode_kv_store_delta_direct_payload(
     store_id: &str,
@@ -2910,6 +2904,11 @@ mod tests {
         let payload = encode_kv_store_delta_direct_payload("store-1", peer_id, &delta)
             .expect("payload should encode");
         assert!(payload.starts_with(KV_STORE_DELTA_DM_PREFIX));
+        assert!(crate::server::valid_kv_store_delta_typed_dm(&payload));
+        assert_eq!(
+            x0x::history::classify::classify_dm_payload(&payload),
+            x0x::history::classify::DmPayloadClass::Ephemeral
+        );
 
         let decoded: KvStoreDirectDelta =
             serde_json::from_slice(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])
@@ -3062,6 +3061,25 @@ mod tests {
         let groups = std::collections::HashMap::from([(gid.clone(), base)]);
         assert!(resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([3; 32])).is_err());
         assert!(resolve_gss_group_store(&groups, "missing", "Wiki", &AgentId([2; 32])).is_err());
+    }
+
+    /// #794: an invite-joined GSS member's stub starts KEYLESS — the real
+    /// secret arrives via `SecureShareDelivered` after committed admission.
+    /// Until then, opening/creating the group store must fail closed with
+    /// the explicit 409, never silently open with a wrong local secret.
+    #[test]
+    fn gss794_keyless_stub_store_open_fails_closed() {
+        let gid = "79".repeat(16);
+        let mut info = binding_fixture(&gid);
+        info.shared_secret = None;
+        let groups = std::collections::HashMap::from([(gid.clone(), info)]);
+        let err = resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([2; 32]))
+            .expect_err("keyless stub must refuse store resolution");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "keyless stub is a 409, not a silent wrong-secret open"
+        );
     }
 
     #[test]
