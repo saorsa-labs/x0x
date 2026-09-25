@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0072-scope-freeze-deferred-and-legacy-maintenance.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-25 by David Irvine ("accept ADR-0070, 0071 and 0072"; status change applied by Claude at his instruction)
 - **Date:** 2026-09-25
 - **Decision owners:** David Irvine (decision, 2026-09-25 vision-alignment review), Claude (drafting)
 - **Reviewers:** pending — David Irvine (acceptance); omp (cross-model review)
