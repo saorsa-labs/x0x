@@ -889,7 +889,7 @@ function navigateDm(agentId){navigate('dm',{dmTarget:agentId})}
 const HASH_VIEWS=['home','homespace','discover','people','network','presence','mls','admin','settings','constitution','about'];
 const HASH_SPACE_APPS=['chat','board','files','swarm','feed','wiki','web'];
 function applyHashRoute(){
-  const p=location.hash.replace(/^#\/?/,'').split('/').filter(Boolean);
+  const p=String(location.hash||'').replace(/^#\/?/,'').split('/').filter(Boolean);
   const hex=s=>/^[0-9a-f]{16,128}$/i.test(s||'');
   if(p[0]==='dm'&&p.length===2&&hex(p[1])){navigateDm(p[1].toLowerCase());return true}
   if(p[0]==='groups'&&(p.length===2||p.length===3)&&hex(p[1])&&(!p[2]||HASH_SPACE_APPS.includes(p[2]))){navigateSpace(p[1].toLowerCase(),p[2]);return true}
@@ -6131,7 +6131,7 @@ pollContacts();
 pollGroups();
 if(!applyHashRoute())renderView();
 renderSidebar();
-window.addEventListener('hashchange',applyHashRoute);
+window.onhashchange=applyHashRoute;
 setInterval(maybeRefreshSession,30000);
 document.addEventListener('visibilitychange',maybeRefreshSession);
 
