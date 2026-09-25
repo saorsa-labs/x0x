@@ -28,9 +28,10 @@ use super::auth::SessionStore;
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
-    ListenerRegistration, NamedGroupMetadataEvent, PendingCausalApproval, PendingJoinAttempt,
-    PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome,
-    PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription, WelcomeFetchWaiter,
+    ListenerRegistration, NamedGroupMetadataEvent, ParkedRoleUpdate, PendingCausalApproval,
+    PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent,
+    PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription,
+    WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -938,6 +939,19 @@ pub(super) struct AppState {
     /// arrived before local TreeKEM readiness or ahead of our state frontier.
     pub(super) treekem_pending_events:
         RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// #878 r4 (review finding 2): one in-flight oversized join-result
+    /// staging task per (group, recipient) — a 1-permit semaphore each;
+    /// duplicates are dropped while a staging is running (the recipient
+    /// can re-request; the reference it fetches is byte-identical).
+    pub(super) join_result_staging_guards: StdMutex<
+        HashMap<(String, crate::identity::AgentId), std::sync::Arc<tokio::sync::Semaphore>>,
+    >,
+    /// #876: signed `MemberRoleUpdated` events that arrived before their
+    /// target member was seated locally (the member's `MemberAdded` blob
+    /// was still in flight behind the control-blob staging budget). Parked,
+    /// never dropped; replayed after the group's next accepted
+    /// `MemberAdded`. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
+    pub(super) parked_role_updates: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
     /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
     /// certificate evidence (retryable), retained so the authority can
     /// re-apply them once the joiner's announce blob resolves. Keyed by

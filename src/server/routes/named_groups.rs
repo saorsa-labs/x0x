@@ -839,6 +839,23 @@ pub(in crate::server) struct PendingTreeKemMetadataEvent {
     queued_at: Instant,
 }
 
+/// #876: a signed `MemberRoleUpdated` that arrived before its target
+/// member was seated locally. Parked instead of dropped; replayed after
+/// the group's next accepted `MemberAdded`. Bounded per group
+/// (`PARKED_ROLE_UPDATE_CAP`).
+#[derive(Debug, Clone)]
+pub(in crate::server) struct ParkedRoleUpdate {
+    pub(in crate::server) event: NamedGroupMetadataEvent,
+    pub(in crate::server) sender: AgentId,
+    pub(in crate::server) parked_at: Instant,
+}
+
+/// #876: per-group bound on parked role updates (drop-oldest with a warn).
+/// Accepted abuse (review note): an admin can park 32 junk updates to
+/// evict a real one — bounded, logged, and requires admin authority the
+/// same admin could spend on direct role churn anyway.
+pub(in crate::server) const PARKED_ROLE_UPDATE_CAP: usize = 32;
+
 /// ADR 0028: a `JoinRequestApproved` that arrived before its matching
 /// `JoinRequestCreated` predecessor. The approval is durably queued without
 /// mutating group state until the predecessor arrives and the ordinary
@@ -9240,6 +9257,11 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     }
 
     let mut still_pending = VecDeque::new();
+    // #878 r4 (finding 1): a JoinRequestApproved landing seats the
+    // requester — the drain must fire for parked role updates, but only
+    // AFTER this function's guards drop (the drain re-enters the apply
+    // path, which takes the membership lock).
+    let mut member_landed = false;
     for pending in entries {
         // ADR 0028: skip conflicted entries (reject-both, Kimi blocker 5).
         if pending.conflicted {
@@ -9419,6 +9441,9 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                 "ADR 0028 B5: queued approval drained and applied (group state durable)"
             );
             state.groups_diagnostics.record_causal_applied(group_id);
+            if applied_member_add(&pending.event) {
+                member_landed = true;
+            }
             continue;
         }
         if applied.accepted && visible_not_durable {
@@ -9484,6 +9509,15 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             let mut queue_lock = state.causal_approval_queue.write().await;
             queue_lock.insert(group_id.to_string(), queue_snapshot);
         }
+    }
+
+    // #878 r4 (finding 1): a queued JoinRequestApproved seated a member —
+    // drain this group's parked role updates now that every guard of this
+    // replay (membership, persistence, per-iteration roster) has dropped.
+    if member_landed {
+        drop(_replay_membership_guard);
+        drop(_persistence_guard);
+        Box::pin(replay_parked_role_updates(state, group_id)).await;
     }
 }
 
@@ -10076,6 +10110,17 @@ async fn apply_named_group_metadata_event_with_binding(
     // dropped, because the task-ingest drain takes `TaskList` write then
     // `named_groups` read.
     let mut cleared_quarantine = std::collections::BTreeSet::new();
+    // #876: a role update parked for a member who is landing NOW must be
+    // replayed after this apply — capture the trigger before `event` moves.
+    // #876 r2 (review item 1): the replay key is the group's LOCAL MAP
+    // KEY — the same key the park site resolved — never the raw event
+    // group id: a group whose local key differs from its stable id would
+    // otherwise never replay.
+    let member_landing_group = if applied_member_add(&event) {
+        local_group_key_for_parking(state, named_group_metadata_event_group_id(&event)).await
+    } else {
+        None
+    };
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10095,7 +10140,215 @@ async fn apply_named_group_metadata_event_with_binding(
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
+    if applied.accepted {
+        if let Some(gid) = member_landing_group {
+            replay_parked_role_updates(state, &gid).await;
+        }
+    }
     applied
+}
+
+/// #876: is this apply the one that seats a member (the replay trigger for
+/// parked role updates)?
+fn applied_member_add(event: &NamedGroupMetadataEvent) -> bool {
+    // #876 r2 (review item 2): a member can also be seated through an
+    // accepted MemberJoined (self-joins) — both release parked updates.
+    // #878 r4 (finding 1): JoinRequestApproved seats the requester too
+    // (its mutate add_member's the requester) — the third landing path.
+    matches!(
+        event,
+        NamedGroupMetadataEvent::MemberAdded { .. }
+            | NamedGroupMetadataEvent::MemberJoined { .. }
+            | NamedGroupMetadataEvent::JoinRequestApproved { .. }
+    )
+}
+
+/// #876 r2 (review item 1): resolve an event's group id to the LOCAL
+/// named-groups map key (exact match, else the stable-id match) — the
+/// key both the park site and the replay trigger must use, so a group
+/// whose local key differs from its stable id still replays.
+async fn local_group_key_for_parking(state: &AppState, event_group_id: &str) -> Option<String> {
+    let groups = state.named_groups.read().await;
+    if let Some((key, _)) = groups.get_key_value(event_group_id) {
+        return Some(key.clone());
+    }
+    groups
+        .iter()
+        .find(|(_, info)| info.stable_group_id() == event_group_id)
+        .map(|(key, _)| key.clone())
+}
+
+/// #876 (issue item 3): park a signed role update whose target member is
+/// not yet in the local roster, instead of dropping it. Bounded per group
+/// (drop-oldest with a warn); suppressed in replay contexts (`allow_queue`
+/// false) so a re-park cannot grow the lot.
+fn park_role_update_for_late_member(
+    state: &AppState,
+    group_key: &str,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    member_hex: &str,
+    allow_queue: bool,
+) {
+    tracing::warn!(
+        group_id = %LogHexId::group(group_key),
+        member = %LogHexId::agent(member_hex),
+        "role update targets a member not yet in the local roster; parking it until their MemberAdded applies (#876)"
+    );
+    if !allow_queue {
+        return;
+    }
+    let mut lot = state
+        .parked_role_updates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = lot.entry(group_key.to_string()).or_default();
+    // #876 r2 (review item 2): TTL — a member that never lands must not
+    // hold the slot forever.
+    list.retain(|entry| entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    while list.len() >= PARKED_ROLE_UPDATE_CAP {
+        let evicted = list.remove(0);
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            "parked role update cap reached; dropping the oldest ({})",
+            named_group_metadata_event_kind(&evicted.event)
+        );
+    }
+    list.push(ParkedRoleUpdate {
+        event,
+        sender,
+        parked_at: Instant::now(),
+    });
+}
+
+/// #876 r3 (review finding 1): after a member lands, drain the group's
+/// parked role updates. An entry whose target member is STILL absent is
+/// re-inserted with its ORIGINAL `parked_at` — a member who never lands
+/// must expire on the TTL, never have it reset by every other member's
+/// landing. An entry whose member HAS landed is re-applied through the
+/// ordinary apply; if that apply refuses for other reasons (a stale
+/// chain, a withdrawn group), the update is dropped with a warn — the
+/// member is seated, so this is an ordinary apply refusal, not a
+/// parking case.
+async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
+    let mut parked = {
+        let mut lot = state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lot.remove(group_key).unwrap_or_default()
+    };
+    // #876 r2 (review item 2): expired entries die with the drain.
+    parked.retain(|entry| entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    if parked.is_empty() {
+        return;
+    }
+    tracing::info!(
+        group_id = %LogHexId::group(group_key),
+        count = parked.len(),
+        oldest_parked_secs = parked
+            .first()
+            .map(|entry| entry.parked_at.elapsed().as_secs())
+            .unwrap_or_default(),
+        "member landed; replaying parked role updates (#876)"
+    );
+    let mut still_late = Vec::new();
+    for entry in parked {
+        let member_seated = {
+            let groups = state.named_groups.read().await;
+            groups.get(group_key).is_some_and(|info| {
+                role_update_target(&entry.event)
+                    .is_some_and(|member| info.members_v2.contains_key(member))
+            })
+        };
+        if !member_seated {
+            still_late.push(entry);
+            continue;
+        }
+        let outcome = Box::pin(apply_named_group_metadata_event(
+            state,
+            entry.event,
+            entry.sender,
+            true,
+            None,
+        ))
+        .await;
+        if !outcome.accepted {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_key),
+                "a drained role update was refused with its member seated; dropping it (#876 r3)"
+            );
+        }
+    }
+    if still_late.is_empty() {
+        return;
+    }
+    let mut lot = state
+        .parked_role_updates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = lot.entry(group_key.to_string()).or_default();
+    for entry in still_late {
+        // Re-inserted entries keep their ORIGINAL parked_at (TTL
+        // continuity — the finding-1 fix) and arrival order.
+        list.push(entry);
+    }
+    list.sort_by_key(|entry| entry.parked_at);
+    while list.len() > PARKED_ROLE_UPDATE_CAP {
+        let evicted = list.remove(0);
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            "parked role update cap reached; dropping the oldest ({})",
+            named_group_metadata_event_kind(&evicted.event)
+        );
+    }
+}
+
+/// #878 r5: drop the per-pair guard entry once its staging task ends —
+/// the map must not grow with the (group, recipient) universe. Removed
+/// only when the stored semaphore is the SAME instance and fully
+/// released (no other task holds a permit on it).
+fn release_join_result_staging_guard(state: &AppState, key: &(String, AgentId)) {
+    let mut guards = state
+        .join_result_staging_guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The semaphore always has exactly 1 permit: available == 1 means
+    // no staging task holds it.
+    if guards
+        .get(key)
+        .is_some_and(|semaphore| semaphore.available_permits() == 1)
+    {
+        guards.remove(key);
+    }
+}
+
+/// #878 r4 (review finding 2): acquire the single in-flight permit for
+/// an oversized join-result staging task for this (group, recipient).
+/// `None` while one is already running (the duplicate is dropped).
+fn acquire_join_result_staging_permit(
+    state: &AppState,
+    group_id: &str,
+    recipient: &AgentId,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let mut guards = state
+        .join_result_staging_guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let semaphore = guards
+        .entry((group_id.to_string(), *recipient))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    semaphore.try_acquire_owned().ok()
+}
+
+/// #876 r3: the `agent_id` a `MemberRoleUpdated` targets, if the event
+/// is one.
+fn role_update_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
+    match event {
+        NamedGroupMetadataEvent::MemberRoleUpdated { agent_id, .. } => Some(agent_id),
+        _ => None,
+    }
 }
 
 async fn apply_named_group_metadata_event_inner(
@@ -10109,6 +10362,16 @@ async fn apply_named_group_metadata_event_inner(
     // ADR 0028: replay is called after _serialized returns (guard dropped).
     // Only when allow_queue is true (suppressed during replay itself to
     // prevent recursion).
+    // #876 r3 (review finding 2): this wrapper is the path a MemberAdded
+    // lands through when the TreeKEM pending replay applies it
+    // (`replay_pending_treekem_events` calls here with allow_queue =
+    // false) — the lagging-join shape #876 exists for. Capture the same
+    // #876 landing trigger the direct-apply wrapper uses.
+    let member_landing_group = if applied_member_add(&event) {
+        Some(named_group_metadata_event_group_id(&event).to_string())
+    } else {
+        None
+    };
     let mut replay_group_id: Option<String> = None;
     // #759 item 1: as in `apply_named_group_metadata_event` above — the
     // notification is consumed only after the (guard-free) replay call.
@@ -10134,6 +10397,15 @@ async fn apply_named_group_metadata_event_inner(
         }
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
+    if applied.accepted {
+        if let Some(event_gid) = member_landing_group {
+            // Resolve to the local map key AFTER the apply (the group may
+            // have been installed by this very apply).
+            if let Some(gid) = local_group_key_for_parking(state, &event_gid).await {
+                replay_parked_role_updates(state, &gid).await;
+            }
+        }
+    }
     applied
 }
 
@@ -11321,6 +11593,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 ) {
                     return ApplyMetadataResult::REJECTED;
                 }
+                // #876 r3 (review finding 3): the group is gone — its
+                // parked role updates die with it.
+                for alias in &cache_aliases {
+                    state
+                        .parked_role_updates
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(alias);
+                }
                 *replay_group_id = Some(resolved_group_key.clone());
                 save_mls_groups(state).await;
                 let _ =
@@ -11512,6 +11793,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let Some(target) = info.members_v2.get(&agent_id).cloned() else {
+                // #876 (issue item 3): the member's own MemberAdded has
+                // not reached this roster yet (its join blob can lag
+                // behind the control-blob staging budget). Never drop the
+                // signed role update silently — park it and replay once
+                // the member lands. The apply result stays REJECTED so
+                // ordering semantics are unchanged.
+                park_role_update_for_late_member(
+                    state,
+                    &resolved_group_key,
+                    event_for_log.clone(),
+                    sender,
+                    &agent_id,
+                    allow_queue,
+                );
                 return ApplyMetadataResult::REJECTED;
             };
             if target.is_removed() || target.is_banned() {
@@ -19383,6 +19678,16 @@ async fn wipe_local_group_crypto_material(
         }
     }
     state.control_blobs.prune_groups(&aliases);
+    // #876 r2 (review item 2): parked role updates die with the group.
+    {
+        let mut lot = state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for alias in &aliases {
+            lot.remove(alias);
+        }
+    }
 
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
@@ -19739,6 +20044,15 @@ async fn leave_treekem_group(
     }
     // #341 Phase B: left/removed group — retire its encrypted stores.
     super::retire_group_kv_stores(&state, &id).await;
+    // #876 r3 (review finding 3): the group is gone — its parked role
+    // updates die with it.
+    for alias in &cache_aliases {
+        state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(alias);
+    }
     let _ = prune_treekem_cache_groups(&state, &cache_aliases, "treekem_leave").await;
     state.group_card_cache.write().await.remove(&id);
     state.mls_groups.write().await.remove(&id);
@@ -21021,6 +21335,15 @@ pub(in crate::server) async fn leave_group(
     }
     // #341 Phase B: left/removed group — retire its encrypted stores.
     super::retire_group_kv_stores(&state, &id).await;
+    // #878 r4 (review finding 3): the non-TreeKEM leave deletes the
+    // group — its parked role updates die with it.
+    for alias in &cache_aliases {
+        state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(alias);
+    }
     let mut cache = state.group_card_cache.write().await;
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
@@ -33641,19 +33964,52 @@ async fn handle_join_result_message_bound(
                     );
                     return;
                 }
-                if let Err(e) = control_blob::send_reference(
-                    &state.control_blobs,
-                    &state.agent,
-                    sender,
-                    control_blob::ControlBlobKind::JoinResult,
-                    &group_id,
-                    attempt_id.as_deref(),
-                    payload,
-                )
-                .await
-                {
-                    tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to send join-result reference: {e}");
-                }
+                // #876 r2 (review item 3) + #878 r4 (finding 2): the
+                // bounded staging retry must NOT run inside the single
+                // join-result listener loop, and repeated requests from
+                // the same (group, recipient) must not stack overlapping
+                // staging tasks. One 1-permit semaphore per pair: a
+                // duplicate while a staging runs is DROPPED (the
+                // reference it would stage is byte-identical; the
+                // recipient's retry fetches the live one).
+                let Some(permit) = acquire_join_result_staging_permit(state, &group_id, sender)
+                else {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&group_id),
+                        member = %LogHexId::agent(&member_agent_id),
+                        "join-result staging already in flight for this recipient; dropping the duplicate (#878 r4)"
+                    );
+                    return;
+                };
+                let control_blobs = state.control_blobs.clone();
+                let agent = Arc::clone(&state.agent);
+                let group_id_for_task = group_id.clone();
+                let attempt = attempt_id.clone();
+                let member_for_log = member_agent_id.clone();
+                let recipient = *sender;
+                let guard_key = (group_id.clone(), *sender);
+                let guard_state = Arc::clone(state);
+                tokio::spawn(async move {
+                    let _staging_permit = permit;
+                    let outcome = control_blob::send_reference(
+                        &control_blobs,
+                        &agent,
+                        &recipient,
+                        control_blob::ControlBlobKind::JoinResult,
+                        &group_id_for_task,
+                        attempt.as_deref(),
+                        payload,
+                    )
+                    .await;
+                    // #878 r5 (review): drop OUR permit BEFORE pruning,
+                    // so the released semaphore is observably idle — the
+                    // prune condition (available == 1) actually holds.
+                    drop(_staging_permit);
+                    release_join_result_staging_guard(&guard_state, &guard_key);
+                    if let Err(e) = outcome {
+                        tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
+                    }
+                });
                 return;
             }
             if let Err(e) = state
@@ -35797,6 +36153,8 @@ pub(in crate::server) mod tests {
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
+            parked_role_updates: StdMutex::new(HashMap::new()),
+            join_result_staging_guards: StdMutex::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
             public_group_bootstrap_outbox: RwLock::new(HashMap::new()),
@@ -41188,6 +41546,1168 @@ pub(in crate::server) mod tests {
             x0x::groups::GroupRole::Member
         );
         assert_eq!(stored.shared_secret, Some(vec![9; 32]));
+        Ok(())
+    }
+
+    /// #876 (issue item 3): a role update that arrives before its target
+    /// member's `MemberAdded` must be PARKED (warn) — never silently
+    /// dropped — and replayed to acceptance once the member lands. This is
+    /// the R15 shape: the member's join blob lagged behind the control-blob
+    /// staging budget, so sfo saw the role update first. On the pre-fix
+    /// head the update is silently rejected and the lot stays empty (the
+    /// fail-before).
+    #[tokio::test]
+    async fn role_update_for_late_member_parks_then_replays_on_member_add() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "role-update-late-member-876";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        // #876 r2 (review item 1): the group's LOCAL MAP KEY differs
+        // from its stable id (genesis-pinned), so the parked update is
+        // keyed under the map key while the events carry the stable id —
+        // the mismatch shape the replay must survive.
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "876-stable-role-late".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let foreign = "33".repeat(32);
+
+        // The owner's chain: MemberAdded seats `foreign`, RoleUpdated
+        // promotes them — both sealed exactly as production seals them.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            foreign.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let revision_add = seated.roster_revision;
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        // Advance the scratch to the post-add state the authority holds
+        // (the role update must chain from the MemberAdded's hash).
+        seated.prev_state_hash = Some(parent.state_hash.clone());
+        seated.state_hash = commit_add.state_hash.clone();
+        seated.state_revision = commit_add.revision;
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_add,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+        };
+
+        let mut adminified = seated.clone();
+        adminified.roster_revision = adminified.roster_revision.saturating_add(1);
+        adminified.set_member_role(&foreign, x0x::groups::GroupRole::Admin);
+        let revision_role = adminified.roster_revision;
+        let commit_role = sign_metadata_terminality_commit(&seated, &adminified, &state, 3_000);
+        let role_update = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_role,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(commit_role),
+        };
+
+        // 1) The role update arrives FIRST: the member is not in the local
+        //    roster, so the apply refuses — but parks instead of dropping.
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_update.clone(),
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted, "the member has not landed yet");
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                lot.get(group_id).map(Vec::len),
+                Some(1),
+                "#876: the role update is PARKED, not dropped"
+            );
+        }
+
+        // 2) The MemberAdded lands: accepted, and the parked role update
+        //    replays through the ordinary apply to acceptance.
+        let applied_add = apply_named_group_metadata_event(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(applied_add.accepted, "the member lands: {applied_add:?}");
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(group_id).expect("group retained");
+            assert!(stored.has_active_member(&foreign));
+            assert_eq!(
+                stored.members_v2[&foreign].role,
+                x0x::groups::GroupRole::Admin,
+                "#876: the parked role update replayed to acceptance"
+            );
+        }
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                lot.get(group_id).is_none_or(|list| list.is_empty()),
+                "#876: the parking lot drained after the replay"
+            );
+        }
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 1): a parked update whose member never
+    /// lands keeps its ORIGINAL `parked_at` across other members'
+    /// landings (the TTL is not reset by the drain), and finally EXPIRES
+    /// on the TTL. On the r2 drain (re-park with `Instant::now()`) the
+    /// timestamp assert fails (the fail-before); without the expiry
+    /// retain the second phase fails.
+    #[tokio::test]
+    async fn parked_update_keeps_its_ttl_across_other_members_landing() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-ttl-continuity-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        // Distinct stable id from the map key (the r1.1 shape).
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-parked-ttl".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        let never_lands = "44".repeat(32);
+        let lands_first = "55".repeat(32);
+        let lands_second = "66".repeat(32);
+
+        // Park: a role update for `never_lands` (no commit validation is
+        // needed to reach the parking site — the member check precedes
+        // the stateful apply).
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: never_lands,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        let parked_at_original = {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lot.get(group_id).expect("parked")[0].parked_at
+        };
+
+        // A DIFFERENT member lands: the drain runs, `never_lands` is
+        // still absent — the entry must be re-inserted with its ORIGINAL
+        // parked_at (TTL continuity).
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            lands_first.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: seated.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: lands_first,
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+        };
+        let applied_add = apply_named_group_metadata_event(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(applied_add.accepted, "first member lands: {applied_add:?}");
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let list = lot
+                .get(group_id)
+                .expect("still parked for the absent member");
+            assert_eq!(list.len(), 1);
+            assert_eq!(
+                list[0].parked_at, parked_at_original,
+                "#878 r3: the drain must NOT reset the TTL of an update whose member never lands"
+            );
+        }
+
+        // Expire it, then land another member: the drain now DROPS it.
+        {
+            let mut lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lot.get_mut(group_id).expect("parked")[0].parked_at =
+                Instant::now() - PENDING_JOIN_RESULT_TTL - std::time::Duration::from_secs(1);
+        }
+        let seated_now = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group")
+            .clone();
+        let mut seated2 = seated_now.clone();
+        seated2.roster_revision = seated2.roster_revision.saturating_add(1);
+        seated2.add_member(
+            lands_second.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add2 = sign_metadata_terminality_commit(&seated_now, &seated2, &state, 3_000);
+        let member_added2 = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: seated2.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: lands_second,
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add2),
+        };
+        let applied_add2 = apply_named_group_metadata_event(
+            &state,
+            member_added2,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            applied_add2.accepted,
+            "second member lands: {applied_add2:?}"
+        );
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                lot.get(group_id).is_none_or(|list| list.is_empty()),
+                "#878 r3: the expired entry is dropped, never re-parked forever"
+            );
+        }
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 4b): teardown — a self-leave that deletes
+    /// the local group clears its parked updates. Reverting the clear
+    /// leaves the lot populated (the fail-before).
+    #[tokio::test]
+    async fn self_leave_deletion_clears_the_parked_lot() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-self-leave-878";
+        let (mut info, admin_hex, member_hex) = metadata_terminality_test_group(&state, group_id);
+        // The OTHER member is an admin, so the local agent's self-leave
+        // passes the last-admin invariant (the apply's mutate removes
+        // ONLY the leaver).
+        info.set_member_role(&member_hex, x0x::groups::GroupRole::Admin);
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        // Park a role update for a member who never lands.
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: "77".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // The local agent self-leaves: the local group is deleted and its
+        // parked updates die with it.
+        let mut scratch = parent.clone();
+        scratch.remove_member(&admin_hex, Some(admin_hex.clone()));
+        let commit = sign_metadata_terminality_commit(&parent, &scratch, &state, 2_000);
+        let leave_event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: admin_hex,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(commit),
+        };
+        let leave = apply_named_group_metadata_event(
+            &state,
+            leave_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(leave.accepted, "self-leave path: {leave:?}");
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r3: the parked lot dies with the group"
+        );
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 4b): a `MemberJoined` landing ALSO drains
+    /// the parked lot (`applied_member_add` matches both seating paths).
+    /// Reverting the MemberJoined arm leaves the lot populated (the
+    /// fail-before).
+    #[tokio::test]
+    async fn member_joined_landing_also_drains_parked_updates() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-member-joined-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-member-joined".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        let invite_secret = "member-joined-878-secret".to_string();
+        info.record_issued_invite(
+            invite_secret.clone(),
+            now_millis_u64() / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // The joiner: a real member-signed MemberJoined (GSS plane, real
+        // keypair, matching invite secret).
+        let joiner_kp = crate::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner_kp.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let ts_ms = now_millis_u64();
+        let canonical = canonical_member_joined_bytes(
+            parent.stable_group_id(),
+            Some(parent.stable_group_id()),
+            &joiner_hex,
+            &BASE64.encode(joiner_kp.public_key().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            None,
+            &admin_hex,
+            &invite_secret,
+            ts_ms,
+            None,
+        );
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            joiner_kp.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| anyhow::anyhow!("sign join fixture: {e:?}"))?;
+        let member_joined = NamedGroupMetadataEvent::MemberJoined {
+            group_id: parent.stable_group_id().to_string(),
+            stable_group_id: Some(parent.stable_group_id().to_string()),
+            member_agent_id: joiner_hex.clone(),
+            member_public_key_b64: BASE64.encode(joiner_kp.public_key().as_bytes()),
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: admin_hex.clone(),
+            invite_secret,
+            ts_ms,
+            treekem_key_package_b64: None,
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: BASE64.encode(signature.as_bytes()),
+            certificate_b64: None,
+        };
+
+        // Park a role update for the joiner BEFORE they land.
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: joiner_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_some_and(|list| !list.is_empty()),
+            "parked before the join"
+        );
+
+        // The joiner lands through an accepted MemberJoined.
+        let join =
+            apply_named_group_metadata_event(&state, member_joined, joiner_id, true, None).await;
+        assert!(join.accepted, "the join lands: {join:?}");
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r3: the MemberJoined landing drains the parked lot"
+        );
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 2): the TreeKEM pending-replay path lands
+    /// its MemberAdded through `apply_named_group_metadata_event_inner`
+    /// (`replay_pending_treekem_events`, allow_queue = false) — the
+    /// landing hook must fire THERE too, or the lagging joiner's parked
+    /// role updates never drain. Removing the inner-path hook leaves the
+    /// lot populated (the fail-before).
+    #[tokio::test]
+    async fn inner_replay_path_landing_drains_parked_updates() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-inner-replay-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-inner-replay".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        let invite_secret = "inner-replay-878-secret".to_string();
+        info.record_issued_invite(
+            invite_secret.clone(),
+            now_millis_u64() / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // Park a role update for the joiner first.
+        let joiner_hex = "88".repeat(32);
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: joiner_hex.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // The member lands through the INNER path (the TreeKEM
+        // pending-replay entry) with allow_queue = false.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: seated.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: joiner_hex,
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+        };
+        let applied_inner = apply_named_group_metadata_event_inner(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            applied_inner.accepted,
+            "the inner path lands: {applied_inner:?}"
+        );
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r3: the INNER-path landing drains the parked lot"
+        );
+        Ok(())
+    }
+
+    /// #878 r4 (review finding 1): a `JoinRequestApproved` landing ALSO
+    /// seats a member — the causal-approval replay path (and the direct
+    /// apply) must drain the parked lot. Removing the
+    /// JoinRequestApproved arm from `applied_member_add` (or the
+    /// replay's post-guard drain) leaves the lot populated (the
+    /// fail-before).
+    #[tokio::test]
+    async fn join_request_approved_landing_drains_parked_updates() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-join-approval-878";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "878-stable-join-approval".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        // The pending join request the approval resolves.
+        info.join_requests.insert(
+            "req-878".to_string(),
+            x0x::groups::JoinRequest::new(
+                group_id.to_string(),
+                "99".repeat(32),
+                None,
+                now_millis_u64(),
+            ),
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // Park a role update for the requester BEFORE approval.
+        let requester = "99".repeat(32);
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: parent.state_revision.saturating_add(1),
+            actor: admin_hex.clone(),
+            agent_id: requester.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(sign_metadata_terminality_commit(
+                &parent, &parent, &state, 1_000,
+            )),
+        };
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_event,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // The approval seats the requester.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            requester.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        let approval = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-878".to_string(),
+            revision: seated.roster_revision,
+            actor: admin_hex.clone(),
+            requester_agent_id: requester,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            commit: Some(commit_add),
+        };
+        let applied_approval =
+            apply_named_group_metadata_event(&state, approval, state.agent.agent_id(), true, None)
+                .await;
+        assert!(
+            applied_approval.accepted,
+            "the approval lands: {applied_approval:?}"
+        );
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "#878 r4: the JoinRequestApproved landing drains the parked lot"
+        );
+        Ok(())
+    }
+
+    /// #878 r4 (review follow-up): the CAUSAL-QUEUE replay drain. A
+    /// lagging peer receives the approval BEFORE the join request it
+    /// resolves: the approval is queued, the JoinRequestCreated then
+    /// lands (the production replay trigger), the replay applies the
+    /// approval through _serialized directly, seats the requester, and
+    /// — only with the post-guard drain (:9498-9506 region) — the
+    /// parked role update APPLIES. Asserts the ROLE CHANGE LANDED, not
+    /// only that the lot drained. Deleting the replay drain leaves the
+    /// requester at Member (the fail-before).
+    #[tokio::test]
+    async fn causal_queue_approval_landing_applies_the_parked_role_update() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-causal-queue-878";
+        // NOTE: map key == stable id here (no genesis pinning) — the
+        // causal-queue admission binds the decoded event's group_id to
+        // the resolved map key; the distinct-key park coverage lives in
+        // the other r3/r4 tests.
+        let (info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let admin_id = state.agent.agent_id();
+
+        // The requester's REAL keypair: the JoinRequestCreated is
+        // member-signed by them (NonMemberRequest commit).
+        let requester_kp = crate::identity::AgentKeypair::generate()?;
+        let requester_id = requester_kp.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+
+        // Precompute the sender's consecutive chain exactly as the
+        // producing peer sealed it:
+        //   state0 (no record) --Created--> state1 --Approved--> state2.
+        let mut state1 = parent.clone();
+        state1.roster_revision = state1.roster_revision.saturating_add(1);
+        state1.join_requests.insert(
+            "req-causal-878".to_string(),
+            x0x::groups::JoinRequest::new(
+                group_id.to_string(),
+                requester_hex.clone(),
+                None,
+                now_millis_u64(),
+            ),
+        );
+        let created_commit = x0x::groups::GroupStateCommit::sign(
+            parent.stable_group_id().to_string(),
+            parent.state_revision.saturating_add(1),
+            Some(parent.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state1.members_v2),
+            x0x::groups::compute_policy_hash(&state1.policy),
+            x0x::groups::compute_public_meta_hash(&state1.public_meta()),
+            state1.security_binding.clone(),
+            false,
+            1_000,
+            &requester_kp,
+        )?;
+        // state1 as the apply leaves it.
+        state1.prev_state_hash = Some(parent.state_hash.clone());
+        state1.state_hash = created_commit.state_hash.clone();
+        state1.state_revision = created_commit.revision;
+
+        let mut state2 = state1.clone();
+        state2.roster_revision = state2.roster_revision.saturating_add(1);
+        state2.add_member(
+            requester_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let approval_revision = state2.roster_revision;
+        let approval_commit = x0x::groups::GroupStateCommit::sign(
+            parent.stable_group_id().to_string(),
+            state1.state_revision.saturating_add(1),
+            Some(state1.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state2.members_v2),
+            x0x::groups::compute_policy_hash(&state2.policy),
+            x0x::groups::compute_public_meta_hash(&state2.public_meta()),
+            state2.security_binding.clone(),
+            false,
+            2_000,
+            state.agent.identity().agent_keypair(),
+        )?;
+
+        // The post-join state the role update chains from (the admin
+        // seals it AFTER the join — realistic late-arrival ordering).
+        state2.prev_state_hash = Some(state1.state_hash.clone());
+        state2.state_hash = approval_commit.state_hash.clone();
+        state2.state_revision = state1.state_revision.saturating_add(1);
+        let mut state3 = state2.clone();
+        state3.roster_revision = state3.roster_revision.saturating_add(1);
+        state3.set_member_role(&requester_hex, x0x::groups::GroupRole::Admin);
+        let role_commit = x0x::groups::GroupStateCommit::sign(
+            state2.stable_group_id().to_string(),
+            state2.state_revision.saturating_add(1),
+            Some(state2.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state3.members_v2),
+            x0x::groups::compute_policy_hash(&state3.policy),
+            x0x::groups::compute_public_meta_hash(&state3.public_meta()),
+            state3.security_binding.clone(),
+            false,
+            3_000,
+            state.agent.identity().agent_keypair(),
+        )?;
+
+        // 1) Park the role update for the requester (they have not
+        //    landed).
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: state3.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: requester_hex.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(role_commit),
+        };
+        let applied =
+            apply_named_group_metadata_event(&state, role_event, admin_id, true, None).await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // 2) The approval arrives BEFORE its predecessor — queued.
+        let approval = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-causal-878".to_string(),
+            revision: approval_revision,
+            actor: admin_hex.clone(),
+            requester_agent_id: requester_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            commit: Some(approval_commit),
+        };
+        // The REAL V2 envelope signed by the approval actor over the
+        // group's metadata topic (what validate_causal_envelope checks).
+        let metadata_topic = parent.metadata_topic.clone();
+        let admin_kp = state.agent.identity().agent_keypair();
+        let envelope = {
+            use ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa;
+            let payload = serde_json::to_vec(&approval)?;
+            let agent_id = state.agent.agent_id();
+            let pub_bytes = admin_kp.public_key().as_bytes();
+            let mut signing = Vec::with_capacity(10 + 32 + metadata_topic.len() + payload.len());
+            signing.extend_from_slice(b"x0x-msg-v2");
+            signing.extend_from_slice(agent_id.as_bytes());
+            signing.extend_from_slice(metadata_topic.as_bytes());
+            signing.extend_from_slice(&payload);
+            let sig = sign_with_ml_dsa(admin_kp.secret_key(), &signing)
+                .map_err(|e| anyhow::anyhow!("sign envelope: {e:?}"))?;
+            let sig_bytes = sig.as_bytes();
+            let topic_bytes = metadata_topic.as_bytes();
+            let mut buf = Vec::with_capacity(
+                1 + 32
+                    + 2
+                    + pub_bytes.len()
+                    + 2
+                    + sig_bytes.len()
+                    + 2
+                    + topic_bytes.len()
+                    + payload.len(),
+            );
+            buf.push(0x02u8);
+            buf.extend_from_slice(agent_id.as_bytes());
+            buf.extend_from_slice(&(pub_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(pub_bytes);
+            buf.extend_from_slice(&(sig_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(sig_bytes);
+            buf.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(topic_bytes);
+            buf.extend_from_slice(&payload);
+            buf
+        };
+        let approval_apply =
+            apply_named_group_metadata_event(&state, approval, admin_id, true, Some(&envelope))
+                .await;
+        assert!(
+            !approval_apply.accepted,
+            "no record yet — queued, not applied"
+        );
+        assert!(
+            state
+                .causal_approval_queue
+                .read()
+                .await
+                .get(group_id)
+                .is_some_and(|q| !q.is_empty()),
+            "the approval was admitted to the causal queue"
+        );
+
+        // 3) The predecessor lands: the requester's member-signed
+        //    JoinRequestCreated. Its acceptance triggers the causal
+        //    replay (the production trigger), which applies the queued
+        //    approval and — with the post-guard drain — the parked role
+        //    update.
+        let created = NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-causal-878".to_string(),
+            requester_agent_id: requester_hex.clone(),
+            message: None,
+            ts: now_millis_u64(),
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit: Some(created_commit),
+        };
+        let created_apply =
+            apply_named_group_metadata_event(&state, created, requester_id, true, None).await;
+        assert!(
+            created_apply.accepted,
+            "the predecessor lands: {created_apply:?}"
+        );
+
+        // 4) THE assertion: the role change LANDED through the whole
+        //    chain (created → replay → approval → drain → role update).
+        {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(group_id).expect("group retained");
+            let seat = info
+                .members_v2
+                .get(&requester_hex)
+                .expect("the requester was seated by the replayed approval");
+            assert!(
+                seat.is_active(),
+                "the replayed approval seated the requester as an active member"
+            );
+            assert_eq!(
+                seat.role,
+                x0x::groups::GroupRole::Admin,
+                "#878 r4: the PARKED role update applied after the causal-queue landing"
+            );
+        }
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "the parked lot drained"
+        );
+        Ok(())
+    }
+
+    /// #878 r4 (review finding 2): a second concurrent oversized
+    /// join-result staging for the same (group, recipient) does NOT start
+    /// a second task — the 1-permit guard drops the duplicate. Removing
+    /// the guard lets the second acquire succeed (the fail-before: the
+    /// assert on None fails).
+    #[tokio::test]
+    async fn concurrent_join_result_staging_is_bounded_per_recipient() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "staging-bound-878".to_string();
+        let recipient = crate::identity::AgentId([0x5A; 32]);
+        let first = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(first.is_some(), "the first staging acquires the permit");
+        let second = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(
+            second.is_none(),
+            "#878 r4: the duplicate staging is dropped while the first runs"
+        );
+        drop(first);
+        let third = acquire_join_result_staging_permit(&state, &group_id, &recipient);
+        assert!(
+            third.is_some(),
+            "the permit is released when the staging task ends"
+        );
+        // A DIFFERENT recipient is unaffected.
+        let other = crate::identity::AgentId([0x5B; 32]);
+        assert!(acquire_join_result_staging_permit(&state, &group_id, &other).is_some());
+        // #878 r5: the guard entry is PRUNED once released (no map growth
+        // with the (group, recipient) universe).
+        drop(third);
+        release_join_result_staging_guard(&state, &(group_id.clone(), recipient));
+        assert!(
+            !state
+                .join_result_staging_guards
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&(group_id.clone(), recipient)),
+            "the per-pair guard entry is pruned after release"
+        );
+        Ok(())
+    }
+
+    /// #878 r3 (review finding 4a): the RECIPIENT sends the Release. A
+    /// real pull on a single networked state looped to itself (gossip
+    /// delivers own publishes to own subscriptions): the production
+    /// dispatch answers Fetch with Chunk; the pull reassembles,
+    /// digest-verifies and EMITS its Release notice; the same dispatch
+    /// handles it and frees the staged slot. Deleting the release notice
+    /// in `fetch_and_apply` leaves the slot staged forever (the
+    /// fail-before).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completed_pull_sends_its_release_over_the_wire() -> Result<()> {
+        let plane = format!("ctrl-release-{}", rand::random::<u32>());
+        let (state, _dir) = networked_test_state(&plane).await?;
+        let group_id = insert_local_public_group(&state, &"b1".repeat(16)).await;
+        let local = state.agent.agent_id();
+        let local_hex = hex::encode(local.as_bytes());
+        // A Trusted contact card for OURSELVES with our own KEM (the
+        // gossip-DM capability shape the advert service normally
+        // converges).
+        state
+            .agent
+            .contacts()
+            .write()
+            .await
+            .add(crate::contacts::Contact {
+                agent_id: local,
+                trust_level: crate::contacts::TrustLevel::Trusted,
+                label: None,
+                added_at: 0,
+                last_seen: None,
+                identity_type: crate::contacts::IdentityType::Known,
+                machines: Vec::new(),
+                dm_capabilities: Some(crate::dm::DmCapabilities::v1_gossip_ready(
+                    state.agent_kem_keypair.public_bytes.clone(),
+                )),
+            });
+        // Production dispatch (test states skip server listener startup).
+        {
+            let dispatch_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let mut rx = dispatch_state.agent.subscribe_direct();
+                while let Some(msg) = rx.recv().await {
+                    if let Ok(message) = serde_json::from_slice::<ControlBlobMessage>(&msg.payload)
+                    {
+                        handle_control_blob_message(
+                            &dispatch_state,
+                            &msg.sender,
+                            msg.verified,
+                            message,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+        // The payload is deliberately NOT valid event JSON: the pull still
+        // completes and digest-verifies (which is what triggers the
+        // Release); only the post-release apply refuses it.
+        let bytes = vec![0xA6u8; x0x::dm::MAX_PAYLOAD_BYTES + 512];
+        let reference = crate::server::routes::named_groups::control_blob::test_reference(
+            &bytes, &group_id, &local_hex, &local_hex,
+        );
+        state
+            .control_blobs
+            .stage(reference.clone(), bytes)
+            .map_err(|e| anyhow::anyhow!("stage: {e}"))?;
+        // The recipient sees its own Reference through the production
+        // handler (the transport delivery is the gossip self-loop).
+        handle_control_blob_message(
+            &state,
+            &local,
+            true,
+            ControlBlobMessage::Reference {
+                reference: reference.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            state.control_blobs.staged_len(),
+            1,
+            "the reference is staged"
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.control_blobs.staged_len() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "#878 r3: the completed pull never sent its Release"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        state.agent.shutdown().await;
         Ok(())
     }
 
