@@ -10129,6 +10129,25 @@ async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
     }
 }
 
+/// #878 r5: drop the per-pair guard entry once its staging task ends —
+/// the map must not grow with the (group, recipient) universe. Removed
+/// only when the stored semaphore is the SAME instance and fully
+/// released (no other task holds a permit on it).
+fn release_join_result_staging_guard(state: &AppState, key: &(String, AgentId)) {
+    let mut guards = state
+        .join_result_staging_guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The semaphore always has exactly 1 permit: available == 1 means
+    // no staging task holds it.
+    if guards
+        .get(key)
+        .is_some_and(|semaphore| semaphore.available_permits() == 1)
+    {
+        guards.remove(key);
+    }
+}
+
 /// #878 r4 (review finding 2): acquire the single in-flight permit for
 /// an oversized join-result staging task for this (group, recipient).
 /// `None` while one is already running (the duplicate is dropped).
@@ -33670,9 +33689,11 @@ async fn handle_join_result_message_bound(
                 let attempt = attempt_id.clone();
                 let member_for_log = member_agent_id.clone();
                 let recipient = *sender;
+                let guard_key = (group_id.clone(), *sender);
+                let guard_state = Arc::clone(state);
                 tokio::spawn(async move {
                     let _staging_permit = permit;
-                    if let Err(e) = control_blob::send_reference(
+                    let outcome = control_blob::send_reference(
                         &control_blobs,
                         &agent,
                         &recipient,
@@ -33681,8 +33702,12 @@ async fn handle_join_result_message_bound(
                         attempt.as_deref(),
                         payload,
                     )
-                    .await
-                    {
+                    .await;
+                    // #878 r5: prune the per-pair guard entry so the map
+                    // does not grow with the (group, recipient) universe.
+                    // Only when nobody else holds the pair's semaphore.
+                    release_join_result_staging_guard(&guard_state, &guard_key);
+                    if let Err(e) = outcome {
                         tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
                     }
                 });
@@ -41997,6 +42022,261 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// #878 r4 (review follow-up): the CAUSAL-QUEUE replay drain. A
+    /// lagging peer receives the approval BEFORE the join request it
+    /// resolves: the approval is queued, the JoinRequestCreated then
+    /// lands (the production replay trigger), the replay applies the
+    /// approval through _serialized directly, seats the requester, and
+    /// — only with the post-guard drain (:9498-9506 region) — the
+    /// parked role update APPLIES. Asserts the ROLE CHANGE LANDED, not
+    /// only that the lot drained. Deleting the replay drain leaves the
+    /// requester at Member (the fail-before).
+    #[tokio::test]
+    async fn causal_queue_approval_landing_applies_the_parked_role_update() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "parked-causal-queue-878";
+        // NOTE: map key == stable id here (no genesis pinning) — the
+        // causal-queue admission binds the decoded event's group_id to
+        // the resolved map key; the distinct-key park coverage lives in
+        // the other r3/r4 tests.
+        let (info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let admin_id = state.agent.agent_id();
+
+        // The requester's REAL keypair: the JoinRequestCreated is
+        // member-signed by them (NonMemberRequest commit).
+        let requester_kp = crate::identity::AgentKeypair::generate()?;
+        let requester_id = requester_kp.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+
+        // Precompute the sender's consecutive chain exactly as the
+        // producing peer sealed it:
+        //   state0 (no record) --Created--> state1 --Approved--> state2.
+        let mut state1 = parent.clone();
+        state1.roster_revision = state1.roster_revision.saturating_add(1);
+        state1.join_requests.insert(
+            "req-causal-878".to_string(),
+            x0x::groups::JoinRequest::new(
+                group_id.to_string(),
+                requester_hex.clone(),
+                None,
+                now_millis_u64(),
+            ),
+        );
+        let created_commit = x0x::groups::GroupStateCommit::sign(
+            parent.stable_group_id().to_string(),
+            parent.state_revision.saturating_add(1),
+            Some(parent.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state1.members_v2),
+            x0x::groups::compute_policy_hash(&state1.policy),
+            x0x::groups::compute_public_meta_hash(&state1.public_meta()),
+            state1.security_binding.clone(),
+            false,
+            1_000,
+            &requester_kp,
+        )?;
+        // state1 as the apply leaves it.
+        state1.prev_state_hash = Some(parent.state_hash.clone());
+        state1.state_hash = created_commit.state_hash.clone();
+        state1.state_revision = created_commit.revision;
+
+        let mut state2 = state1.clone();
+        state2.roster_revision = state2.roster_revision.saturating_add(1);
+        state2.add_member(
+            requester_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let approval_revision = state2.roster_revision;
+        let approval_commit = x0x::groups::GroupStateCommit::sign(
+            parent.stable_group_id().to_string(),
+            state1.state_revision.saturating_add(1),
+            Some(state1.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state2.members_v2),
+            x0x::groups::compute_policy_hash(&state2.policy),
+            x0x::groups::compute_public_meta_hash(&state2.public_meta()),
+            state2.security_binding.clone(),
+            false,
+            2_000,
+            state.agent.identity().agent_keypair(),
+        )?;
+
+        // The post-join state the role update chains from (the admin
+        // seals it AFTER the join — realistic late-arrival ordering).
+        state2.prev_state_hash = Some(state1.state_hash.clone());
+        state2.state_hash = approval_commit.state_hash.clone();
+        state2.state_revision = state1.state_revision.saturating_add(1);
+        let mut state3 = state2.clone();
+        state3.roster_revision = state3.roster_revision.saturating_add(1);
+        state3.set_member_role(&requester_hex, x0x::groups::GroupRole::Admin);
+        let role_commit = x0x::groups::GroupStateCommit::sign(
+            state2.stable_group_id().to_string(),
+            state2.state_revision.saturating_add(1),
+            Some(state2.state_hash.clone()),
+            x0x::groups::compute_roster_root(&state3.members_v2),
+            x0x::groups::compute_policy_hash(&state3.policy),
+            x0x::groups::compute_public_meta_hash(&state3.public_meta()),
+            state3.security_binding.clone(),
+            false,
+            3_000,
+            state.agent.identity().agent_keypair(),
+        )?;
+
+        // 1) Park the role update for the requester (they have not
+        //    landed).
+        let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: state3.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: requester_hex.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(role_commit),
+        };
+        let applied =
+            apply_named_group_metadata_event(&state, role_event, admin_id, true, None).await;
+        assert!(!applied.accepted);
+        assert!(state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .is_some_and(|list| !list.is_empty()));
+
+        // 2) The approval arrives BEFORE its predecessor — queued.
+        let approval = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-causal-878".to_string(),
+            revision: approval_revision,
+            actor: admin_hex.clone(),
+            requester_agent_id: requester_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            commit: Some(approval_commit),
+        };
+        // The REAL V2 envelope signed by the approval actor over the
+        // group's metadata topic (what validate_causal_envelope checks).
+        let metadata_topic = parent.metadata_topic.clone();
+        let admin_kp = state.agent.identity().agent_keypair();
+        let envelope = {
+            use ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa;
+            let payload = serde_json::to_vec(&approval)?;
+            let agent_id = state.agent.agent_id();
+            let pub_bytes = admin_kp.public_key().as_bytes();
+            let mut signing = Vec::with_capacity(10 + 32 + metadata_topic.len() + payload.len());
+            signing.extend_from_slice(b"x0x-msg-v2");
+            signing.extend_from_slice(agent_id.as_bytes());
+            signing.extend_from_slice(metadata_topic.as_bytes());
+            signing.extend_from_slice(&payload);
+            let sig = sign_with_ml_dsa(admin_kp.secret_key(), &signing)
+                .map_err(|e| anyhow::anyhow!("sign envelope: {e:?}"))?;
+            let sig_bytes = sig.as_bytes();
+            let topic_bytes = metadata_topic.as_bytes();
+            let mut buf = Vec::with_capacity(
+                1 + 32
+                    + 2
+                    + pub_bytes.len()
+                    + 2
+                    + sig_bytes.len()
+                    + 2
+                    + topic_bytes.len()
+                    + payload.len(),
+            );
+            buf.push(0x02u8);
+            buf.extend_from_slice(agent_id.as_bytes());
+            buf.extend_from_slice(&(pub_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(pub_bytes);
+            buf.extend_from_slice(&(sig_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(sig_bytes);
+            buf.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(topic_bytes);
+            buf.extend_from_slice(&payload);
+            buf
+        };
+        let approval_apply =
+            apply_named_group_metadata_event(&state, approval, admin_id, true, Some(&envelope))
+                .await;
+        assert!(
+            !approval_apply.accepted,
+            "no record yet — queued, not applied"
+        );
+        assert!(
+            state
+                .causal_approval_queue
+                .read()
+                .await
+                .get(group_id)
+                .is_some_and(|q| !q.is_empty()),
+            "the approval was admitted to the causal queue"
+        );
+
+        // 3) The predecessor lands: the requester's member-signed
+        //    JoinRequestCreated. Its acceptance triggers the causal
+        //    replay (the production trigger), which applies the queued
+        //    approval and — with the post-guard drain — the parked role
+        //    update.
+        let created = NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: parent.stable_group_id().to_string(),
+            request_id: "req-causal-878".to_string(),
+            requester_agent_id: requester_hex.clone(),
+            message: None,
+            ts: now_millis_u64(),
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit: Some(created_commit),
+        };
+        let created_apply =
+            apply_named_group_metadata_event(&state, created, requester_id, true, None).await;
+        assert!(
+            created_apply.accepted,
+            "the predecessor lands: {created_apply:?}"
+        );
+
+        // 4) THE assertion: the role change LANDED through the whole
+        //    chain (created → replay → approval → drain → role update).
+        {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(group_id).expect("group retained");
+            let seat = info
+                .members_v2
+                .get(&requester_hex)
+                .expect("the requester was seated by the replayed approval");
+            assert!(
+                seat.is_active(),
+                "the replayed approval seated the requester as an active member"
+            );
+            assert_eq!(
+                seat.role,
+                x0x::groups::GroupRole::Admin,
+                "#878 r4: the PARKED role update applied after the causal-queue landing"
+            );
+        }
+        assert!(
+            state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_id)
+                .is_none_or(|list| list.is_empty()),
+            "the parked lot drained"
+        );
+        Ok(())
+    }
+
     /// #878 r4 (review finding 2): a second concurrent oversized
     /// join-result staging for the same (group, recipient) does NOT start
     /// a second task — the 1-permit guard drops the duplicate. Removing
@@ -42023,6 +42303,18 @@ pub(in crate::server) mod tests {
         // A DIFFERENT recipient is unaffected.
         let other = crate::identity::AgentId([0x5B; 32]);
         assert!(acquire_join_result_staging_permit(&state, &group_id, &other).is_some());
+        // #878 r5: the guard entry is PRUNED once released (no map growth
+        // with the (group, recipient) universe).
+        drop(third);
+        release_join_result_staging_guard(&state, &(group_id.clone(), recipient));
+        assert!(
+            !state
+                .join_result_staging_guards
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&(group_id.clone(), recipient)),
+            "the per-pair guard entry is pruned after release"
+        );
         Ok(())
     }
 
