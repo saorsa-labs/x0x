@@ -14707,7 +14707,7 @@ pub(in crate::server) async fn send_group_public_message(
         if let Some(resp) = reject_withdrawn_group(info) {
             return resp;
         }
-        if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+        if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
             return resp;
         }
         // ADR-0066 §1 row 1 / §4 (slice 9): capture the lifecycle epoch token
@@ -14910,8 +14910,13 @@ pub(in crate::server) async fn send_group_public_message(
     // fan-out race both happen AFTER the publish returns, and this path has no
     // ratchet, so a refusal burns no generation and leaves the message cache,
     // the outbox and the roster byte-identical.
-    if let Some(resp) =
-        reject_fork_quarantine_installed_before_effect(&state, &id, captured_epoch.as_ref()).await
+    if let Some(resp) = reject_fork_quarantine_installed_before_effect_for_actor(
+        &state,
+        &id,
+        captured_epoch.as_ref(),
+        Some(&actor),
+    )
+    .await
     {
         return resp;
     }
@@ -21777,6 +21782,45 @@ pub(in crate::server) fn reject_fork_quarantined(
     Some(reject_fork_quarantined_marker(state, group_id, marker))
 }
 
+/// Session tokens cannot inspect a contested roster unless this daemon still
+/// has an active local seat. The caller supplies the already-borrowed group so
+/// the decision and marker are read under the same roster guard.
+pub(in crate::server) fn reject_fork_quarantined_for_actor(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    actor: &crate::server::rider_auth::ActorContext,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let marker = info.fork_quarantine.as_ref()?;
+    Some(reject_fork_quarantined_marker_for_actor(
+        state, group_id, marker, info, actor,
+    ))
+}
+
+pub(in crate::server) fn reject_fork_quarantined_marker_for_actor(
+    state: &AppState,
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+    info: &x0x::groups::GroupInfo,
+    actor: &crate::server::rider_auth::ActorContext,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if matches!(
+        actor,
+        crate::server::rider_auth::ActorContext::Owner { durable: false }
+    ) && !info.has_active_member(&hex::encode(state.agent.agent_id().as_bytes()))
+    {
+        state
+            .groups_diagnostics
+            .record_fork_quarantine_refusal(group_id);
+        return api_error_with_reason(
+            StatusCode::FORBIDDEN,
+            "active local group membership required",
+            "group_membership_required",
+        );
+    }
+    reject_fork_quarantined_marker(state, group_id, marker)
+}
+
 /// ADR-0066 §3e (slice 3): the same single refusal, for a caller that
 /// already holds the marker rather than the whole [`GroupInfo`].
 ///
@@ -21880,10 +21924,20 @@ pub(in crate::server) fn reject_fork_quarantined_marker(
 /// allocation on the success path, and no other lock is held across it — see
 /// the per-site comments for the one place (row 2) where an EXISTING nesting
 /// is reused rather than a new one introduced.
+#[cfg(test)]
 pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect(
     state: &AppState,
     group_id: &str,
     captured: Option<&x0x::groups::LifecycleEpochToken>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    reject_fork_quarantine_installed_before_effect_for_actor(state, group_id, captured, None).await
+}
+
+pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect_for_actor(
+    state: &AppState,
+    group_id: &str,
+    captured: Option<&x0x::groups::LifecycleEpochToken>,
+    actor: Option<&crate::server::rider_auth::ActorContext>,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     // Slice-9 test barrier: an injected install lands HERE, immediately
     // before the re-check takes its read guard — the tightest interleaving a
@@ -21903,7 +21957,12 @@ pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect(
         // ADR-0067 one if a future caller ever admits with a marker.
         return None;
     }
-    Some(reject_fork_quarantined_marker(state, group_id, marker))
+    Some(match actor {
+        Some(actor) => {
+            reject_fork_quarantined_marker_for_actor(state, group_id, marker, live, actor)
+        }
+        None => reject_fork_quarantined_marker(state, group_id, marker),
+    })
 }
 
 /// ADR-0066 §1 rows 1/2/4/6 deterministic race harness — `cfg(test)` END TO
@@ -24953,12 +25012,32 @@ fn treekem_metadata_event_requires_phase3(_event: &NamedGroupMetadataEvent) -> b
 /// send-ratchet advances, so the snapshot is persisted before returning to
 /// prevent send-generation (nonce) reuse across a restart. Returns the
 /// self-describing `ApplicationCiphertext` as `ciphertext_b64`.
+#[cfg(test)]
 async fn treekem_group_encrypt(
     state: &AppState,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     payload_b64: &str,
     rider_provenance: Option<&x0x::groups::RiderProvenance>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    treekem_group_encrypt_for_actor(
+        state,
+        group_id_hex,
+        stable_group_id,
+        payload_b64,
+        rider_provenance,
+        None,
+    )
+    .await
+}
+
+async fn treekem_group_encrypt_for_actor(
+    state: &AppState,
+    group_id_hex: &str,
+    stable_group_id: Option<&str>,
+    payload_b64: &str,
+    rider_provenance: Option<&x0x::groups::RiderProvenance>,
+    actor: Option<&crate::server::rider_auth::ActorContext>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
     let plaintext = match BASE64.decode(payload_b64) {
@@ -24994,7 +25073,10 @@ async fn treekem_group_encrypt(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
-            if let Some(resp) = reject_fork_quarantined(state, group_id_hex, info) {
+            if let Some(resp) = match actor {
+                Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
+                None => reject_fork_quarantined(state, group_id_hex, info),
+            } {
                 return resp;
             }
         }
@@ -25029,9 +25111,13 @@ async fn treekem_group_encrypt(
     // are therefore exactly main's, and taking the re-check BEFORE the
     // `group.lock().await` instead would have been strictly worse: a contended
     // mutex would then sit inside the window.
-    if let Some(resp) =
-        reject_fork_quarantine_installed_before_effect(state, group_id_hex, captured_epoch.as_ref())
-            .await
+    if let Some(resp) = reject_fork_quarantine_installed_before_effect_for_actor(
+        state,
+        group_id_hex,
+        captured_epoch.as_ref(),
+        actor,
+    )
+    .await
     {
         return resp;
     }
@@ -25103,11 +25189,23 @@ async fn treekem_group_encrypt(
 /// replay window advances, so the snapshot is persisted to keep replay
 /// protection across a restart (best-effort: a persist failure is logged but
 /// does not invalidate the already-recovered plaintext).
+#[cfg(test)]
 async fn treekem_group_decrypt(
     state: &AppState,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     ciphertext_b64: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    treekem_group_decrypt_for_actor(state, group_id_hex, stable_group_id, ciphertext_b64, None)
+        .await
+}
+
+async fn treekem_group_decrypt_for_actor(
+    state: &AppState,
+    group_id_hex: &str,
+    stable_group_id: Option<&str>,
+    ciphertext_b64: &str,
+    actor: Option<&crate::server::rider_auth::ActorContext>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
     let ciphertext = match BASE64.decode(ciphertext_b64) {
@@ -25138,7 +25236,10 @@ async fn treekem_group_decrypt(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
-            if let Some(resp) = reject_fork_quarantined(state, group_id_hex, info) {
+            if let Some(resp) = match actor {
+                Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
+                None => reject_fork_quarantined(state, group_id_hex, info),
+            } {
                 return resp;
             }
         }
@@ -25221,7 +25322,7 @@ pub(in crate::server) async fn secure_group_encrypt(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
-    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
         return resp;
     }
     // ADR-0066 §1 row 4 / §4 (slice 9): capture under the SAME read guard as
@@ -25324,12 +25425,13 @@ pub(in crate::server) async fn secure_group_encrypt(
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         let stable_group_id = info.stable_group_id().to_string();
         drop(groups);
-        return treekem_group_encrypt(
+        return treekem_group_encrypt_for_actor(
             state.as_ref(),
             &id,
             Some(&stable_group_id),
             &req.payload_b64,
             rider_provenance.as_ref(),
+            Some(&actor),
         )
         .await;
     }
@@ -25410,9 +25512,13 @@ pub(in crate::server) async fn secure_group_encrypt(
     // read acquisition is placed as late as the effect allows. It holds no
     // other lock, and the terminality re-check below takes its read guard
     // sequentially rather than nested.
-    if let Some(resp) =
-        reject_fork_quarantine_installed_before_effect(state.as_ref(), &id, captured_epoch.as_ref())
-            .await
+    if let Some(resp) = reject_fork_quarantine_installed_before_effect_for_actor(
+        state.as_ref(),
+        &id,
+        captured_epoch.as_ref(),
+        Some(&actor),
+    )
+    .await
     {
         return resp;
     }
@@ -25448,6 +25554,9 @@ pub(in crate::server) async fn secure_group_encrypt(
 pub(in crate::server) async fn secure_group_decrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<SecureDecryptRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -25463,7 +25572,7 @@ pub(in crate::server) async fn secure_group_decrypt(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
-    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
         return resp;
     }
 
@@ -25477,11 +25586,12 @@ pub(in crate::server) async fn secure_group_decrypt(
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         let stable_group_id = info.stable_group_id().to_string();
         drop(groups);
-        return treekem_group_decrypt(
+        return treekem_group_decrypt_for_actor(
             state.as_ref(),
             &id,
             Some(&stable_group_id),
             &req.ciphertext_b64,
+            Some(&actor),
         )
         .await;
     }
@@ -25610,6 +25720,9 @@ pub(in crate::server) struct ResealRequest {
 pub(in crate::server) async fn secure_group_reseal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<ResealRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -25628,7 +25741,7 @@ pub(in crate::server) async fn secure_group_reseal(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
-    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
         return resp;
     }
     // ADR-0066 §1 row 6 / §4 (slice 9): capture under the SAME read guard as
@@ -25718,9 +25831,13 @@ pub(in crate::server) async fn secure_group_reseal(
     //
     // As on row 4, nothing awaits between `drop(groups)` above and here, so
     // this is the last suspension-free point before the effect.
-    if let Some(resp) =
-        reject_fork_quarantine_installed_before_effect(state.as_ref(), &id, captured_epoch.as_ref())
-            .await
+    if let Some(resp) = reject_fork_quarantine_installed_before_effect_for_actor(
+        state.as_ref(),
+        &id,
+        captured_epoch.as_ref(),
+        Some(&actor),
+    )
+    .await
     {
         return resp;
     }
@@ -34944,6 +35061,7 @@ pub(in crate::server) mod tests {
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
+    mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     mod wp_c;
@@ -41308,6 +41426,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_decrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(SecureDecryptRequest {
                 ciphertext_b64: encrypted.0["ciphertext_b64"]
                     .as_str()
@@ -41354,6 +41475,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_reseal(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(ResealRequest { recipient }),
         )
         .await;
@@ -41417,6 +41541,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_reseal(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(ResealRequest { recipient: absent }),
         )
         .await;
@@ -41429,6 +41556,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_reseal(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(ResealRequest {
                 recipient: bob.clone(),
             }),
@@ -41442,6 +41572,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_reseal(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(ResealRequest {
                 recipient: charlie.clone(),
             }),
@@ -41977,6 +42110,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_decrypt(
             State(Arc::clone(&state)),
             Path(group_id.clone()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(SecureDecryptRequest {
                 ciphertext_b64: BASE64.encode(b"item4a-ciphertext-not-reached"),
                 nonce_b64: BASE64.encode([0u8; 12]),
@@ -43221,6 +43357,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_decrypt(
             State(Arc::clone(&state)),
             Path(group_id.clone()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(SecureDecryptRequest {
                 ciphertext_b64,
                 nonce_b64,
@@ -44413,6 +44552,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_decrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(SecureDecryptRequest {
                 ciphertext_b64: encrypted.0["ciphertext_b64"]
                     .as_str()

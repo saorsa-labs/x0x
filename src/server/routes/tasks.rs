@@ -171,9 +171,9 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// under disputed membership even when the CRDT data itself is recoverable
 /// (the ADR's own answer to the warn-only argument it rejected).
 ///
-/// The refusal goes through the single slice-1 helper, so it carries the §5
-/// body — machine `reason`, the human sentence, and the manual-clear remedy
-/// — and bumps `fork_quarantine_refusals` exactly once (§3e).
+/// The refusal goes through the shared marker gate and bumps
+/// `fork_quarantine_refusals` once. Sessions without an active local seat
+/// receive only a membership error; durable operators retain the §5 body.
 ///
 /// WHY it runs BEFORE [`ensure_task_list_access`] rather than after: #153's
 /// guard resolves the group with a single-spelling `named_groups.get(id)`, so
@@ -181,22 +181,28 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// request naming the stable id. Ordering the quarantine check after it would
 /// make the alias case fail closed for the wrong, undiagnosable reason — the
 /// exact "right outcome, wrong reason" defect slice 3 found on row 18 — and
-/// R5's condition for removing the warn-only window was that the user always
-/// learns WHY. Containment is a property of the group's contested state, not
-/// of who is asking, and these are daemon-local control-plane endpoints
-/// authenticated by the daemon's own token, so there is no third party to
-/// leak the marker to. Slice 3 set the same precedent on
+/// R5's condition for removing the warn-only window was that an authorized
+/// operator learns WHY. A session without a local seat must not inspect the
+/// marker, even though quarantine containment remains unconditional. Slice 3
+/// set the same precedence on
 /// `delegate_group_authority`, where the quarantine refusal precedes the
 /// ban/role checks.
 async fn reject_quarantined_task_mutation(
     state: &Arc<AppState>,
     id: &str,
+    actor: &crate::server::rider_auth::ActorContext,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let (group_id, marker) = task_list_fork_quarantine(state, id).await?;
-    Some(
-        crate::server::routes::named_groups::reject_fork_quarantined_marker(
-            state, &group_id, &marker,
-        ),
+    let scoped = parse_group_scoped_task_list_id(id)?;
+    if scoped.is_malformed() {
+        return None;
+    }
+    let groups = state.named_groups.read().await;
+    let (_, info) = crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)?;
+    crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+        state,
+        &scoped.group_id,
+        info,
+        actor,
     )
 }
 
@@ -663,6 +669,9 @@ pub(in crate::server) async fn list_task_lists(
 /// POST /task-lists
 pub(in crate::server) async fn create_task_list(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<CreateTaskListRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: binding a NEW task list to a contested roster is
@@ -671,7 +680,7 @@ pub(in crate::server) async fn create_task_list(
     // writes a durable subscription registration and starts a sync listener
     // that publishes deltas on the group's topic. Refusing here means none
     // of that happens: no handle, no manifest row, no listener.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &req.topic).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &req.topic, &actor).await {
         return refused;
     }
     // #153: creating a group-scoped task list requires membership of that group.
@@ -839,6 +848,9 @@ pub(in crate::server) async fn list_tasks(
 pub(in crate::server) async fn add_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<AddTaskRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: refuse BEFORE the handle is resolved, so nothing
@@ -846,7 +858,7 @@ pub(in crate::server) async fn add_task(
     // snapshot or publish a delta. The ordering is observable: on a
     // quarantined group this returns 409 even for a list this daemon does
     // not hold, where the ungated path returns 404.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &id, &actor).await {
         return refused;
     }
     // #153: group-scoped task lists require local-agent membership (write too).
@@ -879,6 +891,9 @@ pub(in crate::server) async fn add_task(
 pub(in crate::server) async fn update_task(
     State(state): State<Arc<AppState>>,
     Path((id, tid)): Path<(String, String)>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: claim/complete is a mutation, refused before any
@@ -891,7 +906,7 @@ pub(in crate::server) async fn update_task(
     // first, a quarantined group produces exactly ONE refusal and one
     // `fork_quarantine_refusals` increment, and row 17's check stays wired
     // for the case where a future change narrows row 20's scope.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &id, &actor).await {
         return refused;
     }
     // #153: group-scoped task lists require local-agent membership (write too).
@@ -961,19 +976,24 @@ pub(in crate::server) async fn update_task(
         // delegation-cited branch — gating group task mutations generally
         // is row 20 (§3c, slice 5) and is not this slice's business.
         //
-        // §5 says row 17 refuses with the full body, so the refusal goes
-        // through the shared helper rather than the local `forbidden`
-        // mapping: the caller gets the 409, the `fork_quarantined` reason
-        // and the remedy, not a bare 403.
-        let quarantine =
-            crate::server::delegations::fork_quarantine_marker(&state, &scoped.group_id).await;
-        if let Some(marker) = &quarantine {
-            return crate::server::routes::named_groups::reject_fork_quarantined_marker(
-                &state,
-                &scoped.group_id,
-                marker,
-            );
+        // Row 17 uses the shared helper. The marker and local seat are read
+        // together, so a nonmember session cannot inspect contested details.
+        let groups = state.named_groups.read().await;
+        if let Some((_, info)) =
+            crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)
+        {
+            if let Some(refused) =
+                crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+                    &state,
+                    &scoped.group_id,
+                    info,
+                    &actor,
+                )
+            {
+                return refused;
+            }
         }
+        drop(groups);
         let committed =
             crate::server::delegations::committed_delegations(&state, &scoped.group_id).await;
         let sd = committed
@@ -994,17 +1014,14 @@ pub(in crate::server) async fn update_task(
             &committed,
             // Proven `None` by the refusal above; passed rather than
             // hard-coded so the predicate's gate stays wired here.
-            quarantine.as_ref(),
+            None,
         ) {
             return forbidden(format!("delegation does not authorize this action: {why}"));
         }
         let active = crate::server::delegations::active_members_of(&state, &scoped.group_id).await;
-        if let Err(why) = crate::server::delegations::chain_members_active(
-            sd,
-            &committed,
-            &active,
-            quarantine.as_ref(),
-        ) {
+        if let Err(why) =
+            crate::server::delegations::chain_members_active(sd, &committed, &active, None)
+        {
             return forbidden(format!("delegation chain no longer active: {why}"));
         }
         authorized_via = Some(hex::encode(sd.delegation.from_agent.as_bytes()));

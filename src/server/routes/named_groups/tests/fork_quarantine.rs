@@ -3012,6 +3012,7 @@ async fn issue732_startup_quarantines_a_lineage_free_ordinary_group() -> Result<
     let (status, body) = secure_group_decrypt(
         State(Arc::clone(&state)),
         Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(serde_json::from_value::<SecureDecryptRequest>(
             serde_json::json!({ "ciphertext_b64": "aGVsbG8=" }),
         )?),
@@ -3022,6 +3023,7 @@ async fn issue732_startup_quarantines_a_lineage_free_ordinary_group() -> Result<
     let (status, body) = secure_group_reseal(
         State(Arc::clone(&state)),
         Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(serde_json::from_value::<ResealRequest>(
             serde_json::json!({ "recipient": "ab".repeat(32) }),
         )?),
