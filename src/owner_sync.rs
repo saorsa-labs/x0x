@@ -2094,7 +2094,16 @@ pub trait SyncDaemonView: Send + Sync + 'static {
     /// Snapshot of the current self-profile names.
     fn profile_names(&self) -> SyncProfileNames;
     /// Home roster + policy pointer snapshot, `None` when no Home exists.
+    /// Best-effort (`try_read`): the reconcile pass tolerates a missed
+    /// snapshot; the SESSION PATH must not — use
+    /// [`Self::home_pointer_definitive`] there (#863 r2).
     fn home_pointer(&self) -> Option<SyncValue>;
+    /// #863 r2: the DEFINITIVE Home pointer under an AWAITED
+    /// `named_groups` read — `Err(())` only on a poisoned lock, so a
+    /// session can fail CLOSED instead of understating the pointer.
+    fn home_pointer_definitive(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<SyncValue>, ()>> + Send>>;
     /// Apply winning Tier-1 names to live daemon state.
     fn apply_names(
         &self,
@@ -2300,21 +2309,14 @@ impl OwnerSyncService {
             );
             return; // drop => stream reset, fail closed
         }
+        let (mut send, mut recv) = stream.into_split();
         // #863: publish the local Home pointer BEFORE the version-vector
         // exchange — an empty HomePointer vector must be genuine proof of
-        // no local Home, never a timing artifact.
-        self.materialize_local_home_pointer().await;
-        let (mut send, mut recv) = stream.into_split();
-        let result = run_sync_session(
-            &mut send,
-            &mut recv,
-            &self.store,
-            owner_kp,
-            &local_machine,
-            &peer,
-            |record| self.apply_record(record),
-        )
-        .await;
+        // no local Home, never a timing artifact (see
+        // session_with_home_publication).
+        let result = self
+            .session_with_home_publication(&mut send, &mut recv, owner_kp, &local_machine, &peer)
+            .await;
         match result {
             Ok(summary) => {
                 tracing::debug!(
@@ -2383,19 +2385,14 @@ impl OwnerSyncService {
             .acquire_owned()
             .await
             .map_err(|e| ("session_limit", e.to_string()))?;
-        // #863: as the responder path — the initiator's vector must not
-        // understate a local Home either.
-        self.materialize_local_home_pointer().await;
-        let result = run_sync_session(
-            &mut send,
-            &mut recv,
-            &self.store,
-            owner_kp,
-            &local_machine,
-            &peer,
-            |record| self.apply_record(record),
-        )
-        .await;
+        // #863: as the responder path (handle_inbound) — the
+        // initiator's vector must not understate a local Home either.
+        // Both session directions go through the shared composition, so
+        // an unpublication-capable view fails the session CLOSED (never
+        // an empty HomePointer vector).
+        let result = self
+            .session_with_home_publication(&mut send, &mut recv, owner_kp, &local_machine, &peer)
+            .await;
         self.store.set_session_status(&peer, result.is_ok()).await;
         result.map_err(|e| (e.class(), e.to_string()))
     }
@@ -2422,6 +2419,22 @@ impl OwnerSyncService {
         Arc::clone(&self.session_permits).try_acquire_owned().ok()
     }
 
+    /// #863 r2 (review finding 2): the DEFINITIVE local Home pointer,
+    /// read under an AWAITED `named_groups` lock (the view's boxed
+    /// future) — unlike the trait's `home_pointer()` (a `try_read`
+    /// best-effort the reconcile pass tolerates), this never mistakes
+    /// lock contention for "no Home". `Err(())` only on a poisoned
+    /// lock; the session path fails CLOSED on it rather than advertise
+    /// an empty vector.
+    async fn definitive_local_home_pointer(&self) -> Result<Option<SyncValue>, ()> {
+        let Some(view) = self.view() else {
+            // No view attached (tests / library use): nothing to publish,
+            // and nothing to understate — a genuinely empty vector.
+            return Ok(None);
+        };
+        view.home_pointer_definitive().await
+    }
+
     /// #863: mint the local Home pointer into the Tier-1 store NOW. A
     /// device holding a Home it has not yet published (created since the
     /// last reconcile pass, or a mint that failed) would otherwise answer
@@ -2435,10 +2448,7 @@ impl OwnerSyncService {
         let Some(owner_kp) = self.owner_kp() else {
             return;
         };
-        let Some(view) = self.view() else {
-            return;
-        };
-        let Some(home_value) = view.home_pointer() else {
+        let Ok(Some(home_value)) = self.definitive_local_home_pointer().await else {
             return;
         };
         if self.should_mint_home_pointer(&home_value).await {
@@ -2452,6 +2462,63 @@ impl OwnerSyncService {
             )
             .await;
         }
+    }
+
+    /// #863 r2 (review finding 1): the session composition BOTH session
+    /// directions run — publish the local Home pointer (definitive read;
+    /// an unreadable view fails the session CLOSED), then the exchange.
+    /// This is the seam the #863 guarantee is proven on: with the
+    /// publication removed, a Home-holding peer advertises an empty
+    /// HomePointer vector (the fail-before).
+    pub(crate) async fn session_with_home_publication<S, R>(
+        &self,
+        send: &mut S,
+        recv: &mut R,
+        owner_kp: &crate::identity::UserKeypair,
+        local_machine: &MachineId,
+        peer: &MachineId,
+    ) -> Result<SessionSummary, SyncError>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        // Fail closed on an unreadable view: an empty HomePointer vector
+        // must be proof of no Home, never a timing artifact.
+        match self.definitive_local_home_pointer().await {
+            Err(()) => {
+                return Err(SyncError::MalformedFrame(
+                    "local daemon view unreadable; refusing to understate the Home pointer"
+                        .to_string(),
+                ));
+            }
+            Ok(home_value) => {
+                if let Some(home_value) = home_value {
+                    if let Some(owner_kp) = self.owner_kp() {
+                        if self.should_mint_home_pointer(&home_value).await {
+                            let local_machine_for_mint = self.agent.machine_id();
+                            self.mint_or_log(
+                                SyncKind::HomePointer,
+                                HOME_POINTER_KEY,
+                                home_value,
+                                owner_kp,
+                                local_machine_for_mint,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+        run_sync_session(
+            send,
+            recv,
+            &self.store,
+            owner_kp,
+            local_machine,
+            peer,
+            |record| self.apply_record(record),
+        )
+        .await
     }
 
     /// One full pass: mint local Tier-1 records from live daemon state,

@@ -370,7 +370,7 @@ pub(in crate::server) async fn resolve_home(state: &Arc<AppState>) -> HomeResolu
 /// `OwnerCertified(owner)` Home-shaped AND our own agent is an active
 /// member. Anything else (injected metadata, a foreign owner's Home, a
 /// group we were removed from) is not trusted.
-pub(in crate::server) async fn find_home(
+pub(crate) async fn find_home(
     state: &AppState,
     owner: &crate::identity::UserId,
 ) -> Option<(String, crate::groups::GroupInfo)> {
@@ -798,7 +798,7 @@ enum ProvisionStep {
     AwaitOwnerSync,
 }
 
-pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
+pub(crate) async fn provision_home(state: &Arc<AppState>) {
     let _ = provision_home_steps(state, false).await;
 }
 

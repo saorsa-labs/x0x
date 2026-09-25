@@ -72,68 +72,35 @@ impl SyncDaemonView for DaemonView {
     }
 
     fn home_pointer(&self) -> Option<SyncValue> {
+        // Best-effort (try_read): the reconcile pass tolerates a missed
+        // snapshot; the SESSION PATH must not — it uses
+        // `home_pointer_definitive` (#863 r2 review finding 2).
         let owner = self.state.agent.identity().user_keypair()?.user_id();
         let local_hex = hex::encode(self.state.agent.agent_id().as_bytes());
         let groups = self.state.named_groups.try_read().ok()?;
-        // #449 (D4): this MUST use the same predicate as
-        // `routes::home::find_home` — a weaker one (any owner-certified
-        // group carrying Home metadata) let a device publish a Home it is
-        // not a member of, or a half-shaped group, as the owner's Home.
-        // Combined with `.find()` over an UNORDERED map that made the
-        // published pointer nondeterministic: with two Home-stamped groups
-        // in the roster (exactly what cross-device adoption creates) the
-        // selection could differ on every reconcile pass, and every flip
-        // re-minted the `"home"` record. Select the lexicographically
-        // smallest stable id so the choice is stable across passes.
-        let pending: Vec<String> = {
-            let pending = self
-                .state
-                .pending_join_stubs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.iter().cloned().collect()
-        };
-        groups
-            .iter()
-            .filter(|(id, info)| {
-                !pending.iter().any(|p| p == id.as_str())
-                    // Review P2: withdrawal keeps `home` and `members_v2`
-                    // populated, so without this a RETIRED Home would be
-                    // republished as the owner's canonical one — and because
-                    // provisioning yields to a named canonical Home, every
-                    // device would then refuse to make a replacement while
-                    // `GET /home` reported `elsewhere`. Mirrors the
-                    // `!withdrawn` guard in `find_home`.
-                    && !info.withdrawn
-                    && info.home.is_some()
-                    && super::home::is_home_policy(&info.policy, &owner)
-                    && info.has_active_member(&local_hex)
-            })
-            .map(|(_, info)| info)
-            .min_by(|a, b| a.stable_group_id().cmp(b.stable_group_id()))
-            .map(|info| SyncValue::HomePointer {
-                group_id: info.stable_group_id().to_string(),
-                policy: info.policy.clone(),
-                roster: info
-                    .members_v2
-                    .values()
-                    .map(|m| crate::owner_sync::HomeRosterEntry {
-                        agent_id: m.agent_id.clone(),
-                        role: m.role,
-                        state: m.state,
-                    })
-                    .collect(),
-                primary_agent: info
-                    .home
-                    .as_ref()
-                    .map(|h| h.primary_agent.clone())
-                    .unwrap_or_default(),
-                provisioned_at_ms: info
-                    .home
-                    .as_ref()
-                    .map(|h| h.provisioned_at_ms)
-                    .unwrap_or_default(),
-            })
+        home_pointer_from_state(&self.state, &owner, &local_hex, &groups)
+    }
+
+    fn home_pointer_definitive(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<SyncValue>, ()>> + Send>>
+    {
+        // #863 r2 (review finding 2): the AWAITED read — lock contention
+        // is never mistaken for "no Home". `Err(())` only when there is
+        // no owner key (an anonymous install genuinely has nothing to
+        // publish) or the lock is poisoned; the session path treats Err
+        // as fail-closed.
+        let state = std::sync::Arc::clone(&self.state);
+        Box::pin(async move {
+            let owner = match state.agent.identity().user_keypair() {
+                Some(kp) => kp.user_id(),
+                // Anonymous install: nothing to understate.
+                None => return Ok(None),
+            };
+            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let groups = state.named_groups.read().await;
+            Ok(home_pointer_from_state(&state, &owner, &local_hex, &groups))
+        })
     }
 
     fn canonical_pointer_is_retired(&self, group_id: &str) -> bool {
@@ -214,6 +181,74 @@ impl SyncDaemonView for DaemonView {
             }
         });
     }
+}
+
+/// The Home-pointer computation over a HELD `named_groups` guard —
+/// shared by the best-effort and the definitive reads (#863 r2).
+fn home_pointer_from_state(
+    state: &AppState,
+    owner: &crate::identity::UserId,
+    local_hex: &str,
+    groups: &std::collections::HashMap<String, crate::groups::GroupInfo>,
+) -> Option<SyncValue> {
+    // #449 (D4): this MUST use the same predicate as
+    // `routes::home::find_home` — a weaker one (any owner-certified
+    // group carrying Home metadata) let a device publish a Home it is
+    // not a member of, or a half-shaped group, as the owner's Home.
+    // Combined with `.find()` over an UNORDERED map that made the
+    // published pointer nondeterministic: with two Home-stamped groups
+    // in the roster (exactly what cross-device adoption creates) the
+    // selection could differ on every reconcile pass, and every flip
+    // re-minted the `"home"` record. Select the lexicographically
+    // smallest stable id so the choice is stable across passes.
+    let pending: Vec<String> = {
+        let pending = state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.iter().cloned().collect()
+    };
+    groups
+        .iter()
+        .filter(|(id, info)| {
+            !pending.iter().any(|p| p == id.as_str())
+                // Review P2: withdrawal keeps `home` and `members_v2`
+                // populated, so without this a RETIRED Home would be
+                // republished as the owner's canonical one — and because
+                // provisioning yields to a named canonical Home, every
+                // device would then refuse to make a replacement while
+                // `GET /home` reported `elsewhere`. Mirrors the
+                // `!withdrawn` guard in `find_home`.
+                && !info.withdrawn
+                && info.home.is_some()
+                && super::home::is_home_policy(&info.policy, owner)
+                && info.has_active_member(local_hex)
+        })
+        .map(|(_, info)| info)
+        .min_by(|a, b| a.stable_group_id().cmp(b.stable_group_id()))
+        .map(|info| SyncValue::HomePointer {
+            group_id: info.stable_group_id().to_string(),
+            policy: info.policy.clone(),
+            roster: info
+                .members_v2
+                .values()
+                .map(|m| crate::owner_sync::HomeRosterEntry {
+                    agent_id: m.agent_id.clone(),
+                    role: m.role,
+                    state: m.state,
+                })
+                .collect(),
+            primary_agent: info
+                .home
+                .as_ref()
+                .map(|h| h.primary_agent.clone())
+                .unwrap_or_default(),
+            provisioned_at_ms: info
+                .home
+                .as_ref()
+                .map(|h| h.provisioned_at_ms)
+                .unwrap_or_default(),
+        })
 }
 
 /// One enrolled device in the `GET /sync/devices` response.
@@ -458,6 +493,100 @@ fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<serde_
 mod tests {
     use super::*;
     use crate::server::routes::sync::DaemonView;
+
+    /// #863 r2 (review finding 1, Rule 9): the SESSION PATH publishes the
+    /// local Home pointer before the version-vector exchange. Two services
+    /// over a duplex pipe: the responder holds an UNPUBLISHED Home; running
+    /// the responder side through `session_with_home_publication` (the
+    /// composition both production session directions call), the initiator
+    /// must RECEIVE the HomePointer record. Reverting the session-path
+    /// composition (the materialization removed) leaves the initiator's
+    /// store without it (the fail-before).
+    #[tokio::test]
+    async fn session_path_publishes_home_pointer_before_the_exchange() {
+        use crate::server::routes::home::tests::owned_state;
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+        let a = owned_state(dir_a.path(), [0x8E; 32])
+            .await
+            .expect("state a");
+        let b = owned_state(dir_b.path(), [0x8E; 32])
+            .await
+            .expect("state b");
+        // Views attached exactly as the server startup does.
+        for state in [&a, &b] {
+            state
+                .owner_sync
+                .as_ref()
+                .expect("owned state wires sync")
+                .attach_view(Arc::new(DaemonView::new(Arc::clone(state))));
+        }
+        let sync_a = a.owner_sync.as_ref().expect("sync a");
+        let sync_b = b.owner_sync.as_ref().expect("sync b");
+        let owner_kp = a
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key");
+        let machine_a = a.agent.machine_id();
+        let machine_b = b.agent.machine_id();
+        // Mutual enrollment.
+        sync_a
+            .store()
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(machine_b, owner_kp, 1_000, None)
+                    .expect("enroll b"),
+            )
+            .await
+            .expect("persist enroll b");
+        sync_b
+            .store()
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(machine_a, owner_kp, 1_000, None)
+                    .expect("enroll a"),
+            )
+            .await
+            .expect("persist enroll a");
+
+        // The RESPONDER holds an UNPUBLISHED Home.
+        crate::server::routes::home::provision_home(&a).await;
+        assert!(sync_a.canonical_home().await.is_none(), "unpublished");
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut b_recv, mut b_send) = tokio::io::split(server);
+        let (mut a_recv, mut a_send) = tokio::io::split(client);
+        let responder = sync_a.session_with_home_publication(
+            &mut b_send,
+            &mut b_recv,
+            owner_kp,
+            &machine_a,
+            &machine_b,
+        );
+        let initiator = sync_b.session_with_home_publication(
+            &mut a_send,
+            &mut a_recv,
+            owner_kp,
+            &machine_b,
+            &machine_a,
+        );
+        let (responder_out, initiator_out) = tokio::join!(responder, initiator);
+        assert!(
+            responder_out.is_ok(),
+            "responder session: {responder_out:?}"
+        );
+        assert!(
+            initiator_out.is_ok(),
+            "initiator session: {initiator_out:?}"
+        );
+        // THE assertion: the initiator received the HomePointer record —
+        // only possible because the responder's session path published its
+        // pointer BEFORE the version-vector exchange.
+        let canonical = sync_b.canonical_home().await.expect("HomePointer received");
+        let (gid, _) = crate::server::routes::home::find_home(&a, &owner_kp.user_id())
+            .await
+            .expect("a's Home");
+        assert_eq!(canonical.group_id, gid);
+    }
 
     /// WHY: the profile mirror must never regress to defaults while the
     /// AppState lock is contended — a default read would mint a record
