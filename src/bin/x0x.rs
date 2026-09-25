@@ -368,6 +368,23 @@ enum Commands {
     },
     /// Active byte-stream + connect-ACL diagnostics.
     Streams,
+    /// Print a compact recipe that teaches another agent to install x0x
+    /// and DM you (#894).
+    Onboard {
+        /// Emit the recipe as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Omit your agent card (the recipe then looks you up by agent id).
+        #[arg(long, conflicts_with_all = ["inline_card", "card_file"])]
+        no_card: bool,
+        /// Embed the (~20 KB) signed card link in the recipe instead of
+        /// writing it to a file.
+        #[arg(long, conflicts_with = "card_file")]
+        inline_card: bool,
+        /// Where to write the signed card link (default: ./x0x-invite-card.txt).
+        #[arg(long, value_name = "PATH")]
+        card_file: Option<PathBuf>,
+    },
 }
 
 // ── Nested subcommands ──────────────────────────────────────────────────
@@ -2974,6 +2991,23 @@ async fn run(
             }
         },
         Commands::Streams => commands::forward::streams(&client).await,
+        Commands::Onboard {
+            json,
+            no_card,
+            inline_card,
+            card_file,
+        } => {
+            let card = if no_card {
+                commands::onboard::CardDelivery::Lookup
+            } else if inline_card {
+                commands::onboard::CardDelivery::Inline
+            } else {
+                commands::onboard::CardDelivery::File(
+                    card_file.unwrap_or_else(|| PathBuf::from("x0x-invite-card.txt")),
+                )
+            };
+            commands::onboard::run(&client, json, card).await
+        }
         Commands::Routes { .. }
         | Commands::Tree
         | Commands::Uninstall
@@ -3006,6 +3040,7 @@ x0x (v{VERSION})
 |   |   +-- user-id        Show user ID
 |   |   +-- card           Generate shareable identity card
 |   |   +-- import         Import an agent card to contacts
+|   +-- onboard            Recipe teaching another agent to install + DM you
 |   +-- user-id create     Create user identity keypair
 |   +-- user-id inspect    Validate a user identity file (daemonless)
 |   +-- profile           Show stored self-profile names
