@@ -4421,6 +4421,20 @@ async fn record_anchored_gap_refusal(
     let terminal_revision = commit.revision;
     let terminal_state_hash = commit.state_hash.clone();
     let committed_by = commit.committed_by.clone();
+    // #846: the validated chain's per-step hashes, ending with the
+    // terminal's own hash — what the owner attestation covers. Length
+    // bound: `validate_alternate_chain` admits a chain only when every
+    // link is CONSECUTIVE from the base revision
+    // (link.revision == previous + 1, terminal == last + 1), so
+    // `attested_chain_hashes.len() == terminal_revision -
+    // head-anchored base revision + 1` and every entry is an
+    // individually admin-signed retained commit — there is no unbounded
+    // amplification from a longer served chain.
+    let attested_chain_hashes: Vec<String> = chain
+        .iter()
+        .map(|link| link.commit.state_hash.clone())
+        .chain(std::iter::once(terminal_state_hash.clone()))
+        .collect();
     let mutate = move |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
         // ADR0066-LOOKUP-WAIVER: `key` is the already-resolved map key the
         // apply path was called with (same as `install_fork_evidence`).
@@ -4479,6 +4493,7 @@ async fn record_anchored_gap_refusal(
             occurrences: occurrences.saturating_add(1),
             first_observed_at_ms,
             last_observed_at_ms: now_ms,
+            attested_chain_hashes,
             by_reason,
         });
         true
@@ -9624,6 +9639,92 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     }
 }
 
+/// Test-only observability for the #846 catch-up gate: set when the gate
+/// REFUSES a catch-up page, so tests can distinguish "the gate fired"
+/// from "the apply refused for unrelated reasons".
+///
+/// Reset contract: PROCESS-GLOBAL within one test binary — every test
+/// in the binary shares this static. A test that asserts it must
+/// `store(false)` immediately before the scenario it drives and read it
+/// back immediately after; under plain `cargo test` a concurrently
+/// running gate-firing test can flip it in between, so flag-asserting
+/// suites are run under nextest (one process per test), as CI does.
+#[cfg(test)]
+pub(in crate::server) static CATCHUP_846_GATE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// #846 r3: is the durable #816/#839 anchored-gap audit record ARMED for
+/// catch-up gating? Arming is tied to the DURABLE RECORD alone: the
+/// reason is the owner-attested stale-base gap and the current state has
+/// not yet reached the attested terminal revision. The in-memory
+/// terminal queue is deliberately NOT consulted — it drains on TTL, on a
+/// replay that does not retain, and on every restart, while the record
+/// (with its attested sequence) persists; the gate must survive all
+/// three. Returns the armed record; `attested_chain_hashes` is the
+/// per-step sequence (intervening links in order, ending with the
+/// terminal hash). Records persisted before #846 r1 carry an EMPTY
+/// sequence: they still arm, and the walker then refuses every page
+/// (fail-closed — nothing outside a never-recorded attestation adopts).
+fn armed_anchored_gap_sequence(
+    info: &x0x::groups::GroupInfo,
+) -> Option<&x0x::groups::AnchoredGapRefusal> {
+    let record = info
+        .invite_lineage
+        .as_ref()?
+        .anchored_gap_refusal
+        .as_ref()?;
+    if record.reason != "owner_attested_stale_base_gap" {
+        return None;
+    }
+    // Already converged: the terminal (or something past it) applied.
+    if info.state_revision >= record.terminal_revision {
+        return None;
+    }
+    Some(record)
+}
+
+/// #846 r3: does this catch-up page stay INSIDE the attested sequence?
+/// The CURSOR is derived from the current state: when the current hash
+/// is sequence[i] — a previous page of this gap already applied — the
+/// next expected hash is sequence[i+1]; otherwise the page must begin at
+/// sequence[0]. That default is safe because the first served commit
+/// must both LINK from the current hash and hash-match sequence[0], and
+/// sequence[0]'s signed state hash commits to its own prev_state_hash —
+/// the genuine first link validates only against the gap anchor it was
+/// signed over, so a divergent current head cannot ride it. A page that
+/// ends mid-sequence is fine (paging continues); a mismatch or a broken
+/// link is a fork. An EMPTY sequence (pre-r1 record) admits no commit.
+fn catchup_page_within_attested_sequence(
+    events: &[NamedGroupMetadataEvent],
+    current_state_hash: &str,
+    sequence: &[String],
+) -> bool {
+    let expected_from = sequence
+        .iter()
+        .position(|hash| hash == current_state_hash)
+        .map_or(0, |applied| applied + 1);
+    let mut expected = sequence.iter().skip(expected_from);
+    let mut cursor = current_state_hash.to_string();
+    for commit in events.iter().filter_map(named_group_metadata_event_commit) {
+        if commit.prev_state_hash.as_deref() != Some(cursor.as_str()) {
+            return false;
+        }
+        match expected.next() {
+            Some(want) if *want == commit.state_hash => {}
+            _ => return false,
+        }
+        cursor = commit.state_hash.clone();
+    }
+    true
+}
+
+/// Test-only mirror of [`armed_anchored_gap_sequence`]: is the #846
+/// catch-up gate ARMED for this group right now? Lets a test prove the
+/// gate (not a disarm) admitted or refused each page.
+#[cfg(test)]
+pub(in crate::server) fn catchup_846_gate_armed(info: &x0x::groups::GroupInfo) -> bool {
+    armed_anchored_gap_sequence(info).is_some()
+}
 pub(in crate::server) async fn handle_treekem_catchup_response(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -9664,6 +9765,34 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     let was_truncated = response.truncated;
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
+
+    // #846: while the durable owner-anchored gap record is ARMED (the
+    // owner attested a stale-base gap and the current state has not yet
+    // reached the attested terminal revision), every catch-up page must
+    // stay INSIDE the hash sequence the owner attestation covers: each
+    // served commit must link from the current head AND match the NEXT
+    // expected hash — derived from the CURRENT state, so a page that
+    // follows already-applied pages of the same gap keeps converging. A
+    // page ending mid-sequence is fine (paging continues); a mismatch or
+    // broken link is a fork — adopt NOTHING and page no further, leaving
+    // the durable record (and any queued terminal) intact.
+    if let Some(record) = armed_anchored_gap_sequence(&response_info) {
+        if !catchup_page_within_attested_sequence(
+            &events,
+            &response_info.state_hash,
+            &record.attested_chain_hashes,
+        ) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&response.group_id),
+                sender = %LogHexId::agent(&sender_hex),
+                "[1/6 groups] #846: TreeKEM catch-up page leaves the owner-attested \
+                 chain sequence; adopting nothing (fork or stale responder)"
+            );
+            #[cfg(test)]
+            CATCHUP_846_GATE_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+    }
     for event in events {
         let recovery_event = member_joined_kp_cache_entry(&event)
             .map(|(_, ev)| ev)
@@ -9674,6 +9803,52 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         }
     }
     replay_pending_treekem_events(state, &response.group_id).await;
+    // #846: retire the armed record once the attested terminal actually
+    // LINKED (the group reached its revision) — a stale record must never
+    // arm the gate against a head the current hash is already past. The
+    // map key is resolved ONCE (register key, else the stable-id match)
+    // and the retire mutation runs against that SAME key, so the check
+    // and the mutation cannot disagree about which entry they touched.
+    let retire_key: Option<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get_key_value(&response.group_id)
+            .map(|(key, info)| (key.clone(), info))
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == response.group_id)
+                    .map(|(key, info)| (key.clone(), info))
+            })
+            .filter(|(_, info)| {
+                info.invite_lineage
+                    .as_ref()
+                    .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                    .is_some_and(|record| {
+                        record.reason == "owner_attested_stale_base_gap"
+                            && info.state_revision >= record.terminal_revision
+                    })
+            })
+            .map(|(key, _)| key)
+    };
+    if let Some(key) = retire_key {
+        let mutate = move |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
+            groups
+                .get_mut(&key)
+                .and_then(|info| info.invite_lineage.as_mut())
+                .is_some_and(|lineage| {
+                    lineage.anchored_gap_refusal = None;
+                    true
+                })
+        };
+        let outcome = persist_named_groups_mutation(state, mutate).await;
+        if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&response.group_id),
+                "#846: retiring the converged anchored-gap record did not persist durably"
+            );
+        }
+    }
     if was_truncated {
         tracing::debug!(
             target: "treekem.trace",
