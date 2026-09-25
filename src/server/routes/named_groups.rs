@@ -851,6 +851,9 @@ pub(in crate::server) struct ParkedRoleUpdate {
 }
 
 /// #876: per-group bound on parked role updates (drop-oldest with a warn).
+/// Accepted abuse (review note): an admin can park 32 junk updates to
+/// evict a real one — bounded, logged, and requires admin authority the
+/// same admin could spend on direct role churn anyway.
 pub(in crate::server) const PARKED_ROLE_UPDATE_CAP: usize = 32;
 
 /// ADR 0028: a `JoinRequestApproved` that arrived before its matching
@@ -9917,8 +9920,12 @@ async fn apply_named_group_metadata_event_with_binding(
     let mut cleared_quarantine = std::collections::BTreeSet::new();
     // #876: a role update parked for a member who is landing NOW must be
     // replayed after this apply — capture the trigger before `event` moves.
+    // #876 r2 (review item 1): the replay key is the group's LOCAL MAP
+    // KEY — the same key the park site resolved — never the raw event
+    // group id: a group whose local key differs from its stable id would
+    // otherwise never replay.
     let member_landing_group = if applied_member_add(&event) {
-        Some(named_group_metadata_event_group_id(&event).to_string())
+        local_group_key_for_parking(state, named_group_metadata_event_group_id(&event)).await
     } else {
         None
     };
@@ -9952,7 +9959,27 @@ async fn apply_named_group_metadata_event_with_binding(
 /// #876: is this apply the one that seats a member (the replay trigger for
 /// parked role updates)?
 fn applied_member_add(event: &NamedGroupMetadataEvent) -> bool {
-    matches!(event, NamedGroupMetadataEvent::MemberAdded { .. })
+    // #876 r2 (review item 2): a member can also be seated through an
+    // accepted MemberJoined (self-joins) — both release parked updates.
+    matches!(
+        event,
+        NamedGroupMetadataEvent::MemberAdded { .. } | NamedGroupMetadataEvent::MemberJoined { .. }
+    )
+}
+
+/// #876 r2 (review item 1): resolve an event's group id to the LOCAL
+/// named-groups map key (exact match, else the stable-id match) — the
+/// key both the park site and the replay trigger must use, so a group
+/// whose local key differs from its stable id still replays.
+async fn local_group_key_for_parking(state: &AppState, event_group_id: &str) -> Option<String> {
+    let groups = state.named_groups.read().await;
+    if let Some((key, _)) = groups.get_key_value(event_group_id) {
+        return Some(key.clone());
+    }
+    groups
+        .iter()
+        .find(|(_, info)| info.stable_group_id() == event_group_id)
+        .map(|(key, _)| key.clone())
 }
 
 /// #876 (issue item 3): park a signed role update whose target member is
@@ -9980,6 +10007,9 @@ fn park_role_update_for_late_member(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let list = lot.entry(group_key.to_string()).or_default();
+    // #876 r2 (review item 2): TTL — a member that never lands must not
+    // hold the slot forever.
+    list.retain(|entry| entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL);
     while list.len() >= PARKED_ROLE_UPDATE_CAP {
         let evicted = list.remove(0);
         tracing::warn!(
@@ -10006,6 +10036,9 @@ async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         lot.remove(group_key).unwrap_or_default()
     };
+    // #876 r2 (review item 2): expired entries die with the drain.
+    let mut parked = parked;
+    parked.retain(|entry| entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL);
     if parked.is_empty() {
         return;
     }
@@ -19318,6 +19351,16 @@ async fn wipe_local_group_crypto_material(
         }
     }
     state.control_blobs.prune_groups(&aliases);
+    // #876 r2 (review item 2): parked role updates die with the group.
+    {
+        let mut lot = state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for alias in &aliases {
+            lot.remove(alias);
+        }
+    }
 
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
@@ -33464,19 +33507,31 @@ async fn handle_join_result_message_bound(
                     );
                     return;
                 }
-                if let Err(e) = control_blob::send_reference(
-                    &state.control_blobs,
-                    &state.agent,
-                    sender,
-                    control_blob::ControlBlobKind::JoinResult,
-                    &group_id,
-                    attempt_id.as_deref(),
-                    payload,
-                )
-                .await
-                {
-                    tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to send join-result reference: {e}");
-                }
+                // #876 r2 (review item 3): the bounded staging retry must
+                // NOT run inside the single join-result listener loop — a
+                // busy budget would stall every joiner's result handling
+                // up to 12 s. Deliver on a task; the loop stays free.
+                let control_blobs = state.control_blobs.clone();
+                let agent = Arc::clone(&state.agent);
+                let group_id_for_task = group_id.clone();
+                let attempt = attempt_id.clone();
+                let member_for_log = member_agent_id.clone();
+                let recipient = *sender;
+                tokio::spawn(async move {
+                    if let Err(e) = control_blob::send_reference(
+                        &control_blobs,
+                        &agent,
+                        &recipient,
+                        control_blob::ControlBlobKind::JoinResult,
+                        &group_id_for_task,
+                        attempt.as_deref(),
+                        payload,
+                    )
+                    .await
+                    {
+                        tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
+                    }
+                });
                 return;
             }
             if let Err(e) = state
@@ -41025,7 +41080,18 @@ pub(in crate::server) mod tests {
     async fn role_update_for_late_member_parks_then_replays_on_member_add() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let group_id = "role-update-late-member-876";
-        let (info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        // #876 r2 (review item 1): the group's LOCAL MAP KEY differs
+        // from its stable id (genesis-pinned), so the parked update is
+        // keyed under the map key while the events carry the stable id —
+        // the mismatch shape the replay must survive.
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "876-stable-role-late".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        info.recompute_state_hash();
         state
             .named_groups
             .write()

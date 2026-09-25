@@ -741,15 +741,22 @@ async fn fetch_and_apply(
     // per-peer staging cap then bounds IN-FLIGHT blobs, not TTL-held
     // ones). Best-effort: an older source ignores the unknown message
     // type and keeps TTL semantics; a failure here never fails the fetch.
-    let release = ControlBlobMessage::Release {
-        reference: reference.clone(),
-    };
-    if let Err(reason) = send_message(&state.agent, &source, &release).await {
-        tracing::debug!(
-            reason,
-            "control blob release notice failed (TTL still applies)"
-        );
-    }
+    // #876 r2 (review minor): best-effort on a TASK — a slow transport
+    // must never delay the fetched payload's dispatch to its handler.
+    let release_state = Arc::clone(state);
+    let release_source = source;
+    let release_reference = reference.clone();
+    tokio::spawn(async move {
+        let release = ControlBlobMessage::Release {
+            reference: release_reference,
+        };
+        if let Err(reason) = send_message(&release_state.agent, &release_source, &release).await {
+            tracing::debug!(
+                reason,
+                "control blob release notice failed (TTL still applies)"
+            );
+        }
+    });
     if !reference_admitted(state, reference).await {
         return Err("control blob binding no longer current");
     }
@@ -969,6 +976,58 @@ mod tests {
             .expect("#876: a released slot is reusable by the same recipient");
     }
 
+    /// #876 r2 (review item 4a, WIRE-LEVEL): three sequential joins, each
+    /// staging two oversized events for the SAME recipient; every
+    /// completed pull sends its Release THROUGH the source's message
+    /// handler (serde round-trip included), freeing the slot for the next
+    /// join. With the release path disabled (the fail-before) the third
+    /// join's first stage — the FIFTH blob for this recipient — is
+    /// refused with "staging budget exhausted" and the event is dropped:
+    /// the R15 failure.
+    #[tokio::test]
+    async fn three_sequential_joins_release_slots_through_the_handler() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = super::super::super::home::tests::owned_state(dir.path(), [0x73; 32]).await?;
+        super::super::super::home::provision_home(&state).await;
+        let owner = state.agent.identity().user_keypair().expect("owned Home");
+        let (_, info) = super::super::super::home::find_home(&state, &owner.user_id())
+            .await
+            .expect("Home group");
+        let group_id = info.stable_group_id().to_string();
+        let recipient = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let source_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        for join in 0..3u32 {
+            for event_index in 0..2u32 {
+                let bytes = vec![
+                    u8::try_from(join * 2 + event_index).unwrap_or(0x7A);
+                    x0x::dm::MAX_PAYLOAD_BYTES + 64
+                ];
+                let reference = ControlBlobRef {
+                    kind: ControlBlobKind::NamedGroupEvent,
+                    group_id: group_id.clone(),
+                    source: source_hex.clone(),
+                    recipient: hex::encode(recipient.as_bytes()),
+                    digest: hex::encode(blake3::hash(&bytes).as_bytes()),
+                    byte_len: bytes.len() as u64,
+                    join_attempt_id: None,
+                };
+                state
+                    .control_blobs
+                    .stage(reference.clone(), bytes)
+                    .unwrap_or_else(|e| panic!("join {join} event {event_index} must stage: {e}"));
+                // The completed pull: the recipient's Release goes over
+                // the wire (serialized + reparsed) and through the
+                // SOURCE's production handler.
+                let wire = serde_json::to_vec(&ControlBlobMessage::Release {
+                    reference: reference.clone(),
+                })?;
+                let message: ControlBlobMessage = serde_json::from_slice(&wire)?;
+                handle_control_blob_message(&state, &recipient, true, message).await;
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn control_ref_rejects_wrong_identity_kind_digest_length_and_expiry() {
         let bytes = vec![0x5a; x0x::dm::MAX_PAYLOAD_BYTES + 1];

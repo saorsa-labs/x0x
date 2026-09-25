@@ -7099,20 +7099,16 @@ fn cert_carrying_member_joined_sizes_are_representative() -> Result<()> {
         *certificate_b64 = Some(cert_b64);
     }
     let home_shaped = serde_json::to_vec(&event)?;
-    if home_shaped.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-        // The representative Home shape exceeds one DM — it MUST take the
-        // control-blob path. Print the measurement for the record.
-        eprintln!(
-            "cert+keypackage MemberJoined: {} bytes > {} DM budget -> control blob path",
-            home_shaped.len(),
-            x0x::dm::MAX_PAYLOAD_BYTES
-        );
-    } else {
-        eprintln!(
-            "cert+keypackage MemberJoined: {} bytes (fits the DM budget; blob path unneeded)",
-            home_shaped.len()
-        );
-    }
+    // #876 r2 (review item 4b): ASSERT the representative band — the
+    // real key package + cert really are in the payload (a fixture that
+    // silently drops them fails here). The >-DM-budget shape (the
+    // welcome-carrying join RESULT) is asserted in
+    // home_control_payload_size.rs.
+    assert!(
+        home_shaped.len() > 30_000 && home_shaped.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
+        "cert+keypackage MemberJoined measured {} bytes — outside the representative band",
+        home_shaped.len()
+    );
     Ok(())
 }
 
