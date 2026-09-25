@@ -5064,15 +5064,22 @@ mod tests {
         })
         .await
         .expect("connected member becomes a topic peer");
-        assert_eq!(
-            role_for(&publisher, topic, *receiver_peer.as_bytes()),
-            "lazy",
-            "member must be outside the ordinary Full eager fanout"
+        let connected = publisher.transport.connected_peer_ids().await;
+        assert!(
+            publisher
+                .preferred_roster_peers(topic, &connected)
+                .await
+                .is_empty(),
+            "a member has no roster preference before the roster is installed"
         );
 
         publisher
             .replace_group_rosters(vec![("ab".repeat(32), String::new(), vec![member_agent])])
             .await;
+        assert_eq!(
+            publisher.preferred_roster_peers(topic, &connected).await,
+            vec![receiver_peer]
+        );
         assert_eq!(
             role_for(&publisher, topic, *receiver_peer.as_bytes()),
             "eager"
@@ -5106,22 +5113,19 @@ mod tests {
         });
         let identity = group_identity_for_test(&manager);
         let member = AgentId([40; 32]);
-        let machine = MachineId([90; 32]);
-        authorize_group_peer_for_test(&identity.bindings, member, machine).await;
         let group_id = "ab".repeat(32);
         let topic_name = format!("x0x/group/{group_id}/kv/{}", "cd".repeat(32));
         let topic = TopicId::from_entity(topic_name.as_bytes());
-        let mut plane: Vec<[u8; 32]> = (1..=13).map(|n| [n; 32]).collect();
-        plane.push(machine.0);
-        set_plane(&manager, plane);
+        let plane: Vec<[u8; 32]> = (1..=14).map(|n| [n; 32]).collect();
+        set_plane(&manager, plane.clone());
         let _sub = manager.subscribe(topic_name).await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while role_for(&manager, topic, machine.0) == "absent" {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("anonymous member enters topic mesh");
+        let machine = MachineId(
+            plane
+                .into_iter()
+                .find(|peer| role_for(&manager, topic, *peer) == "lazy")
+                .expect("fourteen peers leave an ordinary lazy peer"),
+        );
+        authorize_group_peer_for_test(&identity.bindings, member, machine).await;
         assert_eq!(role_for(&manager, topic, machine.0), "lazy");
         manager
             .replace_group_rosters(vec![(group_id, String::new(), vec![member])])
