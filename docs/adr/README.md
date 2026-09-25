@@ -83,6 +83,8 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
 
+- [ADR 0073: Audio and Video Calling Ship Together via the Daemon-Side Browser Gateway](./0073-audio-and-video-calling.md) (proposed 2026-09-25) — serves vision **R8**; extends ADR 0042 by making its (e) gateway the human media path: the GUI captures and encodes (Opus/VP8) and talks WebRTC to its own daemon over loopback only; daemons relay RTP/RTCP over `WebRtcV1` lanes with no transcoding and need no TURN/ICE across the WAN; native daemon capture/encode (Option B) rejected; voice enabled in release builds with `/calls` REST, `call.*` events, `x0x call` CLI (lifecycle only) and GUI call UI; call invites ring only past the existing stream/connect-ACL gates, with a `Call` cap proposed for ADR 0070 `ShareGrant`; 1:1 only, group mesh 0042 (d) deferred; defines the `calling-r8-e2e` cross-NAT acceptance test (#892)
+
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
 Documentation-audit corrections, 2026-07-19. The ADR files themselves are
