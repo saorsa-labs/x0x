@@ -707,6 +707,14 @@ pub const MACHINE_ANNOUNCE_V3_TOPIC: &str = "x0x.machine.announce.v3";
 /// [`MOVE_ACTIVATION_TOPIC`].
 pub const REVOCATION_V2_TOPIC: &str = "x0x.revocation.v2";
 
+/// Reserved gossip topic for ADR-0070 share-grant revocation records
+/// (`Vec<RevocationRecord>` of `ShareGrant` subjects only).
+///
+/// Older daemons decode the v1/v2 batches as one whole
+/// `Vec<RevocationRecord>` and drop the batch on an unknown variant, so
+/// share-grant revocations ride only this topic (and `revocations-v3.bin`).
+pub const REVOCATION_V3_TOPIC: &str = "x0x.revocation.v3";
+
 /// Reserved gossip topic for ADR-0043 move activation bundles.
 ///
 /// Payload is exactly one `ChainedRecord { ActivationBundle }`, published
@@ -3644,6 +3652,17 @@ impl HeartbeatContext {
                         .await;
                 }
             }
+            // ADR-0070: share-grant revocations ride v3 only, same gating.
+            let share_grant_records = self.revocation_set.read().await.share_grant_records();
+            if !share_grant_records.is_empty() {
+                if let Ok(bytes) = bincode::serialize(&share_grant_records) {
+                    let _ = self
+                        .runtime
+                        .pubsub()
+                        .publish(REVOCATION_V3_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .await;
+                }
+            }
 
             let records = self.revocation_set.read().await.all_records();
             if !records.is_empty() {
@@ -3722,6 +3741,72 @@ fn raw_dm_history_record(
         ingress_sender_agent: None,
         logical_request_id: None,
     })
+}
+
+/// File (in the identity dir) holding ADR-0070 share-grant revocations.
+pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
+
+/// Apply a `x0x.revocation.v3` batch (ADR-0070): verify each share-grant
+/// record's owner-key authority, insert, and persist `revocations-v3.bin`
+/// when anything was new. Records of any other subject are ignored here —
+/// they have their own carriers.
+async fn ingest_share_grant_revocations(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<std::path::PathBuf>,
+    payload: &[u8],
+) -> bool {
+    const MAX_V3_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+    if payload.len() > MAX_V3_PAYLOAD_BYTES {
+        return false;
+    }
+    let Ok(records) = bincode::deserialize::<Vec<revocation::RevocationRecord>>(payload) else {
+        return false;
+    };
+    let mut inserted = false;
+    {
+        let mut set = revocation_set.write().await;
+        for record in records {
+            if !matches!(record.subject, revocation::RevokedSubject::ShareGrant(_))
+                || set.contains_hash(&record.record_hash())
+            {
+                continue;
+            }
+            match set.verify_and_insert(record, None) {
+                Ok(true) => inserted = true,
+                Ok(false) => {}
+                Err(e) => tracing::debug!("v3 share-grant revocation rejected: {e}"),
+            }
+        }
+    }
+    if inserted {
+        persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
+    }
+    inserted
+}
+
+/// Best-effort write of `revocations-v3.bin` (atomic, mode 0600). The
+/// in-memory set stays authoritative for this run if the write fails.
+pub(crate) async fn persist_share_grant_revocations(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+) {
+    let Some(dir) = identity_dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(storage::x0x_home_dir)
+    else {
+        return;
+    };
+    let bytes = revocation_set.read().await.to_bytes_v3();
+    match bytes {
+        Ok(bytes) => {
+            if let Err(e) =
+                storage::save_private_bytes_to(&dir.join(SHARE_GRANT_REVOCATIONS_FILE), bytes).await
+            {
+                tracing::warn!("revocations-v3 persist failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("revocations-v3 encode failed: {e}"),
+    }
 }
 
 struct RawDirectDelivery {
@@ -8713,6 +8798,11 @@ impl Agent {
             .pubsub()
             .subscribe(REVOCATION_V2_TOPIC.to_string())
             .await;
+        // ADR-0070: share-grant revocations (v3 carrier).
+        let mut sub_revocation_v3 = runtime
+            .pubsub()
+            .subscribe(REVOCATION_V3_TOPIC.to_string())
+            .await;
         let mut sub_move_activation = runtime
             .pubsub()
             .subscribe(MOVE_ACTIVATION_TOPIC.to_string())
@@ -8728,6 +8818,7 @@ impl Agent {
                 Revocation(crate::gossip::PubSubMessage),
                 MachineV3(crate::gossip::PubSubMessage),
                 RevocationV2(crate::gossip::PubSubMessage),
+                RevocationV3(crate::gossip::PubSubMessage),
                 MoveActivation(crate::gossip::PubSubMessage),
             }
 
@@ -8787,6 +8878,7 @@ impl Agent {
                     Some(m) = sub_revocation.recv() => DiscoveryMessage::Revocation(m),
                     Some(m) = sub_machine_v3.recv() => DiscoveryMessage::MachineV3(m),
                     Some(m) = sub_revocation_v2.recv() => DiscoveryMessage::RevocationV2(m),
+                    Some(m) = sub_revocation_v3.recv() => DiscoveryMessage::RevocationV3(m),
                     Some(m) = sub_move_activation.recv() => DiscoveryMessage::MoveActivation(m),
                     // Required for PROMPT shutdown: without this arm the listener
                     // only exits when every gossip subscription closes (the
@@ -9064,6 +9156,10 @@ impl Agent {
                                             "evicted revoked machine (received via gossip)"
                                         );
                                     }
+                                    // A share-grant record on v1 is never
+                                    // republished there (allowlist); grants
+                                    // are denied at evaluation time.
+                                    revocation::RevokedSubject::ShareGrant(_) => {}
                                     // Binding tombstones evict nothing (§7):
                                     // the pairing dies at the B/P gates.
                                     revocation::RevokedSubject::AgentMachineBinding(
@@ -9186,6 +9282,16 @@ impl Agent {
                                 }
                             });
                         }
+                        continue;
+                    }
+                    // ADR-0070: share-grant revocations on the v3 carrier.
+                    DiscoveryMessage::RevocationV3(msg) => {
+                        ingest_share_grant_revocations(
+                            &revocation_set,
+                            identity_dir_for_listener.clone(),
+                            &msg.payload,
+                        )
+                        .await;
                         continue;
                     }
                     // ADR-0043 §3.3: a carried ActivationBundle under the
@@ -12300,6 +12406,14 @@ impl Agent {
                 tracing::info!(
                     machine = %hex::encode(machine_id.as_bytes()),
                     "evicted revoked machine from discovery cache"
+                );
+            }
+            // ADR-0070: a revoked share grant evicts nothing; grants are
+            // re-evaluated against the revocation set at every gate.
+            revocation::RevokedSubject::ShareGrant(grant) => {
+                tracing::info!(
+                    grant_id = %hex::encode(grant.grant_id),
+                    "share grant revoked"
                 );
             }
             // ADR-0043: a binding tombstone retires ONE (agent, machine)
@@ -15664,6 +15778,13 @@ impl AgentBuilder {
                     match revocation::RevocationSet::from_bytes_v2(&bytes) {
                         Ok(v2) => revoked_for_load.merge_v2(v2),
                         Err(e) => tracing::warn!("revocations-v2.bin unreadable: {e}"),
+                    }
+                }
+                // ADR-0070: share-grant revocations (v3 file).
+                if let Ok(bytes) = tokio::fs::read(dir.join(SHARE_GRANT_REVOCATIONS_FILE)).await {
+                    match revocation::RevocationSet::from_bytes_v3(&bytes) {
+                        Ok(v3) => revoked_for_load.merge_v3(v3),
+                        Err(e) => tracing::warn!("revocations-v3.bin unreadable: {e}"),
                     }
                 }
             }
