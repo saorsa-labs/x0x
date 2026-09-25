@@ -112,6 +112,47 @@ impl OwnerTrust {
             .clone()
     }
 
+    /// ADR-0070 §2: what the held share grants confer on `(agent_id,
+    /// machine_id)` for this daemon's agent. Explicit local denials win: a
+    /// `Blocked` agent or a machine-pin mismatch gets nothing. Pairing uses
+    /// the same authenticated binding as owner trust (module docs, 2); see
+    /// [`crate::share_grant::evaluate_grant_access`] for the rest.
+    pub async fn grant_access(
+        &self,
+        contact_store: &RwLock<ContactStore>,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+    ) -> crate::share_grant::GrantAccess {
+        let Some(store) = self.share_grant_store() else {
+            return crate::share_grant::GrantAccess::default();
+        };
+        let base = {
+            let contacts = contact_store.read().await;
+            TrustEvaluator::new(&contacts).evaluate(&TrustContext {
+                agent_id,
+                machine_id,
+            })
+        };
+        if matches!(
+            base,
+            TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch
+        ) {
+            return crate::share_grant::GrantAccess::default();
+        }
+        crate::share_grant::evaluate_grant_access(
+            &store,
+            &self.bindings,
+            discovery_cache,
+            revocation_set,
+            agent_id,
+            machine_id,
+            unix_now_secs(),
+        )
+        .await
+    }
+
     /// The local owner, if this install has one.
     #[must_use]
     pub fn local_owner(&self) -> Option<UserId> {

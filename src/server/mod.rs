@@ -1893,7 +1893,13 @@ pub async fn serve_with_options(
                 );
                 // The legacy unprefixed wire form carries no durable
                 // receipt, so the admission outcome has nowhere to go.
-                let _ = admit_public_group_bootstrap(&bootstrap_state, msg.sender, bootstrap).await;
+                let _ = admit_public_group_bootstrap(
+                    &bootstrap_state,
+                    msg.sender,
+                    Some(msg.machine_id),
+                    bootstrap,
+                )
+                .await;
             }
         }));
     }

@@ -1137,6 +1137,7 @@ pub(in crate::server) fn spawn_public_group_bootstrap_delivery(state: &Arc<AppSt
 pub(in crate::server) async fn admit_public_group_bootstrap(
     state: &Arc<AppState>,
     sender: AgentId,
+    sender_machine: Option<x0x::identity::MachineId>,
     bootstrap: PublicGroupBootstrap,
 ) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
     use x0x::dm_inbox::DmTypedPayloadCompletion;
@@ -1156,9 +1157,29 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     // roster inside the bootstrap is sender-controlled and cannot carry the
     // consent decision; only senders the local agent already knows may seed
     // groups (mirrors the pending-welcome convention for encrypted groups).
-    {
+    //
+    // ADR-0070 §2: a current `GroupInvite` ShareGrant for this agent is the
+    // one other consent — the owner said this grantee may add the shared
+    // agent to groups. Blocked still wins (the grant evaluation refuses a
+    // Blocked sender), and the grant pairs only on the authenticated
+    // binding of the transport machine. It never touches Home admission
+    // (`GroupAdmission::OwnerCertified`).
+    let known_contact = {
         let contacts = state.contacts.read().await;
-        if contacts.trust_level(&sender).rank() < crate::contacts::TrustLevel::Known.rank() {
+        contacts.trust_level(&sender).rank() >= crate::contacts::TrustLevel::Known.rank()
+    };
+    if !known_contact {
+        let granted = match sender_machine {
+            Some(machine) => {
+                state
+                    .agent
+                    .share_grant_access(&sender, &machine)
+                    .await
+                    .group_invite
+            }
+            None => false,
+        };
+        if !granted {
             tracing::debug!(
                 sender = %LogHexId::agent(&sender_hex),
                 "ignoring public-group bootstrap from unknown or blocked sender"
@@ -1260,6 +1281,7 @@ pub(in crate::server) async fn handle_public_group_bootstrap_typed_payload(
 ) {
     let x0x::dm_inbox::DmTypedPayload {
         sender,
+        machine_id,
         payload,
         verified,
         completion,
@@ -1268,7 +1290,9 @@ pub(in crate::server) async fn handle_public_group_bootstrap_typed_payload(
     let result = if verified {
         match payload.strip_prefix(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX) {
             Some(encoded) => match decode_public_group_bootstrap(encoded) {
-                Ok(bootstrap) => admit_public_group_bootstrap(state, sender, bootstrap).await,
+                Ok(bootstrap) => {
+                    admit_public_group_bootstrap(state, sender, Some(machine_id), bootstrap).await
+                }
                 Err(error) => Err(error),
             },
             None => Err("typed public-group bootstrap prefix is missing".to_string()),
@@ -1702,6 +1726,7 @@ mod tests {
         let completion = admit_public_group_bootstrap(
             &state,
             authority.agent_id(),
+            None,
             PublicGroupBootstrap {
                 message_type: PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE.to_string(),
                 group: Box::new(group),

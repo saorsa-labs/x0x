@@ -293,6 +293,7 @@ async fn connect_acl_denies_unlisted_voice_peer() {
                 targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
             }],
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         },
     )));
 
@@ -428,6 +429,7 @@ async fn connect_acl_denies_unlisted_datagram_lane() {
                 targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
             }],
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         },
     )));
 

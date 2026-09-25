@@ -347,3 +347,5 @@ async fn grant_signed_by_grantee_over_owner_agent_is_not_issued_here() {
         Err(ShareGrantError::NotForUs)
     );
 }
+
+mod enforcement;

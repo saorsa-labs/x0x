@@ -242,6 +242,9 @@ pub struct DmInboxConfig {
     pub silent_reject: bool,
     /// Prefix-routed payloads that should bypass generic DirectMessaging fan-out.
     pub typed_payload_routes: Vec<DmTypedPayloadRoute>,
+    /// ADR-0070 §2 DM-acceptance input: a sender holding a current `Dm`
+    /// ShareGrant for this agent is promoted to `Accept`. `None` ⇒ no grants.
+    pub share_grant_gate: Option<crate::share_grant::ShareGrantDmGate>,
 }
 
 impl std::fmt::Debug for DmInboxConfig {
@@ -249,11 +252,19 @@ impl std::fmt::Debug for DmInboxConfig {
         f.debug_struct("DmInboxConfig")
             .field("silent_reject", &self.silent_reject)
             .field("typed_payload_routes", &self.typed_payload_routes.len())
+            .field("share_grant_gate", &self.share_grant_gate.is_some())
             .finish()
     }
 }
 
 impl DmInboxConfig {
+    /// Install the ADR-0070 §2 share-grant DM-acceptance gate.
+    #[must_use]
+    pub fn with_share_grant_gate(mut self, gate: crate::share_grant::ShareGrantDmGate) -> Self {
+        self.share_grant_gate = Some(gate);
+        self
+    }
+
     /// Add a typed-payload route. Matching payloads are delivered to `sender`
     /// and are not emitted to generic `/direct/events` consumers.
     ///
@@ -542,6 +553,7 @@ impl DmInboxService {
             cache,
             silent_reject: config.silent_reject,
             typed_payload_routes: config.typed_payload_routes,
+            share_grant_gate: config.share_grant_gate,
             revocation_set,
             move_state,
             authenticated_machine_bindings,
@@ -975,6 +987,8 @@ pub(crate) struct InboxPipeline {
     cache: Arc<RecentDeliveryCache>,
     silent_reject: bool,
     typed_payload_routes: Vec<DmTypedPayloadRoute>,
+    /// ADR-0070 §2 share-grant DM-acceptance gate (`None` ⇒ no grants).
+    share_grant_gate: Option<crate::share_grant::ShareGrantDmGate>,
     /// Shared revocation set for enforcement point 3.
     revocation_set: Arc<RwLock<RevocationSet>>,
     /// ADR-0043 derived move state — the B/P pairing gate reads the
@@ -1501,6 +1515,24 @@ impl InboxPipeline {
                 agent_id: &sender_agent_id,
                 machine_id: &sender_machine_id,
             })
+        };
+        // ADR-0070 §2: a current `Dm` ShareGrant for this agent promotes an
+        // Unknown/AcceptWithFlag sender to Accept. Rejections are never
+        // overridden; the grant pairs only on the authenticated binding.
+        let decision = match (&self.share_grant_gate, decision) {
+            (Some(gate), TrustDecision::Unknown | TrustDecision::AcceptWithFlag)
+                if gate
+                    .dm_allowed(
+                        &self.contacts,
+                        &self.revocation_set,
+                        &sender_agent_id,
+                        &sender_machine_id,
+                    )
+                    .await =>
+            {
+                TrustDecision::Accept
+            }
+            (_, decision) => decision,
         };
 
         tracing::info!(
@@ -2520,6 +2552,7 @@ mod tests {
             cache: Arc::new(RecentDeliveryCache::with_defaults()),
             silent_reject: true,
             typed_payload_routes: Vec::new(),
+            share_grant_gate: None,
             revocation_set: Arc::new(RwLock::new(revocation_set)),
             move_state: Arc::new(RwLock::new(crate::key_move::MoveState::new())),
             authenticated_machine_bindings,

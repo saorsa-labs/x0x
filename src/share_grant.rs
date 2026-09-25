@@ -44,8 +44,19 @@ use ant_quic::crypto::raw_public_keys::pqc::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion, DmTypedPayloadCompletionResult};
-use crate::identity::{AgentId, UserId, UserKeypair};
+use std::collections::HashMap;
+
+use tokio::sync::RwLock;
+
+use crate::contacts::ContactStore;
+use crate::dm_inbox::{
+    AuthenticatedMachineBindings, DmTypedPayload, DmTypedPayloadCompletion,
+    DmTypedPayloadCompletionResult,
+};
+use crate::identity::{AgentId, MachineId, UserId, UserKeypair};
+use crate::owner_trust::OwnerTrust;
+use crate::revocation::RevocationSet;
+use crate::DiscoveredAgent;
 
 /// Versioned, NUL-terminated DM prefix of a share-grant delivery.
 pub const SHARE_GRANT_DM_PREFIX: &[u8] = b"x0x-sharegrant-v1\0";
@@ -588,6 +599,25 @@ impl ShareGrantStore {
         self.read_state().issued.get(grant_id).cloned()
     }
 
+    /// Issued grants that can open THIS daemon's agent at `now_unix`: signed
+    /// by the local owner, listing the local agent, inside their window.
+    /// Filters under the read lock and clones only the candidates.
+    #[must_use]
+    pub fn candidates_for_local_agent(&self, now_unix: u64) -> Vec<ShareGrant> {
+        let Some(owner) = self.local_owner else {
+            return Vec::new();
+        };
+        let state = self.read_state();
+        state
+            .issued
+            .values()
+            .filter(|g| {
+                g.owner == owner && g.agents.contains(&self.local_agent) && g.is_active_at(now_unix)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Verify, classify and durably store a grant.
     ///
     /// Returns `Inserted` or `Duplicate` only once the grant is on disk (or
@@ -668,6 +698,176 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// What the grants held here confer on one requester pair, for this
+/// daemon's own agent (ADR-0070 §2). The union over every matching grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrantAccess {
+    /// `Dm`: DMs are accepted (`Unknown`/`AcceptWithFlag` → `Accept`).
+    pub dm: bool,
+    /// `Exec`: `principal = "grant"` exec entries may match.
+    pub exec: bool,
+    /// `Connect`: `principal = "grant"` connect entries may match for these
+    /// target ports.
+    pub connect_ports: BTreeSet<u16>,
+    /// `GroupInvite`: groups may be seeded without a contact entry.
+    pub group_invite: bool,
+    /// `Call` (ADR-0073): carried, not yet enforced.
+    pub call: bool,
+}
+
+impl GrantAccess {
+    /// Whether no capability is conferred.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether a `Connect` capability covers `port`.
+    #[must_use]
+    pub fn allows_connect_port(&self, port: u16) -> bool {
+        self.connect_ports.contains(&port)
+    }
+
+    fn absorb(&mut self, caps: &BTreeSet<ShareCap>) {
+        for cap in caps {
+            match cap {
+                ShareCap::Dm => self.dm = true,
+                ShareCap::Exec => self.exec = true,
+                ShareCap::Connect { ports } => self.connect_ports.extend(ports.iter().copied()),
+                ShareCap::GroupInvite => self.group_invite = true,
+                ShareCap::Call => self.call = true,
+            }
+        }
+    }
+}
+
+/// Evaluate the grants held in `store` for `(requester_agent,
+/// requester_machine)` at `now_unix`. Every failure is "no grant":
+///
+/// 1. a grant counts only when signed by this install's owner, listing this
+///    daemon's agent, and inside `[not_before, expiry)`;
+/// 2. the requester's machine must equal its AUTHENTICATED binding (#890;
+///    the slice-1 hardened rule) — a claimed or rewritten discovery-cache
+///    machine never pairs, so a spoofed raw Direct claim (#898) gains
+///    nothing;
+/// 3. the requester agent, machine and ADR-0043 binding must not be revoked,
+///    and the grant itself must not be revoked (`x0x.revocation.v3`);
+/// 4. `Grantee::Agent(a)` matches exactly `a`; `Grantee::User(u)` matches a
+///    requester whose cached `AgentCertificate` is valid, unexpired, binds
+///    exactly this agent and is signed by `u`.
+///
+/// Callers apply explicit local denials (`Blocked`, machine-pin mismatch)
+/// first — see [`OwnerTrust::grant_access`].
+pub async fn evaluate_grant_access(
+    store: &ShareGrantStore,
+    bindings: &AuthenticatedMachineBindings,
+    discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+    revocation_set: &RwLock<RevocationSet>,
+    requester_agent: &AgentId,
+    requester_machine: &MachineId,
+    now_unix: u64,
+) -> GrantAccess {
+    let mut access = GrantAccess::default();
+    let candidates = store.candidates_for_local_agent(now_unix);
+    if candidates.is_empty() {
+        return access;
+    }
+    match crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent).await {
+        Some(bound) if bound == *requester_machine => {}
+        _ => return access,
+    }
+    let live: Vec<ShareGrant> = {
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(requester_agent)
+            || revoked.is_machine_revoked(requester_machine)
+            || revoked.is_binding_revoked(requester_agent, requester_machine)
+        {
+            return access;
+        }
+        candidates
+            .into_iter()
+            .filter(|g| !revoked.is_share_grant_revoked(&g.grant_id, &g.owner))
+            .collect()
+    };
+    let cert = if live.iter().any(|g| matches!(g.grantee, Grantee::User(_))) {
+        discovery_cache
+            .read()
+            .await
+            .get(requester_agent)
+            .and_then(|entry| entry.agent_certificate.clone())
+    } else {
+        None
+    };
+    for grant in &live {
+        let grantee_matches = match grant.grantee {
+            Grantee::Agent(agent) => agent == *requester_agent,
+            Grantee::User(user) => cert.as_ref().is_some_and(|cert| {
+                crate::owner_trust::certificate_chains_to_owner(
+                    &user,
+                    requester_agent,
+                    cert,
+                    false,
+                    now_unix,
+                )
+            }),
+        };
+        if grantee_matches {
+            access.absorb(&grant.caps);
+        }
+    }
+    access
+}
+
+/// The DM-acceptance input of ADR-0070 §2, handed to the DM inbox: a
+/// grantee holding a current `Dm` grant for this daemon's agent is promoted
+/// from `Unknown`/`AcceptWithFlag` to `Accept`.
+#[derive(Clone)]
+pub struct ShareGrantDmGate {
+    owner_trust: OwnerTrust,
+    discovery_cache: Arc<RwLock<HashMap<AgentId, DiscoveredAgent>>>,
+}
+
+impl std::fmt::Debug for ShareGrantDmGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareGrantDmGate").finish_non_exhaustive()
+    }
+}
+
+impl ShareGrantDmGate {
+    /// Gate over the agent's owner-trust source (which holds the grant
+    /// store and authenticated bindings) and its discovery cache.
+    #[must_use]
+    pub fn new(
+        owner_trust: OwnerTrust,
+        discovery_cache: Arc<RwLock<HashMap<AgentId, DiscoveredAgent>>>,
+    ) -> Self {
+        Self {
+            owner_trust,
+            discovery_cache,
+        }
+    }
+
+    /// Whether a current `Dm` grant covers `(sender, sender_machine)`.
+    pub async fn dm_allowed(
+        &self,
+        contacts: &RwLock<ContactStore>,
+        revocation_set: &RwLock<RevocationSet>,
+        sender: &AgentId,
+        sender_machine: &MachineId,
+    ) -> bool {
+        self.owner_trust
+            .grant_access(
+                contacts,
+                &self.discovery_cache,
+                revocation_set,
+                sender,
+                sender_machine,
+            )
+            .await
+            .dm
+    }
+}
+
 /// Handle one typed share-grant DM (the durable route's handler).
 ///
 /// Resolves the completion with `Inserted`/`Duplicate` only once the grant
@@ -733,6 +933,25 @@ impl crate::Agent {
     #[must_use]
     pub fn share_grant_store(&self) -> Option<Arc<ShareGrantStore>> {
         self.owner_trust().share_grant_store()
+    }
+
+    /// What the held grants confer on `(agent_id, machine_id)` for this
+    /// daemon's agent (ADR-0070 §2). `machine_id` must be the
+    /// transport-authenticated peer; see [`evaluate_grant_access`].
+    pub async fn share_grant_access(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+    ) -> GrantAccess {
+        self.owner_trust()
+            .grant_access(
+                &self.contact_store,
+                &self.identity_discovery_cache,
+                &self.revocation_set,
+                agent_id,
+                machine_id,
+            )
+            .await
     }
 
     /// Whether this install's owner has revoked `grant`.

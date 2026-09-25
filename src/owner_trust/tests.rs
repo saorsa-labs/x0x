@@ -183,6 +183,7 @@ impl Fixture {
             loaded_at_unix_ms: 0,
             allow: Vec::new(),
             owner_allow,
+            grant_allow: Vec::new(),
         });
         *self
             .connect_policy

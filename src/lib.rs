@@ -10515,6 +10515,11 @@ impl Agent {
                 sender_agent_id: self.identity.agent_id(),
             }) as std::sync::Arc<dyn dm_inbox::DirectAckHedge>
         });
+        // ADR-0070 §2: DM acceptance consults this agent's share grants.
+        let config = config.with_share_grant_gate(share_grant::ShareGrantDmGate::new(
+            self.owner_trust.clone(),
+            std::sync::Arc::clone(&self.identity_discovery_cache),
+        ));
         let service = dm_inbox::DmInboxService::spawn_with_hedge_options(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
@@ -13649,6 +13654,10 @@ impl Agent {
         // machine has no live pairing and is denied.
         let mut surviving: Vec<identity::AgentId> = Vec::with_capacity(agents.len());
         let mut owner_trusted: Vec<identity::AgentId> = Vec::new();
+        // ADR-0070 §2: agents holding a current Connect grant for this
+        // daemon's agent, and those admitted by that grant alone.
+        let mut grant_connect: Vec<identity::AgentId> = Vec::new();
+        let mut grant_only: Vec<identity::AgentId> = Vec::new();
         for (agent_id, cert_not_after) in &agents {
             // Runtime cert-expiry gate (issue #191): a cached entry whose
             // cert has expired must be refused on the live path.
@@ -13665,7 +13674,24 @@ impl Agent {
             if pair.owner_trusted {
                 owner_trusted.push(*agent_id);
             }
-            let trust_decision = Some(pair.decision);
+            let has_connect_grant = !owner_trust
+                .grant_access(
+                    contact_store,
+                    discovery_cache,
+                    revocation_set,
+                    agent_id,
+                    machine_id,
+                )
+                .await
+                .connect_ports
+                .is_empty();
+            if has_connect_grant {
+                grant_connect.push(*agent_id);
+                if pair.decision != trust::TrustDecision::Accept {
+                    grant_only.push(*agent_id);
+                }
+            }
+            let trust_decision = Some(pair.decision.with_owner_trust(has_connect_grant));
             let (revoked_agent, revoked_machine) = {
                 let revoked = revocation_set.read().await;
                 (
@@ -13745,7 +13771,14 @@ impl Agent {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::sync::Arc::clone(&guard)
         };
-        if let Err(e) = streams::stream_acl_gate(&policy, &agents, &owner_trusted, machine_id) {
+        if let Err(e) = streams::stream_acl_gate_with_grants(
+            &policy,
+            &agents,
+            &owner_trusted,
+            &grant_connect,
+            &grant_only,
+            machine_id,
+        ) {
             tracing::info!(
                 target: "x0x::streams",
                 machine = %hex::encode(machine_id.as_bytes()),

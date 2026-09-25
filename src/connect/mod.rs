@@ -29,4 +29,7 @@ pub use acl::{
     ConnectAclSummary, ConnectAllowEntry, ConnectOwnerEntry, ConnectPolicy,
 };
 pub use diagnostics::{ConnectDiagnostics, ConnectDiagnosticsSnapshot};
-pub use gate::{evaluate_connect_gate, evaluate_connect_gate_for_principal, ConnectDenialReason};
+pub use gate::{
+    evaluate_connect_gate, evaluate_connect_gate_for_principal,
+    evaluate_connect_gate_for_principals, ConnectDenialReason,
+};

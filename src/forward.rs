@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connect::gate::ConnectDenialReason;
 use crate::connect::{
-    evaluate_connect_gate, evaluate_connect_gate_for_principal, ConnectDiagnostics, ConnectPolicy,
+    evaluate_connect_gate, evaluate_connect_gate_for_principals, ConnectDiagnostics, ConnectPolicy,
 };
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, AgentKeypair, MachineId};
@@ -643,15 +643,32 @@ async fn decide_inbound_attested(
         )
         .await;
 
+    // ADR-0070 §2: a current ShareGrant whose Connect ports cover THIS
+    // target lets a `principal = "grant"` entry match, and raises the trust
+    // decision for this target only. Blocked/pin mismatch get no grant.
+    let grant_port_allowed = ctx
+        .owner_trust
+        .grant_access(
+            &ctx.contact_store,
+            &ctx.discovery_cache,
+            &ctx.revocation_set,
+            &header.opener_agent_id,
+            peer_machine,
+        )
+        .await
+        .allows_connect_port(target.port());
+    let decision = pair.decision.with_owner_trust(grant_port_allowed);
+
     // The opener is now cryptographically authenticated: ACL-check that
     // specific agent with its REAL trust decision.
-    evaluate_connect_gate_for_principal(
+    evaluate_connect_gate_for_principals(
         /* verified */ true,
-        Some(pair.decision),
+        Some(decision),
         policy,
         &header.opener_agent_id,
         peer_machine,
         pair.owner_trusted,
+        grant_port_allowed,
         &target,
     )?;
 
@@ -673,7 +690,7 @@ async fn decide_inbound_attested(
     let revoked = ctx.revocation_set.read().await;
     crate::streams::stream_gate(
         &header.opener_agent_id,
-        Some(pair.decision),
+        Some(decision),
         revoked.is_agent_revoked(&header.opener_agent_id),
         revoked.is_machine_revoked(peer_machine),
         crate::identity::is_expired(agent.cert_not_after, ctx.now_ms / 1000),
@@ -1855,6 +1872,7 @@ mod tests {
                 targets: vec![target],
             }],
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         })
     }
 
@@ -1908,6 +1926,7 @@ mod tests {
             loaded_at_unix_ms: 0,
             allow: entries,
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         })
     }
 
