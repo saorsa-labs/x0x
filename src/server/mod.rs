@@ -2599,6 +2599,43 @@ pub async fn list_instances() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn valid_exec_typed_dm(payload: &[u8]) -> bool {
+    x0x::exec::decode_frame_payload(payload).is_ok()
+}
+
+pub(crate) fn valid_group_public_typed_dm(payload: &[u8]) -> bool {
+    payload
+        .strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
+        .is_some_and(|bytes| {
+            serde_json::from_slice::<x0x::groups::GroupPublicMessage>(bytes).is_ok()
+        })
+}
+
+pub(crate) fn valid_public_group_bootstrap_typed_dm(payload: &[u8]) -> bool {
+    payload
+        .strip_prefix(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX)
+        .is_some_and(|bytes| {
+            routes::public_group_bootstrap_outbox::decode_public_group_bootstrap(bytes).is_ok()
+        })
+}
+
+pub(crate) fn valid_kv_store_delta_typed_dm(payload: &[u8]) -> bool {
+    payload
+        .strip_prefix(KV_STORE_DELTA_DM_PREFIX)
+        .is_some_and(|bytes| serde_json::from_slice::<KvStoreDirectDelta>(bytes).is_ok())
+}
+
+pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
+    let Some(bytes) = payload.strip_prefix(GROUP_PREDECESSOR_RELAY_DM_PREFIX) else {
+        return false;
+    };
+    bytes.len() <= CAUSAL_ENVELOPE_MAX_BYTES
+        && bytes.first() == Some(&2)
+        && routes::named_groups::decode_and_verify_v2(bytes).is_ok_and(|(event, _, _)| {
+            matches!(event, NamedGroupMetadataEvent::JoinRequestCreated { .. })
+        })
+}
+
 async fn start_dm_inbox_when_gossip_ready(
     agent: Arc<x0x::Agent>,
     kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
@@ -2610,23 +2647,34 @@ async fn start_dm_inbox_when_gossip_ready(
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
-            .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, exec_route_tx.clone())
-            .with_typed_payload_route(
+            .with_validated_typed_payload_route(
+                x0x::exec::EXEC_DM_PREFIX,
+                exec_route_tx.clone(),
+                valid_exec_typed_dm,
+            )
+            .with_validated_typed_payload_route(
                 GROUP_PUBLIC_MESSAGE_DM_PREFIX,
                 group_public_route_tx.clone(),
+                valid_group_public_typed_dm,
             )
             // ADR 0030 §5/§7: durable, not plain. The outbox only clears an
             // obligation on a v2 ACK, and a v2 ACK is released only by this
             // route's completion signal — registering it as a plain typed
             // route would withhold every ACK and livelock the outbox.
-            .with_durable_typed_payload_route(
+            .with_validated_durable_typed_payload_route(
                 PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX,
                 public_group_bootstrap_route_tx.clone(),
+                valid_public_group_bootstrap_typed_dm,
             )
-            .with_typed_payload_route(KV_STORE_DELTA_DM_PREFIX, kv_store_delta_route_tx.clone())
-            .with_typed_payload_route(
+            .with_validated_typed_payload_route(
+                KV_STORE_DELTA_DM_PREFIX,
+                kv_store_delta_route_tx.clone(),
+                valid_kv_store_delta_typed_dm,
+            )
+            .with_validated_typed_payload_route(
                 GROUP_PREDECESSOR_RELAY_DM_PREFIX,
                 predecessor_relay_route_tx.clone(),
+                valid_predecessor_relay_typed_dm,
             );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)

@@ -3680,6 +3680,7 @@ fn raw_dm_history_record(
     verified: bool,
     trust_decision: Option<trust::TrustDecision>,
     now_ms: i64,
+    rejected_typed_prefix: bool,
 ) -> Option<history::HistoryRecord> {
     if !verified
         || matches!(
@@ -3689,9 +3690,12 @@ fn raw_dm_history_record(
     {
         return None;
     }
-    let history::classify::DmPayloadClass::Durable(content_type) =
+    let class = if rejected_typed_prefix {
+        history::classify::classify_ordinary_dm_payload(payload)
+    } else {
         history::classify::classify_dm_payload(payload)
-    else {
+    };
+    let history::classify::DmPayloadClass::Durable(content_type) = class else {
         return None;
     };
     Some(history::HistoryRecord {
@@ -3737,7 +3741,7 @@ async fn dispatch_raw_direct_after_gates(
     history_handle: Option<&history::HistoryHandle>,
     typed_routes: &[dm_inbox::DmTypedPayloadRoute],
     delivery: RawDirectDelivery,
-) {
+) -> dm_inbox::TypedRouteOutcome {
     let RawDirectDelivery {
         sender,
         machine_id,
@@ -3753,6 +3757,7 @@ async fn dispatch_raw_direct_after_gates(
     // gossip inbox and never enters the generic direct-message/history path.
     // Raw transport ACKs remain transport receipts, regardless of whether a
     // bounded typed-route channel accepts or its handler processes the item.
+    let mut route_outcome = dm_inbox::TypedRouteOutcome::NoPrefix;
     if verified
         && !matches!(
             trust_decision,
@@ -3762,7 +3767,7 @@ async fn dispatch_raw_direct_after_gates(
         let hash = blake3::hash(&data);
         let mut request_id = [0u8; 16];
         request_id.copy_from_slice(&hash.as_bytes()[..16]);
-        if dm_inbox::InboxPipeline::try_route_typed_payload(
+        route_outcome = dm_inbox::InboxPipeline::try_route_typed_payload(
             typed_routes,
             dm,
             dm_inbox::DmTypedPayload {
@@ -3775,8 +3780,9 @@ async fn dispatch_raw_direct_after_gates(
                 request_id,
                 completion: None,
             },
-        ) {
-            return;
+        );
+        if route_outcome == dm_inbox::TypedRouteOutcome::Recognized {
+            return route_outcome;
         }
     }
 
@@ -3789,6 +3795,7 @@ async fn dispatch_raw_direct_after_gates(
             verified,
             trust_decision,
             i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
+            route_outcome == dm_inbox::TypedRouteOutcome::RejectedPrefix,
         ),
     ) {
         history.record(record);
@@ -3825,6 +3832,7 @@ async fn dispatch_raw_direct_after_gates(
         subscriber_count = dm.subscriber_count(),
         "direct message dispatched"
     );
+    route_outcome
 }
 
 // ─── ADR 0030: strict capability refresh ───────────────────────────────────
@@ -19311,6 +19319,7 @@ mod tests {
             true,
             Some(trust::TrustDecision::Accept),
             123,
+            false,
         )
         .expect("verified user DM should produce history");
 
@@ -19328,13 +19337,14 @@ mod tests {
         let mut generic = dm.subscribe();
         let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(4);
         let routes = vec![dm_inbox::DmTypedPayloadRoute {
-            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            prefix: b"TEST-TYPED-ROUTE\n".to_vec(),
             sender: typed_tx,
             durable_completion: false,
+            validator: None,
         }];
         let sender = identity::AgentId([0x81; 32]);
         let machine_id = identity::MachineId([0x82; 32]);
-        let typed_bytes = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nsigned-event".to_vec();
+        let typed_bytes = b"TEST-TYPED-ROUTE\nsigned-event".to_vec();
 
         dispatch_raw_direct_after_gates(
             &dm,
@@ -19441,13 +19451,146 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn verified_raw_ordinary_dm_with_predecessor_prefix_reaches_generic_subscriber() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(1);
+        let routes = vec![dm_inbox::DmTypedPayloadRoute {
+            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            sender: typed_tx,
+            durable_completion: false,
+            validator: None,
+        }];
+        let ordinary = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nhello from an ordinary DM".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender: identity::AgentId([0x81; 32]),
+                machine_id: identity::MachineId([0x82; 32]),
+                data: ordinary.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        assert_eq!(
+            generic
+                .try_recv()
+                .expect("ordinary DM must reach generic subscriber")
+                .payload,
+            ordinary
+        );
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "ordinary DM must not enter relay handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_typed_prefixes_are_ordinary_raw_dms_with_history() {
+        let history_dir = tempfile::tempdir().expect("history tempdir");
+        let history_config = history::HistoryConfig {
+            db_path: Some(history_dir.path().join("history.db")),
+            ..history::HistoryConfig::daemon_default()
+        };
+        let history_service = history::HistoryService::start(&history_config, history_dir.path())
+            .expect("history service");
+        let history_handle = history_service.handle();
+        type TypedPrefixCase<'a> = (&'a [u8], fn(&[u8]) -> bool);
+        let cases: [TypedPrefixCase<'_>; 5] = [
+            (exec::EXEC_DM_PREFIX, server::valid_exec_typed_dm),
+            (
+                history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+                server::valid_group_public_typed_dm,
+            ),
+            (
+                b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n",
+                server::valid_public_group_bootstrap_typed_dm,
+            ),
+            (
+                history::classify::KV_STORE_DELTA_DM_PREFIX,
+                server::valid_kv_store_delta_typed_dm,
+            ),
+            (
+                dm_inbox::GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+                server::valid_predecessor_relay_typed_dm,
+            ),
+        ];
+        for (prefix, validator) in cases {
+            let dm = direct::DirectMessaging::new();
+            let mut generic = dm.subscribe();
+            let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(1);
+            let routes = vec![dm_inbox::DmTypedPayloadRoute {
+                prefix: prefix.to_vec(),
+                sender: typed_tx,
+                durable_completion: false,
+                validator: Some(validator),
+            }];
+            let sender = identity::AgentId([0x81; 32]);
+            let machine_id = identity::MachineId([0x82; 32]);
+            let mut ordinary = prefix.to_vec();
+            ordinary.extend_from_slice(b"ordinary message");
+            let route_outcome = dispatch_raw_direct_after_gates(
+                &dm,
+                Some(&history_handle),
+                &routes,
+                RawDirectDelivery {
+                    sender,
+                    machine_id,
+                    data: ordinary.clone(),
+                    verified: true,
+                    trust_decision: Some(trust::TrustDecision::Accept),
+                    observed_origin: None,
+                    digest: direct::dm_payload_digest_hex(&ordinary),
+                },
+            )
+            .await;
+            assert_eq!(
+                route_outcome,
+                dm_inbox::TypedRouteOutcome::RejectedPrefix,
+                "prefix {prefix:?}"
+            );
+            assert_eq!(
+                generic
+                    .try_recv()
+                    .expect("ordinary DM reaches generic subscriber")
+                    .payload,
+                ordinary,
+                "prefix {prefix:?}"
+            );
+            assert!(typed_rx.try_recv().is_err(), "prefix {prefix:?}");
+            let msg_id = history::HistoryRecord::compute_msg_id(None, &ordinary);
+            let recorded = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(row) = history_handle
+                        .store()
+                        .get_by_msg_id(msg_id)
+                        .expect("history lookup")
+                    {
+                        break row;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("ordinary DM history row");
+            assert_eq!(recorded.record.payload, ordinary, "prefix {prefix:?}");
+        }
+        history_service.shutdown().await;
+    }
+
     #[test]
     fn raw_dm_history_rejects_unverified_blocked_and_plumbing_payloads() {
         let sender = identity::AgentId([7; 32]);
         let machine = identity::MachineId([9; 32]);
         let payload = br#"{"text":"hello","clientId":"raw-history"}"#;
 
-        assert!(raw_dm_history_record(sender, machine, payload, false, None, 1).is_none());
+        assert!(raw_dm_history_record(sender, machine, payload, false, None, 1, false).is_none());
         assert!(raw_dm_history_record(
             sender,
             machine,
@@ -19455,6 +19598,7 @@ mod tests {
             true,
             Some(trust::TrustDecision::RejectBlocked),
             1,
+            false,
         )
         .is_none());
         assert!(raw_dm_history_record(
@@ -19464,6 +19608,7 @@ mod tests {
             true,
             Some(trust::TrustDecision::Accept),
             1,
+            false,
         )
         .is_none());
     }

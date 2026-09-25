@@ -34,6 +34,10 @@ const DURABLE_ACK_ROUTE_TIMEOUT: Duration = Duration::from_secs(22);
 const DURABLE_ACK_QUEUE_CAPACITY: usize = 256;
 /// Bound the number of ACK jobs simultaneously holding pubsub fan-out work.
 const DURABLE_ACK_MAX_CONCURRENT: usize = 32;
+/// Shared with the daemon's predecessor listener. A literal prefix alone is
+/// ordinary DM text until the suffix is a verified signed pubsub envelope.
+pub const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] = b"X0X-GROUP-PREDECESSOR-RELAY-V1\n";
+const PREDECESSOR_RELAY_MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 
 /// Outcome of the C5 live Direct/typed ACK hedge.
 ///
@@ -262,6 +266,7 @@ impl DmInboxConfig {
             prefix: prefix.into(),
             sender,
             durable_completion: false,
+            validator: None,
         });
         self
     }
@@ -285,6 +290,43 @@ impl DmInboxConfig {
             prefix: prefix.into(),
             sender,
             durable_completion: true,
+            validator: None,
+        });
+        self
+    }
+
+    /// Add a typed route whose wire parser can distinguish a real protocol
+    /// frame from an ordinary DM that begins with the same bytes.
+    #[must_use]
+    pub fn with_validated_typed_payload_route(
+        mut self,
+        prefix: impl Into<Vec<u8>>,
+        sender: mpsc::Sender<DmTypedPayload>,
+        validator: fn(&[u8]) -> bool,
+    ) -> Self {
+        self.typed_payload_routes.push(DmTypedPayloadRoute {
+            prefix: prefix.into(),
+            sender,
+            durable_completion: false,
+            validator: Some(validator),
+        });
+        self
+    }
+
+    /// Validated route with the same durable completion contract as
+    /// [`Self::with_durable_typed_payload_route`].
+    #[must_use]
+    pub fn with_validated_durable_typed_payload_route(
+        mut self,
+        prefix: impl Into<Vec<u8>>,
+        sender: mpsc::Sender<DmTypedPayload>,
+        validator: fn(&[u8]) -> bool,
+    ) -> Self {
+        self.typed_payload_routes.push(DmTypedPayloadRoute {
+            prefix: prefix.into(),
+            sender,
+            durable_completion: true,
+            validator: Some(validator),
         });
         self
     }
@@ -298,6 +340,16 @@ pub struct DmTypedPayloadRoute {
     /// Whether this route's handler resolves [`DmTypedPayload::completion`],
     /// and may therefore back a durable v2 ACK (ADR 0030 §7).
     pub durable_completion: bool,
+    /// Parser for this route's complete payload, including the prefix.
+    /// Returning false leaves the bytes on the generic DM path.
+    pub validator: Option<fn(&[u8]) -> bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypedRouteOutcome {
+    Recognized,
+    RejectedPrefix,
+    NoPrefix,
 }
 
 /// What a typed-route handler reports once it has durably recorded a payload.
@@ -1083,10 +1135,14 @@ fn inbound_dm_history_record(
     application_payload: &[u8],
     sender_machine_id: MachineId,
     sender_pubkey: &[u8],
+    rejected_typed_prefix: bool,
 ) -> Result<Option<crate::history::HistoryRecord>, String> {
-    let crate::history::classify::DmPayloadClass::Durable(content_type) =
+    let class = if rejected_typed_prefix {
+        crate::history::classify::classify_ordinary_dm_payload(application_payload)
+    } else {
         crate::history::classify::classify_dm_payload(application_payload)
-    else {
+    };
+    let crate::history::classify::DmPayloadClass::Durable(content_type) = class else {
         return Ok(None);
     };
     let artifact = envelope.to_wire_bytes().map_err(|e| e.to_string())?;
@@ -1608,6 +1664,31 @@ impl InboxPipeline {
             return;
         }
 
+        // Reserve bounded typed-route capacity before claiming dedupe. A full
+        // predecessor channel cannot justify an Accepted ACK: the sender's
+        // obligation must remain pending so it can retry. The permit makes
+        // capacity admission atomic with the claim across the primary inbox
+        // and legacy-bus subscription loops.
+        let (typed_route, typed_route_outcome) =
+            Self::matching_typed_route(&self.typed_payload_routes, &plaintext.payload);
+        let typed_permit = if let Some(route) = typed_route {
+            match route.sender.try_reserve() {
+                Ok(permit) => Some(permit),
+                Err(error) => {
+                    self.dm.record_incoming_typed_route_dropped();
+                    tracing::warn!(
+                        target: "dm.trace",
+                        request_id = %hex::encode(envelope.request_id),
+                        sender = %crate::logging::LogAgentId::from(&sender_agent_id),
+                        "v1 ACK withheld: typed route could not reserve capacity ({error})"
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // Atomic dedupe claim BEFORE delivery. The same envelope can arrive
         // twice — once on the primary per-recipient inbox and once on the
         // legacy bus (during a rolling upgrade), driven by two independent
@@ -1622,6 +1703,7 @@ impl InboxPipeline {
             .cache
             .insert(envelope.dedupe_key(), DmAckOutcome::Accepted)
         {
+            drop(typed_permit);
             let _ = self
                 .publish_ack(
                     sender_agent_id,
@@ -1633,15 +1715,19 @@ impl InboxPipeline {
             return;
         }
 
-        let is_typed_payload = self
-            .route_typed_payload(
-                sender_agent_id,
-                sender_machine_id,
-                envelope.request_id,
-                plaintext.payload.clone(),
-                Some(decision),
-            )
-            .await;
+        let is_typed_payload = typed_permit.is_some();
+        if let Some(permit) = typed_permit {
+            permit.send(DmTypedPayload {
+                sender: sender_agent_id,
+                machine_id: sender_machine_id,
+                payload: plaintext.payload.clone(),
+                verified: true,
+                trust_decision: Some(decision),
+                received_at_unix_ms: now_unix_ms(),
+                request_id: envelope.request_id,
+                completion: None,
+            });
+        }
 
         if !is_typed_payload {
             // ADR-0023 §4: record durable DM communication after every
@@ -1654,6 +1740,7 @@ impl InboxPipeline {
                     &plaintext.payload,
                     sender_machine_id,
                     &sender_pubkey,
+                    typed_route_outcome == TypedRouteOutcome::RejectedPrefix,
                 ) {
                     Ok(Some(record)) => {
                         if let Some(history) = self.history.as_ref() {
@@ -1751,7 +1838,7 @@ impl InboxPipeline {
         let typed_route_durable = self
             .typed_payload_routes
             .iter()
-            .find(|route| application_payload.starts_with(&route.prefix))
+            .find(|route| Self::typed_route_matches(route, &application_payload))
             .map(|route| route.durable_completion);
         if typed_route_durable == Some(false) {
             tracing::info!(
@@ -1890,6 +1977,8 @@ impl InboxPipeline {
             &application_payload,
             sender_machine_id,
             &sender_pubkey,
+            Self::matching_typed_route(&self.typed_payload_routes, &application_payload).1
+                == TypedRouteOutcome::RejectedPrefix,
         ) else {
             tracing::warn!(
                 target: "dm.trace",
@@ -2054,7 +2143,7 @@ impl InboxPipeline {
         let Some(route) = self
             .typed_payload_routes
             .iter()
-            .find(|route| payload.starts_with(&route.prefix))
+            .find(|route| Self::typed_route_matches(route, &payload))
         else {
             return Err("typed_route_vanished");
         };
@@ -2120,28 +2209,56 @@ impl InboxPipeline {
         }
     }
 
-    async fn route_typed_payload(
-        &self,
-        sender_agent_id: AgentId,
-        sender_machine_id: MachineId,
-        request_id: [u8; 16],
-        payload: Vec<u8>,
-        trust_decision: Option<TrustDecision>,
-    ) -> bool {
-        Self::try_route_typed_payload(
-            &self.typed_payload_routes,
-            &self.dm,
-            DmTypedPayload {
-                sender: sender_agent_id,
-                machine_id: sender_machine_id,
-                payload,
-                verified: true,
-                trust_decision,
-                received_at_unix_ms: now_unix_ms(),
-                request_id,
-                completion: None,
-            },
-        )
+    fn typed_route_matches(route: &DmTypedPayloadRoute, payload: &[u8]) -> bool {
+        let Some(suffix) = payload.strip_prefix(route.prefix.as_slice()) else {
+            return false;
+        };
+        if route.prefix == GROUP_PREDECESSOR_RELAY_DM_PREFIX && route.validator.is_none() {
+            if suffix.len() > PREDECESSOR_RELAY_MAX_ENVELOPE_BYTES || suffix.first() != Some(&2) {
+                return false;
+            }
+            let Ok(message) = crate::gossip::pubsub::decode_auto(Bytes::copy_from_slice(suffix))
+            else {
+                return false;
+            };
+            if !message.verified || message.sender.is_none() {
+                return false;
+            }
+            // A direct caller can build this route without the daemon's full
+            // parser. Keep that legacy registration safe as well; production
+            // uses its own validator below and avoids duplicate verification.
+            if !serde_json::from_slice::<serde_json::Value>(&message.payload)
+                .ok()
+                .is_some_and(|event| {
+                    event.get("event").and_then(serde_json::Value::as_str)
+                        == Some("join_request_created")
+                })
+            {
+                return false;
+            }
+        }
+        route.validator.is_none_or(|validator| validator(payload))
+    }
+
+    fn matching_typed_route<'a>(
+        routes: &'a [DmTypedPayloadRoute],
+        payload: &[u8],
+    ) -> (Option<&'a DmTypedPayloadRoute>, TypedRouteOutcome) {
+        let mut rejected_prefix = false;
+        for route in routes {
+            if !payload.starts_with(&route.prefix) {
+                continue;
+            }
+            if Self::typed_route_matches(route, payload) {
+                return (Some(route), TypedRouteOutcome::Recognized);
+            }
+            rejected_prefix = true;
+        }
+        if rejected_prefix {
+            (None, TypedRouteOutcome::RejectedPrefix)
+        } else {
+            (None, TypedRouteOutcome::NoPrefix)
+        }
     }
 
     /// Shared prefix dispatch for verified gossip and post-validation raw direct
@@ -2151,12 +2268,10 @@ impl InboxPipeline {
         routes: &[DmTypedPayloadRoute],
         dm: &DirectMessaging,
         typed: DmTypedPayload,
-    ) -> bool {
-        let Some(route) = routes
-            .iter()
-            .find(|route| typed.payload.starts_with(&route.prefix))
-        else {
-            return false;
+    ) -> TypedRouteOutcome {
+        let (route, outcome) = Self::matching_typed_route(routes, &typed.payload);
+        let Some(route) = route else {
+            return outcome;
         };
         let sender_agent_id = typed.sender;
         // Best-effort, NON-BLOCKING hand-off. Some routes have other delivery
@@ -2183,7 +2298,7 @@ impl InboxPipeline {
                 );
             }
         }
-        true
+        TypedRouteOutcome::Recognized
     }
 
     /// Emit a v1 ACK: verified and locally enqueued (receipt level 2).
@@ -3119,6 +3234,7 @@ mod tests {
             durable_completion,
             prefix: b"X0X-KV-DELTA-V1\n".to_vec(),
             sender: tx,
+            validator: None,
         }];
         let handler = tokio::spawn(async move {
             if let Some(typed) = rx.recv().await {
@@ -5012,6 +5128,7 @@ mod tests {
             durable_completion: false,
             prefix: b"x0x-exec-v1\0".to_vec(),
             sender: tx,
+            validator: None,
         };
         let payload = b"x0x-exec-v1\0some-command".to_vec();
         assert!(payload.starts_with(&route.prefix));
@@ -5024,9 +5141,180 @@ mod tests {
             durable_completion: false,
             prefix: b"x0x-exec-v1\0".to_vec(),
             sender: tx,
+            validator: None,
         };
         let payload = b"x0x-other-stuff".to_vec();
         assert!(!payload.starts_with(&route.prefix));
+    }
+
+    #[tokio::test]
+    async fn full_typed_route_leaves_v1_request_unclaimed_for_retry() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD9; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let (tx, mut rx) = mpsc::channel::<DmTypedPayload>(1);
+        harness.pipeline.typed_payload_routes = vec![DmTypedPayloadRoute {
+            durable_completion: false,
+            prefix: b"test-route\n".to_vec(),
+            sender: tx.clone(),
+            validator: None,
+        }];
+        tx.try_send(DmTypedPayload {
+            sender: sender.agent_id(),
+            machine_id: machine,
+            payload: b"occupied".to_vec(),
+            verified: true,
+            trust_decision: Some(TrustDecision::Accept),
+            received_at_unix_ms: now_unix_ms(),
+            request_id: [0; 16],
+            completion: None,
+        })
+        .expect("fill route");
+
+        let payload = b"test-route\npredecessor".to_vec();
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x73,
+            DM_PROTOCOL_V1,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let key = envelope.dedupe_key();
+        let mut ack_subscription = watch_acks_to(&harness, &sender).await;
+        harness
+            .pipeline
+            .handle_payload(
+                envelope.clone(),
+                match envelope.body.clone() {
+                    DmBody::Payload(p) => p,
+                    _ => panic!("payload"),
+                },
+                machine,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert!(
+            harness.pipeline.cache.lookup(&key).is_none(),
+            "a full route must not be cached as Accepted or ACKed"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), ack_subscription.recv())
+                .await
+                .is_err(),
+            "a full route must withhold its application ACK"
+        );
+        assert_eq!(rx.try_recv().expect("occupied slot").request_id, [0; 16]);
+        harness
+            .pipeline
+            .handle_payload(
+                envelope.clone(),
+                match envelope.body {
+                    DmBody::Payload(p) => p,
+                    _ => panic!("payload"),
+                },
+                machine,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert_eq!(rx.try_recv().expect("retry delivered").payload, payload);
+        assert!(harness.pipeline.cache.lookup(&key).is_some());
+        assert!(matches!(
+            next_ack_outcome(&mut ack_subscription).await,
+            DmAckOutcome::Accepted
+        ));
+    }
+
+    #[tokio::test]
+    async fn signed_predecessor_envelope_still_matches_typed_route() {
+        let signer = test_keypair();
+        let node = Arc::new(
+            NetworkNode::new(test_network_config(), None, None)
+                .await
+                .expect("network node"),
+        );
+        let pubsub =
+            PubSubManager::new(node, Some(Arc::new(SigningContext::from_keypair(&signer))))
+                .expect("signed pubsub");
+        let event = serde_json::json!({
+            "event": "join_request_created",
+            "group_id": "g",
+            "request_id": "r",
+            "requester_agent_id": hex::encode(signer.agent_id().as_bytes()),
+            "message": null,
+            "ts": 1,
+        });
+        let wire = pubsub
+            .publish_and_get_envelope(
+                "x0x.test.predecessor".to_string(),
+                Bytes::from(serde_json::to_vec(&event).expect("event JSON")),
+            )
+            .await
+            .expect("publish signed envelope")
+            .expect("v2 wire bytes");
+        let mut payload = GROUP_PREDECESSOR_RELAY_DM_PREFIX.to_vec();
+        payload.extend_from_slice(&wire);
+        let (tx, mut rx) = mpsc::channel(1);
+        let routes = vec![DmTypedPayloadRoute {
+            prefix: GROUP_PREDECESSOR_RELAY_DM_PREFIX.to_vec(),
+            sender: tx,
+            durable_completion: false,
+            validator: Some(crate::server::valid_predecessor_relay_typed_dm),
+        }];
+        assert_eq!(
+            InboxPipeline::try_route_typed_payload(
+                &routes,
+                &DirectMessaging::new(),
+                DmTypedPayload {
+                    sender: signer.agent_id(),
+                    machine_id: MachineId([0x74; 32]),
+                    payload: payload.clone(),
+                    verified: true,
+                    trust_decision: Some(TrustDecision::Accept),
+                    received_at_unix_ms: now_unix_ms(),
+                    request_id: [0x74; 16],
+                    completion: None,
+                },
+            ),
+            TypedRouteOutcome::Recognized
+        );
+        assert_eq!(
+            rx.try_recv().expect("signed predecessor routed").payload,
+            payload
+        );
+
+        let wrong_event = pubsub
+            .publish_and_get_envelope(
+                "x0x.test.predecessor".to_string(),
+                Bytes::from_static(br#"{"event":"member_added","group_id":"g","revision":1,"actor":"a","agent_id":"b","display_name":null}"#),
+            )
+            .await
+            .expect("publish signed non-predecessor")
+            .expect("v2 wire bytes");
+        let mut ordinary = GROUP_PREDECESSOR_RELAY_DM_PREFIX.to_vec();
+        ordinary.extend_from_slice(&wrong_event);
+        assert_eq!(
+            InboxPipeline::try_route_typed_payload(
+                &routes,
+                &DirectMessaging::new(),
+                DmTypedPayload {
+                    sender: signer.agent_id(),
+                    machine_id: MachineId([0x74; 32]),
+                    payload: ordinary,
+                    verified: true,
+                    trust_decision: Some(TrustDecision::Accept),
+                    received_at_unix_ms: now_unix_ms(),
+                    request_id: [0x75; 16],
+                    completion: None,
+                },
+            ),
+            TypedRouteOutcome::RejectedPrefix,
+            "signed non-predecessor event must remain an ordinary DM"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     // ── DmInboxConfig ─────────────────────────────────────────────────
