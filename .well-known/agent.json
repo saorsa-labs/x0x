@@ -100,16 +100,16 @@
         "description": "EU Central bootstrap node"
       },
       {
-        "url": "quic://149.28.156.231:5483",
+        "url": "quic://152.42.210.67:5483",
         "location": "Singapore, SG",
         "protocol": "quic",
         "description": "Asia SE bootstrap node"
       },
       {
-        "url": "quic://45.77.176.184:5483",
-        "location": "Tokyo, JP",
+        "url": "quic://170.64.176.102:5483",
+        "location": "Sydney, AU",
         "protocol": "quic",
-        "description": "Asia East bootstrap node"
+        "description": "Oceania bootstrap node"
       }
     ],
     "daemon": {
