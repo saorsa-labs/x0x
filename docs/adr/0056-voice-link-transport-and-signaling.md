@@ -1,11 +1,11 @@
 # ADR 0056: Voice Link Transport and Signaling (Historical Record; Media Ratified by ADR-0042)
 
-- **Status:** Proposed
+- **Status:** Superseded
 - **Date:** 2026-08-29
 - **Decision owners:** David Irvine (direction), omp (drafting)
 - **Reviewers:** pending
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** ADR-0042 (superseded 2026-09-25 by David Irvine; status change applied by Claude at his instruction)
 - **Related:** **ADR-0042** (ratifies the `WebRtcV1` media nesting and DM signaling this record predates); ADR-0019/0020/0022 (gates and streams). Backfill: historical record of the shipped design ADR-0042 later ratified.
 
 ## Context
