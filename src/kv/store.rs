@@ -1767,22 +1767,19 @@ impl KvStore {
     /// the admitted lowest-N subset after the entry lands — the same rule
     /// the remote merge applies — so a local put can evict the writer's
     /// lex-highest keys.
-    ///
-    /// Returns the keys this put evicted, sorted (issue #849). It is empty
-    /// unless a `SelfKeyed` put pushed the writer over its quota. Admission is
-    /// unchanged (ADR-0047). Only the eviction becomes visible to the writer.
     pub fn put(
         &mut self,
         key: String,
         value: Vec<u8>,
         content_type: String,
         peer_id: PeerId,
-    ) -> Result<Vec<String>> {
+    ) -> Result<()> {
         if !self.preflight_put_content(&key, &value, &content_type)? {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let seq = self.reserve_sequences(1)?;
-        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)
+        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)?;
+        Ok(())
     }
 
     /// Validate deterministic content constraints before reserving a local
@@ -7614,15 +7611,22 @@ mod tests {
         );
     }
 
+    /// The store half of `KvStoreHandle::put_with_outcome`: reserve a
+    /// sequence and put. Returns the evicted keys it reports.
+    fn put_reporting_evictions(store: &mut KvStore, key: String) -> Vec<String> {
+        let seq = store.reserve_sequences(1).expect("reserve");
+        store
+            .put_with_reserved_sequence(key, b"v".to_vec(), "text/plain".to_string(), peer(1), seq)
+            .expect("put")
+    }
+
     /// Fill `w`'s SelfKeyed quota with keys `<w>/<i:03>` for `range`,
-    /// going through `authorize_put` + `put` like the daemon's put path.
+    /// going through `authorize_put` + put like the daemon's put path.
     fn fill_self_keyed(store: &mut KvStore, w: &AgentId, range: std::ops::Range<usize>) {
         for i in range {
             let key = hex_key(w, Some(&format!("{i:03}")));
             store.authorize_put(w, &key, b"v").expect("within quota");
-            let evicted = store
-                .put(key, b"v".to_vec(), "text/plain".to_string(), peer(1))
-                .expect("put");
+            let evicted = put_reporting_evictions(store, key);
             assert!(evicted.is_empty(), "filling up to the cap evicts nothing");
         }
     }
@@ -7639,14 +7643,7 @@ mod tests {
         store
             .authorize_put(&w, &low, b"v")
             .expect("a lex-low key is admitted");
-        let evicted = store
-            .put(
-                low.clone(),
-                b"v".to_vec(),
-                "text/plain".to_string(),
-                peer(1),
-            )
-            .expect("put");
+        let evicted = put_reporting_evictions(&mut store, low.clone());
         let highest = hex_key(&w, Some(&format!("{MAX_SELFKEYED_KEYS_PER_AGENT:03}")));
         assert_eq!(
             evicted,
@@ -7675,9 +7672,7 @@ mod tests {
         store
             .authorize_put(&w, &key, b"v")
             .expect("the 64th key fits");
-        let evicted = store
-            .put(key, b"v".to_vec(), "text/plain".to_string(), peer(1))
-            .expect("put");
+        let evicted = put_reporting_evictions(&mut store, key);
         assert!(evicted.is_empty(), "no eviction under quota: {evicted:?}");
         assert_eq!(store.active_keys().len(), MAX_SELFKEYED_KEYS_PER_AGENT);
     }
