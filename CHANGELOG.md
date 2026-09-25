@@ -78,7 +78,12 @@ All notable changes to this project will be documented in this file.
   `task_deltas_seal_rejected`. **Compatibility:** an un-upgraded peer cannot
   read the new records and its plaintext deltas are refused, so a group's
   lists only replicate between upgraded members. Personal lists and
-  `SignedPublic` groups are unchanged.
+  `SignedPublic` groups are unchanged. Task lists follow the group write
+  policy (`AdminOnly` groups: only admins write). The GUI space Board moves
+  from the plaintext `x0x-board-<gid16>` list to `x0x.group.<gid>.symphony.board`;
+  the first access by a member with write permission copies the legacy
+  board's tasks in once (same ids, durable marker; claims/completions are not
+  carried). Other members see `board_migration_pending` until then.
 
 - **`Agent::shutdown` now retires persistent kv snapshot paths, so an owner
   restart re-opens them instead of being fenced off (#765, follow-up to

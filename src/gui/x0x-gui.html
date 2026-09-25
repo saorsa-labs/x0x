@@ -2462,7 +2462,7 @@ function renderSpaceBoard(el,sid){
 }
 
 async function initBoard(sid){
-  const topic='x0x-board-'+sid.slice(0,16);
+  const topic='x0x.group.'+sid+'.symphony.board';
   const existing=await api('/task-lists');
   if(!(existing&&existing.task_lists||[]).find(t=>t.id===topic)){
     await api('/task-lists',{method:'POST',body:JSON.stringify({name:'Board',topic})});
@@ -2659,6 +2659,7 @@ async function pollBoard(){
   if(!spaceBoardId)return;
   const seq=++boardPollSeq;
   const r=await api('/task-lists/'+spaceBoardId+'/tasks');if(!r||!r.tasks)return;
+  if(r.board_migration_pending&&!r.tasks.length){const e=document.getElementById('kb-todo');if(e)e.innerHTML='<div style="color:var(--tx3);font-size:11px;padding:8px">Board migration pending — a member with write access will move this board to the encrypted list.</div>';return;}
   const sidecars=await boardFetchSymphonySidecars(spaceBoardId,r.tasks);
   if(seq!==boardPollSeq)return;
   const cols={todo:[],pending_approval:[],in_progress:[],review:[],done:[]};

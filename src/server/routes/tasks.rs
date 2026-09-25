@@ -946,6 +946,110 @@ pub(in crate::server) async fn create_task_list(
     }
 }
 
+/// #895: the list segment of a GUI space Board's group-scoped id,
+/// `x0x.group.<gid>.symphony.board`.
+const SPACE_BOARD_LIST: &str = "board";
+
+/// #895: for a space Board id, the legacy PLAINTEXT board id the GUI used
+/// before the Board moved to the group-scoped (sealed) list:
+/// `x0x-board-<first 16 chars of the group id>`. `None` for any other list.
+pub(in crate::server) fn legacy_space_board_id(id: &str) -> Option<String> {
+    let scoped = parse_group_scoped_task_list_id(id)?;
+    if scoped.is_malformed() || scoped.list_id != SPACE_BOARD_LIST {
+        return None;
+    }
+    let prefix = scoped.group_id.get(..16).unwrap_or(&scoped.group_id);
+    Some(format!("x0x-board-{prefix}"))
+}
+
+/// #895: the durable "this node has migrated this board" marker.
+fn space_board_migration_marker(state: &AppState, id: &str) -> std::path::PathBuf {
+    state.task_list_state_dir.join(format!(
+        "board-migration-{}.done",
+        blake3::hash(id.as_bytes()).to_hex()
+    ))
+}
+
+/// #895 (David, 2026-09-25): whether `agent` may write under the group's
+/// write policy — the same rule the group's encrypted stores and the task
+/// protector apply (active member; `AdminOnly` ⇒ admin or above;
+/// `ModeratedPublic` ⇒ nobody).
+fn may_write_group(info: &x0x::groups::GroupInfo, agent: &x0x::identity::AgentId) -> bool {
+    let Some(member) = info.members_v2.get(&hex::encode(agent.as_bytes())) else {
+        return false;
+    };
+    if !member.is_active() {
+        return false;
+    }
+    match info.policy.write_access {
+        x0x::groups::GroupWriteAccess::MembersOnly => true,
+        x0x::groups::GroupWriteAccess::AdminOnly => {
+            member.role.at_least(x0x::groups::GroupRole::Admin)
+        }
+        x0x::groups::GroupWriteAccess::ModeratedPublic => false,
+    }
+}
+
+/// #895: copy the legacy plaintext space Board into its group-scoped
+/// (sealed) list exactly once. Returns `true` when the board needs no
+/// migration on this node (not a board, already migrated, or migrated now).
+///
+/// - Only a member with write permission migrates; anyone else gets `false`
+///   and the caller reports `board_migration_pending`.
+/// - Idempotent: the durable marker short-circuits re-runs, and the copy
+///   keeps each task's id, so a crash before the marker, or two members
+///   migrating concurrently, converge instead of duplicating.
+/// - A node that does not hold the legacy list has nothing to copy and
+///   records the marker.
+/// - The legacy list and its local snapshot are left untouched (retiring
+///   them is a follow-up); the GUI no longer reads or writes it.
+pub(in crate::server) async fn migrate_space_board_once(state: &Arc<AppState>, id: &str) -> bool {
+    let Some(legacy) = legacy_space_board_id(id) else {
+        return true;
+    };
+    let marker = space_board_migration_marker(state, id);
+    if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+        return true;
+    }
+    let Some(scoped) = parse_group_scoped_task_list_id(id) else {
+        return true;
+    };
+    let may_write = {
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)
+            .is_some_and(|(_, info)| may_write_group(info, &state.agent.agent_id()))
+    };
+    if !may_write {
+        return false;
+    }
+    let (target, source) = {
+        let lists = state.task_lists.read().await;
+        (lists.get(id).cloned(), lists.get(&legacy).cloned())
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    if let Some(source) = source {
+        match target.import_tasks_from(&source).await {
+            Ok(copied) => tracing::info!(
+                board = %id,
+                legacy = %legacy,
+                copied,
+                "[tasks] migrated the legacy plaintext space board (#895)"
+            ),
+            Err(e) => {
+                tracing::warn!(board = %id, "space board migration failed (#895): {e}");
+                return false;
+            }
+        }
+    }
+    if let Err(e) = tokio::fs::write(&marker, b"").await {
+        tracing::warn!(board = %id, "space board migration marker write failed: {e}");
+        return false;
+    }
+    true
+}
+
 /// GET /task-lists/:id/tasks
 pub(in crate::server) async fn list_tasks(
     State(state): State<Arc<AppState>>,
@@ -958,6 +1062,9 @@ pub(in crate::server) async fn list_tasks(
     // ADR-0066 §3c row 20 (read half): resolved before the task-list lock is
     // taken, so the roster read never nests inside it.
     let quarantine = task_list_fork_quarantine(&state, &id).await;
+    // #895: a space Board's first access copies the legacy plaintext board in
+    // once (a mutation, so never while the roster is contested).
+    let board_migrated = quarantine.is_some() || migrate_space_board_once(&state, &id).await;
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {
         return not_found("task list not found");
@@ -980,12 +1087,24 @@ pub(in crate::server) async fn list_tasks(
                     completed_at: t.completed_at,
                 })
                 .collect();
+            let entries_empty = entries.is_empty();
             let mut body = serde_json::json!({
                 "ok": true,
                 "version": fence.revision,
                 "fence_token": fence.to_wire(),
                 "tasks": entries,
             });
+            // #895: a reader (or a writer that could not migrate yet) sees an
+            // explicit pending state instead of an unexplained empty board.
+            // Absent for every other list.
+            if !board_migrated && entries_empty {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "board_migration_pending".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+            }
             // ADR-0066 §3c row 20 (read half): reads are NEVER refused —
             // containment must not blind the operator who is reading the
             // list to work out what the contested roster has been doing —
