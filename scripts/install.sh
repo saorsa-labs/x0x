@@ -151,6 +151,15 @@ http_get() {
     fi
 }
 
+# GET with the daemon's bearer token (every route except /health needs it).
+http_get_auth() {
+    if [ "$DOWNLOADER" = "curl" ]; then
+        curl -sf -H "Authorization: Bearer $2" "$1"
+    else
+        wget -qO- --header="Authorization: Bearer $2" "$1"
+    fi
+}
+
 mkdir -p "$BIN"
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
@@ -241,7 +250,8 @@ if [ "$HEALTH_OK" != true ]; then
     exit 1
 fi
 
-AGENT=$(http_get "http://$API/agent" 2>/dev/null || echo '{}')
+TOKEN=$(cat "$INSTANCE_DIR/api-token" 2>/dev/null || true)
+AGENT=$(http_get_auth "http://$API/agent" "$TOKEN" 2>/dev/null || echo '{}')
 
 echo ""
 echo "x0x is running"
