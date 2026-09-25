@@ -33703,9 +33703,10 @@ async fn handle_join_result_message_bound(
                         payload,
                     )
                     .await;
-                    // #878 r5: prune the per-pair guard entry so the map
-                    // does not grow with the (group, recipient) universe.
-                    // Only when nobody else holds the pair's semaphore.
+                    // #878 r5 (review): drop OUR permit BEFORE pruning,
+                    // so the released semaphore is observably idle — the
+                    // prune condition (available == 1) actually holds.
+                    drop(_staging_permit);
                     release_join_result_staging_guard(&guard_state, &guard_key);
                     if let Err(e) = outcome {
                         tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
