@@ -120,6 +120,13 @@ unchanged:
   `/forwards/:local_addr` (`src/api/mod.rs:1706-1722`).
 - **ADR 0064**: it builds on ADR 0059, which was still Proposed when 0064 was
   accepted. That is resolved: ADR 0059 was Accepted on 2026-09-25.
+- **ADR 0048**: decision item 4 says "encrypted variant exists but
+  unwired". Once #914 (#895) lands, group-scoped task-list deltas and
+  `/state-sync` payloads are sealed with the group's current key, using the
+  same GSS/TreeKEM envelopes as group KV stores. Plaintext deltas for an
+  encrypted group list are rejected and counted. Group task lists follow the
+  group's write policy (David Irvine, 2026-09-25). The unwired
+  `EncryptedTaskListDelta` type is not used.
 - **Design contradictions.** Three contradictions are not fixed here, because
   each needs a new decision rather than an erratum:
   - ADR 0020 and ADR 0035 describe the relay story differently.
