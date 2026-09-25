@@ -273,6 +273,7 @@ fn share_grant_revocation(signer: &UserKeypair, grant: &ShareGrant) -> Vec<u8> {
         crate::revocation::RevokedSubject::ShareGrant(crate::revocation::ShareGrantRevocation {
             grant_id: grant.grant_id,
             owner: grant.owner,
+            grant_expiry: grant.expiry,
         }),
         signer.public_key(),
         signer.secret_key(),
@@ -477,10 +478,75 @@ async fn group_invite_grant_does_not_admit_grantee_to_owner_home() {
     .is_err());
 }
 
-/// #898: a raw Direct payload from machine MX claiming B1 is unverified and
-/// must neither rebind B1 nor gain B1's grant or owner trust — even if the
-/// mutable discovery cache were rewritten to MX. Pairing uses only the
-/// authenticated binding (B1 → MB).
+/// WHY (decision 1): an expired grant is denied regardless of revocation —
+/// which is what makes it safe to garbage-collect the revocation once the
+/// grant is dead (`expiry + slack`).
+#[tokio::test]
+async fn expired_grant_is_denied_after_its_revocation_is_collected() {
+    let w = World::new().await;
+    let now = real_now();
+    let grant = w.grant(dm_connect22(), now - 60, now + 3_600);
+    let store = ShareGrantStore::in_memory(w.a1, Some(w.owner_a.user_id()));
+    store.accept(grant.clone(), now).await.unwrap();
+    let eval = |at: u64| {
+        evaluate_grant_access(
+            &store,
+            &w.bindings,
+            &w.cache,
+            &w.revocations,
+            &w.b1,
+            &w.mb,
+            at,
+        )
+    };
+    assert!(eval(now).await.dm, "control: live grant");
+
+    let payload = share_grant_revocation(&w.owner_a, &grant);
+    assert!(
+        crate::ingest_share_grant_revocations(
+            &w.revocations,
+            Some(w.dir.path().to_path_buf()),
+            &payload,
+        )
+        .await
+    );
+    assert!(eval(now).await.is_empty(), "revoked while live");
+
+    let horizon = grant.expiry + crate::revocation::SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
+    let collected = w
+        .revocations
+        .write()
+        .await
+        .expire_records_older_than(90 * 24 * 3600, horizon);
+    assert_eq!(collected, 1, "revocation collected at expiry + slack");
+    assert!(!w
+        .revocations
+        .read()
+        .await
+        .is_share_grant_revoked(&grant.grant_id, &grant.owner));
+    assert!(
+        eval(horizon).await.is_empty(),
+        "the expired grant stays denied without its revocation"
+    );
+}
+
+/// #898: a raw Direct payload from machine MX that claims an agent is
+/// unverified, and must neither rebind the agent nor gain its grant or
+/// owner trust.
+///
+/// The fixture makes owner trust LIVE (not vacuous): OWN is the owner's own
+/// agent with a valid owner certificate on enrolled machine M_OWN, and MX is
+/// ALSO an enrolled owner machine — so for OWN on MX, the only missing piece
+/// is the agent↔machine pairing, which is exactly what the spoof forges.
+///
+/// Which assertion catches what (hand mutation check; test binaries are not
+/// run on the authoring host):
+/// - re-allowing `mark_connected` for an unverified claim (the #898 bug)
+///   fails the `dm.get_machine_id(..) == Some(real)` assertion below;
+/// - additionally dropping slice 1's authenticated-binding pairing rule
+///   (pairing via the discovery cache, which the pre-fix `connect_to_agent`
+///   rewrote from the DirectMessaging entry) fails the owner-trust and grant
+///   assertions for MX.
 #[tokio::test]
 async fn raw_direct_spoof_gains_neither_grant_nor_owner_trust() {
     let w = World::new().await;
@@ -488,26 +554,79 @@ async fn raw_direct_spoof_gains_neither_grant_nor_owner_trust() {
     let trust = w
         .daemon(w.a1, &[w.grant(dm_connect22(), now - 60, now + 3_600)])
         .await;
+    let own_kp = AgentKeypair::generate().unwrap();
+    let own = own_kp.agent_id();
+    let m_own = MachineId([0xD0; 32]);
     let mx = MachineId([0x99; 32]);
 
-    let dm = crate::direct::DirectMessaging::new();
-    assert!(dm.mark_raw_direct_sender_connected(w.b1, w.mb, true).await);
-    assert!(!dm.mark_raw_direct_sender_connected(w.b1, mx, false).await);
-    assert_eq!(dm.get_machine_id(&w.b1).await, Some(w.mb));
-
-    // Worst case: the discovery cache names MX (the pre-fix
-    // connect_to_agent copy). The authenticated binding still says MB.
-    if let Some(entry) = w.cache.write().await.get_mut(&w.b1) {
-        entry.machine_id = mx;
+    let devices = crate::owner_sync::OwnerSyncStore::load(w.dir.path())
+        .await
+        .unwrap();
+    for machine in [m_own, mx] {
+        devices
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(
+                    machine,
+                    &w.owner_a,
+                    now.saturating_mul(1000),
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
     }
-    assert!(w.access(&trust, &w.b1, &mx).await.is_empty());
+    trust.install_device_store(Arc::new(devices));
+    crate::dm_inbox::record_authenticated_machine_binding(&w.bindings, own, m_own, now).await;
+    let own_cert = AgentCertificate::issue(&w.owner_a, &own_kp).unwrap();
+    w.cache
+        .write()
+        .await
+        .insert(own, discovered(&own_kp, m_own, own_cert));
+
+    // Positive controls: owner trust and the grant are live on the REAL
+    // machines, so the negatives below are not vacuous.
     assert!(
-        !trust
-            .is_owner_trusted(&w.cache, &w.revocations, &w.b1, &mx)
+        trust
+            .is_owner_trusted(&w.cache, &w.revocations, &own, &m_own)
             .await
     );
+    assert!(w.access(&trust, &w.b1, &w.mb).await.dm);
+
+    // The spoof: MX sends raw Direct bytes claiming OWN and B1; the
+    // listener computes verified=false for both.
+    let dm = crate::direct::DirectMessaging::new();
+    for (agent, real) in [(own, m_own), (w.b1, w.mb)] {
+        assert!(dm.mark_raw_direct_sender_connected(agent, real, true).await);
+        assert!(!dm.mark_raw_direct_sender_connected(agent, mx, false).await);
+        // Catches the #898 mutation (unverified claim marks connected).
+        assert_eq!(dm.get_machine_id(&agent).await, Some(real));
+    }
+
+    // Propagate whatever DirectMessaging now says into the discovery cache,
+    // as the pre-fix `connect_to_agent` did — then force MX anyway (worst
+    // case: the cache is attacker-steered).
+    for agent in [own, w.b1] {
+        if let Some(entry) = w.cache.write().await.get_mut(&agent) {
+            entry.machine_id = mx;
+        }
+    }
+    assert!(
+        !trust
+            .is_owner_trusted(&w.cache, &w.revocations, &own, &mx)
+            .await,
+        "enrolled MX + valid owner cert must not owner-trust OWN without its binding"
+    );
+    assert!(w.access(&trust, &w.b1, &mx).await.is_empty());
     assert!(w
         .inbound(&trust, grant_policy(&["127.0.0.1:22"]), &mx)
         .await
         .is_err());
+    // The real pairing is unaffected by the rewritten cache: owner trust
+    // pairs only through the authenticated binding.
+    assert!(
+        trust
+            .is_owner_trusted(&w.cache, &w.revocations, &own, &m_own)
+            .await
+    );
 }

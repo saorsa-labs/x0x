@@ -51,16 +51,41 @@ const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
 /// stores loadable by older daemons after a downgrade.
 const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
 
+/// How long past the revoked grant's own expiry a share-grant revocation is
+/// kept before it may be garbage-collected. A grant is dead at `expiry`
+/// (evaluation never honours it after that); the slack covers clock skew
+/// between the owner and the enforcing daemons.
+pub const SHARE_GRANT_REVOCATION_GC_SLACK_SECS: u64 = 3_600;
+
 /// An ADR-0070 §2 share-grant revocation: the grant id plus the owner that
 /// signed the grant. Carrying the owner makes authority verifiable from the
 /// record alone (the issuer key must hash to `owner`), and scopes the
 /// revocation so a stranger's record for the same id revokes nothing.
+///
+/// `grant_expiry` is the revoked grant's own `expiry`, signed into the
+/// record, so every node garbage-collects the revocation at the same point
+/// (`grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS`) — once the grant
+/// itself can no longer be honoured. `u64::MAX` (an unknown grant) never
+/// expires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShareGrantRevocation {
     /// The revoked grant's random id.
     pub grant_id: [u8; 32],
     /// The grant's owner (grantor). Only this user's key may revoke it.
     pub owner: UserId,
+    /// The revoked grant's `expiry` (unix seconds): the GC horizon.
+    pub grant_expiry: u64,
+}
+
+impl ShareGrantRevocation {
+    /// Whether this revocation may be garbage-collected at `now_unix`.
+    #[must_use]
+    pub fn gc_eligible_at(&self, now_unix: u64) -> bool {
+        now_unix
+            >= self
+                .grant_expiry
+                .saturating_add(SHARE_GRANT_REVOCATION_GC_SLACK_SECS)
+    }
 }
 
 /// An `(agent, machine, move_epoch)` pairing retired by an ADR-0043 move
@@ -142,11 +167,13 @@ impl RevokedSubject {
                 out.extend_from_slice(&binding.move_epoch.to_le_bytes());
                 Some(out)
             }
-            // Fixed-width `grant_id ‖ owner` — no boundary ambiguity.
+            // Fixed-width `grant_id ‖ owner ‖ grant_expiry_le` — no
+            // boundary ambiguity; the GC horizon is signed.
             RevokedSubject::ShareGrant(grant) => {
-                let mut out = Vec::with_capacity(32 + 32);
+                let mut out = Vec::with_capacity(32 + 32 + 8);
                 out.extend_from_slice(&grant.grant_id);
                 out.extend_from_slice(grant.owner.as_bytes());
+                out.extend_from_slice(&grant.grant_expiry.to_le_bytes());
                 Some(out)
             }
             _ => None,
@@ -439,9 +466,11 @@ pub struct RevocationSet {
     /// independent; never TTL-swept. Both maps feed
     /// [`Self::is_binding_revoked`].
     bundle_retired_epochs: HashMap<(AgentId, MachineId), u64>,
-    /// ADR-0070 revoked share grants, keyed by `(grant_id, owner)`.
-    /// Grow-only; never TTL-swept (a grant can outlive the 90-day TTL).
-    revoked_share_grants: HashSet<ShareGrantRevocation>,
+    /// ADR-0070 revoked share grants, keyed by `(grant_id, owner)`, valued
+    /// by the latest signed `grant_expiry`. Not swept by the 90-day TTL (a
+    /// grant can outlive it); collected once the grant itself is dead
+    /// (`grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS`).
+    revoked_share_grants: HashMap<([u8; 32], UserId), u64>,
     /// Monotonic change counter — incremented on every insert or expiry.
     /// Publishers compare this to decide whether the set changed since
     /// their last full broadcast (the on-change piggyback gate), avoiding
@@ -482,10 +511,7 @@ impl RevocationSet {
     /// not match.
     #[must_use]
     pub fn is_share_grant_revoked(&self, grant_id: &[u8; 32], owner: &UserId) -> bool {
-        self.revoked_share_grants.contains(&ShareGrantRevocation {
-            grant_id: *grant_id,
-            owner: *owner,
-        })
+        self.revoked_share_grants.contains_key(&(*grant_id, *owner))
     }
 
     /// Highest epoch of any tombstone for the agent across both carriers,
@@ -610,14 +636,13 @@ impl RevocationSet {
             .iter()
             // ADR-0043 §7.3: binding tombstones are PERMANENT — a retired
             // binding must never resurrect, so the TTL sweep skips them.
-            // ADR-0070: share-grant revocations are permanent too — a grant
-            // may expire after the TTL, and must not come back to life.
-            .filter(|(_, persisted)| {
-                persisted.record.revoked_at < cutoff
-                    && !matches!(
-                        persisted.record.subject,
-                        RevokedSubject::AgentMachineBinding(_) | RevokedSubject::ShareGrant(_)
-                    )
+            // ADR-0070: a share-grant revocation ignores the TTL (a grant
+            // may outlive it) and is collected only once the revoked grant
+            // is dead: its signed expiry plus the skew slack.
+            .filter(|(_, persisted)| match &persisted.record.subject {
+                RevokedSubject::AgentMachineBinding(_) => false,
+                RevokedSubject::ShareGrant(grant) => grant.gc_eligible_at(now_unix),
+                _ => persisted.record.revoked_at < cutoff,
             })
             .map(|(hash, _)| *hash)
             .collect();
@@ -639,8 +664,20 @@ impl RevocationSet {
                         self.binding_epochs
                             .remove(&(binding.agent, binding.machine));
                     }
+                    // Drop the key only when the LATEST expiry recorded for
+                    // it is past the horizon — a longer-lived record for the
+                    // same grant keeps it revoked.
                     RevokedSubject::ShareGrant(grant) => {
-                        self.revoked_share_grants.remove(grant);
+                        let key = (grant.grant_id, grant.owner);
+                        if let Some(latest) = self.revoked_share_grants.get(&key).copied() {
+                            let horizon = ShareGrantRevocation {
+                                grant_expiry: latest,
+                                ..*grant
+                            };
+                            if horizon.gc_eligible_at(now_unix) {
+                                self.revoked_share_grants.remove(&key);
+                            }
+                        }
                     }
                 }
             }
@@ -669,7 +706,11 @@ impl RevocationSet {
                 *entry = (*entry).max(binding.move_epoch);
             }
             RevokedSubject::ShareGrant(grant) => {
-                self.revoked_share_grants.insert(*grant);
+                let entry = self
+                    .revoked_share_grants
+                    .entry((grant.grant_id, grant.owner))
+                    .or_insert(0);
+                *entry = (*entry).max(grant.grant_expiry);
             }
         }
         self.records_by_hash.insert(hash, persisted);
@@ -854,8 +895,12 @@ impl RevocationSet {
     /// Merge a decoded v3 set into this one (grow-only union).
     pub fn merge_v3(&mut self, other: Self) {
         let mut changed = false;
-        for grant in other.revoked_share_grants {
-            changed |= self.revoked_share_grants.insert(grant);
+        for (key, expiry) in other.revoked_share_grants {
+            let entry = self.revoked_share_grants.entry(key).or_insert(0);
+            if *entry < expiry {
+                *entry = expiry;
+                changed = true;
+            }
         }
         for (hash, persisted) in other.records_by_hash {
             if let std::collections::hash_map::Entry::Vacant(slot) =
@@ -1526,6 +1571,7 @@ mod tests {
                 RevokedSubject::ShareGrant(ShareGrantRevocation {
                     grant_id: [0x5A; 32],
                     owner: UserId([0x5B; 32]),
+                    grant_expiry: 1_900_000_000,
                 }),
                 0x5C,
             )
@@ -1551,6 +1597,7 @@ mod tests {
             let subject = RevokedSubject::ShareGrant(ShareGrantRevocation {
                 grant_id,
                 owner: owner.user_id(),
+                grant_expiry: u64::MAX,
             });
 
             let by_owner = RevocationRecord::sign(
@@ -1580,6 +1627,7 @@ mod tests {
                 RevokedSubject::ShareGrant(ShareGrantRevocation {
                     grant_id,
                     owner: stranger.user_id(),
+                    grant_expiry: u64::MAX,
                 }),
                 stranger.public_key(),
                 stranger.secret_key(),
@@ -1716,16 +1764,21 @@ mod tests {
         }
 
         /// WHY: a revoked grant must stay revoked across restart (v3 file)
-        /// and past the 90-day TTL — a grant may be valid for longer than
-        /// the TTL, and an expired revocation would resurrect it.
+        /// and past the 90-day TTL while the grant could still be honoured —
+        /// a grant may be valid for longer than the TTL, and an early
+        /// collection would resurrect it. Once the grant itself is dead
+        /// (expiry + slack) the record is collected, so the set stays
+        /// bounded; every node computes that point from the SIGNED expiry.
         #[test]
-        fn v3_file_round_trips_and_share_grant_revocation_is_permanent() {
+        fn share_grant_revocation_is_kept_until_grant_expiry_then_collected() {
             let owner = UserKeypair::generate().unwrap();
             let grant_id = [0x22; 32];
+            let grant_expiry = 1_000_000_000u64 + 200 * 24 * 3600;
             let record = RevocationRecord::sign(
                 RevokedSubject::ShareGrant(ShareGrantRevocation {
                     grant_id,
                     owner: owner.user_id(),
+                    grant_expiry,
                 }),
                 owner.public_key(),
                 owner.secret_key(),
@@ -1742,11 +1795,58 @@ mod tests {
             restored.merge_v3(RevocationSet::from_bytes_v3(&bytes).unwrap());
             assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
 
-            assert_eq!(restored.expire_records_older_than(60, u64::MAX / 2), 0);
+            // Far past the 90-day TTL, but before expiry + slack: kept.
+            let ttl = 90 * 24 * 3600;
+            let just_before = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS - 1;
+            assert_eq!(restored.expire_records_older_than(ttl, just_before), 0);
             assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
+            assert_eq!(restored.share_grant_records().len(), 1);
+
+            // At expiry + slack: collected (record and index).
+            let horizon = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
+            assert_eq!(restored.expire_records_older_than(ttl, horizon), 1);
+            assert!(!restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
+            assert!(restored.share_grant_records().is_empty());
+
+            // A revocation of an unknown grant (u64::MAX) is never collected.
+            let unknown = ShareGrantRevocation {
+                grant_id,
+                owner: owner.user_id(),
+                grant_expiry: u64::MAX,
+            };
+            assert!(!unknown.gc_eligible_at(u64::MAX - 1));
 
             // A v1/v2 file is not a v3 file.
             assert!(RevocationSet::from_bytes_v3(&set.to_bytes().unwrap()).is_err());
+        }
+
+        /// WHY: two signed records for one grant with different horizons —
+        /// collecting the shorter one must not un-revoke the grant while the
+        /// longer one is still held.
+        #[test]
+        fn shorter_revocation_gc_does_not_unrevoke_a_longer_one() {
+            let short = fake(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [0x44; 32],
+                    owner: UserId([0x45; 32]),
+                    grant_expiry: 1_000,
+                }),
+                0x46,
+            );
+            let long = fake(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [0x44; 32],
+                    owner: UserId([0x45; 32]),
+                    grant_expiry: 1_000_000,
+                }),
+                0x47,
+            );
+            let mut set = RevocationSet::new();
+            insert(&mut set, short);
+            insert(&mut set, long);
+            let now = 1_000 + SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
+            assert_eq!(set.expire_records_older_than(u64::MAX, now), 1);
+            assert!(set.is_share_grant_revoked(&[0x44; 32], &UserId([0x45; 32])));
         }
 
         /// WHY: the v3 file is untrusted input. A tampered file carrying a

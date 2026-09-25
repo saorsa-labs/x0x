@@ -911,6 +911,11 @@ pub async fn handle_share_grant_dm(
     result
 }
 
+/// Send-layer retries for one grant delivery. Every retry reuses the same
+/// logical request id, so a receiver that already stored the grant answers
+/// `Duplicate` and the retry is idempotent.
+pub const GRANT_DELIVERY_RETRIES: u8 = 3;
+
 /// Outcome of delivering a grant to one recipient agent.
 #[derive(Debug, Clone, Serialize)]
 pub struct GrantDelivery {
@@ -1058,6 +1063,22 @@ impl crate::Agent {
     /// Deliver a grant to each recipient as a durable typed DM, concurrently.
     /// A recipient counts as delivered only on its durable v2 ACK, which its
     /// handler releases once the grant is stored.
+    ///
+    /// # Why delivery is reliable without a grant fetch
+    ///
+    /// ADR-0070 §2 also sketches a grantee-attached `grant_id` so a daemon
+    /// that missed delivery can request the grant. That fetch is NOT
+    /// implemented (follow-up). Delivery is still reliable, because it can
+    /// never silently lose a grant:
+    /// - the route is DURABLE: the receiver withholds the v2 ACK until the
+    ///   grant is verified and written to its store, so `delivered = true`
+    ///   means "stored", never "sent";
+    /// - without that ACK the sender retries ([`GRANT_DELIVERY_RETRIES`])
+    ///   under the same logical request id, which the receiver answers
+    ///   idempotently (`Duplicate`), and finally reports the recipient as
+    ///   not delivered in the `POST /grants` response;
+    /// - a shared agent's daemon that never received the grant grants
+    ///   nothing — the failure is closed, and visible to the owner.
     pub async fn deliver_share_grant(
         &self,
         grant: &ShareGrant,
@@ -1085,6 +1106,7 @@ impl crate::Agent {
                     require_durable_app_ack: true,
                     prefer_raw_quic_if_connected: false,
                     logical_request_id: Some(request_id),
+                    max_retries: GRANT_DELIVERY_RETRIES,
                     ..crate::dm::DmSendConfig::default()
                 };
                 let result = self
@@ -1106,7 +1128,11 @@ impl crate::Agent {
     /// `revocations-v3.bin`, and publish the v3 set.
     ///
     /// The revocation names `(grant_id, this owner)`, so it can only ever
-    /// revoke a grant this owner signed (from any of its installs).
+    /// revoke a grant this owner signed (from any of its installs). It also
+    /// signs the grant's `expiry` as its GC horizon, taken from the issued
+    /// grant held here; for a grant this install does not hold the horizon
+    /// is `u64::MAX` (never collected), so a revocation can never lapse
+    /// while its grant could still be honoured.
     ///
     /// # Errors
     /// No owner key, or a signing/verification failure.
@@ -1119,8 +1145,17 @@ impl crate::Agent {
             ShareGrantError::Invalid("revoking a grant needs the owner key".into())
         })?;
         let owner = owner_key.user_id();
+        let grant_expiry = self
+            .share_grant_store()
+            .and_then(|store| store.issued(&grant_id))
+            .filter(|grant| grant.owner == owner)
+            .map_or(u64::MAX, |grant| grant.expiry);
         let subject = crate::revocation::RevokedSubject::ShareGrant(
-            crate::revocation::ShareGrantRevocation { grant_id, owner },
+            crate::revocation::ShareGrantRevocation {
+                grant_id,
+                owner,
+                grant_expiry,
+            },
         );
         let record = crate::revocation::RevocationRecord::sign(
             subject,
