@@ -1,6 +1,7 @@
 # ADR 0073: Audio and Video Calling Ship Together via the Daemon-Side Browser Gateway
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-25 by David Irvine (answers 1–8 in "Decisions"; status change applied by Claude at his instruction)
 - **Date:** 2026-09-25
 - **Decision owners:** David Irvine (direction: voice and video ship together in the next
   milestone, 2026-09-25); Claude (drafting)
@@ -173,7 +174,7 @@ We will ship **1:1 audio and video calling together via Option A**, as follows.
 
 - Setup: two physical machines on **different NATs**, neither of them a VPS, with at
   least one behind a home or CGNAT router. Both run the shipped release binaries.
-  Chrome is on one machine and Safari or Firefox on the other. The two humans are
+  Chrome is on one machine and Firefox on the other (Safari is best-effort; Decision 7). The two humans are
   mutual Trusted contacts.
 - Pass requires all of:
   - (a) 10 of 10 calls connect;
@@ -199,13 +200,24 @@ unable to forward RTP/RTCP end to end; ADR 0070 being rejected or changing `Shar
 
 ## Decisions (David Irvine, 2026-09-25)
 
-These answer the drafting open questions. The ADR itself is still Proposed.
+These answers settle the drafting open questions. David accepted the ADR with them.
 
 1. **WebRTC stack:** str0m.
 2. **Media location:** in the GUI only this milestone. The CLI handles signaling and
    call control but plays no media.
 3. **Binary size:** no hard limit. The delta is measured and reported, not gated.
 4. **Native-agent/browser interop:** not this milestone; later.
+5. **Daemon-visible media:** accepted for this milestone. Each daemon belongs to one of
+   the callers and sees plaintext media, as it sees plaintext DMs today. On the wire the
+   media is protected by ant-quic's PQC transport. Browser end-to-end frame encryption
+   (SFrame / insertable streams) is a later hardening item.
+6. **Ringing with no GUI tab open:** the daemon emits `call.incoming`. The local agent
+   or CLI then opens the GUI on the call through the GUI deep links from #893
+   (`x0x gui --view call/<id>`; the `call/<id>` route is added with the call UI), so the human can answer. Answering therefore
+   depends on the R10 deep-link path. No OS notification code is added.
+7. **Browsers:** `calling-r8-e2e` must pass with Chrome and Firefox. Safari is
+   best-effort and does not block the milestone.
+8. **Acceptance thresholds:** accepted as drafted in Validation.
 
 ## Notes for AI-assisted work
 
