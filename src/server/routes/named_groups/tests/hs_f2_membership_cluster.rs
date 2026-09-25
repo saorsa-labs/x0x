@@ -7042,13 +7042,23 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
     Ok(())
 }
 
-/// #850 review item 3 (size): a REAL certificate adds ~9.8 KB base64 to
-/// the MemberJoined wire form. A cert-carrying join must still fit the
-/// 49,152-byte DM budget on the gossip/metadata path (the direct-DM
-/// path shares the budget; genuinely oversized payloads take the Home
-/// control-blob chunk path instead — see home_control_payload_size.rs).
+/// #850 review item 3 / #876 item 5 (size): what does a cert-carrying
+/// join event REALLY weigh? Two shapes, both measured with real
+/// cryptography:
+///
+/// - The minimal (non-TreeKEM) MemberJoined with a real certificate must
+///   still fit the 49,152-byte DM budget — that path has no blob escape.
+/// - A Home-shaped join (real TreeKEM key package + real certificate)
+///   legitimately EXCEEDS the budget (the R15 live event measured
+///   51,546 B) — it travels as a staged control blob, which #876 makes
+///   reliable (release-on-completed-fetch + bounded staging retry).
+///
+/// The pre-#876 test asserted the Home shape fit; it used an
+/// unrepresentative payload (no key package), which is exactly the gap
+/// #876 closes (the fail-before: the old assertion is false of the real
+/// shape).
 #[test]
-fn cert_carrying_member_joined_fits_dm_payload_budget() -> Result<()> {
+fn cert_carrying_member_joined_sizes_are_representative() -> Result<()> {
     let joiner_kp = AgentKeypair::generate()?;
     let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
     let cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
@@ -7060,20 +7070,49 @@ fn cert_carrying_member_joined_fits_dm_payload_budget() -> Result<()> {
         x0x::groups::GroupRole::Member,
     )?;
     use base64::Engine as _;
+    let cert_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&cert)?);
     if let NamedGroupMetadataEvent::MemberJoined {
         certificate_b64, ..
     } = &mut event
     {
-        *certificate_b64 =
-            Some(base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&cert)?));
+        *certificate_b64 = Some(cert_b64.clone());
     }
-    let wire = serde_json::to_vec(&event)?;
+    let minimal = serde_json::to_vec(&event)?;
     assert!(
-        wire.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
-        "cert-carrying MemberJoined is {} bytes, must fit the {} DM budget",
-        wire.len(),
+        minimal.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
+        "minimal cert-carrying MemberJoined is {} bytes, must fit the {} DM budget",
+        minimal.len(),
         x0x::dm::MAX_PAYLOAD_BYTES
     );
+
+    // The Home shape: a REAL TreeKEM key package rides along.
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(joiner_kp.agent_id(), &[0xB9; 32])?;
+    let key_package_b64 =
+        base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes());
+    if let NamedGroupMetadataEvent::MemberJoined {
+        treekem_key_package_b64,
+        certificate_b64,
+        ..
+    } = &mut event
+    {
+        *treekem_key_package_b64 = Some(key_package_b64);
+        *certificate_b64 = Some(cert_b64);
+    }
+    let home_shaped = serde_json::to_vec(&event)?;
+    if home_shaped.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        // The representative Home shape exceeds one DM — it MUST take the
+        // control-blob path. Print the measurement for the record.
+        eprintln!(
+            "cert+keypackage MemberJoined: {} bytes > {} DM budget -> control blob path",
+            home_shaped.len(),
+            x0x::dm::MAX_PAYLOAD_BYTES
+        );
+    } else {
+        eprintln!(
+            "cert+keypackage MemberJoined: {} bytes (fits the DM budget; blob path unneeded)",
+            home_shaped.len()
+        );
+    }
     Ok(())
 }
 

@@ -1046,6 +1046,7 @@ pub async fn serve_with_options(
         pending_welcome_streams: Mutex::new(Some(HashMap::new())),
         control_blobs: ControlBlobState::default(),
         treekem_pending_events: RwLock::new(HashMap::new()),
+        parked_role_updates: StdMutex::new(HashMap::new()),
         owner_cert_pending_joins: RwLock::new(HashMap::new()),
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
         home_provisioning_deferred: std::sync::atomic::AtomicBool::new(false),

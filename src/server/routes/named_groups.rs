@@ -839,6 +839,20 @@ pub(in crate::server) struct PendingTreeKemMetadataEvent {
     queued_at: Instant,
 }
 
+/// #876: a signed `MemberRoleUpdated` that arrived before its target
+/// member was seated locally. Parked instead of dropped; replayed after
+/// the group's next accepted `MemberAdded`. Bounded per group
+/// (`PARKED_ROLE_UPDATE_CAP`).
+#[derive(Debug, Clone)]
+pub(in crate::server) struct ParkedRoleUpdate {
+    pub(in crate::server) event: NamedGroupMetadataEvent,
+    pub(in crate::server) sender: AgentId,
+    pub(in crate::server) parked_at: Instant,
+}
+
+/// #876: per-group bound on parked role updates (drop-oldest with a warn).
+pub(in crate::server) const PARKED_ROLE_UPDATE_CAP: usize = 32;
+
 /// ADR 0028: a `JoinRequestApproved` that arrived before its matching
 /// `JoinRequestCreated` predecessor. The approval is durably queued without
 /// mutating group state until the predecessor arrives and the ordinary
@@ -9901,6 +9915,13 @@ async fn apply_named_group_metadata_event_with_binding(
     // dropped, because the task-ingest drain takes `TaskList` write then
     // `named_groups` read.
     let mut cleared_quarantine = std::collections::BTreeSet::new();
+    // #876: a role update parked for a member who is landing NOW must be
+    // replayed after this apply — capture the trigger before `event` moves.
+    let member_landing_group = if applied_member_add(&event) {
+        Some(named_group_metadata_event_group_id(&event).to_string())
+    } else {
+        None
+    };
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -9920,7 +9941,93 @@ async fn apply_named_group_metadata_event_with_binding(
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
+    if applied.accepted {
+        if let Some(gid) = member_landing_group {
+            replay_parked_role_updates(state, &gid).await;
+        }
+    }
     applied
+}
+
+/// #876: is this apply the one that seats a member (the replay trigger for
+/// parked role updates)?
+fn applied_member_add(event: &NamedGroupMetadataEvent) -> bool {
+    matches!(event, NamedGroupMetadataEvent::MemberAdded { .. })
+}
+
+/// #876 (issue item 3): park a signed role update whose target member is
+/// not yet in the local roster, instead of dropping it. Bounded per group
+/// (drop-oldest with a warn); suppressed in replay contexts (`allow_queue`
+/// false) so a re-park cannot grow the lot.
+fn park_role_update_for_late_member(
+    state: &AppState,
+    group_key: &str,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    member_hex: &str,
+    allow_queue: bool,
+) {
+    tracing::warn!(
+        group_id = %LogHexId::group(group_key),
+        member = %LogHexId::agent(member_hex),
+        "role update targets a member not yet in the local roster; parking it until their MemberAdded applies (#876)"
+    );
+    if !allow_queue {
+        return;
+    }
+    let mut lot = state
+        .parked_role_updates
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = lot.entry(group_key.to_string()).or_default();
+    while list.len() >= PARKED_ROLE_UPDATE_CAP {
+        let evicted = list.remove(0);
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            "parked role update cap reached; dropping the oldest ({})",
+            named_group_metadata_event_kind(&evicted.event)
+        );
+    }
+    list.push(ParkedRoleUpdate {
+        event,
+        sender,
+        parked_at: Instant::now(),
+    });
+}
+
+/// #876: after a member's `MemberAdded` applies, re-apply the group's
+/// parked role updates in arrival order. An update whose member is STILL
+/// unknown re-parks itself through the ordinary refusal path above.
+async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
+    let parked = {
+        let mut lot = state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lot.remove(group_key).unwrap_or_default()
+    };
+    if parked.is_empty() {
+        return;
+    }
+    tracing::info!(
+        group_id = %LogHexId::group(group_key),
+        count = parked.len(),
+        oldest_parked_secs = parked
+            .first()
+            .map(|entry| entry.parked_at.elapsed().as_secs())
+            .unwrap_or_default(),
+        "member landed; replaying parked role updates (#876)"
+    );
+    for entry in parked {
+        let _ = Box::pin(apply_named_group_metadata_event(
+            state,
+            entry.event,
+            entry.sender,
+            true,
+            None,
+        ))
+        .await;
+    }
 }
 
 async fn apply_named_group_metadata_event_inner(
@@ -11337,6 +11444,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let Some(target) = info.members_v2.get(&agent_id).cloned() else {
+                // #876 (issue item 3): the member's own MemberAdded has
+                // not reached this roster yet (its join blob can lag
+                // behind the control-blob staging budget). Never drop the
+                // signed role update silently — park it and replay once
+                // the member lands. The apply result stays REJECTED so
+                // ordering semantics are unchanged.
+                park_role_update_for_late_member(
+                    state,
+                    &resolved_group_key,
+                    event_for_log.clone(),
+                    sender,
+                    &agent_id,
+                    allow_queue,
+                );
                 return ApplyMetadataResult::REJECTED;
             };
             if target.is_removed() || target.is_banned() {
@@ -35498,6 +35619,7 @@ pub(in crate::server) mod tests {
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
+            parked_role_updates: StdMutex::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
             public_group_bootstrap_outbox: RwLock::new(HashMap::new()),
@@ -40889,6 +41011,138 @@ pub(in crate::server) mod tests {
             x0x::groups::GroupRole::Member
         );
         assert_eq!(stored.shared_secret, Some(vec![9; 32]));
+        Ok(())
+    }
+
+    /// #876 (issue item 3): a role update that arrives before its target
+    /// member's `MemberAdded` must be PARKED (warn) — never silently
+    /// dropped — and replayed to acceptance once the member lands. This is
+    /// the R15 shape: the member's join blob lagged behind the control-blob
+    /// staging budget, so sfo saw the role update first. On the pre-fix
+    /// head the update is silently rejected and the lot stays empty (the
+    /// fail-before).
+    #[tokio::test]
+    async fn role_update_for_late_member_parks_then_replays_on_member_add() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "role-update-late-member-876";
+        let (info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let foreign = "33".repeat(32);
+
+        // The owner's chain: MemberAdded seats `foreign`, RoleUpdated
+        // promotes them — both sealed exactly as production seals them.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            foreign.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let revision_add = seated.roster_revision;
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        // Advance the scratch to the post-add state the authority holds
+        // (the role update must chain from the MemberAdded's hash).
+        seated.prev_state_hash = Some(parent.state_hash.clone());
+        seated.state_hash = commit_add.state_hash.clone();
+        seated.state_revision = commit_add.revision;
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_add,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+        };
+
+        let mut adminified = seated.clone();
+        adminified.roster_revision = adminified.roster_revision.saturating_add(1);
+        adminified.set_member_role(&foreign, x0x::groups::GroupRole::Admin);
+        let revision_role = adminified.roster_revision;
+        let commit_role = sign_metadata_terminality_commit(&seated, &adminified, &state, 3_000);
+        let role_update = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_role,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(commit_role),
+        };
+
+        // 1) The role update arrives FIRST: the member is not in the local
+        //    roster, so the apply refuses — but parks instead of dropping.
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_update.clone(),
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted, "the member has not landed yet");
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                lot.get(group_id).map(Vec::len),
+                Some(1),
+                "#876: the role update is PARKED, not dropped"
+            );
+        }
+
+        // 2) The MemberAdded lands: accepted, and the parked role update
+        //    replays through the ordinary apply to acceptance.
+        let applied_add = apply_named_group_metadata_event(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(applied_add.accepted, "the member lands: {applied_add:?}");
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(group_id).expect("group retained");
+            assert!(stored.has_active_member(&foreign));
+            assert_eq!(
+                stored.members_v2[&foreign].role,
+                x0x::groups::GroupRole::Admin,
+                "#876: the parked role update replayed to acceptance"
+            );
+        }
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                lot.get(group_id).is_none_or(|list| list.is_empty()),
+                "#876: the parking lot drained after the replay"
+            );
+        }
         Ok(())
     }
 

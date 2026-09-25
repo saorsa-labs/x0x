@@ -59,6 +59,12 @@ pub(in crate::server) enum ControlBlobMessage {
         sequence: u32,
         data_b64: String,
     },
+    /// #876: the recipient completed its pull — the source may release the
+    /// staged copy now instead of holding it to the TTL. Mixed fleet: an
+    /// older source does not know this type and keeps TTL semantics; an
+    /// older recipient never sends it.
+    #[serde(rename = "control_blob_release")]
+    Release { reference: ControlBlobRef },
 }
 
 struct StagedBlob {
@@ -321,6 +327,23 @@ impl ControlBlobState {
         });
     }
 
+    /// #876: the blob's own RECIPIENT completed its pull — remove the
+    /// staged entry (and free its entry/byte budget) now instead of
+    /// holding it to `PENDING_JOIN_RESULT_TTL`. The caller has already
+    /// validated the sender IS the reference's recipient, so the remove
+    /// is keyed by the exact reference alone.
+    pub(super) fn release_staged(&self, reference: &ControlBlobRef) {
+        self.with_registry(|registry| {
+            if registry.staged.remove(reference).is_some() {
+                tracing::debug!(
+                    kind = ?reference.kind,
+                    byte_len = reference.byte_len,
+                    "staged control blob released by its recipient (#876)"
+                );
+            }
+        });
+    }
+
     pub(super) fn cancel_attempt(&self, group_id: &str, recipient: &str, attempt_id: &str) {
         // Removes ROUTING only. The cancelled task's lease keeps its
         // declared bytes accounted until the task itself ends, so a
@@ -386,6 +409,10 @@ fn control_config(message: &ControlBlobMessage) -> x0x::dm::DmSendConfig {
                 ..direct_message_send_config()
             }
         }
+        ControlBlobMessage::Release { .. } => x0x::dm::DmSendConfig {
+            prefer_raw_quic_if_connected: false,
+            ..direct_message_send_config()
+        },
     }
 }
 
@@ -407,12 +434,14 @@ async fn send_message(
 
 /// Stage the exact original JSON and send only its bounded reference.
 ///
-/// Bounded retention, stated honestly: a blob that stages successfully but
-/// whose reference — or any later chunk — send fails stays staged and
-/// servable until `PENDING_JOIN_RESULT_TTL` (or group teardown / re-stage
-/// refresh); a failed send does NOT release it early. The bounds above
-/// (entry cap, global and per-recipient byte budgets, per-blob maximum)
-/// keep that retention finite.
+/// Retention, stated honestly: a successfully staged blob is released by
+/// its recipient's `control_blob_release` notice once the pull completes
+/// and verifies (#876), or — for peers that do not send the notice, or
+/// when the notice is lost — by `PENDING_JOIN_RESULT_TTL` / group
+/// teardown / re-stage refresh, whichever comes first. A staging-budget
+/// refusal is retried briefly before this returns an error (the caller
+/// still logs on final failure). The bounds above (entry cap, global and
+/// per-recipient byte budgets, per-blob maximum) keep retention finite.
 pub(super) async fn send_reference(
     store: &ControlBlobState,
     agent: &Agent,
@@ -432,9 +461,28 @@ pub(super) async fn send_reference(
         byte_len: bytes.len() as u64,
         join_attempt_id: join_attempt_id.map(str::to_string),
     };
-    store
-        .stage(reference.clone(), bytes)
-        .map_err(str::to_string)?;
+    // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
+    // recipients release their completed pulls — retry it briefly before
+    // giving up, instead of dropping the event on the floor. Any other
+    // refusal (invalid blob, digest conflict) returns immediately.
+    const BUDGET_RETRIES: usize = 6;
+    const BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
+    for attempt in 0..=BUDGET_RETRIES {
+        match store.stage(reference.clone(), bytes.clone()) {
+            Ok(()) => break,
+            Err("control blob staging budget exhausted") if attempt < BUDGET_RETRIES => {
+                tracing::warn!(
+                    kind = ?reference.kind,
+                    group_id = %reference.group_id,
+                    recipient = %LogHexId::agent(&reference.recipient),
+                    attempt,
+                    "control blob staging budget exhausted; retrying (#876)"
+                );
+                tokio::time::sleep(BUDGET_RETRY_DELAY).await;
+            }
+            Err(other) => return Err(other.to_string()),
+        }
+    }
     send_message(
         agent,
         recipient,
@@ -616,6 +664,16 @@ pub(in crate::server) async fn handle_control_blob_message(
                 .control_blobs
                 .deliver_chunk(&reference, sequence, chunk);
         }
+        ControlBlobMessage::Release { reference } => {
+            // #876: only the staged blob's own RECIPIENT may release it —
+            // the fetch header check enforces sender == reference.recipient
+            // and local == reference.source, and the exact reference
+            // (digest + length) keys the removal.
+            if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
+                return;
+            }
+            state.control_blobs.release_staged(&reference);
+        }
     }
 }
 
@@ -677,6 +735,20 @@ async fn fetch_and_apply(
     }
     if !exact_blob_matches_ref(reference, &bytes) {
         return Err("control blob length or digest mismatch");
+    }
+    // #876: the pull is complete and digest-verified — tell the source it
+    // can free the staged copy now instead of holding it to the TTL (the
+    // per-peer staging cap then bounds IN-FLIGHT blobs, not TTL-held
+    // ones). Best-effort: an older source ignores the unknown message
+    // type and keeps TTL semantics; a failure here never fails the fetch.
+    let release = ControlBlobMessage::Release {
+        reference: reference.clone(),
+    };
+    if let Err(reason) = send_message(&state.agent, &source, &release).await {
+        tracing::debug!(
+            reason,
+            "control blob release notice failed (TTL still applies)"
+        );
     }
     if !reference_admitted(state, reference).await {
         return Err("control blob binding no longer current");
@@ -861,6 +933,40 @@ mod tests {
         for identity in [&reference.group_id, &reference.source, &reference.recipient] {
             assert!(!line.contains(identity.as_str()));
         }
+    }
+
+    /// #876 (issue item 1): the per-peer staging cap bounds IN-FLIGHT
+    /// blobs, not TTL-held ones. A completed pull RELEASES its staged copy
+    /// on the source, so a later blob for the same recipient stages. On
+    /// the pre-fix head the fifth blob is refused with "staging budget
+    /// exhausted" (the fail-before: `release_staged` is a no-op there).
+    #[test]
+    fn release_on_completed_fetch_frees_the_per_peer_staging_budget() {
+        let store = ControlBlobState::default();
+        let mut staged = Vec::new();
+        for i in 0..PER_PEER_ENTRY_CAP {
+            // Distinct payloads => distinct digests => distinct references.
+            let bytes = vec![i as u8; x0x::dm::MAX_PAYLOAD_BYTES + 64 + i];
+            let reference = reference(&bytes);
+            store
+                .stage(reference.clone(), bytes)
+                .expect("within the per-peer cap");
+            staged.push(reference);
+        }
+        // The cap is real: one more blob for the same recipient is refused.
+        let extra = vec![0xEE; x0x::dm::MAX_PAYLOAD_BYTES + 128];
+        let extra_reference = reference(&extra);
+        assert_eq!(
+            store.stage(extra_reference.clone(), extra.clone()),
+            Err("control blob staging budget exhausted"),
+            "the per-peer cap still bounds in-flight blobs"
+        );
+        // The recipient completed its pull of the FIRST blob: released.
+        store.release_staged(&staged[0]);
+        // The next blob for the SAME recipient stages in the freed slot.
+        store
+            .stage(extra_reference, extra)
+            .expect("#876: a released slot is reusable by the same recipient");
     }
 
     #[test]
