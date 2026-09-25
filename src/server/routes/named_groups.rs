@@ -36085,8 +36085,7 @@ pub(in crate::server) mod tests {
                 x0x::connect::ConnectPolicy::default(),
                 exec_policy.clone(),
             )
-            .await
-            .map_err(anyhow::Error::msg)?,
+            .await,
         );
         let exec_service =
             x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);

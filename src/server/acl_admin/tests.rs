@@ -66,14 +66,14 @@ impl Fixture {
     }
 
     /// Simulate daemon startup: load both floors, then the overlays.
-    async fn start(&self) -> Result<AclAdmin, String> {
+    async fn start(&self) -> AclAdmin {
         let connect =
             x0x::connect::load_connect_policy(Some(&self.connect_path), LoadMode::ExplicitPath)
                 .await
-                .map_err(|e| e.to_string())?;
+                .expect("connect floor");
         let exec = x0x::exec::load_exec_policy(Some(&self.exec_path), LoadMode::ExplicitPath)
             .await
-            .map_err(|e| e.to_string())?;
+            .expect("exec floor");
         AclAdmin::load(self.dir.path(), connect, exec).await
     }
 
@@ -145,7 +145,7 @@ fn entry_ids(listing: &serde_json::Value, origin: &str) -> Vec<String> {
 #[tokio::test]
 async fn api_connect_entry_is_effective_immediately_and_survives_restart() {
     let fx = Fixture::new();
-    let admin = fx.start().await.expect("start");
+    let admin = fx.start().await;
     assert!(!connect_allowed(
         &admin.effective_connect().await,
         0xcc,
@@ -180,7 +180,7 @@ async fn api_connect_entry_is_effective_immediately_and_survives_restart() {
 
     // Restart: a fresh load from the same data dir keeps the entry.
     drop(admin);
-    let admin = fx.start().await.expect("restart");
+    let admin = fx.start().await;
     assert!(connect_allowed(
         &admin.effective_connect().await,
         0xcc,
@@ -201,7 +201,7 @@ async fn api_connect_entry_is_effective_immediately_and_survives_restart() {
         "127.0.0.1:8080"
     ));
     drop(admin);
-    let admin = fx.start().await.expect("restart 2");
+    let admin = fx.start().await;
     assert!(!connect_allowed(
         &admin.effective_connect().await,
         0xcc,
@@ -221,7 +221,7 @@ async fn api_connect_entry_is_effective_immediately_and_survives_restart() {
 #[tokio::test]
 async fn api_exec_entry_is_effective_immediately_and_survives_restart() {
     let fx = Fixture::new();
-    let admin = fx.start().await.expect("start");
+    let admin = fx.start().await;
     let added = admin
         .add_exec(exec_pair(0xcc, 0xdd, &["df", "-h"]), false)
         .await
@@ -236,7 +236,7 @@ async fn api_exec_entry_is_effective_immediately_and_survives_restart() {
     );
 
     drop(admin);
-    let admin = fx.start().await.expect("restart");
+    let admin = fx.start().await;
     assert!(exec_allowed(
         &admin.effective_exec().await,
         0xcc,
@@ -258,7 +258,7 @@ async fn api_exec_entry_is_effective_immediately_and_survives_restart() {
 #[tokio::test]
 async fn api_cannot_remove_a_floor_entry() {
     let fx = Fixture::new();
-    let admin = fx.start().await.expect("start");
+    let admin = fx.start().await;
 
     let floor_ids = entry_ids(&admin.list_connect().await, "file");
     assert_eq!(floor_ids.len(), 1, "one floor entry listed");
@@ -301,7 +301,7 @@ async fn api_cannot_remove_a_floor_entry() {
 #[tokio::test]
 async fn malformed_or_widening_floor_reload_keeps_last_good_acl() {
     let fx = Fixture::new();
-    let admin = fx.start().await.expect("start");
+    let admin = fx.start().await;
     admin
         .add_connect(connect_pair(0xcc, 0xdd, "127.0.0.1:8080"), false)
         .await
@@ -373,13 +373,113 @@ async fn malformed_or_widening_floor_reload_keeps_last_good_acl() {
     assert!(listing["reload"]["last_error"].is_null(), "{listing}");
 }
 
-/// WHY: the overlay is operator-reachable on disk too; a corrupted overlay
-/// must be rejected on reload (last good kept) and refuse startup
-/// (fail closed, like a malformed floor).
+/// WHY: overlay entries only ever ADD access, so a malformed overlay must
+/// not take the daemon (and the owner's other agents) down: running on the
+/// TOML floor alone is already fail-closed. The broken file must survive
+/// untouched for the operator to inspect, the failure must be visible, and
+/// API writes must be refused so a rewrite from memory cannot silently
+/// replace it. A successful reload after the fix lifts the block.
 #[tokio::test]
-async fn malformed_overlay_is_rejected_on_reload_and_at_startup() {
+async fn malformed_overlay_at_startup_runs_on_floor_and_blocks_api_writes() {
     let fx = Fixture::new();
-    let admin = fx.start().await.expect("start");
+    std::fs::create_dir_all(fx.dir.path().join(OVERLAY_DIR)).expect("overlay dir");
+    let corrupt = b"{ not json";
+    std::fs::write(fx.overlay_path("connect"), corrupt).expect("corrupt connect overlay");
+    let invalid_entry = serde_json::json!({
+        "version": 1,
+        "entries": [{
+            "added_at_unix_ms": 1,
+            "entry": {
+                "agent_id": hex32(0xcc),
+                "machine_id": hex32(0xdd),
+                "commands": [{ "argv": ["sh", "<CMD>"] }]
+            }
+        }]
+    })
+    .to_string();
+    std::fs::write(fx.overlay_path("exec"), &invalid_entry).expect("invalid exec overlay");
+
+    // The daemon ACL loads (no error path exists any more).
+    let admin = fx.start().await;
+
+    // Effective ACL == the floor, entry for entry.
+    let floor_connect =
+        x0x::connect::load_connect_policy(Some(&fx.connect_path), LoadMode::ExplicitPath)
+            .await
+            .expect("floor");
+    let ConnectPolicy::Enabled(floor_acl) = &floor_connect else {
+        panic!("floor enabled");
+    };
+    let ConnectPolicy::Enabled(effective) = &*admin.effective_connect().await else {
+        panic!("connect stays enabled on the floor");
+    };
+    assert_eq!(effective.entry_specs(), floor_acl.entry_specs());
+    let ExecPolicy::Enabled(exec_effective) = &*admin.effective_exec().await else {
+        panic!("exec stays enabled on the floor");
+    };
+    assert_eq!(exec_effective.entry_specs().len(), 1, "floor entry only");
+    assert!(!exec_allowed(
+        &admin.effective_exec().await,
+        0xcc,
+        0xdd,
+        &["sh", "x"]
+    ));
+
+    // Surfaced: error + counter in the status that feeds /diagnostics.
+    for listing in [admin.list_connect().await, admin.list_exec().await] {
+        assert_eq!(listing["reload"]["overlay_load_failures"], 1, "{listing}");
+        assert!(listing["reload"]["overlay_error"].is_string(), "{listing}");
+    }
+
+    // API writes refused; the files are byte-for-byte untouched.
+    for result in [
+        admin
+            .add_connect(connect_pair(0x11, 0x22, "127.0.0.1:9000"), false)
+            .await,
+        admin.remove_connect("api-0011223344556677").await,
+        admin.add_exec(exec_pair(0x11, 0x22, &["id"]), false).await,
+        admin.remove_exec("api-0011223344556677").await,
+    ] {
+        assert!(
+            matches!(result, Err(AclAdminError::Conflict(_))),
+            "{result:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(fx.overlay_path("connect")).expect("read"),
+        corrupt
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.overlay_path("exec")).expect("read"),
+        invalid_entry
+    );
+
+    // A reload that still sees the broken file keeps blocking writes.
+    let report = admin.reload().await;
+    assert!(!report.connect.ok && !report.exec.ok);
+    assert!(admin
+        .add_connect(connect_pair(0x11, 0x22, "127.0.0.1:9000"), false)
+        .await
+        .is_err());
+
+    // Operator moves the connect file aside and reloads: writes resume.
+    std::fs::remove_file(fx.overlay_path("connect")).expect("move aside");
+    let report = admin.reload().await;
+    assert!(report.connect.ok, "{report:?}");
+    admin
+        .add_connect(connect_pair(0x11, 0x22, "127.0.0.1:9000"), false)
+        .await
+        .expect("writes allowed after a successful reload");
+    assert!(admin.list_connect().await["reload"]["overlay_error"].is_null());
+}
+
+/// WHY: an overlay corrupted while the daemon runs must be rejected on
+/// reload with the last good ACL kept, and must block API writes so the
+/// in-memory copy never overwrites the file under inspection.
+#[tokio::test]
+async fn malformed_overlay_on_reload_keeps_last_good_and_blocks_writes() {
+    let fx = Fixture::new();
+    let admin = fx.start().await;
     admin
         .add_exec(exec_pair(0xcc, 0xdd, &["df", "-h"]), false)
         .await
@@ -389,19 +489,15 @@ async fn malformed_overlay_is_rejected_on_reload_and_at_startup() {
     let report = admin.reload().await;
     assert!(!report.exec.ok);
     assert!(Arc::ptr_eq(&before, &admin.effective_exec().await));
-    drop(admin);
-    assert!(fx.start().await.is_err(), "startup is fail-closed");
-
-    // An overlay entry the parser rejects is fail-closed too.
-    let bad = serde_json::json!({
-        "version": 1,
-        "entries": [{
-            "added_at_unix_ms": 1,
-            "entry": { "principal": "anyone", "commands": [{ "argv": ["id"] }] }
-        }]
-    });
-    std::fs::write(fx.overlay_path("exec"), bad.to_string()).expect("bad overlay");
-    assert!(fx.start().await.is_err());
+    assert_eq!(report.exec.status.overlay_load_failures, 1);
+    assert!(matches!(
+        admin.add_exec(exec_pair(0x11, 0x22, &["id"]), false).await,
+        Err(AclAdminError::Conflict(_))
+    ));
+    assert_eq!(
+        std::fs::read(fx.overlay_path("exec")).expect("read"),
+        b"{ not json"
+    );
 }
 
 /// WHY: "validate every entry exactly as the TOML parser does" — the API
@@ -410,7 +506,7 @@ async fn malformed_overlay_is_rejected_on_reload_and_at_startup() {
 #[tokio::test]
 async fn api_entries_are_validated_like_toml_entries() {
     let fx = Fixture::new();
-    let admin = fx.start().await.expect("start");
+    let admin = fx.start().await;
     let mut non_loopback = connect_pair(0xcc, 0xdd, "10.0.0.1:22");
     let err = admin
         .add_connect(non_loopback.clone(), false)
@@ -458,7 +554,7 @@ async fn api_entries_are_validated_like_toml_entries() {
 #[tokio::test]
 async fn api_owner_entry_needs_owner_identity_and_matches_only_owner_trusted_pairs() {
     let fx = Fixture::new();
-    let admin = fx.start().await.expect("start");
+    let admin = fx.start().await;
     let owner_connect = ConnectAclEntrySpec {
         description: None,
         principal: Some("owner".to_string()),
@@ -519,7 +615,7 @@ async fn api_owner_entry_needs_owner_identity_and_matches_only_owner_trusted_pai
 async fn disabled_floor_refuses_api_entries() {
     let fx = Fixture::new();
     std::fs::write(&fx.connect_path, "[connect]\nenabled = false\n").expect("disabled");
-    let admin = fx.start().await.expect("start");
+    let admin = fx.start().await;
     let err = admin
         .add_connect(connect_pair(0xcc, 0xdd, "127.0.0.1:22"), false)
         .await
@@ -533,7 +629,7 @@ async fn disabled_floor_refuses_api_entries() {
 #[tokio::test]
 async fn exec_reload_refuses_an_audit_sink_change() {
     let fx = Fixture::new();
-    let admin = fx.start().await.expect("start");
+    let admin = fx.start().await;
     std::fs::write(&fx.exec_path, exec_floor_toml(fx.dir.path(), "moved.log")).expect("move audit");
     let report = admin.reload().await;
     assert!(!report.exec.ok);
@@ -541,4 +637,138 @@ async fn exec_reload_refuses_an_audit_sink_change() {
         panic!("exec stays enabled");
     };
     assert_eq!(acl.audit_log_path, fx.dir.path().join("exec.log"));
+}
+
+/// WHY: the overlay is additive only, which is what makes the floor-only
+/// fallback for a bad overlay safe: dropping the overlay can only REMOVE
+/// access, never widen it. For a floor F and overlay O,
+/// effective(F, O) ⊇ effective(F, ∅), and effective(F, ∅) is exactly F. No
+/// overlay entry (even one naming the same pair with other targets) can
+/// narrow, override or remove a floor entry, and no "deny" entry type
+/// exists.
+#[tokio::test]
+async fn overlay_is_additive_only_so_floor_fallback_never_widens() {
+    let fx = Fixture::new();
+    let connect_floor =
+        x0x::connect::load_connect_policy(Some(&fx.connect_path), LoadMode::ExplicitPath)
+            .await
+            .expect("floor");
+    let ConnectPolicy::Enabled(f) = &connect_floor else {
+        panic!("floor enabled");
+    };
+    // O includes an entry for the SAME pair as the floor entry with a
+    // different target, plus an owner entry.
+    let overlay = vec![
+        connect_pair(0xaa, 0xbb, "127.0.0.1:8080"),
+        connect_pair(0xcc, 0xdd, "127.0.0.1:9000"),
+        ConnectAclEntrySpec {
+            description: None,
+            principal: Some("owner".to_string()),
+            agent_id: None,
+            machine_id: None,
+            targets: vec!["127.0.0.1:2222".to_string()],
+        },
+    ];
+    let base = x0x::connect::compose_connect_policy(&connect_floor, &[]).expect("F+0");
+    let full = x0x::connect::compose_connect_policy(&connect_floor, &overlay).expect("F+O");
+    let (ConnectPolicy::Enabled(base), ConnectPolicy::Enabled(full)) = (&base, &full) else {
+        panic!("both enabled");
+    };
+    assert_eq!(base.entry_specs(), f.entry_specs(), "effective(F, ∅) == F");
+    let full_specs = full.entry_specs();
+    for spec in base.entry_specs() {
+        assert!(
+            full_specs.contains(&spec),
+            "floor entry kept verbatim: {spec:?}"
+        );
+    }
+    // Every access effective(F, ∅) grants, effective(F, O) still grants.
+    let (a, m) = ids(0xaa, 0xbb);
+    let t = target("127.0.0.1:22");
+    assert!(base.is_allowed(&a, &m, &t));
+    assert!(
+        full.is_allowed(&a, &m, &t),
+        "overlay did not narrow the floor"
+    );
+    // No deny/negative selector exists in the schema.
+    for principal in ["deny", "!owner", "none"] {
+        let mut spec = connect_pair(0xaa, 0xbb, "127.0.0.1:22");
+        spec.principal = Some(principal.to_string());
+        spec.agent_id = None;
+        spec.machine_id = None;
+        assert!(x0x::connect::compose_connect_policy(&connect_floor, &[spec]).is_err());
+    }
+
+    // Same property on the exec plane.
+    let exec_floor = x0x::exec::load_exec_policy(Some(&fx.exec_path), LoadMode::ExplicitPath)
+        .await
+        .expect("exec floor");
+    let exec_overlay = vec![exec_pair(0xaa, 0xbb, &["df", "-h"])];
+    let base = x0x::exec::compose_exec_policy(&exec_floor, &[]).expect("F+0");
+    let full = x0x::exec::compose_exec_policy(&exec_floor, &exec_overlay).expect("F+O");
+    let (ExecPolicy::Enabled(f), ExecPolicy::Enabled(base), ExecPolicy::Enabled(full)) =
+        (&exec_floor, &base, &full)
+    else {
+        panic!("enabled");
+    };
+    assert_eq!(base.entry_specs(), f.entry_specs());
+    let full_specs = full.entry_specs();
+    for spec in base.entry_specs() {
+        assert!(full_specs.contains(&spec));
+    }
+    let argv = vec!["uptime".to_string()];
+    assert!(
+        full.match_command(&a, &m, &argv).is_some(),
+        "floor argv kept"
+    );
+}
+
+/// WHY: the overlay is authorization state; like the key files it must be
+/// owner-only on disk, and a crash mid-write must never leave a torn file
+/// that would (now) silently drop every API grant at the next start.
+#[tokio::test]
+async fn overlay_writes_are_private_and_atomic() {
+    let fx = Fixture::new();
+    let admin = fx.start().await;
+    admin
+        .add_connect(connect_pair(0xcc, 0xdd, "127.0.0.1:8080"), false)
+        .await
+        .expect("add");
+    let path = fx.overlay_path("connect");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file_mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(file_mode & 0o777, 0o600, "overlay file is 0600");
+        let dir_mode = std::fs::metadata(fx.dir.path().join(OVERLAY_DIR))
+            .expect("stat dir")
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "overlay dir is 0700");
+    }
+    let good = std::fs::read(&path).expect("read overlay");
+
+    // Simulate a write interrupted before the rename: a stray temp file
+    // with partial bytes next to the real overlay.
+    let stray = fx
+        .dir
+        .path()
+        .join(OVERLAY_DIR)
+        .join(".connect-overlay.json.99999.0.tmp");
+    std::fs::write(&stray, b"{\"version\":1,\"entr").expect("stray temp");
+    drop(admin);
+
+    let admin = fx.start().await;
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        good,
+        "previous overlay intact"
+    );
+    assert!(connect_allowed(
+        &admin.effective_connect().await,
+        0xcc,
+        0xdd,
+        "127.0.0.1:8080"
+    ));
+    assert!(admin.list_connect().await["reload"]["overlay_error"].is_null());
 }

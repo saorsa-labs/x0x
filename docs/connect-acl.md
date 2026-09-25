@@ -83,7 +83,9 @@ x0x acl reload                             # re-read the TOML floor and the over
 - **Disabled floor:** if the TOML floor disables connect (or the file is missing), adding an entry returns `409`. API entries never turn a plane on.
 - **Reload:** `POST /acl/reload` (`x0x acl reload`) or `SIGHUP` re-reads the floor file and the overlay, then swaps the effective ACL atomically. The reload is rejected, and the last good ACL stays active, when the file or overlay is malformed or invalid, or when the reload would switch connect between enabled and disabled (that needs a restart). A rejected reload answers `422`. Its reason, plus the `reloads_ok`/`reloads_failed` counters, appears under `acl_reload` in `GET /diagnostics/connect`.
 - **In-flight streams** keep the policy they were admitted under. Each new stream is gated against the current ACL.
-- **Startup is fail-closed:** a malformed overlay stops the daemon from starting, just like a malformed floor.
+- **The overlay only adds access.** The effective ACL is always floor ∪ overlay. There is no deny entry, and no overlay entry can narrow, override or remove a floor entry.
+- **A malformed overlay does not stop the daemon.** Because the overlay only adds access, the daemon starts on the TOML floor alone, which can only withhold access. The bad file stays untouched on disk. The error is logged and appears under `acl_reload.overlay_error`, with `overlay_load_failures` counting such failures, in `GET /diagnostics/connect`. API writes answer `409` until the file is fixed (or moved aside) and a reload succeeds, so the broken file is never silently overwritten. A malformed floor still stops startup.
+- **Overlay files** are written atomically (temp file in the same directory, fsync, rename, directory fsync) with mode `0600`, inside an `acl/` directory restricted to `0700`.
 
 ## Target validation rules
 

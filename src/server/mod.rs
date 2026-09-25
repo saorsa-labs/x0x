@@ -794,14 +794,11 @@ pub async fn serve_with_options(
     enforce_owner_singleton_prebuild(&config, &identity_dir).await?;
 
     // ADR-0070 §3: compose the API-managed ACL overlay (daemon data dir)
-    // over the operator TOML floors. Fail-closed like the floors: a
-    // malformed overlay refuses startup. Everything below consumes the
-    // effective (floor ∪ overlay) policies.
-    let acl_admin = Arc::new(
-        acl_admin::AclAdmin::load(&config.data_dir, connect_policy, exec_policy)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to load API-managed ACL entries: {e}"))?,
-    );
+    // over the operator TOML floors. A malformed overlay only ever withholds
+    // added access: the daemon starts on the floor alone and reports it.
+    // Everything below consumes the effective (floor ∪ overlay) policies.
+    let acl_admin =
+        Arc::new(acl_admin::AclAdmin::load(&config.data_dir, connect_policy, exec_policy).await);
     let exec_policy = (*acl_admin.effective_exec().await).clone();
     let connect_policy = (*acl_admin.effective_connect().await).clone();
 

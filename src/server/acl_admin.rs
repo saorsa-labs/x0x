@@ -271,9 +271,32 @@ async fn write_overlay<S: Serialize + Clone>(
     let mut bytes = serde_json::to_vec_pretty(&file)
         .map_err(|e| format!("failed to encode {}: {e}", path.display()))?;
     bytes.push(b'\n');
+    if let Some(dir) = path.parent() {
+        ensure_private_dir(dir).await?;
+    }
+    // Same helper as the owner key/journal files: temp file in the same
+    // directory, fsync, chmod 0600, atomic rename, fsync the directory. An
+    // interrupted write leaves only a stray `.<name>.*.tmp`, never a torn
+    // overlay.
     x0x::storage::write_private_bytes_durable(path, bytes)
         .await
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+/// Create the overlay directory and restrict it to the daemon user (0700
+/// on unix): it holds authorization state, like the key files.
+async fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| format!("failed to restrict {}: {e}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Where effective policies are installed once the daemon services exist.
@@ -309,43 +332,72 @@ pub(super) struct AclAdmin {
 
 impl AclAdmin {
     /// Load the overlays from `<data_dir>/acl/` and compose them over the
-    /// startup floors. Startup is fail-closed (ADR-0019/0046): a malformed
-    /// overlay or an invalid overlay entry refuses to start the daemon.
+    /// startup floors.
     ///
-    /// # Errors
-    /// A message naming the offending overlay file or entry.
+    /// A malformed or invalid overlay does **not** stop the daemon: overlay
+    /// entries only ever add access, so running on the floor alone is
+    /// already fail-closed and keeps the daemon available. The bad file is
+    /// left untouched on disk, the error is logged and surfaced in
+    /// `/diagnostics/{connect,exec}`, and API writes are refused until a
+    /// successful reload.
     pub(super) async fn load(
         data_dir: &Path,
         connect_floor: ConnectPolicy,
         exec_floor: ExecPolicy,
-    ) -> Result<Self, String> {
+    ) -> Self {
         let dir = data_dir.join(OVERLAY_DIR);
-        let connect = Self::load_plane::<ConnectPlane>(&dir, connect_floor).await?;
-        let exec = Self::load_plane::<ExecPlane>(&dir, exec_floor).await?;
-        Ok(Self {
+        let connect = Self::load_plane::<ConnectPlane>(&dir, connect_floor).await;
+        let exec = Self::load_plane::<ExecPlane>(&dir, exec_floor).await;
+        Self {
             connect: tokio::sync::Mutex::new(connect),
             exec: tokio::sync::Mutex::new(exec),
             sink: std::sync::OnceLock::new(),
-        })
+        }
     }
 
-    async fn load_plane<P: Plane>(dir: &Path, floor: P::Policy) -> Result<PlaneState<P>, String> {
+    async fn load_plane<P: Plane>(dir: &Path, floor: P::Policy) -> PlaneState<P> {
         let overlay_path = dir.join(P::OVERLAY_FILE);
-        let overlay = read_overlay::<P>(&overlay_path).await?;
-        let specs: Vec<P::Spec> = overlay.iter().map(|r| r.entry.clone()).collect();
-        let effective = P::compose(&floor, &specs)
-            .map_err(|e| format!("{} (from {})", e, overlay_path.display()))?;
-        let status = AclReloadStatus {
-            api_entry_count: if P::enabled(&floor) { specs.len() } else { 0 },
-            ..AclReloadStatus::default()
+        let loaded = match read_overlay::<P>(&overlay_path).await {
+            Ok(overlay) => {
+                let specs: Vec<P::Spec> = overlay.iter().map(|r| r.entry.clone()).collect();
+                P::compose(&floor, &specs)
+                    .map(|effective| (overlay, effective))
+                    .map_err(|e| format!("{} (from {})", e, overlay_path.display()))
+            }
+            Err(e) => Err(e),
         };
-        Ok(PlaneState {
-            floor,
-            overlay,
-            effective: Arc::new(effective),
-            status,
-            overlay_path,
-        })
+        match loaded {
+            Ok((overlay, effective)) => PlaneState {
+                status: AclReloadStatus {
+                    api_entry_count: if P::enabled(&floor) { overlay.len() } else { 0 },
+                    ..AclReloadStatus::default()
+                },
+                floor,
+                overlay,
+                effective: Arc::new(effective),
+                overlay_path,
+            },
+            Err(error) => {
+                tracing::error!(
+                    plane = P::NAME,
+                    %error,
+                    "API ACL overlay rejected at startup; running on the TOML floor only, \
+                     the file is left untouched and API ACL writes are refused until a \
+                     successful reload (ADR-0070)"
+                );
+                PlaneState {
+                    effective: Arc::new(floor.clone()),
+                    floor,
+                    overlay: Vec::new(),
+                    status: AclReloadStatus {
+                        overlay_load_failures: 1,
+                        overlay_error: Some(error),
+                        ..AclReloadStatus::default()
+                    },
+                    overlay_path,
+                }
+            }
+        }
     }
 
     /// Effective connect policy (floor ∪ overlay).
@@ -483,7 +535,7 @@ impl AclAdmin {
                     commit_reload(&mut state, staged);
                     Ok(())
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(note_stage_error(&mut state, e)),
             };
             let outcome = finish_reload(&mut state, outcome);
             self.publish_connect(&state);
@@ -499,7 +551,7 @@ impl AclAdmin {
                     }
                     Err(e) => Err(e),
                 },
-                Err(e) => Err(e),
+                Err(e) => Err(note_stage_error(&mut state, e)),
             };
             let outcome = finish_reload(&mut state, outcome);
             self.publish_exec_status(&state);
@@ -534,6 +586,20 @@ type NextEdit<P> = (
     Arc<<P as Plane>::Policy>,
 );
 
+/// API writes are refused while the overlay on disk is not in force, so a
+/// broken file is never silently overwritten by a rewrite from memory.
+fn refuse_while_overlay_broken<P: Plane>(state: &PlaneState<P>) -> Result<(), AclAdminError> {
+    match &state.status.overlay_error {
+        Some(error) => Err(AclAdminError::Conflict(format!(
+            "the {} ACL overlay {} is not in force ({error}); API ACL writes are refused \
+             until it is fixed (or moved aside) and `x0x acl reload` succeeds",
+            P::NAME,
+            state.overlay_path.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Validate an add against the current state. `Ok((body, None))` means the
 /// identical entry already exists (idempotent, nothing to write).
 fn prepare_add<P: Plane>(
@@ -541,6 +607,7 @@ fn prepare_add<P: Plane>(
     spec: P::Spec,
     install_has_owner: bool,
 ) -> Result<(serde_json::Value, Option<NextEdit<P>>), AclAdminError> {
+    refuse_while_overlay_broken(state)?;
     if P::is_owner_entry(&spec) && !install_has_owner {
         return Err(AclAdminError::Conflict(
             "principal = \"owner\" entries need an owner identity on this install \
@@ -577,6 +644,7 @@ fn prepare_add<P: Plane>(
 }
 
 fn prepare_remove<P: Plane>(state: &PlaneState<P>, id: &str) -> Result<NextEdit<P>, AclAdminError> {
+    refuse_while_overlay_broken(state)?;
     if P::floor_specs(&state.floor)
         .iter()
         .any(|spec| entry_id("file", spec) == id)
@@ -624,18 +692,49 @@ fn commit_edit<P: Plane>(
     state.effective = effective;
 }
 
+/// Why a reload was rejected; `overlay_bad` when the overlay file itself
+/// (not the floor) is malformed or holds an invalid entry.
+struct StageError {
+    message: String,
+    overlay_bad: bool,
+}
+
 /// Read floor + overlay from disk and compose; touches no live state.
-async fn stage_reload<P: Plane>(state: &PlaneState<P>) -> Result<Staged<P>, String> {
-    let floor = P::load_floor(&P::floor_path(&state.floor)).await?;
-    let overlay = read_overlay::<P>(&state.overlay_path).await?;
+async fn stage_reload<P: Plane>(state: &PlaneState<P>) -> Result<Staged<P>, StageError> {
+    let floor_err = |message| StageError {
+        message,
+        overlay_bad: false,
+    };
+    let overlay_err = |message| StageError {
+        message,
+        overlay_bad: true,
+    };
+    let floor = P::load_floor(&P::floor_path(&state.floor))
+        .await
+        .map_err(floor_err)?;
+    let overlay = read_overlay::<P>(&state.overlay_path)
+        .await
+        .map_err(overlay_err)?;
     let specs: Vec<P::Spec> = overlay.iter().map(|r| r.entry.clone()).collect();
-    let effective = P::compose(&floor, &specs)?;
-    P::reload_compatible(&state.effective, &effective)?;
+    // The floor parsed on its own, so a composition error is an overlay entry.
+    let effective = P::compose(&floor, &specs).map_err(overlay_err)?;
+    P::reload_compatible(&state.effective, &effective).map_err(floor_err)?;
     Ok((floor, overlay, Arc::new(effective)))
+}
+
+/// Record a rejected reload caused by a bad overlay: keep blocking writes
+/// so the broken file on disk is not overwritten.
+fn note_stage_error<P: Plane>(state: &mut PlaneState<P>, error: StageError) -> String {
+    if error.overlay_bad {
+        state.status.overlay_load_failures = state.status.overlay_load_failures.saturating_add(1);
+        state.status.overlay_error = Some(error.message.clone());
+    }
+    error.message
 }
 
 fn commit_reload<P: Plane>(state: &mut PlaneState<P>, staged: Staged<P>) {
     let (floor, overlay, effective) = staged;
+    state.status.overlay_error = None;
     state.status.api_entry_count = if P::enabled(&floor) { overlay.len() } else { 0 };
     state.floor = floor;
     state.overlay = overlay;

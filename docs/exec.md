@@ -115,6 +115,7 @@ x0x acl reload                  # also SIGHUP
 - API entries are refused with `409` while the floor disables exec. `principal = "owner"` entries are refused with `409` on an install with no owner key.
 - A reload is rejected, and the last good ACL kept, when the file or overlay is malformed or invalid, when it would switch exec on or off, or when it would change `audit_log_path`/`audit_tasklist_id` (the audit sink is bound at start). The reason and counters appear under `acl_reload` in `GET /diagnostics/exec`. Caps and allow entries do hot-reload.
 - Requests already admitted keep the policy they were checked against.
+- As for connect, the overlay only adds access. A malformed `exec-overlay.json` leaves the daemon running on the floor alone, is reported under `acl_reload.overlay_error` in `/diagnostics/exec`, and blocks API writes (`409`) until a reload succeeds. Overlay writes are atomic and `0600`.
 
 Every request argv token is also checked for shell metacharacters (`;`, `|`, `&`, `>`, `<`, backtick, `$`, newline, and NUL). This is defence in depth; commands are still spawned without a shell.
 

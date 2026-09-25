@@ -689,6 +689,14 @@ pub struct AclReloadStatus {
     pub last_error: Option<String>,
     /// API-managed entries currently in the effective ACL.
     pub api_entry_count: usize,
+    /// Times the API overlay file was found malformed or invalid (at
+    /// startup or on reload). The file is left untouched on disk.
+    pub overlay_load_failures: u64,
+    /// Why the overlay on disk is not in force. While set, the effective
+    /// ACL excludes the overlay and API writes are refused (`409`) so the
+    /// broken file is never silently overwritten; cleared by a successful
+    /// reload.
+    pub overlay_error: Option<String>,
 }
 
 impl AllowedToken {
