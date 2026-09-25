@@ -600,9 +600,9 @@ pub struct Subscription {
     /// Live subscribed transport ids used by the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
     /// Group classification and SG preference cleared with the last subscriber.
-    group_topic_by_id: Arc<RwLock<HashMap<TopicId, String>>>,
+    group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
-    group_preference_apply_lock: Arc<tokio::sync::Mutex<()>>,
+    group_preference_apply_locks: Arc<GroupTopicApplyLocks>,
     #[cfg(test)]
     drop_completed: Arc<AtomicU64>,
 }
@@ -611,6 +611,34 @@ pub struct Subscription {
 struct TopicSubscriptionCount {
     count: usize,
     generation: u64,
+}
+
+/// A fixed number of topic shards keeps the hot path bounded without
+/// serializing unrelated topics. Roster writers serialize with each other
+/// and reconcile one shard at a time after publishing the new roster.
+struct GroupTopicApplyLocks {
+    roster_update: tokio::sync::Mutex<()>,
+    names: [tokio::sync::Mutex<()>; 64],
+    shards: [tokio::sync::Mutex<()>; 64],
+}
+
+impl GroupTopicApplyLocks {
+    fn new() -> Self {
+        Self {
+            roster_update: tokio::sync::Mutex::new(()),
+            names: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
+            shards: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
+        }
+    }
+
+    fn name_shard(&self, name: &str) -> &tokio::sync::Mutex<()> {
+        let rank = blake3::hash(name.as_bytes());
+        &self.names[usize::from(rank.as_bytes()[0]) % self.names.len()]
+    }
+
+    fn shard(&self, topic: TopicId) -> &tokio::sync::Mutex<()> {
+        &self.shards[usize::from(topic.as_bytes()[0]) % self.shards.len()]
+    }
 }
 
 impl Subscription {
@@ -657,14 +685,19 @@ impl Drop for Subscription {
         let subscribed_topic_ids = self.subscribed_topic_ids.clone();
         let group_topic_by_id = self.group_topic_by_id.clone();
         let plumtree = self.plumtree.clone();
-        let group_preference_apply_lock = self.group_preference_apply_lock.clone();
+        let group_preference_apply_locks = self.group_preference_apply_locks.clone();
         #[cfg(test)]
         let drop_completed = self.drop_completed.clone();
 
         // Spawn a task to decrement the refcount for this topic.
         // This avoids blocking on synchronous locks in drop.
         tokio::spawn(async move {
-            let _apply_guard = group_preference_apply_lock.lock().await;
+            let _name_guard = group_preference_apply_locks.name_shard(&topic).lock().await;
+            let _apply_guard = if let Some(topic_id) = topic_id {
+                Some(group_preference_apply_locks.shard(topic_id).lock().await)
+            } else {
+                None
+            };
             let mut counts = topic_ref_counts.write().await;
             let mut clear_preference = None;
             if let Some(state) = counts.get_mut(&topic) {
@@ -720,6 +753,15 @@ impl Drop for Subscription {
 #[derive(Clone, PartialEq, Eq)]
 struct GroupEagerRoster {
     metadata_topic: String,
+    active_agents: Vec<AgentId>,
+}
+
+/// Coherent per-topic classification and active roster. A roster writer may
+/// publish a new global snapshot before it reaches this topic's shard; hot
+/// paths then use this complete old binding until that shard is reconciled.
+#[derive(Clone)]
+struct GroupTopicBinding {
+    name: String,
     active_agents: Vec<AgentId>,
 }
 
@@ -780,13 +822,19 @@ pub struct PubSubManager {
     /// Authoritative active group rosters supplied by the daemon after commit.
     group_rosters: RwLock<HashMap<String, GroupEagerRoster>>,
     /// Locally named group topics. Unknown Full pass-through ids stay ordinary relays.
-    group_topic_by_id: Arc<RwLock<HashMap<TopicId, String>>>,
+    group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
     group_identity: std::sync::OnceLock<GroupIdentityContext>,
-    group_preference_apply_lock: Arc<tokio::sync::Mutex<()>>,
+    group_preference_apply_locks: Arc<GroupTopicApplyLocks>,
     #[cfg(test)]
     drop_completed: Arc<AtomicU64>,
     #[cfg(test)]
     subscribe_after_registration_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    roster_after_swap_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    register_after_roster_read_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     /// Live subscribed transport ids for the Leaf C0 refuse gate AND the
     /// #674 C2 zero-subscriber test (shared handle).
@@ -967,42 +1015,81 @@ impl PubSubManager {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let _apply_guard = self.group_preference_apply_lock.lock().await;
+        let _writer_guard = self.group_preference_apply_locks.roster_update.lock().await;
         let mut current = self.group_rosters.write().await;
         if *current == next {
             return;
         }
         *current = next;
         drop(current);
+        #[cfg(test)]
+        {
+            let pause = self
+                .roster_after_swap_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((entered, release)) = pause {
+                entered.wait().await;
+                release.wait().await;
+            }
+        }
         let known = self
             .topic_id_by_name
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         for (name, topic_id) in known {
-            self.register_group_topic_locked(&name, topic_id).await;
+            let _topic_guard = self
+                .group_preference_apply_locks
+                .shard(topic_id)
+                .lock()
+                .await;
+            if self
+                .topic_id_by_name
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&name)
+                == Some(&topic_id)
+            {
+                self.register_group_topic_locked(&name, topic_id).await;
+            }
         }
-        // Publish-only group topics may not have a local subscription name.
-        // A withdrawn group must still lose its classification and SG set.
-        let stale: Vec<TopicId> = {
-            let rosters = self.group_rosters.read().await;
-            self.group_topic_by_id
+        // Publish-only topics are absent from the local name map. Sweep all
+        // remaining bindings, and re-read each under its own ID stripe so a
+        // concurrent Drop cannot be resurrected from this snapshot.
+        let existing: Vec<TopicId> = self
+            .group_topic_by_id
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect();
+        for topic_id in existing {
+            let _topic_guard = self
+                .group_preference_apply_locks
+                .shard(topic_id)
+                .lock()
+                .await;
+            let name = self
+                .group_topic_by_id
                 .read()
                 .await
-                .iter()
-                .filter(|(_, group_id)| !rosters.contains_key(*group_id))
-                .map(|(topic_id, _)| *topic_id)
-                .collect()
-        };
-        for topic_id in stale {
-            self.clear_group_topic_preference_locked(topic_id).await;
+                .get(&topic_id)
+                .map(|binding| binding.name.clone());
+            if let Some(name) = name {
+                self.register_group_topic_locked(&name, topic_id).await;
+            }
         }
-        drop(_apply_guard);
         self.refresh_topic_peers().await;
     }
 
     async fn register_group_topic(&self, name: &str, topic_id: TopicId) {
-        let _apply_guard = self.group_preference_apply_lock.lock().await;
+        let _topic_guard = self
+            .group_preference_apply_locks
+            .shard(topic_id)
+            .lock()
+            .await;
         self.register_group_topic_locked(name, topic_id).await;
     }
 
@@ -1013,23 +1100,40 @@ impl PubSubManager {
             .filter(|(id, store)| !id.is_empty() && !store.is_empty())
             .map(|(id, _)| id.to_string());
         let rosters = self.group_rosters.read().await;
-        let group_id = match kv_group_id {
-            Some(id) if rosters.contains_key(&id) => Some(id),
-            Some(_) => None,
+        let binding = match kv_group_id {
+            Some(id) => rosters.get(&id).map(|roster| roster.active_agents.clone()),
             None => rosters
                 .iter()
                 .find(|(_, roster)| roster.metadata_topic == name)
-                .map(|(id, _)| id.clone()),
+                .map(|(_, roster)| roster.active_agents.clone()),
         };
-        drop(rosters);
-        if let Some(group_id) = group_id {
-            self.group_topic_by_id
-                .write()
-                .await
-                .insert(topic_id, group_id);
+        #[cfg(test)]
+        {
+            let pause = self
+                .register_after_roster_read_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((entered, release)) = pause {
+                entered.wait().await;
+                release.wait().await;
+            }
+        }
+        // Keep the roster read guard through classification publication.
+        // A writer then either sees this binding in its sweep or this
+        // registrar sees the writer's new roster; it cannot miss both.
+        if let Some(active_agents) = binding {
+            self.group_topic_by_id.write().await.insert(
+                topic_id,
+                GroupTopicBinding {
+                    name: name.to_string(),
+                    active_agents,
+                },
+            );
         } else {
             self.clear_group_topic_preference_locked(topic_id).await;
         }
+        drop(rosters);
     }
 
     async fn clear_group_topic_preference_locked(&self, topic_id: TopicId) {
@@ -1047,16 +1151,12 @@ impl PubSubManager {
     }
 
     async fn preferred_roster_peers(&self, topic: TopicId, connected: &[PeerId]) -> Vec<PeerId> {
-        let group_id = self.group_topic_by_id.read().await.get(&topic).cloned();
-        let Some(group_id) = group_id else {
-            return Vec::new();
-        };
         let agents = self
-            .group_rosters
+            .group_topic_by_id
             .read()
             .await
-            .get(&group_id)
-            .map(|r| r.active_agents.clone());
+            .get(&topic)
+            .map(|binding| binding.active_agents.clone());
         let (Some(agents), Some(identity)) = (agents, self.group_identity.get()) else {
             return Vec::new();
         };
@@ -1235,11 +1335,15 @@ impl PubSubManager {
             group_rosters: RwLock::new(HashMap::new()),
             group_topic_by_id: Arc::new(RwLock::new(HashMap::new())),
             group_identity: std::sync::OnceLock::new(),
-            group_preference_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            group_preference_apply_locks: Arc::new(GroupTopicApplyLocks::new()),
             #[cfg(test)]
             drop_completed: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             subscribe_after_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            roster_after_swap_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            register_after_roster_read_pause: std::sync::Mutex::new(None),
             subscribed_topic_ids,
             relay_fanout,
             skip_legacy_dm_bus: AtomicBool::new(false),
@@ -1638,7 +1742,11 @@ impl PubSubManager {
         // (issue #89).
         if is_local_topic(&topic) {
             let (tx, rx) = mpsc::channel(10_000);
-            let _apply_guard = self.group_preference_apply_lock.lock().await;
+            let _name_guard = self
+                .group_preference_apply_locks
+                .name_shard(&topic)
+                .lock()
+                .await;
             self.local_topics
                 .write()
                 .await
@@ -1656,7 +1764,7 @@ impl PubSubManager {
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
-                group_preference_apply_lock: Arc::clone(&self.group_preference_apply_lock),
+                group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
                 #[cfg(test)]
                 drop_completed: Arc::clone(&self.drop_completed),
             };
@@ -1664,7 +1772,16 @@ impl PubSubManager {
 
         self.register_dynamic_topic_priority(&topic, topic_id);
         let generation = {
-            let _apply_guard = self.group_preference_apply_lock.lock().await;
+            let _name_guard = self
+                .group_preference_apply_locks
+                .name_shard(&topic)
+                .lock()
+                .await;
+            let _topic_guard = self
+                .group_preference_apply_locks
+                .shard(topic_id)
+                .lock()
+                .await;
             // Count and classification share the same lock as Drop and
             // unsubscribe. A prior generation cannot erase this hold.
             let generation = self.retain_topic_subscription(&topic).await;
@@ -1698,7 +1815,16 @@ impl PubSubManager {
         let revocation_set = self.revocation_set.get().cloned();
 
         let active_generation = {
-            let _apply_guard = self.group_preference_apply_lock.lock().await;
+            let _name_guard = self
+                .group_preference_apply_locks
+                .name_shard(&topic)
+                .lock()
+                .await;
+            let _topic_guard = self
+                .group_preference_apply_locks
+                .shard(topic_id)
+                .lock()
+                .await;
             let current_generation = self
                 .topic_ref_counts
                 .read()
@@ -1741,7 +1867,7 @@ impl PubSubManager {
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
-                group_preference_apply_lock: Arc::clone(&self.group_preference_apply_lock),
+                group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
                 #[cfg(test)]
                 drop_completed: Arc::clone(&self.drop_completed),
             };
@@ -1867,7 +1993,7 @@ impl PubSubManager {
             subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
             group_topic_by_id: Arc::clone(&self.group_topic_by_id),
             plumtree: Arc::clone(&self.plumtree),
-            group_preference_apply_lock: Arc::clone(&self.group_preference_apply_lock),
+            group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
             #[cfg(test)]
             drop_completed: Arc::clone(&self.drop_completed),
         }
@@ -2049,6 +2175,9 @@ impl PubSubManager {
         };
 
         self.register_dynamic_topic_priority(&topic, topic_id);
+        // Classification linearizes here. A roster commit overlapping this
+        // publish may affect the next send; a completed writer reconciles
+        // every still-known group binding before it returns.
         self.register_group_topic(&topic, topic_id).await;
         self.initialize_topic_peers(topic_id).await;
 
@@ -2239,18 +2368,33 @@ impl PubSubManager {
 
     /// Unsubscribe from a topic, removing all subscriptions.
     pub async fn unsubscribe(&self, topic: &str) {
-        let _apply_guard = self.group_preference_apply_lock.lock().await;
-        self.topic_ref_counts.write().await.remove(topic);
+        let _name_guard = self
+            .group_preference_apply_locks
+            .name_shard(topic)
+            .lock()
+            .await;
         if is_local_topic(topic) {
+            self.topic_ref_counts.write().await.remove(topic);
             self.local_topics.write().await.remove(topic);
             return;
         }
         let stored_id = self
             .topic_id_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(topic)
+            .copied();
+        let topic_id = stored_id.unwrap_or_else(|| TopicId::from_entity(topic.as_bytes()));
+        let _topic_guard = self
+            .group_preference_apply_locks
+            .shard(topic_id)
+            .lock()
+            .await;
+        self.topic_ref_counts.write().await.remove(topic);
+        self.topic_id_by_name
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(topic);
-        let topic_id = stored_id.unwrap_or_else(|| TopicId::from_entity(topic.as_bytes()));
         self.subscribed_topic_ids
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2419,7 +2563,7 @@ impl PubSubManager {
         // still-connected peers keep their roles and cooling/score state.
         let membership = self.topic_membership(peers).await;
         if self.participation.forwards_passthrough() {
-            let _apply_guard = self.group_preference_apply_lock.lock().await;
+            let _topic_guard = self.group_preference_apply_locks.shard(topic).lock().await;
             // Full: #807 is Leaf-only. Keep the pre-#807 add-only seed so a
             // publish never prunes members or their IWANT/cooling state.
             self.plumtree
@@ -2615,7 +2759,11 @@ impl PubSubManager {
     /// ineligible: saorsa-gossip's health and cooling choices win, and x0x
     /// must never retry the preference destructively.
     async fn apply_topic_membership(&self, topic_id: TopicId, membership: TopicMembership) {
-        let _apply_guard = self.group_preference_apply_lock.lock().await;
+        let _topic_guard = self
+            .group_preference_apply_locks
+            .shard(topic_id)
+            .lock()
+            .await;
         if self.participation.forwards_passthrough() {
             // Full: #807 is Leaf-only. Pre-#807 Full replaced membership with
             // the untruncated plane and never forced a preferred eager peer.
@@ -5144,25 +5292,69 @@ mod tests {
         let name = format!("x0x/group/{group_id}/kv/{}", "bd".repeat(32));
         let topic = TopicId::from_entity(name.as_bytes());
         let identity = group_identity_for_test(&manager);
-        let member = AgentId([47; 32]);
-        authorize_group_peer_for_test(&identity.bindings, member, MachineId([9; 32])).await;
-        set_plane(&manager, vec![[1; 32], [2; 32], [8; 32], [9; 32]]);
+        let members: Vec<AgentId> = (9..=11).map(|n| AgentId([n + 38; 32])).collect();
+        for (member, machine) in members.iter().zip(9..=11) {
+            authorize_group_peer_for_test(&identity.bindings, *member, MachineId([machine; 32]))
+                .await;
+        }
+        set_plane(
+            &manager,
+            vec![[1; 32], [2; 32], [8; 32], [9; 32], [10; 32], [11; 32]],
+        );
         manager
-            .replace_group_rosters(vec![(group_id, String::new(), vec![member])])
+            .replace_group_rosters(vec![(group_id, String::new(), members)])
             .await;
         let _sub = manager.subscribe(name.clone()).await;
+        let before = manager.stage_stats().message_kinds;
         for _ in 0..2 {
             manager.refresh_topic_peers().await;
-            assert_eq!(role_for(&manager, topic, [8; 32]), "eager");
-            assert_eq!(role_for(&manager, topic, [9; 32]), "eager");
+            for id in 8..=11 {
+                assert_eq!(role_for(&manager, topic, [id; 32]), "eager");
+            }
             manager
                 .publish(name.clone(), Bytes::from_static(b"leaf-group-write"))
                 .await
                 .expect("group publish");
-            assert_eq!(role_for(&manager, topic, [8; 32]), "eager");
-            assert_eq!(role_for(&manager, topic, [9; 32]), "eager");
+            for id in 8..=11 {
+                assert_eq!(role_for(&manager, topic, [id; 32]), "eager");
+            }
+            let after = manager.stage_stats().message_kinds;
+            assert_eq!(
+                after.prune, before.prune,
+                "refresh/publish pruned eager peers"
+            );
+            assert_eq!(
+                after.graft, before.graft,
+                "refresh/publish regrafted eager peers"
+            );
         }
         let _frame = await_frame_to(&manager, [9; 32], MessageKind::Eager).await;
+
+        // Negative control: the former singular bootstrap wrapper collapses
+        // the four-peer preferred ceiling to two, then re-grafting the roster
+        // visibly churns the tree. The zero-delta assertions above would
+        // reject that order if restored to refresh or publish.
+        let connected = manager.transport.connected_peer_ids().await;
+        let before_old_order = manager.stage_stats().message_kinds;
+        manager
+            .plumtree
+            .set_topic_peers_with_preferred_eager(topic, connected, Some(PeerId::new([8; 32])))
+            .await;
+        let after_singular = manager.stage_stats().message_kinds;
+        assert!(after_singular.prune > before_old_order.prune);
+        manager
+            .plumtree
+            .set_topic_preferred_eager_set(
+                topic,
+                &[
+                    PeerId::new([8; 32]),
+                    PeerId::new([9; 32]),
+                    PeerId::new([10; 32]),
+                    PeerId::new([11; 32]),
+                ],
+            )
+            .await;
+        assert!(manager.stage_stats().message_kinds.graft > after_singular.graft);
     }
 
     #[tokio::test]
@@ -5223,7 +5415,11 @@ mod tests {
         manager
             .replace_group_rosters(vec![(group_id, String::new(), Vec::new())])
             .await;
-        let guard = manager.group_preference_apply_lock.lock().await;
+        let guard = manager
+            .group_preference_apply_locks
+            .name_shard(&name)
+            .lock()
+            .await;
         let mut pending = Box::pin(manager.subscribe(name.clone()));
         assert!(matches!(
             futures::poll!(pending.as_mut()),
@@ -5302,6 +5498,203 @@ mod tests {
             .expect("current receiver timeout")
             .expect("current receiver closed");
         assert_eq!(delivered.payload, Bytes::from_static(b"new-generation"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_topics_do_not_wait_for_a_busy_preference_shard() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let busy = TopicId::new([1; 32]);
+        let other = TopicId::new([2; 32]);
+        assert!(!std::ptr::eq(
+            manager.group_preference_apply_locks.shard(busy),
+            manager.group_preference_apply_locks.shard(other)
+        ));
+        let busy_guard = manager
+            .group_preference_apply_locks
+            .shard(busy)
+            .lock()
+            .await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.apply_topic_membership(
+                other,
+                TopicMembership {
+                    full: Vec::new(),
+                    preferred: None,
+                },
+            ),
+        )
+        .await
+        .expect("unrelated topic waited for busy shard");
+        let mut same_topic = Box::pin(manager.apply_topic_membership(
+            busy,
+            TopicMembership {
+                full: Vec::new(),
+                preferred: None,
+            },
+        ));
+        assert!(matches!(
+            futures::poll!(same_topic.as_mut()),
+            std::task::Poll::Pending
+        ));
+        drop(busy_guard);
+        same_topic.await;
+
+        let busy_name = "x0x/test/busy-name";
+        let other_name = (0..64)
+            .map(|n| format!("x0x/test/other-name-{n}"))
+            .find(|name| {
+                !std::ptr::eq(
+                    manager.group_preference_apply_locks.name_shard(busy_name),
+                    manager.group_preference_apply_locks.name_shard(name),
+                )
+            })
+            .expect("different name shard");
+        let busy_name_guard = manager
+            .group_preference_apply_locks
+            .name_shard(busy_name)
+            .lock()
+            .await;
+        let unrelated = tokio::time::timeout(Duration::from_secs(2), manager.subscribe(other_name))
+            .await
+            .expect("unrelated subscribe waited for busy name shard");
+        drop(busy_name_guard);
+        drop(unrelated);
+    }
+
+    #[tokio::test]
+    async fn metadata_topic_move_never_mix_old_classification_with_new_roster() {
+        let manager = Arc::new(
+            PubSubManager::new_with_participation(
+                test_node().await,
+                None,
+                None,
+                ParticipationMode::Full,
+                "metadata_move",
+            )
+            .expect("manager"),
+        );
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let name = "x0x/group/metadata-move".to_string();
+        let topic = TopicId::from_entity(name.as_bytes());
+        let identity = group_identity_for_test(&manager);
+        for n in 90..=92 {
+            authorize_group_peer_for_test(
+                &identity.bindings,
+                AgentId([n - 40; 32]),
+                MachineId([n; 32]),
+            )
+            .await;
+        }
+        set_plane(&manager, vec![[90; 32], [91; 32], [92; 32]]);
+        manager
+            .replace_group_rosters(vec![
+                ("A".into(), name.clone(), vec![AgentId([50; 32])]),
+                ("B".into(), "other".into(), vec![AgentId([52; 32])]),
+            ])
+            .await;
+        let _sub = manager.subscribe(name.clone()).await;
+        let connected = manager.transport.connected_peer_ids().await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new([90; 32])]
+        );
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.roster_after_swap_pause.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let replacing = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move {
+                manager
+                    .replace_group_rosters(vec![
+                        ("A".into(), "other-new".into(), vec![AgentId([51; 32])]),
+                        ("B".into(), name, vec![AgentId([52; 32])]),
+                    ])
+                    .await;
+            })
+        };
+        entered.wait().await;
+        manager.refresh_topic_peers().await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new([90; 32])],
+            "old topic classification must retain its old roster until reconciliation"
+        );
+        release.wait().await;
+        replacing.await.expect("roster replacement");
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new([92; 32])],
+            "completed replacement must bind the metadata topic to group B"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_only_registration_cannot_escape_roster_reconciliation() {
+        let manager = Arc::new(PubSubManager::new(test_node().await, None).expect("manager"));
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let name = "x0x/group/publish-only-metadata".to_string();
+        let topic = TopicId::from_entity(name.as_bytes());
+        let identity = group_identity_for_test(&manager);
+        for (agent, machine) in [(50, 90), (52, 92)] {
+            authorize_group_peer_for_test(
+                &identity.bindings,
+                AgentId([agent; 32]),
+                MachineId([machine; 32]),
+            )
+            .await;
+        }
+        set_plane(&manager, vec![[90; 32], [92; 32]]);
+        manager
+            .replace_group_rosters(vec![
+                ("A".into(), name.clone(), vec![AgentId([50; 32])]),
+                ("B".into(), "other".into(), vec![AgentId([52; 32])]),
+            ])
+            .await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.register_after_roster_read_pause.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
+        let registering = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move { manager.register_group_topic(&name, topic).await })
+        };
+        entered.wait().await;
+        assert!(
+            manager.group_rosters.try_write().is_err(),
+            "registrar must retain its old roster read guard until binding publication"
+        );
+        let replacing = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move {
+                manager
+                    .replace_group_rosters(vec![
+                        ("A".into(), "other-new".into(), vec![AgentId([50; 32])]),
+                        ("B".into(), name, vec![AgentId([52; 32])]),
+                    ])
+                    .await;
+            })
+        };
+        *manager.register_after_roster_read_pause.lock().unwrap() = None;
+        release.wait().await;
+        registering.await.expect("registration");
+        replacing.await.expect("roster replacement");
+        let connected = manager.transport.connected_peer_ids().await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new([92; 32])],
+            "writer must reclassify a publish-only binding inserted just before swap"
+        );
     }
 
     /// WHY (#774 + C5b): a preferred Full/bootstrap peer that connects AFTER
