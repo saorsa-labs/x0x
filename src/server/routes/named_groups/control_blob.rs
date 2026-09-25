@@ -59,6 +59,12 @@ pub(in crate::server) enum ControlBlobMessage {
         sequence: u32,
         data_b64: String,
     },
+    /// #876: the recipient completed its pull — the source may release the
+    /// staged copy now instead of holding it to the TTL. Mixed fleet: an
+    /// older source does not know this type and keeps TTL semantics; an
+    /// older recipient never sends it.
+    #[serde(rename = "control_blob_release")]
+    Release { reference: ControlBlobRef },
 }
 
 struct StagedBlob {
@@ -138,7 +144,11 @@ impl ControlBlobState {
         f(&mut guard)
     }
 
-    fn stage(&self, reference: ControlBlobRef, bytes: Vec<u8>) -> Result<(), &'static str> {
+    pub(super) fn stage(
+        &self,
+        reference: ControlBlobRef,
+        bytes: Vec<u8>,
+    ) -> Result<(), &'static str> {
         if bytes.len() as u64 != reference.byte_len
             || reference.byte_len <= x0x::dm::MAX_PAYLOAD_BYTES as u64
             || reference.byte_len > MAX_BLOB_BYTES
@@ -321,6 +331,29 @@ impl ControlBlobState {
         });
     }
 
+    /// #876: the blob's own RECIPIENT completed its pull — remove the
+    /// staged entry (and free its entry/byte budget) now instead of
+    /// holding it to `PENDING_JOIN_RESULT_TTL`. The caller has already
+    /// validated the sender IS the reference's recipient, so the remove
+    /// is keyed by the exact reference alone.
+    pub(super) fn release_staged(&self, reference: &ControlBlobRef) {
+        self.with_registry(|registry| {
+            if registry.staged.remove(reference).is_some() {
+                tracing::debug!(
+                    kind = ?reference.kind,
+                    byte_len = reference.byte_len,
+                    "staged control blob released by its recipient (#876)"
+                );
+            }
+        });
+    }
+
+    /// #878 r3 (review 4a): test inspection — entries still staged.
+    #[cfg(test)]
+    pub(super) fn staged_len(&self) -> usize {
+        self.with_registry(|registry| registry.staged.len())
+    }
+
     pub(super) fn cancel_attempt(&self, group_id: &str, recipient: &str, attempt_id: &str) {
         // Removes ROUTING only. The cancelled task's lease keeps its
         // declared bytes accounted until the task itself ends, so a
@@ -386,6 +419,10 @@ fn control_config(message: &ControlBlobMessage) -> x0x::dm::DmSendConfig {
                 ..direct_message_send_config()
             }
         }
+        ControlBlobMessage::Release { .. } => x0x::dm::DmSendConfig {
+            prefer_raw_quic_if_connected: false,
+            ..direct_message_send_config()
+        },
     }
 }
 
@@ -407,12 +444,14 @@ async fn send_message(
 
 /// Stage the exact original JSON and send only its bounded reference.
 ///
-/// Bounded retention, stated honestly: a blob that stages successfully but
-/// whose reference — or any later chunk — send fails stays staged and
-/// servable until `PENDING_JOIN_RESULT_TTL` (or group teardown / re-stage
-/// refresh); a failed send does NOT release it early. The bounds above
-/// (entry cap, global and per-recipient byte budgets, per-blob maximum)
-/// keep that retention finite.
+/// Retention, stated honestly: a successfully staged blob is released by
+/// its recipient's `control_blob_release` notice once the pull completes
+/// and verifies (#876), or — for peers that do not send the notice, or
+/// when the notice is lost — by `PENDING_JOIN_RESULT_TTL` / group
+/// teardown / re-stage refresh, whichever comes first. A staging-budget
+/// refusal is retried briefly before this returns an error (the caller
+/// still logs on final failure). The bounds above (entry cap, global and
+/// per-recipient byte budgets, per-blob maximum) keep retention finite.
 pub(super) async fn send_reference(
     store: &ControlBlobState,
     agent: &Agent,
@@ -432,9 +471,28 @@ pub(super) async fn send_reference(
         byte_len: bytes.len() as u64,
         join_attempt_id: join_attempt_id.map(str::to_string),
     };
-    store
-        .stage(reference.clone(), bytes)
-        .map_err(str::to_string)?;
+    // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
+    // recipients release their completed pulls — retry it briefly before
+    // giving up, instead of dropping the event on the floor. Any other
+    // refusal (invalid blob, digest conflict) returns immediately.
+    const BUDGET_RETRIES: usize = 6;
+    const BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
+    for attempt in 0..=BUDGET_RETRIES {
+        match store.stage(reference.clone(), bytes.clone()) {
+            Ok(()) => break,
+            Err("control blob staging budget exhausted") if attempt < BUDGET_RETRIES => {
+                tracing::warn!(
+                    kind = ?reference.kind,
+                    group_id = %reference.group_id,
+                    recipient = %LogHexId::agent(&reference.recipient),
+                    attempt,
+                    "control blob staging budget exhausted; retrying (#876)"
+                );
+                tokio::time::sleep(BUDGET_RETRY_DELAY).await;
+            }
+            Err(other) => return Err(other.to_string()),
+        }
+    }
     send_message(
         agent,
         recipient,
@@ -616,6 +674,16 @@ pub(in crate::server) async fn handle_control_blob_message(
                 .control_blobs
                 .deliver_chunk(&reference, sequence, chunk);
         }
+        ControlBlobMessage::Release { reference } => {
+            // #876: only the staged blob's own RECIPIENT may release it —
+            // the fetch header check enforces sender == reference.recipient
+            // and local == reference.source, and the exact reference
+            // (digest + length) keys the removal.
+            if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
+                return;
+            }
+            state.control_blobs.release_staged(&reference);
+        }
     }
 }
 
@@ -678,6 +746,27 @@ async fn fetch_and_apply(
     if !exact_blob_matches_ref(reference, &bytes) {
         return Err("control blob length or digest mismatch");
     }
+    // #876: the pull is complete and digest-verified — tell the source it
+    // can free the staged copy now instead of holding it to the TTL (the
+    // per-peer staging cap then bounds IN-FLIGHT blobs, not TTL-held
+    // ones). Best-effort: an older source ignores the unknown message
+    // type and keeps TTL semantics; a failure here never fails the fetch.
+    // #876 r2 (review minor): best-effort on a TASK — a slow transport
+    // must never delay the fetched payload's dispatch to its handler.
+    let release_state = Arc::clone(state);
+    let release_source = source;
+    let release_reference = reference.clone();
+    tokio::spawn(async move {
+        let release = ControlBlobMessage::Release {
+            reference: release_reference,
+        };
+        if let Err(reason) = send_message(&release_state.agent, &release_source, &release).await {
+            tracing::debug!(
+                reason,
+                "control blob release notice failed (TTL still applies)"
+            );
+        }
+    });
     if !reference_admitted(state, reference).await {
         return Err("control blob binding no longer current");
     }
@@ -749,6 +838,26 @@ fn witness_line(kind: &str, reference: &ControlBlobRef) -> String {
 /// keys or invites: the digest was already verified against the bytes.
 fn log_validated_for_handler(kind: &'static str, reference: &ControlBlobRef) {
     tracing::info!("{}", witness_line(kind, reference));
+}
+
+/// #878 r3: build a fully-valid reference (digest/length bound) for a
+/// would-be transfer, for tests that stage it directly.
+#[cfg(test)]
+pub(in crate::server) fn test_reference(
+    bytes: &[u8],
+    group_id: &str,
+    source_hex: &str,
+    recipient_hex: &str,
+) -> ControlBlobRef {
+    ControlBlobRef {
+        kind: ControlBlobKind::NamedGroupEvent,
+        group_id: group_id.to_string(),
+        source: source_hex.to_string(),
+        recipient: recipient_hex.to_string(),
+        digest: hex::encode(blake3::hash(bytes).as_bytes()),
+        byte_len: bytes.len() as u64,
+        join_attempt_id: None,
+    }
 }
 
 /// Drives the actual stage/chunk/frame/incoming/digest functions without a
@@ -863,6 +972,92 @@ mod tests {
         }
     }
 
+    /// #876 (issue item 1): the per-peer staging cap bounds IN-FLIGHT
+    /// blobs, not TTL-held ones. A completed pull RELEASES its staged copy
+    /// on the source, so a later blob for the same recipient stages. On
+    /// the pre-fix head the fifth blob is refused with "staging budget
+    /// exhausted" (the fail-before: `release_staged` is a no-op there).
+    #[test]
+    fn release_on_completed_fetch_frees_the_per_peer_staging_budget() {
+        let store = ControlBlobState::default();
+        let mut staged = Vec::new();
+        for i in 0..PER_PEER_ENTRY_CAP {
+            // Distinct payloads => distinct digests => distinct references.
+            let bytes = vec![i as u8; x0x::dm::MAX_PAYLOAD_BYTES + 64 + i];
+            let reference = reference(&bytes);
+            store
+                .stage(reference.clone(), bytes)
+                .expect("within the per-peer cap");
+            staged.push(reference);
+        }
+        // The cap is real: one more blob for the same recipient is refused.
+        let extra = vec![0xEE; x0x::dm::MAX_PAYLOAD_BYTES + 128];
+        let extra_reference = reference(&extra);
+        assert_eq!(
+            store.stage(extra_reference.clone(), extra.clone()),
+            Err("control blob staging budget exhausted"),
+            "the per-peer cap still bounds in-flight blobs"
+        );
+        // The recipient completed its pull of the FIRST blob: released.
+        store.release_staged(&staged[0]);
+        // The next blob for the SAME recipient stages in the freed slot.
+        store
+            .stage(extra_reference, extra)
+            .expect("#876: a released slot is reusable by the same recipient");
+    }
+
+    /// #876 r2 (review item 4a, WIRE-LEVEL): three sequential joins, each
+    /// staging two oversized events for the SAME recipient; every
+    /// completed pull sends its Release THROUGH the source's message
+    /// handler (serde round-trip included), freeing the slot for the next
+    /// join. With the release path disabled (the fail-before) the third
+    /// join's first stage — the FIFTH blob for this recipient — is
+    /// refused with "staging budget exhausted" and the event is dropped:
+    /// the R15 failure.
+    #[tokio::test]
+    async fn three_sequential_joins_release_slots_through_the_handler() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = super::super::super::home::tests::owned_state(dir.path(), [0x73; 32]).await?;
+        super::super::super::home::provision_home(&state).await;
+        let owner = state.agent.identity().user_keypair().expect("owned Home");
+        let (_, info) = super::super::super::home::find_home(&state, &owner.user_id())
+            .await
+            .expect("Home group");
+        let group_id = info.stable_group_id().to_string();
+        let recipient = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let source_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        for join in 0..3u32 {
+            for event_index in 0..2u32 {
+                let bytes = vec![
+                    u8::try_from(join * 2 + event_index).unwrap_or(0x7A);
+                    x0x::dm::MAX_PAYLOAD_BYTES + 64
+                ];
+                let reference = ControlBlobRef {
+                    kind: ControlBlobKind::NamedGroupEvent,
+                    group_id: group_id.clone(),
+                    source: source_hex.clone(),
+                    recipient: hex::encode(recipient.as_bytes()),
+                    digest: hex::encode(blake3::hash(&bytes).as_bytes()),
+                    byte_len: bytes.len() as u64,
+                    join_attempt_id: None,
+                };
+                state
+                    .control_blobs
+                    .stage(reference.clone(), bytes)
+                    .unwrap_or_else(|e| panic!("join {join} event {event_index} must stage: {e}"));
+                // The completed pull: the recipient's Release goes over
+                // the wire (serialized + reparsed) and through the
+                // SOURCE's production handler.
+                let wire = serde_json::to_vec(&ControlBlobMessage::Release {
+                    reference: reference.clone(),
+                })?;
+                let message: ControlBlobMessage = serde_json::from_slice(&wire)?;
+                handle_control_blob_message(&state, &recipient, true, message).await;
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn control_ref_rejects_wrong_identity_kind_digest_length_and_expiry() {
         let bytes = vec![0x5a; x0x::dm::MAX_PAYLOAD_BYTES + 1];
