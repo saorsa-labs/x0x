@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -36,6 +38,19 @@ class LegacyHarnessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls): cls.m = load()
 
+    def observer_timeout_receipt(self, status, body):
+        observer = FakeApi()
+        observer.request = mock.Mock(return_value=(status, body))
+        evidence = self.m.Evidence()
+        scenario = self.m.LegacyScenario({"observer": observer}, evidence, 1)
+        ticks = iter((0.0, 0.0, 2.0, 2.0))
+        with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: next(ticks)), \
+             mock.patch.object(self.m.time, "sleep"):
+            with self.assertRaises(AssertionError):
+                scenario.await_observer_snapshot("observer", "store", "wiki")
+        self.assertEqual(1, len(evidence.polls))
+        return evidence.polls[0]
+
     def test_legacy_source_uses_exact_historical_topic_and_real_store_routes(self):
         api = FakeApi(); evidence = self.m.Evidence()
         scenario = self.m.LegacyScenario({"writer": api}, evidence, 1)
@@ -58,24 +73,73 @@ class LegacyHarnessTests(unittest.TestCase):
 
     def test_observer_and_refusal_oracles_use_positive_barriers(self):
         writer, observer = FakeApi(), FakeApi()
-        scenario = self.m.LegacyScenario({"writer": writer, "observer": observer}, self.m.Evidence(), 20)
+        evidence = self.m.Evidence()
+        scenario = self.m.LegacyScenario({"writer": writer, "observer": observer}, evidence, 20)
         scenario.put = mock.Mock(return_value=200)
+        observer.request = mock.Mock(side_effect=[
+            (200, {"value": base64.b64encode(b"legacy-web").decode()}),
+        ])
         scenario.read = mock.Mock(side_effect=[
-            (200, "legacy-web"), (404, None),
+            (404, None),
             (200, "barrier"), (404, None), (404, None),
         ])
         scenario.await_observer_snapshot("observer", "store", "web")
+        self.assertEqual("accepted", evidence.polls[0]["outcome"])
+        self.assertEqual("value_present", evidence.polls[0]["response_class"])
+        self.assertTrue(evidence.polls[0]["value_matches_expected"])
         ticks = iter(range(100))
         with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: float(next(ticks))), \
              mock.patch.object(self.m.time, "sleep"):
             scenario.barrier_absence("observer", "writer", "store", "forbidden")
         scenario.put.assert_called_once()
         calls = scenario.read.call_args_list
-        self.assertEqual("legacy-imported", calls[0].args[2])
-        self.assertEqual("legacy-removed", calls[1].args[2])
-        self.assertTrue(calls[2].args[2].startswith("barrier-"))
+        self.assertEqual("legacy-removed", calls[0].args[2])
+        self.assertTrue(calls[1].args[2].startswith("barrier-"))
+        self.assertEqual("forbidden", calls[2].args[2])
         self.assertEqual("forbidden", calls[3].args[2])
-        self.assertEqual("forbidden", calls[4].args[2])
+
+    def test_observer_timeout_records_bounded_http_class_without_body(self):
+        receipt = self.observer_timeout_receipt(404, {"error": "store not found", "secret": "do-not-record"})
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual(404, receipt["last_status"])
+        self.assertEqual("store_not_found", receipt["response_class"])
+        self.assertFalse(receipt["value_matches_expected"])
+        self.assertNotIn("do-not-record", json.dumps(receipt))
+
+    def test_observer_timeout_distinguishes_group_absence_spelling(self):
+        for error in ("group not found", "group_not_found"):
+            with self.subTest(error=error):
+                receipt = self.observer_timeout_receipt(404, {"error": error})
+                self.assertEqual(404, receipt["last_status"])
+                self.assertEqual("group_not_found", receipt["response_class"])
+                self.assertFalse(receipt["value_matches_expected"])
+
+    def test_observer_unknown_error_body_remains_redacted(self):
+        secret = "token=private-invite-and-value"
+        receipt = self.observer_timeout_receipt(404, {"error": secret, "value": secret, "invite": secret})
+        self.assertEqual(404, receipt["last_status"])
+        self.assertEqual("http_error", receipt["response_class"])
+        self.assertNotIn(secret, json.dumps(receipt))
+        self.assertEqual("authentication_denied", self.m.observer_response_class((401, {"error": secret})))
+        self.assertEqual("permission_denied", self.m.observer_response_class((403, {"error": secret})))
+        self.assertEqual("key_not_found", self.m.observer_response_class((404, {"error": "key_not_found"})))
+
+    def test_observer_wrong_value_cannot_satisfy_poll_or_leak_value(self):
+        observer = FakeApi()
+        secret = "unexpected-private-value"
+        observer.request = mock.Mock(return_value=(200, {"value": base64.b64encode(secret.encode()).decode()}))
+        evidence = self.m.Evidence()
+        scenario = self.m.LegacyScenario({"observer": observer}, evidence, 1)
+        ticks = iter((0.0, 0.0, 2.0, 2.0))
+        with mock.patch.object(self.m.time, "monotonic", side_effect=lambda: next(ticks)), \
+             mock.patch.object(self.m.time, "sleep"):
+            with self.assertRaises(AssertionError):
+                scenario.await_observer_snapshot("observer", "store", "wiki")
+        receipt = evidence.polls[0]
+        self.assertEqual("value_present", receipt["response_class"])
+        self.assertFalse(receipt["value_matches_expected"])
+        self.assertNotIn(secret, json.dumps(receipt))
+        self.assertNotIn(base64.b64encode(secret.encode()).decode(), json.dumps(receipt))
 
     def test_conflict_and_full_receipt_binding_are_mandatory(self):
         scenario = self.m.LegacyScenario({}, self.m.Evidence(), 1)
@@ -244,8 +308,10 @@ class LegacyHarnessTests(unittest.TestCase):
             scenario.run(*nodes, stop_owner, restart_writer)
         refused = [x for x in scenario.e.assertions if x["label"] == "revoked import mutation refused"]
         self.assertEqual([removal_status], [x["status"] for x in refused])
-        self.assertEqual(1, len(scenario.e.polls))
-        self.assertEqual("accepted", scenario.e.polls[0]["outcome"])
+        self.assertEqual(["revoked_import_refusal", "legacy_observer_imported_value",
+                          "legacy_observer_imported_value"],
+                         [receipt["operation"] for receipt in scenario.e.polls])
+        self.assertTrue(all(receipt["outcome"] == "accepted" for receipt in scenario.e.polls))
         self.assertIn("owner", backend.stopped)
         self.assertIn("observer", backend.stopped)
 
