@@ -371,6 +371,43 @@ async fn blocked_grantee_gets_nothing() {
         .is_err());
 }
 
+/// WHY (omp #924 finding 1): a `Blocked` that lands WHILE the grant is being
+/// evaluated still wins. The evaluation is parked on the discovery-cache
+/// read (a `User` grant looks up the requester's certificate) after the
+/// first contact read saw `Unknown`; the block is written in that window.
+/// Without the final contact re-read the grant (Dm) would be returned.
+#[tokio::test(flavor = "current_thread")]
+async fn block_landing_mid_evaluation_denies_the_grant() {
+    let w = Arc::new(World::new().await);
+    let now = real_now();
+    let trust = w
+        .daemon(w.a1, &[w.grant(dm_connect22(), now - 60, now + 3_600)])
+        .await;
+    assert!(w.access(&trust, &w.b1, &w.mb).await.dm, "control");
+
+    let cache_guard = w.cache.write().await;
+    let task = {
+        let w = Arc::clone(&w);
+        let trust = trust.clone();
+        tokio::spawn(async move { w.access(&trust, &w.b1, &w.mb).await })
+    };
+    // Single-threaded runtime: let the task run until it parks on the
+    // cache read (after its first contact read).
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    w.contacts
+        .write()
+        .await
+        .set_trust(&w.b1, TrustLevel::Blocked);
+    drop(cache_guard);
+    let access = task.await.unwrap();
+    assert!(
+        access.is_empty(),
+        "a block applied during evaluation must deny: {access:?}"
+    );
+}
+
 /// WHY: a grant never opens anything without an explicit rule. With no
 /// `principal = "grant"` entry, or with connect disabled entirely (where the
 /// identity gate would otherwise be the only boundary), a grant-only peer is

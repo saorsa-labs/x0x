@@ -135,13 +135,16 @@ impl OwnerTrust {
                 machine_id,
             })
         };
-        if matches!(
-            base,
-            TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch
-        ) {
+        let rejected = |decision: TrustDecision| {
+            matches!(
+                decision,
+                TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch
+            )
+        };
+        if rejected(base) {
             return crate::share_grant::GrantAccess::default();
         }
-        crate::share_grant::evaluate_grant_access(
+        let access = crate::share_grant::evaluate_grant_access(
             &store,
             &self.bindings,
             discovery_cache,
@@ -150,7 +153,20 @@ impl OwnerTrust {
             machine_id,
             unix_now_secs(),
         )
-        .await
+        .await;
+        // Final contact read, as in `evaluate_pair`: a `Blocked` or re-pin
+        // that landed while the grant was being evaluated still wins.
+        let last = {
+            let contacts = contact_store.read().await;
+            TrustEvaluator::new(&contacts).evaluate(&TrustContext {
+                agent_id,
+                machine_id,
+            })
+        };
+        if rejected(last) {
+            return crate::share_grant::GrantAccess::default();
+        }
+        access
     }
 
     /// The local owner, if this install has one.

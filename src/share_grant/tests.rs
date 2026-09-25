@@ -348,4 +348,102 @@ async fn grant_signed_by_grantee_over_owner_agent_is_not_issued_here() {
     );
 }
 
+/// WHY (omp #924 finding 2): `X0SG || valid body || garbage` is corruption.
+/// It must fail closed into `load_error` — no grant honoured, no write that
+/// would erase the evidence — exactly like any other unreadable file.
+#[tokio::test]
+async fn store_with_trailing_garbage_fails_closed_and_is_left_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SHARE_GRANT_STORE_FILE);
+    let owner = UserKeypair::generate().unwrap();
+    let grant = grant_by(&owner, Grantee::Agent(agent(7)), vec![agent(1)]);
+    let store = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
+    store.accept(grant.clone(), NOW).await.unwrap();
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"trailing-garbage");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let reloaded = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
+    assert!(
+        reloaded.load_error().is_some(),
+        "trailing bytes are corruption"
+    );
+    assert!(reloaded.grants(GrantRole::Issued).is_empty());
+    assert!(reloaded.candidates_for_local_agent(NOW).is_empty());
+    assert!(matches!(
+        reloaded.accept(grant, NOW).await,
+        Err(ShareGrantError::Store(_))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "file left untouched");
+}
+
+/// WHY (omp #924 finding 3): the store's write releases a v2 ACK meaning
+/// "stored", so it must go through the fsyncing durable writer, not the
+/// rename-only one. Source guard: fails if the store is switched back.
+#[test]
+fn grant_store_persists_through_the_durable_writer() {
+    let src = include_str!("../share_grant.rs");
+    let persist = src
+        .split("async fn persist(&self)")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("persist() present");
+    assert!(persist.contains("write_private_bytes_durable("));
+    assert!(!persist.contains("save_private_bytes_to("));
+}
+
+/// WHY (omp #924 note 5a): a failed clock read maps to 0; a grant whose
+/// window contains 0 must not come back to life — evaluation fails closed.
+#[tokio::test]
+async fn zero_clock_yields_no_access() {
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::in_memory(agent(1), Some(owner.user_id()));
+    let grant = ShareGrant::sign(
+        &owner,
+        [9; 32],
+        Grantee::Agent(agent(7)),
+        vec![agent(1)],
+        vec![ShareCap::Dm],
+        0,
+        10,
+    )
+    .unwrap();
+    store.accept(grant, 5).await.unwrap();
+    let bindings = AuthenticatedMachineBindings::default();
+    let machine = crate::identity::MachineId([7; 32]);
+    crate::dm_inbox::record_authenticated_machine_binding(&bindings, agent(7), machine, 5).await;
+    let cache = RwLock::new(HashMap::new());
+    let revocations = RwLock::new(RevocationSet::new());
+    let requester = agent(7);
+    assert!(
+        evaluate_grant_access(
+            &store,
+            &bindings,
+            &cache,
+            &revocations,
+            &requester,
+            &machine,
+            5
+        )
+        .await
+        .dm,
+        "control: live inside its window"
+    );
+    assert!(
+        evaluate_grant_access(
+            &store,
+            &bindings,
+            &cache,
+            &revocations,
+            &requester,
+            &machine,
+            0
+        )
+        .await
+        .is_empty(),
+        "clock failure fails closed"
+    );
+}
+
 mod enforcement;

@@ -26,7 +26,7 @@
 //! # Storage
 //!
 //! [`ShareGrantStore`] keeps two roles in one file (`share-grants.bin`,
-//! written atomically with mode 0600): **issued** grants (signed by this
+//! written durably — temp, fsync, rename, dir fsync — with mode 0600): **issued** grants (signed by this
 //! install's owner — the set enforcement reads) and **received** grants
 //! (this install is the grantee; informational).
 //!
@@ -388,7 +388,7 @@ impl ShareGrant {
         if body.len() > MAX_SHARE_GRANT_BYTES {
             return Err(ShareGrantError::Malformed("oversized".into()));
         }
-        let grant: Self = bincode::deserialize(body)
+        let grant: Self = strict_decode(body, MAX_SHARE_GRANT_BYTES as u64)
             .map_err(|e| ShareGrantError::Malformed(format!("decode: {e}")))?;
         let canonical = bincode::serialize(&grant)
             .map_err(|e| ShareGrantError::Malformed(format!("re-encode: {e}")))?;
@@ -512,7 +512,10 @@ impl ShareGrantStore {
         };
         let file = if bytes.len() >= STORE_MAGIC.len() && &bytes[..STORE_MAGIC.len()] == STORE_MAGIC
         {
-            bincode::deserialize::<StoreFile>(&bytes[STORE_MAGIC.len()..])
+            // Strict: trailing bytes after a valid body are corruption, not
+            // slack — they fail closed into `load_error` like any other.
+            let body = &bytes[STORE_MAGIC.len()..];
+            strict_decode::<StoreFile>(body, body.len() as u64)
                 .map_err(|e| format!("decode {}: {e}", path.display()))
         } else {
             Err(format!("{} missing X0SG magic", path.display()))
@@ -685,10 +688,28 @@ impl ShareGrantStore {
         let mut bytes = Vec::with_capacity(STORE_MAGIC.len() + body.len());
         bytes.extend_from_slice(STORE_MAGIC);
         bytes.extend_from_slice(&body);
-        crate::storage::save_private_bytes_to(path, bytes)
+        // Durable (temp + fsync + rename + dir fsync): the completion that
+        // follows releases a v2 ACK meaning "stored", which must survive
+        // power loss.
+        crate::storage::write_private_bytes_durable(path, bytes)
             .await
             .map_err(|e| format!("write {}: {e}", path.display()))
     }
+}
+
+/// Bincode decode matching `bincode::serialize`'s encoding (fixint, little
+/// endian) but STRICT: trailing bytes are an error and reads are bounded by
+/// `limit` (which also bounds preallocation).
+fn strict_decode<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    limit: u64,
+) -> Result<T, Box<bincode::ErrorKind>> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(limit)
+        .reject_trailing_bytes()
+        .deserialize(bytes)
 }
 
 fn unix_now_secs() -> u64 {
@@ -768,6 +789,11 @@ pub async fn evaluate_grant_access(
     now_unix: u64,
 ) -> GrantAccess {
     let mut access = GrantAccess::default();
+    // A failed clock read maps to 0; never evaluate validity windows
+    // against it (it could reactivate a long-expired grant). Fail closed.
+    if now_unix == 0 {
+        return access;
+    }
     let candidates = store.candidates_for_local_agent(now_unix);
     if candidates.is_empty() {
         return access;
