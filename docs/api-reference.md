@@ -2176,6 +2176,19 @@ Server → client (complete outbound frame set):
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
 
+**Live `message` delivery is best-effort.** After a subscriber restart,
+subscribe-time anti-entropy can re-serve messages from the sender's roughly
+60-second cache, so applications should expect duplicate frames. Under
+backpressure, `feed_droppable` may also drop topic frames from the bounded
+outbound queue (`ws_outbound_dropped`). The event has no stable top-level
+transport `msg_id` and promises neither exactly-once delivery nor a complete
+feed; do not assume at-least-once delivery. Applications needing exactly-once
+effects must carry their own unique application ID to suppress duplicates and
+use a separate reconciliation path for missed messages. A decoded signed-group
+payload may provide a canonical application message ID for that format.
+`HistoryRecord.msg_id` identifies a local history-store record and is a
+separate identity; it is not the missing transport ID for this event.
+
 **Fork-quarantine annotation (ADR-0066 §3d).** When a group is
 fork-quarantined on this node, its group-scoped frames are **labelled, never
 refused and never dropped** — the WS plane is the live mirror of the
