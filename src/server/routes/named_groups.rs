@@ -14850,6 +14850,7 @@ pub(in crate::server) struct GetMessagesQuery {
 /// in that thread (root included when present). ADR-0029.
 pub(in crate::server) async fn get_group_public_messages(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     Query(query): Query<GetMessagesQuery>,
 ) -> impl IntoResponse {
@@ -14990,9 +14991,14 @@ pub(in crate::server) async fn get_group_public_messages(
     // resolves BOTH spellings (map key or stable id — review r1), so this
     // annotates whether the URL named the alias this daemon keys the group
     // under or the stable id the rows carry.
-    let markers = crate::server::routes::history::markers_for_scopes(
+    let markers = crate::server::routes::history::visible_markers(
         &state,
-        std::iter::once(&x0x::history::Scope::Group(stable_id.clone())),
+        &actor,
+        crate::server::routes::history::markers_for_scopes(
+            &state,
+            std::iter::once(&x0x::history::Scope::Group(stable_id.clone())),
+        )
+        .await,
     )
     .await;
     (

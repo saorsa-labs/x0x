@@ -1460,6 +1460,11 @@ delegation JSON (arrays-of-bytes fields; no outer wrapper).
 durable history (survives restarts; fail-closed on incomplete history scans).
 Each row: `delegation_digest`, `from_agent`, `to_agent`, `scope`, `verbs`,
 `issued_at_ms`, `expiry_ms`, `depth`, `task_ref`.
+The durable operator token retains its read. A session bearer needs **active
+local membership** in the named group, even when its read policy is public;
+a known group with no active local seat returns 403 with
+`reason: "group_membership_required"` before any delegation fields are read
+or returned. An unknown group returns 404. Rider tokens receive 403.
 
 Verified behaviour (this campaign): delegate → B sends citing the digest →
 message accepted and attributed (author = B); the same send with a forged
@@ -2012,6 +2017,16 @@ two: **reads always serve, the purge always refuses.**
 `GET /history/stats`, `GET /diagnostics/history` and
 `GET /groups/:id/messages` return the same rows they always did and add two
 envelope fields:
+
+A session bearer outside an active local group seat still receives retained
+history content under the existing history authorization rules, but the
+group's `fork_quarantined` / `fork_quarantine` envelope annotation and
+`fork_quarantined_at_ingest` row label are omitted. This also applies to
+cross-scope and node-wide history responses: only markers for groups in which
+the session's local agent is active appear. Durable operator and rider views
+retain their existing annotation behavior. `GET /groups/:id/messages` likewise
+keeps serving signed public messages under its read policy while omitting the
+quarantine envelope annotation for a session without an active local seat.
 
 ```json
 {

@@ -1094,6 +1094,9 @@ fn rand_delegation_id() -> [u8; 16] {
 /// CURRENT roster: revoked members' authority auto-expires (ADR-0040).
 pub(in crate::server) async fn list_group_delegations(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -1107,6 +1110,22 @@ pub(in crate::server) async fn list_group_delegations(
         };
         if info.withdrawn {
             return not_found("group is withdrawn");
+        }
+        // #870: a browser session may see delegation authority only while
+        // this daemon's own agent has an active seat. Apply this before the
+        // durable history scan or any response field is assembled.
+        if !actor.is_durable_owner() {
+            if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
+                return forbidden("rider tokens cannot read group delegations");
+            }
+            if !info.has_active_member(&local_hex) {
+                return crate::server::api_error_with_reason(
+                    StatusCode::FORBIDDEN,
+                    "active local group membership required",
+                    "group_membership_required",
+                )
+                .into_response();
+            }
         }
         let is_member = info.has_active_member(&local_hex);
         let read_open = info.policy.read_access == x0x::groups::GroupReadAccess::Public;
