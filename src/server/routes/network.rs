@@ -587,6 +587,9 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "subscribed_topics": egress["subscribed_topics"],
                 "outbound_by_topic_named": egress["outbound_by_topic_named"],
                 "egress_budget": egress["egress_budget"],
+                // SG76 key-cache runtime witness (see PubSubManager::
+                // egress_diagnostics); additive, diagnostics-only.
+                "key_cache": egress["key_cache"],
                 "outer_signature_policy": state.agent.gossip_outer_signature_policy(),
                 "legacy_grants_enabled": false,
                 "outer_v1_receipts": state.agent.gossip_outer_v1_receipts(),
@@ -676,6 +679,39 @@ mod participation_diagnostics_tests {
             assert_eq!(body["egress_budget"]["leaf_max_eager_degree"], 2);
             assert_eq!(body["egress_budget"]["byte_policy"], "observe_only");
             assert_eq!(body["egress_budget"]["applies_to_leaf"], !relay);
+            // SG76 key-cache witness: the additive object must be present at
+            // the real route with the producer snapshot's counter types
+            // (cumulative u64s; usize high-water fields serialize as u64).
+            // Presence/type only — values are runtime evidence, asserted on
+            // isolated Linux runs, not here.
+            let key_cache = &body["key_cache"];
+            assert!(key_cache.is_object(), "key_cache object present");
+            for field in [
+                "full_out_frames",
+                "full_out_bytes",
+                "ref_out_frames",
+                "ref_out_bytes",
+                "full_in_frames",
+                "full_in_bytes",
+                "ref_in_frames",
+                "ref_in_bytes",
+                "cache_hits",
+                "cache_misses",
+                "cache_evictions",
+                "requests",
+                "responses",
+                "pending_frames_high_water",
+                "pending_bytes_high_water",
+                "pending_timeouts",
+                "pending_peer_limit_drops",
+                "pending_global_limit_drops",
+                "malformed_controls",
+                "hash_mismatches",
+                "replay_success",
+                "replay_failure",
+            ] {
+                assert!(key_cache[field].is_u64(), "key_cache.{field} is u64");
+            }
             // #288 soak: cumulative counters are integrals, so the same
             // response must carry the daemon clock, the inner-envelope verify
             // cost (verify/s replaces co-tenant %CPU, #656) and the sub-second
