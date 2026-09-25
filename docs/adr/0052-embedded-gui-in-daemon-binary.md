@@ -11,12 +11,12 @@
 ## Context
 
 The web GUI ships inside the daemon binary with no deciding ADR. The
-single-file asset (`src/gui/x0x-gui.html`, 289,762 bytes at HEAD — the
+single-file asset (`src/gui/x0x-gui.html`, 323,241 bytes on main 2026-09-25 — the
 2026-08-23 audit's "276 KB" figure is stale) is embedded with
-`include_str!` (`GUI_HTML`, `src/server/ws.rs:997`) and served by
+`include_str!` (`GUI_HTML`, `src/server/ws.rs:1313`) and served by
 `serve_gui()` at `GET /gui` and `/gui/` under the standard bearer-token
-middleware (`src/server/mod.rs:1847-1869`), with a token-injection marker
-replaced before serving (`src/server/ws.rs:1004-1006`).
+middleware (`src/server/mod.rs:2105-2125`), with a token-injection marker
+replaced before serving (`src/server/ws.rs:1321`).
 
 ## Decision Drivers
 
@@ -35,14 +35,14 @@ replaced before serving (`src/server/ws.rs:1004-1006`).
 ## Decision
 
 1. The GUI is exactly one HTML asset embedded at compile time
-   (`src/server/ws.rs:997`); there is no runtime asset path and no second
+   (`src/server/ws.rs:1313`); there is no runtime asset path and no second
    listener. It is served under the same auth as every route
-   (`src/server/mod.rs:1856-1869`).
+   (`src/server/mod.rs:2105-2125`).
 2. Endpoint coverage is gated by `src/bin/gui_coverage.rs`: every GUI
    `api(...)` call is compared against `api::ENDPOINTS`, unknown GUI paths
    fail the check, and coverage must meet a 95.0% threshold
-   (`src/bin/gui_coverage.rs:16-18,392-425`).
-3. The coverage denominator excludes only the 17 whitelisted entries in
+   (`src/bin/gui_coverage.rs:20-22,474`).
+3. The coverage denominator excludes only the 16 whitelisted entries in
    `src/gui/coverage-whitelist.txt` — deliberately non-`api(...)`
    surfaces (WS/SSE/event routes, superseded REST pub/sub, aliases,
    self-mount, shutdown, Home navigation), with the whitelist itself
@@ -57,7 +57,7 @@ replaced before serving (`src/server/ws.rs:1004-1006`).
 
 ### Negative / Trade-offs
 
-- Every GUI change rebuilds the binary; a ~290 KB string sits in every
+- Every GUI change rebuilds the binary; a ~323 KB string sits in every
   binary whether or not the GUI is used.
 
 ### Neutral / Operational

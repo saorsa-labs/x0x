@@ -1,4 +1,4 @@
-# ADR 0047: The KV Store Is CRDT-Backed with Delta Gossip and a Reserved `Encrypted` Policy
+# ADR 0047: The KV Store Is CRDT-Backed with Delta Gossip and a Context-Gated `Encrypted` Policy
 
 - **Status:** Proposed
 - **Date:** 2026-08-29
@@ -6,7 +6,7 @@
 - **Reviewers:** pending
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** ADR-0015 (PR #87 `Encrypted`-policy guardrail); `docs/design/encrypted-kvstore.md` (proposal only). Backfill record for shipped behavior.
+- **Related:** ADR-0015 (PR #87 `Encrypted`-policy guardrail); `docs/design/encrypted-kvstore.md` (v1 implemented for the GSS backend, #341 Phase B). Backfill record for shipped behavior.
 
 ## Context
 
@@ -38,13 +38,17 @@ gossip (`src/kv/mod.rs:3-5`).
    topic (`src/kv/sync.rs:1114-1122`); `StateRequest` recovery republishes
    full state so late joiners retrieve pre-subscription keys
    (`src/kv/sync.rs:428-433`).
-3. `AccessPolicy::{Signed, Allowlisted, Encrypted, AppendOnly, SelfKeyed}`
-   governs writes. `Encrypted` is **reserved and fail-closed**: ordinary
-   construction and writes on deserialized encrypted replicas are rejected
-   with `EncryptedPolicyReserved` (`src/kv/store.rs:760-770,1168-1181`)
-   because current gossip carries plaintext bincode deltas — the
-   encrypted design (`docs/design/encrypted-kvstore.md`) is explicitly
-   "Proposal — design document only, not implemented".
+3. `AccessPolicy::{Signed, Allowlisted, Encrypted, AppendOnly, SelfKeyed,
+   GroupSigned, TreeKemEncrypted}` governs writes. `Encrypted` is
+   **context-gated and fail-closed**: `KvStore::new` rejects it with
+   `EncryptedPolicyReserved` (`src/kv/store.rs:854-866`); the only
+   constructors are `KvStore::new_encrypted` / `new_treekem_encrypted`,
+   which require a live `KvSecureContext` (`src/kv/store.rs:892-960`,
+   called from `src/lib.rs:16867,17407`). Writes use active group
+   membership and the sync layer publishes sealed
+   `EncryptedKvStoreRecordV1` records (`src/kv/encrypted.rs`); a
+   deserialized replica without a re-attached context stays fail-closed
+   (`src/kv/store.rs:1377,1504`).
 4. `SelfKeyed` namespaces are quota-bounded per agent: 64 keys / 256 KiB
    (`src/kv/store.rs:137,145`), enforced by deterministic lowest-N
    admission with identical local and remote predicates
@@ -59,8 +63,8 @@ gossip (`src/kv/mod.rs:3-5`).
 
 ### Negative / Trade-offs
 
-- Deltas are plaintext bincode today; group-confidential KV waits on the
-  encrypted-store design.
+- Deltas are plaintext bincode for non-encrypted policies; only
+  `Encrypted`/`TreeKemEncrypted` stores publish sealed records.
 
 ### Neutral / Operational
 
