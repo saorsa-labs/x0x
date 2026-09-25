@@ -16,6 +16,15 @@ pub(crate) const MAX_RETAINED_PAGES: u32 = 64;
 const MAX_INFLIGHT_IMAGES: usize = 4;
 const MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
 const INFLIGHT_TTL: Duration = Duration::from_secs(120);
+/// #811: how long a pending image must be stuck (no completion) before a
+/// NEW image may displace it when the pool is at the in-flight cap.
+/// Production: 30 s — well inside the 120 s late-joiner SLO, generous
+/// against interleaved healthy paging. Tests shrink it so displacement
+/// is observable without wall-clock waits.
+#[cfg(not(test))]
+const INFLIGHT_DISPLACE_AFTER: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const INFLIGHT_DISPLACE_AFTER: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RetainedPageBinding {
@@ -144,9 +153,40 @@ impl RetainedPagePool {
             self.evict_superseded_for(&binding, incoming_len, needs_slot);
         }
         if !self.images.contains_key(&binding) && self.images.len() >= MAX_INFLIGHT_IMAGES {
-            return Err(KvError::Gossip(
-                "too many retained images are awaiting pages".to_string(),
-            ));
+            // #811: a full pool must not wedge a NEW image behind stuck
+            // in-flight ones (a sender that went offline mid-transfer,
+            // or divergent endorser/epoch bindings for the same store).
+            // After the grace period the OLDEST stuck image is displaced
+            // — bounded-buffer semantics; the TTL stays the backstop for
+            // pools with no new traffic. Within the grace period the
+            // refusal stands, now naming the store so testnet evidence
+            // can be attributed.
+            let mut oldest: Option<(RetainedPageBinding, Duration)> = None;
+            for (stuck, pending) in &self.images {
+                let age = pending.created.elapsed();
+                if oldest.as_ref().is_none_or(|(_, best)| age > *best) {
+                    oldest = Some((stuck.clone(), age));
+                }
+            }
+            match oldest {
+                Some((stuck, age)) if age >= INFLIGHT_DISPLACE_AFTER => {
+                    if let Some(pending) = self.images.remove(&stuck) {
+                        self.received_len = self.received_len.saturating_sub(pending.received_len);
+                        tracing::warn!(
+                            store = %hex::encode(&stuck.store_id[..8]),
+                            incoming_store = %hex::encode(&binding.store_id[..8]),
+                            awaited_secs = age.as_secs(),
+                            "displacing a stuck retained image awaiting pages (#811)"
+                        );
+                    }
+                }
+                _ => {
+                    return Err(KvError::Gossip(format!(
+                        "too many retained images are awaiting pages for store {}",
+                        hex::encode(&binding.store_id[..8])
+                    )));
+                }
+            }
         }
         if let RetainedPageV1::Page { index, bytes, .. } = &frame {
             let pending = self.images.get(&binding);
@@ -722,6 +762,106 @@ mod tests {
             )
             .is_err());
         assert!(!pool.images.contains_key(&large_b));
+    }
+
+    /// #811: a full pool of STUCK in-flight images must not wedge a NEW
+    /// image for the whole TTL. After the grace period the OLDEST stuck
+    /// image is displaced and the new binding's pages complete. On the
+    /// pre-fix head the fifth image is rejected outright for up to 120 s
+    /// (the fail-before: the R9/R10 late-joiner wedge — by the time the
+    /// 141 s request retry fires, the harness deadline has passed).
+    #[test]
+    fn full_pool_displaces_a_stuck_image_after_the_grace_period() {
+        let mut pool = RetainedPagePool::default();
+        for tag in 0..MAX_INFLIGHT_IMAGES {
+            let binding = RetainedPageBinding {
+                store_id: [tag as u8; 32],
+                endorser: [1; 32],
+                authorization: [2; 32],
+                image_id: [tag as u8; 32],
+            };
+            pool.push(
+                binding,
+                RetainedPageV1::Page {
+                    image_id: [tag as u8; 32],
+                    index: 0,
+                    bytes: vec![tag as u8],
+                },
+            )
+            .expect("bounded pending image");
+        }
+        // Age every pending image past the displacement grace.
+        std::thread::sleep(INFLIGHT_DISPLACE_AFTER + std::time::Duration::from_millis(20));
+
+        // A NEW binding displaces the oldest stuck image and completes
+        // end-to-end (manifest + every page).
+        let image = b"late-joiner history".to_vec();
+        let pages = split_image(&image, 256).expect("pages");
+        let mut fifth = RetainedPageBinding {
+            store_id: [99; 32],
+            endorser: [1; 32],
+            authorization: [2; 32],
+            image_id: [99; 32],
+        };
+        let mut completed = None;
+        for page in pages {
+            let frame = decode_page(&page).expect("framed").expect("page frame");
+            if let RetainedPageV1::Manifest { image_id, .. } = &frame {
+                fifth.image_id = *image_id;
+            }
+            completed = pool
+                .push(fifth.clone(), frame)
+                .expect("#811: a stuck pool must not wedge the new image")
+                .or(completed);
+        }
+        assert_eq!(completed.as_deref(), Some(image.as_slice()));
+    }
+
+    /// #811 (ask 1): the within-grace refusal NAMES THE STORE so testnet
+    /// evidence can be attributed (R10's log lines could not be).
+    #[test]
+    fn full_pool_refusal_names_the_store() {
+        let mut pool = RetainedPagePool::default();
+        for tag in 0..MAX_INFLIGHT_IMAGES {
+            let binding = RetainedPageBinding {
+                store_id: [tag as u8; 32],
+                endorser: [1; 32],
+                authorization: [2; 32],
+                image_id: [tag as u8; 32],
+            };
+            pool.push(
+                binding,
+                RetainedPageV1::Page {
+                    image_id: [tag as u8; 32],
+                    index: 0,
+                    bytes: vec![tag as u8],
+                },
+            )
+            .expect("bounded pending image");
+        }
+        let extra = RetainedPageBinding {
+            store_id: [0x79; 32],
+            endorser: [1; 32],
+            authorization: [2; 32],
+            image_id: [99; 32],
+        };
+        // Within the grace period the refusal stands — now with the
+        // store id in the message.
+        let err = pool
+            .push(
+                extra,
+                RetainedPageV1::Page {
+                    image_id: [99; 32],
+                    index: 0,
+                    bytes: vec![1],
+                },
+            )
+            .expect_err("within the grace the pool is still bounded");
+        let expected = hex::encode([0x79u8; 8]);
+        assert!(
+            err.to_string().contains(&expected),
+            "the refusal must name the store, got: {err}"
+        );
     }
 
     #[test]
