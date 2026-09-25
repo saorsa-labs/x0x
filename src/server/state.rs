@@ -863,6 +863,8 @@ pub(super) struct AppState {
     /// long-lived sync listeners. Keyed by `"{kind}:{id}"`.
     pub(super) crdt_handle_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     pub(super) named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
+    /// Orders roster snapshots sent to gossip after committed mutations.
+    pub(super) group_roster_gossip_lock: Mutex<()>,
     pub(super) named_groups_path: PathBuf,
     /// Issue #451: disk location of the Home-Suite sidecar
     /// (`home-suite-groups.json`) — the AUTHORITATIVE durable state for
