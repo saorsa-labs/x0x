@@ -84,6 +84,7 @@ This directory contains architecture decision records for x0x.
 - [ADR 0063: Signed KV legacy gossip compatibility adoption boundary](./0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md) — draft; V3 pairing preparation only, G0 met and G1–G8 open; disabled pending audited adoption
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
+- [ADR 0075: Collaborative Notes and Agent Scratchpads](./0075-collaborative-notes-and-agent-scratchpads.md) (proposed 2026-09-25) — R9 (+R6, R10): notes are a `yrs` text CRDT stored as write-once, author-bound update records in the sealed group `notes` store, with a daemon-side three-way merge for plain-text clients; the Wiki migrates to notes; a `scratch` group store becomes rider-reachable under a new per-group `scratch` scope (the only ADR-0039 allow-list widening); GUI deep links for #893.
 
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
