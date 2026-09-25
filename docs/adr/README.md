@@ -83,6 +83,8 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
 
+- [ADR 0070: Owner Trust and Share Grants](./0070-owner-trust-and-share-grants.md) (proposed 2026-09-25) — **extends ADR 0019/0046/0018, edits nothing in them**; addresses vision R3/R5/R7: agents+machines certified/enrolled by the same owner `UserId` are implicitly trusted at trust evaluation and the stream gate, and matchable by a `principal = "owner"` connect/exec ACL selector; an owner-signed, expiring `ShareGrant` exposes a subset of agents with caps (`Dm`/`Exec`/`Connect{ports}`/`GroupInvite`) to another human, revoked via a new `RevokedSubject::ShareGrant`; ACLs gain REST/CLI edit + hot reload over the TOML floor. Home (ADR 0038) unaffected; no re-sharing
+
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
 Documentation-audit corrections, 2026-07-19. The ADR files themselves are
