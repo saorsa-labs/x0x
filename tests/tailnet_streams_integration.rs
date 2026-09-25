@@ -29,6 +29,8 @@ fn loopback_network_config() -> NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
         bootstrap_nodes: Vec::new(),
         mdns_enabled: false,
+        // Loopback only: no UPnP IGD discovery on the runner's LAN.
+        port_mapping_enabled: false,
         ..NetworkConfig::default()
     }
 }
@@ -654,14 +656,24 @@ async fn acceptor_channel_is_bounded() {
     /// replaced by another open below).
     const LAND_DEADLINE: Duration = Duration::from_secs(10);
 
+    /// Overall fill deadline: a bounded failure instead of an unbounded
+    /// replace-and-retry loop if streams stop landing entirely.
+    const FILL_DEADLINE: Duration = Duration::from_secs(180);
+
     let bob_agent = bob.agent_id();
     let mut held: Vec<x0x::streams::PeerStream> = Vec::new();
+    let fill_deadline = Instant::now() + FILL_DEADLINE;
 
     // Serial fill to exactly capacity: open one, wait for it to land, repeat.
     // A stranded open (rare) is replaced by a fresh one — the connection
     // stays healthy for new streams even when an earlier burst frames never
     // transmit.
     while acceptor.queued() < CAP {
+        assert!(
+            Instant::now() < fill_deadline,
+            "acceptor fill stalled at {} of {CAP} within {FILL_DEADLINE:?}",
+            acceptor.queued()
+        );
         let before = acceptor.queued();
         held.push(
             alice
@@ -774,7 +786,15 @@ async fn backpressure_throttles_writer_with_bounded_buffering() {
         offset
     });
 
+    // Wait (bounded) for the writer's first progress so a slow runner cannot
+    // turn scheduling delay into a false "no initial progress" failure.
+    let progress_deadline = Instant::now() + Duration::from_secs(15);
+    while written.load(Ordering::Acquire) == 0 && Instant::now() < progress_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     // Stall the reader: the writer must throttle at the flow-control window.
+    // This is an observation window (proving the writer does NOT finish), so
+    // it stays a fixed duration rather than a poll.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let stalled = written.load(Ordering::Acquire);
     assert!(

@@ -25,6 +25,8 @@ fn loopback_network_config() -> NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: Vec::new(),
         mdns_enabled: false,
+        // Loopback only: no UPnP IGD discovery on the runner's LAN.
+        port_mapping_enabled: false,
         ..NetworkConfig::default()
     }
 }
