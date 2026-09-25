@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0070-owner-trust-and-share-grants.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-25 by David Irvine ("accept ADR-0070, 0071 and 0072"; design choices 1–4 decided the same day, recorded on PR #896; status change applied by Claude at his instruction)
 - **Date:** 2026-09-25
 - **Decision owners:** David Irvine (direction), Claude (drafting)
 - **Reviewers:** pending (cross-model review required before acceptance)

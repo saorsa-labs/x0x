@@ -43,6 +43,7 @@ This directory contains architecture decision records for x0x.
 - [ADR 0040: Agent-to-Agent Delegation in Spaces](./0040-agent-delegation-in-spaces.md) (accepted 2026-08-27) — signed `Delegation` envelope with bounded `authority_scope` + expiry, depth cap 2; task-list CRDT `owner_agent` with signed transfer; structured `mentions`; sealed per-space credential slot; handoffs ride DM durable-ACK v2 (ADR 0030)
 - [ADR 0041: Cross-Machine State Sync — Tiered, Owner-to-Owner Only](./0041-cross-machine-state-sync-tiers.md) (accepted 2026-08-27) — Tier 1 replicates profiles/names/Home roster/sub-agent registry as owner-signed state-commits over ADR 0022 streams; Tier 2 Home history pulls owner-to-owner on demand; Tier 3 (other groups, DMs, exec) never replicates; **amends ADR 0023's cross-node backfill non-goal**
 - [ADR 0042: Voice Media over Tailnet Streams (`WebRtcV1`)](./0042-voice-media-over-tailnet-streams.md) (accepted 2026-08-27) — ratifies `StreamProtocol::WebRtcV1 = 0x04` nesting (saorsa-webrtc `StreamType` 0x20–0x24, u32-BE framing) under the standard identity/ACL gates; Ephemeral DM signaling; audio to the unreliable datagram lane with reliable fallback; mesh ≤4, SFU/browser gateway deferred
+- [ADR 0070: Owner Trust and Share Grants](./0070-owner-trust-and-share-grants.md) (proposed 2026-09-25; accepted 2026-09-25) — **extends ADR 0019/0046/0018, edits nothing in them**; addresses vision R3/R5/R7: agents+machines certified/enrolled by the same owner `UserId` are implicitly trusted at trust evaluation and the stream gate, and matchable by a `principal = "owner"` connect/exec ACL selector; an owner-signed, expiring `ShareGrant` exposes a subset of agents with caps (`Dm`/`Exec`/`Connect{ports}`/`GroupInvite`) to another human, revoked via a new `RevokedSubject::ShareGrant`; ACLs gain REST/CLI edit + hot reload over the TOML floor. Home (ADR 0038) unaffected; no re-sharing
 
 ## Accepted (Phase 1 Functionally Complete)
 
@@ -83,7 +84,6 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
 
-- [ADR 0070: Owner Trust and Share Grants](./0070-owner-trust-and-share-grants.md) (proposed 2026-09-25) — **extends ADR 0019/0046/0018, edits nothing in them**; addresses vision R3/R5/R7: agents+machines certified/enrolled by the same owner `UserId` are implicitly trusted at trust evaluation and the stream gate, and matchable by a `principal = "owner"` connect/exec ACL selector; an owner-signed, expiring `ShareGrant` exposes a subset of agents with caps (`Dm`/`Exec`/`Connect{ports}`/`GroupInvite`) to another human, revoked via a new `RevokedSubject::ShareGrant`; ACLs gain REST/CLI edit + hot reload over the TOML floor. Home (ADR 0038) unaffected; no re-sharing
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
