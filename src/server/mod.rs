@@ -1006,6 +1006,7 @@ pub async fn serve_with_options(
         crdt_subscriptions_persistence_lock: Mutex::new(()),
         crdt_handle_locks: RwLock::new(HashMap::new()),
         named_groups: RwLock::new(named_groups),
+        group_roster_gossip_lock: Mutex::new(()),
         named_groups_path,
         home_suite_groups_path,
         named_groups_persistence_lock: Mutex::new(()),
@@ -1309,6 +1310,15 @@ pub async fn serve_with_options(
         "API server listening on {actual_api_addr} (port file: {})",
         port_file.display()
     );
+
+    routes::named_groups::refresh_group_rosters_for_gossip(&state).await;
+    let roster_refresh_state = Arc::clone(&state);
+    bg_tasks.push(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            routes::named_groups::refresh_group_rosters_for_gossip(&roster_refresh_state).await;
+        }
+    }));
 
     let existing_group_ids: Vec<String> = {
         let groups = state.named_groups.read().await;
