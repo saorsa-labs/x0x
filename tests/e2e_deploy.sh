@@ -262,7 +262,9 @@ LRCONF
             | $SSH root@"$ip" 'cat > /tmp/x0x-result-framing.py.codex && chmod 644 /tmp/x0x-result-framing.py.codex' 2>/dev/null \
            && cat "$RUNNER_INSTALLER" \
             | $SSH root@"$ip" 'cat > /tmp/x0x-install-runner-bundle.sh.codex && chmod 755 /tmp/x0x-install-runner-bundle.sh.codex' 2>/dev/null \
-           && sed -e "s|EnvironmentFile=.*|EnvironmentFile=$RUNNER_ENV_FILE|" \
+           && sed -e "s|^After=x0xd.service$|After=$X0X_SERVICE|" \
+                  -e "s|^Wants=x0xd.service$|Wants=$X0X_SERVICE|" \
+                  -e "s|EnvironmentFile=.*|EnvironmentFile=$RUNNER_ENV_FILE|" \
                   -e "s|ExecStart=.*|ExecStart=/usr/local/bin/x0x-test-runner-$RUNNER_NETWORK.py|" "$RUNNER_UNIT" \
             | $SSH root@"$ip" "cat > /tmp/$RUNNER_UNIT_NAME.codex" 2>/dev/null \
            && $SSH root@"$ip" "
@@ -369,6 +371,10 @@ for node in "${NODE_NAMES[@]}"; do
     echo "    Connected peers: $PEERS"
 done
 
+# Capture all deployment failures, including straggler re-push failures, only
+# after the deployment, straggler, and health phases have completed.
+DEPLOY_FAILURES=${#FAILED_NODES[@]}
+
 # ═════════════════════════════════════════════════════════════════════════
 # OPTIONAL: MESH-DRIVEN VERIFICATION (--mesh-verify or MESH_VERIFY=1)
 # ═════════════════════════════════════════════════════════════════════════
@@ -378,7 +384,7 @@ done
 # which is the strongest "the deploy is good" signal we can get without
 # adding a daemon-side test endpoint.
 MESH_RC=0
-if [ "$MESH_VERIFY" = "1" ] && [ $FAIL -eq 0 ]; then
+if [ "$MESH_VERIFY" = "1" ] && [ $FAIL -eq 0 ] && [ "$DEPLOY_FAILURES" -eq 0 ]; then
     echo -e "\n${CYAN}[5/4] Mesh-driven verification (anchor=$MESH_ANCHOR)${NC}"
     echo "  This replaces the per-node SSH+curl status checks with a"
     echo "  single mesh round-trip that exercises DMs + groups."
@@ -413,7 +419,7 @@ fi
 # SUMMARY
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
-if [ $FAIL -eq 0 ] && [ $MESH_RC -eq 0 ]; then
+if [ $FAIL -eq 0 ] && [ "$DEPLOY_FAILURES" -eq 0 ] && [ $MESH_RC -eq 0 ]; then
     echo -e "${GREEN}  ALL $TOTAL CHECKS PASSED${NC}"
     if [ "$MESH_VERIFY" = "1" ]; then
         echo -e "  ${GREEN}+ mesh-driven verification clean${NC}"
@@ -422,6 +428,9 @@ if [ $FAIL -eq 0 ] && [ $MESH_RC -eq 0 ]; then
     echo -e "  Run: bash tests/e2e_vps.sh    (legacy SSH-per-call)"
     echo -e "  Or:  python3 tests/e2e_vps_mesh.py --anchor $MESH_ANCHOR"
 else
+    if [ "$DEPLOY_FAILURES" -gt 0 ]; then
+        echo -e "${RED}  $DEPLOY_FAILURES deployment node(s) failed${NC}"
+    fi
     if [ $FAIL -gt 0 ]; then
         echo -e "${RED}  $FAIL FAILED / $TOTAL TOTAL${NC} ($PASS passed)"
     fi
@@ -431,6 +440,6 @@ else
 fi
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 
-OVERALL=$FAIL
+OVERALL=$((FAIL + DEPLOY_FAILURES))
 [ $MESH_RC -ne 0 ] && OVERALL=$((OVERALL + MESH_RC))
 exit $OVERALL

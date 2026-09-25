@@ -28,9 +28,10 @@ use super::auth::SessionStore;
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
-    ListenerRegistration, NamedGroupMetadataEvent, PendingCausalApproval, PendingJoinAttempt,
-    PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome,
-    PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription, WelcomeFetchWaiter,
+    ListenerRegistration, NamedGroupMetadataEvent, ParkedRoleUpdate, PendingCausalApproval,
+    PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent,
+    PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription,
+    WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -146,7 +147,9 @@ pub(super) const fn effective_self_update_enabled(
 /// immediately, which matters when binding `127.0.0.1:0` for tests.
 /// Dropping the handle requests shutdown (the supervisor is cancelled) but does
 /// not block; await [`wait`](ServerHandle::wait) or
-/// [`shutdown_and_wait`](ServerHandle::shutdown_and_wait) to observe completion.
+/// [`shutdown_and_wait`](ServerHandle::shutdown_and_wait) to observe completion,
+/// including a typed transport-release failure that makes an immediate
+/// same-port restart unsafe.
 /// The data-dir (and, when configured, shared-identity-dir) instance locks are
 /// held by the supervisor task itself and released only after it has finished
 /// draining (#645) — so after dropping the handle without awaiting completion,
@@ -215,7 +218,8 @@ impl ServerHandle {
             .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
-    /// Request shutdown, then await run-to-completion.
+    /// Request shutdown, then await run-to-completion, including confirmation
+    /// that the transport released its bound socket.
     pub async fn shutdown_and_wait(self) -> anyhow::Result<()> {
         self.cancel.cancel();
         self.wait().await
@@ -925,10 +929,29 @@ pub(super) struct AppState {
     pub(super) pending_welcome_waiters: RwLock<HashMap<String, Vec<WelcomeFetchWaiter>>>,
     /// Per-active Welcome blob transfer ack slots.
     pub(super) pending_welcome_acks: RwLock<HashMap<String, Arc<FileChunkAckSlot>>>,
+    /// One cancellable owner-side stream per staged Welcome.
+    /// `None` closes admission during shutdown under the same lock as replacement.
+    pub(super) pending_welcome_streams: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Bounded, process-local exact-byte transfers for oversized named-group
+    /// direct events and join results. No control payload is persisted.
+    pub(super) control_blobs: crate::server::routes::ControlBlobState,
     /// Bounded per-group queue for verified TreeKEM membership events that
     /// arrived before local TreeKEM readiness or ahead of our state frontier.
     pub(super) treekem_pending_events:
         RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// #878 r4 (review finding 2): one in-flight oversized join-result
+    /// staging task per (group, recipient) — a 1-permit semaphore each;
+    /// duplicates are dropped while a staging is running (the recipient
+    /// can re-request; the reference it fetches is byte-identical).
+    pub(super) join_result_staging_guards: StdMutex<
+        HashMap<(String, crate::identity::AgentId), std::sync::Arc<tokio::sync::Semaphore>>,
+    >,
+    /// #876: signed `MemberRoleUpdated` events that arrived before their
+    /// target member was seated locally (the member's `MemberAdded` blob
+    /// was still in flight behind the control-blob staging budget). Parked,
+    /// never dropped; replayed after the group's next accepted
+    /// `MemberAdded`. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
+    pub(super) parked_role_updates: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
     /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
     /// certificate evidence (retryable), retained so the authority can
     /// re-apply them once the joiner's announce blob resolves. Keyed by
@@ -942,6 +965,10 @@ pub(super) struct AppState {
     /// group's next durable persist happens (the confirmation itself) and
     /// on restart (the set is memory-only; the stub was never on disk).
     pub(super) pending_join_stubs: StdMutex<std::collections::HashSet<String>>,
+    /// #824: true while startup Home provisioning is deferred, waiting for
+    /// a successful owner-sync session (or its rank-scaled deadline) to deliver the canonical Home
+    /// pointer. `GET /home` reports `provisioning_pending` meanwhile.
+    pub(super) home_provisioning_deferred: AtomicBool,
     /// #477: authority-side staged join refusals, keyed
     /// `(group_id, member_agent_id, attempt_id)` — terminal facts with a
     /// lazy ML-DSA signature materialized on first capable serve. Bounded
@@ -969,6 +996,15 @@ pub(super) struct AppState {
     /// verified) by the joiner's chain-verified adoption. Single-apply.
     pub(super) pending_head_attestations:
         StdMutex<HashMap<String, crate::server::routes::named_groups::HeadAttestation>>,
+    /// Serializes the per-joiner join-result context lifecycle
+    /// (chain/attestation insertion → apply → removal) keyed by
+    /// `join_result_key`, so a detached fetch task delivering a stale
+    /// bound result can never clobber the context of a concurrently
+    /// applying current result. Lock order: this mutex is always acquired
+    /// BEFORE the group membership lock inside apply; nothing acquires it
+    /// while holding the membership lock.
+    pub(super) pending_join_result_processing:
+        StdMutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
     /// arrived before their matching `JoinRequestCreated` predecessor. The
     /// approval is retained without mutating group state and drained after

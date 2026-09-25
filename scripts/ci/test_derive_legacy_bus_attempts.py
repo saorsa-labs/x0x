@@ -10,15 +10,22 @@ import unittest
 spec = importlib.util.spec_from_file_location("derive501", Path(__file__).with_name("derive-legacy-bus-attempts.py"))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.PUBSUB_VERSION + '"\nchecksum="' + module.PUBSUB_SHA + '"\n').encode()
+LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.REGISTRY_PUBSUB_VERSION
+        + '"\nsource="' + module.REGISTRY_PUBSUB_SOURCE + '"\nchecksum="' + module.REGISTRY_PUBSUB_SHA + '"\n').encode()
+GIT_LOCK = ('[[package]]\nname="saorsa-gossip-pubsub"\nversion="' + module.GIT_PUBSUB_VERSION
+            + '"\nsource="' + module.GIT_PUBSUB_SOURCE_CURRENT + '"\n').encode()
+GIT_LOCK_ACCOUNTING = GIT_LOCK.replace(module.GIT_PUBSUB_REV_CURRENT.encode(),
+                                       module.GIT_PUBSUB_REV_ACCOUNTING.encode())
 
 
 def fixture():
     def sample(at, eager, subscribed):
         counters = {k: {"msgs": int(eager > 0) if k == "eager" else 0, "bytes": eager if k == "eager" else 0} for k in module.KINDS}
+        control_row = {"topic_id_hex8": module.CONTROL,
+                       "outbound": {k: {"msgs": 0, "bytes": 0} for k in module.KINDS}}
         return {"begin_ns": at, "end_ns": at + 1,
                 "egress": {"subscribed_topics": [{"topic_id_hex8": module.BUS}] if subscribed else [],
-                           "outbound_by_topic_named": [{"topic_id_hex8": module.BUS, "outbound": counters}] if subscribed else [],
+                           "outbound_by_topic_named": ([{"topic_id_hex8": module.BUS, "outbound": counters}] if subscribed else []) + [control_row],
                            "egress_budget": {"byte_policy": "observe_only", "repair": {"tracking_overflow": 0}}},
                 "participation": {"mode": "leaf", "relay_bytes": 0},
                 "stages": {"peer_scores": [{"topic": module.BUS, "role": "eager", "eager_eligible": True, "peer_id": "44" * 8}]}}
@@ -26,7 +33,8 @@ def fixture():
             "identities": [{"agent": b * 32, "machine": b * 32} for b in ("11", "22", "33", "44")],
             "generator_peer_hex8": "11" * 8, "binary_sha256": "ab" * 32,
             "build_lock_sha256": hashlib.sha256(LOCK).hexdigest(),
-            "universe": [{"name": "synthetic-bus", "full_id_hex": module.BUS + "0" * 48, "topic_id_hex8": module.BUS}],
+            "universe": [{"name": "synthetic-bus", "full_id_hex": module.BUS + "0" * 48, "topic_id_hex8": module.BUS},
+                         {"name": module.KEY_CACHE_CONTROL_TOPIC, "full_id_hex": module.CONTROL + "0" * 48, "topic_id_hex8": module.CONTROL}],
             "samples": {"D5": {"t0": sample(2_000_000_000, 0, True), "t1": sample(12_000_000_000, 100, True)},
                         "O5": {"t0": sample(2_000_000_000, 0, False), "t1": sample(12_000_000_000, 0, False)}},
             "load": {"sent": 200, "payload_bytes": 4096, "period_ms": 50, "elapsed_ns": 10000000000, "fanouts": [3] * 200, "witness_observed_during_load": 170}}
@@ -77,20 +85,66 @@ class DerivationControls(unittest.TestCase):
         )
 
     def test_source_premise_drift_is_rejected(self):
-        cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.84"\n'
-        rust = (
-            b'pinned[0]["version"].as_str() != Some("0.5.84")\n'
-            b' || pinned[0]["checksum"].as_str()\n'
-            b' != Some("ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3")'
-        )
-        module.validate_source_premise(cargo, rust)
+        workspace = Path(__file__).resolve().parents[2]
+        cargo = (workspace / "Cargo.toml").read_bytes()
+        rust = (workspace / "src/legacy_bus_interop_tests.rs").read_bytes()
+        registry_cargo = b'[dependencies]\nsaorsa-gossip-pubsub = "=0.5.85"\n'
+
+        def git_cargo(rev):
+            return (registry_cargo + b'[patch.crates-io]\nsaorsa-gossip-pubsub = { git = "'
+                    + module.GIT_PUBSUB_URL.encode() + b'", rev = "' + rev.encode() + b'" }\n')
+
+        module.validate_source_premise(registry_cargo, rust)
+        module.validate_source_premise(git_cargo(module.GIT_PUBSUB_REV_CURRENT), rust)
+        module.validate_source_premise(git_cargo(module.GIT_PUBSUB_REV_ACCOUNTING), rust)
         for cargo_input, rust_input, code in (
-            (cargo.replace(b"=0.5.84", b"0.5.84"), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
-            (cargo, rust.replace(b"0.5.84", b"0.5.83", 1), "RUST_PUBSUB_VERSION_MISMATCH"),
-            (cargo, rust.replace(b"ed849e", b"0d849e", 1), "RUST_PUBSUB_SHA_MISMATCH"),
+            (cargo.replace(b'saorsa-gossip-pubsub = "=0.5.85"',
+                           b'saorsa-gossip-pubsub = "=0.5.84"'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (git_cargo("0" * 40), rust, "WORKSPACE_PUBSUB_PATCH_MISMATCH"),
+            (registry_cargo.replace(b'=0.5.85', b'0.5.85'), rust, "WORKSPACE_PUBSUB_PIN_MISMATCH"),
+            (cargo, rust.replace(b'const GIT_PUBSUB_VERSION: &str = "0.5.85"',
+                                 b'const GIT_PUBSUB_VERSION: &str = "0.5.86"'), "RUST_GIT_PUBSUB_VERSION_MISMATCH"),
+            (cargo, rust.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64, 1), "RUST_REGISTRY_PUBSUB_SHA_MISMATCH"),
+            (cargo, rust.replace(module.GIT_PUBSUB_REV_CURRENT.encode(), b"0" * 40, 1),
+             "RUST_GIT_PUBSUB_SOURCE_CURRENT_MISMATCH"),
+            (cargo, rust.replace(b'const SG_KEY_CACHE_CONTROL_TOPIC: &str = "saorsa-gossip/key-cache-control/v1";',
+                                 b'const SG_KEY_CACHE_CONTROL_TOPIC: &str = "other-control-topic";'),
+             "RUST_SG_KEY_CACHE_CONTROL_TOPIC_MISMATCH"),
         ):
             with self.subTest(code=code), self.assertRaisesRegex(module.Inconclusive, code):
                 module.validate_source_premise(cargo_input, rust_input)
+
+    def test_exact_registry_and_git_producer_sources(self):
+        for lock in (LOCK, GIT_LOCK, GIT_LOCK_ACCOUNTING):
+            record = fixture()
+            record["build_lock_sha256"] = hashlib.sha256(lock).hexdigest()
+            self.assertEqual(module.derive(record, lock)["derivation"], "CONSISTENT")
+        invalid = (
+            GIT_LOCK.replace(module.GIT_PUBSUB_REV_CURRENT.encode(), b"0" * 40, 1),
+            # Lookalike repository URL with the exact reviewed revision:
+            # the premise is source-bound, not revision-bound alone.
+            GIT_LOCK.replace(
+                module.GIT_PUBSUB_URL.encode(),
+                b"https://github.com/saorsa-labs/saorsa-gossip-mirror.git",
+            ),
+            GIT_LOCK.replace(b'0.5.85', b'0.5.86'),
+            GIT_LOCK + b'checksum="' + module.REGISTRY_PUBSUB_SHA.encode() + b'"\n',
+            GIT_LOCK.replace(b'source="', b'unknown="'),
+            GIT_LOCK + GIT_LOCK,
+            LOCK.replace(module.REGISTRY_PUBSUB_SOURCE.encode(), b'registry+https://example.invalid'),
+            LOCK.replace(module.REGISTRY_PUBSUB_SHA.encode(), b"0" * 64),
+            # The superseded 0.5.84 registry package is no longer reviewed.
+            LOCK.replace(b'0.5.85', b'0.5.84').replace(
+                module.REGISTRY_PUBSUB_SHA.encode(),
+                b"ed849eabb8d24a1a28aed78a2dd5909ac2726618f81205071a45d028ce757bf3"),
+        )
+        for lock in invalid:
+            record = fixture()
+            record["build_lock_sha256"] = hashlib.sha256(lock).hexdigest()
+            with self.subTest(lock_sha256=record["build_lock_sha256"]), self.assertRaisesRegex(
+                module.Inconclusive, "PRODUCER_PIN_MISMATCH"
+            ):
+                module.derive(record, lock)
 
     def test_actual_positive_arithmetic_and_absent_zero(self):
         result = module.derive(module.parse(output(fixture())), LOCK)
@@ -149,8 +203,27 @@ class DerivationControls(unittest.TestCase):
                 r = fixture()
                 row = copy.deepcopy(r["samples"]["D5"]["t0"]["egress"]["outbound_by_topic_named"][0])
                 row["outbound"][kind] = {"msgs": 1, "bytes": 64}
-                r["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"] = [row]
+                r["samples"]["O5"]["t1"]["egress"]["outbound_by_topic_named"].append(row)
                 self.assertEqual(module.derive(r, LOCK)["oracle_failures"], ["O5_BUS_EGRESS_ORACLE"])
+
+    def test_reserved_control_topic_is_declared_and_data_plane_zero(self):
+        self.assertEqual(module.derive(fixture(), LOCK)["derivation"], "CONSISTENT")
+
+        missing = fixture()
+        missing["universe"] = [row for row in missing["universe"] if row["topic_id_hex8"] != module.CONTROL]
+        with self.assertRaisesRegex(module.Inconclusive, "UNEXPECTED_OR_DUPLICATE_TOPIC"):
+            module.derive(missing, LOCK)
+
+        for arm in ("D5", "O5"):
+            for kind in module.KINDS:
+                for field in ("msgs", "bytes"):
+                    with self.subTest(arm=arm, kind=kind, field=field):
+                        r = fixture()
+                        control = r["samples"][arm]["t1"]["egress"]["outbound_by_topic_named"][-1]
+                        control["outbound"][kind][field] = 1
+                        result = module.derive(r, LOCK)
+                        self.assertEqual(result["derivation"], "FAIL")
+                        self.assertEqual(result["oracle_failures"], [arm + "_RESERVED_TOPIC_DATA_PLANE"])
 
     def test_unexpected_topic_cannot_be_counted_as_zero(self):
         r = fixture()

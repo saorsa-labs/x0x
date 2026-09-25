@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,54 @@ class HomeFixtureTests(unittest.TestCase):
     def node(self, label="owner"):
         return self.h.Node(label, "192.0.2.1", 14600, 7483,
                            "/var/tmp/x0x-home-e2e-" + "a" * 32)
+
+    def run_join_offline(self, evidence, responses, *, join_state="pending_authority_commit",
+                         local_responses=None, local_join_status=(200, {}), request_advance=0.0,
+                         owner_error_at=(), local_error_at=(), terminal_error=None):
+        """Drive the real Home readiness barrier against fake APIs and a virtual clock."""
+        owner, member = mock.Mock(), mock.Mock()
+        local_responses = local_responses or [(200, {"ok": True, "group_id": "home-gid",
+                                                       "membership_state": "active"})]
+        member.agent_id.return_value = "a" * 64
+        samples = []
+        local_samples = []
+        clock = types.SimpleNamespace(now=1000.0)
+        def owner_roster(method, path):
+            self.assertEqual(("GET", "/groups/home-gid/members"), (method, path))
+            index = len(samples)
+            samples.append(None)
+            clock.now += request_advance
+            if index in owner_error_at:
+                raise RuntimeError("synthetic owner request failure")
+            response = responses[min(index, len(responses) - 1)]
+            samples[-1] = response
+            return response
+        def member_api(method, path, body=None):
+            if method == "POST":
+                return (200, {"ok": True, "group_id": "home-gid", "join_state": join_state})
+            if path == "/groups/home-gid":
+                index = len(local_samples)
+                local_samples.append(None)
+                clock.now += request_advance
+                if index in local_error_at:
+                    raise RuntimeError("synthetic local request failure")
+                response = local_responses[min(index, len(local_responses) - 1)]
+                local_samples[-1] = response
+                return response
+            if path == "/groups/home-gid/join-status":
+                if terminal_error is not None:
+                    raise RuntimeError(terminal_error)
+                return local_join_status
+            raise AssertionError((method, path))
+        owner.request.side_effect = owner_roster
+        member.request.side_effect = member_api
+        def sleep(seconds): clock.now += seconds
+        poll_time = self.h.Scenario.join_home.__globals__["poll"].__globals__["time"]
+        with mock.patch.object(poll_time, "monotonic", side_effect=lambda: clock.now), \
+             mock.patch.object(poll_time, "sleep", side_effect=sleep):
+            self.h.Scenario({"owner": owner, "member": member}, evidence, 120).join_home(
+                "owner", "member", "home-gid", "b" * 64, "x0x://invite/secret-synthetic")
+        return samples
 
     def test_config_is_isolated_and_never_uses_prod_or_testnet_plane(self):
         text = self.h.config_bytes(self.node(), "x0x.home.e2e." + "a" * 32, None).decode()
@@ -171,21 +220,28 @@ esac
                                   api_port_base=14600, quic_port_base=7483, local_port_base=24700,
                                   poll_timeout=20)
 
-    def run_model(self, fixture=None, scenario_cls=None):
+    def run_model(self, fixture=None, scenario_cls=None, card_reply=None):
         """Run the REAL run_fixture -> run_home -> exercise ordering against a stateful model.
 
         The model encodes the product facts the harness depends on: a Home join is
         admitted only by an online inviter, POST /home/seat needs the owner key and an
         Admin seat, user-identity announce needs the owner key, and an uncertified,
-        keyless device is refused (403).
+        keyless device is refused (403). #824: a keyed device that restarts
+        without bilateral owner-sync enrollment and trust with the owner device
+        provisions a DUPLICATE Home (`local` with another gid); only a paired
+        device yields (`elsewhere`, canonical gid) until it is seated.
         """
         h = fixture or self.h
         args = self.args(); evidence = self.h.Evidence(); resources = {}
         tokens = {n: (f"192.0.2.{i}", "unused") for i, n in enumerate(args.nodes, 1)}
         ids = {n: (str(i) * 64) for i, n in enumerate(args.nodes, 1)}
+        public_keys = {n: f"{i:02x}" * 1952 for i, n in enumerate(args.nodes, 1)}
         owner_user, gid, owner_key = "f" * 64, "home-gid", "k" * 64
         events: list[tuple] = []
-        world = {"seats": {"owner": "admin"}, "certs": set(), "announced": set(), "invites": {}, "kv": {}}
+        world = {"seats": {"owner": "admin"}, "certs": set(), "announced": set(), "invites": {}, "kv": {},
+                 "enrolled": set(), "trusted": set(), "keyed_at_start": set()}
+        machines = {n: (f"{i:x}" * 64)[:64][::-1] for i, n in enumerate(args.nodes, 10)}
+        world["machines"] = machines
 
         class Custody:
             instance = None
@@ -195,6 +251,7 @@ esac
             def create_owner_key(self, node, *_args): self.keys[node.label] = owner_key
             def start(self, node):
                 self.offline.discard(node.label); self.started.add(node.label); events.append(("start", node.label))
+                if node.label in self.keys: world["keyed_at_start"].add(node.label)
             def stop(self, label):
                 if label not in self.started: raise RuntimeError("unowned")
                 self.offline.add(label); events.append(("stop", label))
@@ -224,12 +281,37 @@ esac
                 events.append(("req", me, method, path))
                 seats = world["seats"]
                 keyed = me in Custody.instance.keys
-                if path == "/home": return 200, {"state": "local", "group_id": gid, "owner_user_id": owner_user,
-                                                    "primary_agent": {"verified": True}}
+                def paired(label):
+                    return ({("owner", machines[label]), (label, machines["owner"])} <= world["enrolled"]
+                            and {("owner", ids[label]), (label, ids["owner"])} <= world["trusted"])
+                if path == "/home":
+                    if me == "owner" or me in seats:
+                        return 200, {"state": "local", "group_id": gid, "owner_user_id": owner_user,
+                                     "primary_agent": {"verified": True}}
+                    if me not in world["keyed_at_start"]: return 404, {"ok": False, "error": "no Home provisioned"}
+                    if paired(me): return 200, {"state": "elsewhere", "canonical_group_id": gid,
+                                                "owner_user_id": owner_user}
+                    return 200, {"state": "local", "group_id": f"dup-{me}", "owner_user_id": owner_user}
+                if path == "/agent": return 200, {"ok": True, "agent_id": ids[me], "machine_id": machines[me]}
+                if path == "/contacts/trust":
+                    if body.get("level") != "trusted": return 400, {"ok": False}
+                    world["trusted"].add((me, body["agent_id"])); return 200, {"ok": True}
+                if path == "/sync/devices/enroll":
+                    if not keyed: return 409, {"ok": False, "error": "no owner identity configured"}
+                    world["enrolled"].add((me, body.get("machine_id") or machines[me]))
+                    return 200, {"ok": True}
                 if path == "/health": return 200, {"ok": True}
-                if path == "/agent/card": return 200, {"agent_public_key": f"pub-{me}"}
+                if path == "/agent/card":
+                    if card_reply is not None: return 200, card_reply
+                    return 200, {"ok": True, "card": {"agent_id": ids[me],
+                                                      "agent_public_key": public_keys[me],
+                                                      "signature": "ab" * 3309}, "link": "x0x://agent"}
                 if path == "/agent/user-id": return 200, {"ok": True, "user_id": owner_user if keyed else None}
-                if path == "/owner/agents/issue": return 200, {"certificate": {"storage_b64": "Y2VydA=="}}
+                if path == "/owner/agents/issue":
+                    target = body["label"].removeprefix("home-e2e-")
+                    if me != "owner" or body["mode"] != "acp" or body["agent_public_key"] != public_keys[target]:
+                        return 400, {"ok": False}
+                    return 200, {"certificate": {"storage_b64": "Y2VydA=="}}
                 if path == "/announce":
                     if not (keyed and me in world["certs"]): return 400, {"ok": False}
                     world["announced"].add(me); return 200, {"ok": True}
@@ -243,6 +325,9 @@ esac
                     if me not in world["announced"]: return 403, {"ok": False}
                     if online(world["invites"][body["invite"]]): seats[me] = "member"
                     return 200, {"ok": True, "group_id": gid}
+                if path == f"/groups/{gid}":
+                    return 200, {"ok": True, "group_id": gid,
+                                 "membership_state": "active" if me in seats else "pending_authority_commit"}
                 members = f"/groups/{gid}/members"
                 if path == members:
                     return 200, {"members": [{"agent_id": ids[n], "role": r} for n, r in seats.items()]}
@@ -289,6 +374,14 @@ esac
                 error = caught
         return events, Custody.instance, world, evidence, error
 
+    def test_devices_without_owner_sync_pairing_are_caught_provisioning_a_duplicate(self):
+        # #824, Rule 9: the pairing is what prevents the duplicate Home. Without
+        # it, the fixture must FAIL on the device's own Home, not pass on it.
+        with mock.patch.object(self.h, "enroll_peer", lambda *_args, **_kwargs: None):
+            _events, _custody, _world, evidence, _error = self.run_model()
+        failed = [row["label"] for row in evidence.assertions if not row["passed"]]
+        self.assertIn("writer yields to the canonical Home instead of provisioning a duplicate", failed)
+
     def test_full_preparation_certifies_same_owner_devices_and_proves_outsider_denial(self):
         events, custody, world, evidence, error = self.run_model()
         self.assertIsNone(error)
@@ -303,6 +396,12 @@ esac
         self.assertLess(denial, events.index(("copy", "outsider")))
         labels = [row["label"] for row in evidence.assertions]
         self.assertIn("uncertified outsider is refused Home", labels)
+        # #824: every additional owner device is paired for owner sync both
+        # ways and yields to the canonical Home rather than provisioning one.
+        for label in ("writer", "late", "revoked", "outsider"):
+            self.assertIn(f"{label} yields to the canonical Home instead of provisioning a duplicate", labels)
+            self.assertIn(("owner", world["machines"][label]), world["enrolled"])
+            self.assertIn((label, world["machines"]["owner"]), world["enrolled"])
         self.assertIn("original owner device offline during admission", labels)
         self.assertIn("owner and admin devices offline during history; "
                       "history served by same-owner Member-role device", labels)
@@ -326,6 +425,26 @@ esac
                  last(("stop", "writer"))]
         self.assertEqual(sorted(chain), chain)
         self.assertEqual({"owner", "writer", "late", "outsider"}, set(world["seats"]))
+
+    def test_card_envelope_rejects_missing_or_malformed_signed_fields_before_issuance(self):
+        key, signature = "02" * 1952, "ab" * 3309
+        invalid = {
+            "top-level fields only": {"ok": True, "agent_public_key": key, "signature": signature},
+            "wrong nested shape": {"ok": True, "card": [key, signature]},
+            "missing public key": {"ok": True, "card": {"signature": signature}},
+            "unsigned": {"ok": True, "card": {"agent_public_key": key}},
+            "malformed public key": {"ok": True, "card": {"agent_public_key": "zz" * 1952,
+                                                        "signature": signature}},
+            "malformed signature": {"ok": True, "card": {"agent_public_key": key,
+                                                       "signature": "ab" * 3308}},
+        }
+        for name, reply in invalid.items():
+            with self.subTest(card=name):
+                events, _custody, _world, evidence, error = self.run_model(card_reply=reply)
+                self.assertIsInstance(error, AssertionError)
+                self.assertFalse(next(row["passed"] for row in evidence.assertions
+                                      if row["label"] == "writer signed card exposes public key"))
+                self.assertNotIn(("req", "owner", "POST", "/owner/agents/issue"), events)
 
     def test_revert_controls_fail(self):
         tests = Path(__file__).parent
@@ -385,6 +504,150 @@ esac
         with self.assertRaises(ValueError):
             custody.copy_owner_key(owner, owner)
 
+    def test_witness_parser_accepts_exact_line_and_rejects_malformed(self):
+        """Locks the receipt grammar; any drift in the logged line must fail parsing."""
+        digest = "ab" * 32
+        good = (f"x0x_control_blob_witness stage={self.h.WITNESS_STAGE} kind=member_added "
+                f"byte_len=60000 digest={digest}")
+        self.assertEqual({"stage": self.h.WITNESS_STAGE, "kind": "member_added",
+                          "byte_len": 60000, "digest": digest},
+                         self.h.parse_witness_line(good))
+        for bad in (good + " ", good.replace(digest, digest[:63]),
+                    good.replace("byte_len=60000", "byte_len="),
+                    good.replace("x0x_control_blob_witness", "x0x_control_blob_witness2")):
+            with self.subTest(line=bad):
+                with self.assertRaises(RuntimeError): self.h.parse_witness_line(bad)
+
+    def test_witness_oracle_credits_only_right_stage_and_oversized_kinds(self):
+        """Wrong stage, at-limit size, missing or substitute kind must fail an acceptance row."""
+        def witness(kind, byte_len, stage=None):
+            return {"stage": stage or self.h.WITNESS_STAGE, "kind": kind, "byte_len": byte_len,
+                    "digest": "ab" * 32, "node": "writer"}
+        for name, receipts, passed in (
+            ("both kinds oversized", [witness("member_added", 49_153), witness("join_result", 60_000)], [True, True]),
+            ("member_added missing", [witness("join_result", 60_000)], [False, True]),
+            ("wrong stage", [witness("member_added", 60_000, stage="handler_applied"),
+                             witness("join_result", 60_000)], [False, True]),
+            ("byte_len at the DM limit", [witness("member_added", 49_152), witness("join_result", 60_000)], [False, True]),
+            ("named_group_event substitute", [witness("named_group_event", 60_000),
+                                              witness("join_result", 60_000)], [False, True]),
+        ):
+            with self.subTest(case=name):
+                rows = self.h.witness_assertions(receipts)
+                self.assertEqual(["oversized member_added reassembled and validated for handler",
+                                  "oversized join_result reassembled and validated for handler"],
+                                 [row["label"] for row in rows])
+                self.assertEqual(passed, [row["passed"] for row in rows])
+
+    def test_custody_collects_bounded_strictly_parsed_node_tagged_witnesses(self):
+        """Oversized, overlong or unparsable witness output must fail collection, not pass."""
+        remote = mock.Mock()
+        custody = self.h.SyntheticProcessCustody(remote, "/opt/x0x/x0xd", "m" * 32)
+        custody.started["writer"] = self.node("writer")
+        line = (f"x0x_control_blob_witness stage={self.h.WITNESS_STAGE} kind=member_added "
+                f"byte_len=60000 digest={'ab' * 32}\n").encode()
+        remote.run.return_value = line
+        self.assertEqual([{"stage": self.h.WITNESS_STAGE, "kind": "member_added",
+                           "byte_len": 60000, "digest": "ab" * 32, "node": "writer"}],
+                         custody.control_blob_witnesses())
+        self.assertTrue(remote.run.call_args.kwargs["capture"])
+        remote.run.return_value = line + b"x0x_control_blob_witness garbage\n"
+        with self.assertRaises(RuntimeError): custody.control_blob_witnesses()
+        remote.run.return_value = line * (self.h.WITNESS_LINES_PER_NODE + 1)
+        with self.assertRaises(RuntimeError): custody.control_blob_witnesses()
+        remote.run.return_value = b"x" * (self.h.WITNESS_BYTES_PER_NODE + 1)
+        with self.assertRaises(RuntimeError): custody.control_blob_witnesses()
+
+    def test_witness_script_emits_one_line_past_the_bound_so_overflow_fails_closed(self):
+        """Real overflow must fail closed: the remote head passes exactly N+1
+        lines through, N+1 raises in collection, and the at-bound output still
+        collects."""
+        def script_output(log_lines):
+            with tempfile.TemporaryDirectory(prefix="home-witness-bound-") as root:
+                Path(f"{root}/fixture.marker").write_text("marker\n")
+                logs = Path(root) / "logs"; logs.mkdir()
+                line = (f"x0x_control_blob_witness stage={self.h.WITNESS_STAGE} "
+                        f"kind=member_added byte_len=60000 digest={'ab' * 32}")
+                (logs / "daemon.log").write_text("\n".join([line] * log_lines) + "\n")
+                command = self.h.Remote.command(self.h.WITNESS_SCRIPT, [root, "marker"],
+                                                input_bytes=False)
+                return subprocess.run(command, shell=True,
+                                      input=self.h.WITNESS_SCRIPT.encode(),
+                                      capture_output=True, timeout=5, check=True).stdout
+        emitted = script_output(self.h.WITNESS_LINES_PER_NODE + 2)
+        self.assertEqual(self.h.WITNESS_LINES_PER_NODE + 1, len(emitted.splitlines()))
+        remote = mock.Mock(); remote.run.side_effect = lambda *_args, **_kwargs: emitted
+        custody = self.h.SyntheticProcessCustody(remote, "/opt/x0x/x0xd", "m" * 32)
+        custody.started["writer"] = self.node("writer")
+        with self.assertRaisesRegex(RuntimeError, "lines exceed the bound"):
+            custody.control_blob_witnesses()
+        remote.run.side_effect = lambda *_args, **_kwargs: script_output(
+            self.h.WITNESS_LINES_PER_NODE)
+        self.assertEqual(self.h.WITNESS_LINES_PER_NODE,
+                         len(custody.control_blob_witnesses()))
+
+    def test_rust_witness_line_format_still_matches_the_fixture_receipt_regex(self):
+        """If the control_blob.rs format literal or stage drifts, or the dm.rs
+        payload limit moves, the fixture must fail loudly."""
+        rust = (Path(__file__).resolve().parent.parent /
+                "src/server/routes/named_groups/control_blob.rs").read_text(encoding="utf-8")
+        template = re.search(r'fn witness_line\b.*?"([^"]*x0x_control_blob_witness[^"]*)"',
+                             rust, re.DOTALL)
+        stage = re.search(r'const WITNESS_STAGE: &str = "([^"]+)"', rust)
+        self.assertIsNotNone(template)
+        self.assertIsNotNone(stage)
+        values = iter(("60000", "ab" * 32))
+        rendered = re.sub(r"\{\}", lambda _m: next(values),
+                          template.group(1).replace("{WITNESS_STAGE}", stage.group(1))
+                                           .replace("{kind}", "member_added"))
+        self.assertEqual({"stage": self.h.WITNESS_STAGE, "kind": "member_added",
+                          "byte_len": 60000, "digest": "ab" * 32},
+                         self.h.parse_witness_line(rendered))
+        dm = (Path(__file__).resolve().parent.parent /
+              "src/dm.rs").read_text(encoding="utf-8")
+        limit = re.search(r"pub const MAX_PAYLOAD_BYTES: usize = ([0-9_]+);", dm)
+        self.assertIsNotNone(limit, "src/dm.rs MAX_PAYLOAD_BYTES anchor drifted")
+        self.assertEqual(self.h.DM_MAX_PAYLOAD_BYTES, int(limit.group(1).replace("_", "")))
+
+    def test_main_collects_witnesses_after_restore_and_fails_closed_without_them(self):
+        """Exit stays 1 without both receipts; collection must follow restore so logs are flushed."""
+        order: list[str] = []
+        custody = mock.Mock()
+        custody.restore.side_effect = lambda: (order.append("restore"), [])[1]
+        custody.control_blob_witnesses.side_effect = lambda: (order.append("witnesses"), [])[1]
+        def populated(_args, _remote, _evidence, resources):
+            resources["custody"] = custody
+            return True
+        def run_main(populate):
+            with tempfile.TemporaryDirectory(prefix="home-witness-") as root:
+                report = Path(root) / "report.json"
+                argv = ["fixture", "--network", "synthetic-home", "--hosts-file", "hosts",
+                        "--nodes", "a", "b", "c", "d", "e", "--daemon-binary", "/x0xd",
+                        "--cli-binary", "/x0x", "--report", str(report)]
+                with mock.patch.object(sys, "argv", argv), \
+                     mock.patch.object(self.h, "run_fixture", side_effect=populate):
+                    code = self.h.main()
+                return code, json.loads(report.read_text(encoding="utf-8"))
+        with self.subTest(case="missing receipts"):
+            code, data = run_main(populated)
+            self.assertEqual(1, code)
+            self.assertEqual(["restore", "witnesses"], order)
+            self.assertEqual(["oversized member_added reassembled and validated for handler",
+                              "oversized join_result reassembled and validated for handler"],
+                             [row["label"] for row in data["assertions"] if not row["passed"]])
+        with self.subTest(case="collection error"):
+            custody.control_blob_witnesses.side_effect = RuntimeError("witness ssh failure")
+            code, data = run_main(populated)
+            self.assertEqual(1, code)
+            self.assertEqual(["control blob witness collection RuntimeError"],
+                             [row["label"] for row in data["assertions"] if not row["passed"]])
+        with self.subTest(case="no custody"):
+            code, data = run_main(lambda _a, _r, _e, _res: True)
+            self.assertEqual(1, code)
+            self.assertEqual(["control blob witness collection unavailable"],
+                             [row["label"] for row in data["assertions"] if not row["passed"]])
+            self.assertEqual([], data["control_blob_witnesses"])
+
     def test_partial_provision_and_report_failure_still_cleanup_every_resource(self):
         custody = mock.Mock(); custody.restore.return_value = []
         tunnel = mock.Mock()
@@ -401,13 +664,22 @@ esac
         custody.restore.assert_called_once_with(); stop.assert_called_once_with(tunnel)
 
     def test_main_report_exports_stores_polls_and_custody_for_gui_acceptance(self):
+        """Exit 0 needs witness receipts in the report; GUI acceptance reads them from the file."""
         # Root GUI acceptance must work from the frozen report alone: group and
         # store IDs plus page keys from evidence.stores, convergence receipts
-        # from evidence.polls, custody hash receipts from the manifest.
+        # from evidence.polls, custody hash receipts from the manifest, and
+        # runtime control-blob witnesses collected after restore.
         manifest = {"run_id": "a" * 32, "network_id": f"x0x.home.e2e.{'a' * 32}",
                     "binary_sha256": "b" * 64, "config_sha256": {"owner": "c" * 64}}
+        witnesses = [{"stage": self.h.WITNESS_STAGE, "kind": "member_added", "byte_len": 60_000,
+                      "digest": "a" * 64, "node": "writer"},
+                     {"stage": self.h.WITNESS_STAGE, "kind": "join_result", "byte_len": 50_000,
+                      "digest": "b" * 64, "node": "late"}]
+        custody = mock.Mock()
+        custody.restore.return_value = []
+        custody.control_blob_witnesses.return_value = witnesses
         def populate(_args, _remote, evidence, resources):
-            resources["manifest"] = manifest
+            resources["manifest"], resources["custody"] = manifest, custody
             evidence.check("home writer remains Member role", True, role="member")
             for app in ("wiki", "web"):
                 evidence.record_store("writer", "home-gid", app,
@@ -424,9 +696,11 @@ esac
                  mock.patch.object(self.h, "run_fixture", side_effect=populate):
                 self.assertEqual(0, self.h.main())
             data = json.loads(report.read_text(encoding="utf-8"))
-        self.assertEqual({"scenario", "custody", "stores", "polls", "assertions"}, set(data))
+        self.assertEqual({"scenario", "custody", "stores", "polls", "control_blob_witnesses",
+                          "assertions"}, set(data))
         self.assertEqual("synthetic-home", data["scenario"])
         self.assertEqual(manifest, data["custody"])
+        self.assertEqual(witnesses, data["control_blob_witnesses"])
         self.assertEqual([{"node": "writer", "group_id": "home-gid", "app": app,
                            "topic": f"topic-{app}", "store_id": "0" * 64}
                           for app in ("wiki", "web")], data["stores"])
@@ -435,6 +709,195 @@ esac
                            "outcome": "accepted"}], data["polls"])
         self.assertTrue(data["assertions"])
         self.assertTrue(all(row["passed"] for row in data["assertions"]))
+        self.assertEqual(["oversized member_added reassembled and validated for handler",
+                          "oversized join_result reassembled and validated for handler"],
+                         [row["label"] for row in data["assertions"]
+                          if row["label"].startswith("oversized")])
+
+    def test_home_join_seat_receipt_distinguishes_delayed_timeout_and_http_error(self):
+        secret = "DO-NOT-RETAIN-CERT-OR-TOKEN"
+        target = {"agent_id": "a" * 64, "role": "member"}
+        other = {"agent_id": "c" * 64, "role": "owner"}
+        delayed = self.h.Evidence()
+        samples = self.run_join_offline(delayed, [
+            (200, {"members": [other], "token": secret}),
+            (200, {"members": [other], "certificate": secret}),
+            (200, {"members": [other, target], "invite": secret})])
+        self.assertEqual(3, len(samples))
+        self.assertEqual("pending_authority_commit", delayed.assertions[0]["join_state"])
+        self.assertTrue(delayed.assertions[0]["passed"])
+        accepted = delayed.polls[0]
+        self.assertEqual(("member Home seat reaches owner and local readiness", "accepted", 120, 2.0, 200, 2, True),
+                         (accepted["label"], accepted["outcome"], accepted["deadline_seconds"],
+                          accepted["elapsed_seconds"], accepted["last_http_status"],
+                          accepted["observed_member_count"], accepted["expected_member_present"]))
+        self.assertEqual("active", accepted["local_membership_state"])
+        self.assertEqual(3, accepted["local_probe_count"])
+        self.assertNotIn(secret, json.dumps(delayed.polls))
+
+        for label, response, expected_status, expected_count, expected_present in (
+            ("unseated", (200, {"members": [other], "certificate": secret}), 200, 1, False),
+            ("http_error", (503, {"members": [target], "error": secret}), 503, None, None),
+        ):
+            with self.subTest(label=label):
+                evidence = self.h.Evidence()
+                with self.assertRaisesRegex(AssertionError, "member Home seat reaches owner and local readiness"):
+                    self.run_join_offline(evidence, [response], join_state=secret)
+                self.assertEqual("other", evidence.assertions[0]["join_state"])
+                receipt = evidence.polls[0]
+                self.assertEqual("timeout", receipt["outcome"])
+                self.assertEqual(120, receipt["deadline_seconds"])
+                self.assertEqual(120.0, receipt["elapsed_seconds"])
+                self.assertEqual(expected_status, receipt["last_http_status"])
+                self.assertEqual(expected_count, receipt["observed_member_count"])
+                self.assertEqual(expected_present, receipt["expected_member_present"])
+                self.assertEqual(120, receipt["probe_count"])
+                self.assertNotIn(secret, json.dumps({"polls": evidence.polls,
+                                                    "assertions": evidence.assertions}))
+
+    def test_home_join_waits_for_local_active_after_owner_roster(self):
+        evidence = self.h.Evidence()
+        samples = self.run_join_offline(
+            evidence,
+            [(200, {"members": [{"agent_id": "a" * 64}]})],
+            local_responses=[
+                (200, {"ok": True, "group_id": "home-gid", "membership_state": "pending_authority_commit"}),
+                (200, {"ok": True, "group_id": "home-gid", "membership_state": "active"}),
+            ],
+        )
+        self.assertEqual(2, len(samples))
+        receipt = evidence.polls[0]
+        self.assertEqual("accepted", receipt["outcome"])
+        self.assertEqual("active", receipt["local_membership_state"])
+        self.assertEqual(2, receipt["local_probe_count"])
+        self.assertEqual(1, receipt["observed_member_count"])
+
+    def test_home_join_local_pending_timeout_records_terminal_status(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                local_responses=[(200, {"ok": True, "group_id": "home-gid",
+                                        "membership_state": "pending_authority_commit"})],
+                local_join_status=(404, {"error": "group_not_found",
+                                         "last_join_outcome": {"outcome": "timed_out",
+                                                                "reason": "synthetic"}}),
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual(120, receipt["elapsed_seconds"])
+        self.assertEqual(404, receipt["terminal_join_status"])
+        self.assertEqual("timed_out", receipt["terminal_join_outcome"])
+        self.assertEqual("pending_authority_commit", receipt["local_membership_state"])
+        self.assertNotIn("synthetic", json.dumps(evidence.polls))
+
+    def test_home_join_local_http_error_fails_without_claiming_active(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                local_responses=[(503, {"error": "synthetic-secret"})],
+                local_join_status=(503, {"error": "join status unavailable"}),
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual(503, receipt["local_last_status"])
+        self.assertIsNone(receipt["local_membership_state"])
+        self.assertNotIn("synthetic-secret", json.dumps(evidence.polls))
+
+    def test_home_join_shared_deadline_does_not_double_owner_and_local_waits(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "c" * 64}]})],
+                local_responses=[(200, {"ok": True, "group_id": "wrong-group",
+                                        "membership_state": "active"})],
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual(120, receipt["elapsed_seconds"])
+        self.assertEqual(120, receipt["probe_count"])
+        self.assertEqual(120, receipt["local_probe_count"])
+
+    def test_home_join_request_and_terminal_errors_still_emit_bounded_receipt(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                local_responses=[(200, {"group_id": "home-gid", "membership_state": "pending_authority_commit"})],
+                owner_error_at=tuple(range(200)),
+                terminal_error="secret-terminal-error",
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertEqual("RuntimeError", receipt["last_error_class"])
+        self.assertEqual("RuntimeError", receipt["terminal_join_status_error_class"])
+        self.assertIsNone(receipt["terminal_join_status"])
+        self.assertNotIn("secret-terminal-error", json.dumps(evidence.polls))
+
+    def test_home_join_unknown_state_and_terminal_outcome_are_redacted_to_other(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                local_responses=[(200, {"ok": True, "group_id": "home-gid",
+                                        "membership_state": ["SECRET_STATE"]})],
+                local_join_status=(404, {"last_join_outcome": {"outcome": ["SECRET_OUTCOME"]}}),
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("other", receipt["local_membership_state"])
+        self.assertEqual("other", receipt["terminal_join_outcome"])
+        self.assertNotIn("SECRET_STATE", json.dumps(evidence.polls))
+        self.assertNotIn("SECRET_OUTCOME", json.dumps(evidence.polls))
+
+    def test_home_join_rejects_readiness_that_crosses_shared_deadline(self):
+        evidence = self.h.Evidence()
+        with self.assertRaisesRegex(AssertionError, "local readiness"):
+            self.run_join_offline(
+                evidence,
+                [(200, {"members": [{"agent_id": "a" * 64}]})],
+                request_advance=61.0,
+            )
+        receipt = evidence.polls[0]
+        self.assertEqual("timeout", receipt["outcome"])
+        self.assertTrue(receipt["deadline_reached_before_acceptance"])
+        self.assertEqual(1, receipt["probe_count"])
+        self.assertEqual(1, receipt["local_probe_count"])
+        self.assertGreaterEqual(receipt["elapsed_seconds"], 120)
+
+    def test_failed_home_seat_poll_still_reports_and_cleans_up(self):
+        custody = mock.Mock(); custody.restore.return_value = []
+        # Witness rows are appended after restore, so they follow the
+        # fixture's own failure row; give the collector a real (empty) list.
+        custody.control_blob_witnesses.return_value = []
+        tunnel = mock.Mock()
+        def fail(_args, _remote, evidence, resources):
+            resources["custody"] = custody
+            resources["tunnels"] = [tunnel]
+            resources["manifest"] = {"run_id": "a" * 32}
+            self.run_join_offline(evidence, [(200, {"members": []})])
+        with tempfile.TemporaryDirectory(prefix="home-seat-report-") as root:
+            report = Path(root) / "report.json"
+            argv = ["fixture", "--network", "synthetic-home", "--hosts-file", "hosts",
+                    "--nodes", "a", "b", "c", "d", "e", "--daemon-binary", "/x0xd",
+                    "--cli-binary", "/x0x", "--report", str(report)]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(self.h, "run_fixture", side_effect=fail), \
+                 mock.patch.object(self.h, "stop_ssh_tunnel") as stop:
+                self.assertEqual(1, self.h.main())
+            data = json.loads(report.read_text(encoding="utf-8"))
+        custody.restore.assert_called_once_with()
+        stop.assert_called_once_with(tunnel)
+        self.assertEqual("timeout", data["polls"][0]["outcome"])
+        self.assertEqual(200, data["polls"][0]["last_http_status"])
+        self.assertFalse(data["polls"][0]["expected_member_present"])
+        failure = [row for row in data["assertions"] if row["label"] == "fixture AssertionError"]
+        self.assertEqual(1, len(failure), data["assertions"])
+        self.assertFalse(failure[0]["passed"])
 
 
 if __name__ == "__main__": unittest.main()
