@@ -12003,6 +12003,16 @@ impl Agent {
         &self,
         agent: &identity::AgentId,
     ) -> Option<identity::AgentCertificate> {
+        // #797: the daemon's OWN agent. Self-issuance deliberately keeps the
+        // cert journal lean (agent.cert is the durable copy) and the peer
+        // discovery cache never contains ourselves, so neither source below
+        // can resolve the local agent — the identity accessor is
+        // authoritative for it.
+        if *agent == self.agent_id() {
+            if let Some(cert) = self.identity().agent_certificate() {
+                return Some(cert.clone());
+            }
+        }
         if let Ok(Some(entry)) = self.discovered_agent(*agent).await {
             if let Some(cert) = entry.agent_certificate {
                 return Some(cert);
@@ -18838,6 +18848,67 @@ fn spawn_relay_dm_listener(
 
 #[cfg(test)]
 mod tests {
+    mod own_agent_certificate_lookup_797 {
+        use super::*;
+
+        /// #797: revoking the daemon's OWN agent binding must work from the
+        /// identity certificate when neither secondary source can answer —
+        /// the discovery cache never contains ourselves, and the issuance
+        /// journal is stripped here. FAIL-BEFORE (the local-identity
+        /// fallback in `agent_certificate_for` removed): revoke_binding
+        /// errors "no certificate known for the agent".
+        #[tokio::test]
+        async fn revoke_own_agent_binding_uses_identity_certificate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let agent = Agent::builder()
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_identity_dir(dir.path())
+                .with_user_key(identity::UserKeypair::generate().expect("owner user key"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            let own = agent.agent_id();
+            let user_kp = agent
+                .identity()
+                .user_keypair()
+                .expect("owner user key (self-issuance implies one)");
+            // Strip the issuance journal the journal source would answer
+            // from (the builder appends the self-issuance record next to
+            // agent.cert); the discovery cache is empty by construction.
+            std::fs::remove_file(dir.path().join(profile::CERT_JOURNAL_FILE))
+                .expect("issuance journal stripped");
+
+            // Seed the placement the revocation epoch order needs.
+            let owner_pk = user_kp.public_key().as_bytes().to_vec();
+            let secret = user_kp.secret_key();
+            let record = key_move::PlacementRecord::sign(
+                own,
+                &owner_pk,
+                key_move::Placement::Roaming,
+                1,
+                1,
+                secret,
+            )
+            .expect("placement sign");
+            {
+                let mut state = agent.move_state.write().await;
+                let cert = agent.identity().agent_certificate().expect("cert");
+                let authority = key_move::PlacementAuthority::cert_issuer(cert).expect("authority");
+                state
+                    .cache_placement(record, authority)
+                    .expect("placement cached");
+            }
+
+            let machine = agent.machine_id();
+            let outcome = agent.revoke_binding(&own, &machine, 1, None).await;
+            assert!(
+                outcome.is_ok(),
+                "own-agent binding revocation must use the identity certificate: {outcome:?}"
+            );
+        }
+    }
+
     mod announcement_role_honesty {
         use super::*;
 
