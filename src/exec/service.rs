@@ -994,14 +994,14 @@ impl ExecService {
             return Err(DenialReason::StdinTooLarge);
         }
         let requested_secs = u64::from(timeout_ms).saturating_add(999) / 1000;
-        if requested_secs > matched.effective_max_duration_secs {
+        if requested_secs > matched.effective_max_duration_secs() {
             return Err(DenialReason::TimeoutTooLarge);
         }
         Ok(CheckedRequest {
             caps: acl.caps.clone(),
             max_duration: Duration::from_secs(requested_secs.max(1)),
             cwd: acl.caps.default_cwd.clone(),
-            description: matched.description.cloned(),
+            description: matched.description().cloned(),
         })
     }
 

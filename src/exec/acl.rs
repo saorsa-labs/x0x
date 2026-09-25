@@ -253,10 +253,46 @@ pub enum AllowedToken {
 /// Result of a command match.
 #[derive(Debug, Clone)]
 pub struct MatchedCommand<'a> {
-    /// Description of the matched entry (exact-pair or `principal = "owner"`).
-    pub description: Option<&'a String>,
+    pub entry: &'a AllowEntry,
     pub command: &'a AllowedCommand,
     pub effective_max_duration_secs: u64,
+}
+
+/// Result of a command match against a `principal = "owner"` entry.
+#[derive(Debug, Clone)]
+pub struct OwnerMatchedCommand<'a> {
+    pub entry: &'a OwnerAllowEntry,
+    pub command: &'a AllowedCommand,
+    pub effective_max_duration_secs: u64,
+}
+
+/// Result of [`ExecAcl::match_command_for_principal`]: which selector matched.
+#[derive(Debug, Clone)]
+pub enum PrincipalMatch<'a> {
+    /// An exact `(agent_id, machine_id)` entry matched.
+    Pair(MatchedCommand<'a>),
+    /// A `principal = "owner"` entry matched (ADR-0070 §1).
+    Owner(OwnerMatchedCommand<'a>),
+}
+
+impl PrincipalMatch<'_> {
+    /// Description of the matched entry.
+    #[must_use]
+    pub fn description(&self) -> Option<&String> {
+        match self {
+            Self::Pair(m) => m.entry.description.as_ref(),
+            Self::Owner(m) => m.entry.description.as_ref(),
+        }
+    }
+
+    /// Effective duration cap of the matched entry.
+    #[must_use]
+    pub fn effective_max_duration_secs(&self) -> u64 {
+        match self {
+            Self::Pair(m) => m.effective_max_duration_secs,
+            Self::Owner(m) => m.effective_max_duration_secs,
+        }
+    }
 }
 
 /// ACL load/validation error.
@@ -571,7 +607,21 @@ impl ExecAcl {
         machine_id: &MachineId,
         argv: &[String],
     ) -> Option<MatchedCommand<'a>> {
-        self.match_command_for_principal(agent_id, machine_id, false, argv)
+        self.allow
+            .iter()
+            .filter(|entry| entry.agent_id == *agent_id && entry.machine_id == *machine_id)
+            .find_map(|entry| {
+                entry.commands.iter().find_map(|command| {
+                    command.matches(argv).then_some(MatchedCommand {
+                        entry,
+                        command,
+                        effective_max_duration_secs: entry
+                            .max_duration_secs
+                            .unwrap_or(self.caps.max_duration_secs)
+                            .min(self.caps.max_duration_secs),
+                    })
+                })
+            })
     }
 
     /// Find an allowlist command for the requester across both selectors:
@@ -585,30 +635,27 @@ impl ExecAcl {
         machine_id: &MachineId,
         owner_trusted: bool,
         argv: &[String],
-    ) -> Option<MatchedCommand<'a>> {
-        let pair_entries = self
-            .allow
-            .iter()
-            .filter(|entry| entry.agent_id == *agent_id && entry.machine_id == *machine_id)
-            .map(|entry| (&entry.description, entry.max_duration_secs, &entry.commands));
-        let owner_entries = self
-            .owner_allow
-            .iter()
-            .filter(|_| owner_trusted)
-            .map(|entry| (&entry.description, entry.max_duration_secs, &entry.commands));
-        pair_entries
-            .chain(owner_entries)
-            .find_map(|(description, max_duration_secs, commands)| {
-                commands.iter().find_map(|command| {
-                    command.matches(argv).then_some(MatchedCommand {
-                        description: description.as_ref(),
+    ) -> Option<PrincipalMatch<'a>> {
+        if let Some(matched) = self.match_command(agent_id, machine_id, argv) {
+            return Some(PrincipalMatch::Pair(matched));
+        }
+        if !owner_trusted {
+            return None;
+        }
+        self.owner_allow.iter().find_map(|entry| {
+            entry.commands.iter().find_map(|command| {
+                command
+                    .matches(argv)
+                    .then_some(PrincipalMatch::Owner(OwnerMatchedCommand {
+                        entry,
                         command,
-                        effective_max_duration_secs: max_duration_secs
+                        effective_max_duration_secs: entry
+                            .max_duration_secs
                             .unwrap_or(self.caps.max_duration_secs)
                             .min(self.caps.max_duration_secs),
-                    })
-                })
+                    }))
             })
+        })
     }
 
     /// Whether any ACL entry matches this requester pair.
@@ -1154,7 +1201,8 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
         let matched = acl
             .match_command_for_principal(&agent, &machine, true, &uptime)
             .expect("owner-trusted pair matches the owner entry");
-        assert_eq!(matched.effective_max_duration_secs, 5);
+        assert!(matches!(matched, PrincipalMatch::Owner(_)));
+        assert_eq!(matched.effective_max_duration_secs(), 5);
         assert!(acl.has_entry_for_principal(&agent, &machine, true));
 
         assert!(acl
