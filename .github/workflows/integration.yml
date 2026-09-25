@@ -127,6 +127,42 @@ jobs:
       - name: Run bound-port forwarding regression
         run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
 
+  # Tailnet (ADR-0074 slice 0): the ignored loopback stream/forward suites
+  # (7 in tailnet_streams_integration + 1 in forward_v2_attestation_e2e).
+  # The ninth ignored tailnet test (forward.rs port-zero regression) already
+  # runs in integration-core. --test-threads 1 keeps the backpressure and
+  # bounded-acceptor timing proofs from contending with each other.
+  tailnet:
+    name: Integration (tailnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+      - name: Run ignored tailnet stream and forward suites
+        run: |
+          bash scripts/ci/nextest-isolated.sh --all-features \
+            --test tailnet_streams_integration \
+            --test forward_v2_attestation_e2e -- \
+            --run-ignored ignored-only \
+            --no-tests=fail \
+            --test-threads 1
+
   # Groups: the heavy named-group daemon suite (28 daemon-backed tests),
   # isolated on its own runner so it cannot stack on core's cold build.
   # See issue #197: core was cancelled at its budget when this suite rode
