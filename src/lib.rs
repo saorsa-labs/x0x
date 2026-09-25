@@ -196,6 +196,9 @@ pub mod history;
 #[cfg(feature = "voice")]
 pub mod voice;
 
+/// Call lifecycle signalling over the voice DM channel (ADR-0073 slice 1).
+pub mod calls;
+
 pub mod connect;
 /// Secure Tier-1 remote exec protocol and runtime.
 pub mod exec;

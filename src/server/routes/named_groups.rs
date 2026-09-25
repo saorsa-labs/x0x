@@ -36264,6 +36264,7 @@ pub(in crate::server) mod tests {
             start_time: Instant::now(),
             health_snapshot: Arc::new(crate::server::routes::status::HealthSnapshot::default()),
             broadcast_tx,
+            calls: crate::server::routes::calls::new_registry(),
             file_transfers: RwLock::new(HashMap::new()),
             receive_hashers: RwLock::new(HashMap::new()),
             pending_file_chunks: RwLock::new(HashMap::new()),

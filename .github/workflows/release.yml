@@ -234,6 +234,7 @@ jobs:
         run: |
           set -o pipefail
           cargo build --locked --release --target ${{ matrix.target }} \
+            --features voice \
             --bin x0xd --bin x0x --message-format=json-render-diagnostics \
             | tee "${RUNNER_TEMP}/release-${{ matrix.platform }}-build.jsonl"
 
@@ -243,6 +244,7 @@ jobs:
         run: |
           set -o pipefail
           cross build --locked --release --target ${{ matrix.target }} \
+            --features voice \
             --bin x0xd --bin x0x --message-format=json-render-diagnostics \
             | tee "${RUNNER_TEMP}/release-${{ matrix.platform }}-build.jsonl"
 

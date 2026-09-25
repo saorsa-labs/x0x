@@ -250,6 +250,22 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<ExecSub>,
     },
+    /// Audio/video call lifecycle (ADR-0073). Media plays in the GUI; the
+    /// CLI only rings, answers and hangs up.
+    ///
+    /// Ring an agent:  `x0x call <agent_id> [--video]`
+    /// Manage calls:   `x0x call list|show|accept|reject|hangup <call_id>`
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Call {
+        /// Agent ID to ring (64-char hex).
+        agent_id: Option<String>,
+        /// Request video as well as audio.
+        #[arg(long)]
+        video: bool,
+        /// `list` / `show` / `accept` / `reject` / `hangup` sub-actions.
+        #[command(subcommand)]
+        sub: Option<CallSub>,
+    },
     /// Direct messaging.
     Direct {
         #[command(subcommand)]
@@ -906,6 +922,33 @@ enum ForwardSub {
     Remove {
         /// Local bind address, e.g. `127.0.0.1:8022`.
         local_addr: String,
+    },
+}
+
+/// Call sub-actions (`x0x call list|show|accept|reject|hangup`).
+#[derive(Subcommand)]
+enum CallSub {
+    /// List calls with gate and lifecycle counters.
+    List,
+    /// Show one call.
+    Show {
+        /// Call id.
+        call_id: String,
+    },
+    /// Answer a ringing incoming call.
+    Accept {
+        /// Call id.
+        call_id: String,
+    },
+    /// Decline a ringing incoming call.
+    Reject {
+        /// Call id.
+        call_id: String,
+    },
+    /// End or cancel a call.
+    Hangup {
+        /// Call id.
+        call_id: String,
     },
 }
 
@@ -2463,6 +2506,29 @@ async fn run(
                     )
                     .await
                 }
+            }
+        },
+        Commands::Call {
+            agent_id,
+            video,
+            sub,
+        } => match sub {
+            Some(CallSub::List) => commands::call::list(&client).await,
+            Some(CallSub::Show { call_id }) => commands::call::show(&client, &call_id).await,
+            Some(CallSub::Accept { call_id }) => {
+                commands::call::action(&client, &call_id, "accept").await
+            }
+            Some(CallSub::Reject { call_id }) => {
+                commands::call::action(&client, &call_id, "reject").await
+            }
+            Some(CallSub::Hangup { call_id }) => {
+                commands::call::action(&client, &call_id, "hangup").await
+            }
+            None => {
+                let Some(agent_id) = agent_id else {
+                    anyhow::bail!("usage: x0x call <agent_id> [--video] | x0x call list|show|accept|reject|hangup <call_id>");
+                };
+                commands::call::create(&client, &agent_id, video).await
             }
         },
         Commands::Direct { sub } => match sub {
