@@ -2364,6 +2364,13 @@ pub async fn serve_with_options(
         .route("/acl/exec", get(acl_exec_list).post(acl_exec_add))
         .route("/acl/exec/:id", delete(acl_exec_remove))
         .route("/acl/reload", post(acl_reload))
+        // ADR-0070 §2: share grants (issue/list/revoke; received list)
+        .route(
+            "/grants",
+            get(routes::grants_list).post(routes::grants_issue),
+        )
+        .route("/grants/received", get(routes::grants_received))
+        .route("/grants/:id", delete(routes::grants_revoke))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))

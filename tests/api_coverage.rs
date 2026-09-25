@@ -576,6 +576,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/acl/exec", acl_routes_wired),
     covered!(Delete, "/acl/exec/:id", acl_routes_wired),
     covered!(Post, "/acl/reload", acl_routes_wired),
+    // ── Share grants (ADR-0070 §2) ──────────────────────────────────────
+    covered!(Get, "/grants", grant_routes_wired),
+    covered!(Post, "/grants", grant_routes_wired),
+    covered!(Delete, "/grants/:id", grant_routes_wired),
+    covered!(Get, "/grants/received", grant_routes_wired),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
@@ -627,6 +632,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/acl.rs",
         include_str!("../src/server/routes/acl.rs"),
+    ),
+    (
+        "src/server/routes/grants.rs",
+        include_str!("../src/server/routes/grants.rs"),
     ),
     (
         "tests/peer_lifecycle_integration.rs",

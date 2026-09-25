@@ -50,6 +50,12 @@ POST /acl/exec
 DELETE /acl/exec/*
 POST /acl/reload
 
+# ── ADR-0070 §2 share grants — durable API token only, like /acl/*. ──
+GET /grants
+POST /grants
+DELETE /grants/*
+GET /grants/received
+
 # ── Identity card — the GUI calls it via the agentCardPath() helper
 # (share links need the query params), so the first argument is a
 # function call, not a path literal the crawler can statically match.

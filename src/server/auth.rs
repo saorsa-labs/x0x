@@ -304,6 +304,11 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
     if is_acl_admin_path(path) {
         return true;
     }
+    // ADR-0070 §2: share grants decide who reaches the owner's agents;
+    // every method is owner/durable-token only.
+    if is_grants_path(path) {
+        return true;
+    }
     match *method {
         Method::POST => {
             matches!(
@@ -336,6 +341,15 @@ fn is_acl_admin_path(path: &str) -> bool {
                 .and_then(|rest| rest.strip_prefix('/'))
                 .is_some_and(|id| !id.is_empty() && !id.contains('/'))
     })
+}
+
+/// `true` for the ADR-0070 §2 grant routes: `/grants` and
+/// `/grants/<nonempty-segment>` (including `/grants/received`).
+fn is_grants_path(path: &str) -> bool {
+    path == "/grants"
+        || path
+            .strip_prefix("/grants/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// `true` for exactly `/groups/<nonempty-id>/delegate`.
@@ -1059,6 +1073,23 @@ mod tests {
             "/acl/connectx",
         ] {
             assert!(!is_acl_admin_path(path), "{path} must not be classified");
+        }
+    }
+
+    #[test]
+    fn grant_routes_require_durable_owner_for_every_method() {
+        // ADR-0070 §2: listing grants reveals who may reach the owner's
+        // agents; issuing/revoking changes it. Durable-owner only.
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for path in ["/grants", "/grants/received", "/grants/00ff"] {
+                assert!(
+                    requires_durable_owner(&method, path),
+                    "{method} {path} must be durable-owner"
+                );
+            }
+        }
+        for path in ["/grant", "/grants/", "/grants/a/b", "/grantsx"] {
+            assert!(!is_grants_path(path), "{path} must not be classified");
         }
     }
 }

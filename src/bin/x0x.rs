@@ -374,6 +374,34 @@ enum Commands {
         #[command(subcommand)]
         sub: AclSub,
     },
+    /// Share a subset of your agents with another user or agent
+    /// (ADR-0070 ShareGrant; durable API token only).
+    Grant {
+        #[command(subcommand)]
+        sub: GrantSub,
+    },
+}
+
+/// `x0x grant` sub-actions.
+#[derive(Subcommand)]
+enum GrantSub {
+    /// Sign a grant with the owner key and deliver it: the `POST /grants`
+    /// body as JSON (literal, `@path`, or `-` for stdin).
+    Issue {
+        /// Grant JSON, e.g. '{"grantee_user":"<hex>","agents":["<hex>"],
+        /// "caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}'.
+        #[arg(value_name = "GRANT_JSON")]
+        grant: String,
+    },
+    /// List grants this install's owner issued, with status.
+    List,
+    /// Revoke a grant (owner key; gossiped on x0x.revocation.v3).
+    Revoke {
+        /// Grant id (64 hex chars) from `list`.
+        id: String,
+    },
+    /// List grants that name this install as grantee.
+    Received,
 }
 
 /// `x0x acl` sub-actions.
@@ -3026,6 +3054,12 @@ async fn run(
             AclSub::Exec { sub } => {
                 run_acl_plane(&client, commands::acl::AclPlane::Exec, sub).await
             }
+        },
+        Commands::Grant { sub } => match sub {
+            GrantSub::Issue { grant } => commands::grant::issue(&client, &grant).await,
+            GrantSub::List => commands::grant::list(&client).await,
+            GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
+            GrantSub::Received => commands::grant::received(&client).await,
         },
         Commands::Routes { .. }
         | Commands::Tree
