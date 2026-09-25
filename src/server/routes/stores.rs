@@ -3064,6 +3064,25 @@ mod tests {
         assert!(resolve_gss_group_store(&groups, "missing", "Wiki", &AgentId([2; 32])).is_err());
     }
 
+    /// #794: an invite-joined GSS member's stub starts KEYLESS — the real
+    /// secret arrives via `SecureShareDelivered` after committed admission.
+    /// Until then, opening/creating the group store must fail closed with
+    /// the explicit 409, never silently open with a wrong local secret.
+    #[test]
+    fn gss794_keyless_stub_store_open_fails_closed() {
+        let gid = "79".repeat(16);
+        let mut info = binding_fixture(&gid);
+        info.shared_secret = None;
+        let groups = std::collections::HashMap::from([(gid.clone(), info)]);
+        let err = resolve_gss_group_store(&groups, &gid, "Wiki", &AgentId([2; 32]))
+            .expect_err("keyless stub must refuse store resolution");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "keyless stub is a 409, not a silent wrong-secret open"
+        );
+    }
+
     #[test]
     fn issue565_restore_manifest_cannot_supply_identity_or_authority() {
         let gid = "ab".repeat(16);

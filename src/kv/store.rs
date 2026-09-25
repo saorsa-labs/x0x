@@ -651,7 +651,16 @@ pub fn make_owner_checkpoint(params: OwnerCheckpointParams<'_>) -> Result<OwnerC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeOutcome {
     Applied,
-    Rejected,
+    SubsumedCheckpoint,
+    Rejected(MergeRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeRejection {
+    GroupSignedAuthority,
+    UnauthorizedWriter,
+    AnonymousWriter,
+    AmbiguousDelta,
 }
 
 /// A replicated key-value store using CRDTs with access control.
@@ -2166,6 +2175,40 @@ impl KvStore {
         peer_id: PeerId,
         writer: Option<&AgentId>,
     ) -> Result<MergeOutcome> {
+        self.merge_delta_with_outcome_inner(delta, peer_id, writer, false)
+    }
+
+    /// Merge an encrypted delta while the caller holds this store's write
+    /// guard and the attached GSS context's authorization read guard. This
+    /// skips only the duplicate writer lookup, which would recursively take
+    /// the context read lock and can deadlock behind a waiting updater.
+    pub(crate) fn merge_guarded_encrypted_delta(
+        &mut self,
+        delta: &KvStoreDelta,
+        peer_id: PeerId,
+        writer: &AgentId,
+        verified_context: &Arc<dyn KvSecureContext>,
+    ) -> Result<MergeOutcome> {
+        if !matches!(self.policy, AccessPolicy::Encrypted { .. })
+            || !self
+                .secure
+                .as_ref()
+                .is_some_and(|attached| Arc::ptr_eq(attached, verified_context))
+        {
+            return Err(KvError::Unauthorized(
+                "guarded encrypted merge requires its attached secure context".to_string(),
+            ));
+        }
+        self.merge_delta_with_outcome_inner(delta, peer_id, Some(writer), true)
+    }
+
+    fn merge_delta_with_outcome_inner(
+        &mut self,
+        delta: &KvStoreDelta,
+        peer_id: PeerId,
+        writer: Option<&AgentId>,
+        writer_pre_authorized: bool,
+    ) -> Result<MergeOutcome> {
         // SelfKeyed directories take the per-key path: no owner gate, no
         // checkpoint adoption — the store has no owner for life (I3/I8), so
         // both owner-anchored blocks below would no-op anyway.
@@ -2191,7 +2234,7 @@ impl KvStore {
                 "rejected group-signed delta carrying non-content authority for store {}",
                 self.id
             );
-            return Ok(MergeOutcome::Rejected);
+            return Ok(MergeOutcome::Rejected(MergeRejection::GroupSignedAuthority));
         }
         // Authoritative full-snapshot checkpoint adoption (cold-recovery path):
         // if the checkpoint's content root matches the relayed entry set, adopt
@@ -2220,18 +2263,18 @@ impl KvStore {
                     self.highest_checkpoint_seq,
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected);
+                return Ok(MergeOutcome::SubsumedCheckpoint);
             }
         }
         // Access control: reject unauthorized writes
         if let Some(writer_id) = writer {
-            if !self.is_authorized(writer_id) {
+            if !writer_pre_authorized && !self.is_authorized(writer_id) {
                 tracing::warn!(
                     "rejected delta from unauthorized writer {} for store {}",
                     hex::encode(writer_id.as_bytes()),
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected); // Silent rejection — don't propagate errors for spam
+                return Ok(MergeOutcome::Rejected(MergeRejection::UnauthorizedWriter));
             }
         } else {
             // No writer identity applies nothing under ANY policy: the
@@ -2241,7 +2284,7 @@ impl KvStore {
             // sync is wired — it is no longer an anonymous-merge escape
             // hatch.
             tracing::warn!("rejected anonymous delta for store {}", self.id);
-            return Ok(MergeOutcome::Rejected);
+            return Ok(MergeOutcome::Rejected(MergeRejection::AnonymousWriter));
         }
 
         // Canonical-map gate, ALL policies: a delta carrying the same key in
@@ -2258,7 +2301,7 @@ impl KvStore {
                     "rejected ambiguous delta for store {}: key {key:?} appears in both added and updated",
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected);
+                return Ok(MergeOutcome::Rejected(MergeRejection::AmbiguousDelta));
             }
         }
 
@@ -2695,6 +2738,27 @@ impl KvStore {
         if cp.store_id != self.id {
             return;
         }
+        // Adoption rejects a checkpoint that would downgrade a terminal
+        // policy, but an owner-authenticated delta then falls through to the
+        // entry merge path. Preserve that entry behavior while refusing to
+        // cache the rejected checkpoint or advance its high-water sequence.
+        let preserves_terminal_policy = match (&self.policy, &cp.policy) {
+            (AccessPolicy::AppendOnly, AccessPolicy::AppendOnly) => true,
+            (AccessPolicy::AppendOnly, _) => false,
+            (
+                AccessPolicy::Encrypted { group_id: current },
+                AccessPolicy::Encrypted { group_id: claimed },
+            )
+            | (
+                AccessPolicy::TreeKemEncrypted { group_id: current },
+                AccessPolicy::TreeKemEncrypted { group_id: claimed },
+            ) => current == claimed,
+            (AccessPolicy::Encrypted { .. } | AccessPolicy::TreeKemEncrypted { .. }, _) => false,
+            _ => true,
+        };
+        if !preserves_terminal_policy {
+            return;
+        }
         // Cache only if the resulting complete state matches the checkpoint.
         let matches = {
             let pairs = self.checkpoint_pairs();
@@ -2853,8 +2917,17 @@ impl KvStore {
         // Remote images contribute retained content only. Identity, policy,
         // checkpoint authority, allowlists, and local sequence state remain
         // locally anchored.
+        // A replay of the same complete image from the same current writer
+        // must not mint a new serialized retained image solely by bumping the
+        // store version. Newly retained tags/tombstones, any full entry-field
+        // change, and a new authenticated endorser remain versioned changes.
+        let changed = trial.keys.version() != self.keys.version()
+            || !retained_entries_equal(&trial.entries, &self.entries)
+            || self.last_history_endorser.as_ref() != Some(&endorser);
         trial.last_history_endorser = Some(endorser);
-        trial.version = self.version.saturating_add(1);
+        if changed {
+            trial.version = self.version.saturating_add(1);
+        }
         if let Some(floor) = retained_sequence_floor {
             trial.restore_seq_counter(floor);
         }
@@ -4217,6 +4290,295 @@ mod tests {
             target.policy(),
             AccessPolicy::GroupSigned { group_id } if group_id == &group
         ));
+    }
+
+    /// Socket-free characterization of retained-image paging (issue-802
+    /// mechanism, NOT a live-R8 reproduction): the positive control proves
+    /// complementary single-frame loss retries assemble a stable image; the
+    /// repaired retry proves an idempotent sender self-merge preserves the
+    /// complete image_id so the receiver can use buffered pages.
+    mod retained_paging_characterization {
+        use super::*;
+        use crate::kv::retained_paging::{
+            decode_page, split_image, RetainedPageBinding, RetainedPagePool, RetainedPageV1,
+        };
+
+        /// Decode a serialized image into frames: `frames[0]` is the
+        /// manifest, `frames[k]` is data page index `k - 1`.
+        fn paged_frames(image: &[u8]) -> Vec<RetainedPageV1> {
+            let decoded: Vec<_> = split_image(image, 512)
+                .expect("split")
+                .iter()
+                .map(|f| decode_page(f).expect("decode").expect("paged frame"))
+                .collect();
+            assert!(decoded.len() > 3, "image must span multiple page frames");
+            decoded
+        }
+
+        fn image_id_of(frames: &[RetainedPageV1]) -> [u8; 32] {
+            match frames[0] {
+                RetainedPageV1::Manifest { image_id, .. } => image_id,
+                RetainedPageV1::Page { .. } => panic!("manifest first"),
+            }
+        }
+
+        /// GroupSigned sender whose serialized image spans multiple
+        /// retained frames: (store, serialized image, decoded frames).
+        fn paged_group_signed_sender(slot: u8) -> (KvStore, Vec<u8>, Vec<RetainedPageV1>) {
+            let owner = agent(1);
+            let mut sender = KvStore::new_group_signed(
+                store_id(slot),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                TestCtx::new(7, &[owner]),
+            )
+            .expect("sender");
+            for tag in 0..4u8 {
+                sender
+                    .put(
+                        format!("page-{tag}"),
+                        vec![b'a' + tag; 512],
+                        "text/plain".to_string(),
+                        peer(1),
+                    )
+                    .expect("seed page");
+            }
+            let image = bincode::serialize(&sender).expect("retained image");
+            let frames = paged_frames(&image);
+            (sender, image, frames)
+        }
+
+        fn retained_binding(slot: u8, image_id: [u8; 32]) -> RetainedPageBinding {
+            RetainedPageBinding {
+                store_id: [slot; 32],
+                endorser: *agent(1).as_bytes(),
+                authorization: [7; 32],
+                image_id,
+            }
+        }
+
+        /// One serve round: the manifest is ALWAYS delivered; exactly one
+        /// data page (index `omit_page`) is lost.
+        fn deliver_round(
+            pool: &mut RetainedPagePool,
+            binding: &RetainedPageBinding,
+            frames: &[RetainedPageV1],
+            omit_page: usize,
+        ) -> Option<Vec<u8>> {
+            let mut completed = None;
+            for frame in frames {
+                if let RetainedPageV1::Page { index, .. } = frame {
+                    if *index as usize == omit_page {
+                        continue;
+                    }
+                }
+                completed = pool
+                    .push(binding.clone(), frame.clone())
+                    .expect("delivered frame")
+                    .or(completed);
+            }
+            completed
+        }
+
+        #[test]
+        fn retained_image_completes_from_complementary_single_frame_loss_retries() {
+            let (_sender, image, frames) = paged_group_signed_sender(23);
+            let binding = retained_binding(23, image_id_of(&frames));
+            let mut pool = RetainedPagePool::default();
+            // Retry 1 loses exactly one data page (index 0); manifest
+            // delivered, image stranded.
+            assert!(deliver_round(&mut pool, &binding, &frames, 0).is_none());
+            // Retry 2 loses a DIFFERENT single data page (index 1): its
+            // page index 0 plus the buffered pages complete the image.
+            let assembled = deliver_round(&mut pool, &binding, &frames, 1)
+                .expect("complementary retries assemble the image");
+            assert_eq!(assembled, image);
+
+            let image_store: KvStore = bincode::deserialize(&assembled).expect("image decode");
+            let owner = agent(1);
+            let mut target = KvStore::new_group_signed(
+                store_id(23),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                TestCtx::new(7, &[owner]),
+            )
+            .expect("target");
+            target
+                .merge_group_retained_image(&image_store, owner, peer(9))
+                .expect("assembled image merges into a group-signed replica");
+            for tag in 0..4u8 {
+                assert_eq!(
+                    target.get(&format!("page-{tag}")).expect("page").value,
+                    vec![b'a' + tag; 512]
+                );
+            }
+        }
+
+        #[test]
+        fn retained_self_merge_keeps_image_id_and_completes_complementary_pages() {
+            let (mut sender, initial_image, _) = paged_group_signed_sender(24);
+            // The first authenticated endorsement is a real audit change.
+            // Establish it before testing a retry from the same endorser.
+            let initial_store: KvStore =
+                bincode::deserialize(&initial_image).expect("initial image");
+            let version_before_endorsement = sender.current_version();
+            sender
+                .merge_group_retained_image(&initial_store, agent(1), peer(1))
+                .expect("first endorsement");
+            assert!(sender.current_version() > version_before_endorsement);
+            assert_eq!(sender.last_history_endorser(), Some(&agent(1)));
+            let image_one = bincode::serialize(&sender).expect("first endorsed image");
+            let frames_one = paged_frames(&image_one);
+            let binding_one = retained_binding(24, image_id_of(&frames_one));
+            let digest_before = sender.served_digest();
+            let version_before = sender.current_version();
+            let mut pool = RetainedPagePool::default();
+            // Same omission schedule as the stable arm: manifest plus every
+            // data page except page index 0.
+            assert!(deliver_round(&mut pool, &binding_one, &frames_one, 0).is_none());
+
+            // Between retries the sender merges its own complete current
+            // image from the same endorser. No retained state changes.
+            let self_image: KvStore = bincode::deserialize(&image_one).expect("own image");
+            sender
+                .merge_group_retained_image(&self_image, agent(1), peer(1))
+                .expect("self merge");
+            assert_eq!(
+                sender.served_digest(),
+                digest_before,
+                "idempotent self-merge leaves active content unchanged"
+            );
+            assert_eq!(sender.current_version(), version_before);
+            let image_two = bincode::serialize(&sender).expect("second image");
+            assert_eq!(
+                image_two, image_one,
+                "same retained image stays byte-stable"
+            );
+            let frames_two = paged_frames(&image_two);
+            let binding_two = retained_binding(24, image_id_of(&frames_two));
+            assert_eq!(binding_two.image_id, binding_one.image_id);
+
+            // Retry 2 omits page index 1 but supplies the missing page 0;
+            // pages from both rounds now bind to the same complete image.
+            let assembled = deliver_round(&mut pool, &binding_two, &frames_two, 1)
+                .expect("complementary pages assemble after same-endorser replay");
+            assert_eq!(assembled, image_one);
+        }
+
+        #[test]
+        fn retained_endorser_change_versions_once_and_same_writer_replay_does_not() {
+            let owner = agent(1);
+            let next_writer = agent(2);
+            let mut store = KvStore::new_group_signed(
+                store_id(25),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                TestCtx::new(7, &[owner, next_writer]),
+            )
+            .expect("store");
+            store
+                .put(
+                    "page".to_string(),
+                    b"value".to_vec(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("page");
+            let image: KvStore =
+                bincode::deserialize(&bincode::serialize(&store).expect("wire")).expect("image");
+            let before_first = store.current_version();
+            store
+                .merge_group_retained_image(&image, owner, peer(1))
+                .expect("first current writer endorsement");
+            assert!(store.current_version() > before_first);
+            assert_eq!(store.last_history_endorser(), Some(&owner));
+
+            let before_replay = store.current_version();
+            store
+                .merge_group_retained_image(&image, owner, peer(1))
+                .expect("same current writer replay");
+            assert_eq!(store.current_version(), before_replay);
+
+            store
+                .merge_group_retained_image(&image, next_writer, peer(1))
+                .expect("new current writer endorsement");
+            assert!(store.current_version() > before_replay);
+            assert_eq!(store.last_history_endorser(), Some(&next_writer));
+            let before_new_replay = store.current_version();
+            store
+                .merge_group_retained_image(&image, next_writer, peer(1))
+                .expect("new current writer replay");
+            assert_eq!(store.current_version(), before_new_replay);
+        }
+
+        #[test]
+        fn retained_unseen_tombstone_versions_with_equal_active_digest_and_floors_seq() {
+            let owner = agent(1);
+            let local_peer = peer(4);
+            let context = TestCtx::new(7, &[owner]);
+            let mut source = KvStore::new_group_signed(
+                store_id(26),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                context.clone(),
+            )
+            .expect("source");
+            source
+                .put(
+                    "removed".to_string(),
+                    b"old".to_vec(),
+                    "text/plain".to_string(),
+                    local_peer,
+                )
+                .expect("old value");
+            let stale = source.clone();
+            source.remove("removed").expect("tombstone");
+            let mut target = KvStore::new_group_signed(
+                store_id(26),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                context,
+            )
+            .expect("target");
+            // Match every retained entry field while deliberately lacking
+            // the OR-Set tag/tombstone. Only causal state can trigger change.
+            target.entries = source.entries.clone();
+            let initial: KvStore =
+                bincode::deserialize(&bincode::serialize(&target).expect("initial wire"))
+                    .expect("initial image");
+            target
+                .merge_group_retained_image(&initial, owner, local_peer)
+                .expect("establish same endorser");
+            assert_eq!(target.served_digest(), source.served_digest());
+            let before = target.current_version();
+            target
+                .merge_group_retained_image(&source, owner, local_peer)
+                .expect("new tombstone");
+            assert!(target.current_version() > before, "causal change versions");
+            assert!(target.get("removed").is_none());
+            let floor = source
+                .keys
+                .max_retained_sequence_for_peer(&local_peer)
+                .expect("tombstone sequence");
+            assert_eq!(target.seq_counter_value(), floor);
+
+            let mut restored: KvStore =
+                bincode::deserialize(&bincode::serialize(&target).expect("retained wire"))
+                    .expect("retained roundtrip");
+            restored
+                .merge_group_retained_image(&stale, owner, local_peer)
+                .expect("stale add replay");
+            assert!(
+                restored.get("removed").is_none(),
+                "tombstone blocks old tag"
+            );
+            assert!(restored.next_seq().expect("floored sequence") > floor);
+        }
     }
 
     #[test]
@@ -6543,6 +6905,58 @@ mod tests {
             Some(b"x".to_vec()),
             "A keeps its observed history"
         );
+    }
+
+    #[test]
+    fn checkpoint_subsumption_is_distinct_from_admission_rejection() {
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/checkpoint-subsumption-outcome";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+        let stale = forged_snapshot(id, owner, &kp, topic, &[("deleted", b"old")], 1);
+        let current = forged_snapshot(id, owner, &kp, topic, &[("live", b"new")], 2);
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&current, peer(9), Some(&agent(9)))
+                .expect("current checkpoint"),
+            MergeOutcome::Applied
+        );
+        let version = replica.current_version();
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&stale, peer(1), Some(&owner))
+                .expect("stale checkpoint"),
+            MergeOutcome::SubsumedCheckpoint
+        );
+        assert_eq!(replica.current_version(), version);
+        assert!(
+            replica.get("deleted").is_none(),
+            "stale echo cannot resurrect a key"
+        );
+        assert!(replica.get("live").is_some());
+
+        let unauthorized = KvStoreDelta::new(0);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&unauthorized, peer(9), Some(&agent(9)))
+                .expect("unauthorized merge"),
+            MergeOutcome::Rejected(MergeRejection::UnauthorizedWriter)
+        );
+        let mut ambiguous = KvStoreDelta::new(0);
+        let entry = KvEntry::new("ambiguous".into(), b"value".to_vec(), "text/plain".into());
+        ambiguous
+            .added
+            .insert("ambiguous".into(), (entry.clone(), (peer(1), 1)));
+        ambiguous.updated.insert("ambiguous".into(), entry);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&ambiguous, peer(1), Some(&owner))
+                .expect("ambiguous merge"),
+            MergeOutcome::Rejected(MergeRejection::AmbiguousDelta)
+        );
+        assert!(replica.get("ambiguous").is_none());
     }
 
     #[test]

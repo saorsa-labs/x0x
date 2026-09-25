@@ -273,6 +273,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "status",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/auth/session/refresh",
+        cli_name: "auth refresh",
+        description: "Swap a live session token for a fresh one (12h cap from the original mint)",
+        category: "status",
+        request: RequestSpec::None,
+    },
     // ── Identity ────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

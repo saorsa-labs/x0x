@@ -92,7 +92,12 @@ jobs:
 
       - name: Resolve dependency graph
         shell: bash
-        run: cargo generate-lockfile
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
 
       - name: Capture source and dependency provenance
         shell: bash
