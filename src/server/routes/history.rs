@@ -41,6 +41,280 @@ pub(in crate::server) struct HistoryListParams {
     q: Option<String>,
 }
 
+#[cfg(test)]
+mod issue870_session_read_tests {
+    use super::discovery_auth_tests::{history_state, text_row, DURABLE};
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use axum::routing::get;
+    use tower::ServiceExt as _;
+
+    const GROUP: &str = "issue870-group";
+
+    fn router(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/groups/:id/delegations",
+                get(crate::server::delegations::list_group_delegations),
+            )
+            .route(
+                "/groups/:id/messages",
+                get(crate::server::routes::named_groups::get_group_public_messages),
+            )
+            .route("/history", get(history_list))
+            .route("/history/message/:msg_id", get(history_message))
+            .route("/history/scopes", get(history_scopes))
+            .route("/history/search", get(history_search))
+            .route("/history/stats", get(history_stats))
+            .route("/diagnostics/history", get(history_diagnostics))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn read(
+        app: &axum::Router,
+        path: &str,
+        bearer: &str,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let request = Request::get(path)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())?;
+        let response = app.clone().oneshot(request).await?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await?;
+        Ok((status, serde_json::from_slice(&body)?))
+    }
+
+    async fn fixture() -> anyhow::Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let state = history_state(dir.path()).await?;
+        let creator = x0x::identity::AgentId([0x87; 32]);
+        let mut info = x0x::groups::GroupInfo::new(
+            "private grant metadata".into(),
+            "sensitive description".into(),
+            creator,
+            GROUP.into(),
+        );
+        info.policy.read_access = x0x::groups::GroupReadAccess::Public;
+        info.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 9,
+            state_hash: info.state_hash.clone(),
+            committed_by: hex::encode(creator.as_bytes()),
+            observed_at_ms: 1_000,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: Some("signer_only".into()),
+            },
+            no_anchor: true,
+        });
+        state.named_groups.write().await.insert(GROUP.into(), info);
+        state
+            .agent
+            .history()
+            .expect("fixture history")
+            .store()
+            .insert(&text_row(
+                Scope::Group(GROUP.into()),
+                "retained incident content",
+                1_500,
+            ))?;
+        state.public_messages.write().await.insert(
+            GROUP.into(),
+            vec![x0x::groups::GroupPublicMessage {
+                group_id: GROUP.into(),
+                state_hash_at_send: "fixture-state".into(),
+                revision_at_send: 1,
+                author_agent_id: hex::encode(creator.as_bytes()),
+                author_public_key: "fixture-key".into(),
+                author_user_id: None,
+                kind: x0x::groups::GroupPublicMessageKind::Chat,
+                body: "signed message content".into(),
+                timestamp: 1_500,
+                thread_root: None,
+                thread_parent: None,
+                mentions: Vec::new(),
+                delegation_digest: None,
+                rider_provenance: None,
+                signature: "fixture-signature".into(),
+            }],
+        );
+        Ok((state, dir))
+    }
+
+    async fn rider(state: &AppState) -> anyhow::Result<String> {
+        let mut tokens = state.rider_tokens.lock().await;
+        Ok(tokens
+            .issue(
+                "88".repeat(32),
+                vec![GROUP.into()],
+                None,
+                60,
+                "89".repeat(32),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await?
+            .0)
+    }
+
+    #[tokio::test]
+    async fn delegation_read_requires_active_session_membership_before_payload(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = fixture().await?;
+        let app = router(Arc::clone(&state));
+        let session = state.sessions.issue(std::time::Instant::now());
+        let path = format!("/groups/{GROUP}/delegations");
+
+        let (status, body) = read(&app, &path, &session).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["reason"], "group_membership_required");
+        for field in [
+            "delegations",
+            "fork_quarantine",
+            "description",
+            "from_agent",
+            "to_agent",
+        ] {
+            assert!(body.get(field).is_none(), "leaked {field}: {body}");
+        }
+        let (status, body) = read(&app, &path, DURABLE).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["delegations"].is_array());
+        let (status, _) = read(&app, &path, &rider(&state).await?).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = read(&app, "/groups/unknown/delegations", &session).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(GROUP).expect("fixture group");
+            info.add_member(
+                local_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                None,
+                None,
+            );
+            info.members_v2
+                .get_mut(&local_hex)
+                .expect("local seat")
+                .state = x0x::groups::GroupMemberState::Pending;
+        }
+        let (status, body) = read(&app, &path, &session).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["reason"], "group_membership_required");
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(GROUP)
+            .expect("group")
+            .members_v2
+            .get_mut(&local_hex)
+            .expect("seat")
+            .state = x0x::groups::GroupMemberState::Active;
+        let (status, body) = read(&app, &path, &session).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_history_retains_content_and_hides_nonmember_quarantine_metadata(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = fixture().await?;
+        let app = router(Arc::clone(&state));
+        let session = state.sessions.issue(std::time::Instant::now());
+        let path = format!("/history?scope=group:{GROUP}");
+
+        let (status, body) = read(&app, &path, &session).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 1);
+        assert_eq!(
+            body["records"][0]["payload"],
+            BASE64.encode("retained incident content")
+        );
+        assert!(body.get("fork_quarantine").is_none(), "{body}");
+        assert!(body.get("fork_quarantined").is_none(), "{body}");
+        assert!(
+            body["records"][0]
+                .get("fork_quarantined_at_ingest")
+                .is_none(),
+            "{body}"
+        );
+        let (status, durable) = read(&app, &path, DURABLE).await?;
+        assert_eq!(status, StatusCode::OK, "{durable}");
+        assert_eq!(durable["fork_quarantined"], true);
+        assert_eq!(durable["records"][0]["fork_quarantined_at_ingest"], true);
+        let msg_id =
+            x0x::history::HistoryRecord::compute_msg_id(None, b"retained incident content");
+        let point_path = format!("/history/message/{}", hex::encode(msg_id));
+        let (status, point) = read(&app, &point_path, &session).await?;
+        assert_eq!(status, StatusCode::OK, "{point}");
+        assert_eq!(
+            point["record"]["payload"],
+            BASE64.encode("retained incident content")
+        );
+        assert!(point.get("fork_quarantine").is_none(), "{point}");
+        assert!(
+            point["record"].get("fork_quarantined_at_ingest").is_none(),
+            "{point}"
+        );
+        let (_, durable_point) = read(&app, &point_path, DURABLE).await?;
+        assert_eq!(durable_point["fork_quarantined"], true, "{durable_point}");
+        assert_eq!(durable_point["record"]["fork_quarantined_at_ingest"], true);
+        let (_, rider_body) = read(&app, &path, &rider(&state).await?).await?;
+        assert_eq!(rider_body["fork_quarantined"], true, "{rider_body}");
+
+        let messages_path = format!("/groups/{GROUP}/messages");
+        let (status, messages) = read(&app, &messages_path, &session).await?;
+        assert_eq!(status, StatusCode::OK, "{messages}");
+        assert_eq!(messages["messages"][0]["body"], "signed message content");
+        assert!(messages.get("fork_quarantine").is_none(), "{messages}");
+        let (_, durable_messages) = read(&app, &messages_path, DURABLE).await?;
+        assert_eq!(
+            durable_messages["fork_quarantined"], true,
+            "{durable_messages}"
+        );
+
+        for path in [
+            "/history/scopes".to_string(),
+            "/history/search?q=retained".to_string(),
+            "/history/stats".to_string(),
+            "/diagnostics/history".to_string(),
+        ] {
+            let (status, body) = read(&app, &path, &session).await?;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert!(body.get("fork_quarantine").is_none(), "{path}: {body}");
+            let (_, durable) = read(&app, &path, DURABLE).await?;
+            assert_eq!(durable["fork_quarantined"], true, "{path}: {durable}");
+        }
+
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(GROUP)
+            .expect("group")
+            .add_member(local_hex, x0x::groups::GroupRole::Member, None, None);
+        let (status, body) = read(&app, &path, &session).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["fork_quarantined"], true);
+        let (_, messages) = read(&app, &messages_path, &session).await?;
+        assert_eq!(messages["fork_quarantined"], true, "{messages}");
+        let (_, point) = read(&app, &point_path, &session).await?;
+        assert_eq!(point["fork_quarantined"], true, "{point}");
+        Ok(())
+    }
+}
+
 fn parse_scope(s: &str) -> Result<Scope, String> {
     Scope::parse(s).map_err(|e| format!("invalid scope {s:?}: {e}"))
 }
@@ -299,6 +573,35 @@ pub(in crate::server) async fn all_quarantine_markers(state: &AppState) -> Vec<S
     markers
 }
 
+/// Session readers keep the retained content, but see a quarantine marker
+/// only for a group in which the local agent has an active seat. Resolve
+/// stable ids and aliases the same way as the marker lookup. Durable owner
+/// and rider views retain their existing behavior.
+pub(in crate::server) async fn visible_markers(
+    state: &AppState,
+    actor: &crate::server::rider_auth::ActorContext,
+    markers: Vec<ScopeMarker>,
+) -> Vec<ScopeMarker> {
+    if !matches!(
+        actor,
+        crate::server::rider_auth::ActorContext::Owner { durable: false }
+    ) {
+        return markers;
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    markers
+        .into_iter()
+        .filter(|(scope, _)| {
+            let Some(group_id) = scope.strip_prefix("group:") else {
+                return false;
+            };
+            crate::server::resolve_group_entry_locked(&groups, group_id)
+                .is_some_and(|(_, info)| info.has_active_member(&local_hex))
+        })
+        .collect()
+}
+
 /// ADR-0068 D1: the retention reaper's fork-quarantine pin source.
 ///
 /// WHY it holds a `Weak` and not an `Arc`. `AppState` owns the `Agent`, which
@@ -421,7 +724,12 @@ pub(in crate::server) async fn history_list(
             // ADR-0066 §3a (row 13): serve, annotate, never refuse. The
             // annotation comes from the REQUESTED scope, not from the rows,
             // so an empty page of a quarantined group is still labelled.
-            let markers = markers_for_scopes(&state, std::iter::once(&scope)).await;
+            let markers = visible_markers(
+                &state,
+                &actor,
+                markers_for_scopes(&state, std::iter::once(&scope)).await,
+            )
+            .await;
             let items: Vec<_> = rows
                 .iter()
                 .map(|row| row_json(row, marker_for(&markers, &row.record.scope)))
@@ -467,6 +775,9 @@ const HISTORY_MESSAGE_SCAN_PAGE: usize = 256;
 /// when absent; the record uses the same JSON shape as `/history`.
 pub(in crate::server) async fn history_message(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(msg_id_hex): Path<String>,
     Query(params): Query<HistoryMessageParams>,
 ) -> impl IntoResponse {
@@ -501,7 +812,12 @@ pub(in crate::server) async fn history_message(
         Ok(Ok(Some(row))) => {
             // ADR-0066 §3a (row 13): the row's OWN scope decides, so a
             // point lookup made without `?scope=` is annotated too.
-            let markers = markers_for_scopes(&state, std::iter::once(&row.record.scope)).await;
+            let markers = visible_markers(
+                &state,
+                &actor,
+                markers_for_scopes(&state, std::iter::once(&row.record.scope)).await,
+            )
+            .await;
             let record = row_json(&row, marker_for(&markers, &row.record.scope));
             (
                 StatusCode::OK,
@@ -595,6 +911,9 @@ fn resolve_history_message(
 /// `before_id` in, `next_before_id` out.
 pub(in crate::server) async fn history_search(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Query(params): Query<HistoryListParams>,
 ) -> impl IntoResponse {
     let Some(history) = state.agent.history() else {
@@ -615,9 +934,14 @@ pub(in crate::server) async fn history_search(
             // ADR-0066 §3a (row 13). A cross-scope search (no `scope=`)
             // can span several quarantined groups at once, which is why
             // the annotation carries a list rather than one marker.
-            let markers = markers_for_scopes(
+            let markers = visible_markers(
                 &state,
-                rows.iter().map(|r| &r.record.scope).chain(scope.iter()),
+                &actor,
+                markers_for_scopes(
+                    &state,
+                    rows.iter().map(|r| &r.record.scope).chain(scope.iter()),
+                )
+                .await,
             )
             .await;
             let items: Vec<_> = rows
@@ -684,6 +1008,9 @@ fn scope_json(summary: &ScopeSummary) -> serde_json::Value {
 /// outside its grants exist, nor their counts.
 pub(in crate::server) async fn history_scopes(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Query(params): Query<HistoryScopesParams>,
 ) -> impl IntoResponse {
     let Some(history) = state.agent.history() else {
@@ -701,7 +1028,12 @@ pub(in crate::server) async fn history_scopes(
             // ADR-0066 §3a (row 13): annotate the quarantined groups on
             // THIS page, so the label pages with the enumeration it
             // describes.
-            let markers = markers_for_scopes(&state, summaries.iter().map(|s| &s.scope)).await;
+            let markers = visible_markers(
+                &state,
+                &actor,
+                markers_for_scopes(&state, summaries.iter().map(|s| &s.scope)).await,
+            )
+            .await;
             let items: Vec<_> = summaries.iter().map(scope_json).collect();
             (
                 StatusCode::OK,
@@ -724,6 +1056,9 @@ pub(in crate::server) async fn history_scopes(
 /// GET /history/stats — row counts, database size, and retention config.
 pub(in crate::server) async fn history_stats(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
 ) -> impl IntoResponse {
     let Some(history) = state.agent.history() else {
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "history store disabled");
@@ -746,7 +1081,7 @@ pub(in crate::server) async fn history_stats(
                         "scope_limits": state.history_config.scope_limits,
                     },
                 }),
-                &all_quarantine_markers(&state).await,
+                &visible_markers(&state, &actor, all_quarantine_markers(&state).await).await,
             )),
         ),
         Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("stats: {e}")),
@@ -820,6 +1155,9 @@ pub(in crate::server) async fn history_purge(
 /// diagnostics convention, like `/diagnostics/dm`).
 pub(in crate::server) async fn history_diagnostics(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
 ) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
     let Some(history) = state.agent.history() else {
@@ -855,7 +1193,7 @@ pub(in crate::server) async fn history_diagnostics(
             // node-wide, so the annotation names every group this node has
             // quarantined — R3 ingest keeps writing for them, and these
             // counters are what an operator reads to confirm it.
-            &all_quarantine_markers(&state).await,
+            &visible_markers(&state, &actor, all_quarantine_markers(&state).await).await,
         )),
     )
 }
