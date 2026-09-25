@@ -847,6 +847,21 @@ function navigate(view,data){
 }
 function navigateSpace(id,app){navigate('space',{spaceId:id,spaceApp:app||'chat'})}
 function navigateDm(agentId){navigate('dm',{dmTarget:agentId})}
+// #893 deep links: `/gui#/dm/<agent_id>`, `#/groups/<group_id>[/<app>]`,
+// or a top-level view (`#/people`, `#/network`, …). Ids must be hex:
+// several views interpolate them into inline onclick handlers, and a link
+// can come from anyone.
+const HASH_VIEWS=['home','homespace','discover','people','network','presence','mls','admin','settings','constitution','about'];
+const HASH_SPACE_APPS=['chat','board','files','swarm','feed','wiki','web'];
+function applyHashRoute(){
+  const p=location.hash.replace(/^#\/?/,'').split('/').filter(Boolean);
+  const hex=s=>/^[0-9a-f]{16,128}$/i.test(s||'');
+  if(p[0]==='dm'&&p.length===2&&hex(p[1])){navigateDm(p[1].toLowerCase());return true}
+  if(p[0]==='groups'&&(p.length===2||p.length===3)&&hex(p[1])&&(!p[2]||HASH_SPACE_APPS.includes(p[2]))){navigateSpace(p[1].toLowerCase(),p[2]);return true}
+  if(p.length===1&&HASH_VIEWS.includes(p[0])){navigate(p[0]);return true}
+  if(p.length)toast('Unknown GUI view link: #/'+p.join('/'),'warning');
+  return false;
+}
 
 // Utility
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
@@ -6071,8 +6086,9 @@ wsConnect();
 pollDash();
 pollContacts();
 pollGroups();
-renderView();
+if(!applyHashRoute())renderView();
 renderSidebar();
+window.addEventListener('hashchange',applyHashRoute);
 
 setInterval(pollAll,5000);
 setInterval(()=>{pollContacts();pollGroups()},8000);

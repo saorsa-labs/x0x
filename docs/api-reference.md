@@ -2481,6 +2481,7 @@ x0x accept-file <transfer_id>
 x0x reject-file <transfer_id> --reason "not now"
 x0x ws sessions
 x0x gui
+x0x gui --view dm/<agent_id>        # also groups/<group_id>[/board|files|…], people, network
 ```
 
 ## Diagnostics
