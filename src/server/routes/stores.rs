@@ -68,13 +68,7 @@ struct LoadedLegacyStore {
 }
 
 pub(in crate::server) const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(in crate::server) struct KvStoreDirectDelta {
-    store_id: String,
-    peer_id: saorsa_gossip_types::PeerId,
-    delta: x0x::kv::KvStoreDelta,
-}
+pub(in crate::server) use x0x::kv::KvStoreDirectDelta;
 
 fn encode_kv_store_delta_direct_payload(
     store_id: &str,
@@ -2910,6 +2904,11 @@ mod tests {
         let payload = encode_kv_store_delta_direct_payload("store-1", peer_id, &delta)
             .expect("payload should encode");
         assert!(payload.starts_with(KV_STORE_DELTA_DM_PREFIX));
+        assert!(crate::server::valid_kv_store_delta_typed_dm(&payload));
+        assert_eq!(
+            x0x::history::classify::classify_dm_payload(&payload),
+            x0x::history::classify::DmPayloadClass::Ephemeral
+        );
 
         let decoded: KvStoreDirectDelta =
             serde_json::from_slice(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])

@@ -337,6 +337,14 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
     config
 }
 
+/// A predecessor relay can only count a recipient application ACK. Raw QUIC's
+/// receive-pipeline ACK is produced before the typed route admits the item.
+pub(in crate::server) fn predecessor_relay_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    config
+}
+
 /// Request body for POST /groups.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct CreateGroupRequest {
@@ -8678,7 +8686,7 @@ struct ValidatedCausalEnvelope {
 /// Returns the decoded event, the authenticated signer, and the signed
 /// topic string. Used by both the shared exact-envelope validator and
 /// the outbox loader.
-fn decode_and_verify_v2(
+pub(in crate::server) fn decode_and_verify_v2(
     envelope_bytes: &[u8],
 ) -> Result<(NamedGroupMetadataEvent, AgentId, String), &'static str> {
     let msg = x0x::gossip::pubsub::decode_auto(bytes::Bytes::copy_from_slice(envelope_bytes))
@@ -14604,7 +14612,7 @@ pub(in crate::server) const GROUP_PUBLIC_MESSAGE_DM_PREFIX: &[u8] = b"X0X-GROUP-
 /// NOT decoded JSON. The receiver decodes the V2 envelope to verify the
 /// requester's ML-DSA-65 signature independently of the carrier's identity.
 pub(in crate::server) const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] =
-    b"X0X-GROUP-PREDECESSOR-RELAY-V1\n";
+    x0x::dm_inbox::GROUP_PREDECESSOR_RELAY_DM_PREFIX;
 
 /// ADR 0028: finite relay retry step. Advances the retry schedule for all
 /// outbox obligations whose `next_retry_at_ms` has elapsed. Relays to each
@@ -14770,7 +14778,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                 .send_direct_with_config(
                     &target_id,
                     dm_payload,
-                    named_group_direct_delivery_config(),
+                    predecessor_relay_delivery_config(),
                 )
                 .await;
             if send_result.is_ok() {
@@ -23730,7 +23738,7 @@ pub(in crate::server) async fn create_join_request(
                     .send_direct_with_config(
                         &creator_id,
                         dm_payload,
-                        named_group_direct_delivery_config(),
+                        predecessor_relay_delivery_config(),
                     )
                     .await
                 {
@@ -48323,6 +48331,14 @@ pub(in crate::server) mod tests {
     }
 
     #[test]
+    fn predecessor_relay_requires_application_ack_and_excludes_raw_fallback() {
+        let config = predecessor_relay_delivery_config();
+        assert!(config.require_gossip);
+        assert!(config.require_gossip_ack);
+        assert!(!config.prefer_raw_quic_if_connected);
+    }
+
+    #[test]
     fn public_group_messages_prefer_receive_acked_raw_quic_with_gossip_fallback() {
         let config = group_public_message_direct_delivery_config();
 
@@ -48814,6 +48830,11 @@ pub(in crate::server) mod tests {
         let payload =
             encode_group_public_message_direct_payload(&msg).expect("payload should encode");
         assert!(payload.starts_with(GROUP_PUBLIC_MESSAGE_DM_PREFIX));
+        assert!(crate::server::valid_group_public_typed_dm(&payload));
+        assert_eq!(
+            x0x::history::classify::classify_dm_payload(&payload),
+            x0x::history::classify::DmPayloadClass::Ephemeral
+        );
 
         let decoded: x0x::groups::GroupPublicMessage =
             serde_json::from_slice(&payload[GROUP_PUBLIC_MESSAGE_DM_PREFIX.len()..])
