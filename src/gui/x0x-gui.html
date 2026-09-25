@@ -3923,7 +3923,15 @@ function togglePeerEvents(on){
       out.prepend(line);
       while(out.children.length>20)out.removeChild(out.lastChild);
     });
-    peerEventsSse.onerror=()=>{if(out)out.innerHTML='<span style="color:var(--am)">peer event stream unavailable</span>'};
+    // #893: never let EventSource auto-retry — it reuses the original URL,
+    // whose session token a refresh has revoked. Close and reopen with the
+    // current SESSION_TOKEN instead (unless the user toggled it off).
+    const es=peerEventsSse;
+    peerEventsSse.onerror=()=>{
+      if(out)out.innerHTML='<span style="color:var(--am)">peer event stream unavailable</span>';
+      es.close();
+      setTimeout(()=>{if(peerEventsSse===es&&!sessionExpired)togglePeerEvents(true)},3000);
+    };
   }catch(e){
     if(out)out.innerHTML='<span style="color:var(--rd)">failed to open peer events</span>';
   }
