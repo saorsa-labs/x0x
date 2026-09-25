@@ -4273,6 +4273,20 @@ impl Agent {
         self.gossip_runtime.as_ref().map(|rt| rt.pubsub().stats())
     }
 
+    /// Refresh preferred eager peers from committed named-group rosters.
+    /// Agent ids are never used as transport peer ids: pub/sub resolves each
+    /// member through retained authenticated machine bindings, then checks
+    /// live transport connectivity and the current security vetoes.
+    pub async fn replace_group_rosters_for_gossip(
+        &self,
+        rosters: Vec<(String, String, Vec<identity::AgentId>)>,
+    ) {
+        let Some(runtime) = self.gossip_runtime.as_ref() else {
+            return;
+        };
+        runtime.pubsub().replace_group_rosters(rosters).await;
+    }
+
     /// Leaf vs Full participation snapshot (issue #380).
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
@@ -15720,6 +15734,16 @@ impl AgentBuilder {
 
         // Initialize direct messaging infrastructure
         let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
+        let authenticated_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+            dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        if let Some(runtime) = gossip_runtime.as_ref() {
+            runtime.pubsub().set_group_identity_context(
+                std::sync::Arc::clone(&authenticated_machine_bindings),
+                std::sync::Arc::clone(&revocation_set),
+                std::sync::Arc::clone(&move_state),
+            );
+        }
 
         // Create presence wrapper if network exists
         let presence = if let Some(ref net) = network {
@@ -15808,9 +15832,7 @@ impl AgentBuilder {
             gossip_cache_adapter,
             machine_kem,
             identity_discovery_cache,
-            authenticated_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
-                dm_inbox::AuthenticatedMachineBindingCache::default(),
-            )),
+            authenticated_machine_bindings,
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
