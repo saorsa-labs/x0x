@@ -1111,14 +1111,10 @@ pub(in crate::server) async fn list_group_delegations(
         if info.withdrawn {
             return not_found("group is withdrawn");
         }
-        // #870: a browser session may see delegation authority only while
-        // this daemon's own agent has an active seat. Apply this before the
-        // durable history scan or any response field is assembled.
-        if !actor.is_durable_owner() {
-            if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
-                return forbidden("rider tokens cannot read group delegations");
-            }
-            if !info.has_active_member(&local_hex) {
+        let is_member = info.has_active_member(&local_hex);
+        // Sessions need an active local seat before delegation authority is exposed.
+        match &actor {
+            crate::server::rider_auth::ActorContext::Owner { durable: false } if !is_member => {
                 return crate::server::api_error_with_reason(
                     StatusCode::FORBIDDEN,
                     "active local group membership required",
@@ -1126,18 +1122,19 @@ pub(in crate::server) async fn list_group_delegations(
                 )
                 .into_response();
             }
+            crate::server::rider_auth::ActorContext::Owner { .. } => {}
+            _ => return forbidden("rider tokens cannot read group delegations"),
         }
-        let is_member = info.has_active_member(&local_hex);
+        let quarantine = info.fork_quarantine.clone();
         let read_open = info.policy.read_access == x0x::groups::GroupReadAccess::Public;
-        // Keep the existing group read policy for the durable operator too:
-        // #870 only tightens session visibility of delegation metadata.
+        // Durable owners retain the existing group read policy.
         if !is_member && !read_open {
             return forbidden("members-only read policy");
         }
         (
             info.stable_group_id().to_string(),
             info.members_v2.clone(),
-            info.fork_quarantine.clone(),
+            quarantine,
         )
     };
     let (stable_id, members, quarantine) = snapshot;
