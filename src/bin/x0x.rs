@@ -855,6 +855,8 @@ enum HistorySub {
 enum AuthSub {
     /// Exchange the durable API token for a short-lived browser session token.
     Session,
+    /// Swap a live session token (passed via `X0X_API_TOKEN`) for a fresh one.
+    Refresh,
 }
 
 /// Key lifecycle sub-actions (`x0x identity revoke`, `x0x identity revocations`).
@@ -2329,6 +2331,7 @@ async fn run(
         },
         Commands::Auth { sub } => match sub {
             AuthSub::Session => commands::auth::session(&client).await,
+            AuthSub::Refresh => commands::auth::refresh(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,

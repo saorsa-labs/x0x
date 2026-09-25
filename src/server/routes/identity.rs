@@ -1666,7 +1666,7 @@ mod owner_act_tests {
     }
 
     fn matrix_router(state: Arc<AppState>) -> axum::Router {
-        use crate::server::auth::auth_middleware;
+        use crate::server::auth::{auth_middleware, refresh_session};
         use crate::server::delegations::delegate_group_authority;
         use crate::server::routes::direct::direct_send;
         use crate::server::routes::exec::{exec_cancel, exec_run};
@@ -1686,6 +1686,7 @@ mod owner_act_tests {
             .route("/home/rename", post(rename_home))
             .route("/upgrade/apply", post(apply_upgrade))
             .route("/direct/send", post(direct_send))
+            .route("/auth/session/refresh", post(refresh_session))
             .layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&state),
                 auth_middleware,
@@ -1744,6 +1745,58 @@ mod owner_act_tests {
             err.contains("durable API token"),
             "typed 403 must name the durable requirement, got: {err:?}"
         );
+    }
+
+    // #893: session refresh accepts ONLY a live session bearer and yields a
+    // token with exactly the same authority (still refused on owner acts),
+    // while the replaced token stops working. Drives the real middleware.
+    #[tokio::test]
+    async fn session_refresh_accepts_only_sessions_and_does_not_widen() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let path = "/auth/session/refresh";
+        let empty = serde_json::json!({});
+
+        let (status, json) = call(&app, "POST", path, DURABLE, empty.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "durable bearer: {json}");
+        assert!(json.get("session_token").is_none());
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            path,
+            &rider_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        assert!(json.get("session_token").is_none());
+
+        let old = session_token(&state).await;
+        let (status, json) = call(&app, "POST", path, &old, empty.clone()).await;
+        assert_eq!(status, StatusCode::OK, "session bearer: {json}");
+        let fresh = json["session_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(!fresh.is_empty() && fresh != old);
+        assert_eq!(json["expires_in"], 600);
+
+        let (status, json) = call(&app, "POST", path, &old, empty.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "replaced token: {json}");
+
+        let sign = serde_json::json!({
+            "context": "example.test",
+            "payload_b64": BASE64.encode(b"matrix payload"),
+        });
+        let (status, json) = call(&app, "POST", "/agent/sign", &fresh, sign).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "refreshed session on owner act: {json}"
+        );
+        assert_durable_403(&json);
+        Ok(())
     }
 
     #[tokio::test]

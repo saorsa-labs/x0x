@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 182,
+  "endpoint_count": 183,
   "endpoints": [
     {
       "category": "status",
@@ -55,6 +55,16 @@
       "description": "Exchange the durable API token for a short-lived browser session token",
       "method": "POST",
       "path": "/auth/session",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "status",
+      "cli_name": "auth refresh",
+      "description": "Swap a live session token for a fresh one (12h cap from the original mint)",
+      "method": "POST",
+      "path": "/auth/session/refresh",
       "request": {
         "kind": "none"
       }
