@@ -15745,6 +15745,10 @@ impl AgentBuilder {
         let authenticated_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
             dm_inbox::AuthenticatedMachineBindingCache::default(),
         ));
+        let owner_trust = owner_trust::OwnerTrust::new(
+            identity.user_id(),
+            std::sync::Arc::clone(&authenticated_machine_bindings),
+        );
         if let Some(runtime) = gossip_runtime.as_ref() {
             runtime.pubsub().set_group_identity_context(
                 std::sync::Arc::clone(&authenticated_machine_bindings),
@@ -15904,7 +15908,7 @@ impl AgentBuilder {
             connect_policy: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
                 connect::ConnectPolicy::default(),
             ))),
-            owner_trust: owner_trust::OwnerTrust::new(own_pair_user),
+            owner_trust,
         })
     }
 }

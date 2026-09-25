@@ -944,6 +944,13 @@ impl ExecService {
     /// ADR-0070 §1 owner trust for an inbound exec request's sender pair.
     /// Only a verified sender whose contact decision is not an explicit
     /// rejection is checked; everything else is `false` (fail closed).
+    ///
+    /// `inbound.machine_id` is only accepted as the pairing when it equals
+    /// the agent's authenticated binding (checked inside
+    /// [`crate::owner_trust::OwnerTrust::is_owner_trusted`]): an attested
+    /// origin refreshes that binding first, and a sender-claimed fallback
+    /// (no attestation, no binding) never matches, so it never confers
+    /// owner trust.
     async fn inbound_owner_trusted(&self, inbound: &DmTypedPayload) -> bool {
         if !inbound.verified
             || !matches!(

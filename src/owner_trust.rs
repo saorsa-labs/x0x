@@ -4,12 +4,18 @@
 //!
 //! 1. this install has an owner (`user.key`, ADR-0036) and the ADR-0041
 //!    owner device set has been installed ([`crate::Agent::install_owner_device_store`]);
-//! 2. the agent's cached identity announcement names this machine, and the
-//!    `AgentCertificate` it carried verifies, binds exactly this agent, is
-//!    signed by the local owner's key and is unexpired;
-//! 3. neither the agent, the machine, nor the ADR-0043 binding is in the
+//! 2. the agent's **authenticated** machine binding
+//!    ([`crate::dm_inbox::AuthenticatedMachineBindings`], written only from the
+//!    agent's own fresh identity announcement or a valid ADR-0021 DM
+//!    attestation) names exactly the transport-authenticated peer machine —
+//!    no binding (never learned, or LRU-evicted) means not owner-trusted. The
+//!    mutable `DiscoveredAgent::machine_id` is never used for the pairing;
+//! 3. the `AgentCertificate` cached for the agent (looked up by agent only —
+//!    it is self-verifying) verifies, binds exactly this agent, is signed by
+//!    the local owner's key and is unexpired;
+//! 4. neither the agent, the machine, nor the ADR-0043 binding is in the
 //!    local ADR-0018 revocation set;
-//! 4. the machine holds a current `OwnerEnrollment` signed by the local owner
+//! 5. the machine holds a current `OwnerEnrollment` signed by the local owner
 //!    ([`OwnerSyncStore::is_enrolled`], which re-verifies the signature and
 //!    expiry on every call).
 //!
@@ -30,6 +36,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::contacts::ContactStore;
+use crate::dm_inbox::AuthenticatedMachineBindings;
 use crate::identity::{AgentCertificate, AgentId, MachineId, UserId};
 use crate::owner_sync::OwnerSyncStore;
 use crate::revocation::RevocationSet;
@@ -45,6 +52,9 @@ use crate::DiscoveredAgent;
 pub struct OwnerTrust {
     local_owner: Option<UserId>,
     devices: Arc<std::sync::RwLock<Option<Arc<OwnerSyncStore>>>>,
+    /// The agent's authenticated agent→machine bindings (#890). The default
+    /// is an empty cache, which owner-trusts nothing.
+    bindings: AuthenticatedMachineBindings,
 }
 
 impl std::fmt::Debug for OwnerTrust {
@@ -69,12 +79,14 @@ pub struct PairTrust {
 
 impl OwnerTrust {
     /// Owner trust for an install whose owner is `local_owner` (`None` for
-    /// an ownerless install, which never owner-trusts anything).
+    /// an ownerless install, which never owner-trusts anything), pairing
+    /// agents to machines only through `bindings`.
     #[must_use]
-    pub fn new(local_owner: Option<UserId>) -> Self {
+    pub fn new(local_owner: Option<UserId>, bindings: AuthenticatedMachineBindings) -> Self {
         Self {
             local_owner,
             devices: Arc::new(std::sync::RwLock::new(None)),
+            bindings,
         }
     }
 
@@ -101,7 +113,11 @@ impl OwnerTrust {
             .clone()
     }
 
-    /// Whether `(agent_id, machine_id)` is owner-trusted (module docs, 1–4).
+    /// Whether `(agent_id, machine_id)` is owner-trusted (module docs, 1–5).
+    ///
+    /// `machine_id` must be the transport-authenticated peer machine (the
+    /// QUIC peer, or for gossip-DM exec the authenticated origin); it must
+    /// equal the agent's authenticated binding.
     ///
     /// Cheap checks run first so a non-owner peer costs a cache lookup and
     /// a hash, never an ML-DSA verification. Each lock is taken in its own
@@ -119,12 +135,15 @@ impl OwnerTrust {
         let Some(devices) = self.device_store() else {
             return false;
         };
+        match crate::dm_inbox::authenticated_machine_binding(&self.bindings, agent_id).await {
+            Some(bound) if bound == *machine_id => {}
+            _ => return false,
+        }
         let cert = {
             let cache = discovery_cache.read().await;
-            match cache.get(agent_id) {
-                Some(entry) if entry.machine_id == *machine_id => entry.agent_certificate.clone(),
-                _ => None,
-            }
+            cache
+                .get(agent_id)
+                .and_then(|entry| entry.agent_certificate.clone())
         };
         let Some(cert) = cert else {
             return false;

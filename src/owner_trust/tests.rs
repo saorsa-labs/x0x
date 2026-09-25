@@ -31,6 +31,8 @@ struct Fixture {
     revocations: Arc<RwLock<RevocationSet>>,
     move_state: Arc<RwLock<MoveState>>,
     connect_policy: Arc<std::sync::RwLock<Arc<ConnectPolicy>>>,
+    devices: Arc<OwnerSyncStore>,
+    local_owner: UserId,
     trust: OwnerTrust,
 }
 
@@ -72,8 +74,19 @@ impl Fixture {
         if let Some(enrolled) = enrolled {
             devices.enroll(enrolled).await.expect("enroll");
         }
-        let trust = OwnerTrust::new(Some(local_owner.user_id()));
-        trust.install_device_store(Arc::new(devices));
+        let devices = Arc::new(devices);
+        // The agent's authenticated binding names its real machine, as an
+        // accepted identity announcement would record it (#890).
+        let bindings = AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &bindings,
+            agent_id,
+            machine_id,
+            unix_now_secs(),
+        )
+        .await;
+        let trust = OwnerTrust::new(Some(local_owner.user_id()), bindings);
+        trust.install_device_store(Arc::clone(&devices));
 
         let mut cache = HashMap::new();
         cache.insert(
@@ -110,6 +123,8 @@ impl Fixture {
             revocations: Arc::new(RwLock::new(RevocationSet::new())),
             move_state: Arc::new(RwLock::new(MoveState::default())),
             connect_policy: Arc::new(std::sync::RwLock::new(Arc::new(ConnectPolicy::default()))),
+            devices,
+            local_owner: local_owner.user_id(),
             trust,
         }
     }
@@ -131,6 +146,13 @@ impl Fixture {
                 &self.machine_id,
             )
             .await
+    }
+
+    /// Replace the owner-trust source with one whose authenticated
+    /// bindings are `bindings` (same owner, same device store).
+    fn with_bindings(&mut self, bindings: AuthenticatedMachineBindings) {
+        self.trust = OwnerTrust::new(Some(self.local_owner), bindings);
+        self.trust.install_device_store(Arc::clone(&self.devices));
     }
 
     /// The real inbound stream gate (accept loop / datagram lane).
@@ -187,7 +209,7 @@ async fn same_owner_pair_passes_stream_gate_without_contact() {
 #[tokio::test]
 async fn ownerless_install_does_not_owner_trust() {
     let (_owner, mut f) = Fixture::same_owner().await;
-    f.trust = OwnerTrust::new(None);
+    f.trust = OwnerTrust::new(None, AuthenticatedMachineBindings::default());
     let pair = f.pair().await;
     assert!(!pair.owner_trusted);
     assert_eq!(pair.decision, TrustDecision::Unknown);
@@ -383,5 +405,79 @@ async fn owner_acl_entry_does_not_match_non_owner_pairs() {
     assert!(matches!(
         f.inbound_gate().await,
         Err(NetworkError::PeerNotInConnectAcl { .. })
+    ));
+}
+
+// ── Pairing comes only from the authenticated binding (#911 fix) ─────────
+
+// (1) The discovery cache's machine_id is mutable (connect_to_agent, raw
+// Direct mark_connected). Pointing it at an enrolled machine with NO
+// authenticated binding must confer nothing — fail closed, as after LRU
+// eviction.
+#[tokio::test]
+async fn cache_machine_rewrite_without_binding_gets_no_owner_trust() {
+    let (_owner, mut f) = Fixture::same_owner().await;
+    f.with_bindings(AuthenticatedMachineBindings::default());
+    if let Some(entry) = f.cache.write().await.get_mut(&f.agent_id) {
+        entry.machine_id = f.machine_id;
+    }
+    assert!(!f.pair().await.owner_trusted);
+    assert!(matches!(
+        f.inbound_gate().await,
+        Err(NetworkError::PeerTrustRejected { .. })
+    ));
+}
+
+// (2) The binding names machine A; the transport peer is enrolled machine B
+// (the cache has been rewritten to B). No owner trust for (agent, B).
+#[tokio::test]
+async fn binding_to_other_machine_than_transport_peer_gets_no_owner_trust() {
+    let (_owner, mut f) = Fixture::same_owner().await;
+    let machine_a = MachineKeypair::generate()
+        .expect("machine keygen")
+        .machine_id();
+    let bindings = AuthenticatedMachineBindings::default();
+    crate::dm_inbox::record_authenticated_machine_binding(
+        &bindings,
+        f.agent_id,
+        machine_a,
+        unix_now_secs(),
+    )
+    .await;
+    f.with_bindings(bindings);
+    // f.machine_id (B) is enrolled and is what the cache says.
+    assert!(f.devices.is_enrolled(&f.machine_id, &f.local_owner).await);
+    assert!(!f.pair().await.owner_trusted);
+    assert!(f.inbound_gate().await.is_err());
+}
+
+// (3) Binding == transport peer + valid owner cert + enrolled machine: trust.
+// (The positive control for (1), (2) and (4) — same fixture, binding intact.)
+#[tokio::test]
+async fn binding_matching_transport_peer_with_cert_and_enrollment_is_trusted() {
+    let (_owner, f) = Fixture::same_owner().await;
+    let pair = f.pair().await;
+    assert!(pair.owner_trusted);
+    assert_eq!(pair.decision, TrustDecision::Accept);
+    assert_eq!(f.inbound_gate().await.expect("gate"), vec![f.agent_id]);
+}
+
+// (4) #898 path: an UNVERIFIED raw Direct message calls
+// `DirectMessaging::mark_connected(sender, machine)` and the cache may be
+// rewritten to that machine. Neither writes the authenticated binding, so an
+// agent with no binding gains no owner trust from it.
+#[tokio::test]
+async fn unverified_raw_direct_mark_connected_cannot_confer_owner_trust() {
+    let (_owner, mut f) = Fixture::same_owner().await;
+    f.with_bindings(AuthenticatedMachineBindings::default());
+    let dm = crate::direct::DirectMessaging::new();
+    dm.mark_connected(f.agent_id, f.machine_id).await;
+    if let Some(entry) = f.cache.write().await.get_mut(&f.agent_id) {
+        entry.machine_id = f.machine_id;
+    }
+    assert!(!f.pair().await.owner_trusted);
+    assert!(matches!(
+        f.inbound_gate().await,
+        Err(NetworkError::PeerTrustRejected { .. })
     ));
 }
