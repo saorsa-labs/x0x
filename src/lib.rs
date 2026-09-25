@@ -15730,7 +15730,6 @@ impl AgentBuilder {
         if let Some(runtime) = gossip_runtime.as_ref() {
             runtime.pubsub().set_group_identity_context(
                 std::sync::Arc::clone(&authenticated_machine_bindings),
-                std::sync::Arc::clone(&identity_discovery_cache),
                 std::sync::Arc::clone(&revocation_set),
                 std::sync::Arc::clone(&move_state),
             );
