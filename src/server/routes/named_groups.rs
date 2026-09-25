@@ -4977,6 +4977,54 @@ pub(in crate::server) async fn store_named_group_info(
     true
 }
 
+/// Snapshot the committed roster without retaining a group lock across the
+/// direct-connection and gossip awaits.
+pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState) {
+    let _refresh_guard = state.group_roster_gossip_lock.lock().await;
+    let rosters = {
+        // The map write can precede an awaited disk save and be rolled back.
+        // Serialize this snapshot with that transaction so SG never sees an
+        // uncommitted admission or removal. Drop both guards before the
+        // direct-connection and gossip awaits below.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        let groups = state.named_groups.read().await;
+        let mut entries: Vec<_> = groups.iter().collect();
+        // Aliases may retain an older view. The exact stable-id key wins;
+        // otherwise take the highest revision deterministically. A winning
+        // withdrawn record clears its preference rather than reviving an
+        // active alias.
+        entries.sort_by_key(|(key, group)| {
+            (
+                group.stable_group_id(),
+                key.as_str() == group.stable_group_id(),
+                group.state_revision,
+                key.as_str(),
+            )
+        });
+        let mut by_group = std::collections::BTreeMap::new();
+        for (_, group) in entries {
+            let roster = (!group.withdrawn).then(|| {
+                let agents = group
+                    .active_members()
+                    .filter_map(|member| {
+                        let bytes = hex::decode(&member.agent_id).ok()?;
+                        let bytes: [u8; 32] = bytes.try_into().ok()?;
+                        Some(AgentId(bytes))
+                    })
+                    .collect();
+                (
+                    group.stable_group_id().to_string(),
+                    group.metadata_topic.clone(),
+                    agents,
+                )
+            });
+            by_group.insert(group.stable_group_id().to_string(), roster);
+        }
+        by_group.into_values().flatten().collect()
+    };
+    state.agent.replace_group_rosters_for_gossip(rosters).await;
+}
+
 /// Apply one shared-roster mutation as a persistence transaction.
 ///
 /// The global roster persistence lock is acquired before the shared map is
@@ -4992,8 +5040,17 @@ pub(in crate::server) async fn persist_named_groups_mutation<F>(
 where
     F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
 {
-    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    persist_named_groups_mutation_unlocked(state, mutate).await
+    let outcome = {
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        persist_named_groups_mutation_unlocked(state, mutate).await
+    };
+    if matches!(
+        &outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        refresh_group_rosters_for_gossip(state).await;
+    }
+    outcome
 }
 
 /// #457 r10 item 10.1 — the SAME semantics as the locked variant (the
@@ -5579,6 +5636,21 @@ async fn confirm_named_groups_durability_unlocked(state: &AppState) -> bool {
 }
 
 pub(in crate::server) async fn persist_named_group_info(
+    state: &AppState,
+    group_id: &str,
+    info: x0x::groups::GroupInfo,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let outcome = persist_named_group_info_inner(state, group_id, info).await;
+    if matches!(
+        &outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        refresh_group_rosters_for_gossip(state).await;
+    }
+    outcome
+}
+
+async fn persist_named_group_info_inner(
     state: &AppState,
     group_id: &str,
     info: x0x::groups::GroupInfo,
@@ -10095,6 +10167,7 @@ async fn apply_named_group_metadata_event_with_binding(
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
+    refresh_group_rosters_for_gossip(state).await;
     applied
 }
 
@@ -18156,6 +18229,7 @@ pub(in crate::server) async fn add_named_group_member(
                 "named-group state and bootstrap obligation are not directory-durable",
             );
         }
+        refresh_group_rosters_for_gossip(&state).await;
 
         let mut epoch = None;
         let mut mls_groups = state.mls_groups.write().await;
@@ -18679,6 +18753,7 @@ pub(in crate::server) async fn remove_named_group_member(
                 "named-group state is not directory-durable",
             );
         }
+        refresh_group_rosters_for_gossip(&state).await;
 
         let mut epoch = None;
         let mut mls_groups = state.mls_groups.write().await;
@@ -19664,6 +19739,7 @@ async fn leave_treekem_group(
                     "named-group state is not directory-durable",
                 );
             }
+            refresh_group_rosters_for_gossip(&state).await;
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "left": name, "local_only": true })),
@@ -35745,6 +35821,7 @@ pub(in crate::server) mod tests {
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
+            group_roster_gossip_lock: Mutex::new(()),
             named_groups_path,
             home_suite_groups_path,
             named_groups_persistence_lock: Mutex::new(()),
@@ -56024,8 +56101,8 @@ mod hs451_downgrade_safety {
 mod cas_rollback_470 {
     use super::tests::secure_endpoint_test_state;
     use super::{
-        persist_named_groups_mutation, save_named_groups, set_save_fault, AtomicWriteOutcome,
-        SaveFault,
+        persist_named_groups_mutation, refresh_group_rosters_for_gossip, save_named_groups,
+        set_save_fault, AtomicWriteOutcome, SaveFault,
     };
     use crate as x0x;
     use crate::server::AppState;
@@ -56035,6 +56112,35 @@ mod cas_rollback_470 {
     const X_ID: &str = "aa4178787878787878787878787878787878";
     const Y_ID: &str = "bb4278787878787878787878787878787878";
     const Y_MEMBER: &str = "227878787878787878787878787878787878";
+
+    #[tokio::test]
+    async fn gossip_roster_snapshot_waits_for_persist_or_rollback() {
+        let (state, _dir) = secure_endpoint_test_state().await.expect("test state");
+        let persistence_guard = state.named_groups_persistence_lock.lock().await;
+        state.named_groups.write().await.insert(
+            X_ID.to_string(),
+            plain_group(0x58, X_ID, "uncommitted-candidate"),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let refresh_state = Arc::clone(&state);
+        let mut refresh = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            refresh_group_rosters_for_gossip(&refresh_state).await;
+        });
+        started_rx.await.expect("refresh started");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut refresh)
+                .await
+                .is_err(),
+            "refresh must wait while a candidate may still roll back"
+        );
+        state.named_groups.write().await.remove(X_ID);
+        drop(persistence_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), refresh)
+            .await
+            .expect("refresh completed after rollback")
+            .expect("refresh task");
+    }
 
     fn plain_group(seed: u8, id: &str, name: &str) -> x0x::groups::GroupInfo {
         let mut info = x0x::groups::GroupInfo::new(

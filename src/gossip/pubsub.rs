@@ -17,8 +17,10 @@ use super::participation::{
 };
 use super::GossipConfig;
 use crate::contacts::{ContactStore, TrustLevel};
+#[cfg(test)]
+use crate::direct::DirectMessaging;
 use crate::error::{NetworkError, NetworkResult};
-use crate::identity::AgentId;
+use crate::identity::{AgentId, MachineId};
 use crate::network::NetworkNode;
 use bytes::Bytes;
 use saorsa_gossip_pubsub::{BytePolicy, LeafEgressConfig, PlumtreePubSub, PubSub, SignaturePolicy};
@@ -682,6 +684,19 @@ impl Drop for Subscription {
 /// Local subscription delivery path:
 ///     PlumTree topic receiver → decode x0x payload (v1/v2) → trust filter → subscriber channel
 /// ```
+#[derive(Clone, PartialEq, Eq)]
+struct GroupEagerRoster {
+    metadata_topic: String,
+    active_agents: Vec<AgentId>,
+}
+
+struct GroupIdentityContext {
+    bindings: crate::dm_inbox::AuthenticatedMachineBindings,
+    discovery: Arc<RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
+    revoked: Arc<RwLock<crate::revocation::RevocationSet>>,
+    moves: Arc<RwLock<crate::key_move::MoveState>>,
+}
+
 pub struct PubSubManager {
     /// Network node used by PlumTree transport and topic peer initialization.
     network: Arc<NetworkNode>,
@@ -729,6 +744,12 @@ pub struct PubSubManager {
     passthrough_refresh_runs: AtomicU64,
     /// Name → actual PlumTree topic id (DM inboxes are not `from_entity(name)`).
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
+    /// Authoritative active group rosters supplied by the daemon after commit.
+    group_rosters: RwLock<HashMap<String, GroupEagerRoster>>,
+    /// Locally named group topics. Unknown Full pass-through ids stay ordinary relays.
+    group_topic_by_id: RwLock<HashMap<TopicId, String>>,
+    group_identity: std::sync::OnceLock<GroupIdentityContext>,
+    group_preference_apply_lock: tokio::sync::Mutex<()>,
     /// Live subscribed transport ids for the Leaf C0 refuse gate AND the
     /// #674 C2 zero-subscriber test (shared handle).
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
@@ -878,6 +899,156 @@ const _: () = assert!(
 );
 
 impl PubSubManager {
+    /// Install the live security views used to authorize roster preferences.
+    pub fn set_group_identity_context(
+        &self,
+        bindings: crate::dm_inbox::AuthenticatedMachineBindings,
+        discovery: Arc<RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
+        revoked: Arc<RwLock<crate::revocation::RevocationSet>>,
+        moves: Arc<RwLock<crate::key_move::MoveState>>,
+    ) {
+        let _ = self.group_identity.set(GroupIdentityContext {
+            bindings,
+            discovery,
+            revoked,
+            moves,
+        });
+    }
+
+    /// Replace committed group rosters. The daemon calls this after group
+    /// commits and at startup; transport connection changes are read live on
+    /// each ordinary peer refresh.
+    pub async fn replace_group_rosters(&self, rosters: Vec<(String, String, Vec<AgentId>)>) {
+        let next = rosters
+            .into_iter()
+            .map(|(id, metadata_topic, active_agents)| {
+                (
+                    id,
+                    GroupEagerRoster {
+                        metadata_topic,
+                        active_agents,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut current = self.group_rosters.write().await;
+        if *current == next {
+            return;
+        }
+        *current = next;
+        drop(current);
+        let known = self
+            .topic_id_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for (name, topic_id) in known {
+            self.register_group_topic(&name, topic_id).await;
+        }
+        self.refresh_topic_peers().await;
+    }
+
+    async fn register_group_topic(&self, name: &str, topic_id: TopicId) {
+        let group_id = name
+            .strip_prefix("x0x/group/")
+            .and_then(|rest| rest.split_once("/kv/"))
+            .filter(|(id, store)| !id.is_empty() && !store.is_empty())
+            .map(|(id, _)| id.to_string());
+        let group_id = match group_id {
+            Some(id) => Some(id),
+            None => self
+                .group_rosters
+                .read()
+                .await
+                .iter()
+                .find(|(_, roster)| roster.metadata_topic == name)
+                .map(|(id, _)| id.clone()),
+        };
+        if let Some(group_id) = group_id {
+            self.group_topic_by_id
+                .write()
+                .await
+                .insert(topic_id, group_id);
+        }
+    }
+
+    async fn preferred_roster_peers(&self, topic: TopicId, connected: &[PeerId]) -> Vec<PeerId> {
+        let group_id = self.group_topic_by_id.read().await.get(&topic).cloned();
+        let Some(group_id) = group_id else {
+            return Vec::new();
+        };
+        let agents = self
+            .group_rosters
+            .read()
+            .await
+            .get(&group_id)
+            .map(|r| r.active_agents.clone());
+        let (Some(agents), Some(identity)) = (agents, self.group_identity.get()) else {
+            return Vec::new();
+        };
+        let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
+        let local = self.transport.local_peer_id();
+        let mut ranked = Vec::new();
+        let mut seen = HashSet::new();
+        for agent in agents {
+            if let Some(machine) =
+                crate::dm_inbox::authenticated_machine_binding(&identity.bindings, &agent).await
+            {
+                // Raw Direct frames carry an untrusted AgentId prefix and can
+                // overwrite the reachability map. Only an independently
+                // authenticated binding may authorize a roster preference.
+                if !Self::group_pairing_allowed(identity, &agent, &machine).await {
+                    continue;
+                }
+                let peer = PeerId::new(machine.0);
+                if peer != local && connected_set.contains(&peer) && seen.insert(peer) {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(topic.as_bytes());
+                    hasher.update(local.as_bytes());
+                    hasher.update(peer.as_bytes());
+                    ranked.push((*hasher.finalize().as_bytes(), peer));
+                }
+            }
+        }
+        ranked.sort_unstable_by_key(|(rank, peer)| (*rank, *peer.as_bytes()));
+        ranked.into_iter().take(8).map(|(_, peer)| peer).collect()
+    }
+
+    async fn group_pairing_allowed(
+        identity: &GroupIdentityContext,
+        agent: &AgentId,
+        machine: &MachineId,
+    ) -> bool {
+        let revoked = identity.revoked.read().await;
+        if revoked.is_agent_revoked(agent) || revoked.is_machine_revoked(machine) {
+            return false;
+        }
+        let moves = identity.moves.read().await;
+        if crate::key_move::enforce_pairing(&revoked, moves.placement_view(), agent, machine)
+            .is_some()
+        {
+            return false;
+        }
+        drop(moves);
+        drop(revoked);
+        let discovery = identity.discovery.read().await;
+        let Some(entry) = discovery.get(agent) else {
+            return false;
+        };
+        // Discovery's machine field can be rewritten through the raw Direct
+        // reachability fallback. It supplies expiry only; the authenticated
+        // binding above remains the sole machine authority.
+        // A changed V3 cert digest clears cached certificate/expiry until
+        // hydration lands. Treat that gap as unknown expiry, not as the
+        // legacy no-certificate case that `is_expired(None)` accepts.
+        if entry.cert_digest.is_some() && entry.agent_certificate.is_none() {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        !crate::identity::is_expired(entry.cert_not_after, now)
+    }
     /// Create a new pub/sub manager.
     ///
     /// # Arguments
@@ -1004,6 +1175,10 @@ impl PubSubManager {
             participation_reason: "default_leaf".to_string(),
             passthrough_refresh_runs: AtomicU64::new(0),
             topic_id_by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            group_rosters: RwLock::new(HashMap::new()),
+            group_topic_by_id: RwLock::new(HashMap::new()),
+            group_identity: std::sync::OnceLock::new(),
+            group_preference_apply_lock: tokio::sync::Mutex::new(()),
             subscribed_topic_ids,
             relay_fanout,
             skip_legacy_dm_bus: AtomicBool::new(false),
@@ -1402,6 +1577,7 @@ impl PubSubManager {
         }
 
         self.register_dynamic_topic_priority(&topic, topic_id);
+        self.register_group_topic(&topic, topic_id).await;
         self.initialize_topic_peers(topic_id).await;
 
         // The synchronous crate API registers on a detached task. Await the
@@ -1721,6 +1897,7 @@ impl PubSubManager {
         };
 
         self.register_dynamic_topic_priority(&topic, topic_id);
+        self.register_group_topic(&topic, topic_id).await;
         self.initialize_topic_peers(topic_id).await;
 
         match self.plumtree.publish_with_fanout(topic_id, encoded).await {
@@ -2093,6 +2270,7 @@ impl PubSubManager {
             self.plumtree
                 .initialize_topic_peers(topic, membership.into_pre_807_order())
                 .await;
+            self.apply_group_preference(topic, None).await;
             return;
         }
         self.apply_topic_membership(topic, membership).await;
@@ -2288,6 +2466,7 @@ impl PubSubManager {
             self.plumtree
                 .set_topic_peers(topic_id, membership.into_pre_807_order())
                 .await;
+            self.apply_group_preference(topic_id, None).await;
             return;
         }
         let preferred = membership.preferred;
@@ -2302,6 +2481,35 @@ impl PubSubManager {
                 "#774: preferred Full/bootstrap peer stays lazy (cooling/eligibility); no retry"
             );
         }
+        self.apply_group_preference(topic_id, preferred).await;
+    }
+
+    async fn apply_group_preference(&self, topic_id: TopicId, bootstrap: Option<PeerId>) {
+        let _apply_guard = self.group_preference_apply_lock.lock().await;
+        if !self.group_topic_by_id.read().await.contains_key(&topic_id) {
+            return;
+        }
+        let connected = self.transport.connected_peer_ids().await;
+        let roster = self.preferred_roster_peers(topic_id, &connected).await;
+        // Leaf retains its #774 Full/bootstrap fallback. Reserve one of the
+        // bounded eight preference slots for it, including when the roster is
+        // empty or its members are cooling/score-vetoed. Full gives all eight
+        // slots to the roster.
+        let mut preferred = Vec::with_capacity(8);
+        if let Some(bootstrap) = bootstrap.filter(|peer| connected.contains(peer)) {
+            preferred.push(bootstrap);
+        }
+        for peer in roster {
+            if preferred.len() == 8 {
+                break;
+            }
+            if !preferred.contains(&peer) {
+                preferred.push(peer);
+            }
+        }
+        self.plumtree
+            .set_topic_preferred_eager_set(topic_id, &preferred)
+            .await;
     }
 }
 
@@ -3175,6 +3383,64 @@ mod tests {
             .await
             .expect("Failed to create test node"),
         )
+    }
+
+    struct TestGroupIdentity {
+        bindings: crate::dm_inbox::AuthenticatedMachineBindings,
+        discovery: Arc<RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
+        revoked: Arc<RwLock<crate::revocation::RevocationSet>>,
+    }
+
+    fn group_identity_for_test(manager: &PubSubManager) -> TestGroupIdentity {
+        let bindings = Arc::new(RwLock::new(
+            crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        let discovery = Arc::new(RwLock::new(HashMap::new()));
+        let revoked = Arc::new(RwLock::new(crate::revocation::RevocationSet::new()));
+        let moves = Arc::new(RwLock::new(crate::key_move::MoveState::default()));
+        manager.set_group_identity_context(
+            Arc::clone(&bindings),
+            Arc::clone(&discovery),
+            Arc::clone(&revoked),
+            moves,
+        );
+        TestGroupIdentity {
+            bindings,
+            discovery,
+            revoked,
+        }
+    }
+
+    async fn authorize_group_peer_for_test(
+        bindings: &crate::dm_inbox::AuthenticatedMachineBindings,
+        discovery: &Arc<RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
+        agent: AgentId,
+        machine: MachineId,
+    ) {
+        crate::dm_inbox::record_authenticated_machine_binding(bindings, agent, machine, 1).await;
+        discovery.write().await.insert(
+            agent,
+            crate::DiscoveredAgent {
+                agent_id: agent,
+                machine_id: machine,
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: 1,
+                last_seen: 1,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                cert_digest: None,
+                agent_public_key: Vec::new(),
+                self_name: None,
+            },
+        );
     }
 
     async fn slice1_manager(degree: usize, full: bool) -> PubSubManager {
@@ -4472,6 +4738,285 @@ mod tests {
                 .iter()
                 .all(|(_, role)| role == "eager"),
             "no working eager peer is displaced"
+        );
+    }
+
+    /// Rule 9: a Full publisher with a saturated non-member mesh must push a
+    /// two-member store write to the other member. No IHAVE/IWANT is ferried.
+    #[tokio::test]
+    async fn full_group_store_write_eager_reaches_roster_member_on_wire() {
+        let publisher = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "group_roster_test",
+        )
+        .expect("publisher");
+        *publisher.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let receiver = PubSubManager::new(test_node().await, None).expect("receiver");
+        let receiver_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(receiver.transport.as_ref());
+        let publisher_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(publisher.transport.as_ref());
+        let topic_name = format!("x0x/group/{}/kv/{}", "ab".repeat(32), "cd".repeat(32));
+        let topic = TopicId::from_entity(topic_name.as_bytes());
+        let identity = group_identity_for_test(&publisher);
+        let member_agent = AgentId([42; 32]);
+        authorize_group_peer_for_test(
+            &identity.bindings,
+            &identity.discovery,
+            member_agent,
+            MachineId(*receiver_peer.as_bytes()),
+        )
+        .await;
+        let mut nonmembers: Vec<[u8; 32]> = (1..=13).map(|n| [n; 32]).collect();
+        set_plane(&publisher, nonmembers.clone());
+        let _publisher_sub = publisher.subscribe(topic_name.clone()).await;
+        let mut receiver_sub = receiver.subscribe(topic_name.clone()).await;
+        nonmembers.push(*receiver_peer.as_bytes());
+        set_plane(&publisher, nonmembers);
+        publisher.refresh_topic_peers().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while role_for(&publisher, topic, *receiver_peer.as_bytes()) == "absent" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("connected member becomes a topic peer");
+        assert_eq!(
+            role_for(&publisher, topic, *receiver_peer.as_bytes()),
+            "lazy",
+            "member must be outside the ordinary Full eager fanout"
+        );
+
+        publisher
+            .replace_group_rosters(vec![("ab".repeat(32), String::new(), vec![member_agent])])
+            .await;
+        assert_eq!(
+            role_for(&publisher, topic, *receiver_peer.as_bytes()),
+            "eager"
+        );
+        publisher
+            .publish(topic_name, Bytes::from_static(b"owner-gss"))
+            .await
+            .expect("publish store write");
+        let frame = await_frame_to(&publisher, *receiver_peer.as_bytes(), MessageKind::Eager).await;
+        receiver.handle_incoming(publisher_peer, None, frame).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), receiver_sub.recv())
+            .await
+            .expect("wire delivery timeout")
+            .expect("subscriber delivery");
+        assert_eq!(delivered.payload, Bytes::from_static(b"owner-gss"));
+    }
+
+    #[tokio::test]
+    async fn group_roster_change_replaces_preference_and_rendezvous_is_stable() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "group_roster_change",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let group_id = "ef".repeat(32);
+        let name = format!("x0x/group/{group_id}/kv/{}", "12".repeat(32));
+        let topic = TopicId::from_entity(name.as_bytes());
+        let identity = group_identity_for_test(&manager);
+        for n in 20..=30 {
+            authorize_group_peer_for_test(
+                &identity.bindings,
+                &identity.discovery,
+                AgentId([n; 32]),
+                MachineId([n + 40; 32]),
+            )
+            .await;
+        }
+        let mut plane: Vec<[u8; 32]> = (1..=13).map(|n| [n; 32]).collect();
+        plane.extend((20..=30).map(|n| [n + 40; 32]));
+        set_plane(&manager, plane);
+        let _sub = manager.subscribe(name).await;
+        let first: Vec<AgentId> = (20..=29).map(|n| AgentId([n; 32])).collect();
+        manager
+            .replace_group_rosters(vec![(group_id.clone(), String::new(), first.clone())])
+            .await;
+        let connected = manager.transport.connected_peer_ids().await;
+        let chosen = manager.preferred_roster_peers(topic, &connected).await;
+        assert_eq!(chosen.len(), 8);
+        let mut reversed = first;
+        reversed.reverse();
+        manager
+            .replace_group_rosters(vec![(group_id.clone(), String::new(), reversed)])
+            .await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            chosen
+        );
+
+        // Remove one selected member and add a connected replacement. A
+        // removed member may remain ordinary eager by score, but is no longer
+        // protected by the roster preference.
+        let removed = AgentId([chosen[0].as_bytes()[0] - 40; 32]);
+        let updated: Vec<AgentId> = (20..=30)
+            .map(|n| AgentId([n; 32]))
+            .filter(|id| *id != removed)
+            .collect();
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), updated)])
+            .await;
+        let refreshed = manager.preferred_roster_peers(topic, &connected).await;
+        assert_eq!(refreshed.len(), 8);
+        assert!(!refreshed.contains(&chosen[0]));
+        assert!(
+            refreshed
+                .iter()
+                .filter(|peer| !chosen.contains(peer))
+                .count()
+                <= 1,
+            "one roster replacement changes at most one rendezvous winner"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_preference_ignores_spoofed_direct_claim_and_retired_pairing() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "group_roster_identity",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let identity = group_identity_for_test(&manager);
+        let member = AgentId([40; 32]);
+        let legitimate = MachineId([90; 32]);
+        let attacker = MachineId([91; 32]);
+        authorize_group_peer_for_test(&identity.bindings, &identity.discovery, member, legitimate)
+            .await;
+        let direct = DirectMessaging::new();
+        direct.mark_connected(member, legitimate).await;
+        let group_id = "ef".repeat(32);
+        let topic_name = format!("x0x/group/{group_id}/kv/{}", "12".repeat(32));
+        let topic = TopicId::from_entity(topic_name.as_bytes());
+        set_plane(&manager, vec![legitimate.0, attacker.0]);
+        let _sub = manager.subscribe(topic_name).await;
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), vec![member])])
+            .await;
+        let connected = manager.transport.connected_peer_ids().await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new(legitimate.0)]
+        );
+
+        // A raw Direct frame may overwrite reachability with its claimed
+        // AgentId. It must neither promote the attacker nor evict the
+        // independently authenticated legitimate machine.
+        direct.mark_connected(member, attacker).await;
+        assert_eq!(direct.get_machine_id(&member).await, Some(attacker));
+        identity
+            .discovery
+            .write()
+            .await
+            .get_mut(&member)
+            .expect("member discovery")
+            .machine_id = attacker;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new(legitimate.0)]
+        );
+
+        identity
+            .discovery
+            .write()
+            .await
+            .get_mut(&member)
+            .expect("member discovery")
+            .cert_not_after = Some(1);
+        assert!(manager
+            .preferred_roster_peers(topic, &connected)
+            .await
+            .is_empty());
+        // The production upsert clears a stale cert/expiry when a newer V3
+        // digest arrives without its certificate blob. The cleared `None`
+        // must not turn the previous expiry veto into permission.
+        let mut changed_announcement = identity
+            .discovery
+            .read()
+            .await
+            .get(&member)
+            .expect("member discovery")
+            .clone();
+        changed_announcement.announced_at = 2;
+        changed_announcement.cert_digest = Some([1; 32]);
+        let (cert_events, _) = tokio::sync::broadcast::channel(1);
+        crate::upsert_discovered_agent(&identity.discovery, &cert_events, changed_announcement)
+            .await;
+        assert_eq!(
+            identity
+                .discovery
+                .read()
+                .await
+                .get(&member)
+                .expect("member discovery")
+                .cert_not_after,
+            None
+        );
+        assert!(manager
+            .preferred_roster_peers(topic, &connected)
+            .await
+            .is_empty());
+        identity
+            .discovery
+            .write()
+            .await
+            .get_mut(&member)
+            .expect("member discovery")
+            .cert_digest = None;
+
+        // The authenticated cache intentionally survives revocation; a
+        // retired pairing must nonetheless lose its roster preference.
+        identity.revoked.write().await.union_bundle_retired(&[
+            crate::revocation::AgentMachineBinding {
+                agent: member,
+                machine: legitimate,
+                move_epoch: 1,
+            },
+        ]);
+        assert!(manager
+            .preferred_roster_peers(topic, &connected)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn leaf_group_topic_keeps_bootstrap_when_roster_is_empty() {
+        let manager = slice1_manager(2, false).await;
+        let group_id = "aa".repeat(32);
+        let name = format!("x0x/group/{group_id}/kv/{}", "bb".repeat(32));
+        let topic = TopicId::from_entity(name.as_bytes());
+        set_plane(&manager, vec![[1; 32], [2; 32]]);
+        let _sub = manager.subscribe(name).await;
+        set_plane(&manager, vec![[1; 32], [2; 32], [8; 32]]);
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), Vec::new())])
+            .await;
+        assert_eq!(
+            role_for(&manager, topic, [8; 32]),
+            "eager",
+            "an empty roster must retain the #774 bootstrap fallback"
         );
     }
 

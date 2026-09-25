@@ -221,12 +221,19 @@ pub(crate) async fn record_authenticated_machine_binding(
         .record(agent_id, machine_id, announced_at);
 }
 
+pub(crate) async fn authenticated_machine_binding(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: &AgentId,
+) -> Option<MachineId> {
+    bindings.write().await.resolve(agent_id)
+}
+
 #[cfg(test)]
 pub(crate) async fn authenticated_machine_binding_for_testing(
     bindings: &AuthenticatedMachineBindings,
     agent_id: &AgentId,
 ) -> Option<MachineId> {
-    bindings.write().await.resolve(agent_id)
+    authenticated_machine_binding(bindings, agent_id).await
 }
 
 #[derive(Clone, Default)]
