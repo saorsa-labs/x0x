@@ -66,9 +66,8 @@ On `origin/main` today:
    own every interleaving bug.
 4. **(B) Per-paragraph LWW.** This is simple, but two edits to the same paragraph still
    lose one of them. It fails the driver.
-5. **(C) Keep LWW and add conflict copies.** Nothing is lost, but a human must merge by
-   hand, and agents writing often would multiply the copies. Convergence to one text is
-   not achieved.
+5. **(C) Keep LWW and add conflict copies.** Nothing is lost, but humans merge by hand,
+   agents multiply the copies, and the text never converges to one version.
 
 **Scratchpads:** (S1) a dedicated `scratch` group store that riders can reach with a new
 per-group scope; (S2) let riders reach any group store of a granted group; (S3) a new
