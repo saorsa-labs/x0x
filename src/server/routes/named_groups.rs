@@ -33,6 +33,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::Extension;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -1617,6 +1618,18 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// share ONLY when this sub-signature verifies.
         #[serde(default)]
         kem_signature_b64: Option<String>,
+        /// #842: the joiner's OWN `AgentCertificate` (base64 bincode),
+        /// carried so the authority can admit an OwnerCertified join even
+        /// when the joiner's certificate ANNOUNCE has not propagated to the
+        /// authority's caches. Self-verifying via
+        /// `verify_cert_against_owner` against the policy owner — the
+        /// certificate must bind THIS member's agent id and the group
+        /// owner's user id, so no extra trust is added and the legacy
+        /// `signature_b64` canonical bytes stay unchanged (#794
+        /// precedent: additive, `serde(default)`, both directions
+        /// compatible).
+        #[serde(default)]
+        certificate_b64: Option<String>,
         /// Inviter countersignature added only after authoritative acceptance.
         #[serde(default)]
         recovery_authority_agent_id: Option<String>,
@@ -12427,6 +12440,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             treekem_key_package_b64,
             kem_public_key_b64,
             kem_signature_b64,
+            certificate_b64,
             recovery_authority_signature_b64,
             signature_b64,
             ..
@@ -12710,38 +12724,54 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             //     propagated yet; it retries on the next volley). The
             //     verified certificate is bound INTO the roster entry below
             //     so the MemberAdded commit covers it (constraint 2).
-            let owner_certified_admission =
-                match owner_certified_admission_check(state, &info, &member_agent_id).await {
-                    Ok(cert) => cert,
-                    Err(failure) => {
-                        state
-                            .groups_diagnostics
-                            .record_member_joined_rejected_owner_cert_pending(&resolved_group_key);
-                        // #447: NoCertificate is EVIDENCE-IN-FLIGHT, not a
-                        // fact about the joiner — the async announce-blob
-                        // fetch may complete (or the 600 s heartbeat land)
-                        // after the joiner's retry volley has already given
-                        // up. Retain the fully member-signed event so a later
-                        // evidence resolution can re-apply it; every other
-                        // failure is definitive and earns no retention.
-                        if failure == x0x::groups::owner_cert::OwnerCertFailure::NoCertificate {
-                            retain_pending_owner_cert_join(
-                                state,
-                                &resolved_group_key,
-                                &member_agent_id,
-                                &event_for_log,
-                            )
-                            .await;
-                        }
-                        tracing::info!(
-                            group_id = %resolved_group_key,
-                            member = %member_agent_id,
-                            reason = %failure,
-                            "MemberJoined: rejecting uncertified joiner (ADR-0038 OwnerCertified)"
-                        );
-                        return ApplyMetadataResult::REJECTED;
+            // #842: the join event may carry the joiner's certificate
+            // directly (announce-independent admission). Decode it here;
+            // verification happens inside the admission check — a
+            // present-but-invalid certificate fails definitively there.
+            let inline_joiner_certificate = certificate_b64.as_deref().and_then(|b64| {
+                use base64::Engine as _;
+                BASE64.decode(b64).ok().and_then(|bytes| {
+                    bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes).ok()
+                })
+            });
+            let owner_certified_admission = match owner_certified_admission_check(
+                state,
+                &info,
+                &member_agent_id,
+                inline_joiner_certificate.as_ref(),
+            )
+            .await
+            {
+                Ok(cert) => cert,
+                Err(failure) => {
+                    state
+                        .groups_diagnostics
+                        .record_member_joined_rejected_owner_cert_pending(&resolved_group_key);
+                    // #447: NoCertificate is EVIDENCE-IN-FLIGHT, not a
+                    // fact about the joiner — the async announce-blob
+                    // fetch may complete (or the 600 s heartbeat land)
+                    // after the joiner's retry volley has already given
+                    // up. Retain the fully member-signed event so a later
+                    // evidence resolution can re-apply it; every other
+                    // failure is definitive and earns no retention.
+                    if failure == x0x::groups::owner_cert::OwnerCertFailure::NoCertificate {
+                        retain_pending_owner_cert_join(
+                            state,
+                            &resolved_group_key,
+                            &member_agent_id,
+                            &event_for_log,
+                        )
+                        .await;
                     }
-                };
+                    tracing::info!(
+                        group_id = %resolved_group_key,
+                        member = %member_agent_id,
+                        reason = %failure,
+                        "MemberJoined: rejecting uncertified joiner (ADR-0038 OwnerCertified)"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+            };
 
             // #469 A4: an ADDRESSED invite is consumed only by its
             // intended joiner. The compare happens BEFORE consumption —
@@ -12834,6 +12864,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         member_public_key_b64: member_public_key_b64.clone(),
                         role,
                         display_name: display_name.clone(),
+                        certificate_b64: certificate_b64.clone(),
                         inviter_agent_id: inviter_agent_id.clone(),
                         invite_secret: invite_secret.clone(),
                         ts_ms,
@@ -13517,6 +13548,7 @@ pub(in crate::server) async fn create_named_group(
                     treekem_key_package_b64: Some(creator_package),
                     kem_public_key_b64: None,
                     kem_signature_b64: None,
+                    certificate_b64: None,
                     recovery_authority_agent_id: None,
                     recovery_authority_public_key_b64: None,
                     recovery_authority_signature_b64: None,
@@ -13838,6 +13870,7 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
 pub(in crate::server) async fn get_named_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
 ) -> impl IntoResponse {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     // #447/#458: typed LOCAL membership state so a joiner in limbo (local
@@ -13854,6 +13887,28 @@ pub(in crate::server) async fn get_named_group(
             local_join_membership_state(state.as_ref(), &info, &local_agent_hex).await;
         (info, state_label)
     };
+    if !actor.is_durable_owner() {
+        if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
+            return forbidden("rider tokens cannot read named-group details");
+        }
+        if membership_state == "pending_authority_commit" {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "group_id": info.mls_group_id,
+                    "membership_state": "pending_authority_commit",
+                })),
+            );
+        }
+        if membership_state != "active" {
+            return api_error_with_reason(
+                StatusCode::FORBIDDEN,
+                "active local group membership required",
+                "group_membership_required",
+            );
+        }
+    }
     // #447: an operator reading the group is a natural moment to sweep
     // retained owner-cert-pending joins whose evidence may have landed.
     retry_pending_owner_cert_joins(&state, Some(&id)).await;
@@ -14128,11 +14183,25 @@ async fn local_join_membership_state(
 pub(in crate::server) async fn get_named_group_members(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
+    if !actor.is_durable_owner() {
+        if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
+            return forbidden("rider tokens cannot read named-group members");
+        }
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+        if local_join_membership_state(state.as_ref(), info, &local_agent_hex).await != "active" {
+            return api_error_with_reason(
+                StatusCode::FORBIDDEN,
+                "active local group membership required",
+                "group_membership_required",
+            );
+        }
+    }
     let members = named_group_member_values(info);
     (
         StatusCode::OK,
@@ -16641,6 +16710,7 @@ pub(in crate::server) const JOIN_DISPLAY_NAME_MAX_BYTES: usize = 128;
 /// to this join, so the authority can later `publish_secure_share` the
 /// REAL group secret to the invite-joined member (Gap 2). The legacy
 /// signature bytes above are unchanged.
+#[allow(clippy::too_many_arguments)] // matches the targeted allow used elsewhere in this file
 fn build_signed_member_joined_resend(
     info: &x0x::groups::GroupInfo,
     joiner_hex: &str,
@@ -16649,6 +16719,7 @@ fn build_signed_member_joined_resend(
     treekem_key_package_b64: &Option<String>,
     signing_kp: &crate::identity::AgentKeypair,
     joiner_kem: Option<&x0x::groups::kem_envelope::AgentKemKeypair>,
+    joiner_certificate: Option<&x0x::identity::AgentCertificate>,
 ) -> Option<MemberJoinedResend> {
     let now_ms = now_millis_u64();
     use base64::Engine as _;
@@ -16704,6 +16775,12 @@ fn build_signed_member_joined_resend(
                 treekem_key_package_b64: treekem_key_package_b64.clone(),
                 kem_public_key_b64: joiner_kem_b64,
                 kem_signature_b64,
+                certificate_b64: joiner_certificate.and_then(|cert| {
+                    use base64::Engine as _;
+                    bincode::serialize(cert)
+                        .ok()
+                        .map(|bytes| BASE64.encode(bytes))
+                }),
                 recovery_authority_agent_id: None,
                 recovery_authority_public_key_b64: None,
                 recovery_authority_signature_b64: None,
@@ -17345,6 +17422,10 @@ pub(in crate::server) async fn join_group_via_invite(
                     &treekem_key_package_b64,
                     signing_kp,
                     joiner_kem,
+                    // #842: carry the joiner's own certificate so the
+                    // authority can admit this join even when the cert
+                    // announce has not reached its caches yet.
+                    state.agent.identity().agent_certificate(),
                 )
             };
             let Some(member_joined_resend) = signed_resend else {
@@ -17979,7 +18060,7 @@ pub(in crate::server) async fn add_named_group_member(
         // this runs after the role gate and decides alone. The verified
         // certificate is bound into the roster entry (constraint 2).
         let owner_certified_admission =
-            match owner_certified_admission_check(state.as_ref(), info, &agent_hex).await {
+            match owner_certified_admission_check(state.as_ref(), info, &agent_hex, None).await {
                 Ok(cert) => cert,
                 Err(failure) => {
                     return forbidden(format!(
@@ -18185,7 +18266,7 @@ async fn add_treekem_named_group_member(
         // of the admin role that authorized them. Verified certificate is
         // returned for roster binding below (constraint 2).
         let owner_certified_admission =
-            match owner_certified_admission_check(state.as_ref(), info, &agent_hex).await {
+            match owner_certified_admission_check(state.as_ref(), info, &agent_hex, None).await {
                 Ok(cert) => cert,
                 Err(failure) => {
                     return forbidden(format!(
@@ -18239,6 +18320,7 @@ async fn add_treekem_named_group_member(
         treekem_key_package_b64: Some(kp_b64.clone()),
         kem_public_key_b64: None,
         kem_signature_b64: None,
+        certificate_b64: None,
         recovery_authority_agent_id: None,
         recovery_authority_public_key_b64: None,
         recovery_authority_signature_b64: None,
@@ -19273,6 +19355,15 @@ async fn wipe_local_group_crypto_material(
         });
     }
     if !welcome_ids.is_empty() {
+        let mut streams = state.pending_welcome_streams.lock().await;
+        if let Some(streams) = streams.as_mut() {
+            for welcome_id in &welcome_ids {
+                if let Some(stream) = streams.remove(welcome_id) {
+                    stream.abort();
+                }
+            }
+        }
+        drop(streams);
         let mut waiters = state.pending_welcome_waiters.write().await;
         let mut acks = state.pending_welcome_acks.write().await;
         for welcome_id in welcome_ids {
@@ -21463,10 +21554,35 @@ async fn owner_certified_admission_check(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
     member_hex: &str,
+    inline_certificate: Option<&x0x::identity::AgentCertificate>,
 ) -> Result<Option<x0x::identity::AgentCertificate>, x0x::groups::owner_cert::OwnerCertFailure> {
     let Some(owner) = info.policy.admission.owner_certified_user_id().copied() else {
         return Ok(None);
     };
+    // #842: a certificate carried by the join event itself is verified
+    // INLINE — exactly the check the cache-backed evidence path applies,
+    // without depending on the joiner's announce having propagated. A
+    // PRESENT-but-invalid certificate is a definitive failure (forged,
+    // foreign-owner, wrong agent, expired): unlike NoCertificate it is not
+    // evidence-in-flight and earns no retention. An absent certificate
+    // keeps the evidence path unchanged.
+    if let Some(cert) = inline_certificate {
+        let revoked = {
+            let revoked_set = state.agent.revocation_set();
+            let revoked = revoked_set.read().await;
+            parse_agent_id_hex(member_hex)
+                .map(|agent| revoked.is_agent_revoked(&agent))
+                .unwrap_or(false)
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        return x0x::groups::owner_cert::verify_cert_against_owner(
+            &owner, member_hex, cert, revoked, now_unix,
+        )
+        .map(|()| Some(cert.clone()));
+    }
     let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
     x0x::groups::owner_cert::verify_owner_certified_member(&owner, member_hex, &evidence)
         .map(|()| evidence.cert_for(member_hex).cloned())
@@ -23968,6 +24084,7 @@ async fn approve_treekem_join_request(
         invite_secret: String::new(),
         kem_public_key_b64: None,
         kem_signature_b64: None,
+        certificate_b64: None,
         ts_ms: now_ms,
         treekem_key_package_b64: Some(BASE64.encode(&kp_bytes)),
         recovery_authority_agent_id: None,
@@ -31733,7 +31850,9 @@ const MEMBER_JOINED_RESEND_POLL_INTERVALS: u32 = 3;
 
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
 
-const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+// The TreeKEM join-result poll closes at 120s. All fetch retries and the
+// final receive wait must finish inside that window.
+const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(115);
 
 const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
     Duration::ZERO,
@@ -32131,6 +32250,13 @@ async fn refire_pending_join_volley(
             treekem_key_package_b64,
             kem_public_key_b64: joiner_kem_b64,
             kem_signature_b64,
+            // #842: the rebuilt resend carries the certificate too, so a
+            // restarted joiner's retry volley is announce-independent.
+            certificate_b64: state.agent.identity().agent_certificate().and_then(|cert| {
+                bincode::serialize(cert)
+                    .ok()
+                    .map(|bytes| BASE64.encode(bytes))
+            }),
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -34038,7 +34164,24 @@ async fn stage_treekem_welcome(
         created_at: Instant::now(),
     };
     let mut welcomes = state.pending_welcomes.write().await;
-    welcomes.retain(|_, pending| pending.created_at.elapsed() < PENDING_WELCOME_TTL);
+    let mut expired_ids = Vec::new();
+    welcomes.retain(|id, pending| {
+        let live = pending.created_at.elapsed() < PENDING_WELCOME_TTL;
+        if !live {
+            expired_ids.push(id.clone());
+        }
+        live
+    });
+    // Keep the staging lock through stream pruning. A concurrent staging of
+    // the same content id must not be mistaken for the expired entry.
+    let mut streams = state.pending_welcome_streams.lock().await;
+    for id in expired_ids {
+        if let Some(stream) = streams.as_mut().and_then(|streams| streams.remove(&id)) {
+            stream.abort();
+            let _ = stream.await;
+        }
+        state.pending_welcome_acks.write().await.remove(&id);
+    }
     welcomes.insert(welcome_id.clone(), pending);
     WelcomeRef {
         welcome_id,
@@ -34089,11 +34232,21 @@ async fn send_welcome_blob_message(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug)]
 enum WelcomeFetchSendError {
     /// The request might have arrived; only its delivery receipt is missing.
     ReceiptUnconfirmed(String),
     /// The request could not be sent or encoded.
     Failed(String),
+}
+
+fn classify_welcome_fetch_send_error(error: x0x::dm::DmError) -> WelcomeFetchSendError {
+    match error {
+        x0x::dm::DmError::Timeout { .. } => {
+            WelcomeFetchSendError::ReceiptUnconfirmed(error.to_string())
+        }
+        _ => WelcomeFetchSendError::Failed(error.to_string()),
+    }
 }
 
 async fn send_welcome_fetch_request(
@@ -34107,12 +34260,7 @@ async fn send_welcome_fetch_request(
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
         .await
         .map(|_| ())
-        .map_err(|error| match error {
-            x0x::dm::DmError::Timeout { .. } => {
-                WelcomeFetchSendError::ReceiptUnconfirmed(error.to_string())
-            }
-            _ => WelcomeFetchSendError::Failed(error.to_string()),
-        })
+        .map_err(classify_welcome_fetch_send_error)
 }
 
 async fn notify_welcome_waiters(
@@ -34150,37 +34298,6 @@ async fn fetch_treekem_welcome_with_retries(
     group_id: &str,
     welcome_ref: &WelcomeRef,
 ) -> std::result::Result<Vec<u8>, String> {
-    let mut last_error = None;
-    for (attempt, delay) in WELCOME_FETCH_RETRY_DELAYS.iter().enumerate() {
-        if !delay.is_zero() {
-            tokio::time::sleep(*delay).await;
-        }
-        match fetch_treekem_welcome(state, group_id, welcome_ref).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                tracing::warn!(
-                    target: "welcome.trace",
-                    stage = "fetch_retry_failed",
-                    group_id,
-                    welcome_id = %welcome_ref.welcome_id,
-                    attempt,
-                    next_delay_ms = ?WELCOME_FETCH_RETRY_DELAYS
-                        .get(attempt + 1)
-                        .map(|d| d.as_millis() as u64),
-                    error = %e,
-                );
-                last_error = Some(e);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| "TreeKEM Welcome fetch did not run".to_string()))
-}
-
-async fn fetch_treekem_welcome(
-    state: &Arc<AppState>,
-    group_id: &str,
-    welcome_ref: &WelcomeRef,
-) -> std::result::Result<Vec<u8>, String> {
     let send_state = Arc::clone(state);
     fetch_treekem_welcome_via(state, group_id, welcome_ref, move |source, request| {
         let state = Arc::clone(&send_state);
@@ -34198,7 +34315,30 @@ async fn fetch_treekem_welcome_via<S, F>(
     send: S,
 ) -> std::result::Result<Vec<u8>, String>
 where
-    S: FnOnce(AgentId, WelcomeBlobMessage) -> F,
+    S: FnMut(AgentId, WelcomeBlobMessage) -> F,
+    F: std::future::Future<Output = std::result::Result<(), WelcomeFetchSendError>>,
+{
+    fetch_treekem_welcome_via_schedule(
+        state,
+        group_id,
+        welcome_ref,
+        send,
+        &WELCOME_FETCH_RETRY_DELAYS,
+        WELCOME_FETCH_TIMEOUT,
+    )
+    .await
+}
+
+async fn fetch_treekem_welcome_via_schedule<S, F>(
+    state: &Arc<AppState>,
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+    mut send: S,
+    retry_delays: &[Duration],
+    fetch_timeout: Duration,
+) -> std::result::Result<Vec<u8>, String>
+where
+    S: FnMut(AgentId, WelcomeBlobMessage) -> F,
     F: std::future::Future<Output = std::result::Result<(), WelcomeFetchSendError>>,
 {
     if welcome_ref.byte_len > x0x::files::MAX_TRANSFER_SIZE {
@@ -34207,7 +34347,7 @@ where
     let source = parse_agent_id_hex(&welcome_ref.source)?;
     let total_chunks =
         x0x::files::total_chunks_for_size(welcome_ref.byte_len, x0x::files::DEFAULT_CHUNK_SIZE);
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
     let should_send_fetch = {
         let mut receives = state.pending_welcome_receives.write().await;
         let should_send_fetch = match receives.get(&welcome_ref.welcome_id) {
@@ -34253,37 +34393,80 @@ where
         should_send_fetch
     };
 
-    if should_send_fetch {
-        let request = WelcomeBlobMessage::FetchRequest {
-            group_id: group_id.to_string(),
-            welcome_id: welcome_ref.welcome_id.clone(),
-        };
-        match send(source, request).await {
-            Ok(()) => {}
-            Err(WelcomeFetchSendError::ReceiptUnconfirmed(error)) => {
-                // The request may have reached the owner, and the completed
-                // Welcome may already be on `rx`. Its receipt timeout cannot
-                // invalidate the independently verified transfer.
-                tracing::warn!(
-                    target: "welcome.trace",
-                    stage = "fetch_request_receipt_unconfirmed",
-                    group_id,
-                    welcome_id = %welcome_ref.welcome_id,
-                    error = %error,
-                    "waiting for Welcome despite unconfirmed FetchRequest receipt",
-                );
+    let started = tokio::time::Instant::now();
+    let deadline = started + fetch_timeout;
+    let mut due = started;
+    let mut last_progress_bytes = 0;
+    let mut received = None;
+    for (attempt, delay) in retry_delays.iter().enumerate() {
+        due += *delay;
+        if due >= deadline {
+            break;
+        }
+        tokio::select! {
+            result = &mut rx => {
+                received = Some(result);
+                break;
             }
-            Err(WelcomeFetchSendError::Failed(error)) => {
-                cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
-                return Err(error);
+            () = tokio::time::sleep_until(due) => {}
+        }
+        if attempt > 0 {
+            let progress_bytes = state
+                .pending_welcome_receives
+                .read()
+                .await
+                .get(&welcome_ref.welcome_id)
+                .map_or(0, |receive| receive.received_bytes);
+            if progress_bytes > last_progress_bytes {
+                last_progress_bytes = progress_bytes;
+                tracing::debug!(
+                    target: "welcome.trace",
+                    stage = "fetch_retry_stream_progress",
+                    welcome_id = %welcome_ref.welcome_id,
+                    attempt,
+                    progress_bytes,
+                );
+                continue;
+            }
+            tracing::warn!(
+                target: "welcome.trace",
+                stage = "fetch_retry_stalled",
+                group_id,
+                welcome_id = %welcome_ref.welcome_id,
+                attempt,
+            );
+        }
+        if should_send_fetch || attempt > 0 {
+            let request = WelcomeBlobMessage::FetchRequest {
+                group_id: group_id.to_string(),
+                welcome_id: welcome_ref.welcome_id.clone(),
+            };
+            match send(source, request).await {
+                Ok(()) => {}
+                Err(WelcomeFetchSendError::ReceiptUnconfirmed(error)) => {
+                    tracing::warn!(
+                        target: "welcome.trace",
+                        stage = "fetch_request_receipt_unconfirmed",
+                        group_id,
+                        welcome_id = %welcome_ref.welcome_id,
+                        error = %error,
+                        "waiting for Welcome despite unconfirmed FetchRequest receipt",
+                    );
+                }
+                Err(WelcomeFetchSendError::Failed(error)) => {
+                    cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+                    return Err(error);
+                }
             }
         }
     }
-
-    let received = match tokio::time::timeout(WELCOME_FETCH_TIMEOUT, rx).await {
-        Ok(Ok(result)) => result?,
-        Ok(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
-        Err(_) => {
+    if received.is_none() {
+        received = tokio::time::timeout_at(deadline, &mut rx).await.ok();
+    }
+    let received = match received {
+        Some(Ok(result)) => result?,
+        Some(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
+        None => {
             cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
             return Err("timed out waiting for TreeKEM Welcome blob".to_string());
         }
@@ -34391,18 +34574,56 @@ async fn handle_welcome_fetch_request(
         return;
     };
     if pending.created_at.elapsed() >= PENDING_WELCOME_TTL {
-        state.pending_welcomes.write().await.remove(&welcome_id);
+        let mut welcomes = state.pending_welcomes.write().await;
+        // A concurrent restage can replace this content id between the read
+        // above and this write. Only tear down the stream for an entry that is
+        // still expired while holding the same lock as staging.
+        if welcomes
+            .get(&welcome_id)
+            .is_some_and(|current| current.created_at.elapsed() >= PENDING_WELCOME_TTL)
+        {
+            welcomes.remove(&welcome_id);
+            let mut streams = state.pending_welcome_streams.lock().await;
+            if let Some(stream) = streams
+                .as_mut()
+                .and_then(|streams| streams.remove(&welcome_id))
+            {
+                stream.abort();
+                let _ = stream.await;
+            }
+            state.pending_welcome_acks.write().await.remove(&welcome_id);
+        }
         return;
     }
     if pending.group_id != group_id || pending.joiner_agent != sender_hex {
         tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sender = %LogHexId::agent(&sender_hex), "unauthorized Welcome fetch request");
         return;
     }
-    let state = Arc::clone(state);
+    let stream_state = Arc::clone(state);
     let recipient = *sender;
-    tokio::spawn(async move {
-        stream_welcome_blob(&state, &recipient, &welcome_id, pending).await;
-    });
+    let stream_id = welcome_id.clone();
+    replace_welcome_stream(state, &welcome_id, async move {
+        stream_welcome_blob(&stream_state, &recipient, &stream_id, pending).await;
+    })
+    .await;
+}
+
+async fn replace_welcome_stream<F>(state: &Arc<AppState>, welcome_id: &str, stream: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut streams = state.pending_welcome_streams.lock().await;
+    let Some(streams) = streams.as_mut() else {
+        return;
+    };
+    if let Some(previous) = streams.remove(welcome_id) {
+        previous.abort();
+        let _ = previous.await;
+    }
+    // An aborted sender cannot run its normal ack-slot cleanup. Clear its
+    // slot only after it has stopped so the replacement owns every ack.
+    state.pending_welcome_acks.write().await.remove(welcome_id);
+    streams.insert(welcome_id.to_string(), tokio::spawn(stream));
 }
 
 async fn stream_welcome_blob(
@@ -34423,6 +34644,11 @@ async fn stream_welcome_blob(
     })
     .await;
 }
+
+#[cfg(test)]
+static WELCOME_STREAM_TEST_GATES: std::sync::OnceLock<
+    StdMutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+> = std::sync::OnceLock::new();
 
 /// Stream one staged Welcome blob to `recipient`, sending every frame through
 /// `send` (production: [`send_welcome_blob_message`]; tests inject a lossy
@@ -34452,6 +34678,14 @@ async fn stream_welcome_blob_via<S, F>(
             return;
         }
         acks.insert(welcome_id.to_string(), Arc::clone(&ack_slot));
+    }
+    #[cfg(test)]
+    if let Some(gate) = WELCOME_STREAM_TEST_GATES
+        .get()
+        .and_then(|gates| gates.lock().ok())
+        .and_then(|gates| gates.get(welcome_id).cloned())
+    {
+        gate.notified().await;
     }
 
     let offer = WelcomeBlobMessage::Offer {
@@ -34551,7 +34785,7 @@ async fn handle_welcome_blob_chunk(
     };
     let mut receives = state.pending_welcome_receives.write().await;
     let Some(receive) = receives.get_mut(&welcome_id) else {
-        tracing::debug!(target: "welcome.trace", stage = "chunk_recv_no_pending", welcome_id = %welcome_id, seq = sequence);
+        tracing::warn!(target: "welcome.trace", stage = "chunk_recv_no_pending", welcome_id = %welcome_id, seq = sequence);
         return;
     };
     if receive.source != sender_hex {
@@ -34703,6 +34937,7 @@ pub(in crate::server) mod tests {
     mod hs_r3_invite_auth;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
+    mod issue821_read_auth;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     mod wp_c;
@@ -35435,6 +35670,7 @@ pub(in crate::server) mod tests {
             pending_welcome_receives: RwLock::new(HashMap::new()),
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
+            pending_welcome_streams: Mutex::new(Some(HashMap::new())),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
@@ -35855,6 +36091,8 @@ pub(in crate::server) mod tests {
                 recovery_authority_signature_b64: None,
                 recovery_authority_commit: None,
                 signature_b64: BASE64.encode(sig.as_bytes()),
+
+                certificate_b64: None,
             };
             let stored = MemberJoinedResend {
                 metadata_topic: "t9b-topic".into(),
@@ -36011,6 +36249,8 @@ pub(in crate::server) mod tests {
                     recovery_authority_signature_b64: None,
                     recovery_authority_commit: None,
                     signature_b64: BASE64.encode(sig.as_bytes()),
+
+                    certificate_b64: None,
                 },
                 sender_id,
             )
@@ -42615,9 +42855,13 @@ pub(in crate::server) mod tests {
         );
 
         let (get_status, get_body) = response_json(
-            get_named_group(State(Arc::clone(&state)), Path(tombstone_id.clone()))
-                .await
-                .into_response(),
+            get_named_group(
+                State(Arc::clone(&state)),
+                Path(tombstone_id.clone()),
+                Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            )
+            .await
+            .into_response(),
         )
         .await?;
         assert_eq!(get_status, StatusCode::OK);
@@ -43135,6 +43379,8 @@ pub(in crate::server) mod tests {
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
+
+            certificate_b64: None,
         };
         let (recovery_commit, retained_commit) = {
             let groups = state.named_groups.read().await;
@@ -43304,6 +43550,7 @@ pub(in crate::server) mod tests {
             treekem_key_package_b64: None,
             kem_public_key_b64: None,
             kem_signature_b64: None,
+            certificate_b64: None,
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
@@ -45813,6 +46060,8 @@ pub(in crate::server) mod tests {
         let received =
             fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |source, request| {
                 let state = Arc::clone(&receive_state);
+                let welcome_id = welcome_id.clone();
+                let receive_bytes = receive_bytes.clone();
                 async move {
                     assert_eq!(source, owner_id);
                     assert!(matches!(request, WelcomeBlobMessage::FetchRequest { .. }));
@@ -45840,6 +46089,451 @@ pub(in crate::server) mod tests {
         assert_eq!(received, bytes);
         assert!(joiner.pending_welcome_receives.read().await.is_empty());
         assert!(joiner.pending_welcome_waiters.read().await.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn actual_dm_timeout_leaves_welcome_receipt_unconfirmed() {
+        let error = x0x::dm::DmError::Timeout {
+            retries: 1,
+            elapsed: Duration::from_secs(24),
+        };
+        assert!(matches!(
+            classify_welcome_fetch_send_error(error),
+            WelcomeFetchSendError::ReceiptUnconfirmed(message)
+                if message.contains("timed out after 1 retries")
+        ));
+    }
+
+    #[tokio::test]
+    async fn replacement_welcome_stream_stops_previous_before_starting() -> anyhow::Result<()> {
+        struct ActiveGuard(Arc<AtomicUsize>);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let active = Arc::new(AtomicUsize::new(0));
+        let welcome_id = "ab".repeat(32);
+        for _ in 0..2 {
+            let stream_active = Arc::clone(&active);
+            replace_welcome_stream(&owner, &welcome_id, async move {
+                stream_active.fetch_add(1, Ordering::SeqCst);
+                let _guard = ActiveGuard(stream_active);
+                std::future::pending::<()>().await;
+            })
+            .await;
+            tokio::task::yield_now().await;
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+        }
+        let stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|streams| streams.remove(&welcome_id));
+        if let Some(stream) = stream {
+            stream.abort();
+            let _ = stream.await;
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn welcome_fetch_handler_replaces_only_for_authorized_joiner() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let (stranger, _stranger_dir) = secure_endpoint_test_state().await?;
+        let joiner_id = joiner.agent.agent_id();
+        let stranger_id = stranger.agent.agent_id();
+        let group_id = "a1".repeat(32);
+        let bytes = b"handler authorization and replacement Welcome".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        owner.pending_welcomes.write().await.insert(
+            welcome_id.clone(),
+            PendingWelcome {
+                group_id: group_id.clone(),
+                joiner_agent: hex::encode(joiner_id.as_bytes()),
+                bytes,
+                created_at: Instant::now(),
+            },
+        );
+        // Hold the real stream just after ACK-slot registration. This gives
+        // the handler test a deterministic view of the live stream and slot
+        // without depending on network delivery timing.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gates = WELCOME_STREAM_TEST_GATES.get_or_init(|| StdMutex::new(HashMap::new()));
+        gates
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Welcome test gate poisoned"))?
+            .insert(welcome_id.clone(), Arc::clone(&gate));
+
+        let request = |group_id: String| WelcomeBlobMessage::FetchRequest {
+            group_id,
+            welcome_id: welcome_id.clone(),
+        };
+        handle_welcome_blob_message(&owner, &joiner_id, request(group_id.clone())).await;
+        let first_slot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(slot) = owner.pending_welcome_acks.read().await.get(&welcome_id) {
+                    break Arc::clone(slot);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let first_stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|streams| streams.get(&welcome_id))
+            .ok_or_else(|| anyhow::anyhow!("first Welcome stream missing"))?
+            .id();
+
+        handle_welcome_blob_message(&owner, &stranger_id, request(group_id.clone())).await;
+        handle_welcome_blob_message(&owner, &joiner_id, request("wrong-group".into())).await;
+        let unchanged_slot = owner
+            .pending_welcome_acks
+            .read()
+            .await
+            .get(&welcome_id)
+            .cloned();
+        assert!(unchanged_slot
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(slot, &first_slot)));
+        let unchanged_stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|streams| streams.get(&welcome_id))
+            .map(tokio::task::JoinHandle::id);
+        assert_eq!(unchanged_stream, Some(first_stream));
+
+        handle_welcome_blob_message(&owner, &joiner_id, request(group_id)).await;
+        let fresh_slot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(slot) = owner.pending_welcome_acks.read().await.get(&welcome_id) {
+                    if !Arc::ptr_eq(slot, &first_slot) {
+                        break Arc::clone(slot);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(!Arc::ptr_eq(&fresh_slot, &first_slot));
+        let replacement_stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|streams| streams.get(&welcome_id))
+            .map(tokio::task::JoinHandle::id);
+        assert_ne!(replacement_stream, Some(first_stream));
+
+        gates
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Welcome test gate poisoned"))?
+            .remove(&welcome_id);
+        let stream = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|streams| streams.remove(&welcome_id));
+        if let Some(stream) = stream {
+            stream.abort();
+            let _ = stream.await;
+        }
+        owner.pending_welcome_acks.write().await.remove(&welcome_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_welcome_fetch_clears_live_stream_and_ack_slot() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let joiner_id = joiner.agent.agent_id();
+        let group_id = "b2".repeat(32);
+        let bytes = b"expired Welcome with an active stream".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        owner.pending_welcomes.write().await.insert(
+            welcome_id.clone(),
+            PendingWelcome {
+                group_id: group_id.clone(),
+                joiner_agent: hex::encode(joiner_id.as_bytes()),
+                bytes,
+                created_at: Instant::now() - PENDING_WELCOME_TTL - Duration::from_secs(1),
+            },
+        );
+        let active = Arc::new(AtomicBool::new(false));
+        let stream_active = Arc::clone(&active);
+        replace_welcome_stream(&owner, &welcome_id, async move {
+            struct ActiveGuard(Arc<AtomicBool>);
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            stream_active.store(true, Ordering::SeqCst);
+            let _guard = ActiveGuard(stream_active);
+            std::future::pending::<()>().await;
+        })
+        .await;
+        tokio::task::yield_now().await;
+        assert!(active.load(Ordering::SeqCst));
+        owner
+            .pending_welcome_acks
+            .write()
+            .await
+            .insert(welcome_id.clone(), Arc::new(FileChunkAckSlot::new()));
+
+        handle_welcome_blob_message(
+            &owner,
+            &joiner_id,
+            WelcomeBlobMessage::FetchRequest {
+                group_id,
+                welcome_id: welcome_id.clone(),
+            },
+        )
+        .await;
+        assert!(!owner
+            .pending_welcomes
+            .read()
+            .await
+            .contains_key(&welcome_id));
+        assert!(!owner
+            .pending_welcome_acks
+            .read()
+            .await
+            .contains_key(&welcome_id));
+        assert!(!owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|streams| streams.contains_key(&welcome_id)));
+        assert!(!active.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn welcome_receive_survives_retry_sleep() -> anyhow::Result<()> {
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let owner_id = owner.agent.agent_id();
+        let group_id = "cd".repeat(32);
+        let bytes = b"Welcome completed during retry sleep".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        let welcome_ref = WelcomeRef {
+            welcome_id: welcome_id.clone(),
+            byte_len: bytes.len() as u64,
+            source: hex::encode(owner_id.as_bytes()),
+        };
+        let sends = Arc::new(AtomicUsize::new(0));
+        let send_state = Arc::clone(&joiner);
+        let send_bytes = bytes.clone();
+        let send_id = welcome_id.clone();
+        let send_count = Arc::clone(&sends);
+        let received = fetch_treekem_welcome_via_schedule(
+            &joiner,
+            &group_id,
+            &welcome_ref,
+            move |_, _| {
+                let state = Arc::clone(&send_state);
+                let bytes = send_bytes.clone();
+                let id = send_id.clone();
+                let attempt = send_count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            let mut receives = state.pending_welcome_receives.write().await;
+                            let receive =
+                                receives.get_mut(&id).expect("receive remains registered");
+                            receive.chunks.insert(0, bytes.clone());
+                            receive.received_bytes = bytes.len() as u64;
+                            drop(receives);
+                            handle_welcome_blob_complete(&state, &owner_id, &id).await;
+                        });
+                    }
+                    Ok(())
+                }
+            },
+            &[Duration::ZERO, Duration::from_millis(40)],
+            Duration::from_millis(80),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(received, bytes);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn welcome_retry_uses_absolute_schedule_and_skips_progress() -> anyhow::Result<()> {
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let owner_id = owner.agent.agent_id();
+        let group_id = "ef".repeat(32);
+        let bytes = b"partially streamed Welcome".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        let welcome_ref = WelcomeRef {
+            welcome_id: welcome_id.clone(),
+            byte_len: bytes.len() as u64,
+            source: hex::encode(owner_id.as_bytes()),
+        };
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let sent_at = Arc::new(Mutex::new(Vec::new()));
+        let send_times = Arc::clone(&sent_at);
+        let send_state = Arc::clone(&joiner);
+        let send_id = welcome_id.clone();
+        let result = fetch_treekem_welcome_via_schedule(
+            &joiner,
+            &group_id,
+            &welcome_ref,
+            move |_, _| {
+                let times = Arc::clone(&send_times);
+                let state = Arc::clone(&send_state);
+                let id = send_id.clone();
+                async move {
+                    let mut sent = times.lock().await;
+                    sent.push(tokio::time::Instant::now() - started);
+                    if sent.len() == 1 {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            let mut receives = state.pending_welcome_receives.write().await;
+                            let receive = receives.get_mut(&id).expect("receive is registered");
+                            receive.chunks.insert(0, b"part".to_vec());
+                            receive.received_bytes = 4;
+                        });
+                    }
+                    Ok(())
+                }
+            },
+            &[
+                Duration::ZERO,
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+            ],
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ref error) if error == "timed out waiting for TreeKEM Welcome blob"
+        ));
+        let sent = sent_at.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0] <= Duration::from_millis(2));
+        assert_eq!(sent[1] - sent[0], Duration::from_millis(30));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_welcome_stream_releases_its_app_state() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let weak = Arc::downgrade(&owner);
+        let stream_owner = Arc::clone(&owner);
+        replace_welcome_stream(&owner, &"ab".repeat(32), async move {
+            let _keep_alive = stream_owner;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        tokio::task::yield_now().await;
+        let streams = owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .take()
+            .unwrap_or_default();
+        for stream in streams.into_values() {
+            stream.abort();
+            let _ = stream.await;
+        }
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_welcome_stream_admission_for_waiting_fetch() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let weak = Arc::downgrade(&owner);
+        let mut streams = owner.pending_welcome_streams.lock().await;
+        let waiting_state = Arc::clone(&owner);
+        let stream_state = Arc::clone(&owner);
+        let late_stream_polled = Arc::new(AtomicBool::new(false));
+        let polled = Arc::clone(&late_stream_polled);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let waiting_fetch = tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            replace_welcome_stream(&waiting_state, &"ab".repeat(32), async move {
+                let _keep_alive = stream_state;
+                polled.store(true, Ordering::SeqCst);
+            })
+            .await;
+        });
+        entered_rx.await?;
+        tokio::task::yield_now().await;
+        assert!(streams.take().is_some(), "shutdown closes admission");
+        drop(streams);
+        waiting_fetch.await?;
+        assert!(!late_stream_polled.load(Ordering::SeqCst));
+        assert!(owner.pending_welcome_streams.lock().await.is_none());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restaging_expired_welcome_stops_old_stream_first() -> anyhow::Result<()> {
+        let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+        let bytes = b"same content restaged after expiry".to_vec();
+        let welcome_id = welcome_id_for_bytes(&bytes);
+        let group_id = "cd".repeat(32);
+        let joiner_id = "ab".repeat(32);
+        owner.pending_welcomes.write().await.insert(
+            welcome_id.clone(),
+            PendingWelcome {
+                group_id: group_id.clone(),
+                joiner_agent: joiner_id.clone(),
+                bytes: bytes.clone(),
+                created_at: Instant::now() - PENDING_WELCOME_TTL - Duration::from_secs(1),
+            },
+        );
+        let active = Arc::new(AtomicBool::new(false));
+        let stream_active = Arc::clone(&active);
+        replace_welcome_stream(&owner, &welcome_id, async move {
+            struct ActiveGuard(Arc<AtomicBool>);
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            stream_active.store(true, Ordering::SeqCst);
+            let _guard = ActiveGuard(stream_active);
+            std::future::pending::<()>().await;
+        })
+        .await;
+        tokio::task::yield_now().await;
+        assert!(active.load(Ordering::SeqCst));
+
+        let staged = stage_treekem_welcome(&owner, &group_id, &joiner_id, bytes).await;
+        assert_eq!(staged.welcome_id, welcome_id);
+        assert!(!active.load(Ordering::SeqCst));
+        assert!(!owner
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|streams| streams.contains_key(&welcome_id)));
         Ok(())
     }
 
@@ -47190,6 +47884,8 @@ pub(in crate::server) mod tests {
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: "sig".to_string(),
+
+            certificate_b64: None,
         };
         let (key, _) = member_joined_kp_cache_entry(&with_kp).expect("kp-bearing event extracted");
         assert_eq!(key, join_result_key(&group_id, &member));
@@ -47343,6 +48039,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 ..
             } => NamedGroupMetadataEvent::MemberJoined {
                 group_id,
@@ -47355,6 +48052,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 kem_public_key_b64: None,
                 kem_signature_b64: None,
                 recovery_authority_agent_id: None,
@@ -47421,6 +48119,8 @@ pub(in crate::server) mod tests {
                 recovery_authority_signature_b64: None,
                 recovery_authority_commit: None,
                 signature_b64,
+
+                certificate_b64: None,
             },
             _ => unreachable!("fixture is MemberJoined"),
         };
@@ -47476,6 +48176,7 @@ pub(in crate::server) mod tests {
                 ts_ms,
                 treekem_key_package_b64,
                 signature_b64,
+                certificate_b64,
                 ..
             } => NamedGroupMetadataEvent::MemberJoined {
                 group_id: group_b.clone(),
@@ -47488,6 +48189,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 kem_public_key_b64: None,
                 kem_signature_b64: None,
                 recovery_authority_agent_id: None,
@@ -48257,6 +48959,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 ..
             } => NamedGroupMetadataEvent::MemberJoined {
                 group_id,
@@ -48269,6 +48972,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 kem_public_key_b64: None,
                 kem_signature_b64: None,
                 recovery_authority_agent_id: None,
@@ -48347,6 +49051,8 @@ pub(in crate::server) mod tests {
                     recovery_authority_signature_b64: None,
                     recovery_authority_commit: None,
                     signature_b64: BASE64.encode(sig.as_bytes()),
+
+                    certificate_b64: None,
                 }
             }
             _ => unreachable!("fixture is MemberJoined"),
@@ -48385,6 +49091,7 @@ pub(in crate::server) mod tests {
                 ts_ms,
                 treekem_key_package_b64,
                 signature_b64,
+                certificate_b64,
                 ..
             } => NamedGroupMetadataEvent::MemberJoined {
                 group_id: group_b.clone(),
@@ -48397,6 +49104,7 @@ pub(in crate::server) mod tests {
                 invite_secret,
                 ts_ms,
                 treekem_key_package_b64,
+                certificate_b64,
                 kem_public_key_b64: None,
                 kem_signature_b64: None,
                 recovery_authority_agent_id: None,
@@ -49150,6 +49858,8 @@ pub(in crate::server) mod tests {
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
+
+            certificate_b64: None,
         };
         let _ = apply_named_group_metadata_event(state, later_join, later_id, true, None).await;
 
@@ -49646,6 +50356,8 @@ pub(in crate::server) mod tests {
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
+
+            certificate_b64: None,
         };
         Ok((join_result_key(group_id, &member_hex), event))
     }
@@ -49874,6 +50586,7 @@ pub(in crate::server) mod tests {
             &None,
             &joiner_kp,
             Some(&kem),
+            None,
         )
         .expect("resend");
         let NamedGroupMetadataEvent::MemberJoined {
@@ -49932,6 +50645,7 @@ pub(in crate::server) mod tests {
             &None,
             &joiner_kp,
             Some(&kem),
+            None,
         )
         .expect("resend");
         let NamedGroupMetadataEvent::MemberJoined {
@@ -49954,6 +50668,7 @@ pub(in crate::server) mod tests {
             &None,
             &joiner_kp,
             Some(&kem),
+            None,
         )
         .expect("resend");
         let NamedGroupMetadataEvent::MemberJoined {
@@ -50400,6 +51115,8 @@ pub(in crate::server) mod tests {
                 recovery_authority_signature_b64: None,
                 recovery_authority_commit: None,
                 signature_b64: BASE64.encode(sig.as_bytes()),
+
+                certificate_b64: None,
             })
         }
 

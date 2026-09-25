@@ -1043,6 +1043,7 @@ pub async fn serve_with_options(
         pending_welcome_receives: RwLock::new(HashMap::new()),
         pending_welcome_waiters: RwLock::new(HashMap::new()),
         pending_welcome_acks: RwLock::new(HashMap::new()),
+        pending_welcome_streams: Mutex::new(Some(HashMap::new())),
         control_blobs: ControlBlobState::default(),
         treekem_pending_events: RwLock::new(HashMap::new()),
         owner_cert_pending_joins: RwLock::new(HashMap::new()),
@@ -2456,6 +2457,16 @@ pub async fn serve_with_options(
         );
         bg_tasks
             .extend(std::mem::take(&mut *state.public_message_tasks.write().await).into_values());
+        // Taking `Some` closes admission under the same mutex used by
+        // FetchRequest replacement. A handler waiting here cannot spawn a
+        // stream after this shutdown drain.
+        let welcome_streams = state
+            .pending_welcome_streams
+            .lock()
+            .await
+            .take()
+            .unwrap_or_default();
+        bg_tasks.extend(welcome_streams.into_values());
         bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
         // Keep abort handles so stragglers can be aborted after the grace window.
         // Fix C (issue #116): on the timeout path, AWAIT the aborts too — keep the

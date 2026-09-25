@@ -928,6 +928,9 @@ pub(super) struct AppState {
     pub(super) pending_welcome_waiters: RwLock<HashMap<String, Vec<WelcomeFetchWaiter>>>,
     /// Per-active Welcome blob transfer ack slots.
     pub(super) pending_welcome_acks: RwLock<HashMap<String, Arc<FileChunkAckSlot>>>,
+    /// One cancellable owner-side stream per staged Welcome.
+    /// `None` closes admission during shutdown under the same lock as replacement.
+    pub(super) pending_welcome_streams: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Bounded, process-local exact-byte transfers for oversized named-group
     /// direct events and join results. No control payload is persisted.
     pub(super) control_blobs: crate::server::routes::ControlBlobState,

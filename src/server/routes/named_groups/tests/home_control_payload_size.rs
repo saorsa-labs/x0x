@@ -62,6 +62,8 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: String::new(),
+
+        certificate_b64: None,
     };
     next.security_binding = treekem_recovery_security_binding(epoch, &direct_recovery);
     let mandate = mint_owner_mandate_for_seat(
@@ -221,6 +223,8 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: String::new(),
+
+        certificate_b64: None,
     };
     after.security_binding = treekem_recovery_security_binding(second_epoch, &second_recovery);
     let second_mandate = mint_owner_mandate_for_seat(
@@ -408,6 +412,8 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: String::new(),
+
+        certificate_b64: None,
     };
     next.security_binding = treekem_recovery_security_binding(epoch, &direct_recovery);
     let mandate = mint_owner_mandate_for_seat(

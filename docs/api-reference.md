@@ -86,6 +86,15 @@ view of a foreign group). The GUI prompts for the durable token (kept
 in tab-scoped `sessionStorage`, never a URL) the first time an
 owner-act surface is used from a session.
 
+**Named-group read authorization (#821):** the durable API token may read
+`GET /groups/:id` and `GET /groups/:id/members` across the operator's local
+groups. A session bearer requires active membership by this daemon's local
+agent. For a known group without that seat, both endpoints return typed 403
+`reason: "group_membership_required"`; an unknown ID returns 404. A session
+joiner awaiting the authority commit receives only `ok`, `group_id`, and
+`membership_state: "pending_authority_commit"` from `GET /groups/:id`;
+`GET /groups/:id/members` remains 403. Rider tokens are denied on both routes.
+
 `GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept a
 **session token** as a `?token=` query parameter (browser constraint). The
 durable API token and rider tokens are **never** valid in a query string
@@ -2175,6 +2184,19 @@ Server → client (complete outbound frame set):
 | `mention` | `topic`, `group_id`, `msg_id`, `author_agent_id`, `reason` (`"mention"` \| `"delegation"`), `mentions[]` (omitted when empty), `timestamp` | An ingested, validated group message names the local agent (ADR-0040). **Emitted only on the group's shared topic channel — the session must be subscribed to the group's topic; an unsubscribed `/ws` session gets nothing (routing still happens daemon-side).** A delegation carrier directed at the local agent produces the same frame with `reason: "delegation"` — there is no separate `delegation` event type |
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
+
+**Live `message` delivery is best-effort.** After a subscriber restart,
+subscribe-time anti-entropy can re-serve messages from the sender's roughly
+60-second cache, so applications should expect duplicate frames. Under
+backpressure, `feed_droppable` may also drop topic frames from the bounded
+outbound queue (`ws_outbound_dropped`). The event has no stable top-level
+transport `msg_id` and promises neither exactly-once delivery nor a complete
+feed; do not assume at-least-once delivery. Applications needing exactly-once
+effects must carry their own unique application ID to suppress duplicates and
+use a separate reconciliation path for missed messages. A decoded signed-group
+payload may provide a canonical application message ID for that format.
+`HistoryRecord.msg_id` identifies a local history-store record and is a
+separate identity; it is not the missing transport ID for this event.
 
 **Fork-quarantine annotation (ADR-0066 §3d).** When a group is
 fork-quarantined on this node, its group-scoped frames are **labelled, never
