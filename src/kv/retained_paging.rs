@@ -196,6 +196,14 @@ impl RetainedPagePool {
         if !self.images.contains_key(&binding) && self.images.len() >= MAX_INFLIGHT_IMAGES {
             let mut idlest: Option<(RetainedPageBinding, Duration, usize)> = None;
             for (stuck, pending) in &self.images {
+                // #886 r3 (review 1): SAME STORE ONLY. Pools are
+                // per-store in production (one KvStoreSync each), so
+                // this keeps the "other stores keep independent
+                // custody" doc locally true and refuses rather than
+                // displacing cross-store if that ever changes.
+                if stuck.store_id != binding.store_id {
+                    continue;
+                }
                 let idle = pending.last_progress.elapsed();
                 if idlest.as_ref().is_none_or(|(_, best, _)| idle > *best) {
                     idlest = Some((stuck.clone(), idle, pending.received_len));
@@ -784,22 +792,27 @@ mod tests {
         assert!(!pool.images.contains_key(&large_b));
     }
 
-    /// #811 r2: a full pool of IDLE in-flight images must not wedge a
-    /// NEW image. The victim is chosen by MAX IDLE (last_progress), the
-    /// boundary is the REAL 30 s (back-dated, no wall-clock sleep), and
-    /// the accounting is asserted: the victim's bytes leave received_len.
-    /// Reverting the accounting (dropping the saturating_sub) fails the
-    /// received_len assert; reverting idle-based selection fails the
-    /// victim-identity assert (the fresh image would be evicted instead).
+    /// #886 r3 (reviews (a)+(c)): a full pool of idle images no longer
+    /// wedges a NEW image. SINGLE STORE throughout (pools are
+    /// per-store; the same-store filter is exercised). The victim
+    /// scenario separates OLD-but-progressing from YOUNG-idle: the
+    /// incumbents' `created` are back-dated OLDER, their
+    /// `last_progress` stays fresh — the YOUNG idle one (tag 0) must be
+    /// the victim. A first-frame-ordering mutant (pick by `created`,
+    /// gated on the victim's `last_progress`) finds no displaceable
+    /// incumbent and FAILS at the expect; the victim-identity assert
+    /// catches any wrong pick. Accounting is asserted: the victim's
+    /// bytes leave received_len.
     #[test]
     fn full_pool_displaces_the_idlest_image_after_the_grace_period() {
+        let store = [7u8; 32];
         let mut pool = RetainedPagePool::default();
-        // Four stuck bindings: tags 0..3. Tag 0 is the IDLEST (back-dated
-        // past the real 30 s boundary); tags 1..3 are FRESH (idle 0).
+        // tag 0: YOUNG (created now) but IDLE past the real 30 s grace.
+        // tags 1..3: OLD (created 10 min ago) but PROGRESSING (fresh).
         for tag in 0..MAX_INFLIGHT_IMAGES {
             let binding = RetainedPageBinding {
-                store_id: [tag as u8; 32],
-                endorser: [1; 32],
+                store_id: store,
+                endorser: [1 + tag as u8; 32],
                 authorization: [2; 32],
                 image_id: [tag as u8; 32],
             };
@@ -815,19 +828,26 @@ mod tests {
         }
         {
             let mut images = pool.images.iter_mut().collect::<Vec<_>>();
-            images.sort_by_key(|(binding, _)| binding.store_id);
-            images[0].1.last_progress =
-                Instant::now() - INFLIGHT_DISPLACE_AFTER - Duration::from_secs(1);
+            images.sort_by_key(|(binding, _)| binding.image_id);
+            for (binding, pending) in images {
+                if binding.image_id != [0u8; 32] {
+                    // OLD but progressing — within the 120 s staged TTL
+                    // (prune_expired must not reap them), older than
+                    // tag 0's first frame.
+                    pending.created = Instant::now() - Duration::from_secs(60);
+                } else {
+                    pending.last_progress =
+                        Instant::now() - INFLIGHT_DISPLACE_AFTER - Duration::from_secs(1);
+                }
+            }
         }
         let received_before = pool.received_len;
 
-        // A NEW binding displaces the IDLE image (tag 0) and completes
-        // end-to-end (manifest + every page).
         let image = b"late-joiner history".to_vec();
         let pages = split_image(&image, 256).expect("pages");
         let mut fifth = RetainedPageBinding {
-            store_id: [99; 32],
-            endorser: [1; 32],
+            store_id: store,
+            endorser: [99; 32],
             authorization: [2; 32],
             image_id: [99; 32],
         };
@@ -843,31 +863,83 @@ mod tests {
                 .or(completed);
         }
         assert_eq!(completed.as_deref(), Some(image.as_slice()));
-        // Victim identity: tag 0 is GONE (displaced), the fresh ones stay.
-        assert!(!pool.images.contains_key(&RetainedPageBinding {
-            store_id: [0; 32],
-            endorser: [1; 32],
-            authorization: [2; 32],
-            image_id: [0; 32],
-        }));
+        assert!(
+            !pool.images.contains_key(&RetainedPageBinding {
+                store_id: store,
+                endorser: [1; 32],
+                authorization: [2; 32],
+                image_id: [0; 32],
+            }),
+            "the YOUNG idle image is the victim"
+        );
         for tag in 1..MAX_INFLIGHT_IMAGES {
             assert!(
                 pool.images.contains_key(&RetainedPageBinding {
-                    store_id: [tag as u8; 32],
-                    endorser: [1; 32],
+                    store_id: store,
+                    endorser: [1 + tag as u8; 32],
                     authorization: [2; 32],
                     image_id: [tag as u8; 32],
                 }),
-                "fresh image {tag} must not be the victim"
+                "old-but-progressing image {tag} must not be the victim"
             );
         }
-        // Accounting (finding 4): the victim's 16 bytes left the pool's
-        // received_len; the completed image's bytes left too.
         assert_eq!(
             pool.received_len,
             received_before - 16,
             "the displaced victim's bytes are subtracted from received_len"
         );
+    }
+
+    /// #886 r3 (review 1): CROSS-STORE custody is independent — idle
+    /// images from OTHER stores are never displaced for this store's
+    /// newcomer; the bounded refusal stands (named), nothing is evicted.
+    #[test]
+    fn cross_store_idle_images_are_never_displaced() {
+        let mut pool = RetainedPagePool::default();
+        for tag in 0..MAX_INFLIGHT_IMAGES {
+            let binding = RetainedPageBinding {
+                store_id: [tag as u8; 32],
+                endorser: [1; 32],
+                authorization: [2; 32],
+                image_id: [tag as u8; 32],
+            };
+            pool.push(
+                binding,
+                RetainedPageV1::Page {
+                    image_id: [tag as u8; 32],
+                    index: 0,
+                    bytes: vec![tag as u8],
+                },
+            )
+            .expect("bounded pending image");
+        }
+        for pending in pool.images.values_mut() {
+            pending.last_progress =
+                Instant::now() - INFLIGHT_DISPLACE_AFTER - Duration::from_secs(1);
+        }
+        let newcomer = RetainedPageBinding {
+            store_id: [99; 32],
+            endorser: [1; 32],
+            authorization: [2; 32],
+            image_id: [99; 32],
+        };
+        let err = pool
+            .push(
+                newcomer,
+                RetainedPageV1::Page {
+                    image_id: [99; 32],
+                    index: 0,
+                    bytes: vec![1],
+                },
+            )
+            .expect_err("cross-store custody is independent");
+        assert!(
+            err.to_string()
+                .contains("too many retained images are awaiting pages for store"),
+            "the refusal stands (named), got: {err}"
+        );
+        assert_eq!(pool.images.len(), MAX_INFLIGHT_IMAGES);
+        assert_eq!(pool.received_len, MAX_INFLIGHT_IMAGES);
     }
 
     /// #811 (ask 1) + r2 (finding 2): the within-grace refusal NAMES THE
@@ -1009,12 +1081,17 @@ mod tests {
                 },
             )
             .is_err());
+        // Post-refusal asserts (restored per review): the refusal evicted
+        // NOTHING — all four incumbents and their bytes remain.
+        assert_eq!(pool.images.len(), MAX_INFLIGHT_IMAGES);
+        assert_eq!(pool.received_len, MAX_INFLIGHT_IMAGES);
         // Past the grace (back-dated): the idlest is displaced and the
-        // newcomer's page is admitted.
+        // newcomer's page is admitted; the victim's byte leaves.
         for pending in pool.images.values_mut() {
             pending.last_progress =
                 Instant::now() - INFLIGHT_DISPLACE_AFTER - Duration::from_secs(1);
         }
+        let before = pool.received_len;
         assert!(pool
             .push(
                 newcomer,
@@ -1026,6 +1103,11 @@ mod tests {
             )
             .expect("past the grace the idle image is displaced")
             .is_none());
+        assert_eq!(pool.images.len(), MAX_INFLIGHT_IMAGES);
+        assert_eq!(
+            pool.received_len, before,
+            "victim -1 byte, newcomer +1 byte: net unchanged"
+        );
     }
 
     #[test]
