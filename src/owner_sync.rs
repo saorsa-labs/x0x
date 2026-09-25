@@ -2300,6 +2300,10 @@ impl OwnerSyncService {
             );
             return; // drop => stream reset, fail closed
         }
+        // #863: publish the local Home pointer BEFORE the version-vector
+        // exchange — an empty HomePointer vector must be genuine proof of
+        // no local Home, never a timing artifact.
+        self.materialize_local_home_pointer().await;
         let (mut send, mut recv) = stream.into_split();
         let result = run_sync_session(
             &mut send,
@@ -2379,6 +2383,9 @@ impl OwnerSyncService {
             .acquire_owned()
             .await
             .map_err(|e| ("session_limit", e.to_string()))?;
+        // #863: as the responder path — the initiator's vector must not
+        // understate a local Home either.
+        self.materialize_local_home_pointer().await;
         let result = run_sync_session(
             &mut send,
             &mut recv,
@@ -2413,6 +2420,38 @@ impl OwnerSyncService {
         &self,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         Arc::clone(&self.session_permits).try_acquire_owned().ok()
+    }
+
+    /// #863: mint the local Home pointer into the Tier-1 store NOW. A
+    /// device holding a Home it has not yet published (created since the
+    /// last reconcile pass, or a mint that failed) would otherwise answer
+    /// a session's version-vector exchange with an EMPTY HomePointer
+    /// kind — and the peer's rank-0 wait-for-sync would take that empty
+    /// session as proof no Home exists and provision a DUPLICATE. Runs
+    /// before EVERY session (both directions) and in the reconcile pass;
+    /// after it, an empty HomePointer vector is genuine proof the peer
+    /// holds no Home.
+    pub(crate) async fn materialize_local_home_pointer(&self) {
+        let Some(owner_kp) = self.owner_kp() else {
+            return;
+        };
+        let Some(view) = self.view() else {
+            return;
+        };
+        let Some(home_value) = view.home_pointer() else {
+            return;
+        };
+        if self.should_mint_home_pointer(&home_value).await {
+            let local_machine = self.agent.machine_id();
+            self.mint_or_log(
+                SyncKind::HomePointer,
+                HOME_POINTER_KEY,
+                home_value,
+                owner_kp,
+                local_machine,
+            )
+            .await;
+        }
     }
 
     /// One full pass: mint local Tier-1 records from live daemon state,
@@ -2479,18 +2518,7 @@ impl OwnerSyncService {
                 local_machine,
             )
             .await;
-            if let Some(home_value) = view.home_pointer() {
-                if self.should_mint_home_pointer(&home_value).await {
-                    self.mint_or_log(
-                        SyncKind::HomePointer,
-                        HOME_POINTER_KEY,
-                        home_value,
-                        owner_kp,
-                        local_machine,
-                    )
-                    .await;
-                }
-            }
+            self.materialize_local_home_pointer().await;
         }
 
         // Kind 4: issuance journal lines (latest per agent, owner-scoped).
