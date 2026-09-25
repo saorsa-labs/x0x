@@ -824,6 +824,16 @@ Durable-owner only — a session token answers `403`; a missing
 `move_epoch` answers `400`. The one-id forms remain the agent/machine
 self- or user-authority revocations.
 
+Revoking the daemon's OWN agent binding (#797) resolves the certificate
+from the identity dir (`agent.cert`) when it was issued by the loaded
+owner user key — the discovery cache never contains the local agent and
+self-issuance keeps the journal lean. **Warning:** the tombstone is
+grow-only and never expires. Pointing it at the LOCAL machine
+(`machine_id` = this daemon's) permanently bars this daemon's agent from
+signing here until the owner re-issues its certificate; the daemon logs
+a `warn` when that case is taken — it is a legitimate retirement action,
+but never a silent one.
+
 `GET /owner/placement` lazily mints epoch-0 records on first read and
 returns `owner_user_id`, `minted_now`, `roaming_count`, `home_invariant_ok`
 (≥ 1 Roaming agent), and `placements[]` (`agent_id`, `kind`
@@ -1460,6 +1470,11 @@ delegation JSON (arrays-of-bytes fields; no outer wrapper).
 durable history (survives restarts; fail-closed on incomplete history scans).
 Each row: `delegation_digest`, `from_agent`, `to_agent`, `scope`, `verbs`,
 `issued_at_ms`, `expiry_ms`, `depth`, `task_ref`.
+The durable operator token retains its read. A session bearer needs **active
+local membership** in the named group, even when its read policy is public;
+a known group with no active local seat returns 403 with
+`reason: "group_membership_required"` before any delegation fields are read
+or returned. An unknown group returns 404. Rider tokens receive 403.
 
 Verified behaviour (this campaign): delegate → B sends citing the digest →
 message accepted and attributed (author = B); the same send with a forged
@@ -2013,6 +2028,16 @@ two: **reads always serve, the purge always refuses.**
 `GET /groups/:id/messages` return the same rows they always did and add two
 envelope fields:
 
+A session bearer outside an active local group seat still receives retained
+history content under the existing history authorization rules, but the
+group's `fork_quarantined` / `fork_quarantine` envelope annotation and
+`fork_quarantined_at_ingest` row label are omitted. This also applies to
+cross-scope and node-wide history responses: only markers for groups in which
+the session's local agent is active appear. Durable operator and rider views
+retain their existing annotation behavior. `GET /groups/:id/messages` likewise
+keeps serving signed public messages under its read policy while omitting the
+quarantine envelope annotation for a session without an active local seat.
+
 ```json
 {
   "ok": true,
@@ -2203,6 +2228,12 @@ fork-quarantined on this node, its group-scoped frames are **labelled, never
 refused and never dropped** — the WS plane is the live mirror of the
 annotated history reads, and an operator watching an incident must not lose
 the stream. Two frame classes carry the label:
+
+For a session bearer without active local membership in the group, backfill
+`message` and `live` frames and structured `mention` frames still arrive, but
+omit `fork_quarantined` and `fork_quarantine`. Durable operator connections
+and sessions with an active local seat keep the annotation. Raw live gossip
+`message` frames remain unchanged.
 
 - `mention` frames on the group's topic channel;
 - ADR-0023 `subscribe` **backfill** frames for a group topic — the replayed

@@ -422,6 +422,7 @@ impl KvSecureContext for PublicGroupKvContext {
 #[derive(Debug, Clone)]
 pub struct GssKvSecureContext {
     state: Arc<std::sync::RwLock<GssState>>,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 /// Synchronous authorization view attached to an encrypted store whose wire
@@ -523,8 +524,11 @@ impl GssKvSecureContext {
     #[must_use]
     pub fn from_group(info: &GroupInfo) -> Option<Self> {
         info.shared_secret.as_ref()?;
+        let state = GssState::from_group(info);
+        let (changes, _) = tokio::sync::watch::channel(state.generation);
         Some(Self {
-            state: Arc::new(std::sync::RwLock::new(GssState::from_group(info))),
+            state: Arc::new(std::sync::RwLock::new(state)),
+            changes,
         })
     }
 
@@ -563,6 +567,7 @@ impl GssKvSecureContext {
             state.active_members.clear();
             state.member_roles.clear();
             state.generation = state.generation.wrapping_add(1);
+            self.changes.send_replace(state.generation);
             return;
         }
         // ADR-0066 §4 / ADR-0067 — make a marker a REFRESH TRIGGER for this
@@ -597,6 +602,7 @@ impl GssKvSecureContext {
             state.active_members.clear();
             state.member_roles.clear();
             state.generation = state.generation.wrapping_add(1);
+            self.changes.send_replace(state.generation);
             return;
         }
         let mut next = GssState::from_group(info);
@@ -617,6 +623,7 @@ impl GssKvSecureContext {
             );
             next.generation = state.generation.wrapping_add(1);
             *state = next;
+            self.changes.send_replace(state.generation);
         }
     }
 
@@ -693,6 +700,10 @@ impl GssKvSecureContext {
 }
 
 impl KvSecureContext for GssKvSecureContext {
+    fn encrypted_authorization_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changes.subscribe())
+    }
+
     fn group_id(&self) -> Vec<u8> {
         self.state
             .read()
@@ -851,6 +862,7 @@ impl KvSecureContext for GssKvSecureContext {
         state.active_members.clear();
         state.member_roles.clear();
         state.generation = state.generation.wrapping_add(1);
+        self.changes.send_replace(state.generation);
     }
 }
 

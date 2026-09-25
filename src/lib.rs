@@ -11705,7 +11705,9 @@ impl Agent {
                 retired.push(this_move);
             }
             retired.sort_by_key(|b| (b.agent.0, b.machine.0, b.move_epoch));
-            // The certificate: journal/discovery evidence for coherence.
+            // The certificate: journal/discovery evidence for coherence —
+            // and, since #797, the identity-dir certificate when the
+            // activating agent is this daemon's own.
             let cert = self.agent_certificate_for(agent_id).await.ok_or_else(|| {
                 error::IdentityError::Revocation(
                     "no certificate known for the agent — cannot activate".to_string(),
@@ -12090,6 +12092,21 @@ impl Agent {
                 "no certificate known for the agent — binding revocation requires it".to_string(),
             )
         })?;
+
+        // #797 review item 4: a binding tombstone never expires (ADR-0043
+        // grow-only set) — revoking the LOCAL machine's own binding
+        // permanently bars this daemon's agent from signing here until the
+        // owner re-issues the certificate. That is a legitimate retirement
+        // action, so it proceeds — but never silently.
+        if *machine == self.machine_id() {
+            tracing::warn!(
+                agent = %hex::encode(agent.as_bytes()),
+                move_epoch,
+                "revoking the LOCAL machine's own binding — the tombstone never \
+                 expires; this daemon's agent cannot sign from this machine \
+                 again until re-issued"
+            );
+        }
         let subject =
             revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
                 agent: *agent,
@@ -12127,12 +12144,41 @@ impl Agent {
         Ok(record)
     }
 
+    /// #797: the identity-held certificate for the daemon's own agent, but
+    /// ONLY when its issuer is the currently loaded owner user key — a
+    /// cert issued by an earlier owner key is NOT authoritative here and
+    /// must not short-circuit the peer/journal certificate lookups
+    /// (review item 3).
+    fn local_agent_certificate_if_current_issuer(
+        identity: &identity::Identity,
+    ) -> Option<identity::AgentCertificate> {
+        let cert = identity.agent_certificate()?;
+        let user = identity.user_keypair()?;
+        cert.user_id()
+            .is_ok_and(|uid| uid == user.user_id())
+            .then(|| cert.clone())
+    }
+
     /// The newest certificate known for an agent: discovery cache first,
     /// then the owner journal's retained bytes.
     async fn agent_certificate_for(
         &self,
         agent: &identity::AgentId,
     ) -> Option<identity::AgentCertificate> {
+        // #797: the daemon's OWN agent. Self-issuance deliberately keeps the
+        // cert journal lean (agent.cert is the durable copy) and the peer
+        // discovery cache never contains ourselves, so neither source below
+        // can resolve the local agent — the identity accessor is
+        // authoritative for it, but ONLY when the held certificate was
+        // issued by the LOADED owner user key: a cert left behind by an
+        // earlier owner key must fall through to the peer/journal lookups
+        // instead of failing the caller's authority check with the
+        // less-actionable "issuer is neither..." (review item 3).
+        if *agent == self.agent_id() {
+            if let Some(cert) = Self::local_agent_certificate_if_current_issuer(self.identity()) {
+                return Some(cert);
+            }
+        }
         if let Ok(Some(entry)) = self.discovered_agent(*agent).await {
             if let Some(cert) = entry.agent_certificate {
                 return Some(cert);
@@ -18941,6 +18987,133 @@ fn spawn_relay_dm_listener(
 
 #[cfg(test)]
 mod tests {
+    mod own_agent_certificate_lookup_797 {
+        use super::*;
+
+        /// #797: revoking the daemon's OWN agent binding must work from the
+        /// identity certificate when neither secondary source can answer —
+        /// the discovery cache never contains ourselves, and the issuance
+        /// journal is stripped here. FAIL-BEFORE (the local-identity
+        /// fallback in `agent_certificate_for` removed): revoke_binding
+        /// errors "no certificate known for the agent".
+        #[tokio::test]
+        async fn revoke_own_agent_binding_uses_identity_certificate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let agent = Agent::builder()
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_identity_dir(dir.path())
+                .with_user_key(identity::UserKeypair::generate().expect("owner user key"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            let own = agent.agent_id();
+            let user_kp = agent
+                .identity()
+                .user_keypair()
+                .expect("owner user key (self-issuance implies one)");
+            // Strip the issuance journal the journal source would answer
+            // from (the builder appends the self-issuance record next to
+            // agent.cert); the discovery cache is empty by construction.
+            std::fs::remove_file(dir.path().join(profile::CERT_JOURNAL_FILE))
+                .expect("issuance journal stripped");
+
+            // Seed the placement the revocation epoch order needs.
+            let owner_pk = user_kp.public_key().as_bytes().to_vec();
+            let secret = user_kp.secret_key();
+            let record = key_move::PlacementRecord::sign(
+                own,
+                &owner_pk,
+                key_move::Placement::Roaming,
+                1,
+                1,
+                secret,
+            )
+            .expect("placement sign");
+            {
+                let mut state = agent.move_state.write().await;
+                let cert = agent.identity().agent_certificate().expect("cert");
+                let authority = key_move::PlacementAuthority::cert_issuer(cert).expect("authority");
+                state
+                    .cache_placement(record, authority)
+                    .expect("placement cached");
+            }
+
+            let machine = agent.machine_id();
+            let outcome = agent.revoke_binding(&own, &machine, 1, None).await;
+            assert!(
+                outcome.is_ok(),
+                "own-agent binding revocation must use the identity certificate: {outcome:?}"
+            );
+            // Review item 2: the tombstone actually LANDED — is_ok alone
+            // could hide a silent no-op. The tombstone never expires, so
+            // this pairing is barred for peers from here on.
+            {
+                let revocation_set = agent.revocation_set();
+                let revoked = revocation_set.read().await;
+                assert!(
+                    revoked.is_binding_revoked(&own, &machine),
+                    "the (own agent, local machine) tombstone is in the grow-only set"
+                );
+            }
+        }
+
+        /// #797 review item 1 (negative): a STRANGER agent resolves to NO
+        /// certificate — the local-identity fallback must not widen
+        /// resolution beyond the daemon's own agent id, and with the
+        /// journal stripped and the discovery cache empty there is no
+        /// other source. (Through revoke_binding the refusal surfaces as
+        /// "no certificate known for the agent".)
+        #[tokio::test]
+        async fn stranger_agent_still_gets_no_certificate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let agent = Agent::builder()
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_identity_dir(dir.path())
+                .with_user_key(identity::UserKeypair::generate().expect("owner user key"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            std::fs::remove_file(dir.path().join(profile::CERT_JOURNAL_FILE))
+                .expect("issuance journal stripped");
+            let stranger = identity::AgentId([0xEE; 32]);
+            assert!(
+                agent.agent_certificate_for(&stranger).await.is_none(),
+                "a stranger resolves to no certificate; the local-identity \
+                 fallback is scoped to the daemon's own agent id"
+            );
+        }
+
+        /// #797 review items 1+3 (negative): a local agent.cert issued by a
+        /// DIFFERENT user key than the loaded owner must NOT short-circuit
+        /// the lookup — it falls through to the (here empty) peer/journal
+        /// sources instead of poisoning the caller's authority check.
+        #[test]
+        fn local_certificate_from_a_previous_issuer_falls_through() {
+            let machine_kp = identity::MachineKeypair::generate().expect("machine keypair");
+            let agent_kp = identity::AgentKeypair::generate().expect("agent keypair");
+            let previous_owner = identity::UserKeypair::generate().expect("previous owner");
+            let current_owner = identity::UserKeypair::generate().expect("current owner");
+            let stale_cert =
+                identity::AgentCertificate::issue(&previous_owner, &agent_kp).expect("cert");
+            let identity =
+                identity::Identity::new_with_user(machine_kp, agent_kp, current_owner, stale_cert);
+            assert!(
+                Agent::local_agent_certificate_if_current_issuer(&identity).is_none(),
+                "a cert issued by a previous owner key must fall through"
+            );
+            // Control: with the MATCHING owner loaded, the same accessor
+            // answers the local cert.
+            let machine_kp = identity::MachineKeypair::generate().expect("machine keypair");
+            let agent_kp = identity::AgentKeypair::generate().expect("agent keypair");
+            let owner = identity::UserKeypair::generate().expect("owner");
+            let cert = identity::AgentCertificate::issue(&owner, &agent_kp).expect("cert");
+            let identity = identity::Identity::new_with_user(machine_kp, agent_kp, owner, cert);
+            assert!(Agent::local_agent_certificate_if_current_issuer(&identity).is_some());
+        }
+    }
+
     mod announcement_role_honesty {
         use super::*;
 

@@ -1079,8 +1079,13 @@ async fn reseal_refuses_while_restore_quarantined() -> Result<()> {
     }
     let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
     let req: ResealRequest = serde_json::from_value(serde_json::json!({ "recipient": owner_hex }))?;
-    let (status, json) =
-        secure_group_reseal(State(Arc::clone(&state)), Path(group_id.clone()), Json(req)).await;
+    let (status, json) = secure_group_reseal(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(req),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::CONFLICT,

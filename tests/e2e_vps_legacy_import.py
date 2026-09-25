@@ -32,6 +32,52 @@ def revoked_listing_refusal(result: tuple[int, dict[str, Any]]) -> bool:
                 and body["candidates"][0].get("can_import") is False))
 
 
+def observer_value_matches(result: tuple[int, dict[str, Any]], expected: str) -> bool:
+    status, body = result
+    if not isinstance(body, dict):
+        return False
+    raw = body.get("value")
+    if status != 200 or not isinstance(raw, str):
+        return False
+    try:
+        return base64.b64decode(raw, validate=True) == expected.encode()
+    except ValueError:
+        return False
+
+
+def observer_response_class(result: tuple[int, dict[str, Any]] | None) -> str:
+    if result is None:
+        return "no_response"
+    status, body = result
+    if not isinstance(body, dict):
+        return "invalid_body"
+    if status != 200:
+        # Report only fixed error classes. API error text can contain sensitive
+        # request details, so never copy the raw response body into evidence.
+        error = body.get("error")
+        normalized = (error.strip().lower().replace("_", " ").replace("-", " ")
+                      if isinstance(error, str) else "")
+        if status == 404:
+            return {
+                "group not found": "group_not_found",
+                "store not found": "store_not_found",
+                "key not found": "key_not_found",
+            }.get(normalized, "http_error")
+        if status == 401:
+            return "authentication_denied"
+        if status == 403:
+            return "permission_denied"
+        return "http_error"
+    raw = body.get("value")
+    if not isinstance(raw, str):
+        return "missing_value"
+    try:
+        base64.b64decode(raw, validate=True)
+    except ValueError:
+        return "invalid_value"
+    return "value_present"
+
+
 class LegacyScenario:
     def __init__(self, clients: dict[str, Api], evidence: Evidence, timeout: float) -> None:
         self.c, self.e, self.timeout = clients, evidence, timeout
@@ -99,8 +145,12 @@ class LegacyScenario:
 
     def await_observer_snapshot(self, observer: str, sid: str, app: str) -> None:
         poll(f"{app} observer imported value", self.timeout,
-             lambda: self.read(observer, sid, "legacy-imported"),
-             lambda r: r == (200, f"legacy-{app}"))
+             lambda: self.c[observer].request("GET", f"/stores/{enc(sid)}/legacy-imported"),
+             lambda r: observer_value_matches(r, f"legacy-{app}"),
+             lambda facts, last: self.e.record_poll(
+                 facts, operation="legacy_observer_imported_value", node=observer, app=app,
+                 response_class=observer_response_class(last),
+                 value_matches_expected=last is not None and observer_value_matches(last, f"legacy-{app}")))
         poll(f"{app} observer tombstone", self.timeout,
              lambda: self.read(observer, sid, "legacy-removed"), lambda r: r[0] == 404)
 

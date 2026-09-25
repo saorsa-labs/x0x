@@ -241,6 +241,13 @@ pub trait KvSecureContext: Send + Sync {
         None
     }
 
+    /// Nonblocking signal for changes to an encrypted group's local
+    /// authorization snapshot. A pending cold-sync requester can wake when
+    /// its reader membership arrives instead of waiting for a backoff tail.
+    fn encrypted_authorization_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+
     /// Generation of the current GSS authorization snapshot. Capturing this
     /// before opening a record lets the final merge reject even an A-B-A
     /// roster or secret cycle during a store-lock wait.

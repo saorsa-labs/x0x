@@ -4438,6 +4438,20 @@ async fn record_anchored_gap_refusal(
     let terminal_revision = commit.revision;
     let terminal_state_hash = commit.state_hash.clone();
     let committed_by = commit.committed_by.clone();
+    // #846: the validated chain's per-step hashes, ending with the
+    // terminal's own hash — what the owner attestation covers. Length
+    // bound: `validate_alternate_chain` admits a chain only when every
+    // link is CONSECUTIVE from the base revision
+    // (link.revision == previous + 1, terminal == last + 1), so
+    // `attested_chain_hashes.len() == terminal_revision -
+    // head-anchored base revision + 1` and every entry is an
+    // individually admin-signed retained commit — there is no unbounded
+    // amplification from a longer served chain.
+    let attested_chain_hashes: Vec<String> = chain
+        .iter()
+        .map(|link| link.commit.state_hash.clone())
+        .chain(std::iter::once(terminal_state_hash.clone()))
+        .collect();
     let mutate = move |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
         // ADR0066-LOOKUP-WAIVER: `key` is the already-resolved map key the
         // apply path was called with (same as `install_fork_evidence`).
@@ -4496,6 +4510,7 @@ async fn record_anchored_gap_refusal(
             occurrences: occurrences.saturating_add(1),
             first_observed_at_ms,
             last_observed_at_ms: now_ms,
+            attested_chain_hashes,
             by_reason,
         });
         true
@@ -9658,6 +9673,92 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     }
 }
 
+/// Test-only observability for the #846 catch-up gate: set when the gate
+/// REFUSES a catch-up page, so tests can distinguish "the gate fired"
+/// from "the apply refused for unrelated reasons".
+///
+/// Reset contract: PROCESS-GLOBAL within one test binary — every test
+/// in the binary shares this static. A test that asserts it must
+/// `store(false)` immediately before the scenario it drives and read it
+/// back immediately after; under plain `cargo test` a concurrently
+/// running gate-firing test can flip it in between, so flag-asserting
+/// suites are run under nextest (one process per test), as CI does.
+#[cfg(test)]
+pub(in crate::server) static CATCHUP_846_GATE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// #846 r3: is the durable #816/#839 anchored-gap audit record ARMED for
+/// catch-up gating? Arming is tied to the DURABLE RECORD alone: the
+/// reason is the owner-attested stale-base gap and the current state has
+/// not yet reached the attested terminal revision. The in-memory
+/// terminal queue is deliberately NOT consulted — it drains on TTL, on a
+/// replay that does not retain, and on every restart, while the record
+/// (with its attested sequence) persists; the gate must survive all
+/// three. Returns the armed record; `attested_chain_hashes` is the
+/// per-step sequence (intervening links in order, ending with the
+/// terminal hash). Records persisted before #846 r1 carry an EMPTY
+/// sequence: they still arm, and the walker then refuses every page
+/// (fail-closed — nothing outside a never-recorded attestation adopts).
+fn armed_anchored_gap_sequence(
+    info: &x0x::groups::GroupInfo,
+) -> Option<&x0x::groups::AnchoredGapRefusal> {
+    let record = info
+        .invite_lineage
+        .as_ref()?
+        .anchored_gap_refusal
+        .as_ref()?;
+    if record.reason != "owner_attested_stale_base_gap" {
+        return None;
+    }
+    // Already converged: the terminal (or something past it) applied.
+    if info.state_revision >= record.terminal_revision {
+        return None;
+    }
+    Some(record)
+}
+
+/// #846 r3: does this catch-up page stay INSIDE the attested sequence?
+/// The CURSOR is derived from the current state: when the current hash
+/// is sequence[i] — a previous page of this gap already applied — the
+/// next expected hash is sequence[i+1]; otherwise the page must begin at
+/// sequence[0]. That default is safe because the first served commit
+/// must both LINK from the current hash and hash-match sequence[0], and
+/// sequence[0]'s signed state hash commits to its own prev_state_hash —
+/// the genuine first link validates only against the gap anchor it was
+/// signed over, so a divergent current head cannot ride it. A page that
+/// ends mid-sequence is fine (paging continues); a mismatch or a broken
+/// link is a fork. An EMPTY sequence (pre-r1 record) admits no commit.
+fn catchup_page_within_attested_sequence(
+    events: &[NamedGroupMetadataEvent],
+    current_state_hash: &str,
+    sequence: &[String],
+) -> bool {
+    let expected_from = sequence
+        .iter()
+        .position(|hash| hash == current_state_hash)
+        .map_or(0, |applied| applied + 1);
+    let mut expected = sequence.iter().skip(expected_from);
+    let mut cursor = current_state_hash.to_string();
+    for commit in events.iter().filter_map(named_group_metadata_event_commit) {
+        if commit.prev_state_hash.as_deref() != Some(cursor.as_str()) {
+            return false;
+        }
+        match expected.next() {
+            Some(want) if *want == commit.state_hash => {}
+            _ => return false,
+        }
+        cursor = commit.state_hash.clone();
+    }
+    true
+}
+
+/// Test-only mirror of [`armed_anchored_gap_sequence`]: is the #846
+/// catch-up gate ARMED for this group right now? Lets a test prove the
+/// gate (not a disarm) admitted or refused each page.
+#[cfg(test)]
+pub(in crate::server) fn catchup_846_gate_armed(info: &x0x::groups::GroupInfo) -> bool {
+    armed_anchored_gap_sequence(info).is_some()
+}
 pub(in crate::server) async fn handle_treekem_catchup_response(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -9698,6 +9799,34 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     let was_truncated = response.truncated;
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
+
+    // #846: while the durable owner-anchored gap record is ARMED (the
+    // owner attested a stale-base gap and the current state has not yet
+    // reached the attested terminal revision), every catch-up page must
+    // stay INSIDE the hash sequence the owner attestation covers: each
+    // served commit must link from the current head AND match the NEXT
+    // expected hash — derived from the CURRENT state, so a page that
+    // follows already-applied pages of the same gap keeps converging. A
+    // page ending mid-sequence is fine (paging continues); a mismatch or
+    // broken link is a fork — adopt NOTHING and page no further, leaving
+    // the durable record (and any queued terminal) intact.
+    if let Some(record) = armed_anchored_gap_sequence(&response_info) {
+        if !catchup_page_within_attested_sequence(
+            &events,
+            &response_info.state_hash,
+            &record.attested_chain_hashes,
+        ) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&response.group_id),
+                sender = %LogHexId::agent(&sender_hex),
+                "[1/6 groups] #846: TreeKEM catch-up page leaves the owner-attested \
+                 chain sequence; adopting nothing (fork or stale responder)"
+            );
+            #[cfg(test)]
+            CATCHUP_846_GATE_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+    }
     for event in events {
         let recovery_event = member_joined_kp_cache_entry(&event)
             .map(|(_, ev)| ev)
@@ -9708,6 +9837,52 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         }
     }
     replay_pending_treekem_events(state, &response.group_id).await;
+    // #846: retire the armed record once the attested terminal actually
+    // LINKED (the group reached its revision) — a stale record must never
+    // arm the gate against a head the current hash is already past. The
+    // map key is resolved ONCE (register key, else the stable-id match)
+    // and the retire mutation runs against that SAME key, so the check
+    // and the mutation cannot disagree about which entry they touched.
+    let retire_key: Option<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get_key_value(&response.group_id)
+            .map(|(key, info)| (key.clone(), info))
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == response.group_id)
+                    .map(|(key, info)| (key.clone(), info))
+            })
+            .filter(|(_, info)| {
+                info.invite_lineage
+                    .as_ref()
+                    .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                    .is_some_and(|record| {
+                        record.reason == "owner_attested_stale_base_gap"
+                            && info.state_revision >= record.terminal_revision
+                    })
+            })
+            .map(|(key, _)| key)
+    };
+    if let Some(key) = retire_key {
+        let mutate = move |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
+            groups
+                .get_mut(&key)
+                .and_then(|info| info.invite_lineage.as_mut())
+                .is_some_and(|lineage| {
+                    lineage.anchored_gap_refusal = None;
+                    true
+                })
+        };
+        let outcome = persist_named_groups_mutation(state, mutate).await;
+        if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&response.group_id),
+                "#846: retiring the converged anchored-gap record did not persist durably"
+            );
+        }
+    }
     if was_truncated {
         tracing::debug!(
             target: "treekem.trace",
@@ -14827,7 +15002,7 @@ pub(in crate::server) async fn send_group_public_message(
         if let Some(resp) = reject_withdrawn_group(info) {
             return resp;
         }
-        if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+        if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
             return resp;
         }
         // ADR-0066 §1 row 1 / §4 (slice 9): capture the lifecycle epoch token
@@ -15030,8 +15205,13 @@ pub(in crate::server) async fn send_group_public_message(
     // fan-out race both happen AFTER the publish returns, and this path has no
     // ratchet, so a refusal burns no generation and leaves the message cache,
     // the outbox and the roster byte-identical.
-    if let Some(resp) =
-        reject_fork_quarantine_installed_before_effect(&state, &id, captured_epoch.as_ref()).await
+    if let Some(resp) = reject_fork_quarantine_installed_before_effect_for_actor(
+        &state,
+        &id,
+        captured_epoch.as_ref(),
+        Some(&actor),
+    )
+    .await
     {
         return resp;
     }
@@ -15145,6 +15325,7 @@ pub(in crate::server) struct GetMessagesQuery {
 /// in that thread (root included when present). ADR-0029.
 pub(in crate::server) async fn get_group_public_messages(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     Query(query): Query<GetMessagesQuery>,
 ) -> impl IntoResponse {
@@ -15285,9 +15466,14 @@ pub(in crate::server) async fn get_group_public_messages(
     // resolves BOTH spellings (map key or stable id — review r1), so this
     // annotates whether the URL named the alias this daemon keys the group
     // under or the stable id the rows carry.
-    let markers = crate::server::routes::history::markers_for_scopes(
+    let markers = crate::server::routes::history::visible_markers(
         &state,
-        std::iter::once(&x0x::history::Scope::Group(stable_id.clone())),
+        &actor,
+        crate::server::routes::history::markers_for_scopes(
+            &state,
+            std::iter::once(&x0x::history::Scope::Group(stable_id.clone())),
+        )
+        .await,
     )
     .await;
     (
@@ -21919,6 +22105,45 @@ pub(in crate::server) fn reject_fork_quarantined(
     Some(reject_fork_quarantined_marker(state, group_id, marker))
 }
 
+/// Session tokens cannot inspect a contested roster unless this daemon still
+/// has an active local seat. The caller supplies the already-borrowed group so
+/// the decision and marker are read under the same roster guard.
+pub(in crate::server) fn reject_fork_quarantined_for_actor(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    actor: &crate::server::rider_auth::ActorContext,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let marker = info.fork_quarantine.as_ref()?;
+    Some(reject_fork_quarantined_marker_for_actor(
+        state, group_id, marker, info, actor,
+    ))
+}
+
+pub(in crate::server) fn reject_fork_quarantined_marker_for_actor(
+    state: &AppState,
+    group_id: &str,
+    marker: &x0x::groups::ForkQuarantine,
+    info: &x0x::groups::GroupInfo,
+    actor: &crate::server::rider_auth::ActorContext,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if matches!(
+        actor,
+        crate::server::rider_auth::ActorContext::Owner { durable: false }
+    ) && !info.has_active_member(&hex::encode(state.agent.agent_id().as_bytes()))
+    {
+        state
+            .groups_diagnostics
+            .record_fork_quarantine_refusal(group_id);
+        return api_error_with_reason(
+            StatusCode::FORBIDDEN,
+            "active local group membership required",
+            "group_membership_required",
+        );
+    }
+    reject_fork_quarantined_marker(state, group_id, marker)
+}
+
 /// ADR-0066 §3e (slice 3): the same single refusal, for a caller that
 /// already holds the marker rather than the whole [`GroupInfo`].
 ///
@@ -22022,10 +22247,20 @@ pub(in crate::server) fn reject_fork_quarantined_marker(
 /// allocation on the success path, and no other lock is held across it — see
 /// the per-site comments for the one place (row 2) where an EXISTING nesting
 /// is reused rather than a new one introduced.
+#[cfg(test)]
 pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect(
     state: &AppState,
     group_id: &str,
     captured: Option<&x0x::groups::LifecycleEpochToken>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    reject_fork_quarantine_installed_before_effect_for_actor(state, group_id, captured, None).await
+}
+
+pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect_for_actor(
+    state: &AppState,
+    group_id: &str,
+    captured: Option<&x0x::groups::LifecycleEpochToken>,
+    actor: Option<&crate::server::rider_auth::ActorContext>,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     // Slice-9 test barrier: an injected install lands HERE, immediately
     // before the re-check takes its read guard — the tightest interleaving a
@@ -22045,7 +22280,12 @@ pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect(
         // ADR-0067 one if a future caller ever admits with a marker.
         return None;
     }
-    Some(reject_fork_quarantined_marker(state, group_id, marker))
+    Some(match actor {
+        Some(actor) => {
+            reject_fork_quarantined_marker_for_actor(state, group_id, marker, live, actor)
+        }
+        None => reject_fork_quarantined_marker(state, group_id, marker),
+    })
 }
 
 /// ADR-0066 §1 rows 1/2/4/6 deterministic race harness — `cfg(test)` END TO
@@ -25095,12 +25335,32 @@ fn treekem_metadata_event_requires_phase3(_event: &NamedGroupMetadataEvent) -> b
 /// send-ratchet advances, so the snapshot is persisted before returning to
 /// prevent send-generation (nonce) reuse across a restart. Returns the
 /// self-describing `ApplicationCiphertext` as `ciphertext_b64`.
+#[cfg(test)]
 async fn treekem_group_encrypt(
     state: &AppState,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     payload_b64: &str,
     rider_provenance: Option<&x0x::groups::RiderProvenance>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    treekem_group_encrypt_for_actor(
+        state,
+        group_id_hex,
+        stable_group_id,
+        payload_b64,
+        rider_provenance,
+        None,
+    )
+    .await
+}
+
+async fn treekem_group_encrypt_for_actor(
+    state: &AppState,
+    group_id_hex: &str,
+    stable_group_id: Option<&str>,
+    payload_b64: &str,
+    rider_provenance: Option<&x0x::groups::RiderProvenance>,
+    actor: Option<&crate::server::rider_auth::ActorContext>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
     let plaintext = match BASE64.decode(payload_b64) {
@@ -25136,7 +25396,10 @@ async fn treekem_group_encrypt(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
-            if let Some(resp) = reject_fork_quarantined(state, group_id_hex, info) {
+            if let Some(resp) = match actor {
+                Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
+                None => reject_fork_quarantined(state, group_id_hex, info),
+            } {
                 return resp;
             }
         }
@@ -25171,9 +25434,13 @@ async fn treekem_group_encrypt(
     // are therefore exactly main's, and taking the re-check BEFORE the
     // `group.lock().await` instead would have been strictly worse: a contended
     // mutex would then sit inside the window.
-    if let Some(resp) =
-        reject_fork_quarantine_installed_before_effect(state, group_id_hex, captured_epoch.as_ref())
-            .await
+    if let Some(resp) = reject_fork_quarantine_installed_before_effect_for_actor(
+        state,
+        group_id_hex,
+        captured_epoch.as_ref(),
+        actor,
+    )
+    .await
     {
         return resp;
     }
@@ -25245,11 +25512,23 @@ async fn treekem_group_encrypt(
 /// replay window advances, so the snapshot is persisted to keep replay
 /// protection across a restart (best-effort: a persist failure is logged but
 /// does not invalidate the already-recovered plaintext).
+#[cfg(test)]
 async fn treekem_group_decrypt(
     state: &AppState,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     ciphertext_b64: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    treekem_group_decrypt_for_actor(state, group_id_hex, stable_group_id, ciphertext_b64, None)
+        .await
+}
+
+async fn treekem_group_decrypt_for_actor(
+    state: &AppState,
+    group_id_hex: &str,
+    stable_group_id: Option<&str>,
+    ciphertext_b64: &str,
+    actor: Option<&crate::server::rider_auth::ActorContext>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
     let ciphertext = match BASE64.decode(ciphertext_b64) {
@@ -25280,7 +25559,10 @@ async fn treekem_group_decrypt(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
-            if let Some(resp) = reject_fork_quarantined(state, group_id_hex, info) {
+            if let Some(resp) = match actor {
+                Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
+                None => reject_fork_quarantined(state, group_id_hex, info),
+            } {
                 return resp;
             }
         }
@@ -25363,7 +25645,7 @@ pub(in crate::server) async fn secure_group_encrypt(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
-    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
         return resp;
     }
     // ADR-0066 §1 row 4 / §4 (slice 9): capture under the SAME read guard as
@@ -25466,12 +25748,13 @@ pub(in crate::server) async fn secure_group_encrypt(
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         let stable_group_id = info.stable_group_id().to_string();
         drop(groups);
-        return treekem_group_encrypt(
+        return treekem_group_encrypt_for_actor(
             state.as_ref(),
             &id,
             Some(&stable_group_id),
             &req.payload_b64,
             rider_provenance.as_ref(),
+            Some(&actor),
         )
         .await;
     }
@@ -25552,9 +25835,13 @@ pub(in crate::server) async fn secure_group_encrypt(
     // read acquisition is placed as late as the effect allows. It holds no
     // other lock, and the terminality re-check below takes its read guard
     // sequentially rather than nested.
-    if let Some(resp) =
-        reject_fork_quarantine_installed_before_effect(state.as_ref(), &id, captured_epoch.as_ref())
-            .await
+    if let Some(resp) = reject_fork_quarantine_installed_before_effect_for_actor(
+        state.as_ref(),
+        &id,
+        captured_epoch.as_ref(),
+        Some(&actor),
+    )
+    .await
     {
         return resp;
     }
@@ -25590,6 +25877,9 @@ pub(in crate::server) async fn secure_group_encrypt(
 pub(in crate::server) async fn secure_group_decrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<SecureDecryptRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -25605,7 +25895,7 @@ pub(in crate::server) async fn secure_group_decrypt(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
-    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
         return resp;
     }
 
@@ -25619,11 +25909,12 @@ pub(in crate::server) async fn secure_group_decrypt(
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         let stable_group_id = info.stable_group_id().to_string();
         drop(groups);
-        return treekem_group_decrypt(
+        return treekem_group_decrypt_for_actor(
             state.as_ref(),
             &id,
             Some(&stable_group_id),
             &req.ciphertext_b64,
+            Some(&actor),
         )
         .await;
     }
@@ -25752,6 +26043,9 @@ pub(in crate::server) struct ResealRequest {
 pub(in crate::server) async fn secure_group_reseal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<ResealRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -25770,7 +26064,7 @@ pub(in crate::server) async fn secure_group_reseal(
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
-    if let Some(resp) = reject_fork_quarantined(&state, &id, info) {
+    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
         return resp;
     }
     // ADR-0066 §1 row 6 / §4 (slice 9): capture under the SAME read guard as
@@ -25860,9 +26154,13 @@ pub(in crate::server) async fn secure_group_reseal(
     //
     // As on row 4, nothing awaits between `drop(groups)` above and here, so
     // this is the last suspension-free point before the effect.
-    if let Some(resp) =
-        reject_fork_quarantine_installed_before_effect(state.as_ref(), &id, captured_epoch.as_ref())
-            .await
+    if let Some(resp) = reject_fork_quarantine_installed_before_effect_for_actor(
+        state.as_ref(),
+        &id,
+        captured_epoch.as_ref(),
+        Some(&actor),
+    )
+    .await
     {
         return resp;
     }
@@ -35119,6 +35417,7 @@ pub(in crate::server) mod tests {
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
+    mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     mod wp_c;
@@ -42647,6 +42946,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_decrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(SecureDecryptRequest {
                 ciphertext_b64: encrypted.0["ciphertext_b64"]
                     .as_str()
@@ -42693,6 +42995,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_reseal(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(ResealRequest { recipient }),
         )
         .await;
@@ -42756,6 +43061,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_reseal(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(ResealRequest { recipient: absent }),
         )
         .await;
@@ -42768,6 +43076,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_reseal(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(ResealRequest {
                 recipient: bob.clone(),
             }),
@@ -42781,6 +43092,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_reseal(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(ResealRequest {
                 recipient: charlie.clone(),
             }),
@@ -43316,6 +43630,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_decrypt(
             State(Arc::clone(&state)),
             Path(group_id.clone()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(SecureDecryptRequest {
                 ciphertext_b64: BASE64.encode(b"item4a-ciphertext-not-reached"),
                 nonce_b64: BASE64.encode([0u8; 12]),
@@ -44560,6 +44877,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_decrypt(
             State(Arc::clone(&state)),
             Path(group_id.clone()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(SecureDecryptRequest {
                 ciphertext_b64,
                 nonce_b64,
@@ -45752,6 +46072,9 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_decrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(SecureDecryptRequest {
                 ciphertext_b64: encrypted.0["ciphertext_b64"]
                     .as_str()
