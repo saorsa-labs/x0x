@@ -86,7 +86,7 @@ For security details, see [docs/security.md](https://github.com/saorsa-labs/x0x/
 
 ## Beyond Messaging
 
-- **Work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`), MLS group encryption, a built-in **GUI board view** (state columns, badges, approve/deny). See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
+- **Work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`; task-list deltas are not group-encrypted today, see #895), a built-in **GUI board view** (state columns, badges, approve/deny). See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
 - **Tailnet** — connect your own computers over any network and forward a local TCP port to a loopback service on a peer machine, Tailscale-style, over the same post-quantum QUIC transport. Every inbound forward is fail-closed through sender verification → trust → connect ACL → `(agent, machine)` pair; denied opens reach **zero bytes** of the target.
 
 ---
@@ -169,7 +169,9 @@ curl -s -H "Authorization: Bearer $TOKEN" "http://$API/status"
 ### 1.4 First message
 
 ```bash
-x0x subscribe hello-world && x0x publish hello-world "Hello!"
+# `x0x subscribe` streams events until Ctrl+C, so publish from a second terminal
+x0x subscribe hello-world          # terminal 1 (blocks, prints events)
+x0x publish hello-world "Hello!"   # terminal 2
 # REST equivalent
 curl -X POST "http://$API/subscribe" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"topic":"hello-world"}'
 curl -X POST "http://$API/publish"   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -546,7 +548,9 @@ curl -X POST "http://$API/stores/team-config/join" -H "Authorization: Bearer $TO
 ordinary stores remain signed/plaintext according to their creation policy. The
 caller must use the normal durable or session bearer and be an active member of
 the named group; scoped rider tokens are denied by the ADR-0039 route fence. The
-group must be `MlsEncrypted` on the GSS plane (ADR-0010):
+store is encrypted when the group is `MlsEncrypted`, on either the GSS plane
+(ADR-0010) or the TreeKEM plane; a `SignedPublic` group gets a signed, plaintext
+group store instead:
 
 ```bash
 curl -X POST "http://$API/groups/<group_id>/stores" \
@@ -979,7 +983,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | KV stores (CRDT) | `/stores*` | `x0x store ...` | GA |
 | File transfer | `/files/*` | `x0x send-file/transfers` | GA |
 | Remote exec | `/exec/*` | `x0x exec` | GA (fail-closed ACLs) |
-| Tailnet forwards + streams | `/forwards` `/streams` | `x0x forward/streams` | GA |
+| Tailnet forwards + streams | `/forwards` `/streams` | `x0x forward/streams` | Available · caveat #132 (real-NAT/relay path not yet acceptance-proven) |
 | Presence + FOAF | `/presence/*` | `x0x presence ...` | GA |
 | Contacts, trust, machine pinning | `/contacts*` `/trust/evaluate` | `x0x contacts/trust/machines` | GA |
 | Agent cards / A2A | `/agent/card*` `/.well-known/agent-card.json` | `x0x agent card/import` | GA · #450 |

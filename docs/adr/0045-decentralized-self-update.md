@@ -1,6 +1,7 @@
 # ADR 0045: Decentralized Self-Update with Signed Manifests and Transactional Restart
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-25 by David Irvine (vision-alignment review; status change applied by Claude at his instruction)
 - **Date:** 2026-08-29
 - **Decision owners:** David Irvine (direction), omp (drafting)
 - **Reviewers:** pending
