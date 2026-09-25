@@ -19623,10 +19623,44 @@ mod tests {
             false,
         )
         .is_none());
-        assert!(raw_dm_history_record(
+        let malformed_group_public = raw_dm_history_record(
             sender,
             machine,
             history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+            true,
+            Some(trust::TrustDecision::Accept),
+            1,
+            false,
+        )
+        .expect("bare typed prefix is ordinary DM history");
+        assert_eq!(
+            malformed_group_public.payload,
+            history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX
+        );
+
+        let keypair = identity::AgentKeypair::generate().expect("generate group author");
+        let group_message = groups::GroupPublicMessage::sign(
+            "g".into(),
+            "state-hash".into(),
+            1,
+            &keypair,
+            None,
+            groups::GroupPublicMessageKind::Chat,
+            "hello group".into(),
+            1_000,
+            None,
+            None,
+            None,
+        )
+        .expect("sign group public message");
+        let mut typed_payload = history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX.to_vec();
+        typed_payload.extend_from_slice(
+            &serde_json::to_vec(&group_message).expect("serialize group public message"),
+        );
+        assert!(raw_dm_history_record(
+            sender,
+            machine,
+            &typed_payload,
             true,
             Some(trust::TrustDecision::Accept),
             1,
