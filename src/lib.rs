@@ -3720,6 +3720,113 @@ fn raw_dm_history_record(
     })
 }
 
+struct RawDirectDelivery {
+    sender: identity::AgentId,
+    machine_id: identity::MachineId,
+    data: Vec<u8>,
+    verified: bool,
+    trust_decision: Option<trust::TrustDecision>,
+    observed_origin: Option<connectivity::ObservedOrigin>,
+    digest: String,
+}
+
+/// The post-validation raw-QUIC delivery path. The listener calls this only
+/// after the revocation, pairing, and expiry gates have passed.
+async fn dispatch_raw_direct_after_gates(
+    dm: &direct::DirectMessaging,
+    history_handle: Option<&history::HistoryHandle>,
+    typed_routes: &[dm_inbox::DmTypedPayloadRoute],
+    delivery: RawDirectDelivery,
+) {
+    let RawDirectDelivery {
+        sender,
+        machine_id,
+        data,
+        verified,
+        trust_decision,
+        observed_origin,
+        digest,
+    } = delivery;
+
+    // The raw transport has verified the AgentId→MachineId binding by this
+    // point. A recognized typed payload follows the same prefix order as the
+    // gossip inbox and never enters the generic direct-message/history path.
+    // Raw transport ACKs remain transport receipts, regardless of whether a
+    // bounded typed-route channel accepts or its handler processes the item.
+    if verified
+        && !matches!(
+            trust_decision,
+            Some(trust::TrustDecision::RejectBlocked | trust::TrustDecision::RejectMachineMismatch)
+        )
+    {
+        let hash = blake3::hash(&data);
+        let mut request_id = [0u8; 16];
+        request_id.copy_from_slice(&hash.as_bytes()[..16]);
+        if dm_inbox::InboxPipeline::try_route_typed_payload(
+            typed_routes,
+            dm,
+            dm_inbox::DmTypedPayload {
+                sender,
+                machine_id,
+                payload: data.clone(),
+                verified: true,
+                trust_decision,
+                received_at_unix_ms: dm::now_unix_ms(),
+                request_id,
+                completion: None,
+            },
+        ) {
+            return;
+        }
+    }
+
+    if let (Some(history), Some(record)) = (
+        history_handle,
+        raw_dm_history_record(
+            sender,
+            machine_id,
+            &data,
+            verified,
+            trust_decision,
+            i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
+        ),
+    ) {
+        history.record(record);
+    }
+
+    let payload_bytes = data.len();
+    let delivered = dm
+        .handle_incoming(
+            machine_id,
+            sender,
+            data,
+            verified,
+            trust_decision,
+            observed_origin,
+        )
+        .await;
+
+    tracing::debug!(
+        target: "dm.trace",
+        stage = "inbound_broadcast_published",
+        sender = %hex::encode(sender.as_bytes()),
+        machine_id = %hex::encode(machine_id.as_bytes()),
+        path = "raw_quic",
+        delivered,
+        subscribers = dm.subscriber_count(),
+        digest = %digest,
+    );
+
+    tracing::debug!(
+        target: "x0x::direct",
+        stage = "recv",
+        sender_prefix = %network::hex_prefix(&sender.0, 4),
+        payload_bytes,
+        subscriber_count = dm.subscriber_count(),
+        "direct message dispatched"
+    );
+}
+
 // ─── ADR 0030: strict capability refresh ───────────────────────────────────
 
 /// Cap on concurrent refresh flights, so a burst of strict sends to distinct
@@ -4213,7 +4320,7 @@ impl Agent {
         data: bytes::Bytes,
     ) {
         if let Some(rt) = &self.gossip_runtime {
-            rt.pubsub().handle_incoming(peer, data).await;
+            rt.pubsub().handle_incoming(peer, None, data).await;
         }
     }
 
@@ -5761,7 +5868,7 @@ impl Agent {
     /// teardown step, so an aborted leader can neither wedge a snapshot
     /// path in `Retiring` nor let a follower return while the drained
     /// writer is still running.
-    pub async fn shutdown(&self) {
+    pub async fn try_shutdown(&self) -> error::NetworkResult<()> {
         // #765 r4 test instrument: this future was polled. Counted before
         // anything else so a caller parked on the serialize lock below
         // still counts as entered.
@@ -5927,16 +6034,39 @@ impl Agent {
         // keepalive tasks hold the transport (and thus the ant-quic endpoint)
         // alive; the daemon binary survives only by process exit, but an
         // embedded host needs these released to re-`serve()` on the same port.
+        let mut shutdown_errors = Vec::new();
         if let Some(ref runtime) = self.gossip_runtime {
             if let Err(e) = runtime.shutdown().await {
                 tracing::warn!("Gossip runtime shutdown error: {e}");
+                shutdown_errors.push(format!("gossip runtime: {e}"));
             } else {
                 tracing::info!("Gossip runtime shut down");
             }
         }
         if let Some(ref network) = self.network {
-            network.shutdown().await;
-            tracing::info!("Network node shut down");
+            if let Err(e) = network.try_shutdown().await {
+                tracing::warn!("Network node shutdown error: {e}");
+                shutdown_errors.push(format!("network node: {e}"));
+            } else {
+                tracing::info!("Network node shut down");
+            }
+        }
+
+        if shutdown_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(error::NetworkError::NodeError(format!(
+                "agent shutdown incomplete: {}",
+                shutdown_errors.join("; ")
+            )))
+        }
+    }
+
+    /// Compatibility shutdown for callers that cannot consume a typed result.
+    /// Release-sensitive callers must use [`try_shutdown`](Self::try_shutdown).
+    pub async fn shutdown(&self) {
+        if let Err(error) = self.try_shutdown().await {
+            tracing::warn!(%error, "agent shutdown did not fully release its resources");
         }
     }
 
@@ -13125,58 +13255,31 @@ impl Agent {
                     None
                 };
 
-                // ADR-0023: the gossip-inbox path records after its envelope
-                // verification gates, but the receive-ACK raw-QUIC path joins
-                // the same application stream here. Persist an artifact-less
-                // row only when the transport AgentId->MachineId binding was
-                // verified and trust did not reject the sender. Buzz message
-                // envelopes carry a per-send clientId in their payload, so
-                // payload-derived ids remain distinct for repeated user text.
-                if let (Some(history), Some(record)) = (
+                let typed_routes = {
+                    let inbox = dm_inbox_service.lock().await;
+                    // Before the inbox starts there are no registered routes;
+                    // retain the existing generic raw delivery in that case.
+                    inbox
+                        .as_ref()
+                        .map(dm_inbox::DmInboxService::typed_payload_routes)
+                        .unwrap_or_default()
+                        .to_vec()
+                };
+                dispatch_raw_direct_after_gates(
+                    &dm,
                     history_handle.as_ref(),
-                    raw_dm_history_record(
+                    &typed_routes,
+                    RawDirectDelivery {
                         sender,
                         machine_id,
-                        &data,
-                        verified,
-                        trust_decision,
-                        i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
-                    ),
-                ) {
-                    history.record(record);
-                }
-
-                // Fan out to all subscribe_direct() receivers with verification info.
-                let delivered = dm
-                    .handle_incoming(
-                        machine_id,
-                        sender,
                         data,
                         verified,
                         trust_decision,
                         observed_origin,
-                    )
-                    .await;
-
-                tracing::debug!(
-                    target: "dm.trace",
-                    stage = "inbound_broadcast_published",
-                    sender = %hex::encode(sender.as_bytes()),
-                    machine_id = %hex::encode(machine_id.as_bytes()),
-                    path = "raw_quic",
-                    delivered,
-                    subscribers = dm.subscriber_count(),
-                    digest = %digest,
-                );
-
-                tracing::debug!(
-                    target: "x0x::direct",
-                    stage = "recv",
-                    sender_prefix = %network::hex_prefix(&sender.0, 4),
-                    payload_bytes,
-                    subscriber_count = dm.subscriber_count(),
-                    "direct message dispatched"
-                );
+                        digest,
+                    },
+                )
+                .await;
             }
         });
     }
@@ -19046,6 +19149,125 @@ mod tests {
         record.validate().expect("raw DM history record is valid");
     }
 
+    #[tokio::test]
+    async fn raw_post_validation_routes_verified_typed_before_generic_broadcast() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(4);
+        let routes = vec![dm_inbox::DmTypedPayloadRoute {
+            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            sender: typed_tx,
+            durable_completion: false,
+        }];
+        let sender = identity::AgentId([0x81; 32]);
+        let machine_id = identity::MachineId([0x82; 32]);
+        let typed_bytes = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nsigned-event".to_vec();
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        let routed = typed_rx
+            .try_recv()
+            .expect("verified typed payload reaches route");
+        assert_eq!(routed.payload, typed_bytes);
+        assert!(routed.verified);
+        assert_eq!(routed.sender, sender);
+        assert_eq!(routed.machine_id, machine_id);
+        assert!(
+            generic.try_recv().is_none(),
+            "typed payload bypasses generic bus"
+        );
+
+        let ordinary = b"ordinary direct message".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: ordinary.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        assert_eq!(
+            generic
+                .try_recv()
+                .expect("ordinary payload is broadcast")
+                .payload,
+            ordinary
+        );
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: false,
+                trust_decision: Some(trust::TrustDecision::Unknown),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        let unverified = generic
+            .try_recv()
+            .expect("unverified retains generic handling");
+        assert_eq!(unverified.payload, typed_bytes);
+        assert!(!unverified.verified);
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "unverified payload never reaches typed route"
+        );
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::RejectMachineMismatch),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        let rejected = generic
+            .try_recv()
+            .expect("rejected trust retains existing generic handling");
+        assert_eq!(rejected.payload, typed_bytes);
+        assert_eq!(
+            rejected.trust_decision,
+            Some(trust::TrustDecision::RejectMachineMismatch)
+        );
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "rejected trust never reaches typed route"
+        );
+    }
+
     #[test]
     fn raw_dm_history_rejects_unverified_blocked_and_plumbing_payloads() {
         let sender = identity::AgentId([7; 32]);
@@ -19123,7 +19345,7 @@ mod tests {
         let topic = saorsa_gossip_types::TopicId::from_entity(IDENTITY_ANNOUNCE_TOPIC);
         let mut subscriptions = Vec::with_capacity(NODE_COUNT);
         for (node_index, node) in nodes.iter().enumerate() {
-            subscriptions.push(node.subscribe(topic));
+            subscriptions.push(node.subscribe_ready(topic).await);
             let connected = peers
                 .iter()
                 .copied()
@@ -20014,6 +20236,39 @@ mod tests {
             mdns_enabled: false,
             ..network::NetworkConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn typed_shutdown_returns_and_caches_network_release_failure() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("networked agent");
+        let network = agent.network().expect("network");
+        network.fail_shutdown_for_test("injected socket release failure");
+
+        let first = agent
+            .try_shutdown()
+            .await
+            .expect_err("typed shutdown must propagate the network failure")
+            .to_string();
+        assert!(first.contains("injected socket release failure"));
+        let second = agent
+            .try_shutdown()
+            .await
+            .expect_err("later callers must observe the cached failure")
+            .to_string();
+        assert_eq!(second, first);
+
+        // Source-compatible wrapper remains idempotent and callable after a
+        // typed failure; it logs the same cached outcome.
+        agent.shutdown().await;
     }
 
     #[tokio::test]
