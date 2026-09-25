@@ -84,9 +84,9 @@ We will ship **1:1 audio and video calling together via Option A**, as follows.
    otherwise. RTCP (0x23) is relayed end to end, so the receiving browser's
    keyframe requests (PLI/FIR) and bandwidth feedback reach the sender. The payload
    contract for the video lane is specified in saorsa-webrtc by the implementing
-   design, not here. The Rust WebRTC stack is chosen in that design. Candidates are
-   str0m (sans-IO) and webrtc-rs. The selection criteria are binary size, the DTLS
-   backend (no new OpenSSL runtime dependency), and forwarding/RTCP support.
+   design, not here. The daemon's WebRTC stack is **str0m** (sans-IO). Its DTLS
+   backend is chosen in the implementing design, preferring one that adds no new
+   OpenSSL runtime dependency.
    **Option B is rejected.** The daemon cannot show video. Capture code would be
    per-platform. H.264 via openh264 is only royalty-covered as Cisco's downloaded
    binary. A background daemon cannot reliably raise macOS camera or microphone
@@ -125,9 +125,11 @@ We will ship **1:1 audio and video calling together via Option A**, as follows.
    0070 is accepted, contact trust is the only way to be admitted.
 5. **Scope.** The scope is 1:1 audio+video between humans in the GUI. Two things are
    **deferred**: 0042 (d) group calls (which need their own ADR), and screen share
-   (0x22). Two more are **open**: native Rust agents interoperating with browser calls
-   (see Validation Q2), and daemon-blind media via SFrame/insertable streams. Today the
-   daemon sees plaintext media, just as it sees plaintext DMs.
+   (0x22). Media plays only in the GUI this milestone; native CLI audio is out of
+   scope. Interop between native `x0x::voice` agents and browser calls is **deferred
+   to a later milestone**: it would need the gateway to map RTP Opus to and from the
+   `AudioDatagram` framing. Daemon-blind media via SFrame/insertable streams stays
+   **open**. Today the daemon sees plaintext media, just as it sees plaintext DMs.
 
 ## Consequences
 
@@ -144,8 +146,7 @@ We will ship **1:1 audio and video calling together via Option A**, as follows.
 
 - **Binary size.** The daemon gains a WebRTC stack (DTLS, SRTP, ICE-lite, RTP) plus
   libopus via `voice`. The size delta is **unknown until measured**. The implementing
-  PR reports the `x0xd` delta per release target, and a delta over +5 MB needs David's
-  sign-off.
+  PR measures and reports the `x0xd` delta per release target. There is no size gate.
 - Calls need a GUI tab open to ring or to carry media. The CLI only controls the
   lifecycle, so a human with no GUI open misses the call.
 - A relay-then-forward design means bandwidth estimation runs end to end through two
@@ -193,19 +194,18 @@ We will ship **1:1 audio and video calling together via Option A**, as follows.
   handshake working.
 - An SDP test: the loopback answer contains only Opus and VP8.
 
-**Review triggers:** a binary delta over +5 MB; test (d) failing due to congestion
-behaviour; ADR 0070 being rejected or changing `ShareCap`.
+**Review triggers:** test (d) failing due to congestion behaviour; str0m proving
+unable to forward RTP/RTCP end to end; ADR 0070 being rejected or changing `ShareCap`.
 
-**Open questions for David:**
+## Decisions (David Irvine, 2026-09-25)
 
-- Q1: Is the WebRTC-stack choice (str0m or webrtc-rs) delegated to the implementing
-  design?
-- Q2: Must native `x0x::voice` agents talk to browser humans in this milestone? That
-  needs the gateway to map RTP Opus to and from the `AudioDatagram` framing, without
-  transcoding.
-- Q3: Is the +5 MB budget right?
-- Q4: Is the GUI-only media path acceptable, or is native CLI audio (cpal in the CLI
-  process) required?
+These answer the drafting open questions. The ADR itself is still Proposed.
+
+1. **WebRTC stack:** str0m.
+2. **Media location:** in the GUI only this milestone. The CLI handles signaling and
+   call control but plays no media.
+3. **Binary size:** no hard limit. The delta is measured and reported, not gated.
+4. **Native-agent/browser interop:** not this milestone; later.
 
 ## Notes for AI-assisted work
 
