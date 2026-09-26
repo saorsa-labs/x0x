@@ -1042,7 +1042,7 @@ where
         }
     };
     let permit = match outbox {
-        Some(outbox) => Some(outbox.send_permit().await),
+        Some(_) => None::<tokio::sync::OwnedRwLockReadGuard<()>>,
         None => None,
     };
     if revocations
