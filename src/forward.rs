@@ -902,10 +902,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                 Ok(addr) => addr,
                 Err(reason) => {
                     ctx.connect_diag.record_denied(reason);
-                    let _ = stream
-                        .send_mut()
-                        .write_all(&encode_response_denied(reason))
-                        .await;
+                    send_denial(&mut stream, reason).await;
                     tracing::warn!(
                         target: "x0x::forward",
                         peer = %hex::encode(peer.as_bytes()),
@@ -964,10 +961,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                 Ok(addr) => addr,
                 Err(reason) => {
                     ctx.connect_diag.record_denied(reason);
-                    let _ = stream
-                        .send_mut()
-                        .write_all(&encode_response_denied(reason))
-                        .await;
+                    send_denial(&mut stream, reason).await;
                     tracing::info!(
                         target: "x0x::forward",
                         peer = %hex::encode(peer.as_bytes()),
@@ -988,12 +982,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
     if !target.ip().is_loopback() {
         ctx.connect_diag
             .record_denied(ConnectDenialReason::TargetNotLoopback);
-        let _ = stream
-            .send_mut()
-            .write_all(&encode_response_denied(
-                ConnectDenialReason::TargetNotLoopback,
-            ))
-            .await;
+        send_denial(&mut stream, ConnectDenialReason::TargetNotLoopback).await;
         return;
     }
 
@@ -1046,16 +1035,51 @@ impl Drop for StreamLeaveGuard {
     }
 }
 
-/// Bridge a local TCP connection and the peer stream's two halves until one
-/// side closes. QUIC provides native flow control; `copy` is bounded by QUIC
-/// backpressure so no unbounded buffer is introduced.
+/// Write the connect-denied response byte and `finish()` the send stream so
+/// the opener reads the denial byte followed by a clean FIN (#961). Without
+/// the finish, dropping the stream resets it and the reset can overtake the
+/// byte. Nothing else is ever written: the opener sees exactly one byte, then
+/// EOF. A finished-then-dropped ant-quic stream keeps retransmitting its
+/// buffered data, so returning right after is safe.
+async fn send_denial(stream: &mut PeerStream, reason: ConnectDenialReason) {
+    let send = stream.send_mut();
+    if send
+        .write_all(&encode_response_denied(reason))
+        .await
+        .is_ok()
+    {
+        let _ = send.finish();
+    }
+}
+
+/// Bridge a local TCP connection and the peer stream's two halves until both
+/// directions close. QUIC provides native flow control; `copy` is bounded by
+/// QUIC backpressure so no unbounded buffer is introduced.
+///
+/// Half-close propagates per direction (#961): when a source reaches a clean
+/// EOF the destination writer is shut down — a QUIC FIN for the send stream,
+/// a TCP `shutdown(Write)` for the socket — while the other direction keeps
+/// flowing. On a copy error the writer is left unfinished, so dropping the
+/// QUIC send stream resets it and the truncation surfaces as an error rather
+/// than a well-formed but short stream.
 async fn bridge(tcp: TcpStream, mut send: HighLevelSendStream, mut recv: HighLevelRecvStream) {
+    use tokio::io::AsyncWriteExt;
     // Split the TCP socket into owned read/write halves so the two copy tasks
     // can run concurrently without overlapping mutable borrows.
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
-    let to_stream = tokio::io::copy(&mut tcp_read, &mut send);
-    let from_stream = tokio::io::copy(&mut recv, &mut tcp_write);
-    let _ = tokio::join!(to_stream, from_stream);
+    let to_stream = async {
+        if tokio::io::copy(&mut tcp_read, &mut send).await.is_ok() {
+            // `SendStream::poll_shutdown` is `finish()`: queues a FIN; the
+            // connection retransmits buffered data even after drop.
+            let _ = send.shutdown().await;
+        }
+    };
+    let from_stream = async {
+        if tokio::io::copy(&mut recv, &mut tcp_write).await.is_ok() {
+            let _ = tcp_write.shutdown().await;
+        }
+    };
+    tokio::join!(to_stream, from_stream);
 }
 
 /// Read a length-prefixed `ForwardHeader` from an async reader.
