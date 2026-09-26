@@ -14774,6 +14774,9 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         /// #942 r4: the source obligation's due time (oldest-due-first
         /// ordering for the bounded pass).
         next_retry_at_ms: u64,
+        /// #942 r5 (B8): whether this is a retry — first attempts sort
+        /// ahead of the retry backlog.
+        is_retry: bool,
     }
     let mut due: Vec<DueObligation> = Vec::new();
 
@@ -14799,6 +14802,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                     envelope_bytes: obligation.envelope_bytes.clone(),
                     targets: obligation.relay_targets.clone(),
                     next_retry_at_ms: obligation.next_retry_at_ms,
+                    is_retry: obligation.retry_count > 0,
                 });
             }
         }
@@ -14905,7 +14909,10 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
     // the next 500 ms tick — the budget bounds work per tick, not the
     // total.
     let mut due_sorted = due;
-    due_sorted.sort_by_key(|o| o.next_retry_at_ms);
+    // #942 r5 (B8): FIRST ATTEMPTS ahead of retries — a brand-new
+    // obligation is never starved behind a backlog of overdue retries;
+    // oldest-due within each class.
+    due_sorted.sort_by_key(|o| (o.is_retry, o.next_retry_at_ms));
     const CAUSAL_RELAY_PASS_BUDGET: usize = 16;
     let mut pass_budget: usize = CAUSAL_RELAY_PASS_BUDGET;
 
@@ -14914,6 +14921,9 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         if pass_budget == 0 {
             break;
         }
+        // #942 r5 (B7): the budget is charged PER OBLIGATION here — a
+        // started obligation always fans out fully (see the inner loop).
+        pass_budget = pass_budget.saturating_sub(1);
         let group_id = &due_obl.group_id;
         let digest = &due_obl.digest;
         let envelope_bytes = &due_obl.envelope_bytes;
@@ -14922,11 +14932,12 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         let mut success_count: usize = 0;
 
         let obligation_digest = *digest;
+        // #942 r5 (B7): the budget is charged PER OBLIGATION (at the top
+        // of this loop), never per target — a started obligation always
+        // fans out fully, so witnesses past the budget cannot be starved
+        // by earlier failing targets and the obligation is never pruned
+        // unattempted. The fan-out itself is bounded by the group size.
         for target_hex in targets {
-            if pass_budget == 0 {
-                break;
-            }
-            pass_budget = pass_budget.saturating_sub(1);
             let Ok(target_id) = parse_agent_id_hex(target_hex) else {
                 // Unparseable target — skip (not added to success set).
                 continue;
