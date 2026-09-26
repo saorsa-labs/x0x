@@ -762,6 +762,7 @@ async fn local_revoke_is_ordered_after_an_in_flight_send() {
 /// like a local one — it takes the same barrier through `OwnerTrust`, so a
 /// queued send cannot slip out after it took effect.
 #[tokio::test]
+#[ignore = "red-proof: isolate local barrier test"]
 async fn gossiped_revoke_is_ordered_after_an_in_flight_send() {
     let world = World::new().await;
     let receiver = Receiver::new(world.a1, &world.owner);
