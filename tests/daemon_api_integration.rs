@@ -2602,6 +2602,51 @@ async fn daemon_api_auth_session_exchange() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_auth_session_refresh() {
+    // #893: a live session token is swapped for a fresh one; the durable
+    // token is refused and the replaced session stops working.
+    let d = daemon().await;
+    let refused = ca(&d)
+        .post(d.url("/auth/session/refresh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403, "durable token must be refused");
+
+    let r: Value = ca(&d)
+        .post(d.url("/auth/session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let old = r["session_token"].as_str().unwrap().to_string();
+    let plain = reqwest::Client::new();
+    let r: Value = plain
+        .post(d.url("/auth/session/refresh"))
+        .bearer_auth(&old)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fresh = r["session_token"].as_str().unwrap();
+    assert_ne!(fresh, old);
+    assert_eq!(r["expires_in"], 600);
+
+    let replaced = plain
+        .post(d.url("/auth/session/refresh"))
+        .bearer_auth(&old)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), 401, "replaced session must stop working");
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_diagnostics_exec() {
     let d = daemon().await;
     let r: Value = ca(&d)

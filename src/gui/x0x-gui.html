@@ -686,6 +686,7 @@ function readSessionToken(){
     const token=params.get('token')||'';
     if(token){
       sessionStorage.setItem('x0x_session_token',token);
+      sessionStorage.setItem('x0x_session_issued_at',String(Date.now()));
       params.delete('token');
       const qs=params.toString();
       history.replaceState(null,'',location.pathname+(qs?'?'+qs:'')+location.hash);
@@ -694,12 +695,46 @@ function readSessionToken(){
     return sessionStorage.getItem('x0x_session_token')||'';
   }catch(e){return ''}
 }
-const SESSION_TOKEN=readSessionToken();
-const WS_URL=BASE.replace(/^http/,'ws')+'/ws/direct'+(SESSION_TOKEN?'?token='+SESSION_TOKEN:'');
+let SESSION_TOKEN=readSessionToken();
+// Built per connect so a reconnect uses the current (refreshed) token.
+function wsUrl(){return BASE.replace(/^http/,'ws')+'/ws/direct'+(SESSION_TOKEN?'?token='+SESSION_TOKEN:'')}
 let ws=null;
 const wsSubs=new Set();
 
 async function api(path,opt){return apiWith(SESSION_TOKEN,path,opt)}
+
+// #893: sliding session refresh. Session tokens live 10 min; swap the token
+// at ~8 min while this tab is visible. The daemon refuses refresh 12 h after
+// the original `x0x gui` mint (or once the token has lapsed, e.g. the tab was
+// hidden too long), and the user reopens with `x0x gui`. Already-open WS/SSE
+// streams are authenticated at connect and keep running; reconnects read the
+// current SESSION_TOKEN.
+const SESSION_REFRESH_MS=8*60*1000;
+let sessionIssuedAt=(()=>{try{return Number(sessionStorage.getItem('x0x_session_issued_at'))||0}catch(e){return 0}})();
+let sessionExpired=false,sessionRefreshing=false;
+async function refreshSession(){
+  // One refresh at a time: the old token dies on success, so a second
+  // concurrent call would present a revoked token and read as "expired".
+  if(!SESSION_TOKEN||sessionExpired||sessionRefreshing)return;
+  sessionRefreshing=true;
+  const r=await apiWith(SESSION_TOKEN,'/auth/session/refresh',{method:'POST'});
+  sessionRefreshing=false;
+  if(r&&r._http_ok&&r.session_token){
+    SESSION_TOKEN=r.session_token;
+    sessionIssuedAt=Date.now();
+    try{sessionStorage.setItem('x0x_session_token',SESSION_TOKEN);sessionStorage.setItem('x0x_session_issued_at',String(sessionIssuedAt))}catch(e){}
+    return;
+  }
+  if(!r)return; // daemon unreachable: retry on the next tick
+  sessionExpired=true;
+  const el=document.createElement('div');
+  el.className='toast error';
+  el.textContent='Session expired — reopen with `x0x gui`';
+  document.getElementById('toasts').appendChild(el);
+}
+function maybeRefreshSession(){
+  if(document.visibilityState==='visible'&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS)refreshSession();
+}
 
 // Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,
 // /sync/devices*, /announce with user identity, /home/rename,
@@ -789,7 +824,7 @@ async function refreshAgentIdentity(){
 
 function wsConnect(){
   if(ws&&ws.readyState<2)return;
-  try{ws=new WebSocket(WS_URL)}catch(e){setTimeout(wsConnect,3000);return}
+  try{ws=new WebSocket(wsUrl())}catch(e){setTimeout(wsConnect,3000);return}
   ws.onopen=async()=>{
     await refreshAgentIdentity();
     S.set('connected',true);
@@ -847,6 +882,21 @@ function navigate(view,data){
 }
 function navigateSpace(id,app){navigate('space',{spaceId:id,spaceApp:app||'chat'})}
 function navigateDm(agentId){navigate('dm',{dmTarget:agentId})}
+// #893 deep links: `/gui#/dm/<agent_id>`, `#/groups/<group_id>[/<app>]`,
+// or a top-level view (`#/people`, `#/network`, …). Ids must be hex:
+// several views interpolate them into inline onclick handlers, and a link
+// can come from anyone.
+const HASH_VIEWS=['home','homespace','discover','people','network','presence','mls','admin','settings','constitution','about'];
+const HASH_SPACE_APPS=['chat','board','files','swarm','feed','wiki','web'];
+function applyHashRoute(){
+  const p=String(location.hash||'').replace(/^#\/?/,'').split('/').filter(Boolean);
+  const hex=s=>/^[0-9a-f]{16,128}$/i.test(s||'');
+  if(p[0]==='dm'&&p.length===2&&hex(p[1])){navigateDm(p[1].toLowerCase());return true}
+  if(p[0]==='groups'&&(p.length===2||p.length===3)&&hex(p[1])&&(!p[2]||HASH_SPACE_APPS.includes(p[2]))){navigateSpace(p[1].toLowerCase(),p[2]);return true}
+  if(p.length===1&&HASH_VIEWS.includes(p[0])){navigate(p[0]);return true}
+  if(p.length)toast('Unknown GUI view link: #/'+p.join('/'),'warning');
+  return false;
+}
 
 // Utility
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
@@ -3873,7 +3923,15 @@ function togglePeerEvents(on){
       out.prepend(line);
       while(out.children.length>20)out.removeChild(out.lastChild);
     });
-    peerEventsSse.onerror=()=>{if(out)out.innerHTML='<span style="color:var(--am)">peer event stream unavailable</span>'};
+    // #893: never let EventSource auto-retry — it reuses the original URL,
+    // whose session token a refresh has revoked. Close and reopen with the
+    // current SESSION_TOKEN instead (unless the user toggled it off).
+    const es=peerEventsSse;
+    peerEventsSse.onerror=()=>{
+      if(out)out.innerHTML='<span style="color:var(--am)">peer event stream unavailable</span>';
+      es.close();
+      setTimeout(()=>{if(peerEventsSse===es&&!sessionExpired)togglePeerEvents(true)},3000);
+    };
   }catch(e){
     if(out)out.innerHTML='<span style="color:var(--rd)">failed to open peer events</span>';
   }
@@ -6071,8 +6129,11 @@ wsConnect();
 pollDash();
 pollContacts();
 pollGroups();
-renderView();
+if(!applyHashRoute())renderView();
 renderSidebar();
+window.onhashchange=applyHashRoute;
+setInterval(maybeRefreshSession,30000);
+document.addEventListener('visibilitychange',maybeRefreshSession);
 
 setInterval(pollAll,5000);
 setInterval(()=>{pollContacts();pollGroups()},8000);

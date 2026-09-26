@@ -4,6 +4,7 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 use super::super::crdt_subscriptions;
+use super::super::sse::SseEvent;
 use super::super::state::AppState;
 use super::super::{
     api_error, api_error_with_reason, bad_request, direct_message_send_config, forbidden,
@@ -68,13 +69,7 @@ struct LoadedLegacyStore {
 }
 
 pub(in crate::server) const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(in crate::server) struct KvStoreDirectDelta {
-    store_id: String,
-    peer_id: saorsa_gossip_types::PeerId,
-    delta: x0x::kv::KvStoreDelta,
-}
+pub(in crate::server) use x0x::kv::KvStoreDirectDelta;
 
 fn encode_kv_store_delta_direct_payload(
     store_id: &str,
@@ -638,8 +633,14 @@ pub(in crate::server) async fn put_kv_value(
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    match handle.put_with_delta(key, value, content_type).await {
-        Ok(delta) => {
+    match handle
+        .put_with_outcome(key.clone(), value, content_type)
+        .await
+    {
+        Ok(x0x::KvPutOutcome {
+            delta,
+            evicted_keys,
+        }) => {
             // #341 Phase B: encrypted stores replicate ONLY via the sealed
             // gossip path — never ship the plaintext local delta over the
             // DM direct-delivery side channel.
@@ -647,7 +648,22 @@ pub(in crate::server) async fn put_kv_value(
                 let recipients = kv_store_delta_direct_recipients(&state).await;
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+            // #849: a SelfKeyed put can evict the writer's lex-highest keys
+            // under ADR-0047 lowest-N admission. Tell the writer which ones.
+            if !evicted_keys.is_empty() {
+                let _ = state.broadcast_tx.send(SseEvent {
+                    event_type: "kv:evicted".to_string(),
+                    data: serde_json::json!({
+                        "store_id": id,
+                        "key": key,
+                        "evicted_keys": evicted_keys,
+                    }),
+                });
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "evicted_keys": evicted_keys })),
+            )
         }
         Err(e) => {
             let status = if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) {
@@ -1070,6 +1086,19 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
         store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
         retained_image: Option<Vec<u8>>,
     ) -> x0x::kv::Result<()> {
+        self.merge_main_record_with_outcome(opened, sender_peer, local_peer, store, retained_image)
+            .await
+            .map(|_| ())
+    }
+
+    async fn merge_main_record_with_outcome(
+        &self,
+        opened: x0x::kv::treekem::OpenedTreeKemKvRecord,
+        sender_peer: saorsa_gossip_types::PeerId,
+        local_peer: saorsa_gossip_types::PeerId,
+        store: &Arc<tokio::sync::RwLock<x0x::kv::KvStore>>,
+        retained_image: Option<Vec<u8>>,
+    ) -> x0x::kv::Result<Option<bool>> {
         if opened.reader_only || opened.mutation.kind == x0x::kv::KvMutationKind::Control {
             return Err(x0x::kv::KvError::Unauthorized(
                 "read-side TreeKEM record cannot mutate a store".to_string(),
@@ -1092,7 +1121,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 let delta: x0x::kv::KvStoreDelta =
                     bincode::deserialize(&opened.mutation.payload)
                         .map_err(|e| x0x::kv::KvError::Gossip(format!("bad TreeKEM delta: {e}")))?;
-                target.merge_delta(&delta, sender_peer, Some(&opened.mutation.author_id))
+                target
+                    .merge_delta_with_outcome(&delta, sender_peer, Some(&opened.mutation.author_id))
+                    .map(|outcome| Some(matches!(outcome, x0x::kv::store::MergeOutcome::Applied)))
             }
             x0x::kv::KvMutationKind::RetainedState => {
                 let image: x0x::kv::KvStore =
@@ -1102,7 +1133,9 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                         )
                     })?)
                     .map_err(|e| x0x::kv::KvError::Gossip(format!("bad retained image: {e}")))?;
-                target.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)
+                let previous_version = target.current_version();
+                target.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)?;
+                Ok(Some(target.current_version() != previous_version))
             }
             x0x::kv::KvMutationKind::Control => Err(x0x::kv::KvError::Unauthorized(
                 "TreeKEM control record on main topic".to_string(),
@@ -2910,6 +2943,11 @@ mod tests {
         let payload = encode_kv_store_delta_direct_payload("store-1", peer_id, &delta)
             .expect("payload should encode");
         assert!(payload.starts_with(KV_STORE_DELTA_DM_PREFIX));
+        assert!(crate::server::valid_kv_store_delta_typed_dm(&payload));
+        assert_eq!(
+            x0x::history::classify::classify_dm_payload(&payload),
+            x0x::history::classify::DmPayloadClass::Ephemeral
+        );
 
         let decoded: KvStoreDirectDelta =
             serde_json::from_slice(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])
@@ -5666,5 +5704,97 @@ mod tests {
         .into_response();
         assert_eq!(keys_response.status(), StatusCode::FORBIDDEN);
         assert!(!state.kv_stores.read().await.contains_key(&binding.topic));
+    }
+
+    /// WHY (#849): REST clients learn about a SelfKeyed quota eviction
+    /// only through the PUT response and the `/events` stream. ADR-0047
+    /// admission is unchanged: the 65th lex-low key evicts the writer's
+    /// lex-highest key, and a new lex-highest key is refused.
+    #[tokio::test]
+    async fn put_kv_value_reports_self_keyed_evictions() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let topic = "issue-849-directory".to_string();
+        let handle = state
+            .agent
+            .create_kv_store_persistent(
+                "directory",
+                &topic,
+                x0x::kv::AccessPolicy::SelfKeyed,
+                &state.kv_store_state_dir,
+            )
+            .await
+            .expect("create self_keyed store");
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(topic.clone(), handle.clone());
+        let me = hex::encode(state.agent.agent_id().as_bytes());
+        let mut events = state.broadcast_tx.subscribe();
+
+        let put = |suffix: String| {
+            let state = Arc::clone(&state);
+            let topic = topic.clone();
+            let key = format!("{me}/{suffix}");
+            async move {
+                let response = put_kv_value(
+                    State(state),
+                    Path((topic, key)),
+                    Json(PutValueRequest {
+                        value: BASE64.encode(b"v"),
+                        content_type: None,
+                    }),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+                (status, body)
+            }
+        };
+
+        // Under quota: the field is present and empty.
+        for i in 1..=64 {
+            let (status, body) = put(format!("{i:03}")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["evicted_keys"], serde_json::json!([]), "{body}");
+        }
+
+        // The 65th, lex-lowest key evicts exactly the writer's lex-highest key.
+        let (status, body) = put("000".to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let evicted = format!("{me}/064");
+        assert_eq!(body["evicted_keys"], serde_json::json!([evicted]), "{body}");
+        let mut evictions = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.event_type == "kv:evicted" {
+                evictions.push(event);
+            }
+        }
+        assert_eq!(evictions.len(), 1, "exactly one eviction event");
+        let event = &evictions[0];
+        assert_eq!(event.data["store_id"], topic);
+        assert_eq!(event.data["evicted_keys"], serde_json::json!([evicted]));
+        assert_eq!(handle.keys().await.expect("keys").len(), 64);
+
+        // A new lex-highest key is refused as not admitted and evicts nothing.
+        let (status, body) = put("999".to_string()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("NOT admitted")),
+            "{body}"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(
+                event.event_type, "kv:evicted",
+                "a refused put emits no eviction"
+            );
+        }
+        assert_eq!(handle.keys().await.expect("keys").len(), 64);
     }
 }

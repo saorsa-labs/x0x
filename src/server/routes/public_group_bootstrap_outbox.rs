@@ -225,7 +225,9 @@ pub(in crate::server) fn public_group_bootstrap_obligation_for_add(
     prepare_public_group_bootstrap_obligation(recipient, snapshot).map(Some)
 }
 
-fn decode_public_group_bootstrap(encoded: &[u8]) -> Result<PublicGroupBootstrap, String> {
+pub(in crate::server) fn decode_public_group_bootstrap(
+    encoded: &[u8],
+) -> Result<PublicGroupBootstrap, String> {
     let bootstrap: PublicGroupBootstrap = serde_json::from_slice(encoded)
         .map_err(|error| format!("bootstrap payload decode failed: {error}"))?;
     if bootstrap.message_type != PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE {
@@ -1356,6 +1358,15 @@ mod tests {
         let group = signed_public_group(&authority, &hex::encode(recipient.agent_id().as_bytes()))?;
         prepare_public_group_bootstrap_obligation(recipient.agent_id(), group)
             .map_err(|error| anyhow::anyhow!(error))
+    }
+
+    #[test]
+    fn typed_bootstrap_validator_accepts_real_outbox_payload() -> Result<()> {
+        let obligation = test_obligation()?;
+        assert!(crate::server::valid_public_group_bootstrap_typed_dm(
+            &obligation.payload
+        ));
+        Ok(())
     }
 
     /// Prepare an obligation AND put its group on the roster.
