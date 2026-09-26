@@ -786,6 +786,7 @@ impl crate::Agent {
             &self.revocation_set,
             &self.move_state,
             &self.connect_policy,
+            &self.owner_trust,
             machine,
         )
         .await
@@ -811,7 +812,21 @@ impl crate::Agent {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::sync::Arc::clone(&guard)
         };
-        crate::streams::stream_acl_gate(&policy, &[*callee], &machine)
+        // ADR-0070 §1: an owner-trusted callee is listed by a
+        // `principal = "owner"` ACL entry, exactly as on the inbound path.
+        let owner_trusted = self
+            .owner_trust
+            .evaluate_pair(
+                &self.contact_store,
+                &self.identity_discovery_cache,
+                &self.revocation_set,
+                callee,
+                &machine,
+            )
+            .await
+            .owner_trusted;
+        let owner_trusted: &[AgentId] = if owner_trusted { &[*callee] } else { &[] };
+        crate::streams::stream_acl_gate(&policy, &[*callee], owner_trusted, &machine)
             .map_err(|e| CallRefusal::from_gate_error(&e))
     }
 }
