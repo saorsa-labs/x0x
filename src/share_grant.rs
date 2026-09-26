@@ -1015,9 +1015,15 @@ where
             error: result.err(),
         };
         if !delivery.delivered {
-            delivery.queued =
-                queue_failed_delivery(grant, recipient, outbox, now_unix, &mut delivery.error)
-                    .await;
+            // RED PROOF (ci-mirror/926 only): enqueue disabled.
+            delivery.queued = queue_failed_delivery(
+                grant,
+                recipient,
+                outbox.filter(|_| false),
+                now_unix,
+                &mut delivery.error,
+            )
+            .await;
         }
         out.push(delivery);
     }
