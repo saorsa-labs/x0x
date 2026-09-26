@@ -798,6 +798,27 @@ struct TreeKemGroupStoreProtector {
     invalid: std::sync::atomic::AtomicBool,
 }
 
+/// #895: the live TreeKEM protector for a group-scoped task list — the same
+/// adapter this group's encrypted KV stores seal with, so a task list rides
+/// the same ratchet, roster/policy binding and durability rules. `None` when
+/// the group is not an eligible TreeKEM group.
+pub(in crate::server) fn treekem_task_list_protector(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) -> Option<x0x::kv::SharedTreeKemKvProtector> {
+    let authorization = Arc::new(x0x::groups::TreeKemKvAuthorizationContext::from_group(
+        info,
+    )?);
+    Some(Arc::new(TreeKemGroupStoreProtector {
+        state: Arc::clone(state),
+        group_key: group_key.to_string(),
+        stable_group_id: info.stable_group_id().to_string(),
+        authorization,
+        invalid: std::sync::atomic::AtomicBool::new(false),
+    }))
+}
+
 impl TreeKemGroupStoreProtector {
     fn new(
         state: &Arc<AppState>,
@@ -5020,6 +5041,223 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// #895 (TreeKEM mirror of the GSS tests in `crdt/sealed.rs`): a
+    /// group-scoped task list on a TreeKEM group, through the PRODUCTION
+    /// binding (`group_task_list_binding`), seals with the live ratchet so the
+    /// wire bytes carry no task text, a current member opens it, and a member
+    /// whose ratchet is at a different epoch cannot.
+    #[tokio::test]
+    async fn treekem_group_task_list_seals_opens_and_rejects_wrong_epoch() {
+        const TITLE: &str = "TREEKEM-TASK-TITLE-895";
+        let (writer_state, _writer_dir) = encrypted_store_test_state().await;
+        let (reader_state, _reader_dir) = encrypted_store_test_state().await;
+        let owner = AgentId([78; 32]);
+        let writer = writer_state.agent.agent_id();
+        let reader = reader_state.agent.agent_id();
+        let group_key = "46".repeat(16);
+        let group_id = hex::decode(&group_key).expect("group id");
+        let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            writer_state.agent.as_ref(),
+            &group_id,
+        );
+        let reader_seed = crate::server::routes::named_groups::agent_treekem_seed(
+            reader_state.agent.as_ref(),
+            &group_id,
+        );
+        let mut owner_group = x0x::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[78; 32])
+            .expect("owner group");
+        let writer_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(reader, &reader_seed).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances for reader");
+        let reader_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+        assert_eq!(writer_group.epoch(), reader_group.epoch());
+
+        let mut info = GroupInfo::new("tasks".to_string(), String::new(), owner, group_key.clone());
+        info.migrate_from_v1();
+        info.secure_plane = SecureGroupPlane::TreeKem;
+        info.shared_secret = None;
+        for member in [writer, reader] {
+            info.add_member(
+                hex::encode(member.as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(owner.as_bytes())),
+                None,
+            );
+        }
+        info.secret_epoch = writer_group.epoch();
+        info.security_binding = Some(format!("treekem:epoch={}", writer_group.epoch()));
+        info.recompute_state_hash();
+        for (state, live) in [(&writer_state, writer_group), (&reader_state, reader_group)] {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(group_key.clone(), Arc::new(tokio::sync::Mutex::new(live)));
+        }
+
+        let topic = format!("x0x.group.{group_key}.symphony.board");
+        let sealer = crate::server::routes::group_task_list_binding(&writer_state, &topic)
+            .await
+            .delta_protector
+            .expect("group list gets a protector");
+        let opener = crate::server::routes::group_task_list_binding(&reader_state, &topic)
+            .await
+            .delta_protector
+            .expect("group list gets a protector");
+        let payload = format!("plaintext-delta:{TITLE}").into_bytes();
+
+        let body = sealer
+            .seal(x0x::kv::KvMutationKind::Delta, &payload)
+            .await
+            .expect("seal")
+            .expect("an MlsEncrypted group is sealed, never plaintext");
+        assert!(matches!(
+            body,
+            x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(_)
+        ));
+        let wire = x0x::crdt::sealed::encode_sealed_task_record(
+            saorsa_gossip_types::PeerId::new([1; 32]),
+            body.clone(),
+        )
+        .expect("wire");
+        assert!(!wire.windows(TITLE.len()).any(|w| w == TITLE.as_bytes()));
+        assert!(!opener.admits_plaintext().await);
+        let opened = opener.open(&body).await.expect("member opens");
+        assert_eq!(opened.payload, payload);
+        assert_eq!(opened.author, writer);
+
+        // Wrong epoch: the writer's ratchet advances (a third member is
+        // added and only the writer processes the commit), the reader's does
+        // not — a record sealed at the new epoch must not open at the old one.
+        let third = AgentId([79; 32]);
+        let third_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(third, &[79; 32]).expect("third kp");
+        let third_add = owner_group
+            .add_member(third, third_prepared.key_package_bytes())
+            .expect("add third");
+        writer_state
+            .treekem_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("writer ratchet")
+            .lock()
+            .await
+            .process_commit(&third_add.commit)
+            .expect("writer advances");
+        let next_epoch = sealer
+            .seal(x0x::kv::KvMutationKind::Delta, &payload)
+            .await
+            .expect("seal at the new epoch")
+            .expect("sealed");
+        assert!(
+            opener.open(&next_epoch).await.is_err(),
+            "a record from another epoch must fail closed"
+        );
+    }
+
+    /// omp review finding 1 (#895) WHY: the legacy plaintext space board must
+    /// not keep serving its content. Before migration it answers state
+    /// requests only from members of its group; after migration this node has
+    /// retired it — its sync is gone and even a member's request is refused —
+    /// while the copied tasks live on in the sealed board.
+    #[tokio::test]
+    async fn legacy_space_board_is_member_gated_then_retired_by_migration() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let member = state.agent.agent_id();
+        let outsider = AgentId([5; 32]);
+        let group_key = "47".repeat(16);
+        seed_group(&state, &group_key, member).await;
+        let legacy = format!("x0x-board-{}", &group_key[..16]);
+        let board = format!("x0x.group.{group_key}.symphony.board");
+
+        let gate = crate::server::routes::group_task_list_binding(&state, &legacy)
+            .await
+            .state_serve_gate
+            .expect("a legacy board gets a serve gate");
+        assert!(
+            !gate(Some(outsider)).await,
+            "non-member served before migration"
+        );
+        assert!(!gate(None).await, "unsigned request served");
+        assert!(gate(Some(member)).await, "control: a member is served");
+
+        let legacy_binding = crate::server::routes::group_task_list_binding(&state, &legacy).await;
+        let legacy_handle = state
+            .agent
+            .create_task_list_persistent_bound(
+                "Board",
+                &legacy,
+                &state.task_list_state_dir,
+                legacy_binding,
+            )
+            .await
+            .expect("legacy board");
+        legacy_handle
+            .add_task("legacy task".to_string(), "d".to_string())
+            .await
+            .expect("legacy task");
+        state
+            .task_lists
+            .write()
+            .await
+            .insert(legacy.clone(), legacy_handle);
+        let board_binding = crate::server::routes::group_task_list_binding(&state, &board).await;
+        let board_handle = state
+            .agent
+            .create_task_list_persistent_bound(
+                "Board",
+                &board,
+                &state.task_list_state_dir,
+                board_binding,
+            )
+            .await
+            .expect("sealed board");
+        state
+            .task_lists
+            .write()
+            .await
+            .insert(board.clone(), board_handle.clone());
+
+        assert!(crate::server::routes::tasks::migrate_space_board_once(&state, &board).await);
+        assert_eq!(board_handle.list_tasks().await.expect("tasks").len(), 1);
+        assert!(
+            !state.task_lists.read().await.contains_key(&legacy),
+            "the legacy sync must be retired on this node"
+        );
+        assert!(crate::server::routes::legacy_space_board_retired(&state, &legacy).await);
+        assert!(
+            !gate(Some(outsider)).await,
+            "non-member served after migration"
+        );
+        assert!(!gate(Some(member)).await, "a retired board serves nobody");
+        assert!(
+            crate::server::routes::tasks::migrate_space_board_once(&state, &board).await,
+            "re-run is a no-op"
+        );
+        assert_eq!(board_handle.list_tasks().await.expect("tasks").len(), 1);
     }
 
     #[tokio::test]

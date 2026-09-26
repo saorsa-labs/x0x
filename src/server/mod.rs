@@ -1055,6 +1055,9 @@ pub async fn serve_with_options(
         causal_approval_queue_persistence_lock: Mutex::new(()),
         predecessor_relay_outbox_persistence_lock: Mutex::new(()),
         public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
+        cert_fetch_requested: StdMutex::new(std::collections::HashMap::new()),
+        cert_fetch_answered: StdMutex::new(std::collections::HashMap::new()),
+        cert_unresolvable_since: StdMutex::new(std::collections::HashMap::new()),
         pending_b8_compensation: Mutex::new(None),
         pending_listener_admission: Mutex::new(None),
         group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -1123,6 +1126,7 @@ pub async fn serve_with_options(
         start_time: Instant::now(),
         health_snapshot: Arc::new(routes::status::HealthSnapshot::default()),
         broadcast_tx,
+        calls: routes::calls::new_registry(),
         file_transfers: RwLock::new(HashMap::new()),
         receive_hashers: RwLock::new(HashMap::new()),
         pending_file_chunks: RwLock::new(HashMap::new()),
@@ -1757,6 +1761,14 @@ pub async fn serve_with_options(
         }));
     }
 
+    // ADR-0073 call lifecycle: inbound x0x_call_* frames + missed-call sweeper
+    bg_tasks.push(tokio::spawn(routes::calls::run_call_listener(Arc::clone(
+        &state,
+    ))));
+    bg_tasks.push(tokio::spawn(routes::calls::run_call_sweeper(Arc::clone(
+        &state,
+    ))));
+
     // Background join-result listener — joiner-initiated recovery path for
     // fresh TreeKEM members that miss the anchor's opportunistic MemberAdded push.
     {
@@ -2355,6 +2367,15 @@ pub async fn serve_with_options(
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
         .route("/exec/sessions", get(exec_sessions))
+        // ADR-0073 slice 1: call lifecycle (no media yet)
+        .route(
+            "/calls",
+            post(routes::calls::call_create).get(routes::calls::call_list),
+        )
+        .route("/calls/:id", get(routes::calls::call_get))
+        .route("/calls/:id/accept", post(routes::calls::call_accept))
+        .route("/calls/:id/reject", post(routes::calls::call_reject))
+        .route("/calls/:id/hangup", post(routes::calls::call_hangup))
         // Tailnet forwarding (#132 T6)
         .route("/forwards", post(forward_add).get(forward_list))
         .route("/forwards/:local_addr", delete(forward_remove))

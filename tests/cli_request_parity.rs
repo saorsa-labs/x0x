@@ -315,6 +315,14 @@ const CLIENT_ENFORCED_REQUIRED: &[(&str, &str, &str, &str)] = &[
         "agent_id",
         "src/cli/commands/exec.rs::run (argv-empty bail)",
     ),
+    // `x0x call` is a multi-form command (ring / sub-actions); the ring
+    // form requires the agent and bails pre-dispatch.
+    (
+        "POST",
+        "/calls",
+        "agent_id",
+        "src/bin/x0x.rs::Commands::Call (agent-less ring form bails)",
+    ),
     // `x0x history search` is a two-form command (issue #275):
     // `<SCOPE> <QUERY>` (legacy, scoped) or `<QUERY>` alone (cross-scope).
     // The needle is therefore carried by the FIRST positional in the
@@ -748,6 +756,7 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/routes/mod.rs",
     "src/server/routes/acl.rs",
     "src/server/routes/grants.rs",
+    "src/server/routes/calls.rs",
     "src/server/routes/connect.rs",
     "src/server/routes/contacts.rs",
     "src/server/routes/direct.rs",

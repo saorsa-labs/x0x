@@ -332,8 +332,8 @@ pub(crate) fn stream_gate(
 /// stays with the T4 forwarder's `evaluate_connect_gate` call.
 ///
 /// The accept loop calls [`stream_acl_gate_with_grants`]; this form (no
-/// grant holders) is kept for the slice-1 matrix tests.
-#[cfg(test)]
+/// grant holders) is used by the outbound call gate (`src/calls.rs`) and the
+/// slice-1 matrix tests.
 pub(crate) fn stream_acl_gate(
     policy: &crate::connect::ConnectPolicy,
     agents: &[crate::identity::AgentId],
