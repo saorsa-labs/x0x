@@ -2,6 +2,7 @@
 
 pub mod acl;
 pub mod auth;
+pub mod call;
 pub mod connect;
 pub mod constitution;
 pub mod contacts;
