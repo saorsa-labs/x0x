@@ -62,8 +62,9 @@ use routes::{
     leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
     list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
     list_task_lists, list_tasks, load_causal_approval_queue, load_named_groups_merged,
-    load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
+    machine_for_agent_handler, machines_by_user_handler,
+    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
     now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
     owner_riders_list, owner_riders_revoke, peer_health_handler, peers, pin_machine, presence,
@@ -71,9 +72,9 @@ use routes::{
     publish_group_card_to_discovery, put_kv_value, quick_trust,
     recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
     reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
-    remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
-    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    save_named_groups_checked, save_named_groups_checked_unlocked,
+    remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
+    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
+    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
@@ -709,6 +710,7 @@ pub async fn serve_with_options(
     let home_suite_groups_path = config.data_dir.join(HOME_SUITE_GROUPS_FILE);
     let causal_approval_queue_path = config.data_dir.join("causal_approval_queue.json");
     let predecessor_relay_outbox_path = config.data_dir.join("predecessor_relay_outbox.json");
+    let requester_offer_outbox_path = config.data_dir.join("requester_offer_outbox.json");
     let public_group_bootstrap_outbox_path =
         config.data_dir.join("public_group_bootstrap_outbox.json");
     let treekem_dir = config.data_dir.join("treekem");
@@ -1013,6 +1015,7 @@ pub async fn serve_with_options(
         named_groups_requires_durability_confirmation: AtomicBool::new(false),
         causal_approval_queue_persistence_lock: Mutex::new(()),
         predecessor_relay_outbox_persistence_lock: Mutex::new(()),
+        requester_offer_outbox_persistence_lock: Mutex::new(()),
         public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
         pending_b8_compensation: Mutex::new(None),
         pending_listener_admission: Mutex::new(None),
@@ -1061,11 +1064,13 @@ pub async fn serve_with_options(
         pending_join_result_processing: StdMutex::new(HashMap::new()),
         causal_approval_queue: RwLock::new(HashMap::new()),
         predecessor_relay_outbox: RwLock::new(HashMap::new()),
+        requester_offer_outbox: RwLock::new(HashMap::new()),
         public_group_bootstrap_outbox: RwLock::new(HashMap::new()),
         causal_conflict_tombstones: RwLock::new(HashMap::new()),
         completed_relay_tombstones: RwLock::new(HashMap::new()),
         causal_approval_queue_path,
         predecessor_relay_outbox_path,
+        requester_offer_outbox_path,
         public_group_bootstrap_outbox_path,
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
@@ -1273,6 +1278,13 @@ pub async fn serve_with_options(
             primary,
         )
         .await);
+    }
+    // #908: the requester offer outbox loads fail-VISIBLE, never blocking:
+    // a malformed store logs an error and starts empty (the pending join
+    // requests remain in the durable group state; the authority can still
+    // observe the metadata event, and the operator can inspect the file).
+    if let Err(error) = load_requester_offer_outbox(&state).await {
+        tracing::error!("#908 startup: requester offer outbox not loaded: {error}");
     }
     // ADR 0030 §5 fail-closed: a malformed or over-cap bootstrap outbox aborts
     // startup rather than silently dropping delivery obligations the authority
@@ -2014,6 +2026,25 @@ pub async fn serve_with_options(
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(sleep_dur) => {
                         causal_relay_step(&relay_step_state).await;
+                    }
+                }
+            }
+        }));
+    }
+
+    // #908: durable requester→authority predecessor-offer retry worker.
+    // A short poll picks up a newly-admitted obligation immediately (its
+    // first attempt is `next_retry_at_ms = now`), and each pass persists
+    // the exact retry/completion state before counting anything.
+    {
+        let offer_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            let mut shutdown_rx = offer_state.shutdown_notify.subscribe();
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        requester_offer_step(&offer_state).await;
                     }
                 }
             }

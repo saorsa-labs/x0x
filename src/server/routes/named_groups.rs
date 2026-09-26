@@ -11,6 +11,12 @@ pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
 
+mod requester_offer;
+pub(in crate::server) use requester_offer::{
+    insert_requester_offer_obligation, load_requester_offer_outbox, requester_offer_step,
+    RequesterOfferObligation,
+};
+
 use super::super::state::AppState;
 use super::super::{
     api_error, api_error_with_reason, bad_request, forbidden, not_found, parse_agent_id_hex,
@@ -23709,7 +23715,7 @@ pub(in crate::server) async fn create_join_request(
     use base64::Engine as _;
     let requester_kem_b64 = BASE64.encode(&state.agent_kem_keypair.public_bytes);
     let event = NamedGroupMetadataEvent::JoinRequestCreated {
-        group_id: event_group_id,
+        group_id: event_group_id.clone(),
         request_id: request.request_id.clone(),
         requester_agent_id: request.requester_agent_id.clone(),
         message: request.message.clone(),
@@ -23726,28 +23732,61 @@ pub(in crate::server) async fn create_join_request(
         publish_named_group_metadata_event_with_envelope(&state, &metadata_topic, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
     if let Some(envelope) = envelope_bytes {
-        if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
-            let mut dm_payload =
-                Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len());
-            dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
-            dm_payload.extend_from_slice(&envelope);
-            let agent = Arc::clone(&state.agent);
-            let creator = creator_hex.clone();
-            tokio::spawn(async move {
-                if let Err(e) = agent
-                    .send_direct_with_config(
-                        &creator_id,
-                        dm_payload,
-                        predecessor_relay_delivery_config(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        creator = %LogHexId::agent(&creator),
-                        "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+        if parse_agent_id_hex(&creator_hex).is_ok() {
+            // #908: the offer to the authority is a DURABLE obligation,
+            // not a one-shot spawned DM. Persisted here (before the 201
+            // returns), retried by the background worker on the bounded
+            // ADR 0028 schedule over the gossip-only config (#913), and
+            // cleared on the authority's application ACK or when the join
+            // resolves. A send that exhausts its in-flight retries is a
+            // retry, never a silent loss, and a restart resumes it.
+            let now_ms = now_millis_u64();
+            let obligation = RequesterOfferObligation {
+                group_id: event_group_id.to_string(),
+                request_id: request.request_id.clone(),
+                requester_agent_id: request.requester_agent_id.clone(),
+                authority_agent_id: creator_hex.clone(),
+                envelope_bytes: envelope.to_vec(),
+                digest: blake3::hash(&envelope).into(),
+                byte_size: envelope.len(),
+                first_seen_ms: now_ms,
+                next_retry_at_ms: now_ms,
+                retry_count: 0,
+            };
+            if let Err(error) = insert_requester_offer_obligation(&state, obligation).await {
+                // Fail-visible fallback: the pre-#908 one-shot shape, so
+                // a persist failure never leaves the authority with LESS
+                // than it had before.
+                tracing::warn!(
+                    creator = %LogHexId::agent(&creator_hex),
+                    %error,
+                    "#908: failed to persist the requester offer obligation; falling back to a one-shot send"
+                );
+                if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
+                    let mut dm_payload = Vec::with_capacity(
+                        GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len(),
                     );
+                    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+                    dm_payload.extend_from_slice(&envelope);
+                    let agent = Arc::clone(&state.agent);
+                    let creator = creator_hex.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = agent
+                            .send_direct_with_config(
+                                &creator_id,
+                                dm_payload,
+                                predecessor_relay_delivery_config(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                creator = %LogHexId::agent(&creator),
+                                "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+                            );
+                        }
+                    });
                 }
-            });
+            }
         }
     }
 
@@ -35504,6 +35543,7 @@ pub(in crate::server) mod tests {
     mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
+    mod requester_offer;
     mod wp_c;
 
     fn fake_group_state_commit(
@@ -36192,6 +36232,9 @@ pub(in crate::server) mod tests {
             named_groups_requires_durability_confirmation: AtomicBool::new(false),
             causal_approval_queue_persistence_lock: Mutex::new(()),
             predecessor_relay_outbox_persistence_lock: Mutex::new(()),
+            requester_offer_outbox: RwLock::new(HashMap::new()),
+            requester_offer_outbox_path: data_dir.join("requester_offer_outbox.json"),
+            requester_offer_outbox_persistence_lock: Mutex::new(()),
             public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
             pending_b8_compensation: Mutex::new(None),
             pending_listener_admission: Mutex::new(None),
