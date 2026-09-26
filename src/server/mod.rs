@@ -2113,8 +2113,18 @@ pub async fn serve_with_options(
             while let Some(typed) = share_grant_fetch_rx.recv().await {
                 let store = fetch_agent.share_grant_store();
                 let sender = typed.sender;
-                let outcome =
-                    x0x::share_grant::handle_share_grant_fetch(store.as_deref(), typed).await;
+                // #967 B1: the revocation predicate over the live set.
+                let revocation = fetch_agent.revocation_set.read().await;
+                let is_revoked = |grant: &x0x::share_grant::ShareGrant| {
+                    revocation.is_share_grant_revoked(&grant.grant_id, &grant.owner)
+                };
+                let outcome = x0x::share_grant::handle_share_grant_fetch(
+                    store.as_deref(),
+                    Some(&is_revoked),
+                    crate::share_grant::unix_now_secs(),
+                    typed,
+                )
+                .await;
                 if let Some(reply) = outcome.reply {
                     let mut payload = Vec::with_capacity(
                         x0x::share_grant::SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX.len() + reply.len(),
@@ -2125,9 +2135,14 @@ pub async fn serve_with_options(
                     // The reply is a plain (v1-receipt) send: the grant is
                     // owner-signed, so its authenticity does not depend on
                     // this hop; the RECEIVER re-verifies everything.
-                    if let Err(e) = fetch_agent.send_direct(&sender, payload).await {
-                        tracing::debug!(error = %e, "#926: grant fetch reply not delivered");
-                    }
+                    // #967 B2: the reply send is spawned off the handler task —
+                    // a slow peer cannot stall the route consumer.
+                    let reply_agent = std::sync::Arc::clone(&fetch_agent);
+                    tokio::spawn(async move {
+                        if let Err(e) = reply_agent.send_direct(&sender, payload).await {
+                            tracing::debug!(error = %e, "#926: grant fetch reply not delivered");
+                        }
+                    });
                 }
             }
         }));
@@ -2139,9 +2154,18 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_fetch_response_rx.recv().await {
                 let store = fetch_agent.share_grant_store();
-                let _ =
-                    x0x::share_grant::handle_share_grant_fetch_response(store.as_deref(), typed)
-                        .await;
+                // #967 B1: the requester side refuses a revoked grant too.
+                let revocation = fetch_agent.revocation_set.read().await;
+                let is_revoked = |grant: &x0x::share_grant::ShareGrant| {
+                    revocation.is_share_grant_revoked(&grant.grant_id, &grant.owner)
+                };
+                let _ = x0x::share_grant::handle_share_grant_fetch_response(
+                    store.as_deref(),
+                    Some(&is_revoked),
+                    x0x::share_grant::unix_now_secs(),
+                    typed,
+                )
+                .await;
             }
         }));
     }

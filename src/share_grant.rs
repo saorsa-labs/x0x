@@ -498,6 +498,9 @@ pub struct ShareGrantStore {
     /// time — the only responses accepted, and the per-id re-fetch
     /// suppression. Swept + capped (peer-supplied ids are untrusted).
     fetch_in_flight: std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>,
+    /// #967 B2: last time this peer's fetch was served (the per-peer
+    /// rate limit). Swept + capped like the in-flight map.
+    fetch_peer_served: std::sync::Mutex<std::collections::HashMap<AgentId, std::time::Instant>>,
 }
 
 impl ShareGrantStore {
@@ -512,6 +515,7 @@ impl ShareGrantStore {
             write_lock: tokio::sync::Mutex::new(()),
             load_error: None,
             fetch_in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fetch_peer_served: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -658,6 +662,30 @@ impl ShareGrantStore {
         true
     }
 
+    /// #967 B2: one served fetch per peer per window. Returns `true`
+    /// when this peer may be served now; a repeat inside the window is
+    /// rate-limited. Swept + capped.
+    pub fn note_peer_fetch(&self, peer: &AgentId) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self
+            .fetch_peer_served
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.retain(|_, at| {
+            (now.duration_since(*at).as_millis() as u64) < GRANT_FETCH_PEER_INTERVAL_MS
+        });
+        if map.contains_key(peer) {
+            return false;
+        }
+        if map.len() >= GRANT_FETCH_MAX_ENTRIES {
+            if let Some(oldest) = map.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k) {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(*peer, now);
+        true
+    }
+
     /// #926: whether a fetch for `grant_id` is in flight (responses for
     /// other ids are dropped).
     #[must_use]
@@ -789,7 +817,7 @@ fn strict_decode<T: serde::de::DeserializeOwned>(
         .deserialize(bytes)
 }
 
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1035,8 +1063,22 @@ pub struct GrantFetchOutcome {
 /// leaks nothing, and a stranger gets nothing. A grant this daemon does
 /// not hold resolves Err (transient: the fetch may precede the owner's
 /// delivery here), which withholds the v2 ACK so the sender retries.
+/// #967 B1: how the fetch handlers ask "is this grant revoked". The
+/// daemon wiring passes a closure over its revocation set; tests pass a
+/// predicate over known-revoked ids.
+pub type GrantRevoked<'a> = &'a (dyn Fn(&ShareGrant) -> bool + Send + Sync);
+
+/// #967 B2: one served fetch per peer per window (a stranger cannot
+/// hammer the responder); swept and capped like the other maps.
+pub const GRANT_FETCH_PEER_INTERVAL_MS: u64 = 30_000;
+/// #967 B2: the served-grant reply is bounded — a grant wire form larger
+/// than this is corruption, not loadable state.
+pub const GRANT_FETCH_REPLY_MAX_BYTES: usize = 64 * 1024;
+
 pub async fn handle_share_grant_fetch(
     store: Option<&ShareGrantStore>,
+    revoked: Option<GrantRevoked<'_>>,
+    now_unix: u64,
     typed: DmTypedPayload,
 ) -> GrantFetchOutcome {
     let DmTypedPayload {
@@ -1050,48 +1092,96 @@ pub async fn handle_share_grant_fetch(
             result: Err("share grants are not enabled on this daemon".to_string()),
             reply: None,
         },
-        Some(store) => match parse_fetch_request(&payload) {
-            Err(reason) => GrantFetchOutcome {
-                result: Err(reason),
-                reply: None,
-            },
-            Ok(grant_id) => match store.by_id(&grant_id) {
-                None => {
-                    tracing::info!(
-                        grant_id = %hex::encode(grant_id),
-                        "#926: grant fetch for a grant this daemon does not hold; retry"
-                    );
-                    GrantFetchOutcome {
-                        result: Err("grant not held here; retry".to_string()),
+        Some(store) => {
+            // B2: per-peer rate limit BEFORE any store work.
+            if !store.note_peer_fetch(&sender) {
+                GrantFetchOutcome {
+                    result: Err("grant fetch rate limited for this peer; retry".to_string()),
+                    reply: None,
+                }
+            } else {
+                match parse_fetch_request(&payload) {
+                    Err(reason) => GrantFetchOutcome {
+                        result: Err(reason),
                         reply: None,
-                    }
-                }
-                Some(grant) => {
-                    if !grant.agents.contains(&sender) {
-                        tracing::warn!(
-                            sender = %hex::encode(sender.as_bytes()),
-                            grant_id = %hex::encode(grant_id),
-                            "#926: grant fetch from an agent that is not a subject of the grant; refused"
-                        );
-                        GrantFetchOutcome {
-                            result: Err("requester is not a subject of this grant".to_string()),
-                            reply: None,
-                        }
-                    } else {
-                        match grant.to_dm_payload() {
-                            Ok(reply) => GrantFetchOutcome {
-                                result: Ok(DmTypedPayloadCompletion::Inserted),
-                                reply: Some(reply),
-                            },
-                            Err(e) => GrantFetchOutcome {
-                                result: Err(e.to_string()),
+                    },
+                    Ok(grant_id) => match store.by_id(&grant_id) {
+                        None => {
+                            tracing::info!(
+                                grant_id = %hex::encode(grant_id),
+                                "#926: grant fetch for a grant this daemon does not hold; retry"
+                            );
+                            GrantFetchOutcome {
+                                result: Err("grant not held here; retry".to_string()),
                                 reply: None,
-                            },
+                            }
                         }
-                    }
+                        Some(grant) => {
+                            if !grant.agents.contains(&sender) {
+                                tracing::warn!(
+                                    sender = %hex::encode(sender.as_bytes()),
+                                    grant_id = %hex::encode(grant_id),
+                                    "#926: grant fetch from an agent that is not a subject of the grant; refused"
+                                );
+                                GrantFetchOutcome {
+                                    result: Err(
+                                        "requester is not a subject of this grant".to_string()
+                                    ),
+                                    reply: None,
+                                }
+                            } else if !grant.is_active_at(now_unix) {
+                                // B1: never serve expired or not-yet-valid
+                                // state.
+                                tracing::info!(
+                                    grant_id = %hex::encode(grant_id),
+                                    "#967: fetch for an inactive grant; refused"
+                                );
+                                GrantFetchOutcome {
+                                    result: Err("grant is not active".to_string()),
+                                    reply: None,
+                                }
+                            } else if revoked.is_some_and(|is_revoked| is_revoked(&grant)) {
+                                // B1: a revoked grant must not be
+                                // resurrected by a fetch — the offline
+                                // daemon missed the revocation gossip.
+                                tracing::warn!(
+                                    grant_id = %hex::encode(grant_id),
+                                    "#967: fetch for a REVOKED grant; refused"
+                                );
+                                GrantFetchOutcome {
+                                    result: Err("grant is revoked".to_string()),
+                                    reply: None,
+                                }
+                            } else {
+                                match grant.to_dm_payload() {
+                                    Ok(reply) => {
+                                        if reply.len() > GRANT_FETCH_REPLY_MAX_BYTES {
+                                            GrantFetchOutcome {
+                                                result: Err(format!(
+                                                    "grant wire form {} bytes exceeds the {}-byte bound",
+                                                    reply.len(),
+                                                    GRANT_FETCH_REPLY_MAX_BYTES
+                                                )),
+                                                reply: None,
+                                            }
+                                        } else {
+                                            GrantFetchOutcome {
+                                                result: Ok(DmTypedPayloadCompletion::Inserted),
+                                                reply: Some(reply),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => GrantFetchOutcome {
+                                        result: Err(e.to_string()),
+                                        reply: None,
+                                    },
+                                }
+                            }
+                        }
+                    },
                 }
-            },
-        },
+            }
+        }
     };
     if let Some(tx) = completion {
         let _ = tx.send(outcome.result.clone());
@@ -1120,6 +1210,8 @@ fn parse_fetch_request(payload: &[u8]) -> Result<[u8; 32], String> {
 /// window closes on success.
 pub async fn handle_share_grant_fetch_response(
     store: Option<&ShareGrantStore>,
+    revoked: Option<GrantRevoked<'_>>,
+    now_unix: u64,
     typed: DmTypedPayload,
 ) -> DmTypedPayloadCompletionResult {
     let DmTypedPayload {
@@ -1134,7 +1226,22 @@ pub async fn handle_share_grant_fetch_response(
             Some(grant_payload) => match ShareGrant::from_dm_payload(grant_payload) {
                 Err(e) => Err(e.to_string()),
                 Ok(grant) => {
-                    if !store.is_fetch_in_flight(&grant.grant_id) {
+                    if grant_payload.len() > GRANT_FETCH_REPLY_MAX_BYTES {
+                        Err(format!(
+                            "grant fetch response {} bytes exceeds the {}-byte bound",
+                            grant_payload.len(),
+                            GRANT_FETCH_REPLY_MAX_BYTES
+                        ))
+                    } else if revoked.is_some_and(|is_revoked| is_revoked(&grant)) {
+                        // B1: the requester refuses a REVOKED grant too —
+                        // it may have been revoked while our fetch was in
+                        // flight.
+                        tracing::warn!(
+                            grant_id = %hex::encode(grant.grant_id),
+                            "#967: fetched grant is revoked here; not stored"
+                        );
+                        Err("grant is revoked".to_string())
+                    } else if !store.is_fetch_in_flight(&grant.grant_id) {
                         tracing::warn!(
                             grant_id = %hex::encode(grant.grant_id),
                             "#926: grant fetch response for an id we did not request; dropped"
@@ -1143,7 +1250,7 @@ pub async fn handle_share_grant_fetch_response(
                     } else {
                         let grant_id = grant.grant_id;
                         let outcome = store
-                            .accept(grant, unix_now_secs())
+                            .accept(grant, now_unix)
                             .await
                             .map_err(|e| e.to_string());
                         if outcome.is_ok() {
@@ -1436,6 +1543,49 @@ impl crate::Agent {
             }
         }
         Ok(record)
+    }
+
+    /// #967 B3: the production trigger. A daemon that MISSED a grant
+    /// delivery (it holds nothing for `grant_id`) asks `holder` for it:
+    /// opens the fetch window in its store and sends the fetch request
+    /// over the DM wire. The ADR-0070 §2 flow is then automatic — the
+    /// holder's responder serves, the response handler stores.
+    pub async fn request_share_grant_fetch(
+        &self,
+        grant_id: [u8; 32],
+        holder: &AgentId,
+    ) -> Result<(), crate::dm::DmError> {
+        let Some(store) = self.share_grant_store() else {
+            return Ok(());
+        };
+        if store.by_id(&grant_id).is_some() {
+            // Already held — nothing to fetch.
+            return Ok(());
+        }
+        store.note_fetch(&grant_id);
+        let mut payload = Vec::with_capacity(SHARE_GRANT_FETCH_DM_PREFIX.len() + 32);
+        payload.extend_from_slice(SHARE_GRANT_FETCH_DM_PREFIX);
+        payload.extend_from_slice(&grant_id);
+        self.send_direct(holder, payload).await.map(|_| ())
+    }
+
+    /// #967 B3: the grantee-side attachment helper — the ids a grantee
+    /// holds (received) that should ride along when it opens a DM or
+    /// stream to a shared agent, so a daemon that missed delivery can
+    /// request them (ADR-0070 §2). Callers attach these to their open
+    /// frames; the shared daemon feeds each id to
+    /// [`Agent::request_share_grant_fetch`].
+    pub fn held_grant_ids_for(&self, shared_agent: &AgentId) -> Vec<[u8; 32]> {
+        let Some(store) = self.share_grant_store() else {
+            return Vec::new();
+        };
+        let now = unix_now_secs();
+        store
+            .grants(GrantRole::Received)
+            .into_iter()
+            .filter(|g| g.agents.contains(shared_agent) && g.is_active_at(now))
+            .map(|g| g.grant_id)
+            .collect()
     }
 }
 
