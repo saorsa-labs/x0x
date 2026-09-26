@@ -13637,6 +13637,47 @@ impl Agent {
         owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
+        Self::gate_peer_machine_inbound_with_call_grant(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::gate_peer_machine_inbound`] with the ADR-0073 × ADR-0070
+    /// call-signaling input (#980), used ONLY by
+    /// [`Agent::call_gate_inbound`](crate::Agent::call_gate_inbound).
+    ///
+    /// `call_caller` is the agent ringing us. If it holds a live, unrevoked,
+    /// unexpired ShareGrant carrying `Call` for this daemon's agent (the
+    /// same [`owner_trust::OwnerTrust::grant_access`] lookup the Connect
+    /// grant uses), its trust decision is promoted exactly as owner trust
+    /// promotes it (`Unknown`/`AcceptWithFlag` → `Accept`). Every other gate
+    /// is unchanged: revocation and cert expiry are checked before trust in
+    /// [`streams::stream_gate`], `Blocked` / machine-pin mismatch are never
+    /// promoted (and confer no grant), every OTHER agent on the machine must
+    /// still pass on its own, and an Enabled connect ACL must still list the
+    /// caller. `None` adds nothing: the accept loop and datagram lane pass
+    /// `None`, so a `Call` grant opens no stream or media lane.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_peer_machine_inbound_with_call_grant(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        call_caller: Option<&identity::AgentId>,
+    ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
         // non-Accept agent denies the traffic (fail-closed, #192).
@@ -13693,7 +13734,7 @@ impl Agent {
             if pair.owner_trusted {
                 owner_trusted.push(*agent_id);
             }
-            let has_connect_grant = !owner_trust
+            let access = owner_trust
                 .grant_access(
                     contact_store,
                     discovery_cache,
@@ -13701,16 +13742,23 @@ impl Agent {
                     agent_id,
                     machine_id,
                 )
-                .await
-                .connect_ports
-                .is_empty();
+                .await;
+            let has_connect_grant = !access.connect_ports.is_empty();
+            // ADR-0073 × ADR-0070 (#980): only on the call-signaling gate,
+            // and only for the ringing agent itself.
+            let has_call_grant = access.call && call_caller == Some(agent_id);
             if has_connect_grant {
                 grant_connect.push(*agent_id);
-                if pair.decision != trust::TrustDecision::Accept {
+                // A caller admitted by its Call grant is not "Connect-grant
+                // only": the Call cap is the explicit rule for ringing.
+                if pair.decision != trust::TrustDecision::Accept && !has_call_grant {
                     grant_only.push(*agent_id);
                 }
             }
-            let trust_decision = Some(pair.decision.with_owner_trust(has_connect_grant));
+            let trust_decision = Some(
+                pair.decision
+                    .with_owner_trust(has_connect_grant || has_call_grant),
+            );
             let (revoked_agent, revoked_machine) = {
                 let revoked = revocation_set.read().await;
                 (

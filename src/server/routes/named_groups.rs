@@ -359,6 +359,7 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
 /// send layer — owns retry scheduling (max_retries = 0).
 pub(in crate::server) fn predecessor_relay_delivery_config(
     envelope_digest: &[u8; 32],
+    target: &crate::identity::AgentId,
 ) -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     config.require_gossip = true;
@@ -369,10 +370,33 @@ pub(in crate::server) fn predecessor_relay_delivery_config(
     config.require_durable_app_ack = true;
     config.prefer_raw_quic_if_connected = false;
     config.max_retries = 0;
-    let mut request_id = [0u8; 16];
-    request_id.copy_from_slice(&envelope_digest[..16]);
-    config.logical_request_id = Some(request_id);
+    config.logical_request_id = Some(relay_request_id(envelope_digest, target));
     config
+}
+
+/// #979 r2 (B1): the PER-TARGET logical request id —
+/// blake3("x0x relay request id v1", digest || target)[..16]. One
+/// obligation fanned out to N witnesses now registers N DISTINCT
+/// in-flight ACK waiters (the registry is keyed by request id alone, and
+/// a shared id made concurrent sends cancel each other: 0 successes, the
+/// obligation pruned unretried). The id stays stable per
+/// (obligation, target) across restarts, so a retry is still a replay
+/// for that recipient; the recipient's durable dedup is keyed by the
+/// ENVELOPE digest (Inserted/Duplicate), not by this id, so distinct
+/// per-target ids never double-apply.
+pub(in crate::server) fn relay_request_id(
+    envelope_digest: &[u8; 32],
+    target: &crate::identity::AgentId,
+) -> [u8; 16] {
+    let mut material = Vec::with_capacity(32 + 32);
+    material.extend_from_slice(envelope_digest);
+    material.extend_from_slice(target.as_bytes());
+    let mut hasher = blake3::Hasher::new_derive_key("x0x relay request id v1");
+    hasher.update(&material);
+    let derived: [u8; 32] = *hasher.finalize().as_bytes();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&derived[..16]);
+    id
 }
 
 /// #942 r3 (B4): the legacy (v1) fallback for authorities without a
@@ -14982,9 +15006,9 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
     // oldest-due within each class.
     due_sorted.sort_by_key(|o| (o.is_retry, o.next_retry_at_ms));
     const CAUSAL_RELAY_PASS_BUDGET: usize = 16;
-    /// #979: per-obligation concurrent fan-out width. One obligation's
-    /// targets send in parallel (bounded), so a slow witness never
-    /// serialises the pass; the per-OBLIGATION pass budget is unchanged.
+    // #979: per-obligation concurrent fan-out width. One obligation's
+    // targets send in parallel (bounded), so a slow witness never
+    // serialises the pass; the per-OBLIGATION pass budget is unchanged.
     const RELAY_TARGET_FANOUT: usize = 8;
     let mut pass_budget: usize = CAUSAL_RELAY_PASS_BUDGET;
 
@@ -15008,7 +15032,8 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         // of this loop), never per target — a started obligation always
         // fans out fully, so witnesses past the budget cannot be starved
         // by earlier failing targets and the obligation is never pruned
-        // unattempted. The fan-out itself is bounded by the group size.
+        // unattempted. The fan-out width is bounded by RELAY_TARGET_FANOUT
+        // (and the daemon-wide target cap of 4096).
         use futures::StreamExt;
         // #979: fan ONE obligation's targets out CONCURRENTLY with bounded
         // concurrency — one slow (ACK-withholding) witness no longer
@@ -15040,7 +15065,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                             .send_direct_with_config(
                                 &target_id,
                                 dm_payload,
-                                predecessor_relay_delivery_config(&obligation_digest),
+                                predecessor_relay_delivery_config(&obligation_digest, &target_id),
                             )
                             .await
                     } else {
@@ -24117,7 +24142,7 @@ pub(in crate::server) async fn create_join_request(
                             .send_direct_with_config(
                                 &creator_id,
                                 dm_payload,
-                                predecessor_relay_delivery_config(&fallback_digest),
+                                predecessor_relay_delivery_config(&fallback_digest, &creator_id),
                             )
                             .await
                         {
@@ -48887,20 +48912,79 @@ pub(in crate::server) mod tests {
         );
     }
 
+    /// #979 r2 (B1, the wire-level pin): two CONCURRENT witnesses of one
+    /// obligation register two DISTINCT in-flight waiters — the exact
+    /// registration the fan-out performs — and BOTH stay live. Under the
+    /// r1 shared id the second registration closed the first (the
+    /// registry-hazard test in dm.rs pins that mechanism; this test pins
+    /// that the relay configs can no longer trigger it).
+    #[test]
+    fn concurrent_relay_targets_register_distinct_waiters() {
+        let digest = [7u8; 32];
+        let a = crate::identity::AgentId([0x11; 32]);
+        let b = crate::identity::AgentId([0x22; 32]);
+        let cfg_a = predecessor_relay_delivery_config(&digest, &a);
+        let cfg_b = predecessor_relay_delivery_config(&digest, &b);
+        let id_a = cfg_a.logical_request_id.expect("a id");
+        let id_b = cfg_b.logical_request_id.expect("b id");
+        assert_ne!(id_a, id_b, "concurrent witnesses must not share an ACK key");
+        // And the registry agrees: both waiters stay live.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let registry = crate::dm::InFlightAcks::new();
+            let (rx1, _) = registry.register_for_protocol_with_provenance(
+                id_a,
+                2,
+                a,
+                Some(crate::identity::MachineId([1; 32])),
+            );
+            let (_rx2, _) = registry.register_for_protocol_with_provenance(
+                id_b,
+                2,
+                b,
+                Some(crate::identity::MachineId([2; 32])),
+            );
+            let first_live = tokio::time::timeout(std::time::Duration::from_millis(10), rx1)
+                .await
+                .is_err();
+            assert!(
+                first_live,
+                "the first witness's waiter survives the second registration"
+            );
+        });
+    }
+
     #[test]
     fn predecessor_relay_requires_application_ack_and_excludes_raw_fallback() {
         let digest = [7u8; 32];
-        let config = predecessor_relay_delivery_config(&digest);
+        let target = crate::identity::AgentId([0x11; 32]);
+        let config = predecessor_relay_delivery_config(&digest, &target);
         assert!(config.require_gossip);
         assert!(config.require_gossip_ack);
         assert!(config.require_durable_app_ack);
         assert!(!config.prefer_raw_quic_if_connected);
-        // #942 r3 (B4): the outbox owns scheduling and the logical request
-        // id is the envelope digest's first half — a retry is a replay.
+        // #942 r3 (B4): the outbox owns scheduling; #979 r2 (B1): the
+        // logical request id is PER-TARGET (stable per (digest, target)
+        // across restarts, so a retry is still a replay for that
+        // recipient) — concurrent fan-out no longer makes witnesses
+        // cancel each other's in-flight waiters.
         assert_eq!(config.max_retries, 0);
-        let mut expected = [0u8; 16];
-        expected.copy_from_slice(&digest[..16]);
+        let expected = relay_request_id(&digest, &target);
         assert_eq!(config.logical_request_id, Some(expected));
+        // B1: DISTINCT targets of one digest get DISTINCT request ids,
+        // and the same target is stable (replay semantics).
+        let other = crate::identity::AgentId([0xAB; 32]);
+        assert_ne!(
+            relay_request_id(&digest, &target),
+            relay_request_id(&digest, &other)
+        );
+        assert_eq!(
+            relay_request_id(&digest, &target),
+            relay_request_id(&digest, &target)
+        );
     }
 
     #[test]
