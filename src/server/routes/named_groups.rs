@@ -5133,6 +5133,10 @@ pub(in crate::server) async fn persist_named_groups_mutation_unlocked<F>(
 where
     F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
 {
+    // The caller already holds roster persistence P. Every live map change,
+    // durable save and rollback stays behind G so no encrypted KV publisher
+    // can refresh a candidate epoch or enqueue an old sealed record midway.
+    let _gss_publication_guard = state.gss_publication_gate.write().await;
     if state
         .named_groups_requires_durability_confirmation
         .load(Ordering::Acquire)
@@ -5705,6 +5709,7 @@ async fn persist_named_group_info_inner(
     // a correctness bug), rolls the visible map back, restores the
     // pending-stub marker, and fails the operation.
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let _gss_publication_guard = state.gss_publication_gate.write().await;
     if state
         .named_groups_requires_durability_confirmation
         .load(Ordering::Acquire)
@@ -9437,6 +9442,10 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             still_pending.push_back(pending);
             continue;
         }
+        // Replay installs a live candidate directly, bypassing the ordinary
+        // persist wrapper. Keep encrypted KV publishes out through its checked
+        // save or rollback.
+        let replay_gss_guard = state.gss_publication_gate.write().await;
         // B5: snapshot the group AFTER lock acquisition so we can roll back
         // the in-memory state if persistence fails. Without this, the next
         // replay sees the advanced in-memory state_hash as already_current
@@ -9511,6 +9520,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         } else {
             (false, false)
         };
+        drop(replay_gss_guard);
         if applied.accepted && group_persisted {
             // #759 item 1: the candidate is DURABLE, so a marker clear it
             // carried is real — promote it to the caller's notification set.
@@ -24000,6 +24010,9 @@ pub(in crate::server) async fn approve_join_request(
             "named-group state is awaiting directory-durability confirmation",
         );
     }
+    // Approval mutates the live roster before its outbox and roster writes.
+    // Hold G until every durable or compensating outcome has finished.
+    let approval_gss_guard = state.gss_publication_gate.write().await;
     let proof_read_now_ms = now_millis_u64();
 
     // R3: Check the live outbox first, then completed tombstones. Return the
@@ -24470,6 +24483,7 @@ pub(in crate::server) async fn approve_join_request(
             *state.pending_b8_compensation.lock().await = None;
         }
     }
+    drop(approval_gss_guard);
     drop(roster_persistence_guard);
     drop(relay_persistence_guard);
 
@@ -36397,6 +36411,7 @@ pub(in crate::server) mod tests {
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
+            gss_publication_gate: Arc::new(RwLock::new(())),
             group_roster_gossip_lock: Mutex::new(()),
             named_groups_path,
             home_suite_groups_path,
