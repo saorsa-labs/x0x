@@ -797,40 +797,184 @@ async fn gossiped_revoke_is_ordered_after_an_in_flight_send() {
         .is_share_grant_revoked(&grant.grant_id, &grant.owner));
 }
 
-/// WHY (review r2 P1, lost update): an OLDER revocation snapshot written
-/// last (a gossip ingest that snapshotted before a local revoke, then
-/// renamed after it) must not erase the local revoke from disk, or a
-/// restart forgets a revocation the API acknowledged. Every writer merges
-/// monotonically with the file under one lock.
+fn v3_bytes_revoking(world: &World, grants: &[&ShareGrant]) -> Vec<u8> {
+    let mut set = RevocationSet::new();
+    for grant in grants {
+        set.verify_and_insert(world.revocation_record(grant), None)
+            .unwrap();
+    }
+    set.to_bytes_v3().unwrap()
+}
+
+fn reload_v3(path: &std::path::Path) -> RevocationSet {
+    RevocationSet::from_bytes_v3(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// WHY (review r2/r3 P1, lost update across daemons): two writers with
+/// INDEPENDENT views — two daemons sharing one identity dir, each with its
+/// own process-local state — must not lose each other's revocation. Each
+/// writer here takes its own OS lock handle (no shared mutex; the
+/// process-local mutex is bypassed by calling the core directly). Writer A
+/// reads the file and pauses; writer B is released only once it has either
+/// been refused the lock (correct) or already read the same stale file (no
+/// lock). Without the cross-process lock both read the empty file and the
+/// later rename erases the other's revoke — deterministically, whichever
+/// order the renames land in.
 #[tokio::test]
-async fn stale_revocation_snapshot_cannot_erase_a_durable_revoke() {
+async fn concurrent_v3_writers_with_separate_lock_handles_both_survive() {
     let world = World::new().await;
-    let identity_dir = world.identity_dir();
-    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let path = world
+        .identity_dir()
+        .join(crate::SHARE_GRANT_REVOCATIONS_FILE);
     let (g1, g2) = (world.grant(1, 3_600), world.grant(2, 3_600));
+    let (a_bytes, b_bytes) = (
+        v3_bytes_revoking(&world, &[&g1]),
+        v3_bytes_revoking(&world, &[&g2]),
+    );
+    let a_has_read_for_b = tokio::sync::Notify::new();
+    let a_has_read_for_driver = tokio::sync::Notify::new();
+    let a_go = tokio::sync::Notify::new();
+    let b_progress = tokio::sync::Notify::new();
 
-    // The gossip writer's older view: only G1.
-    let stale = RwLock::new(RevocationSet::new());
-    stale
-        .write()
+    let writer_a = crate::merge_write_share_grant_revocations(
+        &path,
+        &a_bytes,
+        world.now,
+        || {},
+        || async {
+            a_has_read_for_b.notify_one();
+            a_has_read_for_driver.notify_one();
+            a_go.notified().await;
+        },
+    );
+    let writer_b = async {
+        a_has_read_for_b.notified().await;
+        crate::merge_write_share_grant_revocations(
+            &path,
+            &b_bytes,
+            world.now,
+            || b_progress.notify_one(),
+            || async { b_progress.notify_one() },
+        )
         .await
-        .verify_and_insert(world.revocation_record(&g1), None)
-        .unwrap();
+    };
+    let driver = async {
+        a_has_read_for_driver.notified().await;
+        b_progress.notified().await; // B is blocked on the lock, or read stale
+        a_go.notify_one();
+    };
+    let (a, b, ()) = tokio::join!(writer_a, writer_b, driver);
+    a.unwrap();
+    b.unwrap();
 
-    // Live: G1 arrived, then the owner revokes G2 through the API (durable).
-    world.revoke_in_memory_only(&g1).await;
-    world.revoke(&g2, &identity_dir, &outbox).await.unwrap();
-
-    // The stale writer finishes LAST.
-    crate::persist_share_grant_revocations(&stale, Some(&identity_dir)).await;
-
-    let bytes = std::fs::read(identity_dir.join(crate::SHARE_GRANT_REVOCATIONS_FILE)).unwrap();
-    let reloaded = RevocationSet::from_bytes_v3(&bytes).unwrap();
+    let reloaded = reload_v3(&path);
+    assert!(
+        reloaded.is_share_grant_revoked(&g1.grant_id, &g1.owner),
+        "A's revoke survives"
+    );
     assert!(
         reloaded.is_share_grant_revoked(&g2.grant_id, &g2.owner),
-        "the acknowledged revoke survives a restart"
+        "B's revoke survives"
     );
-    assert!(reloaded.is_share_grant_revoked(&g1.grant_id, &g1.owner));
+}
+
+/// WHY (review r3 P2): the disk union must not resurrect records the
+/// retention rule has collected — a share-grant revocation is dropped once
+/// its grant is past its GC horizon, in memory AND on the next write, while
+/// live revocations are kept.
+#[tokio::test]
+async fn v3_merge_applies_the_gc_horizon() {
+    let world = World::new().await;
+    let path = world
+        .identity_dir()
+        .join(crate::SHARE_GRANT_REVOCATIONS_FILE);
+    let dead_grant = ShareGrant::sign(
+        &world.owner,
+        [0xDD; 32],
+        Grantee::Agent(world.b1),
+        vec![world.a1],
+        vec![ShareCap::Dm],
+        1_000,
+        2_000,
+    )
+    .unwrap();
+    let live_grant = world.grant(1, 3_600);
+    std::fs::create_dir_all(world.identity_dir()).unwrap();
+    std::fs::write(&path, v3_bytes_revoking(&world, &[&dead_grant])).unwrap();
+    assert!(
+        reload_v3(&path).is_share_grant_revoked(&dead_grant.grant_id, &dead_grant.owner),
+        "control: the long-dead revocation is on disk"
+    );
+
+    crate::merge_write_share_grant_revocations(
+        &path,
+        &v3_bytes_revoking(&world, &[&live_grant]),
+        world.now,
+        || {},
+        || async {},
+    )
+    .await
+    .unwrap();
+    let reloaded = reload_v3(&path);
+    assert!(
+        !reloaded.is_share_grant_revoked(&dead_grant.grant_id, &dead_grant.owner),
+        "a collected revocation is not resurrected by the union"
+    );
+    assert!(reloaded.is_share_grant_revoked(&live_grant.grant_id, &live_grant.owner));
+}
+
+/// WHY (review r3 P2): a share-grant revocation that arrives ONLY on a
+/// legacy carrier (v1 `x0x.revocation`, v2 bindings) is enforced in memory,
+/// but the legacy files cannot hold it — so it must also be written to
+/// `revocations-v3.bin`, or a restart forgets it and the outbox could
+/// redeliver the grant. Functional half: the v3 writer persists a record
+/// inserted the way the legacy handlers insert it, and it survives a reload
+/// while the legacy encodings drop it. Wiring half: both legacy handlers
+/// call the v3 writer (they are inline in the gossip listener and cannot be
+/// driven without a network, so this half is a source check).
+#[tokio::test]
+async fn share_grant_revocation_from_a_legacy_carrier_survives_restart() {
+    let world = World::new().await;
+    let grant = world.grant(1, 3_600);
+    world.revoke_in_memory_only(&grant).await; // as the v1/v2 handler inserts
+    {
+        let set = world.revocations.read().await;
+        for reloaded in [
+            RevocationSet::from_bytes(&set.to_bytes().unwrap()).unwrap(),
+            RevocationSet::from_bytes_v2(&set.to_bytes_v2().unwrap()).unwrap(),
+        ] {
+            assert!(
+                !reloaded.is_share_grant_revoked(&grant.grant_id, &grant.owner),
+                "control: the legacy files cannot carry it"
+            );
+        }
+    }
+    let identity_dir = world.identity_dir();
+    crate::persist_share_grant_revocations(&world.revocations, Some(&identity_dir)).await;
+    let path = identity_dir.join(crate::SHARE_GRANT_REVOCATIONS_FILE);
+    assert!(reload_v3(&path).is_share_grant_revoked(&grant.grant_id, &grant.owner));
+
+    let lib = include_str!("../../lib.rs");
+    for (arm, next) in [
+        (
+            "DiscoveryMessage::Revocation(msg) => {",
+            "DiscoveryMessage::RevocationV2(msg) => {",
+        ),
+        (
+            "DiscoveryMessage::RevocationV2(msg) => {",
+            "DiscoveryMessage::RevocationV3(msg) => {",
+        ),
+    ] {
+        let body = lib
+            .split(arm)
+            .nth(1)
+            .and_then(|rest| rest.split(next).next())
+            .unwrap_or_default();
+        assert!(
+            body.contains("persist_share_grant_revocations("),
+            "{arm} must persist share-grant revocations to v3"
+        );
+    }
 }
 
 /// WHY (review P1, fail loud): if `revocations-v3.bin` cannot be written

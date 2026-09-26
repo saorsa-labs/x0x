@@ -68,6 +68,9 @@ pub mod identity;
 /// persistent storage of MachineKeypair and AgentKeypair.
 pub mod storage;
 
+/// Cross-process advisory file locks (instance lock, revocations-v3 writer).
+pub(crate) mod file_lock;
+
 /// Signed identity revocation records and the grow-only revocation set.
 ///
 /// See [`revocation::RevocationRecord`] for the authority rules (self- and
@@ -3809,24 +3812,29 @@ pub(crate) async fn persist_share_grant_revocations(
     }
 }
 
-/// Serializes every read-merge-write of `revocations-v3.bin` in this
-/// process (#926).
+/// Serializes the v3 writers of THIS process before they contend for the
+/// cross-process file lock (keeps in-process writers from spinning on it).
 static SHARE_GRANT_REVOCATIONS_WRITE_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// Retention applied when merging `revocations-v3.bin`: the same rule the
+/// heartbeat sweep applies in memory
+/// ([`revocation::RevocationSet::expire_records_older_than`]; share-grant
+/// records ignore the TTL and are collected at their grant's GC horizon).
+const SHARE_GRANT_REVOCATIONS_TTL_SECS: u64 = 90 * 24 * 3600;
+
+/// How long a v3 writer waits for another process's lock before failing.
+const SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// Durable, MONOTONIC write of `revocations-v3.bin` (temp, fsync, rename,
-/// dir fsync; mode 0600). Every writer — local revoke and gossip ingest —
-/// comes through here: under one process-wide lock it re-reads the file,
-/// unions it with the live set, and writes the union. Revocations only
-/// grow, so no writer can ever remove a record another writer persisted,
-/// whatever order their snapshots were taken in (#926 r2: an older gossip
-/// snapshot renamed last used to erase a just-acknowledged local revoke).
-/// An unreadable or corrupt file contributes nothing (its records could not
-/// be honoured on load either). `Ok` when there is no identity directory
-/// (an in-memory agent).
+/// dir fsync; mode 0600). Every writer — local revoke, the v3 gossip
+/// carrier, share-grant records arriving on the v1/v2 carriers — comes
+/// through here. See [`merge_write_share_grant_revocations`]. `Ok` when
+/// there is no identity directory (an in-memory agent).
 ///
 /// # Errors
-/// Encoding, reading (other than not-found) or writing failed.
+/// Encoding, locking, reading (other than not-found) or writing failed.
 pub(crate) async fn persist_share_grant_revocations_durable(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
@@ -3837,9 +3845,67 @@ pub(crate) async fn persist_share_grant_revocations_durable(
     else {
         return Ok(());
     };
-    let path = dir.join(SHARE_GRANT_REVOCATIONS_FILE);
-    let _write = SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
-    let mut merged = match tokio::fs::read(&path).await {
+    let live = revocation_set
+        .read()
+        .await
+        .to_bytes_v3()
+        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
+    let _in_process = SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
+    merge_write_share_grant_revocations(
+        &dir.join(SHARE_GRANT_REVOCATIONS_FILE),
+        &live,
+        unix_now_secs_for_gc(),
+        || {},
+        || async {},
+    )
+    .await
+}
+
+fn unix_now_secs_for_gc() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The cross-process core of the v3 writer (#926 r3). Holding an exclusive
+/// OS advisory lock on the sibling `revocations-v3.bin.lock` for the whole
+/// read → merge → rename, it re-reads the file, unions it with `live_v3`
+/// (bytes from [`revocation::RevocationSet::to_bytes_v3`]), applies the
+/// retention rule at `now_unix` (a zero clock applies none), and writes the
+/// result durably. Revocations only grow and every writer — in this process
+/// or another daemon sharing the identity dir — holds the same lock, so no
+/// writer can erase a record another persisted, while records past their
+/// horizon are still collected rather than resurrected from disk.
+///
+/// `on_contended` / `after_read` are test hooks (no-ops in production).
+pub(crate) async fn merge_write_share_grant_revocations<A, AF>(
+    path: &std::path::Path,
+    live_v3: &[u8],
+    now_unix: u64,
+    on_contended: impl Fn(),
+    after_read: A,
+) -> std::result::Result<(), String>
+where
+    A: FnOnce() -> AF,
+    AF: std::future::Future<Output = ()>,
+{
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("revocations-v3 dir {}: {e}", parent.display()))?;
+    }
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let _lock = file_lock::lock_exclusive_with_retry(
+        std::path::Path::new(&lock_path),
+        std::time::Duration::from_millis(20),
+        SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT,
+        on_contended,
+    )
+    .await
+    .map_err(|e| format!("revocations-v3 lock: {e}"))?;
+    let mut merged = match tokio::fs::read(path).await {
         Ok(bytes) => revocation::RevocationSet::from_bytes_v3(&bytes).unwrap_or_else(|e| {
             tracing::warn!("revocations-v3 on disk unreadable, rewriting from memory: {e}");
             revocation::RevocationSet::new()
@@ -3847,18 +3913,17 @@ pub(crate) async fn persist_share_grant_revocations_durable(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => revocation::RevocationSet::new(),
         Err(e) => return Err(format!("revocations-v3 read {}: {e}", path.display())),
     };
-    let live = revocation_set
-        .read()
-        .await
-        .to_bytes_v3()
-        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
-    let live = revocation::RevocationSet::from_bytes_v3(&live)
+    after_read().await;
+    let live = revocation::RevocationSet::from_bytes_v3(live_v3)
         .map_err(|e| format!("revocations-v3 re-decode: {e}"))?;
     merged.merge_v3(live);
+    if now_unix != 0 {
+        merged.expire_records_older_than(SHARE_GRANT_REVOCATIONS_TTL_SECS, now_unix);
+    }
     let bytes = merged
         .to_bytes_v3()
         .map_err(|e| format!("revocations-v3 encode: {e}"))?;
-    storage::write_private_bytes_durable(&path, bytes)
+    storage::write_private_bytes_durable(path, bytes)
         .await
         .map_err(|e| format!("revocations-v3 write {}: {e}", path.display()))
 }
@@ -9176,6 +9241,18 @@ impl Agent {
                                 }
                             }
                         }
+                        // #926 r3: the legacy v1 file filters share-grant
+                        // records out; one that arrived on this carrier must
+                        // reach `revocations-v3.bin` or a restart forgets it.
+                        if newly_inserted.iter().any(|record| {
+                            matches!(record.subject, revocation::RevokedSubject::ShareGrant(_))
+                        }) {
+                            persist_share_grant_revocations(
+                                &revocation_set,
+                                identity_dir_for_listener.as_deref(),
+                            )
+                            .await;
+                        }
                         if !newly_inserted.is_empty() {
                             // Persist asynchronously — best-effort; if it fails
                             // the revocation is still enforced in memory for this
@@ -9317,6 +9394,7 @@ impl Agent {
                         };
                         let subject_certs = collect_subject_certs(&*cache.read().await);
                         let mut inserted = false;
+                        let mut share_grant_inserted = false;
                         {
                             let _share_grant_barrier = owner_trust_for_listener
                                 .share_grant_revocation_barrier(&records, &revocation_set)
@@ -9332,8 +9410,15 @@ impl Agent {
                                     }
                                     _ => None,
                                 };
+                                let is_share_grant = matches!(
+                                    record.subject,
+                                    revocation::RevokedSubject::ShareGrant(_)
+                                );
                                 match set.verify_and_insert(record, subject_cert) {
-                                    Ok(true) => inserted = true,
+                                    Ok(true) => {
+                                        inserted = true;
+                                        share_grant_inserted |= is_share_grant;
+                                    }
                                     Ok(false) => {}
                                     Err(e) => {
                                         tracing::debug!(
@@ -9342,6 +9427,15 @@ impl Agent {
                                     }
                                 }
                             }
+                        }
+                        // #926 r3: the v2 file filters share-grant records
+                        // out; persist them in v3 so a restart keeps them.
+                        if share_grant_inserted {
+                            persist_share_grant_revocations(
+                                &revocation_set,
+                                identity_dir_for_listener.as_deref(),
+                            )
+                            .await;
                         }
                         if inserted {
                             let persisted = revocation_set.read().await.to_bytes_v2();
@@ -11159,12 +11253,21 @@ impl Agent {
             }
         }
 
-        // 2. Persist.
+        // 2. Persist. The legacy file filters share-grant records out
+        //    (#926 r3), so those also go to `revocations-v3.bin`.
         storage::save_revocation_set(
             &*self.revocation_set.read().await,
             self.identity_dir.as_deref(),
         )
         .await?;
+        if matches!(record.subject, revocation::RevokedSubject::ShareGrant(_)) {
+            persist_share_grant_revocations_durable(
+                &self.revocation_set,
+                self.identity_dir.as_deref(),
+            )
+            .await
+            .map_err(|e| error::IdentityError::Storage(std::io::Error::other(e)))?;
+        }
 
         // 3. Evict from caches.
         self.evict_revoked_subject(&record.subject).await;
