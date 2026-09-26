@@ -58,6 +58,10 @@
 //!    arrives — every access decision filters grants through the local
 //!    revocation set ([`super::evaluate_grant_access`]).
 //!
+//!    **Window:** until that gossip arrives, a receiver that stored an
+//!    in-flight grant still honours it. Closing the window needs a direct
+//!    revocation push, a wire change tracked in #1003.
+//!
 //! # Revocation is serialized with sending
 //!
 //! A worker pass holds the outbox's send gate (shared) from its revocation
