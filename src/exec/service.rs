@@ -774,9 +774,10 @@ impl ExecService {
             return;
         }
         let owner_trusted = self.inbound_owner_trusted(&inbound).await;
+        let grant_exec = self.inbound_grant_exec(&inbound).await;
         if inbound
             .trust_decision
-            .map(|decision| decision.with_owner_trust(owner_trusted))
+            .map(|decision| decision.with_owner_trust(owner_trusted || grant_exec))
             != Some(TrustDecision::Accept)
         {
             self.diagnostics.record_request_received();
@@ -849,11 +850,13 @@ impl ExecService {
         }
         // ADR-0070 §1: owner trust raises Unknown/AcceptWithFlag to Accept
         // (never a rejection) and is the only way a `principal = "owner"`
-        // entry can match below.
+        // entry can match below. ADR-0070 §2: a current Exec ShareGrant does
+        // the same for `principal = "grant"` entries.
         let owner_trusted = self.inbound_owner_trusted(&inbound).await;
+        let grant_exec = self.inbound_grant_exec(&inbound).await;
         if inbound
             .trust_decision
-            .map(|decision| decision.with_owner_trust(owner_trusted))
+            .map(|decision| decision.with_owner_trust(owner_trusted || grant_exec))
             != Some(TrustDecision::Accept)
         {
             self.deny(
@@ -883,11 +886,12 @@ impl ExecService {
             }
         };
 
-        let checked = match self.check_request(
+        let checked = match self.check_request_with_grant(
             acl,
             inbound.sender,
             inbound.machine_id,
             owner_trusted,
+            grant_exec,
             &argv,
             stdin.as_ref(),
             timeout_ms,
@@ -1006,6 +1010,28 @@ impl ExecService {
             .await
     }
 
+    /// ADR-0070 §2: whether the inbound sender pair holds a current
+    /// ShareGrant with `Exec` over this daemon's agent. Same fail-closed
+    /// guard as [`Self::inbound_owner_trusted`]; the pairing must equal the
+    /// sender's authenticated binding (inside the grant evaluation).
+    async fn inbound_grant_exec(&self, inbound: &DmTypedPayload) -> bool {
+        if !inbound.verified
+            || !matches!(
+                inbound.trust_decision,
+                Some(
+                    TrustDecision::Unknown | TrustDecision::AcceptWithFlag | TrustDecision::Accept
+                )
+            )
+        {
+            return false;
+        }
+        self.agent
+            .share_grant_access(&inbound.sender, &inbound.machine_id)
+            .await
+            .exec
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn check_request(
         &self,
@@ -1013,6 +1039,35 @@ impl ExecService {
         agent_id: AgentId,
         machine_id: MachineId,
         owner_trusted: bool,
+        argv: &[String],
+        stdin: Option<&Vec<u8>>,
+        timeout_ms: u32,
+        cwd: Option<&String>,
+    ) -> Result<CheckedRequest, DenialReason> {
+        self.check_request_with_grant(
+            acl,
+            agent_id,
+            machine_id,
+            owner_trusted,
+            false,
+            argv,
+            stdin,
+            timeout_ms,
+            cwd,
+        )
+    }
+
+    /// Validate a request against the ACL for every selector the requester
+    /// holds: exact pair, `principal = "owner"` (only when `owner_trusted`),
+    /// and `principal = "grant"` (only when `grant_exec`).
+    #[allow(clippy::too_many_arguments)]
+    fn check_request_with_grant(
+        &self,
+        acl: &ExecAcl,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        owner_trusted: bool,
+        grant_exec: bool,
         argv: &[String],
         stdin: Option<&Vec<u8>>,
         timeout_ms: u32,
@@ -1027,12 +1082,16 @@ impl ExecService {
         if argv_has_shell_metachar(argv) {
             return Err(DenialReason::ShellMetacharInArgv);
         }
-        if !acl.has_entry_for_principal(&agent_id, &machine_id, owner_trusted) {
+        if !acl.has_entry_for_principals(&agent_id, &machine_id, owner_trusted, grant_exec) {
             return Err(DenialReason::AgentMachineNotInAcl);
         }
-        let Some(matched) =
-            acl.match_command_for_principal(&agent_id, &machine_id, owner_trusted, argv)
-        else {
+        let Some(matched) = acl.match_command_for_principals(
+            &agent_id,
+            &machine_id,
+            owner_trusted,
+            grant_exec,
+            argv,
+        ) else {
             return Err(DenialReason::ArgvNotAllowed);
         };
         let stdin_len = stdin.map(Vec::len).unwrap_or(0) as u64;
@@ -1753,6 +1812,7 @@ mod tests {
                 }],
             }],
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         }
     }
 
@@ -2104,6 +2164,7 @@ mod tests {
                 }],
             }],
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         };
         let (service, _dir) = enabled_test_service(acl).await;
         let request_id = ExecRequestId([77; 16]);

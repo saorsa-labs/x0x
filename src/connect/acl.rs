@@ -138,11 +138,12 @@ impl ConnectPolicy {
                 enabled: true,
                 loaded_from: acl.loaded_from.display().to_string(),
                 loaded_at_unix_ms: acl.loaded_at_unix_ms,
-                allow_entry_count: acl.allow.len() + acl.owner_allow.len(),
+                allow_entry_count: acl.allow.len() + acl.owner_allow.len() + acl.grant_allow.len(),
                 target_entry_count: acl.allow.iter().map(|e| e.targets.len()).sum::<usize>()
                     + acl
                         .owner_allow
                         .iter()
+                        .chain(acl.grant_allow.iter())
                         .map(|e| e.targets.len())
                         .sum::<usize>(),
                 disabled_reason: None,
@@ -178,6 +179,10 @@ pub struct ConnectAcl {
     /// so the exact-pair lookups ([`Self::entry_for`], [`Self::is_allowed`])
     /// keep their meaning; only the `*_for_principal` lookups consult it.
     pub owner_allow: Vec<ConnectOwnerEntry>,
+    /// `principal = "grant"` entries (ADR-0070 §2): targets allowed to a
+    /// requester holding a current ShareGrant whose `Connect { ports }`
+    /// covers the target's port. Same shape as owner entries.
+    pub grant_allow: Vec<ConnectOwnerEntry>,
 }
 
 impl ConnectAcl {
@@ -245,6 +250,43 @@ impl ConnectAcl {
             || (owner_trusted
                 && self
                     .owner_allow
+                    .iter()
+                    .any(|e| e.targets.iter().any(|t| t == target)))
+    }
+
+    /// [`Self::has_entry_for_principal`] plus — only when `grant_connect`
+    /// (the requester holds a current `Connect` grant) — a `principal =
+    /// "grant"` entry.
+    #[must_use]
+    pub fn has_entry_for_principals(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+        grant_connect: bool,
+    ) -> bool {
+        self.has_entry_for_principal(agent_id, machine_id, owner_trusted)
+            || (grant_connect && !self.grant_allow.is_empty())
+    }
+
+    /// [`Self::is_allowed_for_principal`] plus the ADR-0070 §2 grant
+    /// selector: a `principal = "grant"` entry listing exactly `target`
+    /// matches only when `grant_port_allowed` — the requester's current
+    /// `Connect { ports }` grant covers `target.port()`. Both the entry and
+    /// the grant must allow the target.
+    #[must_use]
+    pub fn is_allowed_for_principals(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+        grant_port_allowed: bool,
+        target: &SocketAddr,
+    ) -> bool {
+        self.is_allowed_for_principal(agent_id, machine_id, owner_trusted, target)
+            || (grant_port_allowed
+                && self
+                    .grant_allow
                     .iter()
                     .any(|e| e.targets.iter().any(|t| t == target)))
     }
@@ -372,10 +414,12 @@ pub fn parse_connect_policy(
 
     let mut allow = Vec::with_capacity(connect.allow.len());
     let mut owner_allow = Vec::new();
+    let mut grant_allow = Vec::new();
     for (idx, entry) in connect.allow.into_iter().enumerate() {
         match build_connect_entry(path, &format!("allow[{idx}]"), entry)? {
             BuiltConnectEntry::Pair(entry) => allow.push(entry),
             BuiltConnectEntry::Owner(entry) => owner_allow.push(entry),
+            BuiltConnectEntry::Grant(entry) => grant_allow.push(entry),
         }
     }
 
@@ -384,6 +428,7 @@ pub fn parse_connect_policy(
         loaded_at_unix_ms,
         allow,
         owner_allow,
+        grant_allow,
     }))
 }
 
@@ -391,6 +436,7 @@ pub fn parse_connect_policy(
 enum BuiltConnectEntry {
     Pair(ConnectAllowEntry),
     Owner(ConnectOwnerEntry),
+    Grant(ConnectOwnerEntry),
 }
 
 /// Validate one allow entry — the single code path for TOML floor entries
@@ -441,6 +487,10 @@ fn build_connect_entry(
             description: entry.description,
             targets,
         }),
+        AclPrincipal::Grant => BuiltConnectEntry::Grant(ConnectOwnerEntry {
+            description: entry.description,
+            targets,
+        }),
     })
 }
 
@@ -481,6 +531,7 @@ pub fn compose_connect_policy(
         match build_connect_entry(&acl.loaded_from, &format!("api[{idx}]"), spec.clone())? {
             BuiltConnectEntry::Pair(entry) => acl.allow.push(entry),
             BuiltConnectEntry::Owner(entry) => acl.owner_allow.push(entry),
+            BuiltConnectEntry::Grant(entry) => acl.grant_allow.push(entry),
         }
     }
     Ok(ConnectPolicy::Enabled(acl))
@@ -537,9 +588,19 @@ impl ConnectOwnerEntry {
     /// The entry in its TOML/API schema form (for listings).
     #[must_use]
     pub fn to_spec(&self) -> ConnectAclEntrySpec {
+        self.to_spec_as("owner")
+    }
+
+    /// The entry as a `principal = "grant"` spec (ADR-0070 §2).
+    #[must_use]
+    pub fn to_grant_spec(&self) -> ConnectAclEntrySpec {
+        self.to_spec_as("grant")
+    }
+
+    fn to_spec_as(&self, principal: &str) -> ConnectAclEntrySpec {
         ConnectAclEntrySpec {
             description: self.description.clone(),
-            principal: Some("owner".to_string()),
+            principal: Some(principal.to_string()),
             agent_id: None,
             machine_id: None,
             targets: self.targets.iter().map(ToString::to_string).collect(),
@@ -548,13 +609,19 @@ impl ConnectOwnerEntry {
 }
 
 impl ConnectAcl {
-    /// Every entry in TOML/API schema form: exact pairs, then owner entries.
+    /// Every entry in TOML/API schema form: exact pairs, then owner
+    /// entries, then grant entries.
     #[must_use]
     pub fn entry_specs(&self) -> Vec<ConnectAclEntrySpec> {
         self.allow
             .iter()
             .map(ConnectAllowEntry::to_spec)
             .chain(self.owner_allow.iter().map(ConnectOwnerEntry::to_spec))
+            .chain(
+                self.grant_allow
+                    .iter()
+                    .map(ConnectOwnerEntry::to_grant_spec),
+            )
             .collect()
     }
 }

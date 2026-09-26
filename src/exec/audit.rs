@@ -264,6 +264,7 @@ mod tests {
             audit_tasklist_id: None,
             allow: vec![],
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         })
     }
 

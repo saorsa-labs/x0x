@@ -522,12 +522,29 @@ async fn api_entries_are_validated_like_toml_entries() {
         admin.add_connect(mixed, true).await,
         Err(AclAdminError::BadRequest(_))
     ));
-    let mut grant = connect_pair(0xcc, 0xdd, "127.0.0.1:22");
-    grant.principal = Some("grant".to_string());
-    grant.agent_id = None;
-    grant.machine_id = None;
+    // An unknown principal is refused, exactly as the TOML parser refuses it.
+    let mut unknown = connect_pair(0xcc, 0xdd, "127.0.0.1:22");
+    unknown.principal = Some("nobody".to_string());
+    unknown.agent_id = None;
+    unknown.machine_id = None;
     assert!(matches!(
-        admin.add_connect(grant, true).await,
+        admin.add_connect(unknown, true).await,
+        Err(AclAdminError::BadRequest(_))
+    ));
+    // "grant" is a real principal since ADR-0070 slice 3, but it gets the same
+    // TOML rules as "owner": mixing it with pair ids is ambiguous and refused.
+    let mut mixed_grant = connect_pair(0xcc, 0xdd, "127.0.0.1:22");
+    mixed_grant.principal = Some("grant".to_string());
+    assert!(matches!(
+        admin.add_connect(mixed_grant, true).await,
+        Err(AclAdminError::BadRequest(_))
+    ));
+    let mut remote_grant = connect_pair(0xcc, 0xdd, "10.0.0.1:22");
+    remote_grant.principal = Some("grant".to_string());
+    remote_grant.agent_id = None;
+    remote_grant.machine_id = None;
+    assert!(matches!(
+        admin.add_connect(remote_grant, true).await,
         Err(AclAdminError::BadRequest(_))
     ));
 
@@ -545,6 +562,44 @@ async fn api_entries_are_validated_like_toml_entries() {
 
     assert!(!fx.overlay_path("connect").exists());
     assert!(!fx.overlay_path("exec").exists());
+}
+
+/// WHY (ADR-0070 §2/§3, slice 3): `principal = "grant"` is a valid TOML
+/// selector, so the API must accept a well-formed grant entry too (on an
+/// install with an owner). It lands in `grant_allow` only, never as an exact
+/// pair or owner entry, so it cannot widen access for non-grant holders.
+#[tokio::test]
+async fn api_accepts_well_formed_grant_entry_like_toml() {
+    let fx = Fixture::new();
+    let admin = fx.start().await;
+    let grant = ConnectAclEntrySpec {
+        description: None,
+        principal: Some("grant".to_string()),
+        agent_id: None,
+        machine_id: None,
+        targets: vec!["127.0.0.1:22".to_string()],
+    };
+    let err = admin
+        .add_connect(grant.clone(), false)
+        .await
+        .expect_err("ownerless install holds no grants");
+    assert!(matches!(err, AclAdminError::Conflict(_)), "{err}");
+    assert!(!fx.overlay_path("connect").exists());
+
+    admin
+        .add_connect(grant, true)
+        .await
+        .expect("well-formed grant entry accepted");
+    let ConnectPolicy::Enabled(acl) = &*admin.effective_connect().await else {
+        panic!("connect stays enabled");
+    };
+    assert_eq!(acl.grant_allow.len(), 1);
+    assert_eq!(acl.grant_allow[0].targets, vec![target("127.0.0.1:22")]);
+    assert!(
+        acl.owner_allow.is_empty(),
+        "grant entry is not an owner entry"
+    );
+    assert!(fx.overlay_path("connect").exists());
 }
 
 /// WHY (PR #896 decision 1 + ADR-0070 §1): owner trust opens connect/exec

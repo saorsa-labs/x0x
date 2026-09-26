@@ -536,6 +536,7 @@ async fn connect_acl_refuses_unlisted_peer_stream() {
             targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
         }],
         owner_allow: Vec::new(),
+        grant_allow: Vec::new(),
     });
     bob.set_connect_policy(Arc::new(policy));
     let mut acceptor = bob

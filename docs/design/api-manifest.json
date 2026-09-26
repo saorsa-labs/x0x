@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 197,
+  "endpoint_count": 201,
   "endpoints": [
     {
       "category": "status",
@@ -3307,6 +3307,96 @@
       "description": "Re-read the connect/exec ACL floors and overlays; rejects keep the last good ACL",
       "method": "POST",
       "path": "/acl/reload",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant list",
+      "description": "List share grants this install's owner issued, with status",
+      "method": "GET",
+      "path": "/grants",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant issue",
+      "description": "Sign a share grant with the owner key, store it, and deliver it by durable DM",
+      "method": "POST",
+      "path": "/grants",
+      "request": {
+        "fields": [
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "grantee_user",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "grantee_agent",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "agents",
+            "required": true
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "caps",
+            "required": true
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "not_before",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "expiry",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "ttl_secs",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "deliver_to",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant revoke",
+      "description": "Revoke a share grant (owner key; gossiped on x0x.revocation.v3)",
+      "method": "DELETE",
+      "path": "/grants/:id",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant received",
+      "description": "List share grants that name this install as grantee",
+      "method": "GET",
+      "path": "/grants/received",
       "request": {
         "kind": "none"
       }

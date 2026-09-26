@@ -13,6 +13,7 @@ pub mod exec;
 pub mod files;
 pub mod find;
 pub mod forward;
+pub mod grant;
 pub mod group;
 pub mod groups;
 pub mod history;

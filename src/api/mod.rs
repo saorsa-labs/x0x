@@ -1855,6 +1855,48 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "acl",
         request: RequestSpec::None,
     },
+    // ── Share grants (ADR-0070 §2; durable owner token only) ────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/grants",
+        cli_name: "grant list",
+        description: "List share grants this install's owner issued, with status",
+        category: "grants",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/grants",
+        cli_name: "grant issue",
+        description: "Sign a share grant with the owner key, store it, and deliver it by durable DM",
+        category: "grants",
+        request: RequestSpec::Fields(&[
+            RequestField::body_json_doc("grantee_user", false),
+            RequestField::body_json_doc("grantee_agent", false),
+            RequestField::body_json_doc("agents", true),
+            RequestField::body_json_doc("caps", true),
+            RequestField::body_json_doc("not_before", false),
+            RequestField::body_json_doc("expiry", false),
+            RequestField::body_json_doc("ttl_secs", false),
+            RequestField::body_json_doc("deliver_to", false),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/grants/:id",
+        cli_name: "grant revoke",
+        description: "Revoke a share grant (owner key; gossiped on x0x.revocation.v3)",
+        category: "grants",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/grants/received",
+        cli_name: "grant received",
+        description: "List share grants that name this install as grantee",
+        category: "grants",
+        request: RequestSpec::None,
+    },
 ];
 
 /// Find an endpoint by its CLI name.

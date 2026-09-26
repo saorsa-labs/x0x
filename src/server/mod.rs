@@ -842,6 +842,9 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let (predecessor_relay_dm_tx, mut predecessor_relay_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
+    // ADR-0070 §2: durable typed route for share-grant deliveries.
+    let (share_grant_dm_tx, mut share_grant_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -1006,6 +1009,19 @@ pub async fn serve_with_options(
     } else {
         None
     };
+
+    // ADR-0070 §2: the share-grant store (issued + received grants). An
+    // unreadable file holds no grants and refuses writes (fail closed).
+    agent.install_share_grant_store(Arc::new(
+        x0x::share_grant::ShareGrantStore::load(
+            config
+                .data_dir
+                .join(x0x::share_grant::SHARE_GRANT_STORE_FILE),
+            agent.agent_id(),
+            agent.identity().user_keypair().map(|kp| kp.user_id()),
+        )
+        .await,
+    ));
 
     // ADR-0070 §3: from here on ACL edits and reloads swap the policies the
     // agent (connect accept + forwarder) and the exec service consult.
@@ -1514,6 +1530,7 @@ pub async fn serve_with_options(
     let dm_inbox_kv_store_delta_route_tx = kv_store_delta_dm_tx.clone();
     let dm_inbox_public_group_bootstrap_route_tx = public_group_bootstrap_dm_tx.clone();
     let dm_inbox_predecessor_relay_route_tx = predecessor_relay_dm_tx.clone();
+    let dm_inbox_share_grant_route_tx = share_grant_dm_tx.clone();
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
@@ -1522,6 +1539,7 @@ pub async fn serve_with_options(
         dm_inbox_public_group_bootstrap_route_tx,
         dm_inbox_kv_store_delta_route_tx,
         dm_inbox_predecessor_relay_route_tx,
+        dm_inbox_share_grant_route_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -1900,7 +1918,13 @@ pub async fn serve_with_options(
                 );
                 // The legacy unprefixed wire form carries no durable
                 // receipt, so the admission outcome has nowhere to go.
-                let _ = admit_public_group_bootstrap(&bootstrap_state, msg.sender, bootstrap).await;
+                let _ = admit_public_group_bootstrap(
+                    &bootstrap_state,
+                    msg.sender,
+                    Some(msg.machine_id),
+                    bootstrap,
+                )
+                .await;
             }
         }));
     }
@@ -2099,6 +2123,19 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
                 handle_public_group_bootstrap_typed_payload(&bootstrap_state, typed).await;
+            }
+        }));
+    }
+
+    // ADR-0070 §2: share-grant deliveries. The handler verifies and stores
+    // the grant before completing, so the v2 ACK means "stored"; every
+    // refusal withholds it.
+    {
+        let grant_agent = Arc::clone(&agent);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = share_grant_dm_rx.recv().await {
+                let store = grant_agent.share_grant_store();
+                let _ = x0x::share_grant::handle_share_grant_dm(store.as_deref(), typed).await;
             }
         }));
     }
@@ -2381,6 +2418,13 @@ pub async fn serve_with_options(
         .route("/acl/exec", get(acl_exec_list).post(acl_exec_add))
         .route("/acl/exec/:id", delete(acl_exec_remove))
         .route("/acl/reload", post(acl_reload))
+        // ADR-0070 §2: share grants (issue/list/revoke; received list)
+        .route(
+            "/grants",
+            get(routes::grants_list).post(routes::grants_issue),
+        )
+        .route("/grants/received", get(routes::grants_received))
+        .route("/grants/:id", delete(routes::grants_revoke))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
@@ -2734,6 +2778,7 @@ pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_dm_inbox_when_gossip_ready(
     agent: Arc<x0x::Agent>,
     kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
@@ -2742,6 +2787,7 @@ async fn start_dm_inbox_when_gossip_ready(
     public_group_bootstrap_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -2782,6 +2828,13 @@ async fn start_dm_inbox_when_gossip_ready(
                 predecessor_relay_route_tx.clone(),
                 valid_predecessor_relay_typed_dm,
             );
+        // ADR-0070 §2: durable, never validated-and-fallthrough — a
+        // malformed grant must fail the handler (ACK withheld), never be
+        // shown as a generic DM.
+        let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
+            x0x::share_grant::SHARE_GRANT_DM_PREFIX,
+            share_grant_route_tx.clone(),
+        );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
             .await

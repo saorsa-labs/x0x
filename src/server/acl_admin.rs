@@ -122,7 +122,7 @@ impl Plane for ConnectPlane {
         x0x::connect::connect_reload_compatible(current, next)
     }
     fn is_owner_entry(spec: &ConnectAclEntrySpec) -> bool {
-        spec.principal.as_deref() == Some("owner")
+        matches!(spec.principal.as_deref(), Some("owner" | "grant"))
     }
     fn summary_json(policy: &ConnectPolicy) -> serde_json::Value {
         serde_json::to_value(policy.summary()).unwrap_or_default()
@@ -166,7 +166,7 @@ impl Plane for ExecPlane {
         x0x::exec::exec_reload_compatible(current, next)
     }
     fn is_owner_entry(spec: &ExecAclEntrySpec) -> bool {
-        spec.principal.as_deref() == Some("owner")
+        matches!(spec.principal.as_deref(), Some("owner" | "grant"))
     }
     fn summary_json(policy: &ExecPolicy) -> serde_json::Value {
         serde_json::to_value(policy.summary()).unwrap_or_default()
@@ -610,8 +610,9 @@ fn prepare_add<P: Plane>(
     refuse_while_overlay_broken(state)?;
     if P::is_owner_entry(&spec) && !install_has_owner {
         return Err(AclAdminError::Conflict(
-            "principal = \"owner\" entries need an owner identity on this install \
-             (ADR-0070 §1: installs without an owner have no owner trust)"
+            "principal = \"owner\" and \"grant\" entries need an owner identity on this \
+             install (ADR-0070: installs without an owner have no owner trust and hold \
+             no grants)"
                 .to_string(),
         ));
     }

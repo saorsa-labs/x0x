@@ -623,6 +623,7 @@ fn topic_universe(agents: &[Agent]) -> serde_json::Value {
         crate::REVOCATION_TOPIC,
         crate::MACHINE_ANNOUNCE_V3_TOPIC,
         crate::REVOCATION_V2_TOPIC,
+        crate::REVOCATION_V3_TOPIC,
         crate::MOVE_ACTIVATION_TOPIC,
         crate::announce_blob::ANNOUNCE_BLOB_TOPIC,
         crate::dm_capability::DM_CAPABILITY_TOPIC,
