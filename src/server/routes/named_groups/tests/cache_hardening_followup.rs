@@ -221,11 +221,15 @@ async fn canonical_alias_records_collapse_and_keep_highest_authority_revision() 
             invite_secret,
             ts_ms: now_ms,
             treekem_key_package_b64: Some(kp_b64),
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
             recovery_authority_agent_id: None,
             recovery_authority_public_key_b64: None,
             recovery_authority_signature_b64: None,
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
+
+            certificate_b64: None,
         };
         let mut info =
             treekem_metadata_group_info(authority_kp.agent_id(), alias_group_id, stable_group_id);
@@ -404,11 +408,15 @@ fn synthetic_member_joined(
         invite_secret: format!("invite-{group_id}-{member}"),
         ts_ms,
         treekem_key_package_b64: Some(BASE64.encode(vec![0xA5u8; key_package_payload_len])),
+        kem_public_key_b64: None,
+        kem_signature_b64: None,
         recovery_authority_agent_id: None,
         recovery_authority_public_key_b64: None,
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: BASE64.encode([0xA5u8; 64]),
+
+        certificate_b64: None,
     }
 }
 
