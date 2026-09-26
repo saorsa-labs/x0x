@@ -3758,7 +3758,8 @@ pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 /// record's owner-key authority, insert, and persist `revocations-v3.bin`
 /// when anything was new. Records of any other subject are ignored here —
 /// they have their own carriers.
-async fn ingest_share_grant_revocations(
+pub(crate) async fn ingest_share_grant_revocations(
+    owner_trust: &owner_trust::OwnerTrust,
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<std::path::PathBuf>,
     payload: &[u8],
@@ -3772,6 +3773,10 @@ async fn ingest_share_grant_revocations(
     };
     let mut inserted = false;
     {
+        // #926: ordered against in-flight grant redeliveries.
+        let _barrier = owner_trust
+            .share_grant_revocation_barrier(&records, revocation_set)
+            .await;
         let mut set = revocation_set.write().await;
         for record in records {
             if !matches!(record.subject, revocation::RevokedSubject::ShareGrant(_))
@@ -3792,38 +3797,36 @@ async fn ingest_share_grant_revocations(
     inserted
 }
 
-/// Best-effort write of `revocations-v3.bin` (atomic, mode 0600). The
+/// Best-effort write of `revocations-v3.bin` (see
+/// [`persist_share_grant_revocations_durable`]); failures are logged. The
 /// in-memory set stays authoritative for this run if the write fails.
 pub(crate) async fn persist_share_grant_revocations(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
 ) {
-    let Some(dir) = identity_dir
-        .map(std::path::Path::to_path_buf)
-        .or_else(storage::x0x_home_dir)
-    else {
-        return;
-    };
-    let bytes = revocation_set.read().await.to_bytes_v3();
-    match bytes {
-        Ok(bytes) => {
-            if let Err(e) =
-                storage::save_private_bytes_to(&dir.join(SHARE_GRANT_REVOCATIONS_FILE), bytes).await
-            {
-                tracing::warn!("revocations-v3 persist failed: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("revocations-v3 encode failed: {e}"),
+    if let Err(e) = persist_share_grant_revocations_durable(revocation_set, identity_dir).await {
+        tracing::warn!("revocations-v3 persist failed: {e}");
     }
 }
 
-/// Durable write of `revocations-v3.bin` (temp, fsync, rename, dir fsync;
-/// mode 0600) for a LOCAL revocation, whose caller must not report success
-/// unless the revocation will survive a restart (#926). `Ok` when there is
-/// no identity directory to write to (an in-memory agent).
+/// Serializes every read-merge-write of `revocations-v3.bin` in this
+/// process (#926).
+static SHARE_GRANT_REVOCATIONS_WRITE_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// Durable, MONOTONIC write of `revocations-v3.bin` (temp, fsync, rename,
+/// dir fsync; mode 0600). Every writer — local revoke and gossip ingest —
+/// comes through here: under one process-wide lock it re-reads the file,
+/// unions it with the live set, and writes the union. Revocations only
+/// grow, so no writer can ever remove a record another writer persisted,
+/// whatever order their snapshots were taken in (#926 r2: an older gossip
+/// snapshot renamed last used to erase a just-acknowledged local revoke).
+/// An unreadable or corrupt file contributes nothing (its records could not
+/// be honoured on load either). `Ok` when there is no identity directory
+/// (an in-memory agent).
 ///
 /// # Errors
-/// Encoding or writing failed.
+/// Encoding, reading (other than not-found) or writing failed.
 pub(crate) async fn persist_share_grant_revocations_durable(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
@@ -3834,12 +3837,27 @@ pub(crate) async fn persist_share_grant_revocations_durable(
     else {
         return Ok(());
     };
-    let bytes = revocation_set
+    let path = dir.join(SHARE_GRANT_REVOCATIONS_FILE);
+    let _write = SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
+    let mut merged = match tokio::fs::read(&path).await {
+        Ok(bytes) => revocation::RevocationSet::from_bytes_v3(&bytes).unwrap_or_else(|e| {
+            tracing::warn!("revocations-v3 on disk unreadable, rewriting from memory: {e}");
+            revocation::RevocationSet::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => revocation::RevocationSet::new(),
+        Err(e) => return Err(format!("revocations-v3 read {}: {e}", path.display())),
+    };
+    let live = revocation_set
         .read()
         .await
         .to_bytes_v3()
         .map_err(|e| format!("revocations-v3 encode: {e}"))?;
-    let path = dir.join(SHARE_GRANT_REVOCATIONS_FILE);
+    let live = revocation::RevocationSet::from_bytes_v3(&live)
+        .map_err(|e| format!("revocations-v3 re-decode: {e}"))?;
+    merged.merge_v3(live);
+    let bytes = merged
+        .to_bytes_v3()
+        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
     storage::write_private_bytes_durable(&path, bytes)
         .await
         .map_err(|e| format!("revocations-v3 write {}: {e}", path.display()))
@@ -8830,6 +8848,9 @@ impl Agent {
             .await;
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let identity_dir_for_listener = self.identity_dir.clone();
+        // #926: every share-grant revocation insert takes the redelivery
+        // outbox's barrier (see `share_grant::outbox`).
+        let owner_trust_for_listener = self.owner_trust.clone();
         let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
         // L3 fetch-on-miss: the listener resolves V3 cert digests from the
         // blob cache (hit) or fires a background fetch (miss) — never
@@ -9130,6 +9151,9 @@ impl Agent {
                         // no two identity locks are held at once.
                         let subject_certs = collect_subject_certs(&*cache.read().await);
                         {
+                            let _share_grant_barrier = owner_trust_for_listener
+                                .share_grant_revocation_barrier(&records, &revocation_set)
+                                .await;
                             let mut set = revocation_set.write().await;
                             for record in records {
                                 if set.contains_hash(&record.record_hash()) {
@@ -9294,6 +9318,9 @@ impl Agent {
                         let subject_certs = collect_subject_certs(&*cache.read().await);
                         let mut inserted = false;
                         {
+                            let _share_grant_barrier = owner_trust_for_listener
+                                .share_grant_revocation_barrier(&records, &revocation_set)
+                                .await;
                             let mut set = revocation_set.write().await;
                             for record in records {
                                 if set.contains_hash(&record.record_hash()) {
@@ -9336,6 +9363,7 @@ impl Agent {
                     // ADR-0070: share-grant revocations on the v3 carrier.
                     DiscoveryMessage::RevocationV3(msg) => {
                         ingest_share_grant_revocations(
+                            &owner_trust_for_listener,
                             &revocation_set,
                             identity_dir_for_listener.clone(),
                             &msg.payload,
@@ -11116,8 +11144,13 @@ impl Agent {
         record: revocation::RevocationRecord,
         subject_cert: Option<&identity::AgentCertificate>,
     ) -> error::Result<()> {
-        // 1. Verify and insert.
+        // 1. Verify and insert (under the #926 barrier if it is a
+        //    share-grant revocation).
         {
+            let _share_grant_barrier = self
+                .owner_trust
+                .share_grant_revocation_barrier(std::iter::once(&record), &self.revocation_set)
+                .await;
             let mut set = self.revocation_set.write().await;
             if let Err(e) = set.verify_and_insert(record.clone(), subject_cert) {
                 return Err(error::IdentityError::CertificateVerification(format!(

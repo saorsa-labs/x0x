@@ -44,9 +44,13 @@
 //! # Revocation is serialized with sending
 //!
 //! A worker pass holds the outbox's send gate (shared) from its revocation
-//! check until its sends have completed; a local revocation takes the gate
-//! exclusively ([`GrantRedeliveryOutbox::revocation_barrier`]) before it
-//! records the revocation. So once a revocation has been recorded no pass
+//! check until its sends have completed. EVERY path that makes a share-grant
+//! revocation effective — the local API revoke, the `x0x.revocation.v3`
+//! gossip carrier, and a share-grant record arriving on any other revocation
+//! carrier — takes the gate exclusively
+//! ([`GrantRedeliveryOutbox::revocation_barrier`], reached through
+//! [`crate::owner_trust::OwnerTrust::share_grant_revocation_barrier`]) before
+//! it inserts the record. So once a revocation has been recorded no pass
 //! can start a send of that grant, and a send already in flight when the
 //! revoke began completes BEFORE the revoke returns (it is ordered before
 //! the revocation, exactly like a delivery at issue time).
@@ -189,7 +193,7 @@ pub struct GrantRedeliveryOutbox {
     wake: tokio::sync::Notify,
     /// Shared by a worker pass from revocation check to send completion;
     /// exclusive for a local revocation (see the module docs).
-    send_gate: RwLock<()>,
+    send_gate: std::sync::Arc<RwLock<()>>,
     /// The last write failed: the file may hold entries memory no longer
     /// has, so the next mutation must rewrite it.
     dirty: AtomicBool,
@@ -206,7 +210,7 @@ impl GrantRedeliveryOutbox {
             write_lock: tokio::sync::Mutex::new(()),
             load_error: None,
             wake: tokio::sync::Notify::new(),
-            send_gate: RwLock::new(()),
+            send_gate: std::sync::Arc::new(RwLock::new(())),
             dirty: AtomicBool::new(false),
         }
     }
@@ -310,8 +314,8 @@ impl GrantRedeliveryOutbox {
     /// Exclusive side of the send gate. Hold it while recording a local
     /// revocation and removing its entries: it waits for an in-flight pass
     /// to finish its sends and keeps a new pass from starting.
-    pub async fn revocation_barrier(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
-        self.send_gate.write().await
+    pub async fn revocation_barrier(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        std::sync::Arc::clone(&self.send_gate).write_owned().await
     }
 
     /// Why the on-disk outbox is not in force, if it is not.

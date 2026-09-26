@@ -648,73 +648,189 @@ async fn foreign_grants_are_not_queued() {
     ));
 }
 
-/// WHY (review P1, race): a revoke that begins while a redelivery of the
-/// grant is IN FLIGHT must not return until that send has completed, and no
-/// send may start after it returns. Otherwise `DELETE /grants/:id` could
-/// answer "revoked" and the grant still be delivered afterwards. The send
-/// is paused deterministically; without the revocation barrier the revoke
-/// returns at once and the assertion below fails.
+/// A redelivery pass of `outbox` whose single send is paused in flight:
+/// `entered` is set once the send started; it proceeds when `release` fires.
+struct PausedSend {
+    entered: AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+impl PausedSend {
+    fn new() -> Self {
+        Self {
+            entered: AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn send(
+        &self,
+        receiver: &Receiver,
+        to: AgentId,
+        payload: Vec<u8>,
+        request_id: [u8; 16],
+    ) -> Result<(), String> {
+        self.entered.store(true, Ordering::SeqCst);
+        self.release.notified().await;
+        receiver.send(to, payload, request_id).await
+    }
+}
+
+/// Shared body of the two race tests: with a send of `grant` paused in
+/// flight, `revoke` (polled exactly once) must NOT be able to make the
+/// revocation effective — it must wait at the barrier until the pass has
+/// finished. Deterministic: a single `now_or_never` poll, no timers. With
+/// the barrier removed, that one poll inserts the revocation synchronously
+/// (before any I/O await) and the assertion fails.
+async fn assert_revoke_waits_for_in_flight_send<R>(
+    world: &World,
+    outbox: &GrantRedeliveryOutbox,
+    receiver: &Receiver,
+    grant: &ShareGrant,
+    revoke: R,
+) where
+    R: std::future::Future<Output = ()>,
+{
+    use futures::FutureExt;
+    let due = world.now + retry_delay_secs(0);
+    let paused = PausedSend::new();
+    let step = outbox.step(due, &world.revocations, |r, p, id| {
+        paused.send(receiver, r, p, id)
+    });
+    tokio::pin!(step);
+    assert!(step.as_mut().now_or_never().is_none());
+    assert!(
+        paused.entered.load(Ordering::SeqCst),
+        "control: the send is in flight"
+    );
+
+    tokio::pin!(revoke);
+    assert!(revoke.as_mut().now_or_never().is_none());
+    assert!(
+        !world
+            .revocations
+            .read()
+            .await
+            .is_share_grant_revoked(&grant.grant_id, &grant.owner),
+        "a revocation took effect while a send of the grant was in flight"
+    );
+
+    paused.release.notify_one();
+    let report = step.await;
+    assert_eq!(report.delivered, 1, "the in-flight send is ordered first");
+    revoke.await;
+    assert!(world
+        .revocations
+        .read()
+        .await
+        .is_share_grant_revoked(&grant.grant_id, &grant.owner));
+
+    // From here on nothing of this grant is ever sent.
+    let sends = receiver.sends.load(Ordering::SeqCst);
+    let other = AgentId([0x42; 32]);
+    assert_eq!(outbox.enqueue(grant, other, world.now).await, Ok(true));
+    outbox.nudge(&[other], due);
+    let report = outbox
+        .step(due, &world.revocations, |r, p, id| receiver.send(r, p, id))
+        .await;
+    assert_eq!((report.delivered, report.dropped), (0, 1), "{report:?}");
+    assert_eq!(receiver.sends.load(Ordering::SeqCst), sends);
+}
+
+/// WHY (review P1, race; r2 P2 deterministic): a LOCAL revoke that begins
+/// while a redelivery of the grant is in flight must not take effect (and
+/// so cannot return) until that send has completed, and no send may start
+/// after it — otherwise `DELETE /grants/:id` could answer "revoked" and the
+/// grant still be delivered afterwards.
 #[tokio::test]
-async fn revoke_is_ordered_after_an_in_flight_send() {
+async fn local_revoke_is_ordered_after_an_in_flight_send() {
     let world = World::new().await;
     let receiver = Receiver::new(world.a1, &world.owner);
     receiver.online.store(true, Ordering::SeqCst);
     let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
     let grant = world.grant(1, 3_600);
     assert!(outbox.enqueue(&grant, world.a1, world.now).await.unwrap());
-    let due = world.now + retry_delay_secs(0);
-
-    let entered = tokio::sync::Notify::new();
-    let release = tokio::sync::Notify::new();
-    let revoke_returned = AtomicBool::new(false);
-    let delivered_after_revoke = AtomicBool::new(false);
-
-    let step = outbox.step(due, &world.revocations, |r, p, id| {
-        let (entered, release, receiver) = (&entered, &release, &receiver);
-        let (revoke_returned, delivered_after_revoke) = (&revoke_returned, &delivered_after_revoke);
-        async move {
-            entered.notify_one();
-            release.notified().await;
-            let out = receiver.send(r, p, id).await;
-            if out.is_ok() && revoke_returned.load(Ordering::SeqCst) {
-                delivered_after_revoke.store(true, Ordering::SeqCst);
-            }
-            out
-        }
-    });
-    let driver = async {
-        entered.notified().await; // the send is in flight
-        let identity_dir = world.identity_dir();
-        let revoke = world.revoke(&grant, &identity_dir, &outbox);
-        tokio::pin!(revoke);
-        let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut revoke).await;
-        if early.is_ok() {
-            revoke_returned.store(true, Ordering::SeqCst);
-        }
-        assert!(
-            early.is_err(),
-            "revoke returned while a send of the grant was still in flight"
-        );
-        release.notify_one();
-        revoke.await.unwrap();
-        revoke_returned.store(true, Ordering::SeqCst);
+    let identity_dir = world.identity_dir();
+    let revoke = async {
+        world.revoke(&grant, &identity_dir, &outbox).await.unwrap();
     };
-    tokio::join!(step, driver);
-    assert!(!delivered_after_revoke.load(Ordering::SeqCst));
-    assert!(outbox.is_empty());
+    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke).await;
+}
 
-    // After the revoke returned, nothing of this grant is ever sent again.
-    let sends = receiver.sends.load(Ordering::SeqCst);
-    assert!(!outbox
-        .enqueue(&grant, AgentId([0x42; 32]), world.now)
+/// WHY (review r2 P1): a revocation delivered by GOSSIP (the
+/// `x0x.revocation.v3` carrier) must be ordered against redelivery exactly
+/// like a local one — it takes the same barrier through `OwnerTrust`, so a
+/// queued send cannot slip out after it took effect.
+#[tokio::test]
+async fn gossiped_revoke_is_ordered_after_an_in_flight_send() {
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    receiver.online.store(true, Ordering::SeqCst);
+    let outbox = Arc::new(GrantRedeliveryOutbox::in_memory(Some(
+        world.owner.user_id(),
+    )));
+    let grant = world.grant(1, 3_600);
+    assert!(outbox.enqueue(&grant, world.a1, world.now).await.unwrap());
+    let trust = OwnerTrust::new(
+        Some(world.owner.user_id()),
+        AuthenticatedMachineBindings::default(),
+    );
+    trust.install_share_grant_outbox(Arc::clone(&outbox));
+    let payload = bincode::serialize(&vec![world.revocation_record(&grant)]).unwrap();
+    let identity_dir = world.identity_dir();
+    let revoke = async {
+        assert!(
+            crate::ingest_share_grant_revocations(
+                &trust,
+                &world.revocations,
+                Some(identity_dir.clone()),
+                &payload,
+            )
+            .await
+        );
+    };
+    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke).await;
+    // The gossiped revocation is durable too.
+    let bytes = std::fs::read(identity_dir.join(crate::SHARE_GRANT_REVOCATIONS_FILE)).unwrap();
+    assert!(RevocationSet::from_bytes_v3(&bytes)
+        .unwrap()
+        .is_share_grant_revoked(&grant.grant_id, &grant.owner));
+}
+
+/// WHY (review r2 P1, lost update): an OLDER revocation snapshot written
+/// last (a gossip ingest that snapshotted before a local revoke, then
+/// renamed after it) must not erase the local revoke from disk, or a
+/// restart forgets a revocation the API acknowledged. Every writer merges
+/// monotonically with the file under one lock.
+#[tokio::test]
+async fn stale_revocation_snapshot_cannot_erase_a_durable_revoke() {
+    let world = World::new().await;
+    let identity_dir = world.identity_dir();
+    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let (g1, g2) = (world.grant(1, 3_600), world.grant(2, 3_600));
+
+    // The gossip writer's older view: only G1.
+    let stale = RwLock::new(RevocationSet::new());
+    stale
+        .write()
         .await
-        .is_err_and(|e| matches!(e, OutboxError::Store(_))));
-    outbox.nudge(&[AgentId([0x42; 32])], due);
-    let report = outbox
-        .step(due, &world.revocations, |r, p, id| receiver.send(r, p, id))
-        .await;
-    assert_eq!((report.delivered, report.dropped), (0, 1), "{report:?}");
-    assert_eq!(receiver.sends.load(Ordering::SeqCst), sends);
+        .verify_and_insert(world.revocation_record(&g1), None)
+        .unwrap();
+
+    // Live: G1 arrived, then the owner revokes G2 through the API (durable).
+    world.revoke_in_memory_only(&g1).await;
+    world.revoke(&g2, &identity_dir, &outbox).await.unwrap();
+
+    // The stale writer finishes LAST.
+    crate::persist_share_grant_revocations(&stale, Some(&identity_dir)).await;
+
+    let bytes = std::fs::read(identity_dir.join(crate::SHARE_GRANT_REVOCATIONS_FILE)).unwrap();
+    let reloaded = RevocationSet::from_bytes_v3(&bytes).unwrap();
+    assert!(
+        reloaded.is_share_grant_revoked(&g2.grant_id, &g2.owner),
+        "the acknowledged revoke survives a restart"
+    );
+    assert!(reloaded.is_share_grant_revoked(&g1.grant_id, &g1.owner));
 }
 
 /// WHY (review P1, fail loud): if `revocations-v3.bin` cannot be written
