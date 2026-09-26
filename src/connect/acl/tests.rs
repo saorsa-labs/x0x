@@ -564,8 +564,9 @@ fn owner_principal_with_pair_ids_is_rejected() {
 
 #[test]
 fn unknown_principal_is_rejected() {
-    // "grant" is reserved for ADR-0070 slice 3 and must not load today.
-    for principal in ["grant", "Owner", "anyone"] {
+    // An unrecognised selector must fail the load closed, never be ignored.
+    // ("grant" is a real principal since ADR-0070 slice 3; see below.)
+    for principal in ["nobody", "Owner", "anyone"] {
         let text = format!(
             "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"{principal}\"\n\
              targets = [\"127.0.0.1:22\"]\n"
@@ -576,6 +577,28 @@ fn unknown_principal_is_rejected() {
             "{principal}: {err}"
         );
     }
+}
+
+#[test]
+fn grant_principal_entry_parses_into_grant_allow() {
+    // ADR-0070 §2 (slice 3): "grant" was reserved in slice 1 and is now a
+    // real selector. It must land in `grant_allow` only — never as an exact
+    // pair or an owner entry — so a grant cannot widen either of those.
+    let text = "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"grant\"\n\
+                targets = [\"127.0.0.1:22\"]\n";
+    let policy = parse_connect_policy(Path::new("/tmp/x"), 0, text).unwrap();
+    let ConnectPolicy::Enabled(acl) = &policy else {
+        panic!("expected Enabled");
+    };
+    assert!(acl.allow.is_empty(), "grant entry is not an exact pair");
+    assert!(
+        acl.owner_allow.is_empty(),
+        "grant entry is not an owner entry"
+    );
+    assert_eq!(acl.grant_allow.len(), 1);
+    let t22: SocketAddr = "127.0.0.1:22".parse().unwrap();
+    assert_eq!(acl.grant_allow[0].targets, vec![t22]);
+    assert_eq!(policy.summary().allow_entry_count, 1);
 }
 
 #[test]
