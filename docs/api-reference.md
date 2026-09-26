@@ -1883,7 +1883,7 @@ never an error: the value IS applied and persisted locally.
   "ok": true,
   "published": false,
   "reason": "<the publish failure cause>",
-  "direct_delivered": 2,
+  "direct_attempted": 2,
   "evicted_keys": []
 }
 ```
@@ -1892,7 +1892,7 @@ never an error: the value IS applied and persisted locally.
   and re-published by the store's retry tick and by the next PUT (a client
   retry of the same PUT re-announces it, including on `append_only`
   stores where the identical re-put is otherwise a no-op).
-- `direct_delivered` — how many directly-connected peers received the
+- `direct_attempted` — how many directly-connected peers received the
   delta over the DM side channel despite the publish failure.
 - `evicted_keys` — as on 200; eviction notices (`kv:evicted` SSE) fire on
   this path too.

@@ -1090,7 +1090,7 @@ async function createChannel(spaceId){
   }
   channels.push(channel);
   const r=await api('/stores/'+encSeg(st.id)+'/channels_index',{method:'PUT',body:JSON.stringify({value:u8encode(JSON.stringify(channels)),content_type:'application/json'})});
-  if(!r||!r._http_ok){channelModalError('Channel NOT created. '+apiError(r));return}
+  if(!r||!r._http_ok){channelModalError('Channel saved locally; not yet published. '+apiError(r));return}
   if(!spacePageStoreCurrent(spaceId,st)){channelModalError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   channelCache[spaceId]=channels;
   delete channelErrors[spaceId];
@@ -3295,7 +3295,7 @@ async function saveWikiPage(sid){
   if(!st.ok){wikiError(st.reason);return}
   if(!spacePageStoreCurrent(sid,st)){wikiError(SPACE_POLICY_MOVED_BEFORE);return}
   const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(currentWikiSlug),{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/markdown'})});
-  if(!r||!r._http_ok){wikiError('Not saved. '+apiError(r));return}
+  if(!r||!r._http_ok){wikiError('Saved locally; not yet published. '+apiError(r));return}
   if(!spacePageStoreCurrent(sid,st)){wikiError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   document.getElementById('wiki-editor').style.display='none';
   // The daemon confirms it stored the page on THIS machine. It does not
@@ -3402,7 +3402,7 @@ async function saveWebPage(sid){
   if(!st.ok){webError(st.reason);return}
   if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_BEFORE);return}
   const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(currentWebPath),{method:'PUT',body:JSON.stringify({value:u8encode(content),content_type:'text/html'})});
-  if(!r||!r._http_ok){webError('Not saved. '+apiError(r));return}
+  if(!r||!r._http_ok){webError('Saved locally; not yet published. '+apiError(r));return}
   if(!spacePageStoreCurrent(sid,st)){webError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
   document.getElementById('web-editor').style.display='none';
   toast('Page saved on this device','success');
