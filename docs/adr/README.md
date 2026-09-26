@@ -84,6 +84,7 @@ This directory contains architecture decision records for x0x.
 ## Proposed
 - [ADR 0051: Peer Relay (X0X-0070) Is a Default-Off, One-Hop DM Fallback](./0051-application-level-peer-relay.md) (proposed 2026-08-29) — signed `RelayHeader` routing (version/dst/src/pubkey/timestamp — no inner-envelope digest, substitution tracked as #437), inner `DmEnvelope` sealed end-to-end, one hop; policy default disabled, contact-required, rate/byte caps; first-eligible selection pending ADR-0035's spread model
 - [ADR 0063: Signed KV legacy gossip compatibility adoption boundary](./0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md) — draft; V3 pairing preparation only, G0 met and G1–G8 open; disabled pending audited adoption
+- [ADR 0077: Share-Grant Redelivery Is an Owner-Side Durable Outbox; Grantee Fetch Deferred](./0077-share-grant-owner-side-redelivery-outbox.md) (proposed 2026-09-26) — serves **R5**; records the owner-side outbox (#926, PR #983) as the ADR-0070 §2 mechanism for missed grant deliveries and defers the grantee-attached fetch; would supersede that one §2 sentence if accepted, ADR-0070 itself unedited
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
 
