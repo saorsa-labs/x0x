@@ -599,6 +599,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                     .agent
                     .gossip_inbound_by_topic()
                     .unwrap_or_default(),
+                "legacy_dm_bus_origin": egress["legacy_dm_bus_origin"],
                 "relay_fanout": state.agent.gossip_relay_fanout().unwrap_or_default(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "inner_envelope_verify": x0x::gossip::inner_verify_stats(),

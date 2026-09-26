@@ -17,6 +17,7 @@ use super::participation::{
 };
 use super::GossipConfig;
 use crate::contacts::{ContactStore, TrustLevel};
+use crate::dm::LegacyBusMessageKind;
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
 use crate::network::NetworkNode;
@@ -802,6 +803,8 @@ pub struct PubSubManager {
     /// Inbound frames/bytes per (topic class, kind) — `inbound_by_topic` on
     /// `GET /diagnostics/gossip` (#674).
     inbound_by_topic: InboundByTopicStats,
+    /// Originated legacy DM bus publishes, labeled by the producer before encryption.
+    legacy_dm_bus_origin: [InboundSlot; 7],
     /// Subscriber channels for `local:` topics (issue #89). These topics
     /// are same-daemon IPC: delivered only to local subscribers, never
     /// handed to PlumTree, never gossipped to remote peers.
@@ -1376,6 +1379,7 @@ impl PubSubManager {
             revocation_set: std::sync::OnceLock::new(),
             stats: Arc::new(PubSubStats::default()),
             inbound_by_topic: InboundByTopicStats::default(),
+            legacy_dm_bus_origin: std::array::from_fn(|_| InboundSlot::default()),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
             participation: ParticipationMode::Leaf,
@@ -1527,6 +1531,7 @@ impl PubSubManager {
         serde_json::json!({
             "subscribed_topics": topics,
             "outbound_by_topic_named": rows,
+            "legacy_dm_bus_origin": self.legacy_dm_bus_origin_snapshot(),
             "egress_budget": {
                 "leaf_max_eager_degree": self.egress_config.leaf_max_eager_degree,
                 "leaf_egress_soft_bytes_per_sec": self.egress_config.leaf_egress_soft_bytes_per_sec,
@@ -2061,6 +2066,68 @@ impl PubSubManager {
         self.publish_with_fanout(topic, payload).await.map(|_| ())
     }
 
+    /// Publish on the compatibility DM bus and count the successful local
+    /// origin. `bytes` measures the serialized DM envelope handed to PubSub;
+    /// relay copies, gossip framing, and fan-out are outside this counter.
+    pub async fn publish_legacy_dm_bus(
+        &self,
+        payload: Bytes,
+        kind: LegacyBusMessageKind,
+    ) -> NetworkResult<()> {
+        let topic = crate::dm_inbox::DM_BUS_TOPIC.to_string();
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.publish_topic_id_with_fanout_and_envelope(
+            topic,
+            topic_id,
+            payload,
+            SignedVersion::V2,
+            Some(kind),
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn record_legacy_dm_bus_origin(&self, index: usize, wire_bytes: u64) {
+        let slot = &self.legacy_dm_bus_origin[index];
+        slot.frames.fetch_add(1, Ordering::Relaxed);
+        slot.bytes.fetch_add(wire_bytes, Ordering::Relaxed);
+    }
+
+    /// Fixed-cardinality, process-local origin counters. Independent atomic
+    /// loads mean simultaneous updates can straddle a snapshot.
+    #[must_use]
+    pub fn legacy_dm_bus_origin_snapshot(&self) -> serde_json::Value {
+        const NAMES: [&str; 7] = [
+            "control_blob_reference",
+            "control_blob_fetch",
+            "control_blob_chunk",
+            "control_blob_release",
+            "other_payload",
+            "ack",
+            "unknown",
+        ];
+        let outbound = NAMES
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let slot = &self.legacy_dm_bus_origin[index];
+                (
+                    name.to_string(),
+                    serde_json::json!({
+                        "count": slot.frames.load(Ordering::Relaxed),
+                        "wire_bytes": slot.bytes.load(Ordering::Relaxed),
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        serde_json::json!({
+            "scope": "local_successful_origin_publishes",
+            "wire_bytes_semantics": "serialized_dm_envelope_excludes_gossip_framing_and_fanout",
+            "reset": "process_restart",
+            "outbound": outbound,
+        })
+    }
+
     /// Publish to a topic and return the eager-peer fan-out count.
     ///
     /// `0` means PlumTree handed the message to no remote eager peers
@@ -2069,7 +2136,13 @@ impl PubSubManager {
     pub async fn publish_with_fanout(&self, topic: String, payload: Bytes) -> NetworkResult<u32> {
         let topic_id = TopicId::from_entity(topic.as_bytes());
         Ok(self
-            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .publish_topic_id_with_fanout_and_envelope(
+                topic,
+                topic_id,
+                payload,
+                SignedVersion::V2,
+                None,
+            )
             .await?
             .fan_out)
     }
@@ -2083,7 +2156,13 @@ impl PubSubManager {
     ) -> NetworkResult<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let outcome = self
-            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .publish_topic_id_with_fanout_and_envelope(
+                topic,
+                topic_id,
+                payload,
+                SignedVersion::V2,
+                None,
+            )
             .await?;
         Ok(outcome.observed_fanout())
     }
@@ -2129,7 +2208,13 @@ impl PubSubManager {
         payload: Bytes,
     ) -> NetworkResult<u32> {
         let outcome = self
-            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .publish_topic_id_with_fanout_and_envelope(
+                topic,
+                topic_id,
+                payload,
+                SignedVersion::V2,
+                None,
+            )
             .await?;
         Ok(outcome.fan_out)
     }
@@ -2145,9 +2230,15 @@ impl PubSubManager {
         topic_id: TopicId,
         payload: Bytes,
     ) -> NetworkResult<Option<Bytes>> {
-        self.publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
-            .await
-            .map(|outcome| outcome.envelope)
+        self.publish_topic_id_with_fanout_and_envelope(
+            topic,
+            topic_id,
+            payload,
+            SignedVersion::V2,
+            None,
+        )
+        .await
+        .map(|outcome| outcome.envelope)
     }
 
     /// Publish a topic-bound V3 inner envelope for the Signed KV pairing.
@@ -2168,10 +2259,16 @@ impl PubSubManager {
             ));
         }
         let topic_id = TopicId::from_entity(topic.as_bytes());
-        self.publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V3)
-            .await?
-            .envelope
-            .ok_or_else(|| NetworkError::SerializationError("Missing V3 envelope".to_string()))
+        self.publish_topic_id_with_fanout_and_envelope(
+            topic,
+            topic_id,
+            payload,
+            SignedVersion::V3,
+            None,
+        )
+        .await?
+        .envelope
+        .ok_or_else(|| NetworkError::SerializationError("Missing V3 envelope".to_string()))
     }
 
     /// Publish and return both the signed envelope (when signing) and the
@@ -2182,7 +2279,10 @@ impl PubSubManager {
         topic_id: TopicId,
         payload: Bytes,
         version: SignedVersion,
+        legacy_bus_kind: Option<LegacyBusMessageKind>,
     ) -> NetworkResult<PublishFanoutOutcome> {
+        let bus_wire_bytes =
+            (topic == crate::dm_inbox::DM_BUS_TOPIC).then_some(payload.len() as u64);
         // `local:` topics fan out to same-daemon subscribers only — the
         // payload never reaches PlumTree or any remote peer (issue #89).
         if is_local_topic(&topic) {
@@ -2234,6 +2334,10 @@ impl PubSubManager {
         match self.plumtree.publish_with_fanout(topic_id, encoded).await {
             Ok(counts) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
+                if let Some(wire_bytes) = bus_wire_bytes {
+                    let index = legacy_bus_kind.map_or(6, LegacyBusMessageKind::index);
+                    self.record_legacy_dm_bus_origin(index, wire_bytes);
+                }
                 let attempted = counts.map(|c| c.attempted).unwrap_or(0);
                 let fan_out = u32::try_from(attempted).unwrap_or(u32::MAX);
                 #[cfg(test)]
@@ -3486,6 +3590,75 @@ fn verify_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_bus_origin_diagnostics_exposes_unknown_generic_bus_publish() {
+        let manager = slice1_manager(1, false).await;
+        manager
+            .publish(
+                crate::dm_inbox::DM_BUS_TOPIC.to_string(),
+                Bytes::from_static(b"wire"),
+            )
+            .await
+            .expect("generic bus publish");
+        let snap = manager.egress_diagnostics();
+        assert_eq!(
+            snap["legacy_dm_bus_origin"]["outbound"]["unknown"]["count"],
+            1
+        );
+        assert_eq!(
+            snap["legacy_dm_bus_origin"]["outbound"]["unknown"]["wire_bytes"],
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_bus_origin_counts_labeled_and_unknown_publishes() {
+        let manager = slice1_manager(1, false).await;
+        let before = manager.legacy_dm_bus_origin_snapshot();
+        for kind in [
+            LegacyBusMessageKind::ControlBlobReference,
+            LegacyBusMessageKind::ControlBlobFetch,
+            LegacyBusMessageKind::ControlBlobChunk,
+            LegacyBusMessageKind::ControlBlobRelease,
+            LegacyBusMessageKind::OtherPayload,
+            LegacyBusMessageKind::Ack,
+        ] {
+            manager
+                .publish_legacy_dm_bus(Bytes::from_static(b"wire"), kind)
+                .await
+                .expect("local bus publish");
+        }
+        manager
+            .publish(
+                crate::dm_inbox::DM_BUS_TOPIC.to_string(),
+                Bytes::from_static(b"unlabeled"),
+            )
+            .await
+            .expect("unlabeled publish");
+        let failed = manager
+            .publish_signed_kv_v3(
+                crate::dm_inbox::DM_BUS_TOPIC.to_string(),
+                Bytes::from_static(b"rejected"),
+            )
+            .await;
+        assert!(failed.is_err(), "unsigned V3 bus publish must fail");
+        let after = manager.legacy_dm_bus_origin_snapshot();
+        for key in [
+            "control_blob_reference",
+            "control_blob_fetch",
+            "control_blob_chunk",
+            "control_blob_release",
+            "other_payload",
+            "ack",
+        ] {
+            assert_eq!(after["outbound"][key]["count"].as_u64(), Some(1));
+            assert_eq!(after["outbound"][key]["wire_bytes"].as_u64(), Some(4));
+            assert_eq!(before["outbound"][key]["count"].as_u64(), Some(0));
+        }
+        assert_eq!(after["outbound"]["unknown"]["count"].as_u64(), Some(1));
+        assert_eq!(after["outbound"]["unknown"]["wire_bytes"].as_u64(), Some(9));
+    }
     use crate::identity::AgentKeypair;
     use crate::network::NetworkConfig;
 
