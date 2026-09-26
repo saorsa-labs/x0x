@@ -22733,6 +22733,18 @@ mod tests {
         fn local_agent(&self) -> Option<crate::identity::AgentId> {
             Some(self.signing.agent_id)
         }
+
+        /// A fixed `GroupInfo` snapshot: its epoch can never move.
+        fn confirm_publication<'a>(
+            &'a self,
+            _body: &'a crate::crdt::sealed::SealedTaskRecordBody,
+        ) -> crate::crdt::sealed::TaskSealFuture<'a, crate::crdt::TaskPublication> {
+            Box::pin(async {
+                Ok(crate::crdt::TaskPublication::Current(
+                    crate::crdt::TaskPublicationPermit::none(),
+                ))
+            })
+        }
     }
 
     /// #895 (David, 2026-09-25) WHY: the space Board moves from its legacy

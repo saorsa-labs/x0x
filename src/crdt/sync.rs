@@ -2788,6 +2788,18 @@ mod tests {
         fn local_agent(&self) -> Option<AgentId> {
             Some(self.signing.agent_id)
         }
+
+        /// A fixed `GroupInfo` snapshot: its epoch can never move.
+        fn confirm_publication<'a>(
+            &'a self,
+            _body: &'a crate::crdt::sealed::SealedTaskRecordBody,
+        ) -> crate::crdt::sealed::TaskSealFuture<'a, TaskPublication> {
+            Box::pin(async {
+                Ok(TaskPublication::Current(
+                    crate::crdt::sealed::TaskPublicationPermit::none(),
+                ))
+            })
+        }
     }
 
     /// An MlsEncrypted GSS group whose creator (and only active member) is

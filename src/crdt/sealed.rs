@@ -132,16 +132,14 @@ pub trait TaskDeltaProtector: Send + Sync + 'static {
     /// between seal and publish can never let a pre-removal record out: the
     /// loop sees [`TaskPublication::Stale`] and re-seals instead.
     ///
-    /// The default confirms unconditionally and holds nothing. It is correct
-    /// only for a protector whose key cannot change (a fixed snapshot, as in
-    /// tests); a protector that resolves a live group key MUST override it.
+    /// Deliberately has no default: an unconditional confirmation is
+    /// fail-open for any protector that resolves a live group key, so every
+    /// implementor must decide. Only a protector whose key can never change
+    /// (a fixed snapshot) may confirm with [`TaskPublicationPermit::none`].
     fn confirm_publication<'a>(
         &'a self,
         body: &'a SealedTaskRecordBody,
-    ) -> TaskSealFuture<'a, TaskPublication> {
-        let _ = body;
-        Box::pin(async { Ok(TaskPublication::Current(TaskPublicationPermit::none())) })
-    }
+    ) -> TaskSealFuture<'a, TaskPublication>;
 }
 
 /// Holds whatever keeps a group's epoch fixed while a sealed task record is
