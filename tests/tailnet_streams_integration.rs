@@ -558,17 +558,26 @@ async fn connect_acl_refuses_unlisted_peer_stream() {
         "unlisted peer's stream must not be surfaced"
     );
 
-    // Carol observes the refusal: bob dropped the stream halves, so her read
-    // hits EOF (FIN from the dropped send half)…
+    // Carol observes the refusal: bob dropped the stream halves unfinished,
+    // which ant-quic turns into a RESET with DROPPED_UNFINISHED_ERROR_CODE
+    // (not a FIN — a FIN would let a refusal read as a complete, empty
+    // stream). The accept loop documents this as "the stream is reset". She
+    // must see exactly that reset, with zero application bytes…
     let mut buf = [0u8; 16];
     let read = tokio::time::timeout(
         Duration::from_secs(10),
         carol_stream.recv_mut().read(&mut buf),
     )
     .await
-    .expect("refused stream read must settle")
-    .expect("refused stream read must not error (FIN, not reset)");
-    assert!(read.is_none(), "refused stream reads EOF, got {read:?}");
+    .expect("refused stream read must settle");
+    assert!(
+        matches!(
+            read,
+            Err(ant_quic::high_level::ReadError::Reset(code))
+                if code == ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE
+        ),
+        "refused stream must be reset by the gate with zero bytes, got {read:?}"
+    );
 
     // …and her writes fail (STOP_SENDING from the dropped recv half). Retry
     // a few times: the STOP_SENDING frame may lag the FIN by a packet.
@@ -785,6 +794,9 @@ async fn backpressure_throttles_writer_with_bounded_buffering() {
             offset = end;
             written_in_task.store(offset, Ordering::Release);
         }
+        // The task drops the stream on return; ant-quic resets an unfinished
+        // dropped stream, discarding the buffered tail the reader still needs.
+        alice_stream.send_mut().finish().expect("finish stream");
         offset
     });
 

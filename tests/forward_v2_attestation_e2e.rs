@@ -226,6 +226,10 @@ async fn forward_v2_attestation_succeeds_on_loopback() {
             bob_stream.recv_mut().read_exact(&mut ping).await.unwrap();
             assert_eq!(&ping, b"ping");
             bob_stream.send_mut().write_all(b"pong").await.unwrap();
+            // ant-quic resets a send stream dropped without finish()
+            // (DROPPED_UNFINISHED_ERROR_CODE), which can discard "pong" before
+            // alice reads it once this branch ends. FIN it gracefully.
+            bob_stream.send_mut().finish().unwrap();
         }
     );
 }
