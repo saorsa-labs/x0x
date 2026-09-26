@@ -6,8 +6,8 @@
 //! fail its assertion) if the check it guards were removed.
 
 use super::super::outbox::{
-    retry_delay_secs, GrantRedeliveryOutbox, OutboxError, MAX_OUTBOX_ENTRIES,
-    MAX_OUTBOX_ENTRIES_PER_RECIPIENT, OUTBOX_ENTRY_TTL_SECS,
+    retry_delay_secs, GrantRedeliveryOutbox, OutboxError, PendingGrantDelivery, MAX_OUTBOX_ENTRIES,
+    MAX_OUTBOX_ENTRIES_PER_GRANTEE, OUTBOX_ENTRY_TTL_SECS,
 };
 use super::*;
 use crate::identity::{AgentKeypair, MachineId, UserKeypair};
@@ -118,6 +118,19 @@ impl World {
         .unwrap()
     }
 
+    fn grant_to(&self, id: u8, grantee: Grantee) -> ShareGrant {
+        ShareGrant::sign(
+            &self.owner,
+            [id; 32],
+            grantee,
+            vec![self.a1],
+            vec![ShareCap::Dm],
+            self.now - 60,
+            self.now + 3_600,
+        )
+        .unwrap()
+    }
+
     fn outbox_path(&self) -> std::path::PathBuf {
         self.dir
             .path()
@@ -143,9 +156,10 @@ impl World {
         .dm
     }
 
-    /// The owner's revocation of `grant` (what `revoke_share_grant` signs).
-    async fn revoke(&self, grant: &ShareGrant) {
-        let record = RevocationRecord::sign(
+    /// The owner's revocation record for `grant` (what
+    /// `revoke_share_grant` signs).
+    fn revocation_record(&self, grant: &ShareGrant) -> RevocationRecord {
+        RevocationRecord::sign(
             RevokedSubject::ShareGrant(ShareGrantRevocation {
                 grant_id: grant.grant_id,
                 owner: self.owner.user_id(),
@@ -156,13 +170,45 @@ impl World {
             self.now,
             None,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// A revocation recorded in memory only (as a gossiped revocation, or a
+    /// crash before the outbox was rewritten, leaves it).
+    async fn revoke_in_memory_only(&self, grant: &ShareGrant) {
         self.revocations
             .write()
             .await
-            .verify_and_insert(record, None)
+            .verify_and_insert(self.revocation_record(grant), None)
             .unwrap();
     }
+
+    /// The real local revocation path (`Agent::revoke_share_grant`'s core).
+    async fn revoke(
+        &self,
+        grant: &ShareGrant,
+        identity_dir: &std::path::Path,
+        outbox: &GrantRedeliveryOutbox,
+    ) -> Result<(), ShareGrantError> {
+        record_local_share_grant_revocation(
+            self.revocation_record(grant),
+            &self.revocations,
+            Some(identity_dir),
+            Some(outbox),
+        )
+        .await
+    }
+
+    fn identity_dir(&self) -> std::path::PathBuf {
+        self.dir.path().join("identity")
+    }
+}
+
+fn recipient(i: usize) -> AgentId {
+    let mut id = [0u8; 32];
+    id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+    id[31] = 0x5A;
+    AgentId(id)
 }
 
 /// Issue-time delivery to A1 through the real queueing entry point.
@@ -312,10 +358,10 @@ async fn revocation_removes_the_entry_and_nothing_is_delivered() {
     assert!(issue_to(&world, &grant, &outbox, &receiver).await.queued);
     let sends_at_issue = receiver.sends.load(Ordering::SeqCst);
 
-    // What `Agent::revoke_share_grant` does: record the revocation, drop
-    // the grant's queued deliveries.
-    world.revoke(&grant).await;
-    assert_eq!(outbox.remove_grant(&grant.grant_id).await.unwrap(), 1);
+    world
+        .revoke(&grant, &world.identity_dir(), &outbox)
+        .await
+        .unwrap();
     assert!(outbox.is_empty());
     assert!(
         world.outbox(world.now).await.is_empty(),
@@ -350,7 +396,7 @@ async fn revoked_while_queued_is_never_redelivered_across_restart() {
         assert!(issue_to(&world, &grant, &outbox, &receiver).await.queued);
     }
     // Revoked, but the outbox file was never rewritten.
-    world.revoke(&grant).await;
+    world.revoke_in_memory_only(&grant).await;
     let restarted = world.outbox(world.now).await;
     assert_eq!(restarted.len(), 1, "control: the stale entry is on disk");
     let sends_before = receiver.sends.load(Ordering::SeqCst);
@@ -376,26 +422,44 @@ async fn revoked_while_queued_is_never_redelivered_across_restart() {
     );
 }
 
-/// WHY (#926 test d): one peer cannot fill the outbox — each recipient is
-/// capped, and other recipients still queue.
+/// WHY (#926 test d): one grantee cannot fill the outbox — the cap is per
+/// GRANTEE (the grant's `Grantee`), counted across every recipient agent its
+/// entries are addressed to; a different grantee still queues.
 #[tokio::test]
-async fn per_recipient_bound_is_enforced() {
+async fn per_grantee_bound_is_enforced() {
     let world = World::new().await;
     let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
-    for i in 0..MAX_OUTBOX_ENTRIES_PER_RECIPIENT {
-        let grant = world.grant(u8::try_from(i).unwrap(), 3_600);
-        assert!(outbox.enqueue(&grant, world.a1, world.now).await.unwrap());
+    let grant = world.grant(1, 3_600);
+    for i in 0..MAX_OUTBOX_ENTRIES_PER_GRANTEE {
+        // Each entry goes to a DIFFERENT recipient agent: a per-recipient
+        // cap would never trip here.
+        assert_eq!(
+            outbox.enqueue(&grant, recipient(i), world.now).await,
+            Ok(true)
+        );
     }
-    let over = world.grant(0xFE, 3_600);
+    let second_grant_same_grantee = world.grant(2, 3_600);
     assert_eq!(
-        outbox.enqueue(&over, world.a1, world.now).await,
-        Err(OutboxError::RecipientFull)
+        outbox
+            .enqueue(
+                &second_grant_same_grantee,
+                recipient(MAX_OUTBOX_ENTRIES_PER_GRANTEE),
+                world.now
+            )
+            .await,
+        Err(OutboxError::GranteeFull)
     );
-    assert_eq!(outbox.len(), MAX_OUTBOX_ENTRIES_PER_RECIPIENT);
-    let other = AgentId([0x77; 32]);
-    assert_eq!(outbox.enqueue(&over, other, world.now).await, Ok(true));
+    assert_eq!(outbox.len(), MAX_OUTBOX_ENTRIES_PER_GRANTEE);
+    let other_grantee = world.grant_to(3, Grantee::Agent(AgentId([0x77; 32])));
+    assert_eq!(
+        outbox.enqueue(&other_grantee, world.a1, world.now).await,
+        Ok(true)
+    );
     // Re-queueing the same (grant, recipient) is a no-op, not a new entry.
-    assert_eq!(outbox.enqueue(&over, other, world.now).await, Ok(false));
+    assert_eq!(
+        outbox.enqueue(&other_grantee, world.a1, world.now).await,
+        Ok(false)
+    );
 }
 
 /// WHY (#926 test d): the outbox as a whole is bounded, and past the bound a
@@ -404,15 +468,23 @@ async fn per_recipient_bound_is_enforced() {
 async fn total_bound_is_enforced_and_reported() {
     let world = World::new().await;
     let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
-    let grant = world.grant(6, 3_600);
-    for i in 0..MAX_OUTBOX_ENTRIES {
-        let mut recipient = [0u8; 32];
-        recipient[..8].copy_from_slice(&(i as u64).to_le_bytes());
-        assert_eq!(
-            outbox.enqueue(&grant, AgentId(recipient), world.now).await,
-            Ok(true)
+    let grantees = MAX_OUTBOX_ENTRIES / MAX_OUTBOX_ENTRIES_PER_GRANTEE;
+    let mut n = 0;
+    for g in 0..grantees {
+        let grant = world.grant_to(
+            u8::try_from(g).unwrap(),
+            Grantee::Agent(AgentId([0xD0 + u8::try_from(g).unwrap(); 32])),
         );
+        for _ in 0..MAX_OUTBOX_ENTRIES_PER_GRANTEE {
+            assert_eq!(
+                outbox.enqueue(&grant, recipient(n), world.now).await,
+                Ok(true)
+            );
+            n += 1;
+        }
     }
+    assert_eq!(n, MAX_OUTBOX_ENTRIES);
+    let grant = world.grant(0xEE, 3_600);
     assert_eq!(
         outbox.enqueue(&grant, world.a1, world.now).await,
         Err(OutboxError::Full)
@@ -429,6 +501,87 @@ async fn total_bound_is_enforced_and_reported() {
         "{delivery:?}"
     );
     assert_eq!(outbox.len(), MAX_OUTBOX_ENTRIES, "nothing was evicted");
+}
+
+/// Write `entries` as an outbox file, bypassing `enqueue`'s checks.
+fn write_raw_outbox(path: &std::path::Path, entries: &[PendingGrantDelivery]) {
+    let mut bytes = b"X0GO".to_vec();
+    bytes.extend_from_slice(&bincode::serialize(&entries.to_vec()).unwrap());
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn raw_entry(grant: &ShareGrant, to: AgentId, now: u64) -> PendingGrantDelivery {
+    PendingGrantDelivery {
+        recipient: to,
+        grant: grant.clone(),
+        queued_at: now,
+        deadline: grant.expiry,
+        next_attempt_at: now,
+        attempts: 0,
+    }
+}
+
+/// WHY (review P2): an over-bound file must NOT be silently truncated to
+/// the bound and then rewritten — it loads as empty with `load_error`, and
+/// refuses writes so the file on disk is left exactly as found.
+#[tokio::test]
+async fn over_bound_file_fails_closed_and_is_never_truncated() {
+    let world = World::new().await;
+    let grant = world.grant(1, 3_600);
+    let entries: Vec<_> = (0..=MAX_OUTBOX_ENTRIES_PER_GRANTEE)
+        .map(|i| raw_entry(&grant, recipient(i), world.now))
+        .collect();
+    write_raw_outbox(&world.outbox_path(), &entries);
+    let before = std::fs::read(world.outbox_path()).unwrap();
+
+    let outbox = world.outbox(world.now).await;
+    assert!(
+        outbox
+            .load_error()
+            .is_some_and(|e| e.contains("one grantee")),
+        "{:?}",
+        outbox.load_error()
+    );
+    assert!(outbox.is_empty(), "nothing partial is held");
+    assert!(matches!(
+        outbox
+            .enqueue(&world.grant(2, 3_600), world.a1, world.now)
+            .await,
+        Err(OutboxError::Store(_))
+    ));
+    assert_eq!(std::fs::read(world.outbox_path()).unwrap(), before);
+
+    // Control: exactly at the bound loads fine.
+    write_raw_outbox(
+        &world.outbox_path(),
+        &entries[..MAX_OUTBOX_ENTRIES_PER_GRANTEE],
+    );
+    let at_bound = world.outbox(world.now).await;
+    assert!(at_bound.load_error().is_none());
+    assert_eq!(at_bound.len(), MAX_OUTBOX_ENTRIES_PER_GRANTEE);
+
+    // A foreign-owner entry is also refused, not skipped.
+    let stranger = UserKeypair::generate().unwrap();
+    let foreign = ShareGrant::sign(
+        &stranger,
+        [9; 32],
+        Grantee::Agent(world.b1),
+        vec![world.a1],
+        vec![ShareCap::Dm],
+        world.now - 60,
+        world.now + 3_600,
+    )
+    .unwrap();
+    write_raw_outbox(
+        &world.outbox_path(),
+        &[
+            raw_entry(&grant, world.a1, world.now),
+            raw_entry(&foreign, world.a1, world.now),
+        ],
+    );
+    let mixed = world.outbox(world.now).await;
+    assert!(mixed.load_error().is_some());
+    assert!(mixed.is_empty());
 }
 
 /// WHY (TTL): an entry lives at most `OUTBOX_ENTRY_TTL_SECS`, and never past
@@ -493,4 +646,169 @@ async fn foreign_grants_are_not_queued() {
             .await,
         Err(OutboxError::NotQueueable(_))
     ));
+}
+
+/// WHY (review P1, race): a revoke that begins while a redelivery of the
+/// grant is IN FLIGHT must not return until that send has completed, and no
+/// send may start after it returns. Otherwise `DELETE /grants/:id` could
+/// answer "revoked" and the grant still be delivered afterwards. The send
+/// is paused deterministically; without the revocation barrier the revoke
+/// returns at once and the assertion below fails.
+#[tokio::test]
+async fn revoke_is_ordered_after_an_in_flight_send() {
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    receiver.online.store(true, Ordering::SeqCst);
+    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let grant = world.grant(1, 3_600);
+    assert!(outbox.enqueue(&grant, world.a1, world.now).await.unwrap());
+    let due = world.now + retry_delay_secs(0);
+
+    let entered = tokio::sync::Notify::new();
+    let release = tokio::sync::Notify::new();
+    let revoke_returned = AtomicBool::new(false);
+    let delivered_after_revoke = AtomicBool::new(false);
+
+    let step = outbox.step(due, &world.revocations, |r, p, id| {
+        let (entered, release, receiver) = (&entered, &release, &receiver);
+        let (revoke_returned, delivered_after_revoke) = (&revoke_returned, &delivered_after_revoke);
+        async move {
+            entered.notify_one();
+            release.notified().await;
+            let out = receiver.send(r, p, id).await;
+            if out.is_ok() && revoke_returned.load(Ordering::SeqCst) {
+                delivered_after_revoke.store(true, Ordering::SeqCst);
+            }
+            out
+        }
+    });
+    let driver = async {
+        entered.notified().await; // the send is in flight
+        let identity_dir = world.identity_dir();
+        let revoke = world.revoke(&grant, &identity_dir, &outbox);
+        tokio::pin!(revoke);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut revoke).await;
+        if early.is_ok() {
+            revoke_returned.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            early.is_err(),
+            "revoke returned while a send of the grant was still in flight"
+        );
+        release.notify_one();
+        revoke.await.unwrap();
+        revoke_returned.store(true, Ordering::SeqCst);
+    };
+    tokio::join!(step, driver);
+    assert!(!delivered_after_revoke.load(Ordering::SeqCst));
+    assert!(outbox.is_empty());
+
+    // After the revoke returned, nothing of this grant is ever sent again.
+    let sends = receiver.sends.load(Ordering::SeqCst);
+    assert!(!outbox
+        .enqueue(&grant, AgentId([0x42; 32]), world.now)
+        .await
+        .is_err_and(|e| matches!(e, OutboxError::Store(_))));
+    outbox.nudge(&[AgentId([0x42; 32])], due);
+    let report = outbox
+        .step(due, &world.revocations, |r, p, id| receiver.send(r, p, id))
+        .await;
+    assert_eq!((report.delivered, report.dropped), (0, 1), "{report:?}");
+    assert_eq!(receiver.sends.load(Ordering::SeqCst), sends);
+}
+
+/// WHY (review P1, fail loud): if `revocations-v3.bin` cannot be written
+/// durably the revoke must fail (5xx), never report success that a restart
+/// would forget — after which the reloaded outbox would redeliver the
+/// grant. A retry once the disk is writable succeeds and is durable.
+#[tokio::test]
+async fn revoke_fails_when_the_revocation_is_not_durable() {
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    let grant = world.grant(1, 3_600);
+    let outbox = world.outbox(world.now).await;
+    assert!(issue_to(&world, &grant, &outbox, &receiver).await.queued);
+
+    // The identity dir cannot be created: a file sits where it should be.
+    let blocked = world.dir.path().join("blocked");
+    std::fs::write(&blocked, b"not a dir").unwrap();
+    let err = world
+        .revoke(&grant, &blocked.join("identity"), &outbox)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ShareGrantError::Store(ref m) if m.contains("revocations-v3")),
+        "{err:?}"
+    );
+    // In force for this run (fail closed) even though not durable.
+    assert!(world
+        .revocations
+        .read()
+        .await
+        .is_share_grant_revoked(&grant.grant_id, &grant.owner));
+
+    // Retry with a writable identity dir: durable on disk.
+    world
+        .revoke(&grant, &world.identity_dir(), &outbox)
+        .await
+        .unwrap();
+    let bytes = std::fs::read(
+        world
+            .identity_dir()
+            .join(crate::SHARE_GRANT_REVOCATIONS_FILE),
+    )
+    .unwrap();
+    assert!(RevocationSet::from_bytes_v3(&bytes)
+        .unwrap()
+        .is_share_grant_revoked(&grant.grant_id, &grant.owner));
+    assert!(world.outbox(world.now).await.is_empty());
+}
+
+/// WHY (review P1, fail loud): if the outbox removal cannot be written the
+/// revoke must fail too — and a retry must REWRITE the outbox even though
+/// the entry is already gone from memory, or a restart would reload it.
+#[tokio::test]
+async fn revoke_fails_when_the_outbox_removal_is_not_durable() {
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    let grant = world.grant(1, 3_600);
+    let dir = world.dir.path().join("o");
+    let path = dir.join(super::super::outbox::SHARE_GRANT_OUTBOX_FILE);
+    let outbox =
+        GrantRedeliveryOutbox::load(path.clone(), Some(world.owner.user_id()), world.now).await;
+    assert!(issue_to(&world, &grant, &outbox, &receiver).await.queued);
+
+    // Make the outbox directory unwritable by swapping a file in its place.
+    let parked = world.dir.path().join("o.parked");
+    std::fs::rename(&dir, &parked).unwrap();
+    std::fs::write(&dir, b"not a dir").unwrap();
+    let err = world
+        .revoke(&grant, &world.identity_dir(), &outbox)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ShareGrantError::Store(ref m) if m.contains("outbox")),
+        "{err:?}"
+    );
+
+    // The disk comes back holding the stale entry.
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::rename(&parked, &dir).unwrap();
+    assert_eq!(
+        GrantRedeliveryOutbox::load(path.clone(), Some(world.owner.user_id()), world.now)
+            .await
+            .len(),
+        1,
+        "control: the file still holds the revoked entry"
+    );
+    world
+        .revoke(&grant, &world.identity_dir(), &outbox)
+        .await
+        .unwrap();
+    assert!(
+        GrantRedeliveryOutbox::load(path, Some(world.owner.user_id()), world.now)
+            .await
+            .is_empty(),
+        "the retry rewrote the outbox"
+    );
 }

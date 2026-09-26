@@ -1294,8 +1294,10 @@ impl crate::Agent {
 
     /// Revoke an issued grant (owner key only): sign a
     /// [`crate::revocation::RevokedSubject::ShareGrant`] record, apply it
-    /// locally (effective at the next evaluation, no restart), persist
-    /// `revocations-v3.bin`, and publish the v3 set.
+    /// locally (effective at the next evaluation, no restart), durably
+    /// persist `revocations-v3.bin`, drop the grant's queued redeliveries
+    /// (#926; see [`record_local_share_grant_revocation`]), and publish the
+    /// v3 set.
     ///
     /// The revocation names `(grant_id, this owner)`, so it can only ever
     /// revoke a grant this owner signed (from any of its installs). It also
@@ -1305,7 +1307,9 @@ impl crate::Agent {
     /// while its grant could still be honoured.
     ///
     /// # Errors
-    /// No owner key, or a signing/verification failure.
+    /// No owner key, a signing/verification failure, or `Store` when the
+    /// revocation or the outbox removal is not durable (a 5xx to the API
+    /// caller; retrying is idempotent).
     pub async fn revoke_share_grant(
         &self,
         grant_id: [u8; 32],
@@ -1335,21 +1339,17 @@ impl crate::Agent {
             reason,
         )
         .map_err(|e| ShareGrantError::BadSignature(e.to_string()))?;
-        self.revocation_set
-            .write()
-            .await
-            .verify_and_insert(record.clone(), None)
-            .map_err(|e| ShareGrantError::BadSignature(e.to_string()))?;
-        // #926: a revoked grant must never be redelivered. The outbox worker
-        // also re-checks the revocation set before every send, so failing to
-        // rewrite the outbox file here cannot lead to a delivery.
-        if let Some(outbox) = self.share_grant_outbox() {
-            if let Err(e) = outbox.remove_grant(&grant_id).await {
-                tracing::warn!("revoked grant's queued deliveries not rewritten: {e}");
-            }
-        }
-        crate::persist_share_grant_revocations(&self.revocation_set, self.identity_dir.as_deref())
-            .await;
+        let outbox = self.share_grant_outbox();
+        let durable = record_local_share_grant_revocation(
+            record.clone(),
+            &self.revocation_set,
+            self.identity_dir.as_deref(),
+            outbox.as_deref(),
+        )
+        .await;
+        // Publish even when a local write failed: the revocation is in force
+        // here and the owner's other installs should learn it. The caller
+        // still gets the error (a 5xx), and a retry rewrites both files.
         if let Some(rt) = &self.gossip_runtime {
             let records = self.revocation_set.read().await.share_grant_records();
             if let Ok(bytes) = bincode::serialize(&records) {
@@ -1362,7 +1362,65 @@ impl crate::Agent {
                     .await;
             }
         }
-        Ok(record)
+        durable.map(|()| record)
+    }
+}
+
+/// Record a LOCAL share-grant revocation (#926): under the outbox's
+/// revocation barrier, insert `record`, write `revocations-v3.bin` durably,
+/// and durably drop the grant's queued deliveries.
+///
+/// The barrier makes a concurrent redelivery pass finish its in-flight sends
+/// first and keeps a new pass from starting until the revocation is in the
+/// set, so no send of this grant can begin after this returns.
+///
+/// Returns `Ok` only when BOTH writes are durable, so `DELETE /grants/:id`
+/// never answers success for a revocation a restart would forget (which
+/// would let the reloaded outbox redeliver the grant). The in-memory
+/// revocation and removal stand either way (fail closed for this run), and
+/// a retry is idempotent and rewrites both files.
+///
+/// # Errors
+/// `BadSignature` if the record does not verify; `Store` if either write
+/// failed.
+pub async fn record_local_share_grant_revocation(
+    record: crate::revocation::RevocationRecord,
+    revocation_set: &RwLock<RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+    outbox: Option<&outbox::GrantRedeliveryOutbox>,
+) -> Result<(), ShareGrantError> {
+    let grant_id = match &record.subject {
+        crate::revocation::RevokedSubject::ShareGrant(subject) => Some(subject.grant_id),
+        _ => None,
+    };
+    let _barrier = match outbox {
+        Some(outbox) => Some(outbox.revocation_barrier().await),
+        None => None,
+    };
+    revocation_set
+        .write()
+        .await
+        .verify_and_insert(record, None)
+        .map_err(|e| ShareGrantError::BadSignature(e.to_string()))?;
+    let mut failures = Vec::new();
+    if let Err(e) =
+        crate::persist_share_grant_revocations_durable(revocation_set, identity_dir).await
+    {
+        failures.push(e);
+    }
+    if let (Some(outbox), Some(grant_id)) = (outbox, grant_id) {
+        if let Err(e) = outbox.remove_grant(&grant_id).await {
+            failures.push(e.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let joined = failures.join("; ");
+        tracing::error!("share-grant revocation not durable: {joined}");
+        Err(ShareGrantError::Store(format!(
+            "revocation is in force until restart but not durable: {joined}"
+        )))
     }
 }
 
