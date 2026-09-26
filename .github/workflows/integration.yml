@@ -127,6 +127,46 @@ jobs:
       - name: Run bound-port forwarding regression
         run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
 
+  # Tailnet (ADR-0074 slice 0): the ignored loopback stream/forward suites
+  # (7 in tailnet_streams_integration + 1 in forward_v2_attestation_e2e).
+  # The ninth ignored tailnet test (forward.rs port-zero regression) already
+  # runs in integration-core. --test-threads 1 keeps the backpressure and
+  # bounded-acceptor timing proofs from contending with each other.
+  # X0X_REQUIRE_NETWORK_TESTS=1 turns a refused loopback bind into a failure
+  # instead of a silent early-return pass (tests/common/network_gate.rs).
+  tailnet:
+    name: Integration (tailnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+      X0X_REQUIRE_NETWORK_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+      - name: Run ignored tailnet stream and forward suites
+        run: |
+          bash scripts/ci/nextest-isolated.sh --all-features \
+            --test tailnet_streams_integration \
+            --test forward_v2_attestation_e2e -- \
+            --run-ignored ignored-only \
+            --no-tests=fail \
+            --no-fail-fast \
+            --test-threads 1
+
   # Groups: the heavy named-group daemon suite (28 daemon-backed tests),
   # isolated on its own runner so it cannot stack on core's cold build.
   # See issue #197: core was cancelled at its budget when this suite rode
@@ -409,6 +449,85 @@ jobs:
           path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
           if-no-files-found: error
 
+  # ── Typed Agent/server lifecycle regression (dedicated, isolated). ────
+  #    tests/server_inprocess.rs proves the typed Agent/server shutdown
+  #    contract against real sockets on FIXED QUIC ports: a startup
+  #    rejection (corrupt self profile) must release the port, and a clean
+  #    serve() teardown must rebind. Both tests are #[ignore]d real-socket
+  #    tests, so each selector runs in its own matrix row — one build-
+  #    custody record, one isolation receipt, one native exit — and a
+  #    partial pass can never hide behind a combined filter.
+  #    --run-ignored ignored-only selects them at all; --no-tests=fail
+  #    makes an absent or renamed selector fail the row instead of passing
+  #    empty; --test-threads 1 keeps each fixed-port lifecycle serial
+  #    within its row; fail-fast: false keeps both rows' independent
+  #    results even when one fails.
+  #    Deliberately NO sibling-symlink dependency override here (unlike the
+  #    jobs above): resolve Cargo.toml's declared graph. Exact git patches in
+  #    a composition candidate are test-only; remove them before claiming
+  #    published-registry validation.
+  typed-server-shutdown:
+    name: Typed server shutdown (${{ matrix.case }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: startup-rejection
+            selector: corrupt_self_profile_releases_fixed_quic_port_during_startup_rejection
+          - case: normal-restart
+            selector: serve_tears_down_cleanly_and_rebinds
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+      # The wrapper invocation is the step's final command: no pipe, no
+      # `|| true`, no output truncation or status rewriting, so a nextest
+      # failure or timeout remains a failing step and job.
+      - name: Run exact ignored server lifecycle selector
+        env:
+          X0X_ISOLATION_ROLE: acceptance
+          TEST_SELECTOR: ${{ matrix.selector }}
+        run: |
+          bash scripts/ci/nextest-isolated.sh --all-features \
+            --test server_inprocess -- \
+            --run-ignored ignored-only \
+            --no-tests=fail \
+            --test-threads 1 \
+            -E "test(=$TEST_SELECTOR)"
+      # Closed-schema custody: the collector reads only the wrapper chain's
+      # receipts from RUNNER_TEMP, emits a fixed field allowlist (no argv,
+      # environment, absolute paths, tokens or product output), runs on
+      # failure too without masking the job result, and exits non-zero when
+      # the job otherwise succeeded but a receipt is missing or
+      # inconsistent — a green row cannot be reported without its custody.
+      - name: Collect isolation and build custody
+        id: collect_custody
+        if: always()
+        env:
+          X0X_CUSTODY_EXPECT: ${{ job.status }}
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: server_inprocess
+        run: >-
+          python3 scripts/ci/isolation-custody-collect.py
+          "$RUNNER_TEMP/x0x-custody-receipt"
+      - name: Upload isolation custody receipt
+        if: always() && steps.collect_custody.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: typed-server-${{ matrix.case }}-isolation-custody
+          path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
+          if-no-files-found: error
+
   # Net: GUI smoke + WebSocket + kv bootstrap + local-topic routing.
   integration-net:
     name: Integration (net)
@@ -530,6 +649,59 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: encrypted-kv-transport-isolation-custody
+          path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
+          if-no-files-found: error
+
+  # SG76: public application PubSub through the real x0x/QUIC adapter, with
+  # Full -> Ref counters and exact remote delivery before and after restart.
+  gossip-key-cache-transport:
+    name: Gossip key-cache transport proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144
+      - name: Run exact ignored public PubSub key-cache selector
+        env:
+          X0X_ISOLATION_ROLE: acceptance
+        run: |
+          bash scripts/ci/nextest-isolated.sh --all-features \
+            --test gossip_key_cache_transport -- \
+            --run-ignored ignored-only \
+            --no-tests=fail \
+            --test-threads 1 \
+            -E 'test(=public_pubsub_key_cache_full_ref_restart_recovery)'
+      - name: Collect isolation and build custody
+        id: collect_key_cache_custody
+        if: always()
+        env:
+          X0X_CUSTODY_EXPECT: ${{ job.status }}
+          X0X_CUSTODY_MIN_RUNS: '1'
+          X0X_CUSTODY_ROLES: acceptance
+          X0X_CUSTODY_TARGET: gossip_key_cache_transport
+        run: >-
+          python3 scripts/ci/isolation-custody-collect.py
+          "$RUNNER_TEMP/x0x-custody-receipt"
+      - name: Upload isolation custody receipt
+        if: always() && steps.collect_key_cache_custody.outputs.receipt_eligible == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: gossip-key-cache-transport-isolation-custody
           path: ${{ runner.temp }}/x0x-custody-receipt/custody-receipt.json
           if-no-files-found: error
 
