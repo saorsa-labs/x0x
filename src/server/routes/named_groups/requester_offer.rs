@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     now_millis_u64, parse_agent_id_hex, predecessor_relay_delivery_config,
+    predecessor_relay_legacy_delivery_config, predecessor_relay_wire_version,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
     CAUSAL_RELAY_RETRY_SECS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
@@ -329,24 +330,33 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
         );
         dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
         dm_payload.extend_from_slice(&obligation.envelope_bytes);
-        // #913: gossip-only delivery. #942 M5 — what `Ok` actually means:
-        // the recipient endpoint ACCEPTED the payload into the predecessor
-        // typed-route channel (an enqueue-level ACK from the live authority
-        // daemon), not a transport receipt and not yet the authority's
-        // durable B8 persist. The residual window (authority crashes
-        // between enqueue and its durable admission) is closed by the join
-        // protocol, not this store: the request stays pending on the
-        // requester, and every unresolved join retry re-inserts the
-        // obligation (the /join path calls
-        // insert_requester_offer_obligation unconditionally), so a lost
-        // post-ACK offer is re-offered on the next join attempt. A full
-        // typed-route channel fails the enqueue — that is the failure the
-        // retry schedule below absorbs.
-        let delivered = state
-            .agent
-            .send_direct_with_config(&authority, dm_payload, predecessor_relay_delivery_config())
-            .await
-            .is_ok();
+        // #942 r3 (B4): dual-wire delivery, the bootstrap-outbox pattern.
+        // A v2-capable authority gets the STRICT config (send Ok = the
+        // handler's durable disposition, logical_request_id makes retries
+        // replays); a legacy or history-less authority gets the v1 gossip
+        // config (transport receipt, same payload, same prefix) so the
+        // offer still reaches it — the pre-durable-route behavior.
+        let delivered = if predecessor_relay_wire_version(state, &authority).await {
+            state
+                .agent
+                .send_direct_with_config(
+                    &authority,
+                    dm_payload,
+                    predecessor_relay_delivery_config(&obligation.digest),
+                )
+                .await
+                .is_ok()
+        } else {
+            state
+                .agent
+                .send_direct_with_config(
+                    &authority,
+                    dm_payload,
+                    predecessor_relay_legacy_delivery_config(),
+                )
+                .await
+                .is_ok()
+        };
         attempts.push((obligation, delivered));
     }
     // Settle under the persistence lock: mutate → durable write → count.

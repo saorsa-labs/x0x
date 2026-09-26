@@ -351,17 +351,65 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
 
 /// A predecessor relay can only count a recipient application ACK. Raw QUIC's
 /// receive-pipeline ACK is produced before the typed route admits the item.
-pub(in crate::server) fn predecessor_relay_delivery_config() -> x0x::dm::DmSendConfig {
+/// #942 r3 (B4): the strict-v2 delivery config, following the durable
+/// bootstrap-outbox pattern exactly — the logical request id is the first
+/// 16 bytes of the obligation's envelope digest, so a retry after a lost
+/// ACK or a restart is a REPLAY of one logical request (the recipient's
+/// dedupe re-ACKs instead of re-dispatching), and the outbox — not the
+/// send layer — owns retry scheduling (max_retries = 0).
+pub(in crate::server) fn predecessor_relay_delivery_config(
+    envelope_digest: &[u8; 32],
+) -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     config.require_gossip = true;
-    // #942 B2/M5: the predecessor route is registered DURABLE, so demand
-    // the durable application ACK — send Ok means the AUTHORITY's handler
-    // resolved the completion (Inserted/Duplicate), not a bare enqueue. A
-    // full typed channel withholds the ACK, which is exactly the failure
-    // the retry schedule absorbs ("a full typed channel is a retry,
-    // never a silent loss").
+    // The predecessor route is registered DURABLE: send Ok means the
+    // AUTHORITY's handler resolved its completion (Inserted/Duplicate),
+    // never a bare enqueue. A full typed channel withholds the ACK — that
+    // is the failure the retry schedule absorbs.
     config.require_durable_app_ack = true;
+    config.prefer_raw_quic_if_connected = false;
+    config.max_retries = 0;
+    let mut request_id = [0u8; 16];
+    request_id.copy_from_slice(&envelope_digest[..16]);
+    config.logical_request_id = Some(request_id);
     config
+}
+
+/// #942 r3 (B4): the legacy (v1) fallback for authorities without a
+/// current v2 durable-ACK advert — pre-ADR-0030 builds and daemons with
+/// history disabled. The payload is unchanged (the predecessor prefix is
+/// the v1 listener's prefix too); the receipt is transport-level, so the
+/// obligation is discharged on delivery exactly as it was before the
+/// durable route existed. Without this arm such an authority would NEVER
+/// receive the offer (compatibility regression fixed).
+pub(in crate::server) fn predecessor_relay_legacy_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    config.require_durable_app_ack = false;
+    config.prefer_raw_quic_if_connected = false;
+    config.max_retries = 0;
+    config
+}
+
+/// #942 r3 (B4): which wire an authority can receive on, mirroring the
+/// bootstrap outbox's probe — a capability binding under v2 means legacy;
+/// a contact card that self-reports v1 means legacy; unknown defaults to
+/// the strict v2 attempt (which fails fast and retries on schedule).
+pub(in crate::server) async fn predecessor_relay_wire_version(
+    state: &AppState,
+    recipient: &crate::identity::AgentId,
+) -> bool {
+    if let Some(binding) = state.agent.capability_store().lookup_binding(recipient) {
+        return binding.capabilities.max_protocol_version >= 2;
+    }
+    let card_reports_v1 = state
+        .contacts
+        .read()
+        .await
+        .get(recipient)
+        .and_then(|contact| contact.dm_capabilities.as_ref())
+        .is_some_and(|capabilities| capabilities.max_protocol_version < 2);
+    !card_reports_v1
 }
 
 /// Request body for POST /groups.
@@ -14855,6 +14903,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         let mut successful_targets: Vec<String> = Vec::new();
         let mut success_count: usize = 0;
 
+        let obligation_digest = *digest;
         for target_hex in targets {
             let Ok(target_id) = parse_agent_id_hex(target_hex) else {
                 // Unparseable target — skip (not added to success set).
@@ -14871,7 +14920,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                 .send_direct_with_config(
                     &target_id,
                     dm_payload,
-                    predecessor_relay_delivery_config(),
+                    predecessor_relay_delivery_config(&obligation_digest),
                 )
                 .await;
             if send_result.is_ok() {
@@ -23891,9 +23940,9 @@ pub(in crate::server) async fn create_join_request(
             // not a one-shot spawned DM. Persisted here (before the 201
             // returns), retried by the background worker on the bounded
             // ADR 0028 schedule over the gossip-only config (#913), and
-            // cleared on the authority's typed-route enqueue ACK or when
-            // the join resolves (see requester_offer.rs for the exact ACK
-            // semantics and the join-retry backstop). A failed send is a
+            // cleared on the authority's DURABLE application ACK (the
+            // handler's Inserted/Duplicate disposition — never a bare
+            // enqueue) or when the join resolves. A failed send is a
             // retry, never a silent loss, and a restart resumes it.
             let now_ms = now_millis_u64();
             let obligation = RequesterOfferObligation {
@@ -23925,12 +23974,13 @@ pub(in crate::server) async fn create_join_request(
                     dm_payload.extend_from_slice(&envelope);
                     let agent = Arc::clone(&state.agent);
                     let creator = creator_hex.clone();
+                    let fallback_digest: [u8; 32] = blake3::hash(&envelope).into();
                     tokio::spawn(async move {
                         if let Err(e) = agent
                             .send_direct_with_config(
                                 &creator_id,
                                 dm_payload,
-                                predecessor_relay_delivery_config(),
+                                predecessor_relay_delivery_config(&fallback_digest),
                             )
                             .await
                         {
@@ -30574,7 +30624,17 @@ pub(in crate::server) async fn save_predecessor_relay_outbox_unlocked(
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
     };
-    write_relay_outbox_sidecar(state, &json).await
+    let outcome = write_relay_outbox_sidecar(state, &json).await;
+    #[cfg(test)]
+    if let Err(ref e) = outcome {
+        eprintln!(
+            "#942R3 PROBE write failed at {}: {e}",
+            state.predecessor_relay_outbox_path.display()
+        );
+    }
+    #[cfg(test)]
+    eprintln!("#942R3 PROBE write outcome: {outcome:?}");
+    outcome
 }
 
 /// ADR 0028: persist the predecessor relay outbox to a durable sidecar file.
@@ -35762,8 +35822,8 @@ pub(in crate::server) mod tests {
     mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
-    mod requester_offer;
     mod r17_cert_hydrate;
+    mod requester_offer;
     mod wp_c;
 
     fn fake_group_state_commit(
@@ -48612,10 +48672,18 @@ pub(in crate::server) mod tests {
 
     #[test]
     fn predecessor_relay_requires_application_ack_and_excludes_raw_fallback() {
-        let config = predecessor_relay_delivery_config();
+        let digest = [7u8; 32];
+        let config = predecessor_relay_delivery_config(&digest);
         assert!(config.require_gossip);
         assert!(config.require_gossip_ack);
+        assert!(config.require_durable_app_ack);
         assert!(!config.prefer_raw_quic_if_connected);
+        // #942 r3 (B4): the outbox owns scheduling and the logical request
+        // id is the envelope digest's first half — a retry is a replay.
+        assert_eq!(config.max_retries, 0);
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(&digest[..16]);
+        assert_eq!(config.logical_request_id, Some(expected));
     }
 
     #[test]
