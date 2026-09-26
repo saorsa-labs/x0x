@@ -1005,6 +1005,13 @@ pub fn grant_delivery_request(grant: &ShareGrant) -> Result<(Vec<u8>, [u8; 16]),
 /// must return `Ok` only on the recipient's durable v2 ACK) and durably
 /// queue every failed recipient in `outbox` for redelivery (#926).
 ///
+/// The sends run while holding the outbox send gate shared
+/// ([`outbox::GrantRedeliveryOutbox::send_permit`], #994 r1) after checking
+/// the grant is not already revoked, each bounded by
+/// [`outbox::GRANT_SEND_DEADLINE`]: a `DELETE /grants/:id` racing this POST
+/// waits for the in-flight DMs, so none can be delivered after the DELETE
+/// returns. The permit is released before queueing.
+///
 /// A failed recipient is queued with the clock read at QUEUE time (`now`),
 /// not before the send, and only if the grant is not revoked by then (see
 /// [`outbox::GrantRedeliveryOutbox::enqueue`]; #983 post-merge P1).
@@ -1034,12 +1041,35 @@ where
                 .collect();
         }
     };
+    let permit = match outbox {
+        Some(outbox) => Some(outbox.send_permit().await),
+        None => None,
+    };
+    if revocations
+        .read()
+        .await
+        .is_share_grant_revoked(&grant.grant_id, &grant.owner)
+    {
+        return recipients
+            .iter()
+            .map(|a| GrantDelivery {
+                agent: hex::encode(a.as_bytes()),
+                delivered: false,
+                queued: false,
+                error: Some("grant is revoked; not delivered".to_string()),
+            })
+            .collect();
+    }
     let sends = recipients.iter().map(|recipient| {
         let fut = send(*recipient, payload.clone(), request_id);
-        async move { (*recipient, fut.await) }
+        async move { (*recipient, outbox::bounded_send(fut).await) }
     });
+    let results = futures::future::join_all(sends).await;
+    // Release before queueing: `enqueue` takes the gate again, and a
+    // revocation queued for it in between must be allowed to run first.
+    drop(permit);
     let mut out = Vec::with_capacity(recipients.len());
-    for (recipient, result) in futures::future::join_all(sends).await {
+    for (recipient, result) in results {
         let mut delivery = GrantDelivery {
             agent: hex::encode(recipient.as_bytes()),
             delivered: result.is_ok(),

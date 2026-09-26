@@ -55,6 +55,29 @@
 //! revoke began completes BEFORE the revoke returns (it is ordered before
 //! the revocation, exactly like a delivery at issue time).
 //!
+//! The INITIAL delivery made by `POST /grants` takes the same gate shared
+//! across its DMs ([`GrantRedeliveryOutbox::send_permit`], #994 r1), so a
+//! `DELETE /grants/:id` racing a POST returns only after the POST's
+//! in-flight DMs have resolved; a DM that succeeded is then ordered before
+//! the revocation, exactly like a delivery completed before the DELETE.
+//!
+//! Every send made while the gate is held is bounded by
+//! [`GRANT_SEND_DEADLINE`], so a revoke waits at most that long (plus the
+//! local I/O of the pass) for the gate — a stuck send cannot hang DELETE.
+//!
+//! # Lock order
+//!
+//! Acquired in this order only, never the reverse, so no cycle is possible:
+//!
+//! 1. the outbox send gate (`tokio::sync::RwLock`; shared for sends and
+//!    enqueue, exclusive for a revocation) — never re-entered while held:
+//!    the POST releases its shared permit before it queues;
+//! 2. the agent's revocation set (`tokio::sync::RwLock`);
+//! 3. the `revocations-v3.bin` writer: its process-local `tokio` mutex,
+//!    then the OS advisory file lock;
+//! 4. the outbox `write_lock` (`tokio::sync::Mutex`);
+//! 5. the outbox entry map (`std::sync::Mutex`, never held across `.await`).
+//!
 //! # Storage
 //!
 //! `X0GO` magic ‖ strict bincode, written durably (temp, fsync, rename, dir
@@ -111,6 +134,13 @@ pub const OUTBOX_MAX_SENDS_PER_STEP: usize = 8;
 /// Send-layer retries inside one outbox attempt (the outbox itself is the
 /// outer retry loop).
 pub const OUTBOX_SEND_RETRIES: u8 = 1;
+
+/// Hard bound on any single grant send made while the send gate is held
+/// (an initial `POST /grants` DM or a worker redelivery). It bounds how long
+/// a revocation can wait for the gate. A send cut off here counts as not
+/// delivered (the POST queues it; the worker reschedules it) — safe, since
+/// every retry is the same idempotent logical request.
+pub const GRANT_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One queued grant delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +349,14 @@ impl GrantRedeliveryOutbox {
     /// to finish its sends and keeps a new pass from starting.
     pub async fn revocation_barrier(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         std::sync::Arc::clone(&self.send_gate).write_owned().await
+    }
+
+    /// Shared side of the send gate for a send made outside a worker pass
+    /// (the initial `POST /grants` delivery). Hold it across the sends and
+    /// release it before calling [`Self::enqueue`] (the gate is not
+    /// re-entrant: a queued revocation would otherwise deadlock).
+    pub async fn send_permit(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        std::sync::Arc::clone(&self.send_gate).read_owned().await
     }
 
     /// Why the on-disk outbox is not in force, if it is not.
@@ -593,7 +631,7 @@ impl GrantRedeliveryOutbox {
                 request.map(|(payload, request_id)| send(entry.recipient, payload, request_id));
             async move {
                 let outcome = match fut {
-                    Ok(fut) => fut.await,
+                    Ok(fut) => bounded_send(fut).await,
                     Err(e) => Err(e.to_string()),
                 };
                 (entry, outcome)
@@ -664,5 +702,20 @@ impl GrantRedeliveryOutbox {
         crate::storage::write_private_bytes_durable(path, bytes)
             .await
             .map_err(|e| format!("write {}: {e}", path.display()))
+    }
+}
+
+/// Run one grant send under [`GRANT_SEND_DEADLINE`]; a timeout is a failed
+/// send.
+pub(crate) async fn bounded_send<Fut>(send: Fut) -> Result<(), String>
+where
+    Fut: Future<Output = Result<(), String>>,
+{
+    match tokio::time::timeout(GRANT_SEND_DEADLINE, send).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(format!(
+            "grant send timed out after {}s",
+            GRANT_SEND_DEADLINE.as_secs()
+        )),
     }
 }

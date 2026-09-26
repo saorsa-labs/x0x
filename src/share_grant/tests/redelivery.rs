@@ -771,13 +771,15 @@ async fn assert_revoke_waits_for_in_flight_send<R>(
         outbox
             .enqueue(grant, other, world.now, &world.revocations)
             .await,
-        Ok(true)
+        Err(OutboxError::Revoked),
+        "a revoked grant can no longer be queued"
     );
+    assert!(outbox.is_empty());
     outbox.nudge(&[other], due);
     let report = outbox
         .step(due, &world.revocations, |r, p, id| receiver.send(r, p, id))
         .await;
-    assert_eq!((report.delivered, report.dropped), (0, 1), "{report:?}");
+    assert_eq!(report, Default::default(), "{report:?}");
     assert_eq!(receiver.sends.load(Ordering::SeqCst), sends);
 }
 
@@ -1128,8 +1130,9 @@ async fn revoke_fails_when_the_outbox_removal_is_not_durable() {
 /// pending finds nothing queued to remove. When the DM then fails, the POST
 /// must NOT queue the (now revoked) grant — otherwise the worker would
 /// deliver it after DELETE returned success. Deterministic: the DM is
-/// paused on a notify, the revoke runs to completion, then the DM fails.
-/// Nothing may ever be queued or sent.
+/// paused on a notify, the DELETE is issued (and queues on the send gate),
+/// then the DM fails; the DELETE records the revocation before the POST can
+/// queue. Nothing may ever be queued or sent.
 #[tokio::test]
 async fn revoke_during_the_initial_dm_is_never_undone_by_the_post() {
     use futures::FutureExt;
@@ -1156,12 +1159,17 @@ async fn revoke_during_the_initial_dm_is_never_undone_by_the_post() {
         "control: the initial DM is in flight"
     );
 
-    // DELETE completes while the POST's DM is pending.
-    world.revoke(&grant, &identity_dir, &outbox).await.unwrap();
+    // DELETE is issued while the POST's DM is pending (it waits for the
+    // DM: #994 r1). It is queued on the send gate BEFORE the DM resolves,
+    // so it records the revocation before the POST can try to queue.
+    let delete = world.revoke(&grant, &identity_dir, &outbox);
+    tokio::pin!(delete);
+    assert!(delete.as_mut().now_or_never().is_none());
 
     // The DM fails.
     paused.release.notify_one();
-    let mut deliveries = post.await;
+    let (mut deliveries, deleted) = tokio::join!(post, delete);
+    deleted.unwrap();
     let delivery = deliveries.remove(0);
     assert!(!delivery.delivered);
     assert!(
@@ -1283,4 +1291,81 @@ async fn idle_worker_retries_a_dirty_outbox_write() {
             .is_empty(),
         "the dirty write was retried"
     );
+}
+
+/// WHY (#994 r1 P1): a `DELETE /grants/:id` issued while the POST's initial
+/// DM is in flight and about to SUCCEED must block until that DM resolves,
+/// and only then revoke — otherwise the recipient could store and ACK the
+/// grant after DELETE returned success. Deterministic: the DM is paused on a
+/// notify and the revoke is polled exactly once; without the POST holding
+/// the send gate, that single poll records the revocation (before any I/O)
+/// and the assertion fails.
+#[tokio::test]
+async fn delete_during_a_successful_initial_dm_waits_for_it() {
+    use futures::FutureExt;
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    receiver.online.store(true, Ordering::SeqCst); // the DM will succeed
+    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let grant = world.grant(1, 3_600);
+    let identity_dir = world.identity_dir();
+
+    let paused = PausedSend::new();
+    let recipients = [world.a1];
+    let post = deliver_grant_via(
+        &grant,
+        &recipients,
+        Some(&outbox),
+        &world.revocations,
+        || world.now,
+        |r, p, id| paused.send(&receiver, r, p, id),
+    );
+    tokio::pin!(post);
+    assert!(post.as_mut().now_or_never().is_none());
+    assert!(
+        paused.entered.load(Ordering::SeqCst),
+        "control: the initial DM is in flight"
+    );
+
+    let delete = world.revoke(&grant, &identity_dir, &outbox);
+    tokio::pin!(delete);
+    assert!(
+        delete.as_mut().now_or_never().is_none(),
+        "DELETE must block while the initial DM is in flight"
+    );
+    assert!(
+        !world
+            .revocations
+            .read()
+            .await
+            .is_share_grant_revoked(&grant.grant_id, &grant.owner),
+        "the revocation took effect while the initial DM was in flight"
+    );
+
+    paused.release.notify_one();
+    let deliveries = post.await;
+    assert!(
+        deliveries[0].delivered,
+        "the DM resolved first: {deliveries:?}"
+    );
+    delete.await.unwrap();
+    assert!(world
+        .revocations
+        .read()
+        .await
+        .is_share_grant_revoked(&grant.grant_id, &grant.owner));
+
+    // After DELETE returned, a new POST of the same grant delivers nothing.
+    let sends = receiver.sends.load(Ordering::SeqCst);
+    let again = deliver_grant_via(
+        &grant,
+        &recipients,
+        Some(&outbox),
+        &world.revocations,
+        || world.now,
+        |r, p, id| receiver.send(r, p, id),
+    )
+    .await;
+    assert!(!again[0].delivered && !again[0].queued, "{again:?}");
+    assert_eq!(receiver.sends.load(Ordering::SeqCst), sends);
 }
