@@ -315,8 +315,7 @@ impl GrantRedeliveryOutbox {
     /// revocation and removing its entries: it waits for an in-flight pass
     /// to finish its sends and keeps a new pass from starting.
     pub async fn revocation_barrier(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
-        // RED PROOF (ci-mirror only): the barrier is a fresh, uncontended lock.
-        std::sync::Arc::new(RwLock::new(())).write_owned().await
+        std::sync::Arc::clone(&self.send_gate).write_owned().await
     }
 
     /// Why the on-disk outbox is not in force, if it is not.
