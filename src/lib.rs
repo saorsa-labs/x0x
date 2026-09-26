@@ -6347,6 +6347,21 @@ impl Agent {
             .map(|(receipt, _ingress)| receipt)
     }
 
+    /// Send with a producer-supplied diagnostic label for any legacy DM-bus
+    /// fallback. The label stays local and never changes the DM wire format.
+    /// Ordinary callers should use [`Self::send_direct_with_config`].
+    pub async fn send_direct_with_config_labeled(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        kind: dm::LegacyBusMessageKind,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_config_with_provenance_labeled(to, payload, config, kind)
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
     /// #461: provenance variant for the direct-send HTTP route — identical
     /// behavior to the public method INCLUDING the ADR-0023 §4 outbound
     /// history wiring (this is the single common path; the public method
@@ -6358,6 +6373,22 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        self.send_direct_with_config_with_provenance_labeled(
+            to,
+            payload,
+            config,
+            dm::LegacyBusMessageKind::OtherPayload,
+        )
+        .await
+    }
+
+    async fn send_direct_with_config_with_provenance_labeled(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        kind: dm::LegacyBusMessageKind,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
@@ -6373,7 +6404,7 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner_with_provenance(to, payload, config)
+            .send_direct_with_config_inner_with_provenance(to, payload, config, kind)
             .await;
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
@@ -6426,6 +6457,7 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
+        kind: dm::LegacyBusMessageKind,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
@@ -6760,7 +6792,10 @@ impl Agent {
                         &kem_pub,
                         payload,
                         &config,
-                        lifecycle_hint,
+                        dm_send::DmSendProvenanceOptions {
+                            lifecycle_hint,
+                            legacy_bus_kind: kind,
+                        },
                     )
                     .await
                 }

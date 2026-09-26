@@ -809,7 +809,7 @@ async fn publish_durable_ack_job(
     // the targeted route here so this node does not rejoin the bus.
     let legacy = async move {
         legacy_pubsub
-            .publish(DM_BUS_TOPIC.to_string(), encoded_legacy)
+            .publish_legacy_dm_bus(encoded_legacy, crate::dm::LegacyBusMessageKind::Ack)
             .await
     };
     // C5: same v2 ACK envelope on live Direct/typed as a third hedge.
@@ -2399,7 +2399,10 @@ impl InboxPipeline {
                 .await;
             let legacy = if ack_legacy_bus {
                 self.pubsub
-                    .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
+                    .publish_legacy_dm_bus(
+                        Bytes::from(encoded),
+                        crate::dm::LegacyBusMessageKind::Ack,
+                    )
                     .await
             } else {
                 Ok(())

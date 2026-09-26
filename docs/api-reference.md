@@ -2493,7 +2493,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 |---|---|---|---|
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
-| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count` |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), local DM-bus origin counters (`legacy_dm_bus_origin`), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count` |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
@@ -2505,6 +2505,16 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023), including the ADR-0068 D1 quarantine-pin pair |
 
 The inner-envelope verification fields are independent lock-free samples.
+`legacy_dm_bus_origin.outbound` has fixed keys `control_blob_reference`,
+`control_blob_fetch`, `control_blob_chunk`, `control_blob_release`,
+`other_payload`, `ack`, and `unknown`, each with `count` and `wire_bytes`.
+The first four labels come from the local control-blob producer before DM
+encryption. `other_payload` covers all other locally produced DM payloads;
+`unknown` covers a generic bus publish without a producer label. Counts advance
+only after a local publish succeeds and reset on process restart. `wire_bytes`
+is the serialized DM envelope size passed to PubSub, before gossip framing and
+fan-out. These counters do not classify encrypted relay copies or measure total
+network egress; compare them with `outbound_by_topic_named` for that total.
 Derived failure ratios and mean durations are approximate, especially over
 low-volume intervals; see the [sampling guidance](diagnostics.md#soak-instrumentation-288).
 

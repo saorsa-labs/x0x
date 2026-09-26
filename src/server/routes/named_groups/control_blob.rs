@@ -450,7 +450,21 @@ async fn send_message(
         return Err("control blob frame exceeds direct-message limit".to_string());
     }
     agent
-        .send_direct_with_config(recipient, bytes, control_config(message))
+        .send_direct_with_config_labeled(
+            recipient,
+            bytes,
+            control_config(message),
+            match message {
+                ControlBlobMessage::Reference { .. } => {
+                    x0x::dm::LegacyBusMessageKind::ControlBlobReference
+                }
+                ControlBlobMessage::Fetch { .. } => x0x::dm::LegacyBusMessageKind::ControlBlobFetch,
+                ControlBlobMessage::Chunk { .. } => x0x::dm::LegacyBusMessageKind::ControlBlobChunk,
+                ControlBlobMessage::Release { .. } => {
+                    x0x::dm::LegacyBusMessageKind::ControlBlobRelease
+                }
+            },
+        )
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

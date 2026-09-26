@@ -3,7 +3,7 @@
 use crate::dm::{
     dm_inbox_topic, millis_since, now_unix_ms, DmAckIngress, DmAckOutcome, DmError, DmPath,
     DmReceipt, DmSendConfig, DurableSendStages, EnvelopeBuilder, InFlightAcks,
-    DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
+    LegacyBusMessageKind, DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
 };
 use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
@@ -30,6 +30,12 @@ pub struct DmLifecycleHint {
     /// Receiver for `(machine_id, new_generation)` from
     /// [`crate::direct::DirectMessaging::subscribe_lifecycle_replaced`].
     pub replaced_rx: tokio::sync::broadcast::Receiver<(MachineId, u64)>,
+}
+
+/// Local-only diagnostics carried alongside one gossip send.
+pub(crate) struct DmSendProvenanceOptions {
+    pub lifecycle_hint: Option<DmLifecycleHint>,
+    pub legacy_bus_kind: LegacyBusMessageKind,
 }
 
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
@@ -155,7 +161,10 @@ pub async fn send_via_gossip(
         recipient_kem_public_key,
         payload,
         config,
-        lifecycle_hint,
+        DmSendProvenanceOptions {
+            lifecycle_hint,
+            legacy_bus_kind: LegacyBusMessageKind::OtherPayload,
+        },
     )
     .await
     .map(|(receipt, _ingress)| receipt)
@@ -173,8 +182,12 @@ pub(crate) async fn send_via_gossip_with_provenance(
     recipient_kem_public_key: &[u8],
     payload: Vec<u8>,
     config: &DmSendConfig,
-    lifecycle_hint: Option<DmLifecycleHint>,
+    options: DmSendProvenanceOptions,
 ) -> Result<(DmReceipt, Option<DmAckIngress>), DmError> {
+    let DmSendProvenanceOptions {
+        lifecycle_hint,
+        legacy_bus_kind,
+    } = options;
     let DmSendContext {
         pubsub,
         signing,
@@ -351,7 +364,7 @@ pub(crate) async fn send_via_gossip_with_provenance(
             );
             attempt_tracker.switch(StageTracker::PUBLISH);
             if let Err(e) = pubsub
-                .publish(DM_BUS_TOPIC.to_string(), Bytes::from(wire.clone()))
+                .publish_legacy_dm_bus(Bytes::from(wire.clone()), legacy_bus_kind)
                 .await
             {
                 if primary_publish_ok {
