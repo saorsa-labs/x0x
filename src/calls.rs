@@ -765,14 +765,48 @@ impl crate::Agent {
     /// `streams::stream_gate` (revoked → expired → trust `Accept`) and,
     /// when the connect ACL is Enabled, `streams::stream_acl_gate` — plus
     /// the DM must be signature-verified and `caller` must be one of the
-    /// machine's live agents. No bypass is added.
+    /// machine's live agents.
     ///
-    /// HOOK(ADR-0070 / #924): when the ShareGrant `Call` cap lands, a
-    /// caller that fails ONLY on trust (never on revocation or the ACL)
-    /// and holds a live `ShareGrant` carrying `Call` is admitted here.
-    /// Until then contact trust is the only way in.
+    /// ADR-0070 / #924 × ADR-0073 (#980): a caller that fails ONLY on trust
+    /// (never on revocation, expiry or the connect ACL) is admitted when it
+    /// holds a live, unrevoked, unexpired `ShareGrant` carrying `Call` for
+    /// this daemon's agent — the same `OwnerTrust::grant_access` lookup the
+    /// Connect grant uses. Nothing else is bypassed: see
+    /// `Agent::gate_peer_machine_inbound_with_call_grant`.
     pub(crate) async fn call_gate_inbound(
         &self,
+        caller: &AgentId,
+        machine: &MachineId,
+        dm_verified: bool,
+    ) -> Result<(), CallRefusal> {
+        Self::call_gate_inbound_with(
+            &self.identity_discovery_cache,
+            &self.contact_store,
+            &self.revocation_set,
+            &self.move_state,
+            &self.connect_policy,
+            &self.owner_trust,
+            caller,
+            machine,
+            dm_verified,
+        )
+        .await
+    }
+
+    /// [`Self::call_gate_inbound`] over explicit state, so the verdict is
+    /// unit-testable without a network.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_gate_inbound_with(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<
+            std::sync::RwLock<std::sync::Arc<crate::connect::ConnectPolicy>>,
+        >,
+        owner_trust: &crate::owner_trust::OwnerTrust,
         caller: &AgentId,
         machine: &MachineId,
         dm_verified: bool,
@@ -780,14 +814,15 @@ impl crate::Agent {
         if !dm_verified {
             return Err(CallRefusal::NotVerified);
         }
-        let agents = Self::gate_peer_machine_inbound(
-            &self.identity_discovery_cache,
-            &self.contact_store,
-            &self.revocation_set,
-            &self.move_state,
-            &self.connect_policy,
-            &self.owner_trust,
+        let agents = Self::gate_peer_machine_inbound_with_call_grant(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
             machine,
+            Some(caller),
         )
         .await
         .map_err(|e| CallRefusal::from_gate_error(&e))?;
@@ -1250,5 +1285,315 @@ mod tests {
         advert.extend_from_slice(br#"{"type":"x0x_datagram_cap","datagram":true}"#);
         assert_eq!(CallFrame::decode(&advert), None);
         assert_eq!(CallFrame::decode(br#"{"type":"x0x_call_invite"}"#), None);
+    }
+
+    /// #980 (ADR-0073 × ADR-0070): the inbound call gate admits a caller
+    /// that fails ONLY on trust when it holds a live `Call` ShareGrant for
+    /// this daemon's agent — and nothing else. Every test drives the real
+    /// gate (`Agent::call_gate_inbound_with`, the body of
+    /// `call_gate_inbound`) over the real grant store, authenticated
+    /// bindings, revocation set and connect ACL; no network.
+    mod call_grant {
+        use super::*;
+        use crate::connect::{ConnectAcl, ConnectAllowEntry, ConnectPolicy};
+        use crate::identity::{AgentCertificate, AgentKeypair, UserKeypair};
+        use crate::owner_trust::OwnerTrust;
+        use crate::revocation::RevocationSet;
+        use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        fn real_now() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+
+        /// Owner A's daemon hosting callee agent A1. User B's agent B1 on
+        /// machine MB is a stranger (no contact entry) with an authenticated
+        /// binding and an owner-B certificate in the discovery cache.
+        struct World {
+            dir: tempfile::TempDir,
+            owner_a: UserKeypair,
+            a1: AgentId,
+            user_b: UserKeypair,
+            b1: AgentId,
+            mb: MachineId,
+            contacts: Arc<RwLock<ContactStore>>,
+            cache: Arc<RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
+            revocations: Arc<RwLock<RevocationSet>>,
+            bindings: crate::dm_inbox::AuthenticatedMachineBindings,
+            move_state: Arc<RwLock<crate::key_move::MoveState>>,
+        }
+
+        impl World {
+            async fn new() -> Self {
+                let dir = tempfile::tempdir().expect("tmpdir");
+                let owner_a = UserKeypair::generate().expect("owner a");
+                let user_b = UserKeypair::generate().expect("user b");
+                let a1 = AgentKeypair::generate().expect("a1").agent_id();
+                let b1_kp = AgentKeypair::generate().expect("b1");
+                let b1 = b1_kp.agent_id();
+                let mb = MachineId([0xB0; 32]);
+                let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
+                crate::dm_inbox::record_authenticated_machine_binding(
+                    &bindings,
+                    b1,
+                    mb,
+                    real_now(),
+                )
+                .await;
+                let cert = AgentCertificate::issue(&user_b, &b1_kp).expect("cert");
+                let entry = crate::DiscoveredAgent {
+                    self_name: None,
+                    agent_id: b1,
+                    machine_id: mb,
+                    user_id: cert.user_id().ok(),
+                    addresses: Vec::new(),
+                    announced_at: 0,
+                    last_seen: 0,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    cert_not_after: cert.not_after(),
+                    agent_certificate: Some(cert),
+                    agent_public_key: b1_kp.public_key().as_bytes().to_vec(),
+                    cert_digest: None,
+                };
+                let mut cache = HashMap::new();
+                cache.insert(b1, entry);
+                let contacts = ContactStore::new(dir.path().join("contacts.json"));
+                Self {
+                    dir,
+                    owner_a,
+                    a1,
+                    user_b,
+                    b1,
+                    mb,
+                    contacts: Arc::new(RwLock::new(contacts)),
+                    cache: Arc::new(RwLock::new(cache)),
+                    revocations: Arc::new(RwLock::new(RevocationSet::new())),
+                    bindings,
+                    move_state: Arc::new(RwLock::new(crate::key_move::MoveState::default())),
+                }
+            }
+
+            /// A grant from owner A to user B over A1.
+            fn grant(&self, caps: Vec<ShareCap>, not_before: u64, expiry: u64) -> ShareGrant {
+                ShareGrant::sign(
+                    &self.owner_a,
+                    [0x44; 32],
+                    Grantee::User(self.user_b.user_id()),
+                    vec![self.a1],
+                    caps,
+                    not_before,
+                    expiry,
+                )
+                .expect("sign grant")
+            }
+
+            /// Owner-trust source of A1's daemon holding `grants` (each
+            /// accepted inside its own window).
+            async fn daemon(&self, grants: &[ShareGrant]) -> OwnerTrust {
+                let store = ShareGrantStore::in_memory(self.a1, Some(self.owner_a.user_id()));
+                for grant in grants {
+                    store
+                        .accept(grant.clone(), grant.not_before)
+                        .await
+                        .expect("accept grant");
+                }
+                let trust =
+                    OwnerTrust::new(Some(self.owner_a.user_id()), Arc::clone(&self.bindings));
+                trust.install_share_grant_store(Arc::new(store));
+                trust
+            }
+
+            /// The inbound call verdict for B1 ringing A1 from MB.
+            async fn ring(
+                &self,
+                trust: &OwnerTrust,
+                policy: ConnectPolicy,
+            ) -> Result<(), CallRefusal> {
+                let policy = Arc::new(std::sync::RwLock::new(Arc::new(policy)));
+                crate::Agent::call_gate_inbound_with(
+                    &self.cache,
+                    &self.contacts,
+                    &self.revocations,
+                    &self.move_state,
+                    &policy,
+                    trust,
+                    &self.b1,
+                    &self.mb,
+                    true,
+                )
+                .await
+            }
+
+            /// Owner A revokes `grant` over the real `x0x.revocation.v3`
+            /// ingest path.
+            async fn revoke(&self, grant: &ShareGrant) {
+                let record = crate::revocation::RevocationRecord::sign(
+                    crate::revocation::RevokedSubject::ShareGrant(
+                        crate::revocation::ShareGrantRevocation {
+                            grant_id: grant.grant_id,
+                            owner: grant.owner,
+                            grant_expiry: grant.expiry,
+                        },
+                    ),
+                    self.owner_a.public_key(),
+                    self.owner_a.secret_key(),
+                    real_now(),
+                    None,
+                )
+                .expect("sign revocation");
+                let payload = bincode::serialize(&vec![record]).expect("encode");
+                assert!(
+                    crate::ingest_share_grant_revocations(
+                        &self.revocations,
+                        Some(self.dir.path().to_path_buf()),
+                        &payload,
+                    )
+                    .await,
+                    "the owner's v3 revocation must be accepted"
+                );
+            }
+        }
+
+        fn acl(entries: Vec<ConnectAllowEntry>) -> ConnectPolicy {
+            ConnectPolicy::Enabled(ConnectAcl {
+                loaded_from: std::path::PathBuf::from("/test/connect-acl.toml"),
+                loaded_at_unix_ms: 0,
+                allow: entries,
+                owner_allow: Vec::new(),
+                grant_allow: Vec::new(),
+            })
+        }
+
+        fn listed(agent: AgentId, machine: MachineId) -> ConnectAllowEntry {
+            ConnectAllowEntry {
+                description: None,
+                agent_id: agent,
+                machine_id: machine,
+                targets: vec!["127.0.0.1:22".parse().expect("addr")],
+            }
+        }
+
+        // WHY (a): a stranger holding a live Call grant for the callee rings
+        // without a contact entry. The control shows the same caller with
+        // no grant is refused on trust, so the admit comes from the grant.
+        // Fails if `call_gate_inbound` stops passing the caller to the
+        // Call-grant promotion (it would be refused `Untrusted`).
+        #[tokio::test]
+        async fn call_grantee_is_admitted() {
+            let w = World::new().await;
+            let now = real_now();
+            let none = w.daemon(&[]).await;
+            assert_eq!(
+                w.ring(&none, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted),
+                "control: an ungranted stranger fails on trust"
+            );
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            assert_eq!(w.ring(&trust, ConnectPolicy::default()).await, Ok(()));
+        }
+
+        // WHY (b): the same grantee is refused once owner A revokes the grant
+        // on x0x.revocation.v3, at the next evaluation and without restart.
+        #[tokio::test]
+        async fn call_grantee_is_refused_after_revocation() {
+            let w = World::new().await;
+            let now = real_now();
+            let grant = w.grant(vec![ShareCap::Call], now - 60, now + 3_600);
+            let trust = w.daemon(std::slice::from_ref(&grant)).await;
+            assert_eq!(
+                w.ring(&trust, ConnectPolicy::default()).await,
+                Ok(()),
+                "control: live grant admits"
+            );
+            w.revoke(&grant).await;
+            assert_eq!(
+                w.ring(&trust, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted)
+            );
+        }
+
+        // WHY (c): a Call grant that was live when accepted but whose expiry
+        // has passed confers nothing — the grantee is refused on trust.
+        #[tokio::test]
+        async fn call_grantee_is_refused_after_expiry() {
+            let w = World::new().await;
+            let now = real_now();
+            let live = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            assert_eq!(
+                w.ring(&live, ConnectPolicy::default()).await,
+                Ok(()),
+                "control: the same grantee with a live grant is admitted"
+            );
+            let expired = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 7_200, now - 60)])
+                .await;
+            assert_eq!(
+                w.ring(&expired, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted)
+            );
+        }
+
+        // WHY (d): only the Call cap rings. A live Dm-only grant (proved
+        // live by its `dm` access) is refused, so the promotion is keyed on
+        // `Call`, not on "holds any grant".
+        #[tokio::test]
+        async fn dm_only_grant_is_refused() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Dm], now - 60, now + 3_600)])
+                .await;
+            let access = trust
+                .grant_access(&w.contacts, &w.cache, &w.revocations, &w.b1, &w.mb)
+                .await;
+            assert!(access.dm && !access.call, "control: the Dm grant is live");
+            assert_eq!(
+                w.ring(&trust, ConnectPolicy::default()).await,
+                Err(CallRefusal::Untrusted)
+            );
+        }
+
+        // WHY (e): a Call grant is not an ACL bypass. With the connect ACL
+        // Enabled and B1 unlisted, the grantee is refused `NotInConnectAcl`;
+        // pair-listing B1 (control) admits it, and the listing alone without
+        // the grant still fails on trust.
+        #[tokio::test]
+        async fn call_grant_does_not_override_acl_denial() {
+            let w = World::new().await;
+            let now = real_now();
+            let trust = w
+                .daemon(&[w.grant(vec![ShareCap::Call], now - 60, now + 3_600)])
+                .await;
+            let other = AgentKeypair::generate().expect("other").agent_id();
+            assert_eq!(
+                w.ring(&trust, acl(vec![listed(other, w.mb)])).await,
+                Err(CallRefusal::NotInConnectAcl)
+            );
+            assert_eq!(
+                w.ring(&trust, acl(vec![listed(w.b1, w.mb)])).await,
+                Ok(()),
+                "control: a listed grantee is admitted"
+            );
+            let none = w.daemon(&[]).await;
+            assert_eq!(
+                w.ring(&none, acl(vec![listed(w.b1, w.mb)])).await,
+                Err(CallRefusal::Untrusted),
+                "control: listing alone does not replace trust or the grant"
+            );
+        }
     }
 }

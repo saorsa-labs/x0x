@@ -111,7 +111,8 @@ pub enum ShareCap {
     /// The grantee may seed groups for shared agents without a contact
     /// entry. Never satisfies `GroupAdmission::OwnerCertified` (Home).
     GroupInvite,
-    /// ADR-0073 calling. Carried and signed; not yet enforced anywhere.
+    /// ADR-0073 calling: the holder may ring the granted agents (inbound
+    /// call gate only, `Agent::call_gate_inbound`; opens no stream).
     Call,
 }
 
@@ -732,7 +733,7 @@ pub struct GrantAccess {
     pub connect_ports: BTreeSet<u16>,
     /// `GroupInvite`: groups may be seeded without a contact entry.
     pub group_invite: bool,
-    /// `Call` (ADR-0073): carried, not yet enforced.
+    /// `Call` (ADR-0073): the inbound call gate admits the caller (#980).
     pub call: bool,
 }
 
