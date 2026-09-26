@@ -3817,6 +3817,34 @@ pub(crate) async fn persist_share_grant_revocations(
     }
 }
 
+/// Durable write of `revocations-v3.bin` (temp, fsync, rename, dir fsync;
+/// mode 0600) for a LOCAL revocation, whose caller must not report success
+/// unless the revocation will survive a restart (#926). `Ok` when there is
+/// no identity directory to write to (an in-memory agent).
+///
+/// # Errors
+/// Encoding or writing failed.
+pub(crate) async fn persist_share_grant_revocations_durable(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+) -> std::result::Result<(), String> {
+    let Some(dir) = identity_dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(storage::x0x_home_dir)
+    else {
+        return Ok(());
+    };
+    let bytes = revocation_set
+        .read()
+        .await
+        .to_bytes_v3()
+        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
+    let path = dir.join(SHARE_GRANT_REVOCATIONS_FILE);
+    storage::write_private_bytes_durable(&path, bytes)
+        .await
+        .map_err(|e| format!("revocations-v3 write {}: {e}", path.display()))
+}
+
 struct RawDirectDelivery {
     sender: identity::AgentId,
     machine_id: identity::MachineId,

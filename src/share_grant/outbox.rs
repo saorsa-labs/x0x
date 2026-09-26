@@ -33,30 +33,46 @@
 //!
 //! # Bounds
 //!
-//! At most [`MAX_OUTBOX_ENTRIES_PER_RECIPIENT`] entries per recipient agent
-//! (a grantee's agent or a shared agent's daemon) and
-//! [`MAX_OUTBOX_ENTRIES`] in total. Past a bound a new entry is refused (the
+//! At most [`MAX_OUTBOX_ENTRIES_PER_GRANTEE`] entries across all grants to
+//! one grantee (the grant's `Grantee::User` or `Grantee::Agent`, whichever
+//! agents the entries are addressed to) and [`MAX_OUTBOX_ENTRIES`] in total. Past a bound a new entry is refused (the
 //! `POST /grants` response then reports it as not queued) rather than
 //! evicting an older obligation silently. Each pass sends at most
 //! [`OUTBOX_MAX_SENDS_PER_STEP`] entries, so an offline peer cannot turn the
 //! outbox into a hot send loop.
+//!
+//! # Revocation is serialized with sending
+//!
+//! A worker pass holds the outbox's send gate (shared) from its revocation
+//! check until its sends have completed; a local revocation takes the gate
+//! exclusively ([`GrantRedeliveryOutbox::revocation_barrier`]) before it
+//! records the revocation. So once a revocation has been recorded no pass
+//! can start a send of that grant, and a send already in flight when the
+//! revoke began completes BEFORE the revoke returns (it is ordered before
+//! the revocation, exactly like a delivery at issue time).
 //!
 //! # Storage
 //!
 //! `X0GO` magic ‖ strict bincode, written durably (temp, fsync, rename, dir
 //! fsync) with mode 0600, like the grant store. Every stored grant is
 //! re-verified on load and must be signed by this install's owner. An
-//! unreadable or malformed file yields an empty outbox that refuses writes,
-//! so the file is never silently replaced.
+//! unreadable, malformed or over-bound file — including an entry that no
+//! longer verifies or is not this owner's — yields an empty outbox that
+//! refuses writes ([`GrantRedeliveryOutbox::load_error`]), so the file is
+//! never silently truncated or replaced. Only entries past their deadline
+//! are dropped on load, as the lifecycle rules say. A failed write marks the
+//! outbox dirty; the next mutation (including a retried revocation) rewrites
+//! it even if it changes nothing in memory.
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use super::{ShareGrant, ShareGrantError};
+use super::{Grantee, ShareGrant, ShareGrantError};
 use crate::identity::{AgentId, UserId};
 use crate::revocation::RevocationSet;
 
@@ -68,8 +84,10 @@ const OUTBOX_MAGIC: &[u8; 4] = b"X0GO";
 /// Hard bound on queued deliveries across all recipients.
 pub const MAX_OUTBOX_ENTRIES: usize = 1024;
 
-/// Hard bound on queued deliveries to one recipient agent.
-pub const MAX_OUTBOX_ENTRIES_PER_RECIPIENT: usize = 32;
+/// Hard bound on queued deliveries across all grants to one grantee. Large
+/// enough for one grant's full fan-out (up to [`super::MAX_GRANT_AGENTS`]
+/// shared agents plus the grantee's own agents).
+pub const MAX_OUTBOX_ENTRIES_PER_GRANTEE: usize = 128;
 
 /// An entry is dropped this long after it was queued even if its grant is
 /// still valid (the owner can re-issue).
@@ -127,10 +145,10 @@ pub enum OutboxError {
     /// deadline.
     #[error("grant not queueable: {0}")]
     NotQueueable(String),
-    /// The recipient already has [`MAX_OUTBOX_ENTRIES_PER_RECIPIENT`]
+    /// The grant's grantee already has [`MAX_OUTBOX_ENTRIES_PER_GRANTEE`]
     /// entries.
-    #[error("redelivery outbox full for this recipient")]
-    RecipientFull,
+    #[error("redelivery outbox full for this grantee")]
+    GranteeFull,
     /// The outbox holds [`MAX_OUTBOX_ENTRIES`] entries.
     #[error("redelivery outbox full")]
     Full,
@@ -169,6 +187,12 @@ pub struct GrantRedeliveryOutbox {
     write_lock: tokio::sync::Mutex<()>,
     load_error: Option<String>,
     wake: tokio::sync::Notify,
+    /// Shared by a worker pass from revocation check to send completion;
+    /// exclusive for a local revocation (see the module docs).
+    send_gate: RwLock<()>,
+    /// The last write failed: the file may hold entries memory no longer
+    /// has, so the next mutation must rewrite it.
+    dirty: AtomicBool,
 }
 
 impl GrantRedeliveryOutbox {
@@ -182,14 +206,17 @@ impl GrantRedeliveryOutbox {
             write_lock: tokio::sync::Mutex::new(()),
             load_error: None,
             wake: tokio::sync::Notify::new(),
+            send_gate: RwLock::new(()),
+            dirty: AtomicBool::new(false),
         }
     }
 
-    /// Load `path` (missing ⇒ empty). Each entry is re-verified: a grant
-    /// that no longer verifies, is not signed by `local_owner`, or whose
-    /// deadline has passed at `now_unix` is dropped. An unreadable,
-    /// malformed or over-bound file yields an empty outbox that refuses
-    /// writes ([`Self::load_error`]).
+    /// Load `path` (missing ⇒ empty). Entries whose deadline has passed at
+    /// `now_unix` are dropped. Anything else wrong — unreadable, malformed,
+    /// a duplicate key, an entry that no longer verifies or is not signed
+    /// by `local_owner`, or a total or per-grantee bound exceeded — yields
+    /// an empty outbox that refuses writes ([`Self::load_error`]); nothing
+    /// is ever silently dropped from a file that could then be rewritten.
     pub async fn load(path: PathBuf, local_owner: Option<UserId>, now_unix: u64) -> Self {
         let mut outbox = Self::in_memory(local_owner);
         outbox.path = Some(path.clone());
@@ -217,25 +244,9 @@ impl GrantRedeliveryOutbox {
             )),
             other => other,
         };
+        let file = file.and_then(|file| outbox.validate_loaded(file, now_unix, &path));
         match file {
-            Ok(file) => {
-                let mut entries = BTreeMap::new();
-                for entry in file.entries {
-                    if outbox.queueable(&entry.grant).is_err()
-                        || now_unix >= entry.deadline
-                        || entry.deadline > entry.grant.expiry
-                    {
-                        continue;
-                    }
-                    let per_recipient = entries
-                        .keys()
-                        .filter(|(_, r): &&EntryKey| *r == entry.recipient.0)
-                        .count();
-                    if per_recipient >= MAX_OUTBOX_ENTRIES_PER_RECIPIENT {
-                        continue;
-                    }
-                    entries.insert(key_of(&entry.grant.grant_id, &entry.recipient), entry);
-                }
+            Ok(entries) => {
                 outbox.entries = std::sync::Mutex::new(entries);
             }
             Err(e) => {
@@ -244,6 +255,63 @@ impl GrantRedeliveryOutbox {
             }
         }
         outbox
+    }
+
+    /// Check every loaded entry (see [`Self::load`]); only past-deadline
+    /// entries are dropped.
+    fn validate_loaded(
+        &self,
+        file: OutboxFile,
+        now_unix: u64,
+        path: &std::path::Path,
+    ) -> Result<BTreeMap<EntryKey, PendingGrantDelivery>, String> {
+        let mut entries = BTreeMap::new();
+        let mut expired = 0usize;
+        for entry in file.entries {
+            if let Err(e) = self.queueable(&entry.grant) {
+                return Err(format!("{}: {e}", path.display()));
+            }
+            if entry.deadline > entry.grant.expiry {
+                return Err(format!(
+                    "{}: entry deadline beyond its grant's expiry",
+                    path.display()
+                ));
+            }
+            if now_unix >= entry.deadline {
+                expired += 1;
+                continue;
+            }
+            let key = key_of(&entry.grant.grant_id, &entry.recipient);
+            if entries.insert(key, entry).is_some() {
+                return Err(format!("{}: duplicate entry", path.display()));
+            }
+        }
+        let mut per_grantee: std::collections::HashMap<Grantee, usize> =
+            std::collections::HashMap::new();
+        for entry in entries.values() {
+            let n = per_grantee.entry(entry.grant.grantee).or_insert(0);
+            *n += 1;
+            if *n > MAX_OUTBOX_ENTRIES_PER_GRANTEE {
+                return Err(format!(
+                    "{}: more than {MAX_OUTBOX_ENTRIES_PER_GRANTEE} entries for one grantee",
+                    path.display()
+                ));
+            }
+        }
+        if expired > 0 {
+            tracing::info!(
+                expired,
+                "share-grant outbox: dropped expired entries on load"
+            );
+        }
+        Ok(entries)
+    }
+
+    /// Exclusive side of the send gate. Hold it while recording a local
+    /// revocation and removing its entries: it waits for an in-flight pass
+    /// to finish its sends and keeps a new pass from starting.
+    pub async fn revocation_barrier(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.send_gate.write().await
     }
 
     /// Why the on-disk outbox is not in force, if it is not.
@@ -331,9 +399,12 @@ impl GrantRedeliveryOutbox {
                 return Ok(false);
             }
             entries.retain(|_, e| now_unix < e.deadline);
-            let per_recipient = entries.keys().filter(|(_, r)| *r == recipient.0).count();
-            if per_recipient >= MAX_OUTBOX_ENTRIES_PER_RECIPIENT {
-                return Err(OutboxError::RecipientFull);
+            let per_grantee = entries
+                .values()
+                .filter(|e| e.grant.grantee == grant.grantee)
+                .count();
+            if per_grantee >= MAX_OUTBOX_ENTRIES_PER_GRANTEE {
+                return Err(OutboxError::GranteeFull);
             }
             if entries.len() >= MAX_OUTBOX_ENTRIES {
                 return Err(OutboxError::Full);
@@ -364,9 +435,10 @@ impl GrantRedeliveryOutbox {
     /// Returns how many entries were removed.
     ///
     /// # Errors
-    /// The outbox could not be rewritten. The entries are still gone from
-    /// memory, and every worker pass re-checks revocation before sending,
-    /// so a stale file never leads to a delivery.
+    /// The outbox could not be rewritten (fatal for the caller: a revoke
+    /// must not report success). The entries are gone from memory, the
+    /// outbox stays dirty so a retry rewrites the file, and every worker
+    /// pass re-checks revocation before sending.
     pub async fn remove_grant(&self, grant_id: &[u8; 32]) -> Result<usize, OutboxError> {
         let _write = self.write_lock.lock().await;
         let removed = {
@@ -375,7 +447,7 @@ impl GrantRedeliveryOutbox {
             entries.retain(|(id, _), _| id != grant_id);
             before - entries.len()
         };
-        if removed > 0 {
+        if removed > 0 || self.dirty.load(Ordering::Acquire) {
             self.persist().await.map_err(OutboxError::Store)?;
         }
         Ok(removed)
@@ -404,6 +476,9 @@ impl GrantRedeliveryOutbox {
 
     /// One worker pass at `now_unix`.
     ///
+    /// Holds the send gate (shared) throughout, so a local revocation is
+    /// ordered strictly before or after this pass's sends.
+    ///
     /// 1. Drop entries that are revoked in `revocations` or past their
     ///    deadline — they are never sent.
     /// 2. Send at most [`OUTBOX_MAX_SENDS_PER_STEP`] due entries, oldest
@@ -428,6 +503,7 @@ impl GrantRedeliveryOutbox {
         if now_unix == 0 {
             return report;
         }
+        let _gate = self.send_gate.read().await;
         // 1. Drop dead entries.
         let snapshot = self.pending();
         let dead: Vec<EntryKey> = {
@@ -521,6 +597,12 @@ impl GrantRedeliveryOutbox {
 
     /// Write the outbox atomically (mode 0600). Callers hold `write_lock`.
     async fn persist(&self) -> Result<(), String> {
+        let result = self.write_file().await;
+        self.dirty.store(result.is_err(), Ordering::Release);
+        result
+    }
+
+    async fn write_file(&self) -> Result<(), String> {
         let Some(path) = &self.path else {
             return Ok(());
         };

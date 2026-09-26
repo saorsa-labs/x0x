@@ -12,9 +12,13 @@ All notable changes to this project will be documented in this file.
   backoff (5 s doubling to 5 min), and at once when the recipient's machine
   connects again, until the recipient ACKs. An entry is dropped on ACK, on
   revocation (checked before every send) or at its deadline: the grant's
-  expiry or 7 days after queueing. Bounds: 32 entries per recipient, 1024 in
-  total; past a bound the entry is refused and reported. `POST /grants`
-  delivery rows gain `queued`. No wire change: retries re-send the #924
+  expiry or 7 days after queueing. Bounds: 128 entries per grantee, 1024 in
+  total; past a bound the entry is refused and reported, and an over-bound
+  file loads fail-closed rather than truncated. `POST /grants` delivery rows
+  gain `queued`; `GET /grants` reports `outbox_error`. `DELETE /grants/:id`
+  is serialized with in-flight redeliveries and now answers `503` unless
+  both `revocations-v3.bin` (now written durably) and the outbox removal
+  are durable (retry is idempotent). No wire change: retries re-send the #924
   typed DM with the same logical request id, so the receiving side is
   unchanged.
 
