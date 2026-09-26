@@ -1870,7 +1870,16 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "grant issue",
         description: "Sign a share grant with the owner key, store it, and deliver it by durable DM",
         category: "grants",
-        request: RequestSpec::Passthrough,
+        request: RequestSpec::Fields(&[
+            RequestField::body_json_doc("grantee_user", false),
+            RequestField::body_json_doc("grantee_agent", false),
+            RequestField::body_json_doc("agents", true),
+            RequestField::body_json_doc("caps", true),
+            RequestField::body_json_doc("not_before", false),
+            RequestField::body_json_doc("expiry", false),
+            RequestField::body_json_doc("ttl_secs", false),
+            RequestField::body_json_doc("deliver_to", false),
+        ]),
     },
     EndpointDef {
         method: Method::Delete,

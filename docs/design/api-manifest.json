@@ -3328,7 +3328,57 @@
       "method": "POST",
       "path": "/grants",
       "request": {
-        "kind": "passthrough"
+        "fields": [
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "grantee_user",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "grantee_agent",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "agents",
+            "required": true
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "caps",
+            "required": true
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "not_before",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "expiry",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "ttl_secs",
+            "required": false
+          },
+          {
+            "cli": "json-doc",
+            "in": "body",
+            "name": "deliver_to",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
