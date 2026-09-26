@@ -1120,11 +1120,11 @@ pub(in crate::server) enum JoinResultMessage {
 pub(in crate::server) enum JoinRefusalReason {
     InviteSecretUnknown,
     InviteSecretConsumed,
-    /// #908/R17 Home blocker: a member's committed certificate digest
-    /// never hydrated and the seal-time warranted fetch could not obtain
-    /// it from any peer (typically the certificate's owner offline and
-    /// no peer cached it). Definitive for THIS attempt: the joiner is
-    /// told instead of polling forever.
+    /// #946 r2 (item B): a member's committed certificate digest never
+    /// hydrated and the group-scoped fetch could not obtain it. RETRYABLE
+    /// FIRST — the joiner keeps retrying while the condition may still
+    /// converge; the typed refusal is staged only after
+    /// CERT_EVIDENCE_DEADLINE_MS of continuous unavailability.
     CertificateEvidenceUnavailable,
     InviteRoleExceedsCap,
     InviteEventBeforeCreation,
@@ -13764,7 +13764,14 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                     // event); route it to the real handler branches and
                     // continue the listener loop.
                     if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_DOMAIN) {
-                        handle_group_cert_fetch_request(&state_for_task, rest).await;
+                        handle_group_cert_fetch_request(
+                            &state_for_task,
+                            rest,
+                            Some(&sender),
+                            msg.verified,
+                            &task_group_id,
+                        )
+                        .await;
                         continue;
                     }
                     if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {

@@ -150,6 +150,7 @@ async fn owner_offline_seal_hydrates_from_a_members_cache() -> Result<()> {
     let pump_state = Arc::clone(&state);
     let owner_id = owner.user_id();
     let remote_cert_for_member = remote_cert.clone();
+    let pump_group_key = group_key.clone();
     let pump = tokio::spawn(async move {
         while let Some(msg) = sub.recv().await {
             if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_DOMAIN) {
@@ -169,7 +170,14 @@ async fn owner_offline_seal_hydrates_from_a_members_cache() -> Result<()> {
                         fetched_at_unix: 0,
                     })
                     .await;
-                handle_group_cert_fetch_request(&pump_state, rest).await;
+                handle_group_cert_fetch_request(
+                    &pump_state,
+                    rest,
+                    Some(&pump_state.agent.agent_id()),
+                    true,
+                    &pump_group_key,
+                )
+                .await;
             }
             if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {
                 handle_group_cert_fetch_response(&pump_state, rest).await;
@@ -281,7 +289,14 @@ async fn wrong_user_pair_is_rejected_and_refusal_is_retryable() -> Result<()> {
     })
     .expect("request json");
     assert!(
-        !seat_cert_fetch::handle_group_cert_fetch_request(&state, &request).await,
+        !seat_cert_fetch::handle_group_cert_fetch_request(
+            &state,
+            &request,
+            Some(&state.agent.agent_id()),
+            true,
+            &group_key,
+        )
+        .await,
         "the responder refuses a wrong-user pair"
     );
     // The seat is untouched and the seal still refuses; no typed refusal
@@ -385,6 +400,159 @@ async fn terminal_refusal_after_the_deadline() -> Result<()> {
         })
     };
     assert!(staged, "the typed refusal IS staged after the deadline");
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// C4: RETRYABLE-THEN-SUCCESS — the deadline stamp CLEARS on a successful
+/// hydrate (C3), so a later second gap starts a fresh window and never
+/// goes instantly terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_stamp_clears_on_success_so_rejoins_retry() -> Result<()> {
+    let plane = format!("r17v2-d-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let owner = x0x::identity::UserKeypair::generate().expect("owner key");
+    let remote_kp = x0x::identity::AgentKeypair::generate().expect("remote key");
+    let remote_cert =
+        x0x::identity::AgentCertificate::issue(&owner, &remote_kp).expect("remote cert");
+    let remote_hex = hex::encode(remote_kp.agent_id().as_bytes());
+    let remote_digest = seat_cert_digest_of(&remote_cert);
+    let group_key = r17_fixture(&state, &owner, &remote_hex, &remote_digest).await;
+    // An EXPIRED stamp (a past gap) exists; a successful response for the
+    // group must clear it (C3).
+    state
+        .cert_unresolvable_since
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            format!("{group_key}:{remote_hex}"),
+            now_millis_u64().saturating_sub(11 * 60_000),
+        );
+    use base64::Engine as _;
+    let cert_json = serde_json::to_vec(&remote_cert).expect("cert json");
+    let response = seat_cert_fetch::GroupCertFetchResponse {
+        group_id: group_key.clone(),
+        cert_digest: remote_digest.clone(),
+        cert_json_b64: base64::engine::general_purpose::STANDARD.encode(cert_json),
+    };
+    let raw = serde_json::to_vec(&response).expect("response json");
+    assert!(
+        seat_cert_fetch::handle_group_cert_fetch_response(&state, &raw).await,
+        "the real response branch hydrates and clears the stamps"
+    );
+    let cleared = {
+        let since = state
+            .cert_unresolvable_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        since.is_empty()
+    };
+    assert!(cleared, "the deadline stamp is cleared on success (C3)");
+    // And the SAME backdated refusal NOW stages nothing until a fresh
+    // 10-minute window elapses (the stamp is gone).
+    let err = x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
+        group_id: group_key.clone(),
+        members: vec![remote_hex.clone()],
+    };
+    stage_refusal_if_certificates_unobtainable(
+        &state,
+        &group_key,
+        &remote_hex,
+        &NamedGroupMetadataEvent::GroupDeleted {
+            group_id: group_key.clone(),
+            revision: 1,
+            actor: remote_hex.clone(),
+            commit: None,
+        },
+        &err,
+    )
+    .await;
+    let staged = {
+        let refusals = state
+            .pending_join_refusals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        refusals
+            .values()
+            .any(|p| p.receipt.reason == JoinRefusalReason::CertificateEvidenceUnavailable)
+    };
+    assert!(!staged, "a fresh window starts retryable — nothing staged");
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// C1: the responder ignores UNVERIFIED senders and senders who are NOT
+/// active roster members of the topic's group, and a request whose
+/// group id does not match the topic's group is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn responder_refuses_unverified_foreign_and_mismatched_requests() -> Result<()> {
+    let plane = format!("r17v2-e-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let owner = x0x::identity::UserKeypair::generate().expect("owner key");
+    let remote_kp = x0x::identity::AgentKeypair::generate().expect("remote key");
+    let remote_cert =
+        x0x::identity::AgentCertificate::issue(&owner, &remote_kp).expect("remote cert");
+    let remote_hex = hex::encode(remote_kp.agent_id().as_bytes());
+    let remote_digest = seat_cert_digest_of(&remote_cert);
+    let group_key = r17_fixture(&state, &owner, &remote_hex, &remote_digest).await;
+    // Seed the cache so ONLY the C1 gates can refuse.
+    let pair = (Some(owner.user_id()), Some(remote_cert.clone()));
+    let pair_digest = x0x::announce_v3::cert_digest(&pair.0, &pair.1);
+    state
+        .agent
+        .announce_blob_cache
+        .insert_verified(x0x::announce_blob::CachedBlob {
+            digest: pair_digest,
+            payload_version: 1,
+            user_id: pair.0,
+            agent_certificate: pair.1,
+            fetched_at_unix: 0,
+        })
+        .await;
+    let request = serde_json::to_vec(&seat_cert_fetch::GroupCertFetchRequest {
+        group_id: group_key.clone(),
+        cert_digest: remote_digest.clone(),
+        requester: hex::encode(state.agent.agent_id().as_bytes()),
+    })
+    .expect("request json");
+    let local = state.agent.agent_id();
+    // Unverified sender.
+    assert!(
+        !seat_cert_fetch::handle_group_cert_fetch_request(
+            &state,
+            &request,
+            Some(&local),
+            false,
+            &group_key
+        )
+        .await,
+        "unverified senders are ignored"
+    );
+    // Verified but NOT a roster member (a stranger).
+    let stranger = x0x::identity::AgentKeypair::generate().expect("stranger");
+    assert!(
+        !seat_cert_fetch::handle_group_cert_fetch_request(
+            &state,
+            &request,
+            Some(&stranger.agent_id()),
+            true,
+            &group_key
+        )
+        .await,
+        "non-roster senders are ignored"
+    );
+    // Group id does not match the topic's group.
+    assert!(
+        !seat_cert_fetch::handle_group_cert_fetch_request(
+            &state,
+            &request,
+            Some(&local),
+            true,
+            "some-other-group"
+        )
+        .await,
+        "a request for a foreign group id on this topic is ignored"
+    );
     state.agent.shutdown().await;
     Ok(())
 }

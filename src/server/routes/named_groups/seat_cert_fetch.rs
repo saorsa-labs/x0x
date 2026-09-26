@@ -43,6 +43,8 @@ pub(in crate::server) const CERT_FETCH_REQUESTED_TTL_MS: u64 = 60_000;
 pub(in crate::server) const CERT_FETCH_ANSWER_INTERVAL_MS: u64 = 30_000;
 /// Responder: how long a failed roster/cache lookup is negatively cached.
 pub(in crate::server) const CERT_FETCH_MISS_TTL_MS: u64 = 60_000;
+/// C5: absolute cap on the (attacker-keyed) responder cache map.
+pub(in crate::server) const CERT_FETCH_CACHE_MAX_ENTRIES: usize = 4096;
 /// Item B: how long a certificate-unobtainable seal refusal stays
 /// RETRYABLE before the typed (terminal) refusal is staged.
 pub(in crate::server) const CERT_EVIDENCE_DEADLINE_MS: u64 = 10 * 60_000;
@@ -127,14 +129,25 @@ pub(in crate::server) fn publish_group_cert_fetch(
 pub(in crate::server) async fn handle_group_cert_fetch_request(
     state: &std::sync::Arc<AppState>,
     raw: &[u8],
+    sender: Option<&crate::identity::AgentId>,
+    verified: bool,
+    topic_group_key: &str,
 ) -> bool {
     let Ok(request) = serde_json::from_slice::<GroupCertFetchRequest>(raw) else {
         return false;
     };
+    // C1 (security): unverified senders are ignored outright.
+    if !verified {
+        return false;
+    }
+    let Some(sender) = sender else {
+        return false;
+    };
     let now = std::time::Instant::now();
     // Resolve the group (both spellings) and validate the requester's
-    // target against the CURRENT owner-signed roster, all under one read.
-    let (metadata_topic, owner_user, member_agent_hex, cert) = {
+    // target against the CURRENT owner-signed roster, all under one read;
+    // the lock is released BEFORE the cache hash scan (C5).
+    let (metadata_topic, owner_user, member_agent_hex) = {
         let groups = state.named_groups.read().await;
         let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, &request.group_id)
         else {
@@ -143,71 +156,78 @@ pub(in crate::server) async fn handle_group_cert_fetch_request(
         if info.withdrawn {
             return false;
         }
-        // (2) our own agent must be an ACTIVE ROSTER member of this group.
+        // C1: the request's group id must BE the topic's group (the
+        // stable id may spell differently than the map key, so compare
+        // stable ids), and the SENDER must be an ACTIVE ROSTER member of
+        // this same group — a stranger relaying a request onto the topic
+        // gets nothing.
+        let Some(topic_info) = groups.get(topic_group_key) else {
+            return false;
+        };
+        if info.stable_group_id() != topic_info.stable_group_id() {
+            return false;
+        }
+        let sender_hex = hex::encode(sender.as_bytes());
+        if !info.has_active_member(&sender_hex) {
+            return false;
+        }
+        // (2) our own agent must be an ACTIVE ROSTER member of this group
+        // (we only answer for groups we are in).
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         if !info.has_active_member(&local_hex) {
             return false;
         }
         // (3) the digest must be in the CURRENT roster, and identify
-        // exactly the member seat it belongs to.
+        // exactly the member seat it belongs to. C5: the negative cache
+        // fires BEFORE any hash scan.
         let Some(owner) = info.policy.admission.owner_certified_user_id().copied() else {
             return false;
         };
-        let mut member_for_digest: Option<String> = None;
-        for seat in info.members_v2.values() {
-            if seat.certificate_digest.as_deref() == Some(&request.cert_digest) {
-                member_for_digest = Some(seat.agent_id.clone());
-                break;
-            }
-        }
-        let Some(member_agent_hex) = member_for_digest else {
+        let Some(member_agent_hex) = info.members_v2.values().find_map(|seat| {
+            (seat.certificate_digest.as_deref() == Some(&request.cert_digest))
+                .then(|| seat.agent_id.clone())
+        }) else {
             record_responder_miss(state, &request.group_id, &request.cert_digest, now);
             return false;
         };
-        // (4) a VERIFIED cached pair whose certificate hashes to the
-        // digest.
-        let Ok(digest_bytes) = hex::decode(&request.cert_digest) else {
-            return false;
-        };
-        let Ok(digest_arr): Result<[u8; 32], _> = <[u8; 32]>::try_from(digest_bytes) else {
-            return false;
-        };
-        let Some(blob) = state
-            .agent
-            .announce_blob_cache
-            .find_by_cert_digest(&digest_arr)
-            .await
-        else {
-            record_responder_miss(state, &request.group_id, &request.cert_digest, now);
-            return false;
-        };
-        let Some(cert) = blob.agent_certificate.as_ref() else {
-            record_responder_miss(state, &request.group_id, &request.cert_digest, now);
-            return false;
-        };
-        // Item C: the pair's user must be the group's OWNER user, and the
-        // certificate must bind the roster member the digest belongs to.
-        if blob.user_id.as_ref() != Some(&owner)
-            || !cert
-                .agent_id()
-                .is_ok_and(|id| hex::encode(id.as_bytes()) == member_agent_hex)
-        {
-            tracing::debug!(
-                group_id = %LogHexId::group(&request.group_id),
-                "#946: cached pair for a roster digest fails the owner/binding check; not served"
-            );
-            record_responder_miss(state, &request.group_id, &request.cert_digest, now);
-            return false;
-        }
-        (
-            info.metadata_topic.clone(),
-            owner,
-            member_agent_hex,
-            cert.clone(),
-        )
+        (info.metadata_topic.clone(), owner, member_agent_hex)
     };
-    let _ = owner_user;
-    let _ = member_agent_hex;
+    // (4) a VERIFIED cached pair whose certificate hashes to the digest —
+    // scanned with NO named_groups lock held (C5).
+    let Ok(digest_bytes) = hex::decode(&request.cert_digest) else {
+        return false;
+    };
+    let Ok(digest_arr): Result<[u8; 32], _> = <[u8; 32]>::try_from(digest_bytes) else {
+        return false;
+    };
+    let blob = state
+        .agent
+        .announce_blob_cache
+        .find_by_cert_digest(&digest_arr)
+        .await;
+    let Some(blob) = blob else {
+        record_responder_miss(state, &request.group_id, &request.cert_digest, now);
+        return false;
+    };
+    let Some(cert) = blob.agent_certificate.as_ref() else {
+        record_responder_miss(state, &request.group_id, &request.cert_digest, now);
+        return false;
+    };
+    // Item C: the pair's user must be the group's OWNER user, and the
+    // certificate must bind the roster member the digest belongs to.
+    if blob.user_id.as_ref() != Some(&owner_user)
+        || !cert
+            .agent_id()
+            .is_ok_and(|id| hex::encode(id.as_bytes()) == member_agent_hex)
+    {
+        tracing::debug!(
+            group_id = %LogHexId::group(&request.group_id),
+            "#946: cached pair for a roster digest fails the owner/binding check; not served"
+        );
+        record_responder_miss(state, &request.group_id, &request.cert_digest, now);
+        return false;
+    }
+    let cert = cert.clone();
     // Responder rate limit: 1 answer per digest per interval per group.
     {
         let key = format!("{}\u{0}{}", request.group_id, request.cert_digest);
@@ -268,6 +288,22 @@ fn record_responder_miss(state: &AppState, group_id: &str, digest: &str, now: st
         .cert_fetch_answered
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // C5: the map is ATTACKER-KEYED (a stranger can request arbitrary
+    // digests) — sweep expired entries on every insert so it stays
+    // bounded by the live universe, and cap it absolutely.
+    answered.retain(|_, at| {
+        let elapsed_ms = now.duration_since(*at).as_millis() as u64;
+        elapsed_ms < CERT_FETCH_MISS_TTL_MS
+    });
+    if answered.len() >= CERT_FETCH_CACHE_MAX_ENTRIES && !answered.contains_key(&key) {
+        if let Some(oldest) = answered
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(k, _)| k.clone())
+        {
+            answered.remove(&oldest);
+        }
+    }
     answered.insert(key, now);
 }
 
@@ -346,6 +382,18 @@ pub(in crate::server) async fn handle_group_cert_fetch_response(
         };
     match super::persist_named_groups_mutation(state, mutate).await {
         Ok(super::AtomicWriteOutcome::Durable) => {
+            // C3: the unavailability is OVER — clear the retryable-refusal
+            // deadline stamp for this group so a LATER gap (or a rejoin)
+            // starts a fresh 10-minute window instead of going instantly
+            // terminal.
+            {
+                let mut since = state
+                    .cert_unresolvable_since
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let prefix = format!("{}:", response.group_id);
+                since.retain(|k, _| !k.starts_with(&prefix));
+            }
             // The hydrate persisted; clear the requester's negative mark
             // so nothing delays a later re-request for other seats.
             state
