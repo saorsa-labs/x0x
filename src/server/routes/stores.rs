@@ -648,10 +648,10 @@ pub(in crate::server) async fn put_kv_value(
             // DM direct-delivery side channel. #976 ruling: the fallback
             // runs on the UNPUBLISHED path too — congested gossip is
             // exactly what it exists for.
-            let mut direct_delivered = 0usize;
+            let mut direct_attempted = 0usize;
             if !handle.is_encrypted().await && !handle.is_group_signed().await {
                 let recipients = kv_store_delta_direct_recipients(&state).await;
-                direct_delivered = recipients.len();
+                direct_attempted = recipients.len();
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
             // #849: a SelfKeyed put can evict the writer's lex-highest keys
@@ -681,7 +681,7 @@ pub(in crate::server) async fn put_kv_value(
                         "ok": true,
                         "published": false,
                         "reason": publish_error,
-                        "direct_delivered": direct_delivered,
+                        "direct_attempted": direct_attempted,
                         "evicted_keys": evicted_keys,
                     })),
                 )

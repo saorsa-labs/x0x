@@ -18180,12 +18180,6 @@ impl KvStoreHandle {
         self.sync.fail_next_publish_for_test();
     }
 
-    /// #976 test hook: how many deltas await re-publish.
-    #[cfg(test)]
-    pub(crate) async fn pending_republish_len_for_test(&self) -> usize {
-        self.sync.pending_republish_len().await
-    }
-
     #[cfg(test)]
     pub(crate) async fn with_persist_gate_held_for_test<F: std::future::Future>(
         &self,
@@ -18605,26 +18599,78 @@ impl KvStoreHandle {
                  local writes refused until a snapshot succeeds"
             )))
         })?;
+        // #976 r3: an identical AppendOnly re-put is a no-op for the
+        // STORE but still RE-ANNOUNCES this entry — through the NORMAL
+        // publish_delta path (sealed, #973-gated), with NO store write
+        // lock held across the send. The entry + a fresh wire tag are
+        // captured under the lock; the publish runs after it drops.
+        let noop_republish: Option<(kv::KvStoreDelta, u64)> = {
+            let store = self.sync.write().await;
+            let would_mutate =
+                Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
+            let version_before = store.current_version();
+            if !would_mutate {
+                let Some(entry) = store.get(&key).cloned() else {
+                    return Ok(KvPutOutcome {
+                        delta: kv::KvStoreDelta::new(version_before),
+                        evicted_keys: Vec::new(),
+                        published: true,
+                        publish_error: None,
+                    });
+                };
+                let Ok(seq) = store.reserve_sequences(1) else {
+                    return Ok(KvPutOutcome {
+                        delta: kv::KvStoreDelta::new(version_before),
+                        evicted_keys: Vec::new(),
+                        published: false,
+                        publish_error: Some("sequence reservation failed".to_string()),
+                    });
+                };
+                Some((
+                    kv::KvStoreDelta::for_put(
+                        key.clone(),
+                        entry,
+                        (self.peer_id, seq),
+                        version_before,
+                    ),
+                    version_before,
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((noop_delta, _version_before)) = noop_republish {
+            let (published, publish_error) = match self
+                .sync
+                .publish_delta(self.peer_id, noop_delta.clone())
+                .await
+            {
+                Ok(()) => (true, None),
+                Err(e) => {
+                    tracing::warn!("failed to re-announce append-only entry: {e}");
+                    (false, Some(format!("{e}")))
+                }
+            };
+            return Ok(KvPutOutcome {
+                delta: noop_delta,
+                evicted_keys: Vec::new(),
+                published,
+                publish_error,
+            });
+        }
         let (delta, evicted_keys) = {
             let mut store = self.sync.write().await;
             let would_mutate =
                 Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
             let version_before = store.current_version();
             if !would_mutate {
-                // #976 (F3): an identical AppendOnly re-put is a no-op for
-                // the STORE, but if a prior publish of this entry FAILED the
-                // retry must still RE-ANNOUNCE it — the queue holds the
-                // unpublished delta, and the retry drains it (publish_delta
-                // retries the queue at its head).
-                self.sync.retry_pending_republish(self.peer_id).await;
-                let pending = self.sync.pending_republish_len().await;
+                // Unreachable for AppendOnly (handled above); kept for any
+                // policy whose preflight reports a no-op here.
                 return Ok(KvPutOutcome {
                     delta: kv::KvStoreDelta::new(version_before),
                     evicted_keys: Vec::new(),
-                    published: pending == 0,
-                    publish_error: (pending > 0).then(|| {
-                        "prior publish still failing; delta remains queued for retry".to_string()
-                    }),
+                    published: true,
+                    publish_error: None,
                 });
             }
             let first_seq = store.reserve_sequences(2).map_err(|e| {
@@ -18722,7 +18768,6 @@ impl KvStoreHandle {
                 Ok(()) => (true, None),
                 Err(e) => {
                     tracing::warn!("failed to publish kv put delta: {e}");
-                    self.sync.queue_republish(delta.clone()).await;
                     (false, Some(format!("{e}")))
                 }
             };
@@ -18828,7 +18873,6 @@ impl KvStoreHandle {
         // persisted — a CRDT remove cannot be unwound either).
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv remove delta: {e}");
-            self.sync.queue_republish(delta.clone()).await;
         }
         Ok(delta)
     }
