@@ -1454,6 +1454,7 @@ mod tests {
                 let payload = bincode::serialize(&vec![record]).expect("encode");
                 assert!(
                     crate::ingest_share_grant_revocations(
+                        &crate::owner_trust::OwnerTrust::default(),
                         &self.revocations,
                         Some(self.dir.path().to_path_buf()),
                         &payload,

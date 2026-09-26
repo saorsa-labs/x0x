@@ -947,13 +947,16 @@ async fn relay_budget_charges_per_obligation_not_per_target() -> Result<()> {
     .expect("treekem dir exists");
 
     causal_relay_step(&state).await;
+    // #988 r3 (T2): a pruned/vanished obligation cannot masquerade as
+    // "16 targets remain" — require the obligation to exist (the old
+    // `unwrap_or_default` made an empty outbox pass this vacuously).
     let remaining = {
         let outbox = state.predecessor_relay_outbox.read().await;
-        outbox
+        let obligation = outbox
             .get(&group_id)
             .and_then(|l| l.first())
-            .map(|o| o.relay_targets.clone())
-            .unwrap_or_default()
+            .expect("the obligation must survive the pass");
+        obligation.relay_targets.clone()
     };
     assert_eq!(
         remaining.len(),
@@ -1324,30 +1327,34 @@ async fn slow_targets_do_not_serialise_the_fast_one() -> Result<()> {
     let started = std::time::Instant::now();
     causal_relay_step(&state).await;
     let elapsed = started.elapsed();
-    // The FAST target completed (removed from relay_targets).
+    // The FAST target completed (removed from relay_targets) and the
+    // obligation SURVIVES with EXACTLY the 8 slow targets left — a pruned
+    // or vanished obligation cannot masquerade as success (Rule 9: the old
+    // `unwrap_or_default` made an empty obligation pass vacuously).
     let remaining = {
         let outbox = state.predecessor_relay_outbox.read().await;
-        outbox
+        let obligations = outbox
             .get(&group_id)
-            .and_then(|l| l.first())
-            .map(|o| o.relay_targets.clone())
-            .unwrap_or_default()
+            .expect("the obligation must still exist after one pass");
+        let obligation = obligations
+            .first()
+            .expect("the obligation entry must still exist after one pass");
+        obligation.relay_targets.clone()
     };
-    assert!(!remaining.contains(&local_hex), "the fast target completed");
-    // Rule 9: serialised sends would take >= 8 attempt-timeouts BEFORE the
-    // fast one even starts. The bounded fan-out finishes the whole pass in
-    // about one timeout-wave (~8-16 s); allow generous margin either side.
+    assert_eq!(
+        remaining, slow,
+        "exactly the 8 withholding targets remain; the fast target discharged"
+    );
+    // Rule 9 wall clock, MEASURED and PROVEN discriminating: the concurrent
+    // fan-out finishes the whole pass in one timeout wave (8.09 s measured;
+    // bound = 2 × the 8 s attempt timeout), while a serialized loop pays
+    // 8 × 8 s = 64 s (64.10 s measured with buffer_unordered(1) — the
+    // mutation FAILS this test; see the r3 PR body). The bound sits between
+    // the two regimes with ~2× margin over the concurrent wave.
     assert!(
-        elapsed < std::time::Duration::from_secs(35),
+        elapsed < std::time::Duration::from_secs(16),
         "the pass completed without serialising behind the slow targets ({elapsed:?})"
     );
-    // HONEST LIMIT (documented in the PR body): in the isolated harness
-    // the withholding targets fail FAST (no mesh to await), so a wall-clock
-    // lower bound cannot discriminate serial vs concurrent here — the
-    // upper bound is kept as the regression guard, and the fast target's
-    // completion is the behavioral pin. A true two-daemon wall-clock pin
-    // needs the mesh harness.
-    let _ = elapsed;
     state.agent.shutdown().await;
     Ok(())
 }

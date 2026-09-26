@@ -128,6 +128,10 @@ async fn list_role(state: &AppState, role: GrantRole) -> Response {
             "ok": true,
             "grants": views,
             "store_error": store.load_error(),
+            "outbox_error": state
+                .agent
+                .share_grant_outbox()
+                .and_then(|outbox| outbox.load_error().map(str::to_string)),
         })),
     )
         .into_response()
@@ -221,7 +225,9 @@ pub(in crate::server) async fn grants_issue(
 }
 
 /// DELETE /grants/:id — revoke a grant with the owner key. Effective locally
-/// at once; gossiped on `x0x.revocation.v3` and persisted.
+/// at once; gossiped on `x0x.revocation.v3`. Answers success only once the
+/// revocation and the removal of the grant's queued redeliveries (#926) are
+/// durable; otherwise `503` (retry is idempotent).
 pub(in crate::server) async fn grants_revoke(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,
