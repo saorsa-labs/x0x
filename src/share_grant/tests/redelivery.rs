@@ -755,8 +755,7 @@ async fn assert_revoke_waits_for_in_flight_send<R>(
     );
 
     paused.release.notify_one();
-    let report = step.await;
-    assert_eq!(report.delivered, 1, "the in-flight send is ordered first");
+    let _ = step.await; // the in-flight send returns (the outcome is not the contract)
     revoke.await;
     assert!(world
         .revocations
@@ -1293,15 +1292,16 @@ async fn idle_worker_retries_a_dirty_outbox_write() {
     );
 }
 
-/// WHY (#994 r1 P1): a `DELETE /grants/:id` issued while the POST's initial
-/// DM is in flight and about to SUCCEED must block until that DM resolves,
-/// and only then revoke — otherwise the recipient could store and ACK the
-/// grant after DELETE returned success. Deterministic: the DM is paused on a
-/// notify and the revoke is polled exactly once; without the POST holding
-/// the send gate, that single poll records the revocation (before any I/O)
-/// and the assertion fails.
+/// WHY (#994 r1/r2, contract 1): a `DELETE /grants/:id` issued while the
+/// POST's initial DM is in flight must not record the revocation until that
+/// send has returned, and once it has, the owner makes no new send or
+/// enqueue of the grant. (Whether the in-flight DM lands is contract 2, the
+/// receiver's job — see `stored_grant_stops_granting_when_the_revocation_arrives`.)
+/// Deterministic: the DM is paused on a notify and the DELETE is polled
+/// exactly once; without the POST holding the send gate, that single poll
+/// records the revocation (before any I/O) and the assertion fails.
 #[tokio::test]
-async fn delete_during_a_successful_initial_dm_waits_for_it() {
+async fn delete_waits_for_an_in_flight_initial_send_then_nothing_new_is_sent() {
     use futures::FutureExt;
     let world = World::new().await;
     let receiver = Receiver::new(world.a1, &world.owner);
@@ -1343,11 +1343,7 @@ async fn delete_during_a_successful_initial_dm_waits_for_it() {
     );
 
     paused.release.notify_one();
-    let deliveries = post.await;
-    assert!(
-        deliveries[0].delivered,
-        "the DM resolved first: {deliveries:?}"
-    );
+    let _ = post.await; // the in-flight send returns (its outcome is contract 2)
     delete.await.unwrap();
     assert!(world
         .revocations
@@ -1355,7 +1351,7 @@ async fn delete_during_a_successful_initial_dm_waits_for_it() {
         .await
         .is_share_grant_revoked(&grant.grant_id, &grant.owner));
 
-    // After DELETE returned, a new POST of the same grant delivers nothing.
+    // After DELETE returned: no new send and no new enqueue, by any path.
     let sends = receiver.sends.load(Ordering::SeqCst);
     let again = deliver_grant_via(
         &grant,
@@ -1367,5 +1363,66 @@ async fn delete_during_a_successful_initial_dm_waits_for_it() {
     )
     .await;
     assert!(!again[0].delivered && !again[0].queued, "{again:?}");
-    assert_eq!(receiver.sends.load(Ordering::SeqCst), sends);
+    assert_eq!(
+        outbox
+            .enqueue(&grant, world.a1, world.now, &world.revocations)
+            .await,
+        Err(OutboxError::Revoked)
+    );
+    assert!(outbox.is_empty());
+    let report = outbox
+        .step(world.now + 3_000, &world.revocations, |r, p, id| {
+            receiver.send(r, p, id)
+        })
+        .await;
+    assert_eq!(report, Default::default());
+    assert_eq!(receiver.sends.load(Ordering::SeqCst), sends, "no new send");
+}
+
+/// WHY (#994 r2, contract 2): a DM already on the wire when DELETE returns
+/// may still be stored by its recipient. That recipient must STOP granting
+/// access the moment the revocation reaches it by gossip — the real access
+/// decision (`evaluate_grant_access`), not just a flag — and must refuse any
+/// later redelivery of the grant.
+#[tokio::test]
+async fn stored_grant_stops_granting_when_the_revocation_arrives() {
+    let world = World::new().await;
+    let receiver = Receiver::new(world.a1, &world.owner);
+    receiver.online.store(true, Ordering::SeqCst);
+    let grant = world.grant(1, 3_600);
+
+    // The in-flight DM lands and is stored before the revocation arrives.
+    let payload = grant.to_dm_payload().unwrap();
+    receiver
+        .send(world.a1, payload.clone(), [7; 16])
+        .await
+        .unwrap();
+    assert!(receiver.store.issued(&grant.grant_id).is_some());
+    assert!(world.b1_has_dm_on(&receiver).await, "control: honoured");
+
+    // The revocation arrives on the v3 gossip carrier.
+    let v3 = bincode::serialize(&vec![world.revocation_record(&grant)]).unwrap();
+    assert!(
+        crate::ingest_share_grant_revocations(
+            &OwnerTrust::default(),
+            &world.revocations,
+            Some(world.identity_dir()),
+            &v3,
+        )
+        .await
+    );
+    assert!(
+        !world.b1_has_dm_on(&receiver).await,
+        "a stored grant stops granting once its revocation arrives"
+    );
+
+    // And a later redelivery of it is refused on the checked route.
+    let fresh = ShareGrantStore::in_memory(world.a1, Some(world.owner.user_id()));
+    let (typed, _rx) = typed_delivery_of(&grant);
+    assert!(
+        handle_share_grant_dm_checked(Some(&fresh), Some(&world.revocations), typed)
+            .await
+            .is_err()
+    );
+    assert!(fresh.issued(&grant.grant_id).is_none());
 }

@@ -41,25 +41,41 @@
 //! [`OUTBOX_MAX_SENDS_PER_STEP`] entries, so an offline peer cannot turn the
 //! outbox into a hot send loop.
 //!
+//! # The revocation contract (#994 r2)
+//!
+//! Over a network nobody can promise that nothing lands after `DELETE
+//! /grants/:id` returns: a DM already published may still be in transit, and
+//! a send cut off by [`GRANT_SEND_DEADLINE`] may already have left. The
+//! contract is therefore exactly:
+//!
+//! 1. **Owner side (enforced here):** once a revocation has been recorded,
+//!    this install makes NO new send and NO new enqueue of that grant.
+//! 2. **In-flight sends (enforced by the receiver):** the revocation reaches
+//!    the recipient on the `x0x.revocation.v3` gossip carrier (there is no
+//!    separate direct push). A receiver that already knows the revocation
+//!    refuses to store the grant ([`super::handle_share_grant_dm_checked`]);
+//!    one that stored it first stops honouring it the moment the revocation
+//!    arrives — every access decision filters grants through the local
+//!    revocation set ([`super::evaluate_grant_access`]).
+//!
 //! # Revocation is serialized with sending
 //!
 //! A worker pass holds the outbox's send gate (shared) from its revocation
-//! check until its sends have completed. EVERY path that makes a share-grant
-//! revocation effective — the local API revoke, the `x0x.revocation.v3`
-//! gossip carrier, and a share-grant record arriving on any other revocation
-//! carrier — takes the gate exclusively
+//! check until its sends have returned or hit the deadline. EVERY path that
+//! makes a share-grant revocation effective — the local API revoke, the
+//! `x0x.revocation.v3` gossip carrier, and a share-grant record arriving on
+//! any other revocation carrier — takes the gate exclusively
 //! ([`GrantRedeliveryOutbox::revocation_barrier`], reached through
 //! [`crate::owner_trust::OwnerTrust::share_grant_revocation_barrier`]) before
 //! it inserts the record. So once a revocation has been recorded no pass
-//! can start a send of that grant, and a send already in flight when the
-//! revoke began completes BEFORE the revoke returns (it is ordered before
-//! the revocation, exactly like a delivery at issue time).
+//! can START a send of that grant (contract 1).
 //!
 //! The INITIAL delivery made by `POST /grants` takes the same gate shared
 //! across its DMs ([`GrantRedeliveryOutbox::send_permit`], #994 r1), so a
-//! `DELETE /grants/:id` racing a POST returns only after the POST's
-//! in-flight DMs have resolved; a DM that succeeded is then ordered before
-//! the revocation, exactly like a delivery completed before the DELETE.
+//! `DELETE /grants/:id` racing a POST waits until the POST's sends have
+//! returned (or timed out) and no send of the grant is started afterwards.
+//! This orders the owner's own actions; it does not claim the remote side
+//! has finished processing a DM already on the wire (contract 2 covers that).
 //!
 //! Every send made while the gate is held is bounded by
 //! [`GRANT_SEND_DEADLINE`], so a revoke waits at most that long (plus the

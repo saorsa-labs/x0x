@@ -1009,8 +1009,10 @@ pub fn grant_delivery_request(grant: &ShareGrant) -> Result<(Vec<u8>, [u8; 16]),
 /// ([`outbox::GrantRedeliveryOutbox::send_permit`], #994 r1) after checking
 /// the grant is not already revoked, each bounded by
 /// [`outbox::GRANT_SEND_DEADLINE`]: a `DELETE /grants/:id` racing this POST
-/// waits for the in-flight DMs, so none can be delivered after the DELETE
-/// returns. The permit is released before queueing.
+/// waits until these sends have returned (or timed out), and none is started
+/// after it. A DM already on the wire may still land; the receiver then drops
+/// it when the revocation arrives (see the contract in [`outbox`]). The
+/// permit is released before queueing.
 ///
 /// A failed recipient is queued with the clock read at QUEUE time (`now`),
 /// not before the send, and only if the grant is not revoked by then (see
@@ -1454,9 +1456,11 @@ impl crate::Agent {
 /// revocation barrier, insert `record`, write `revocations-v3.bin` durably,
 /// and durably drop the grant's queued deliveries.
 ///
-/// The barrier makes a concurrent redelivery pass finish its in-flight sends
-/// first and keeps a new pass from starting until the revocation is in the
-/// set, so no send of this grant can begin after this returns.
+/// The barrier waits for a concurrent pass's sends to return (bounded by
+/// [`outbox::GRANT_SEND_DEADLINE`]) and keeps a new pass from starting until
+/// the revocation is in the set, so this install makes no new send or
+/// enqueue of the grant after this returns. A DM already on the wire is
+/// dropped by its receiver when the revocation arrives (see [`outbox`]).
 ///
 /// Returns `Ok` only when BOTH writes are durable, so `DELETE /grants/:id`
 /// never answers success for a revocation a restart would forget (which
