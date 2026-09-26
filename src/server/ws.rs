@@ -156,6 +156,12 @@ enum WsOutbound {
     },
     #[serde(rename = "error")]
     Error { message: String },
+    /// ADR-0073: an invite passed the call gate and is ringing.
+    #[serde(rename = "call.incoming")]
+    CallIncoming { call: serde_json::Value },
+    /// ADR-0073: a call lifecycle transition.
+    #[serde(rename = "call.state")]
+    CallState { call: serde_json::Value },
 }
 
 /// Client → Server WebSocket command.
@@ -269,12 +275,12 @@ fn group_id_for_topic(topic: &str) -> Option<&str> {
 /// fork-quarantined on this node.
 ///
 /// HOT-PATH COST (§3d's constraint): one `named_groups` read-lock
-/// acquisition, taken only at the two sites row 25 names — mention emit
-/// (once per ROUTED mention, on a path that already awaits `ws_topics` and
-/// sits downstream of ML-DSA validation) and `Subscribe` backfill (once per
-/// topic, beside a `spawn_blocking` store query that dominates it). The
-/// per-frame broadcast forwarder never calls this, so the high-volume live
-/// path adds nothing and needs no per-subscription cache to invalidate.
+/// acquisition at mention emit (once per ROUTED mention, downstream of
+/// ML-DSA validation). Durable `Subscribe` backfill resolves once per topic;
+/// session backfill resolves per replayed frame and the `live` boundary so
+/// revocation during a slow query or replay cannot expose the marker. Shared
+/// mentions check session membership on delivery. Raw high-volume live
+/// gossip messages still take no roster lock.
 ///
 /// Resolving at EMIT time rather than at subscribe time is also what makes
 /// the marker transitions work for free: a session that subscribed before
@@ -302,24 +308,26 @@ async fn fork_quarantine_annotation(
     state: &AppState,
     group_id: &str,
 ) -> Option<ForkQuarantineAnnotation> {
-    // Copy the three fields out under the lock rather than cloning the
-    // marker: `ForkQuarantine` carries a forensic `ForkSnapshot` of both
-    // competing commit headers, which no frame needs.
-    let (revision, observed_at_ms, no_anchor) = {
-        let groups = state.named_groups.read().await;
-        let (_, info) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
-        let marker = info.fork_quarantine.as_ref()?;
-        (marker.revision, marker.observed_at_ms, marker.no_anchor)
-    };
+    let groups = state.named_groups.read().await;
+    let (_, info) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
+    annotation_from_group_info(info, group_id)
+}
+
+fn annotation_from_group_info(
+    info: &crate::groups::GroupInfo,
+    group_id: &str,
+) -> Option<ForkQuarantineAnnotation> {
+    // Copy only wire fields; the marker's forensic snapshot stays private.
+    let marker = info.fork_quarantine.as_ref()?;
     Some(ForkQuarantineAnnotation {
         fork_quarantined: true,
         fork_quarantine: ForkQuarantineDetail {
             clear_with: crate::server::routes::named_groups::FORK_QUARANTINE_CLEAR_ROUTE,
             scopes: vec![ForkQuarantineScope {
                 scope: crate::history::Scope::Group(group_id.to_string()).to_string(),
-                revision,
-                observed_at_ms,
-                no_anchor,
+                revision: marker.revision,
+                observed_at_ms: marker.observed_at_ms,
+                no_anchor: marker.no_anchor,
             }],
         },
     })
@@ -333,6 +341,33 @@ async fn topic_fork_quarantine_annotation(
 ) -> Option<ForkQuarantineAnnotation> {
     let group_id = group_id_for_topic(topic)?;
     fork_quarantine_annotation(state, group_id).await
+}
+
+/// Re-evaluate a session's marker at each backfill emission. Membership and
+/// marker are read under the same roster lock, so a pending/revoked seat
+/// cannot race between two separate lookups and expose the marker.
+async fn session_topic_fork_quarantine_annotation(
+    state: &AppState,
+    topic: &str,
+) -> Option<ForkQuarantineAnnotation> {
+    let group_id = group_id_for_topic(topic)?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let (_, info) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
+    if !info.has_active_member(&local_hex) {
+        return None;
+    }
+    annotation_from_group_info(info, group_id)
+}
+
+/// The shared mention channel carries one marker for every subscriber; each
+/// session applies its own live roster view before forwarding that frame.
+/// Backfill uses the same predicate before constructing its frames.
+async fn session_has_active_group_membership(state: &AppState, group_id: &str) -> bool {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    crate::server::resolve_group_entry_locked(&groups, group_id)
+        .is_some_and(|(_, info)| info.has_active_member(&local_hex))
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +826,31 @@ async fn handle_ws_connection(
         None
     };
 
+    // ADR-0073: forward `call.*` events from the daemon event channel to
+    // every WS session (plain and direct), so a GUI tab rings.
+    let call_tx = outbound_tx.clone();
+    let call_stats = Arc::clone(&stats);
+    let call_slow_close = slow_close.clone();
+    let call_counted = Arc::clone(&slow_close_counted);
+    let mut call_rx = state.broadcast_tx.subscribe();
+    let call_forwarder = tokio::spawn(async move {
+        loop {
+            let event = match call_rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let out = match event.event_type.as_str() {
+                "call.incoming" => WsOutbound::CallIncoming { call: event.data },
+                "call.state" => WsOutbound::CallState { call: event.data },
+                _ => continue,
+            };
+            if !feed_critical(&call_tx, out, &call_stats, &call_slow_close, &call_counted) {
+                break;
+            }
+        }
+    });
+
     // Spawn keepalive pinger (30s interval). The keepalive is the reliable
     // slow-consumer detector: every interval it tries to enqueue a Pong and,
     // on a Full queue, closes the session — so a stalled reader is closed
@@ -867,6 +927,7 @@ async fn handle_ws_connection(
     // Retire the feeders and drop the last outbound sender so the writer can
     // observe channel closure and exit on its own.
     keepalive.abort();
+    call_forwarder.abort();
     if let Some(h) = direct_handle {
         h.abort();
     }
@@ -941,7 +1002,7 @@ async fn cleanup_ws_topic_if_empty(state: &AppState, topic: &str, session_id: &s
 
 /// Dispatch an inbound WebSocket JSON command.
 async fn handle_ws_command(
-    state: &AppState,
+    state: &Arc<AppState>,
     session_id: &str,
     text: &str,
     tx: &mpsc::Sender<WsOutbound>,
@@ -1050,11 +1111,15 @@ async fn handle_ws_command(
                 // during the query are deduped by payload hash below.
                 let mut backfill_hashes: Option<std::collections::HashSet<[u8; 32]>> = None;
                 if let Some(spec) = backfill.as_ref() {
-                    // ADR-0066 §3d (row 25): resolve the marker ONCE per
-                    // subscribed topic, beside the store query that dominates
-                    // this path. `None` for every non-group topic, which is
-                    // what keeps ordinary pub/sub backfill byte-identical.
-                    let quarantine = topic_fork_quarantine_annotation(state, topic).await;
+                    // ADR-0066 §3d (row 25): durable operator markers are
+                    // resolved once per subscribed topic. Session visibility
+                    // is checked at each emission after the store query.
+                    // Non-group topics remain byte-identical.
+                    let durable_quarantine = if durable_owner {
+                        topic_fork_quarantine_annotation(state, topic).await
+                    } else {
+                        None
+                    };
                     if let Some(history) = state.agent.history() {
                         let store = Arc::clone(history.store());
                         let q = crate::history::HistoryQuery {
@@ -1076,7 +1141,15 @@ async fn handle_ws_command(
                                         origin: r.author_agent.clone(),
                                         // Every replayed frame is annotated,
                                         // per the ADR's §3d fixture clause.
-                                        quarantine: quarantine.clone(),
+                                        // A session checks its CURRENT seat
+                                        // before each frame, including after a
+                                        // slow store query or mid-replay revoke.
+                                        quarantine: if durable_owner {
+                                            durable_quarantine.clone()
+                                        } else {
+                                            session_topic_fork_quarantine_annotation(state, topic)
+                                                .await
+                                        },
                                     };
                                     if !feed_droppable(tx, out, stats) {
                                         break;
@@ -1099,7 +1172,11 @@ async fn handle_ws_command(
                         tx,
                         WsOutbound::Live {
                             topic: topic.clone(),
-                            quarantine,
+                            quarantine: if durable_owner {
+                                durable_quarantine
+                            } else {
+                                session_topic_fork_quarantine_annotation(state, topic).await
+                            },
                         },
                         stats,
                     );
@@ -1108,6 +1185,7 @@ async fn handle_ws_command(
                 // Per-session forwarder: broadcast channel → session outbound
                 let tx_clone = tx.clone();
                 let fwd_stats = Arc::clone(&state.ws_outbound_stats);
+                let fwd_state = Arc::clone(state);
                 let handle = tokio::spawn(async move {
                     let mut rx = broadcast_rx;
                     // Dedupe frames already delivered by backfill: drop live
@@ -1117,7 +1195,7 @@ async fn handle_ws_command(
                     let mut dedupe = backfill_hashes;
                     loop {
                         match rx.recv().await {
-                            Ok(msg) => {
+                            Ok(mut msg) => {
                                 if let Some(set) = dedupe.as_mut() {
                                     if let WsOutbound::Message { payload, .. } = &msg {
                                         match BASE64.decode(payload) {
@@ -1133,6 +1211,29 @@ async fn handle_ws_command(
                                             }
                                             Err(_) => {
                                                 dedupe = None;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Mention frames share a broadcast channel,
+                                // so redact per subscriber at delivery time.
+                                // Raw live gossip messages carry no marker and
+                                // never take this roster lock.
+                                if !durable_owner {
+                                    if let WsOutbound::Mention {
+                                        group_id,
+                                        quarantine: Some(_),
+                                        ..
+                                    } = &msg
+                                    {
+                                        if !session_has_active_group_membership(
+                                            &fwd_state, group_id,
+                                        )
+                                        .await
+                                        {
+                                            if let WsOutbound::Mention { quarantine, .. } = &mut msg
+                                            {
+                                                *quarantine = None;
                                             }
                                         }
                                     }
@@ -1978,6 +2079,171 @@ mod tests {
                 other => panic!("unexpected frame during backfill: {other:?}"),
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue870_ws_redacts_nonmember_session_markers_without_cutting_frames(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = quarantine_test_group_id();
+        let alias = "issue870-ws-alias";
+        let foreign = crate::identity::AgentId([0x87; 32]);
+        let info = crate::groups::GroupInfo::new(
+            "issue870-ws".into(),
+            String::new(),
+            foreign,
+            group_id.clone(),
+        );
+        state.named_groups.write().await.insert(alias.into(), info);
+        set_test_marker(&state, alias).await;
+        let topic = crate::groups::public_topic_for(&group_id);
+        let content = b"retained WS content";
+        state
+            .agent
+            .history()
+            .expect("history")
+            .store()
+            .insert(&crate::history::HistoryRecord {
+                msg_id: crate::history::HistoryRecord::compute_msg_id(None, content),
+                scope: crate::history::Scope::Topic(topic.clone()),
+                author_agent: Some(hex::encode(foreign.as_bytes())),
+                author_machine: None,
+                author_pubkey: None,
+                sent_at_ms: 1_500,
+                seen_at_ms: 1_500,
+                direction: crate::history::Direction::Inbound,
+                content_type: "text/plain".into(),
+                payload: content.to_vec(),
+                signed_artifact: None,
+                signature: None,
+                sig_context: None,
+                provenance: crate::history::Provenance::LocalAppDecrypt,
+                replace_key: None,
+                thread_root: None,
+                thread_parent: None,
+                ingress_sender_agent: None,
+                logical_request_id: None,
+            })?;
+
+        let stats = WsOutboundStats::default();
+        let subscribe = serde_json::json!({
+            "type": "subscribe",
+            "topics": [&topic],
+            "backfill": { "limit": 8 },
+        })
+        .to_string();
+        let (session_tx, mut session_rx) = mpsc::channel::<WsOutbound>(16);
+        register_test_session(&state, "issue870-session").await;
+        handle_ws_command(
+            &state,
+            "issue870-session",
+            &subscribe,
+            &session_tx,
+            &stats,
+            false,
+        )
+        .await;
+        let mut session_replayed = false;
+        loop {
+            let frame = next_frame(&mut session_rx).await;
+            match &frame {
+                WsOutbound::Message { payload, .. } => {
+                    assert_eq!(payload, &BASE64.encode(content));
+                    assert_not_annotated(&frame);
+                    session_replayed = true;
+                }
+                WsOutbound::Live { .. } => {
+                    assert_not_annotated(&frame);
+                    break;
+                }
+                other => panic!("unexpected session backfill frame: {other:?}"),
+            }
+        }
+        assert!(session_replayed, "session must keep the retained content");
+        assert!(matches!(
+            next_frame(&mut session_rx).await,
+            WsOutbound::Subscribed { .. }
+        ));
+
+        let (durable_tx, mut durable_rx) = mpsc::channel::<WsOutbound>(16);
+        register_test_session(&state, "issue870-durable").await;
+        handle_ws_command(
+            &state,
+            "issue870-durable",
+            &subscribe,
+            &durable_tx,
+            &stats,
+            true,
+        )
+        .await;
+        let mut durable_replayed = false;
+        loop {
+            let frame = next_frame(&mut durable_rx).await;
+            match &frame {
+                WsOutbound::Message { payload, .. } => {
+                    assert_eq!(payload, &BASE64.encode(content));
+                    assert_annotated(&frame, &group_id);
+                    durable_replayed = true;
+                }
+                WsOutbound::Live { .. } => {
+                    assert_annotated(&frame, &group_id);
+                    break;
+                }
+                other => panic!("unexpected durable backfill frame: {other:?}"),
+            }
+        }
+        assert!(durable_replayed);
+        assert!(matches!(
+            next_frame(&mut durable_rx).await,
+            WsOutbound::Subscribed { .. }
+        ));
+
+        emit_test_mention(&state, &group_id, &topic).await;
+        let session_mention = next_frame(&mut session_rx).await;
+        assert!(matches!(session_mention, WsOutbound::Mention { .. }));
+        assert_eq!(frame_json(&session_mention)["msg_id"], "m1");
+        assert_not_annotated(&session_mention);
+        let durable_mention = next_frame(&mut durable_rx).await;
+        assert_annotated(&durable_mention, &group_id);
+
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(alias)
+            .expect("group")
+            .add_member(local_hex, crate::groups::GroupRole::Member, None, None);
+        emit_test_mention(&state, &group_id, &topic).await;
+        assert_annotated(&next_frame(&mut session_rx).await, &group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(alias)
+            .expect("group")
+            .members_v2
+            .get_mut(&hex::encode(state.agent.agent_id().as_bytes()))
+            .expect("local seat")
+            .state = crate::groups::GroupMemberState::Pending;
+        emit_test_mention(&state, &group_id, &topic).await;
+        assert_not_annotated(&next_frame(&mut session_rx).await);
+
+        let (pending_tx, mut pending_rx) = mpsc::channel::<WsOutbound>(16);
+        register_test_session(&state, "issue870-pending").await;
+        handle_ws_command(
+            &state,
+            "issue870-pending",
+            &subscribe,
+            &pending_tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert_not_annotated(&next_frame(&mut pending_rx).await);
+        assert_not_annotated(&next_frame(&mut pending_rx).await);
         Ok(())
     }
 
