@@ -12,9 +12,9 @@ pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
 pub(in crate::server) use seat_cert_fetch::{
-    cert_evidence_deadline_elapsed, handle_group_cert_fetch_request,
-    handle_group_cert_fetch_response, publish_group_cert_fetch, GROUP_CERT_FETCH_DOMAIN,
-    GROUP_CERT_FETCH_RESPONSE_DOMAIN,
+    cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
+    handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
+    CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
 };
 
 use super::super::state::AppState;
@@ -1111,20 +1111,23 @@ pub(in crate::server) enum JoinResultMessage {
 /// outcomes: the five `consume_issued_invite` failures (src/groups/mod.rs
 /// `consume_issued_invite`) plus the addressed-recipient pre-consumption
 /// refusal (an immutable fact about the invite itself). OwnerCertified-gate
-/// failures are deliberately ABSENT: certificate evidence is mutable
-/// discovery state and the authority-side attempt tombstone that would make
-/// them safely terminal is deferred (#481) — they stay retryable.
+/// failures stay retryable — certificate evidence is mutable discovery
+/// state and the authority-side attempt tombstone that would make them
+/// safely terminal is deferred (#481) — with ONE exception:
+/// [`JoinRefusalReason::CertificateEvidenceUnavailable`], staged only after
+/// a digest-only seat has blocked the same join attempt continuously for
+/// `CERT_EVIDENCE_DEADLINE_MS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)] // the shared Invite prefix IS the taxonomy
 pub(in crate::server) enum JoinRefusalReason {
     InviteSecretUnknown,
     InviteSecretConsumed,
-    /// #946 r2 (item B): a member's committed certificate digest never
-    /// hydrated and the group-scoped fetch could not obtain it. RETRYABLE
-    /// FIRST — the joiner keeps retrying while the condition may still
-    /// converge; the typed refusal is staged only after
-    /// CERT_EVIDENCE_DEADLINE_MS of continuous unavailability.
+    /// #946: an existing member's committed certificate digest never
+    /// hydrated to bytes, so the seal refused. RETRYABLE FIRST — the joiner
+    /// keeps retrying while a group-scoped fetch may still obtain it; this
+    /// typed refusal is staged only after CERT_EVIDENCE_DEADLINE_MS of
+    /// continuous refusals for the same join attempt.
     CertificateEvidenceUnavailable,
     InviteRoleExceedsCap,
     InviteEventBeforeCreation,
@@ -10214,6 +10217,18 @@ async fn apply_named_group_metadata_event_with_binding(
     } else {
         None
     };
+    // #946 C3: a member who leaves or is removed/banned loses any
+    // certificate-unobtainable refusal window, so a later rejoin starts
+    // retryable. Captured before `event` moves.
+    let departing_member = match &event {
+        NamedGroupMetadataEvent::MemberRemoved {
+            group_id, agent_id, ..
+        }
+        | NamedGroupMetadataEvent::MemberBanned {
+            group_id, agent_id, ..
+        } => Some((group_id.clone(), agent_id.clone())),
+        _ => None,
+    };
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10234,6 +10249,9 @@ async fn apply_named_group_metadata_event_with_binding(
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
     if applied.accepted {
+        if let Some((gid, member)) = departing_member.as_ref() {
+            clear_cert_evidence_stamps_for(state, gid, Some(member)).await;
+        }
         if let Some(gid) = member_landing_group {
             replay_parked_role_updates(state, &gid).await;
         }
@@ -13399,12 +13417,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 "MemberJoined: failed to seal authoritative add: {e}"
                             );
                             // #908/R17: a pending-certificate refusal whose
-                            // members are ALL still digest-only will not
-                            // converge (the seal-time warranted fetch just
-                            // ran inside the seal and could not obtain
-                            // them) — stage the typed refusal so the joiner
-                            // learns the terminal outcome instead of
-                            // retrying forever.
+                            // members are ALL still digest-only. The seal
+                            // published a group-scoped fetch; the refusal
+                            // stays retryable, and the typed refusal is
+                            // staged only after CERT_EVIDENCE_DEADLINE_MS of
+                            // continuous refusals for this join attempt.
                             stage_refusal_if_certificates_unobtainable(
                                 state,
                                 &resolved_group_key,
@@ -13486,8 +13503,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             member = %LogHexId::agent(&member_agent_id),
                             "MemberJoined: failed to seal authoritative add: {e}"
                         );
-                        // #908/R17: same non-converging-refusal staging
-                        // as the TreeKEM arm above.
+                        // #908/R17: same deadline-gated refusal staging as
+                        // the TreeKEM arm above.
                         stage_refusal_if_certificates_unobtainable(
                             state,
                             &resolved_group_key,
@@ -13775,7 +13792,13 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         continue;
                     }
                     if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {
-                        handle_group_cert_fetch_response(&state_for_task, rest).await;
+                        handle_group_cert_fetch_response(
+                            &state_for_task,
+                            rest,
+                            msg.verified,
+                            &task_group_id,
+                        )
+                        .await;
                         continue;
                     }
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
@@ -18955,6 +18978,9 @@ pub(in crate::server) async fn remove_named_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: a removed member's refusal window ends (clearing early only
+    // keeps a later rejoin retryable longer).
+    clear_cert_evidence_stamps_for(&state, &id, Some(&agent_id_hex)).await;
     let agent_id = match parse_agent_id_hex(&agent_id_hex) {
         Ok(id) => id,
         Err(e) => {
@@ -21318,6 +21344,9 @@ pub(in crate::server) async fn leave_group(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: leaving the group ends every refusal window this node
+    // tracked for it.
+    clear_cert_evidence_stamps_for(&state, &id, None).await;
     let local_agent = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent.as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
@@ -21866,22 +21895,18 @@ async fn owner_cert_seal_evidence(
 const SEAL_TIME_CERT_FETCH_CAP_SEATS: usize = 8;
 
 /// #908/R17: seal-time warranted certificate fetch. For each still
-/// digest-only seat, ask the mesh for the blob its committed digest
-/// names (`AnnounceBlobCache::fetch_pair_now` publishes the real blob
-/// request on both carriers; any peer holding the verified pair —
-/// including via its own cache — can answer). Results land in the blob
-/// cache; the caller re-runs the local hydrate, which installs only
-/// bytes hashing to the committed digest.
-async fn warranted_fetch_for_pending_seats(
+/// digest-only seat (up to [`SEAL_TIME_CERT_FETCH_CAP_SEATS`]), publish a
+/// group-scoped request for its committed digest on the group's metadata
+/// topic and return without waiting. An active roster member holding the
+/// verified owner-issued pair answers (see `seat_cert_fetch`); the
+/// response handler hydrates the seat durably, and the NEXT seal retry
+/// finds the bytes.
+fn warranted_fetch_for_pending_seats(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
     members: &[String],
 ) {
-    // #946 r2 (item D): PUBLISH the group-scoped request and return —
-    // NEVER wait on the network under the caller's membership lock. The
-    // metadata listener answers asynchronously (see seat_cert_fetch), the
-    // response handler hydrates the seat durably, and the authority's
-    // NEXT seal retry (the MemberJoined cadence) finds the bytes.
+    // NEVER wait on the network under the caller's membership lock.
     let stable_group_id = info.stable_group_id().to_string();
     let metadata_topic = info.metadata_topic.clone();
     for member_hex in members.iter().take(SEAL_TIME_CERT_FETCH_CAP_SEATS) {
@@ -21941,34 +21966,20 @@ pub(in crate::server) async fn seal_commit_owner_certified(
                 "#483: seal-time hydrate installed certificates onto digest-only seats"
             );
         }
-        // #908/R17 Home blocker: when the local caches hold nothing, run
-        // a WARRANTED fetch by committed digest over the real blob
-        // request path — ANY connected peer that has ever heard the
-        // member announce can serve the verified pair (the responder
-        // also serves cached blobs). This is what lets an admin seal
-        // while the certificate's owner is offline. Bounded to
-        // SEAL_TIME_CERT_FETCH_CAP_SEATS seats and one fetch deadline;
-        // a total miss falls through to the typed refusal below.
+        // #908/R17 Home blocker: seats the local caches could not hydrate
+        // get a group-scoped fetch request published on the group's
+        // metadata topic. It does not wait: THIS seal falls through to the
+        // pending refusal below, an active member holding the verified
+        // pair answers, the response hydrates the seat durably, and the
+        // next seal retry succeeds. This is what lets an admin seal while
+        // the certificate's owner is offline.
         let still_pending: Vec<String> = info
             .active_members()
             .filter(|m| m.certificate.is_none() && m.certificate_digest.is_some())
             .map(|m| m.agent_id.clone())
             .collect();
         if !still_pending.is_empty() {
-            warranted_fetch_for_pending_seats(state, info, &still_pending).await;
-            let hydrated_after = hydrate_digest_only_seats_at_seat_time(
-                state,
-                &stable_group_id,
-                info,
-                &still_pending,
-            )
-            .await;
-            if hydrated_after > 0 {
-                tracing::info!(
-                    hydrated_after,
-                    "#908: seal-time warranted fetch hydrated digest-only seats from peers"
-                );
-            }
+            warranted_fetch_for_pending_seats(state, info, &still_pending);
         }
     }
     let evidence = owner_cert_seal_evidence(state, info).await;
@@ -21997,8 +22008,15 @@ pub(in crate::server) async fn seal_commit_owner_certified(
             },
         );
     }
-    info.seal_commit_with_owner_certs(signing_kp, now_ms, &verdict)
-        .map(|(commit, _evicted)| commit)
+    let sealed = info
+        .seal_commit_with_owner_certs(signing_kp, now_ms, &verdict)
+        .map(|(commit, _evicted)| commit);
+    // C3: an all-clean OwnerCertified seal ends any certificate-unobtainable
+    // refusal window for this group.
+    if sealed.is_ok() && info.policy.admission.owner_certified_user_id().is_some() {
+        clear_cert_evidence_stamps(state, info.stable_group_id(), None);
+    }
+    sealed
 }
 
 /// ADR-0064 (Decision §1/§1a; slice-3 closes the seat-path advisory):
@@ -23284,6 +23302,8 @@ pub(in crate::server) async fn ban_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: a banned member's refusal window ends.
+    clear_cert_evidence_stamps_for(&state, &id, Some(&agent_id_hex)).await;
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -33127,11 +33147,12 @@ async fn remove_listener_if_token(state: &AppState, key: &str, token: u64) {
     }
 }
 
-/// #908/R17 Home blocker: stage the typed join refusal when a seal
-/// refusal is a pending-certificate verdict that cannot converge: every
-/// listed member is still digest-only (committed digest, no bytes) —
-/// the seal-time warranted fetch already ran and no peer served them.
-/// In-grace members (evidence in flight) stay retryable: no refusal.
+/// #908/R17 Home blocker: stage the typed join refusal for a seal refusal
+/// whose pending members are ALL still digest-only (committed digest, no
+/// bytes) — but only once such refusals have continued for
+/// CERT_EVIDENCE_DEADLINE_MS for the same join attempt. The seal publishes
+/// a group-scoped fetch each time, so until then the refusal stays
+/// retryable. In-grace members (evidence in flight) never stage a refusal.
 async fn stage_refusal_if_certificates_unobtainable(
     state: &AppState,
     group_key: &str,
@@ -33146,25 +33167,31 @@ async fn stage_refusal_if_certificates_unobtainable(
     if pending.is_empty() {
         return;
     }
-    let all_digest_only = {
+    // A refusal is bound to a join attempt; without one there is nothing
+    // to stage and no window to track.
+    let Some(attempt_id) = member_joined_event_attempt_id(event) else {
+        return;
+    };
+    let (all_digest_only, stable_group_id) = {
         let groups = state.named_groups.read().await;
         let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_key) else {
             return;
         };
-        pending.iter().all(|hex| {
+        let all_digest_only = pending.iter().all(|hex| {
             info.members_v2
                 .get(hex)
                 .is_some_and(|seat| seat.certificate.is_none() && seat.certificate_digest.is_some())
-        })
+        });
+        (all_digest_only, info.stable_group_id().to_string())
     };
     if !all_digest_only {
         return;
     }
-    // Item B: the refusal is RETRYABLE first — the joiner keeps retrying
-    // while the fetch may still converge (a peer caching the certificate
-    // comes online, the owner returns). Stage the typed terminal refusal
-    // only after CERT_EVIDENCE_DEADLINE_MS of continuous unavailability.
-    if !cert_evidence_deadline_elapsed(state, group_key, member_agent_id) {
+    // The refusal is RETRYABLE first — the joiner keeps retrying while a
+    // fetch may still obtain the certificate (a member caching it comes
+    // online, the owner returns). Stage the typed terminal refusal only
+    // after CERT_EVIDENCE_DEADLINE_MS of continuous refusals.
+    if !cert_evidence_deadline_elapsed(state, &stable_group_id, member_agent_id, &attempt_id) {
         tracing::debug!(
             group_id = %LogHexId::group(group_key),
             member = %LogHexId::agent(member_agent_id),

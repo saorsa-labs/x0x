@@ -673,8 +673,8 @@ pub enum ApplyError {
     /// window (evidence missing or a replacement fetch in flight), or
     /// seats whose committed certificate digest never hydrated to bytes
     /// (#908/R17: listed here too, so the operator sees WHO is pending —
-    /// the seal-time warranted fetch already ran and could not obtain
-    /// them). Seals that require a clean roster refuse; retry after the
+    /// the seal has published a group-scoped fetch for them that may still
+    /// hydrate the seat). Seals that require a clean roster refuse; retry after the
     /// announce/blob fetch converges, or use the explicit eviction path
     /// once the window expires.
     #[error(
