@@ -933,7 +933,7 @@ pub async fn handle_share_grant_dm_checked(
                     Some(set) => set
                         .read()
                         .await
-                        .is_share_grant_revoked(&grant.grant_id, &grant.owner),
+                        .is_share_grant_revoked(&[0u8; 32], &grant.owner), // RED PROOF
                     None => false,
                 };
                 if revoked {
