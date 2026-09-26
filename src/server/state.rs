@@ -863,6 +863,9 @@ pub(super) struct AppState {
     /// long-lived sync listeners. Keyed by `"{kind}:{id}"`.
     pub(super) crdt_handle_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     pub(super) named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
+    /// Orders every GSS encrypted KV seal/publish with authoritative roster
+    /// transactions. Writers hold it through durability or rollback.
+    pub(super) gss_publication_gate: Arc<RwLock<()>>,
     /// Orders roster snapshots sent to gossip after committed mutations.
     pub(super) group_roster_gossip_lock: Mutex<()>,
     pub(super) named_groups_path: PathBuf,

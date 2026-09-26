@@ -1593,6 +1593,7 @@ async fn open_bound_gss_store(
             Arc::clone(&secure) as Arc<dyn KvSecureContext>,
             refresh,
             snapshot_lease,
+            Arc::clone(&state.gss_publication_gate),
         )
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
@@ -4783,6 +4784,78 @@ mod tests {
             .write()
             .await
             .insert(group_key.to_string(), info);
+    }
+
+    #[tokio::test]
+    async fn durable_gss_rekey_waits_for_inflight_publication() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "96".repeat(16);
+        let owner = state.agent.agent_id();
+        let removed = AgentId([7; 32]);
+        seed_group(&state, &group_key, owner).await;
+        let previous = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_key).expect("group");
+            info.add_member(
+                hex::encode(removed.as_bytes()),
+                crate::groups::GroupRole::Member,
+                Some(hex::encode(owner.as_bytes())),
+                None,
+            );
+            info.clone()
+        };
+        let old_epoch = previous.secret_epoch;
+        let mut next = previous;
+        next.roster_revision += 1;
+        next.remove_member(
+            &hex::encode(removed.as_bytes()),
+            Some(hex::encode(owner.as_bytes())),
+        );
+        let _ = next.rotate_shared_secret();
+        assert_eq!(next.secret_epoch, old_epoch + 1);
+
+        // An encrypted publisher holds this read permit from refresh through
+        // enqueue. The production persistence transaction must wait before
+        // installing its new roster and retain its writer permit through save.
+        let publication = state.gss_publication_gate.read().await;
+        let committing = Arc::clone(&state);
+        let commit_key = group_key.clone();
+        let commit = tokio::spawn(async move {
+            crate::server::routes::named_groups::persist_named_group_info(
+                &committing,
+                &commit_key,
+                next,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if state.gss_publication_gate.try_read().is_err() {
+                    break;
+                }
+                assert!(
+                    !commit.is_finished(),
+                    "roster committed without waiting for G"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("roster writer did not queue behind publication");
+        assert_eq!(
+            state.named_groups.read().await[&group_key].secret_epoch,
+            old_epoch,
+            "candidate became visible before the publication permit released"
+        );
+        drop(publication);
+        assert!(matches!(
+            commit.await.expect("commit task").expect("persist rekey"),
+            crate::server::routes::named_groups::AtomicWriteOutcome::Durable
+        ));
+        assert_eq!(
+            state.named_groups.read().await[&group_key].secret_epoch,
+            old_epoch + 1
+        );
     }
 
     async fn seed_treekem_group(state: &AppState, group_key: &str) {

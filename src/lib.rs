@@ -16935,8 +16935,17 @@ impl Agent {
         persist_path: Option<std::path::PathBuf>,
         snapshot_lease: Option<&kv::snapshot_fence::StoreOpenLease>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
-        self.spawn_kv_sync_inner(store, topic, persist_path, snapshot_lease, None, None, None)
-            .await
+        self.spawn_kv_sync_inner(
+            store,
+            topic,
+            persist_path,
+            snapshot_lease,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Construct, arm persistence for, and start a `KvStoreSync` bound to a
@@ -16955,6 +16964,7 @@ impl Agent {
         secure: Option<std::sync::Arc<dyn kv::encrypted::KvSecureContext>>,
         secure_refresh: Option<kv::sync::SecureRefreshFn>,
         treekem_secure: Option<kv::SharedTreeKemKvProtector>,
+        gss_publication_gate: Option<kv::sync::GssPublicationGate>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
@@ -16983,6 +16993,9 @@ impl Agent {
                 kv::encrypted::AuthorSigning::from_keypair(self.identity().agent_keypair())
                     .map_err(|e| kv_storage_err(format!("kv author signing setup failed: {e}")))?;
             sync.set_author_signing(signing);
+        }
+        if let Some(gate) = gss_publication_gate {
+            sync.set_gss_publication_gate(gate);
         }
         // Arm persistence BEFORE start so no merged delta can land
         // unpersisted, and write an initial snapshot so the file exists from
@@ -17060,6 +17073,7 @@ impl Agent {
     /// Gossip runtime not initialized; a corrupt/foreign snapshot (fail
     /// closed); a context bound to a different group; snapshot persistence
     /// failures; sync start failures.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_group_kv_store_persistent(
         &self,
         name: &str,
@@ -17068,6 +17082,7 @@ impl Agent {
         secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
         secure_refresh: kv::sync::SecureRefreshFn,
         snapshot_lease: KvStoreOpenLease,
+        gss_publication_gate: kv::sync::GssPublicationGate,
     ) -> error::Result<KvStoreHandle> {
         if name.is_empty() {
             return Err(kv_storage_err(
@@ -17102,6 +17117,7 @@ impl Agent {
                 Some(secure),
                 Some(secure_refresh),
                 None,
+                Some(gss_publication_gate),
             )
             .await?;
         self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "group store open")?;
@@ -17197,6 +17213,7 @@ impl Agent {
                 None,
                 None,
                 Some(protector),
+                None,
             )
             .await?;
         self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "TreeKEM group store open")?;
@@ -17269,6 +17286,7 @@ impl Agent {
                 Some(&snapshot_lease),
                 Some(context),
                 Some(refresh),
+                None,
                 None,
             )
             .await?;

@@ -3937,6 +3937,7 @@ async fn install_fork_evidence(
     evidence: x0x::groups::ForkEvidence,
     quarantine: Option<x0x::groups::ForkQuarantine>,
     persistence_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
 ) -> bool {
     let install_key = group_key.to_string();
     let marker_was_carried = quarantine.is_some();
@@ -3998,8 +3999,16 @@ async fn install_fork_evidence(
         true
     };
     let outcome = if persistence_lock_already_held {
-        persist_named_groups_mutation_unlocked(state, install).await
+        if let Some(guard) = held_gss_guard {
+            persist_named_groups_mutation_with_gss_guard(state, guard, install).await
+        } else {
+            persist_named_groups_mutation_unlocked(state, install).await
+        }
     } else {
+        debug_assert!(
+            held_gss_guard.is_none(),
+            "GSS writer requires held roster persistence"
+        );
         persist_named_groups_mutation(state, install).await
     };
     match outcome {
@@ -4086,6 +4095,7 @@ async fn apply_stateful_event_with_evidence(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
     action: x0x::groups::ActionKind,
     mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
 ) -> Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError> {
@@ -4099,6 +4109,7 @@ async fn apply_stateful_event_with_evidence(
                 commit,
                 owner_mandate,
                 persistence_lock_already_held,
+                held_gss_guard,
                 &e,
             )
             .await;
@@ -4120,6 +4131,7 @@ async fn apply_terminal_stateful_event_with_evidence(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
     action: x0x::groups::ActionKind,
     mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
 ) -> Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError> {
@@ -4133,6 +4145,7 @@ async fn apply_terminal_stateful_event_with_evidence(
                 commit,
                 owner_mandate,
                 persistence_lock_already_held,
+                held_gss_guard,
                 &e,
             )
             .await;
@@ -4208,6 +4221,7 @@ fn fork_evidence_path_open(current: &x0x::groups::GroupInfo) -> bool {
 /// drift from the ordinary hook's rules. `owner_mandate` is `Some`
 /// only on the `MemberAdded` arm (the one event kind that can carry an
 /// owner anchor).
+#[allow(clippy::too_many_arguments)]
 async fn record_fork_evidence_on_apply_error(
     state: &Arc<AppState>,
     group_key: &str,
@@ -4215,6 +4229,7 @@ async fn record_fork_evidence_on_apply_error(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     owner_mandate: Option<&x0x::groups::OwnerMandate>,
     persistence_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
     error: &x0x::groups::state_commit::ApplyError,
 ) {
     if fork_evidence_path_open(current) {
@@ -4235,6 +4250,7 @@ async fn record_fork_evidence_on_apply_error(
                     evidence.clone(),
                     quarantine,
                     persistence_lock_already_held,
+                    held_gss_guard,
                 )
                 .await;
                 // ADR-0064 slice 4: the classification counters fire on
@@ -4438,6 +4454,7 @@ async fn classify_refused_joiner_fork_chain(
         evidence,
         quarantine,
         persistence_lock_already_held,
+        None,
     )
     .await;
     if durable {
@@ -5144,6 +5161,24 @@ pub(in crate::server) async fn persist_named_groups_mutation_unlocked<F>(
 where
     F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
 {
+    // The caller already holds roster persistence P. Every live map change,
+    // durable save and rollback stays behind G so no encrypted KV publisher
+    // can refresh a candidate epoch or enqueue an old sealed record midway.
+    let gss_publication_guard = state.gss_publication_gate.write().await;
+    persist_named_groups_mutation_with_gss_guard(state, &gss_publication_guard, mutate).await
+}
+
+/// The roster mutation core for a caller that already owns the GSS writer.
+/// A borrowed guard is the capability: causal replay can enter here while
+/// retaining its P→G transaction without reacquiring the non-reentrant G.
+async fn persist_named_groups_mutation_with_gss_guard<F>(
+    state: &AppState,
+    _gss_publication_guard: &tokio::sync::RwLockWriteGuard<'_, ()>,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
     if state
         .named_groups_requires_durability_confirmation
         .load(Ordering::Acquire)
@@ -5716,6 +5751,7 @@ async fn persist_named_group_info_inner(
     // a correctness bug), rolls the visible map back, restores the
     // pending-stub marker, and fails the operation.
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let _gss_publication_guard = state.gss_publication_gate.write().await;
     if state
         .named_groups_requires_durability_confirmation
         .load(Ordering::Acquire)
@@ -9448,6 +9484,10 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             still_pending.push_back(pending);
             continue;
         }
+        // Replay installs a live candidate directly, bypassing the ordinary
+        // persist wrapper. Keep encrypted KV publishes out through its checked
+        // save or rollback.
+        let replay_gss_guard = state.gss_publication_gate.write().await;
         // B5: snapshot the group AFTER lock acquisition so we can roll back
         // the in-memory state if persistence fails. Without this, the next
         // replay sees the advanced in-memory state_hash as already_current
@@ -9480,6 +9520,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             None,
             true, // lock_already_held
             true, // roster_lock_already_held
+            Some(&replay_gss_guard),
         ))
         .await;
 
@@ -9522,6 +9563,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         } else {
             (false, false)
         };
+        drop(replay_gss_guard);
         if applied.accepted && group_persisted {
             // #759 item 1: the candidate is DURABLE, so a marker clear it
             // carried is real — promote it to the caller's notification set.
@@ -10253,6 +10295,7 @@ async fn apply_named_group_metadata_event_with_binding(
         bound_join_attempt,
         false,
         false,
+        None,
     ))
     .await;
     if let Some(gid) = replay_group_id {
@@ -10512,6 +10555,7 @@ async fn apply_named_group_metadata_event_inner(
         None,
         false,
         false,
+        None,
     ))
     .await;
     if allow_queue {
@@ -10573,6 +10617,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     bound_join_attempt: Option<&str>,
     lock_already_held: bool,
     roster_lock_already_held: bool,
+    held_gss_guard: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
 ) -> ApplyMetadataResult {
     let observed_predecessor_at_ms =
         envelope_bytes.map(|_| predecessor_first_seen_ms.unwrap_or_else(now_millis_u64));
@@ -10923,6 +10968,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11655,6 +11701,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 action_kind,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11804,6 +11851,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -11869,6 +11917,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.policy_revision = revision.max(next.policy_revision);
@@ -11951,6 +12000,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -12009,6 +12059,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -12139,6 +12190,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -12210,6 +12262,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::NonMemberRequest,
                 |next| {
                     let req = x0x::groups::JoinRequest {
@@ -12382,6 +12435,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     let now_ms = commit.committed_at;
@@ -12584,6 +12638,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     let requester_hex = next
@@ -12641,6 +12696,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::NonMemberRequest,
                 |next| {
                     if let Some(req) = next.join_requests.get_mut(&request_id) {
@@ -12714,6 +12770,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 None,
                 roster_lock_already_held,
+                held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
@@ -24011,6 +24068,9 @@ pub(in crate::server) async fn approve_join_request(
             "named-group state is awaiting directory-durability confirmation",
         );
     }
+    // Approval mutates the live roster before its outbox and roster writes.
+    // Hold G until every durable or compensating outcome has finished.
+    let approval_gss_guard = state.gss_publication_gate.write().await;
     let proof_read_now_ms = now_millis_u64();
 
     // R3: Check the live outbox first, then completed tombstones. Return the
@@ -24481,6 +24541,7 @@ pub(in crate::server) async fn approve_join_request(
             *state.pending_b8_compensation.lock().await = None;
         }
     }
+    drop(approval_gss_guard);
     drop(roster_persistence_guard);
     drop(relay_persistence_guard);
 
@@ -31905,6 +31966,7 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                                         evidence,
                                         quarantine,
                                         false,
+                                        None,
                                     )
                                     .await;
                                     if durable {
@@ -36478,6 +36540,7 @@ pub(in crate::server) mod tests {
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
+            gss_publication_gate: Arc::new(RwLock::new(())),
             group_roster_gossip_lock: Mutex::new(()),
             named_groups_path,
             home_suite_groups_path,

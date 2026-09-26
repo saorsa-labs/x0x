@@ -1031,6 +1031,7 @@ pub async fn serve_with_options(
         crdt_subscriptions_persistence_lock: Mutex::new(()),
         crdt_handle_locks: RwLock::new(HashMap::new()),
         named_groups: RwLock::new(named_groups),
+        gss_publication_gate: Arc::new(RwLock::new(())),
         group_roster_gossip_lock: Mutex::new(()),
         named_groups_path,
         home_suite_groups_path,
@@ -3137,6 +3138,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 None,
                 true,
                 false,
+                None,
             ))
             .await;
             replay_after = replay_group_id;
@@ -3551,6 +3553,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 None,
                 true, // lock_already_held
                 false,
+                None,
             ))
             .await;
             replay_after = replay_group_id;
