@@ -120,6 +120,7 @@ async fn apply_commit(
         &commit,
         None,
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = mutation;
@@ -1269,6 +1270,7 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
         &removal_commit,
         None,
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.add_member(
@@ -1308,6 +1310,7 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
         &removal_commit,
         None,
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.remove_member(&a_hex, Some(authority_hex.clone()));
@@ -1453,6 +1456,7 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
             &seating_commit,
             None,
             false,
+            None,
             x0x::groups::ActionKind::AdminOrHigher,
             |next| {
                 next.add_member(
@@ -1489,6 +1493,7 @@ async fn adr0064_classification_signer_only_and_unauthorized_labels() -> Result<
             &commit,
             None,
             false,
+            None,
             x0x::groups::ActionKind::AdminOrHigher,
             |next| {
                 next.remove_member(&a_hex3, Some(authority_hex.clone()));
@@ -1716,6 +1721,7 @@ async fn adr0064_contested_branch_anchored_commit_cannot_clear() -> Result<()> {
         &contested_commit,
         Some(&mandate),
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = "contested-3".to_string();
@@ -1842,6 +1848,7 @@ async fn adr0064_owner_anchored_successor_conflicting_commit_never_clears() -> R
         &anchored_commit,
         Some(&mandate),
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = "owner-anchored-3".to_string();
@@ -2041,6 +2048,7 @@ async fn adr0064_owner_anchored_conflict_label_lands_on_fresh_evidence() -> Resu
         &anchored_commit,
         Some(&mandate),
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = "owner-anchored-sibling-2".to_string();
@@ -4538,6 +4546,7 @@ async fn issue732_inherited_divergent_containment_survives_the_load_boundary() -
             evidence.clone(),
             Some(marker_x.clone()),
             false,
+            None,
         )
         .await,
         "first-complete-wins: an identical marker is already recorded, nothing installs"
@@ -4582,6 +4591,7 @@ async fn issue732_inherited_divergent_containment_survives_the_load_boundary() -
             evidence_y,
             Some(marker_y.clone()),
             false,
+            None,
         )
         .await,
         "the faulted install never reaches durability"
@@ -4775,6 +4785,7 @@ async fn issue732_mixed_lineage_aliases_keep_retained_evidence_and_refuse_the_id
                 evidence.clone(),
                 Some(marker.clone()),
                 false,
+                None,
             )
             .await,
             "first-complete-wins: the identical conflict does not re-install"
@@ -4884,6 +4895,7 @@ async fn issue732_install_refuses_when_a_marker_already_exists_despite_an_empty_
             evidence.clone(),
             Some(marker.clone()),
             false,
+            None,
         )
         .await,
         "atomic admission: a pre-existing marker refuses the install even with \
