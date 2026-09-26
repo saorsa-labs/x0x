@@ -8191,6 +8191,85 @@ mod tests {
         assert_eq!(value, Some(b"hush".to_vec()));
     }
 
+    /// #976 r4 (T1c): the ONLY publish path (put_with_delta →
+    /// publish_delta) never puts unsealed delta bytes on an encrypted
+    /// store's topic. A RAW subscription — no member context, exactly
+    /// what a rogue peer on the mesh would see — receives the wire
+    /// bytes; they must decode as an `EncryptedKvStoreRecordV1` and
+    /// must not contain the plaintext key or value anywhere.
+    #[tokio::test]
+    async fn encrypted_put_publishes_no_unsealed_bytes_on_the_topic() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let kp_a = AgentKeypair::generate().expect("kp");
+        let kp_b = AgentKeypair::generate().expect("kp");
+        let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a, b]);
+        let ctx_b = ctxs.pop().expect("ctx b");
+        let ctx_a = ctxs.pop().expect("ctx a");
+        let topic = "store/enc-976-t1c";
+        let sync_a = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            1,
+            a,
+            a,
+            &kp_a,
+            ctx_a,
+            group_id,
+            peer(1),
+        )
+        .await;
+        sync_a.start().await.expect("start a");
+        // A raw eavesdropper subscription (no secure context of any kind).
+        let mut raw = pubsub.subscribe(topic.to_string()).await;
+        let _ = ctx_b; // member b is irrelevant to the eavesdrop assertion
+        let marker = b"976-plaintext-marker-hush";
+        let delta = {
+            let mut s = sync_a.write().await;
+            s.put(
+                "secret-key".to_string(),
+                marker.to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+            let entry = s.get("secret-key").cloned().expect("entry");
+            KvStoreDelta::for_put(
+                "secret-key".to_string(),
+                entry,
+                (peer(1), s.next_seq().expect("sequence")),
+                s.current_version(),
+            )
+        };
+        sync_a.publish_delta(peer(1), delta).await.expect("publish");
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), raw.recv())
+            .await
+            .expect("the raw subscriber sees the publication")
+            .expect("subscription alive");
+        assert_eq!(msg.topic, topic);
+        let wire = &msg.payload[..];
+        // (1) Not plaintext: neither the value marker nor the key name
+        // appears anywhere in the published bytes.
+        assert!(
+            !wire.windows(marker.len()).any(|w| w == marker),
+            "the plaintext VALUE must not appear on the topic"
+        );
+        assert!(
+            !wire.windows("secret-key".len()).any(|w| w == b"secret-key"),
+            "the plaintext KEY must not appear on the topic"
+        );
+        // (2) It IS the sealed envelope (a failed publish alone would
+        // also satisfy (1)).
+        let (_, record) = decode_delta::<EncryptedKvStoreRecordV1>(wire).expect("sealed envelope");
+        assert!(
+            !record.ciphertext.windows(marker.len()).any(|w| w == marker),
+            "the AEAD ciphertext is not the plaintext (defense in depth)"
+        );
+        assert!(!record.ciphertext.is_empty());
+    }
+
     #[tokio::test]
     async fn rejected_owner_announce_does_not_wait_behind_a_receive_section() {
         // WHY (#757 r3, Codex P2): the responder serves state requests from

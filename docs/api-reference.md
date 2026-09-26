@@ -1888,14 +1888,25 @@ never an error: the value IS applied and persisted locally.
 }
 ```
 
-- `published: false` — the mesh announcement failed; the delta is queued
-  and re-published by the store's retry tick and by the next PUT (a client
-  retry of the same PUT re-announces it, including on `append_only`
-  stores where the identical re-put is otherwise a no-op).
-- `direct_attempted` — how many directly-connected peers received the
-  delta over the DM side channel despite the publish failure.
+- `published: false` — the mesh announcement failed. The delta is NOT
+  queued anywhere: the client re-issues the PUT to retry the publish
+  (an identical re-put, including on `append_only` stores, re-announces
+  the existing entry through the normal sealed publish path — a store
+  no-op, not a second write).
+- `direct_attempted` — how many directly-connected peers the daemon
+  ATTEMPTED to notify over the DM side channel after the publish
+  failure. The sends are fire-and-forget: this counts attempts, not
+  delivery confirmations.
 - `evicted_keys` — as on 200; eviction notices (`kv:evicted` SSE) fire on
   this path too.
+
+### Store delete publish outcome (#976)
+
+`DELETE` behaves symmetrically: a remove whose local apply succeeded
+but whose publish failed returns **202** with
+`{"ok":true,"published":false,"reason":...,"direct_attempted":N}` —
+the key is gone locally, never an error, and there is no background
+replay: the client re-issues the DELETE to retry the publish.
 
 ### Store write authorization
 
