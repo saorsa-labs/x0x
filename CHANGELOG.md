@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Share-grant redelivery outbox (#926, ADR-0070 §2).** A grant delivery
+  whose durable-DM attempts all fail is now queued in
+  `<data_dir>/share-grant-outbox.bin` (durable, 0600) and retried on bounded
+  backoff (5 s doubling to 5 min), and at once when the recipient's machine
+  connects again, until the recipient ACKs. An entry is dropped on ACK, on
+  revocation (checked before every send) or at its deadline: the grant's
+  expiry or 7 days after queueing. Bounds: 128 entries per grantee, 1024 in
+  total; past a bound the entry is refused and reported, and an over-bound
+  file loads fail-closed rather than truncated. `POST /grants` delivery rows
+  gain `queued`; `GET /grants` reports `outbox_error`. Every share-grant
+  revocation source (local `DELETE /grants/:id`, the `x0x.revocation.v3`
+  carrier, and share-grant records on the v1/v2 carriers) is serialized
+  with in-flight redeliveries. `DELETE /grants/:id` now answers `503` unless
+  both `revocations-v3.bin` and the outbox removal are durable (retry is
+  idempotent). `revocations-v3.bin` is now written durably and
+  monotonically: every writer re-reads and unions the file while holding an
+  exclusive OS advisory lock on `revocations-v3.bin.lock` (shared with the
+  daemon instance lock's primitives), so neither an older snapshot nor
+  another daemon sharing the identity dir can erase a newer revocation; the
+  union applies the same GC horizon as the in-memory sweep. Share-grant
+  revocations received on the v1/v2 carriers are now persisted to v3 too. No wire change: retries re-send the #924
+  typed DM with the same logical request id, so the receiving side is
+  unchanged.
+
 - **`[gossip] byte_policy` — opt-in Leaf egress shedding (#504 slice 2).**
   `"observe_only"` (default) | `"shed_normal"`. The byte thresholds and the
   authority to act on them are now two separate settings: a non-zero

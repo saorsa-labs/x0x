@@ -299,6 +299,7 @@ async fn v3_revocation_denies_the_grantee_promptly() {
     let payload = share_grant_revocation(&w.owner_a, &grant);
     assert!(
         crate::ingest_share_grant_revocations(
+            &OwnerTrust::default(),
             &w.revocations,
             Some(w.dir.path().to_path_buf()),
             &payload,
@@ -324,6 +325,7 @@ async fn grantee_signed_revocation_is_rejected() {
     let payload = share_grant_revocation(&w.user_b, &grant);
     assert!(
         !crate::ingest_share_grant_revocations(
+            &OwnerTrust::default(),
             &w.revocations,
             Some(w.dir.path().to_path_buf()),
             &payload,
@@ -541,6 +543,7 @@ async fn expired_grant_is_denied_after_its_revocation_is_collected() {
     let payload = share_grant_revocation(&w.owner_a, &grant);
     assert!(
         crate::ingest_share_grant_revocations(
+            &OwnerTrust::default(),
             &w.revocations,
             Some(w.dir.path().to_path_buf()),
             &payload,
