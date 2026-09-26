@@ -363,6 +363,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/agents/reachability/<agent_i
 x0x agents find <agent_id>               # POST /agents/find/:id — active network-wide lookup
 x0x agents machine <agent_id>            # GET /agents/:id/machine — which machine an agent runs on
 x0x agents by-user <user_id>             # GET /users/:user_id/agents (also /users/:user_id/machines)
+x0x onboard [--no-card] [--json]         # teach a non-x0x agent: install, start, import your card, DM you back
 ```
 
 **Card import and direct-connect REST contracts**

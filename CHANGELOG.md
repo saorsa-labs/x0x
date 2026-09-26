@@ -66,6 +66,14 @@ All notable changes to this project will be documented in this file.
   `docs/diagnostics.md`.
 ### Fixed
 
+- **Typed DM relay admission and prefix collisions (#903).** A full predecessor
+  relay channel now leaves the gossip request unacknowledged and unclaimed for
+  the authority's outbox retry. Typed routes validate their complete payloads
+  before taking a verified DM; an ordinary message that merely starts with any
+  of the five registered prefixes reaches generic subscribers and keeps its
+  durable message history. The new public `DmTypedPayloadRoute.validator` field
+  is a source-level API change: downstream struct literals must supply it (or
+  use the `DmInboxConfig` route builders).
 - **`Agent::shutdown` now retires persistent kv snapshot paths, so an owner
   restart re-opens them instead of being fenced off (#765, follow-up to
   #760).** The #760 snapshot fence refuses to arm persistence for any open
@@ -847,6 +855,20 @@ All notable changes to this project will be documented in this file.
   nextest-isolated.sh) through success, test-failure, report-failure and
   ratchet-failure controls, asserting phase order, exit codes and argument
   preservation.
+
+### Known limitations
+
+- **Mixed-version predecessor relays can still be falsely acknowledged (#903).**
+  The new sender uses gossip so a full typed channel remains retryable when
+  both peers are upgraded. An older sender using raw QUIC can receive a
+  transport ACK from a new receiver before application admission; deferred
+  admission-aware transport ACKs are tracked in
+  [ant-quic #301](https://github.com/saorsa-labs/ant-quic/issues/301). A new
+  sender talking to an older receiver can instead receive a false v1 gossip
+  application `Accepted` ACK when that receiver's typed channel is full. Only
+  on upgraded receivers does a v1 gossip ACK confirm queue admission, and it
+  still does not confirm handler application or persistence. The initial
+  requester-to-authority offer remains a one-shot send tracked in #908.
 
 ## [v0.45.0] - 2026-09-14
 

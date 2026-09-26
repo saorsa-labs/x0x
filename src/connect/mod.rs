@@ -25,7 +25,7 @@ pub use crate::exec::acl::LoadMode;
 pub use acl::{
     default_connect_acl_path, default_connect_acl_path_for, is_loopback, load_connect_policy,
     parse_connect_policy, parse_target, ConnectAcl, ConnectAclError, ConnectAclSummary,
-    ConnectAllowEntry, ConnectPolicy,
+    ConnectAllowEntry, ConnectOwnerEntry, ConnectPolicy,
 };
 pub use diagnostics::{ConnectDiagnostics, ConnectDiagnosticsSnapshot};
-pub use gate::{evaluate_connect_gate, ConnectDenialReason};
+pub use gate::{evaluate_connect_gate, evaluate_connect_gate_for_principal, ConnectDenialReason};
