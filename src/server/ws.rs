@@ -156,6 +156,12 @@ enum WsOutbound {
     },
     #[serde(rename = "error")]
     Error { message: String },
+    /// ADR-0073: an invite passed the call gate and is ringing.
+    #[serde(rename = "call.incoming")]
+    CallIncoming { call: serde_json::Value },
+    /// ADR-0073: a call lifecycle transition.
+    #[serde(rename = "call.state")]
+    CallState { call: serde_json::Value },
 }
 
 /// Client → Server WebSocket command.
@@ -820,6 +826,31 @@ async fn handle_ws_connection(
         None
     };
 
+    // ADR-0073: forward `call.*` events from the daemon event channel to
+    // every WS session (plain and direct), so a GUI tab rings.
+    let call_tx = outbound_tx.clone();
+    let call_stats = Arc::clone(&stats);
+    let call_slow_close = slow_close.clone();
+    let call_counted = Arc::clone(&slow_close_counted);
+    let mut call_rx = state.broadcast_tx.subscribe();
+    let call_forwarder = tokio::spawn(async move {
+        loop {
+            let event = match call_rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let out = match event.event_type.as_str() {
+                "call.incoming" => WsOutbound::CallIncoming { call: event.data },
+                "call.state" => WsOutbound::CallState { call: event.data },
+                _ => continue,
+            };
+            if !feed_critical(&call_tx, out, &call_stats, &call_slow_close, &call_counted) {
+                break;
+            }
+        }
+    });
+
     // Spawn keepalive pinger (30s interval). The keepalive is the reliable
     // slow-consumer detector: every interval it tries to enqueue a Pong and,
     // on a Full queue, closes the session — so a stalled reader is closed
@@ -896,6 +927,7 @@ async fn handle_ws_connection(
     // Retire the feeders and drop the last outbound sender so the writer can
     // observe channel closure and exit on its own.
     keepalive.abort();
+    call_forwarder.abort();
     if let Some(h) = direct_handle {
         h.abort();
     }

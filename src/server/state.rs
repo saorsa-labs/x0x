@@ -1127,6 +1127,8 @@ pub(super) struct AppState {
     /// [`super::routes::status::HealthSnapshot`].
     pub(super) health_snapshot: Arc<super::routes::status::HealthSnapshot>,
     pub(super) broadcast_tx: broadcast::Sender<SseEvent>,
+    /// ADR-0073 call lifecycle registry (slice 1: signalling only).
+    pub(super) calls: tokio::sync::Mutex<x0x::calls::CallRegistry>,
     /// Active file transfers.
     pub(super) file_transfers: RwLock<HashMap<String, x0x::files::TransferState>>,
     /// Incremental SHA-256 hashers for receiving transfers.

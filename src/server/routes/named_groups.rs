@@ -1100,6 +1100,17 @@ pub(in crate::server) enum JoinResultMessage {
         /// result (owner installs only) — the joiner's CAS anchor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_attestation: Option<Box<HeadAttestation>>,
+        /// R19 (#802 R18 Home blocker): base64 bincode `AgentCertificate`s
+        /// for the authority's byte-bearing roster seats (owner devices
+        /// included), so the joiner holds them even after their device
+        /// goes offline. Not covered by any signature: each entry is
+        /// installed only when it hashes to a committed seat digest and
+        /// verifies under the group owner (see
+        /// `seat_cert_fetch::hydrate_from_roster_certificate_sidecar`).
+        /// Empty and omitted for legacy authorities; legacy joiners ignore
+        /// the key.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roster_certificates_b64: Vec<String>,
     },
     /// #477 W1: the authority's typed, attempt-bound refusal. Served ONLY
     /// to fetches that carried `accepts_refusal: true` AND a matching
@@ -34052,6 +34063,46 @@ async fn group_membership_lock_for_known_group(
     )))
 }
 
+/// R19 (#802 R18 Home blocker): serialize a served JoinResult with the
+/// authority's roster certificate sidecar
+/// ([`seat_cert_fetch::roster_certificate_sidecar`]) attached. The sidecar
+/// is trimmed from the end until the payload fits the budget of the
+/// transport the BARE result would use: an inline result stays within the
+/// direct-message limit, and an oversized one stays within the
+/// control-blob limit. Attaching certificates therefore never moves a
+/// result onto a transport the joiner may not support.
+pub(in crate::server) async fn join_result_payload_with_roster_certificates(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    mut response: JoinResultMessage,
+) -> serde_json::Result<Vec<u8>> {
+    let bare = serde_json::to_vec(&response)?;
+    let mut sidecar =
+        seat_cert_fetch::roster_certificate_sidecar(state, group_id, member_agent_id).await;
+    let budget = if bare.len() <= x0x::dm::MAX_PAYLOAD_BYTES {
+        x0x::dm::MAX_PAYLOAD_BYTES
+    } else {
+        TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_BYTES
+    };
+    while !sidecar.is_empty() {
+        let JoinResultMessage::Result {
+            roster_certificates_b64,
+            ..
+        } = &mut response
+        else {
+            return Ok(bare);
+        };
+        *roster_certificates_b64 = sidecar.clone();
+        let payload = serde_json::to_vec(&response)?;
+        if payload.len() <= budget {
+            return Ok(payload);
+        }
+        sidecar.pop();
+    }
+    Ok(bare)
+}
+
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -34231,8 +34282,16 @@ async fn handle_join_result_message_bound(
                 event: Box::new(event),
                 chain,
                 head_attestation: head_attestation.map(Box::new),
+                roster_certificates_b64: Vec::new(),
             };
-            let payload = match serde_json::to_vec(&response) {
+            let payload = match join_result_payload_with_roster_certificates(
+                state,
+                &group_id,
+                &member_agent_id,
+                response,
+            )
+            .await
+            {
                 Ok(payload) => payload,
                 Err(e) => {
                     tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize join-result event: {e}");
@@ -34337,6 +34396,7 @@ async fn handle_join_result_message_bound(
             event,
             chain,
             head_attestation,
+            roster_certificates_b64,
         } => {
             let event = *event;
             tracing::debug!(
@@ -34471,6 +34531,18 @@ async fn handle_join_result_message_bound(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&expected_key);
+            // R19: hydrate digest-only seats from the authority's
+            // certificate sidecar. This runs whether or not THIS apply
+            // was accepted: the gossip copy of the same MemberAdded may
+            // already have seated us, leaving this result a no-op apply.
+            // Every entry is verified against the committed seat digest
+            // and the group owner before it is installed.
+            seat_cert_fetch::hydrate_from_roster_certificate_sidecar(
+                state,
+                &group_id,
+                &roster_certificates_b64,
+            )
+            .await;
             if applied {
                 // #477 (r6 item 2 → r7): the seat finalize ran INSIDE the
                 // MemberAdded apply while its membership guard was held
@@ -35716,6 +35788,7 @@ pub(in crate::server) mod tests {
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     mod r17_cert_hydrate;
+    mod r19_cert_carry;
     mod wp_c;
 
     fn fake_group_state_commit(
@@ -36479,6 +36552,7 @@ pub(in crate::server) mod tests {
             start_time: Instant::now(),
             health_snapshot: Arc::new(crate::server::routes::status::HealthSnapshot::default()),
             broadcast_tx,
+            calls: crate::server::routes::calls::new_registry(),
             file_transfers: RwLock::new(HashMap::new()),
             receive_hashers: RwLock::new(HashMap::new()),
             pending_file_chunks: RwLock::new(HashMap::new()),
@@ -37827,6 +37901,7 @@ pub(in crate::server) mod tests {
                     event: Box::new(event),
                     chain: Vec::new(),
                     head_attestation: attestation.map(Box::new),
+                    roster_certificates_b64: Vec::new(),
                 },
             )
             .await;
@@ -47866,6 +47941,7 @@ pub(in crate::server) mod tests {
             }),
             chain: Vec::new(),
             head_attestation: None,
+            roster_certificates_b64: Vec::new(),
         };
         let result_payload = serde_json::to_vec(&result);
         assert!(result_payload.is_ok(), "join-result response serializes");

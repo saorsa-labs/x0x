@@ -297,6 +297,29 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/exec/run", daemon_api_exec_run_bad_agent_id),
     covered!(Post, "/exec/cancel", daemon_api_exec_cancel_bad_request_id),
     covered!(Get, "/exec/sessions", daemon_api_exec_sessions),
+    // ── Calls (ADR-0073 slice 1) ────────────────────────────────────────
+    covered!(
+        Post,
+        "/calls",
+        daemon_api_calls_create_unverified_callee_refused
+    ),
+    covered!(Get, "/calls", daemon_api_calls_list),
+    covered!(Get, "/calls/:id", daemon_api_calls_unknown_id_is_404),
+    covered!(
+        Post,
+        "/calls/:id/accept",
+        daemon_api_calls_unknown_id_is_404
+    ),
+    covered!(
+        Post,
+        "/calls/:id/reject",
+        daemon_api_calls_unknown_id_is_404
+    ),
+    covered!(
+        Post,
+        "/calls/:id/hangup",
+        daemon_api_calls_unknown_id_is_404
+    ),
     // ── MLS groups ──────────────────────────────────────────────────────
     covered!(Post, "/mls/groups", daemon_api_create_group),
     covered!(Get, "/mls/groups", daemon_api_list_groups),
@@ -1090,6 +1113,7 @@ fn categories_are_valid() {
         "stores",
         "files",
         "exec",
+        "calls",
         "connect",
         "upgrade",
         "websocket",

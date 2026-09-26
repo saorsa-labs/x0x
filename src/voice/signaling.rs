@@ -220,6 +220,100 @@ mod tests {
         assert!(!is_x0x_extension_frame(b"not json"));
     }
 
+    /// ADR-0073 frame-compatibility test: interleaving `x0x_call_*`
+    /// lifecycle frames with the upstream capability handshake must leave
+    /// the handshake intact on BOTH an old and a current peer.
+    ///
+    /// * Old peer (pre-extension reader): tries `SignalingMessage` on every
+    ///   prefixed body; a decode `Err` is logged and skipped (`continue`),
+    ///   never fatal. So every call frame must FAIL that decode — if one
+    ///   decoded, an old peer would feed a bogus message into its call
+    ///   state — and every handshake frame must still decode.
+    /// * Current peer: `is_x0x_extension_frame` skips call frames silently
+    ///   before the decode, and never skips a handshake frame.
+    #[test]
+    fn call_frames_do_not_disturb_the_voice_handshake_on_old_or_new_peers() {
+        use crate::calls::{CallFrame, MediaKinds};
+
+        let media = MediaKinds {
+            audio: true,
+            video: true,
+        };
+        let call_id = "ab".repeat(16);
+        let handshake = [
+            SignalingMessage::CapabilityExchange {
+                session_id: "s1".to_owned(),
+                audio: true,
+                video: true,
+                data_channel: false,
+                max_bandwidth_kbps: 2_000,
+                quic_endpoint: None,
+            },
+            SignalingMessage::ConnectionConfirm {
+                session_id: "s1".to_owned(),
+                audio: true,
+                video: true,
+                data_channel: false,
+                max_bandwidth_kbps: 2_000,
+                quic_endpoint: None,
+            },
+            SignalingMessage::ConnectionReady {
+                session_id: "s1".to_owned(),
+            },
+        ];
+        let calls = [
+            CallFrame::Invite {
+                call_id: call_id.clone(),
+                media,
+            },
+            CallFrame::Accept {
+                call_id: call_id.clone(),
+                media,
+            },
+            CallFrame::Reject {
+                call_id: call_id.clone(),
+                media,
+            },
+            CallFrame::Hangup {
+                call_id,
+                media,
+                reason: Some("missed".to_owned()),
+            },
+        ];
+
+        // Interleave: call frame, handshake frame, call frame, … — the
+        // order a live channel could carry them in.
+        let mut wire: Vec<Vec<u8>> = Vec::new();
+        for (i, call) in calls.iter().enumerate() {
+            wire.push(call.encode().expect("call frame encodes"));
+            if let Some(msg) = handshake.get(i) {
+                let mut payload = VOICE_SIGNALING_DM_PREFIX.to_vec();
+                payload.extend_from_slice(&serde_json::to_vec(msg).expect("handshake encodes"));
+                wire.push(payload);
+            }
+        }
+
+        let mut old_peer_delivered = Vec::new();
+        let mut new_peer_delivered = Vec::new();
+        for payload in &wire {
+            let body = payload
+                .strip_prefix(VOICE_SIGNALING_DM_PREFIX)
+                .expect("every frame carries the voice prefix");
+            // Old peer: decode or skip.
+            if let Ok(msg) = serde_json::from_slice::<SignalingMessage>(body) {
+                old_peer_delivered.push(msg);
+            }
+            // Current peer: extension frames skipped before decoding.
+            if !is_x0x_extension_frame(body) {
+                if let Ok(msg) = serde_json::from_slice::<SignalingMessage>(body) {
+                    new_peer_delivered.push(msg);
+                }
+            }
+        }
+        assert_eq!(old_peer_delivered, handshake.to_vec());
+        assert_eq!(new_peer_delivered, handshake.to_vec());
+    }
+
     #[test]
     fn prefix_literal_is_pinned() {
         // The wire prefix is protocol surface — changing it breaks live

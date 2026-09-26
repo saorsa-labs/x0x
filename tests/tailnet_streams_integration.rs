@@ -14,6 +14,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/network_gate.rs"]
+mod network_gate;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -26,18 +29,14 @@ fn loopback_network_config() -> NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
         bootstrap_nodes: Vec::new(),
         mdns_enabled: false,
+        // Loopback only: no UPnP IGD discovery on the runner's LAN.
+        port_mapping_enabled: false,
         ..NetworkConfig::default()
     }
 }
 
-fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("Operation not permitted")
-        && (message.contains("bind UDP socket")
-            || message.contains("network initialization failed"))
-}
-
 async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
+    network_gate::init_stream_tracing();
     match x0x::Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
         .with_agent_key_path(dir.path().join(format!("{name}-agent.key")))
@@ -48,7 +47,7 @@ async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
         .await
     {
         Ok(agent) => Some(agent),
-        Err(e) if is_network_bind_permission_error(&e) => None,
+        Err(e) if network_gate::skip_on_refused_network(&e) => None,
         Err(e) => panic!("agent build failed: {e}"),
     }
 }
@@ -559,17 +558,26 @@ async fn connect_acl_refuses_unlisted_peer_stream() {
         "unlisted peer's stream must not be surfaced"
     );
 
-    // Carol observes the refusal: bob dropped the stream halves, so her read
-    // hits EOF (FIN from the dropped send half)…
+    // Carol observes the refusal: bob dropped the stream halves unfinished,
+    // which ant-quic turns into a RESET with DROPPED_UNFINISHED_ERROR_CODE
+    // (not a FIN — a FIN would let a refusal read as a complete, empty
+    // stream). The accept loop documents this as "the stream is reset". She
+    // must see exactly that reset, with zero application bytes…
     let mut buf = [0u8; 16];
     let read = tokio::time::timeout(
         Duration::from_secs(10),
         carol_stream.recv_mut().read(&mut buf),
     )
     .await
-    .expect("refused stream read must settle")
-    .expect("refused stream read must not error (FIN, not reset)");
-    assert!(read.is_none(), "refused stream reads EOF, got {read:?}");
+    .expect("refused stream read must settle");
+    assert!(
+        matches!(
+            read,
+            Err(ant_quic::high_level::ReadError::Reset(code))
+                if code == ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE
+        ),
+        "refused stream must be reset by the gate with zero bytes, got {read:?}"
+    );
 
     // …and her writes fail (STOP_SENDING from the dropped recv half). Retry
     // a few times: the STOP_SENDING frame may lag the FIN by a packet.
@@ -659,14 +667,24 @@ async fn acceptor_channel_is_bounded() {
     /// replaced by another open below).
     const LAND_DEADLINE: Duration = Duration::from_secs(10);
 
+    /// Overall fill deadline: a bounded failure instead of an unbounded
+    /// replace-and-retry loop if streams stop landing entirely.
+    const FILL_DEADLINE: Duration = Duration::from_secs(180);
+
     let bob_agent = bob.agent_id();
     let mut held: Vec<x0x::streams::PeerStream> = Vec::new();
+    let fill_deadline = Instant::now() + FILL_DEADLINE;
 
     // Serial fill to exactly capacity: open one, wait for it to land, repeat.
     // A stranded open (rare) is replaced by a fresh one — the connection
     // stays healthy for new streams even when an earlier burst frames never
     // transmit.
     while acceptor.queued() < CAP {
+        assert!(
+            Instant::now() < fill_deadline,
+            "acceptor fill stalled at {} of {CAP} within {FILL_DEADLINE:?}",
+            acceptor.queued()
+        );
         let before = acceptor.queued();
         held.push(
             alice
@@ -776,10 +794,21 @@ async fn backpressure_throttles_writer_with_bounded_buffering() {
             offset = end;
             written_in_task.store(offset, Ordering::Release);
         }
+        // The task drops the stream on return; ant-quic resets an unfinished
+        // dropped stream, discarding the buffered tail the reader still needs.
+        alice_stream.send_mut().finish().expect("finish stream");
         offset
     });
 
+    // Wait (bounded) for the writer's first progress so a slow runner cannot
+    // turn scheduling delay into a false "no initial progress" failure.
+    let progress_deadline = Instant::now() + Duration::from_secs(15);
+    while written.load(Ordering::Acquire) == 0 && Instant::now() < progress_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     // Stall the reader: the writer must throttle at the flow-control window.
+    // This is an observation window (proving the writer does NOT finish), so
+    // it stays a fixed duration rather than a poll.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let stalled = written.load(Ordering::Acquire);
     assert!(
