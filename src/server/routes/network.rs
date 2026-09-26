@@ -587,6 +587,9 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "subscribed_topics": egress["subscribed_topics"],
                 "outbound_by_topic_named": egress["outbound_by_topic_named"],
                 "egress_budget": egress["egress_budget"],
+                // SG76 key-cache runtime witness (see PubSubManager::
+                // egress_diagnostics); additive, diagnostics-only.
+                "key_cache": egress["key_cache"],
                 "outer_signature_policy": state.agent.gossip_outer_signature_policy(),
                 "legacy_grants_enabled": false,
                 "outer_v1_receipts": state.agent.gossip_outer_v1_receipts(),
@@ -596,6 +599,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                     .agent
                     .gossip_inbound_by_topic()
                     .unwrap_or_default(),
+                "legacy_dm_bus_origin": egress["legacy_dm_bus_origin"],
                 "relay_fanout": state.agent.gossip_relay_fanout().unwrap_or_default(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "inner_envelope_verify": x0x::gossip::inner_verify_stats(),
@@ -615,11 +619,115 @@ pub(in crate::server) async fn gossip_diagnostics(
     }
 }
 
+/// GET /diagnostics/state-sync — cumulative local activity for open stores.
+pub(in crate::server) async fn state_sync_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let stores = state.kv_stores.read().await;
+    let snapshots: std::collections::BTreeMap<_, _> = stores
+        .iter()
+        .map(|(topic, handle)| (topic.clone(), handle.state_sync_snapshot()))
+        .collect();
+    Json(serde_json::json!({
+        "ok": true,
+        "scope": "local_open_stores",
+        "reset": "store_close_or_process_restart",
+        "stores": snapshots,
+    }))
+}
+
 #[cfg(test)]
 mod participation_diagnostics_tests {
     use super::*;
     use axum::{body::Body, http::Request, routing::get, Router};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn state_sync_route_exposes_bounded_open_store_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let handle = agent
+            .create_kv_store("Diagnostics", "diagnostics/state-sync-test")
+            .await
+            .unwrap();
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert("diagnostics/state-sync-test".to_string(), handle);
+        let app = Router::new()
+            .route("/diagnostics/state-sync", get(state_sync_diagnostics))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics/state-sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["scope"], "local_open_stores");
+        assert_eq!(json["reset"], "store_close_or_process_restart");
+        let counters = &json["stores"]["diagnostics/state-sync-test"];
+        let keys = counters
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "incoming_record_merges",
+                "rejected_authorization_version",
+                "rejected_cooldown",
+                "rejected_no_retained",
+                "rejected_other",
+                "rejected_unauthorized_control",
+                "rejected_unauthorized_request",
+                "rejected_verify",
+                "request_seal_failed",
+                "requests_answered",
+                "requests_received",
+                "requests_sent",
+                "retained_pages_served",
+            ]
+        );
+        assert!(counters
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value.is_u64()));
+    }
 
     /// The C0 soak needs the subscription-aware relay meter, not the older
     /// origin-based counter that also includes subscribed-topic forwarding.
@@ -676,6 +784,39 @@ mod participation_diagnostics_tests {
             assert_eq!(body["egress_budget"]["leaf_max_eager_degree"], 2);
             assert_eq!(body["egress_budget"]["byte_policy"], "observe_only");
             assert_eq!(body["egress_budget"]["applies_to_leaf"], !relay);
+            // SG76 key-cache witness: the additive object must be present at
+            // the real route with the producer snapshot's counter types
+            // (cumulative u64s; usize high-water fields serialize as u64).
+            // Presence/type only — values are runtime evidence, asserted on
+            // isolated Linux runs, not here.
+            let key_cache = &body["key_cache"];
+            assert!(key_cache.is_object(), "key_cache object present");
+            for field in [
+                "full_out_frames",
+                "full_out_bytes",
+                "ref_out_frames",
+                "ref_out_bytes",
+                "full_in_frames",
+                "full_in_bytes",
+                "ref_in_frames",
+                "ref_in_bytes",
+                "cache_hits",
+                "cache_misses",
+                "cache_evictions",
+                "requests",
+                "responses",
+                "pending_frames_high_water",
+                "pending_bytes_high_water",
+                "pending_timeouts",
+                "pending_peer_limit_drops",
+                "pending_global_limit_drops",
+                "malformed_controls",
+                "hash_mismatches",
+                "replay_success",
+                "replay_failure",
+            ] {
+                assert!(key_cache[field].is_u64(), "key_cache.{field} is u64");
+            }
             // #288 soak: cumulative counters are integrals, so the same
             // response must carry the daemon clock, the inner-envelope verify
             // cost (verify/s replaces co-tenant %CPU, #656) and the sub-second

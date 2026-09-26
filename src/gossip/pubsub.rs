@@ -17,15 +17,16 @@ use super::participation::{
 };
 use super::GossipConfig;
 use crate::contacts::{ContactStore, TrustLevel};
+use crate::dm::LegacyBusMessageKind;
 use crate::error::{NetworkError, NetworkResult};
-use crate::identity::AgentId;
+use crate::identity::{AgentId, MachineId};
 use crate::network::NetworkNode;
 use bytes::Bytes;
 use saorsa_gossip_pubsub::{BytePolicy, LeafEgressConfig, PlumtreePubSub, PubSub, SignaturePolicy};
 use saorsa_gossip_transport::GossipTransport;
-use saorsa_gossip_types::{
-    MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
-};
+#[cfg(test)]
+use saorsa_gossip_types::MessageHeader;
+use saorsa_gossip_types::{MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -261,7 +262,7 @@ impl PubSubStats {
 }
 
 /// Inbound frames and bytes per (topic class, PlumTree message kind),
-/// counted off the already-decoded [`MessageHeader`] before any signature
+/// counted off the already-decoded [`saorsa_gossip_pubsub::InspectedMessageHeader`] before any signature
 /// work (#674): `/diagnostics/gossip` could not previously attribute
 /// inbound cost to a topic, forcing eviction-rate inference. Exposed as
 /// `inbound_by_topic` on the `GET /diagnostics/gossip` snapshot.
@@ -365,9 +366,9 @@ impl Default for InboundByTopicStats {
 
 impl InboundByTopicStats {
     /// Attribute one inbound frame. `frame_len` is the full wire length.
-    fn record(&self, header: &MessageHeader, frame_len: u64) {
-        let slot = &self.slots[inbound_topic_class(&header.topic) * INBOUND_KIND_NAMES.len()
-            + inbound_kind_index(header.kind)];
+    fn record(&self, inspected: &saorsa_gossip_pubsub::InspectedMessageHeader, frame_len: u64) {
+        let slot = &self.slots[inbound_topic_class(&inspected.topic) * INBOUND_KIND_NAMES.len()
+            + inbound_kind_index(inspected.kind)];
         slot.frames.fetch_add(1, Ordering::Relaxed);
         slot.bytes.fetch_add(frame_len, Ordering::Relaxed);
     }
@@ -593,11 +594,52 @@ pub struct Subscription {
     /// Channel receiver for messages on this topic.
     receiver: mpsc::Receiver<PubSubMessage>,
     /// Reference to per-topic subscriber counts for cleanup on drop.
-    topic_ref_counts: Arc<RwLock<HashMap<String, usize>>>,
+    topic_ref_counts: Arc<RwLock<HashMap<String, TopicSubscriptionCount>>>,
+    generation: u64,
     /// Name → transport id, dropped with the last local subscriber.
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
     /// Live subscribed transport ids used by the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// Group classification and SG preference cleared with the last subscriber.
+    group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
+    plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
+    group_preference_apply_locks: Arc<GroupTopicApplyLocks>,
+    #[cfg(test)]
+    drop_completed: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy)]
+struct TopicSubscriptionCount {
+    count: usize,
+    generation: u64,
+}
+
+/// A fixed number of topic shards keeps the hot path bounded without
+/// serializing unrelated topics. Roster writers serialize with each other
+/// and reconcile one shard at a time after publishing the new roster.
+struct GroupTopicApplyLocks {
+    roster_update: tokio::sync::Mutex<()>,
+    names: [tokio::sync::Mutex<()>; 64],
+    shards: [tokio::sync::Mutex<()>; 64],
+}
+
+impl GroupTopicApplyLocks {
+    fn new() -> Self {
+        Self {
+            roster_update: tokio::sync::Mutex::new(()),
+            names: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
+            shards: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
+        }
+    }
+
+    fn name_shard(&self, name: &str) -> &tokio::sync::Mutex<()> {
+        let rank = blake3::hash(name.as_bytes());
+        &self.names[usize::from(rank.as_bytes()[0]) % self.names.len()]
+    }
+
+    fn shard(&self, topic: TopicId) -> &tokio::sync::Mutex<()> {
+        &self.shards[usize::from(topic.as_bytes()[0]) % self.shards.len()]
+    }
 }
 
 impl Subscription {
@@ -638,17 +680,35 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         let topic = self.topic.clone();
         let topic_id = self.topic_id;
+        let generation = self.generation;
         let topic_ref_counts = self.topic_ref_counts.clone();
         let topic_id_by_name = self.topic_id_by_name.clone();
         let subscribed_topic_ids = self.subscribed_topic_ids.clone();
+        let group_topic_by_id = self.group_topic_by_id.clone();
+        let plumtree = self.plumtree.clone();
+        let group_preference_apply_locks = self.group_preference_apply_locks.clone();
+        #[cfg(test)]
+        let drop_completed = self.drop_completed.clone();
 
         // Spawn a task to decrement the refcount for this topic.
         // This avoids blocking on synchronous locks in drop.
         tokio::spawn(async move {
+            let _name_guard = group_preference_apply_locks.name_shard(&topic).lock().await;
+            let _apply_guard = if let Some(topic_id) = topic_id {
+                Some(group_preference_apply_locks.shard(topic_id).lock().await)
+            } else {
+                None
+            };
             let mut counts = topic_ref_counts.write().await;
-            if let Some(count) = counts.get_mut(&topic) {
-                if *count > 1 {
-                    *count -= 1;
+            let mut clear_preference = None;
+            if let Some(state) = counts.get_mut(&topic) {
+                if state.generation != generation {
+                    #[cfg(test)]
+                    drop_completed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                if state.count > 1 {
+                    state.count -= 1;
                 } else {
                     counts.remove(&topic);
                     topic_id_by_name
@@ -660,9 +720,18 @@ impl Drop for Subscription {
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .remove(&topic_id);
+                        if group_topic_by_id.write().await.remove(&topic_id).is_some() {
+                            clear_preference = Some(topic_id);
+                        }
                     }
                 }
             }
+            drop(counts);
+            if let Some(topic_id) = clear_preference {
+                plumtree.set_topic_preferred_eager_set(topic_id, &[]).await;
+            }
+            #[cfg(test)]
+            drop_completed.fetch_add(1, Ordering::Relaxed);
         });
     }
 }
@@ -682,6 +751,27 @@ impl Drop for Subscription {
 /// Local subscription delivery path:
 ///     PlumTree topic receiver → decode x0x payload (v1/v2) → trust filter → subscriber channel
 /// ```
+#[derive(Clone, PartialEq, Eq)]
+struct GroupEagerRoster {
+    metadata_topic: String,
+    active_agents: Vec<AgentId>,
+}
+
+/// Coherent per-topic classification and active roster. A roster writer may
+/// publish a new global snapshot before it reaches this topic's shard; hot
+/// paths then use this complete old binding until that shard is reconciled.
+#[derive(Clone)]
+struct GroupTopicBinding {
+    name: String,
+    active_agents: Vec<AgentId>,
+}
+
+struct GroupIdentityContext {
+    bindings: crate::dm_inbox::AuthenticatedMachineBindings,
+    revoked: Arc<RwLock<crate::revocation::RevocationSet>>,
+    moves: Arc<RwLock<crate::key_move::MoveState>>,
+}
+
 pub struct PubSubManager {
     /// Network node used by PlumTree transport and topic peer initialization.
     network: Arc<NetworkNode>,
@@ -695,7 +785,8 @@ pub struct PubSubManager {
     egress_meter: Mutex<EgressMeter>,
     eager_ceiling_initialized: tokio::sync::OnceCell<()>,
     /// Local topic subscription ref-counts (for stats and cleanup).
-    topic_ref_counts: Arc<RwLock<HashMap<String, usize>>>,
+    topic_ref_counts: Arc<RwLock<HashMap<String, TopicSubscriptionCount>>>,
+    next_subscription_generation: AtomicU64,
     /// Signing context for authenticating published messages.
     signing: Option<Arc<SigningContext>>,
     /// Contact store for trust-based message filtering.
@@ -712,6 +803,8 @@ pub struct PubSubManager {
     /// Inbound frames/bytes per (topic class, kind) — `inbound_by_topic` on
     /// `GET /diagnostics/gossip` (#674).
     inbound_by_topic: InboundByTopicStats,
+    /// Originated legacy DM bus publishes, labeled by the producer before encryption.
+    legacy_dm_bus_origin: [InboundSlot; 7],
     /// Subscriber channels for `local:` topics (issue #89). These topics
     /// are same-daemon IPC: delivered only to local subscribers, never
     /// handed to PlumTree, never gossipped to remote peers.
@@ -729,6 +822,23 @@ pub struct PubSubManager {
     passthrough_refresh_runs: AtomicU64,
     /// Name → actual PlumTree topic id (DM inboxes are not `from_entity(name)`).
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
+    /// Authoritative active group rosters supplied by the daemon after commit.
+    group_rosters: RwLock<HashMap<String, GroupEagerRoster>>,
+    /// Locally named group topics. Unknown Full pass-through ids stay ordinary relays.
+    group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
+    group_identity: std::sync::OnceLock<GroupIdentityContext>,
+    group_preference_apply_locks: Arc<GroupTopicApplyLocks>,
+    #[cfg(test)]
+    drop_completed: Arc<AtomicU64>,
+    #[cfg(test)]
+    subscribe_after_registration_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    roster_after_swap_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    register_after_roster_read_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     /// Live subscribed transport ids for the Leaf C0 refuse gate AND the
     /// #674 C2 zero-subscriber test (shared handle).
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
@@ -832,8 +942,10 @@ pub fn is_local_topic(topic: &str) -> bool {
 }
 
 /// Peek the PlumTree header of a serialized `GossipMessage` without verifying
-/// the signature. Used by the Leaf C0 refuse gate so unsubscribed frames
-/// never reach `handle_message`.
+/// the signature. Test assertions on captured legacy egress frames; the
+/// production inbound gates use SG's structural `inspect_message_header`,
+/// which also recognizes v3 frames and enforces exact ML-DSA sizes.
+#[cfg(test)]
 fn peek_pubsub_header(frame: &[u8]) -> Option<MessageHeader> {
     postcard::take_from_bytes::<MessageHeader>(frame)
         .ok()
@@ -876,6 +988,276 @@ const _: () = assert!(
 );
 
 impl PubSubManager {
+    /// Install the live security views used to authorize roster preferences.
+    pub fn set_group_identity_context(
+        &self,
+        bindings: crate::dm_inbox::AuthenticatedMachineBindings,
+        revoked: Arc<RwLock<crate::revocation::RevocationSet>>,
+        moves: Arc<RwLock<crate::key_move::MoveState>>,
+    ) {
+        let _ = self.group_identity.set(GroupIdentityContext {
+            bindings,
+            revoked,
+            moves,
+        });
+    }
+
+    /// Replace committed group rosters. The daemon calls this after group
+    /// commits and at startup; transport connection changes are read live on
+    /// each ordinary peer refresh.
+    pub async fn replace_group_rosters(&self, rosters: Vec<(String, String, Vec<AgentId>)>) {
+        let next = rosters
+            .into_iter()
+            .map(|(id, metadata_topic, active_agents)| {
+                (
+                    id,
+                    GroupEagerRoster {
+                        metadata_topic,
+                        active_agents,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let _writer_guard = self.group_preference_apply_locks.roster_update.lock().await;
+        let mut current = self.group_rosters.write().await;
+        if *current == next {
+            return;
+        }
+        let changed_groups: HashSet<String> = current
+            .keys()
+            .chain(next.keys())
+            .filter(|id| current.get(*id) != next.get(*id))
+            .cloned()
+            .collect();
+        let mut changed_metadata_topics = HashSet::new();
+        for id in &changed_groups {
+            if let Some(roster) = current.get(id) {
+                changed_metadata_topics.insert(roster.metadata_topic.clone());
+            }
+            if let Some(roster) = next.get(id) {
+                changed_metadata_topics.insert(roster.metadata_topic.clone());
+            }
+        }
+        *current = next;
+        drop(current);
+        #[cfg(test)]
+        {
+            let pause = self
+                .roster_after_swap_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((entered, release)) = pause {
+                entered.wait().await;
+                release.wait().await;
+            }
+        }
+        let known = self
+            .topic_id_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut affected_topics = HashSet::new();
+        for (name, topic_id) in known {
+            if !Self::topic_affected_by_roster_change(
+                &name,
+                &changed_groups,
+                &changed_metadata_topics,
+            ) {
+                continue;
+            }
+            let _topic_guard = self
+                .group_preference_apply_locks
+                .shard(topic_id)
+                .lock()
+                .await;
+            if self
+                .topic_id_by_name
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&name)
+                == Some(&topic_id)
+            {
+                self.register_group_topic_locked(&name, topic_id).await;
+                affected_topics.insert(topic_id);
+            }
+        }
+        // Publish-only topics are absent from the local name map. Sweep all
+        // remaining bindings, and re-read each under its own ID stripe so a
+        // concurrent Drop cannot be resurrected from this snapshot.
+        let existing: Vec<TopicId> = self
+            .group_topic_by_id
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect();
+        for topic_id in existing {
+            let _topic_guard = self
+                .group_preference_apply_locks
+                .shard(topic_id)
+                .lock()
+                .await;
+            let name = self
+                .group_topic_by_id
+                .read()
+                .await
+                .get(&topic_id)
+                .map(|binding| binding.name.clone());
+            if let Some(name) = name.filter(|name| {
+                Self::topic_affected_by_roster_change(
+                    name,
+                    &changed_groups,
+                    &changed_metadata_topics,
+                )
+            }) {
+                self.register_group_topic_locked(&name, topic_id).await;
+                affected_topics.insert(topic_id);
+            }
+        }
+        let peers = self.transport.connected_peer_ids().await;
+        let mut ordered_peers = None;
+        for topic_id in affected_topics {
+            self.apply_topic_peers_from_snapshot(topic_id, &peers, &mut ordered_peers)
+                .await;
+        }
+    }
+
+    fn topic_affected_by_roster_change(
+        name: &str,
+        changed_groups: &HashSet<String>,
+        changed_metadata_topics: &HashSet<String>,
+    ) -> bool {
+        changed_metadata_topics.contains(name)
+            || name
+                .strip_prefix("x0x/group/")
+                .and_then(|rest| rest.split_once("/kv/"))
+                .is_some_and(|(id, store)| {
+                    !id.is_empty() && !store.is_empty() && changed_groups.contains(id)
+                })
+    }
+
+    async fn register_group_topic(&self, name: &str, topic_id: TopicId) {
+        let _topic_guard = self
+            .group_preference_apply_locks
+            .shard(topic_id)
+            .lock()
+            .await;
+        self.register_group_topic_locked(name, topic_id).await;
+    }
+
+    async fn register_group_topic_locked(&self, name: &str, topic_id: TopicId) {
+        let kv_group_id = name
+            .strip_prefix("x0x/group/")
+            .and_then(|rest| rest.split_once("/kv/"))
+            .filter(|(id, store)| !id.is_empty() && !store.is_empty())
+            .map(|(id, _)| id.to_string());
+        let rosters = self.group_rosters.read().await;
+        let binding = match kv_group_id {
+            Some(id) => rosters.get(&id).map(|roster| roster.active_agents.clone()),
+            None => rosters
+                .iter()
+                .find(|(_, roster)| roster.metadata_topic == name)
+                .map(|(_, roster)| roster.active_agents.clone()),
+        };
+        #[cfg(test)]
+        {
+            let pause = self
+                .register_after_roster_read_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((entered, release)) = pause {
+                entered.wait().await;
+                release.wait().await;
+            }
+        }
+        // Keep the roster read guard through classification publication.
+        // A writer then either sees this binding in its sweep or this
+        // registrar sees the writer's new roster; it cannot miss both.
+        if let Some(active_agents) = binding {
+            self.group_topic_by_id.write().await.insert(
+                topic_id,
+                GroupTopicBinding {
+                    name: name.to_string(),
+                    active_agents,
+                },
+            );
+        } else {
+            self.clear_group_topic_preference_locked(topic_id).await;
+        }
+        drop(rosters);
+    }
+
+    async fn clear_group_topic_preference_locked(&self, topic_id: TopicId) {
+        if self
+            .group_topic_by_id
+            .write()
+            .await
+            .remove(&topic_id)
+            .is_some()
+        {
+            self.plumtree
+                .set_topic_preferred_eager_set(topic_id, &[])
+                .await;
+        }
+    }
+
+    async fn preferred_roster_peers(&self, topic: TopicId, connected: &[PeerId]) -> Vec<PeerId> {
+        let agents = self
+            .group_topic_by_id
+            .read()
+            .await
+            .get(&topic)
+            .map(|binding| binding.active_agents.clone());
+        let (Some(agents), Some(identity)) = (agents, self.group_identity.get()) else {
+            return Vec::new();
+        };
+        let connected_set: HashSet<PeerId> = connected.iter().copied().collect();
+        let local = self.transport.local_peer_id();
+        let mut ranked = Vec::new();
+        let mut seen = HashSet::new();
+        for agent in agents {
+            if let Some(machine) =
+                crate::dm_inbox::authenticated_machine_binding(&identity.bindings, &agent).await
+            {
+                // Raw Direct frames carry an untrusted AgentId prefix and can
+                // overwrite the reachability map. Only an independently
+                // authenticated binding may authorize a roster preference.
+                if !Self::group_pairing_allowed(identity, &agent, &machine).await {
+                    continue;
+                }
+                let peer = PeerId::new(machine.0);
+                if peer != local && connected_set.contains(&peer) && seen.insert(peer) {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(topic.as_bytes());
+                    hasher.update(local.as_bytes());
+                    hasher.update(peer.as_bytes());
+                    ranked.push((*hasher.finalize().as_bytes(), peer));
+                }
+            }
+        }
+        ranked.sort_unstable_by_key(|(rank, peer)| (*rank, *peer.as_bytes()));
+        ranked.into_iter().take(8).map(|(_, peer)| peer).collect()
+    }
+
+    async fn group_pairing_allowed(
+        identity: &GroupIdentityContext,
+        agent: &AgentId,
+        machine: &MachineId,
+    ) -> bool {
+        let revoked = identity.revoked.read().await;
+        if revoked.is_agent_revoked(agent) || revoked.is_machine_revoked(machine) {
+            return false;
+        }
+        let moves = identity.moves.read().await;
+        if crate::key_move::enforce_pairing(&revoked, moves.placement_view(), agent, machine)
+            .is_some()
+        {
+            return false;
+        }
+        true
+    }
     /// Create a new pub/sub manager.
     ///
     /// # Arguments
@@ -924,10 +1306,7 @@ impl PubSubManager {
         oracle: Option<Arc<dyn PeerHealthOracle>>,
     ) -> NetworkResult<Self> {
         let peer_id = saorsa_gossip_transport::GossipTransport::local_peer_id(network.as_ref());
-        let plumtree_signing_key =
-            saorsa_gossip_identity::MlDsaKeyPair::generate().map_err(|e| {
-                NetworkError::NodeCreation(format!("failed to create PlumTree signing key: {e}"))
-            })?;
+        let plumtree_signing_key = network.pubsub_signing_key();
 
         let transport = Arc::new(PubSubTransport::new(Arc::clone(&network)));
         let plumtree_inner =
@@ -994,17 +1373,31 @@ impl PubSubManager {
             egress_meter: Mutex::new(EgressMeter::default()),
             eager_ceiling_initialized: tokio::sync::OnceCell::new(),
             topic_ref_counts: Arc::new(RwLock::new(HashMap::new())),
+            next_subscription_generation: AtomicU64::new(1),
             signing,
             contacts: std::sync::OnceLock::new(),
             revocation_set: std::sync::OnceLock::new(),
             stats: Arc::new(PubSubStats::default()),
             inbound_by_topic: InboundByTopicStats::default(),
+            legacy_dm_bus_origin: std::array::from_fn(|_| InboundSlot::default()),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
             passthrough_refresh_runs: AtomicU64::new(0),
             topic_id_by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            group_rosters: RwLock::new(HashMap::new()),
+            group_topic_by_id: Arc::new(RwLock::new(HashMap::new())),
+            group_identity: std::sync::OnceLock::new(),
+            group_preference_apply_locks: Arc::new(GroupTopicApplyLocks::new()),
+            #[cfg(test)]
+            drop_completed: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            subscribe_after_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            roster_after_swap_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            register_after_roster_read_pause: std::sync::Mutex::new(None),
             subscribed_topic_ids,
             relay_fanout,
             skip_legacy_dm_bus: AtomicBool::new(false),
@@ -1080,7 +1473,7 @@ impl PubSubManager {
 
     /// Sample independently of HTTP reads, once per runtime peer-refresh tick.
     pub(crate) fn sample_egress(&self) {
-        let stages = serde_json::to_value(self.plumtree.stage_stats()).unwrap_or_default();
+        let outbound_by_topic = self.plumtree.outbound_by_topic_stats();
         let mut config = self.egress_config.clone();
         config.participation = self.participation;
         self.egress_meter
@@ -1088,7 +1481,7 @@ impl PubSubManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .sample(
                 Instant::now(),
-                &stages["outbound_by_topic"],
+                &outbound_by_topic,
                 &self.subscribed_topic_keys(),
                 &config,
             );
@@ -1138,6 +1531,7 @@ impl PubSubManager {
         serde_json::json!({
             "subscribed_topics": topics,
             "outbound_by_topic_named": rows,
+            "legacy_dm_bus_origin": self.legacy_dm_bus_origin_snapshot(),
             "egress_budget": {
                 "leaf_max_eager_degree": self.egress_config.leaf_max_eager_degree,
                 "leaf_egress_soft_bytes_per_sec": self.egress_config.leaf_egress_soft_bytes_per_sec,
@@ -1164,7 +1558,15 @@ impl PubSubManager {
                     "iwant_matched_eager_attempt_bytes": self.transport.repair_bytes.load(Ordering::Relaxed),
                     "semantics": "subset of eager counters matching v2 in-flight IWANT peer/topic/message IDs (unverified frame fields; PlumTree verifies the IWANT itself, #656); includes coincident same-message forwards, not confirmed delivery; anti_entropy stays separate"
                 }
-            }
+            },
+            // SG76 key-cache runtime witness: cumulative outer-key wire
+            // accounting (Full vs Ref frames/bytes in and out), cache
+            // hits/misses/evictions, control batches emitted, pending
+            // high-water/timeouts/limit drops, and replay outcomes —
+            // serialized straight from the pinned producer's snapshot.
+            // Additive only; no policy input.
+            "key_cache": serde_json::to_value(self.plumtree.key_cache_stats())
+                .unwrap_or_default(),
         })
     }
 
@@ -1363,6 +1765,27 @@ impl PubSubManager {
         self.subscribe_topic_id(topic, topic_id).await
     }
 
+    async fn retain_topic_subscription(&self, topic: &str) -> u64 {
+        let mut counts = self.topic_ref_counts.write().await;
+        match counts.entry(topic.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                state.count += 1;
+                state.generation
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let generation = self
+                    .next_subscription_generation
+                    .fetch_add(1, Ordering::Relaxed);
+                entry.insert(TopicSubscriptionCount {
+                    count: 1,
+                    generation,
+                });
+                generation
+            }
+        }
+    }
+
     /// Subscribe to a topic with an explicit transport `TopicId`.
     ///
     /// Most callers use [`Self::subscribe`], which derives the transport id
@@ -1374,27 +1797,68 @@ impl PubSubManager {
         // (issue #89).
         if is_local_topic(&topic) {
             let (tx, rx) = mpsc::channel(10_000);
+            let _name_guard = self
+                .group_preference_apply_locks
+                .name_shard(&topic)
+                .lock()
+                .await;
             self.local_topics
                 .write()
                 .await
                 .entry(topic.clone())
                 .or_default()
                 .push(tx);
-            {
-                let mut counts = self.topic_ref_counts.write().await;
-                *counts.entry(topic.clone()).or_insert(0) += 1;
-            }
+            let generation = self.retain_topic_subscription(&topic).await;
             return Subscription {
                 topic,
                 topic_id: None,
                 receiver: rx,
                 topic_ref_counts: Arc::clone(&self.topic_ref_counts),
+                generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                group_topic_by_id: Arc::clone(&self.group_topic_by_id),
+                plumtree: Arc::clone(&self.plumtree),
+                group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
+                #[cfg(test)]
+                drop_completed: Arc::clone(&self.drop_completed),
             };
         }
 
         self.register_dynamic_topic_priority(&topic, topic_id);
+        let generation = {
+            let _name_guard = self
+                .group_preference_apply_locks
+                .name_shard(&topic)
+                .lock()
+                .await;
+            let _topic_guard = self
+                .group_preference_apply_locks
+                .shard(topic_id)
+                .lock()
+                .await;
+            // Count and classification share the same lock as Drop and
+            // unsubscribe. A prior generation cannot erase this hold.
+            let generation = self.retain_topic_subscription(&topic).await;
+            self.topic_id_by_name
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(topic.clone(), topic_id);
+            self.register_group_topic_locked(&topic, topic_id).await;
+            generation
+        };
+        #[cfg(test)]
+        {
+            let pause = self
+                .subscribe_after_registration_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((entered, release)) = pause {
+                entered.wait().await;
+                release.wait().await;
+            }
+        }
         self.initialize_topic_peers(topic_id).await;
 
         // The synchronous crate API registers on a detached task. Await the
@@ -1405,18 +1869,64 @@ impl PubSubManager {
         let contacts = self.contacts.get().cloned();
         let revocation_set = self.revocation_set.get().cloned();
 
-        {
-            let mut counts = self.topic_ref_counts.write().await;
-            *counts.entry(topic.clone()).or_insert(0) += 1;
+        let active_generation = {
+            let _name_guard = self
+                .group_preference_apply_locks
+                .name_shard(&topic)
+                .lock()
+                .await;
+            let _topic_guard = self
+                .group_preference_apply_locks
+                .shard(topic_id)
+                .lock()
+                .await;
+            let current_generation = self
+                .topic_ref_counts
+                .read()
+                .await
+                .get(&topic)
+                .map(|state| state.generation);
+            if current_generation == Some(generation) {
+                self.subscribed_topic_ids
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(topic_id);
+                true
+            } else if current_generation.is_none() {
+                // Unsubscribe won while initialization was in flight.
+                // Remove any late SG topic and preference before returning
+                // the canceled generation's handle.
+                self.plumtree
+                    .set_topic_preferred_eager_set(topic_id, &[])
+                    .await;
+                let _ = self.plumtree.unsubscribe(topic_id).await;
+                false
+            } else {
+                // A newer subscription owns this topic. Its SG receiver and
+                // preference must not be removed by this stale generation.
+                false
+            }
+        };
+        if !active_generation {
+            // subscribe_ready may have appended a sender to a newer topic.
+            // Drop only this receiver and return a closed local handle.
+            drop(plumtree_rx);
+            drop(tx);
+            return Subscription {
+                topic,
+                topic_id: None,
+                receiver: rx,
+                topic_ref_counts: self.topic_ref_counts.clone(),
+                generation,
+                topic_id_by_name: Arc::clone(&self.topic_id_by_name),
+                subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                group_topic_by_id: Arc::clone(&self.group_topic_by_id),
+                plumtree: Arc::clone(&self.plumtree),
+                group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
+                #[cfg(test)]
+                drop_completed: Arc::clone(&self.drop_completed),
+            };
         }
-        self.topic_id_by_name
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(topic.clone(), topic_id);
-        self.subscribed_topic_ids
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(topic_id);
         // #674 C2/C3: every subscribed topic carries the composite
         // validator (C3 budget applies to consumed topics; the verdict
         // reads the live subscriber set above, so this is once per topic,
@@ -1533,8 +2043,14 @@ impl PubSubManager {
             topic_id: Some(topic_id),
             receiver: rx,
             topic_ref_counts: self.topic_ref_counts.clone(),
+            generation,
             topic_id_by_name: Arc::clone(&self.topic_id_by_name),
             subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+            group_topic_by_id: Arc::clone(&self.group_topic_by_id),
+            plumtree: Arc::clone(&self.plumtree),
+            group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
+            #[cfg(test)]
+            drop_completed: Arc::clone(&self.drop_completed),
         }
     }
 
@@ -1550,6 +2066,68 @@ impl PubSubManager {
         self.publish_with_fanout(topic, payload).await.map(|_| ())
     }
 
+    /// Publish on the compatibility DM bus and count the successful local
+    /// origin. `bytes` measures the serialized DM envelope handed to PubSub;
+    /// relay copies, gossip framing, and fan-out are outside this counter.
+    pub async fn publish_legacy_dm_bus(
+        &self,
+        payload: Bytes,
+        kind: LegacyBusMessageKind,
+    ) -> NetworkResult<()> {
+        let topic = crate::dm_inbox::DM_BUS_TOPIC.to_string();
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.publish_topic_id_with_fanout_and_envelope(
+            topic,
+            topic_id,
+            payload,
+            SignedVersion::V2,
+            Some(kind),
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn record_legacy_dm_bus_origin(&self, index: usize, wire_bytes: u64) {
+        let slot = &self.legacy_dm_bus_origin[index];
+        slot.frames.fetch_add(1, Ordering::Relaxed);
+        slot.bytes.fetch_add(wire_bytes, Ordering::Relaxed);
+    }
+
+    /// Fixed-cardinality, process-local origin counters. Independent atomic
+    /// loads mean simultaneous updates can straddle a snapshot.
+    #[must_use]
+    pub fn legacy_dm_bus_origin_snapshot(&self) -> serde_json::Value {
+        const NAMES: [&str; 7] = [
+            "control_blob_reference",
+            "control_blob_fetch",
+            "control_blob_chunk",
+            "control_blob_release",
+            "other_payload",
+            "ack",
+            "unknown",
+        ];
+        let outbound = NAMES
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let slot = &self.legacy_dm_bus_origin[index];
+                (
+                    name.to_string(),
+                    serde_json::json!({
+                        "count": slot.frames.load(Ordering::Relaxed),
+                        "wire_bytes": slot.bytes.load(Ordering::Relaxed),
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        serde_json::json!({
+            "scope": "local_successful_origin_publishes",
+            "wire_bytes_semantics": "serialized_dm_envelope_excludes_gossip_framing_and_fanout",
+            "reset": "process_restart",
+            "outbound": outbound,
+        })
+    }
+
     /// Publish to a topic and return the eager-peer fan-out count.
     ///
     /// `0` means PlumTree handed the message to no remote eager peers
@@ -1558,7 +2136,13 @@ impl PubSubManager {
     pub async fn publish_with_fanout(&self, topic: String, payload: Bytes) -> NetworkResult<u32> {
         let topic_id = TopicId::from_entity(topic.as_bytes());
         Ok(self
-            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .publish_topic_id_with_fanout_and_envelope(
+                topic,
+                topic_id,
+                payload,
+                SignedVersion::V2,
+                None,
+            )
             .await?
             .fan_out)
     }
@@ -1572,7 +2156,13 @@ impl PubSubManager {
     ) -> NetworkResult<(u32, Option<saorsa_gossip_pubsub::FanoutCounts>)> {
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let outcome = self
-            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .publish_topic_id_with_fanout_and_envelope(
+                topic,
+                topic_id,
+                payload,
+                SignedVersion::V2,
+                None,
+            )
             .await?;
         Ok(outcome.observed_fanout())
     }
@@ -1618,7 +2208,13 @@ impl PubSubManager {
         payload: Bytes,
     ) -> NetworkResult<u32> {
         let outcome = self
-            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
+            .publish_topic_id_with_fanout_and_envelope(
+                topic,
+                topic_id,
+                payload,
+                SignedVersion::V2,
+                None,
+            )
             .await?;
         Ok(outcome.fan_out)
     }
@@ -1634,9 +2230,15 @@ impl PubSubManager {
         topic_id: TopicId,
         payload: Bytes,
     ) -> NetworkResult<Option<Bytes>> {
-        self.publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V2)
-            .await
-            .map(|outcome| outcome.envelope)
+        self.publish_topic_id_with_fanout_and_envelope(
+            topic,
+            topic_id,
+            payload,
+            SignedVersion::V2,
+            None,
+        )
+        .await
+        .map(|outcome| outcome.envelope)
     }
 
     /// Publish a topic-bound V3 inner envelope for the Signed KV pairing.
@@ -1657,10 +2259,16 @@ impl PubSubManager {
             ));
         }
         let topic_id = TopicId::from_entity(topic.as_bytes());
-        self.publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload, SignedVersion::V3)
-            .await?
-            .envelope
-            .ok_or_else(|| NetworkError::SerializationError("Missing V3 envelope".to_string()))
+        self.publish_topic_id_with_fanout_and_envelope(
+            topic,
+            topic_id,
+            payload,
+            SignedVersion::V3,
+            None,
+        )
+        .await?
+        .envelope
+        .ok_or_else(|| NetworkError::SerializationError("Missing V3 envelope".to_string()))
     }
 
     /// Publish and return both the signed envelope (when signing) and the
@@ -1671,7 +2279,10 @@ impl PubSubManager {
         topic_id: TopicId,
         payload: Bytes,
         version: SignedVersion,
+        legacy_bus_kind: Option<LegacyBusMessageKind>,
     ) -> NetworkResult<PublishFanoutOutcome> {
+        let bus_wire_bytes =
+            (topic == crate::dm_inbox::DM_BUS_TOPIC).then_some(payload.len() as u64);
         // `local:` topics fan out to same-daemon subscribers only — the
         // payload never reaches PlumTree or any remote peer (issue #89).
         if is_local_topic(&topic) {
@@ -1714,11 +2325,19 @@ impl PubSubManager {
         };
 
         self.register_dynamic_topic_priority(&topic, topic_id);
+        // Classification linearizes here. A roster commit overlapping this
+        // publish may affect the next send; a completed writer reconciles
+        // every still-known group binding before it returns.
+        self.register_group_topic(&topic, topic_id).await;
         self.initialize_topic_peers(topic_id).await;
 
         match self.plumtree.publish_with_fanout(topic_id, encoded).await {
             Ok(counts) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
+                if let Some(wire_bytes) = bus_wire_bytes {
+                    let index = legacy_bus_kind.map_or(6, LegacyBusMessageKind::index);
+                    self.record_legacy_dm_bus_origin(index, wire_bytes);
+                }
                 let attempted = counts.map(|c| c.attempted).unwrap_or(0);
                 let fan_out = u32::try_from(attempted).unwrap_or(u32::MAX);
                 #[cfg(test)]
@@ -1782,21 +2401,42 @@ impl PubSubManager {
         Ok(())
     }
 
-    /// Handle an incoming message from a peer.
+    /// Handle an incoming message from a peer, optionally with SG session
+    /// provenance stamped from the frame's source connection.
     ///
     /// Leaf (#380 C0): refuse GRAFT-equivalent / eager / IHAVE / IWANT /
     /// anti-entropy frames for topics this node does not subscribe to, so
     /// PlumTree never creates pass-through state or eager-forwards them.
     /// Full nodes keep today's `handle_message` behaviour.
-    pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
+    ///
+    /// Topic gates run on SG's public `inspect_message_header`, which
+    /// recognizes both legacy postcard frames and key-cache v3 frames —
+    /// v3 reaches the same inbound-by-topic counters, Leaf refusal, and
+    /// relay fan-out validator registration as legacy. The reserved SG
+    /// hop-local control topic stays internal to SG: x0x performs no topic
+    /// accounting, Leaf gating, or relay registration on it.
+    ///
+    /// Only a `Some(session)` whose peer matches the dequeued peer reaches
+    /// SG's authenticated dispatcher; legacy `None` frames use the ordinary
+    /// dispatcher.
+    pub async fn handle_incoming(
+        &self,
+        peer: PeerId,
+        session: Option<saorsa_gossip_transport::AuthenticatedSession>,
+        data: Bytes,
+    ) {
         self.ensure_eager_ceiling().await;
-        // One header decode serves the inbound-by-topic counters (#674),
-        // the Leaf refuse gate, and the IWANT repair tracker — no crypto.
-        let header = peek_pubsub_header(&data);
-        if let Some(header) = &header {
+        // One structural header inspection serves the inbound-by-topic
+        // counters (#674), the Leaf refuse gate, and the IWANT repair
+        // tracker — no crypto.
+        let inspected = saorsa_gossip_pubsub::inspect_message_header(&data);
+        let ordinary_frame = inspected
+            .as_ref()
+            .filter(|header| !header.hop_local_control);
+        if let Some(header) = ordinary_frame {
             self.inbound_by_topic.record(header, data.len() as u64);
         }
-        if self.refuse_leaf_unsubscribed_passthrough(header.as_ref(), &data) {
+        if self.refuse_leaf_unsubscribed_passthrough(ordinary_frame, &data) {
             return;
         }
         // #674 C2/C3: first sight of a topic id on the inbound path
@@ -1805,19 +2445,33 @@ impl PubSubManager {
         // subscribe/unsubscribe) gets the lazy-forward verdict — sg creates
         // topic state from inbound frames directly. One read-locked set
         // lookup per frame; the write path runs once per topic.
-        if let Some(header) = &header {
+        if let Some(header) = ordinary_frame {
             self.relay_fanout
                 .ensure_registered(self.plumtree.as_ref(), header.topic);
         }
-        let _repair_scope = if header
-            .as_ref()
-            .is_some_and(|header| header.kind == MessageKind::IWant)
-        {
-            self.transport.track_iwant(peer, &data)
-        } else {
-            None
+        // Legacy-only diagnostics (#656): the postcard IWANT decode below
+        // does not understand v3 envelopes, so v3 repair traffic stays
+        // uncounted until SG exposes a bounded wire-inspection helper.
+        let _repair_scope =
+            if ordinary_frame.is_some_and(|header| header.kind == MessageKind::IWant) {
+                self.transport.track_iwant(peer, &data)
+            } else {
+                None
+            };
+        let dispatch_result = match session {
+            Some(session) if session.peer == peer => {
+                self.plumtree
+                    .handle_authenticated_message(session, data)
+                    .await
+            }
+            Some(mismatched) => Err(anyhow::anyhow!(
+                "session token peer {} does not match dequeued peer {}",
+                mismatched.peer,
+                peer
+            )),
+            None => self.plumtree.handle_message(peer, data).await,
         };
-        if let Err(e) = self.plumtree.handle_message(peer, data).await {
+        if let Err(e) = dispatch_result {
             tracing::warn!(
                 "Failed to handle PlumTree pubsub message from {}: {e}",
                 crate::logging::LogPeerId::from(peer)
@@ -1827,7 +2481,7 @@ impl PubSubManager {
 
     fn refuse_leaf_unsubscribed_passthrough(
         &self,
-        header: Option<&MessageHeader>,
+        header: Option<&saorsa_gossip_pubsub::InspectedMessageHeader>,
         data: &[u8],
     ) -> bool {
         let Some(header) = header else {
@@ -1868,21 +2522,38 @@ impl PubSubManager {
 
     /// Unsubscribe from a topic, removing all subscriptions.
     pub async fn unsubscribe(&self, topic: &str) {
-        self.topic_ref_counts.write().await.remove(topic);
+        let _name_guard = self
+            .group_preference_apply_locks
+            .name_shard(topic)
+            .lock()
+            .await;
         if is_local_topic(topic) {
+            self.topic_ref_counts.write().await.remove(topic);
             self.local_topics.write().await.remove(topic);
             return;
         }
         let stored_id = self
             .topic_id_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(topic)
+            .copied();
+        let topic_id = stored_id.unwrap_or_else(|| TopicId::from_entity(topic.as_bytes()));
+        let _topic_guard = self
+            .group_preference_apply_locks
+            .shard(topic_id)
+            .lock()
+            .await;
+        self.topic_ref_counts.write().await.remove(topic);
+        self.topic_id_by_name
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(topic);
-        let topic_id = stored_id.unwrap_or_else(|| TopicId::from_entity(topic.as_bytes()));
         self.subscribed_topic_ids
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&topic_id);
+        self.clear_group_topic_preference_locked(topic_id).await;
         if let Err(e) = self.plumtree.unsubscribe(topic_id).await {
             tracing::debug!("PlumTree unsubscribe failed for topic '{topic}': {e}");
         }
@@ -1912,8 +2583,12 @@ impl PubSubManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // The transport plane is one snapshot for this pass. Rank it once:
+        // ant-quic's cache selectors clone and sort every cached peer.
+        let mut ordered_peers = None;
         for topic_id in &subscribed_ids {
-            self.apply_topic_peers(*topic_id, peers.clone()).await;
+            self.apply_topic_peers_from_snapshot(*topic_id, &peers, &mut ordered_peers)
+                .await;
         }
 
         // Full (bootstrap / relay / `--relay`): also refresh pass-through
@@ -1929,20 +2604,39 @@ impl PubSubManager {
         let all_plumtree_topics = self.known_plumtree_topics().await;
         for topic_id in all_plumtree_topics {
             if !subscribed_ids.contains(&topic_id) {
-                self.apply_topic_peers(topic_id, peers.clone()).await;
+                self.apply_topic_peers_from_snapshot(topic_id, &peers, &mut ordered_peers)
+                    .await;
             }
         }
     }
 
+    async fn apply_topic_peers_from_snapshot(
+        &self,
+        topic_id: TopicId,
+        connected_peers: &[PeerId],
+        ordered_peers: &mut Option<TopicMembership>,
+    ) {
+        self.ensure_eager_ceiling().await;
+        let membership = refresh_ordered_peers(connected_peers, ordered_peers, |peers| {
+            self.topic_membership(peers)
+        })
+        .await;
+        self.set_ordered_topic_peers(topic_id, membership).await;
+    }
+
     async fn apply_topic_peers(&self, topic_id: TopicId, peers: Vec<PeerId>) {
         self.ensure_eager_ceiling().await;
+        let membership = self.topic_membership(peers).await;
+        self.set_ordered_topic_peers(topic_id, membership).await;
+    }
+
+    async fn set_ordered_topic_peers(&self, topic_id: TopicId, membership: TopicMembership) {
         #[cfg(test)]
         self.refreshed_topic_ids
             .lock()
             .expect("refresh log")
             .push(topic_id);
-        let peers = self.ordered_topic_peers(peers).await;
-        self.plumtree.set_topic_peers(topic_id, peers).await;
+        self.apply_topic_membership(topic_id, membership).await;
     }
 
     async fn known_plumtree_topics(&self) -> Vec<TopicId> {
@@ -1994,6 +2688,15 @@ impl PubSubManager {
             .register(topic_id, priority);
     }
 
+    /// #810: the admission priority for a topic, read from the same registry
+    /// the substrate admission uses. Consumed by the receive pump's
+    /// proactive control-frame shed exemption so Critical topics (e.g.
+    /// `x0x/dm/v1/*` lazy repair) are never shed before classification.
+    /// Unregistered topics read as `TopicPriority::Normal`.
+    pub(crate) fn topic_priority_for(&self, topic: &TopicId) -> TopicPriority {
+        self.plumtree.admission().registry().priority_for(topic)
+    }
+
     /// Initialize PlumTree peers for a topic from currently connected peers.
     async fn initialize_topic_peers(&self, topic: TopicId) {
         // #674 C2/C3: the pre-subscribe warm path also creates the topic,
@@ -2003,8 +2706,27 @@ impl PubSubManager {
         self.ensure_eager_ceiling().await;
         // Issue #206: plane-gated peer view (see refresh_topic_peers).
         let peers: Vec<PeerId> = self.transport.connected_peer_ids().await;
-        let peers = self.ordered_topic_peers(peers).await;
-        self.plumtree.initialize_topic_peers(topic, peers).await;
+        // #774: one atomic membership pass — the FULL connected plane as
+        // membership (the eager ceiling, not x0x, caps fanout) with the
+        // actual preferred Full/bootstrap peer promoted eager when
+        // graft-eligible. The old degree-capped seed truncated the plane
+        // before saorsa-gossip ever saw it, so the discarded peers were in
+        // neither the eager nor the lazy set: no fanout, no IHAVE/IWANT
+        // repair (the G5→D5 acceptance arm). Re-running per publish is
+        // safe: an already-eager preference is idempotent and
+        // still-connected peers keep their roles and cooling/score state.
+        let membership = self.topic_membership(peers).await;
+        if self.participation.forwards_passthrough() {
+            let _topic_guard = self.group_preference_apply_locks.shard(topic).lock().await;
+            // Full: #807 is Leaf-only. Keep the pre-#807 add-only seed so a
+            // publish never prunes members or their IWANT/cooling state.
+            self.plumtree
+                .initialize_topic_peers(topic, membership.into_pre_807_order())
+                .await;
+            self.apply_group_preference_locked(topic, None).await;
+            return;
+        }
+        self.apply_topic_membership(topic, membership).await;
     }
 
     /// Refresh PlumTree eager-set peers for one topic id via the
@@ -2117,8 +2839,15 @@ impl PubSubManager {
         self.membership_holds.read().await.len()
     }
 
-    /// C5b continuation: pick the preferred eager peer and apply it to the
-    /// ACK topics only (called by [`Self::prefer_one_full_bootstrap_eager`]).
+    /// C5b continuation: apply the preferred-eager policy to the ACK topics
+    /// only (called by [`Self::prefer_one_full_bootstrap_eager`]).
+    ///
+    /// #774: identical to the periodic refresh — one atomic full-membership
+    /// call carrying the actual preferred peer. The upstream reconciliation
+    /// is idempotent for an already-eager preference and preserves connected
+    /// cooling/score/IWANT state, so the per-durable-ACK cadence adds no
+    /// membership churn; a late-connected preferred peer is promoted by the
+    /// same call.
     async fn apply_preferred_eager_peer(&self, plane: Vec<[u8; 32]>, topic_ids: &[TopicId]) {
         let peers = plane.into_iter().map(PeerId::new).collect::<Vec<_>>();
         for topic_id in topic_ids {
@@ -2128,7 +2857,13 @@ impl PubSubManager {
 
     /// One policy for every initializer/overwrite. Keep the full transport plane
     /// as the source on each refresh so disconnected selected peers are replaced.
-    async fn ordered_topic_peers(&self, peers: Vec<PeerId>) -> Vec<PeerId> {
+    ///
+    /// #774: the full deduplicated connected plane is topic MEMBERSHIP —
+    /// only the installed eager ceiling caps fanout, so peers beyond the
+    /// Leaf degree stay lazy and IHAVE/IWANT-repair-eligible instead of
+    /// being truncated away. `preferred` is the ACTUAL selected
+    /// Full/bootstrap peer (or `None`), never a seed-head stand-in.
+    async fn topic_membership(&self, peers: Vec<PeerId>) -> TopicMembership {
         let mut coordinators = Vec::new();
         let mut relays = Vec::new();
         if let Some(cache) = self.network.bootstrap_cache() {
@@ -2149,43 +2884,143 @@ impl PubSubManager {
                 .map(|peer| peer.peer_id.0)
                 .collect();
         }
-        ordered_leaf_peers(
-            peers,
+        let mut plane = peers;
+        plane.sort_by_key(|peer| *peer.as_bytes());
+        plane.dedup();
+        let plane_ids = plane
+            .iter()
+            .map(|peer| *peer.as_bytes())
+            .collect::<Vec<_>>();
+        let preferred = select_one_full_bootstrap_eager_peer(
+            &plane_ids,
             &coordinators,
             &relays,
             &self.network.config().pinned_bootstrap_peers,
-            if self.participation.forwards_passthrough() {
-                0
-            } else {
-                self.egress_config.leaf_max_eager_degree
-            },
         )
+        .map(PeerId::new);
+        TopicMembership {
+            full: plane,
+            preferred,
+        }
+    }
+
+    /// #774: the single atomic membership pass used by initialization, the
+    /// periodic refresh, and the per-durable-ACK preferred path. The full
+    /// connected plane stays represented eager-or-lazy with connected
+    /// cooling/score/IWANT state preserved, and the preferred peer is
+    /// promoted eager only when saorsa-gossip finds it graft-eligible. A
+    /// `false` return means the preferred peer is cooled or otherwise
+    /// ineligible: saorsa-gossip's health and cooling choices win, and x0x
+    /// must never retry the preference destructively.
+    async fn apply_topic_membership(&self, topic_id: TopicId, membership: TopicMembership) {
+        let _topic_guard = self
+            .group_preference_apply_locks
+            .shard(topic_id)
+            .lock()
+            .await;
+        if self.participation.forwards_passthrough() {
+            // Full: #807 is Leaf-only. Pre-#807 Full replaced membership with
+            // the untruncated plane and never forced a preferred eager peer.
+            self.plumtree
+                .set_topic_peers(topic_id, membership.into_pre_807_order())
+                .await;
+            self.apply_group_preference_locked(topic_id, None).await;
+            return;
+        }
+        let preferred = membership.preferred;
+        if self.group_topic_by_id.read().await.contains_key(&topic_id) {
+            // The singular SG wrapper replaces the entire persistent set.
+            // Preserve an existing roster preference through membership
+            // refresh, then atomically replace it with bootstrap + roster.
+            self.plumtree
+                .set_topic_peers(topic_id, membership.full)
+                .await;
+            self.apply_group_preference_locked(topic_id, preferred)
+                .await;
+        } else {
+            let preferred_applied = self
+                .plumtree
+                .set_topic_peers_with_preferred_eager(topic_id, membership.full, preferred)
+                .await;
+            if let (false, Some(preferred)) = (preferred_applied, preferred) {
+                tracing::debug!(
+                    topic = ?topic_id,
+                    preferred = ?(*preferred.as_bytes()),
+                    "#774: preferred Full/bootstrap peer stays lazy (cooling/eligibility); no retry"
+                );
+            }
+        }
+    }
+
+    async fn apply_group_preference_locked(&self, topic_id: TopicId, bootstrap: Option<PeerId>) {
+        if !self.group_topic_by_id.read().await.contains_key(&topic_id) {
+            return;
+        }
+        let connected = self.transport.connected_peer_ids().await;
+        let roster = self.preferred_roster_peers(topic_id, &connected).await;
+        // Leaf retains its #774 Full/bootstrap fallback. Reserve one of the
+        // bounded eight preference slots for it, including when the roster is
+        // empty or its members are cooling/score-vetoed. Full gives all eight
+        // slots to the roster.
+        let mut preferred = Vec::with_capacity(8);
+        if let Some(bootstrap) = bootstrap.filter(|peer| connected.contains(peer)) {
+            preferred.push(bootstrap);
+        }
+        for peer in roster {
+            if preferred.len() == 8 {
+                break;
+            }
+            if !preferred.contains(&peer) {
+                preferred.push(peer);
+            }
+        }
+        self.plumtree
+            .set_topic_preferred_eager_set(topic_id, &preferred)
+            .await;
     }
 }
 
-fn ordered_leaf_peers(
-    mut peers: Vec<PeerId>,
-    coordinators: &[[u8; 32]],
-    relays: &[[u8; 32]],
-    pinned: &HashSet<[u8; 32]>,
-    degree: usize,
-) -> Vec<PeerId> {
-    peers.sort_by_key(|peer| *peer.as_bytes());
-    peers.dedup();
-    let plane = peers
-        .iter()
-        .map(|peer| *peer.as_bytes())
-        .collect::<Vec<_>>();
-    if let Some(preferred) =
-        select_one_full_bootstrap_eager_peer(&plane, coordinators, relays, pinned)
-    {
-        peers.retain(|peer| peer.as_bytes() != &preferred);
-        peers.insert(0, PeerId::new(preferred));
+/// #774: one connected-plane view for the atomic membership pass. See
+/// [`PubSubManager::topic_membership`].
+#[derive(Clone)]
+struct TopicMembership {
+    /// Full deduplicated connected plane — topic membership.
+    full: Vec<PeerId>,
+    /// The actual selected Full/bootstrap peer for C5b, when connected.
+    preferred: Option<PeerId>,
+}
+
+impl TopicMembership {
+    /// The exact pre-#807 untruncated order: preferred first, then the
+    /// sorted plane. Full nodes hand this to the pre-#807 sg writers.
+    fn into_pre_807_order(self) -> Vec<PeerId> {
+        let mut peers = self.full;
+        if let Some(preferred) = self.preferred {
+            peers.retain(|peer| *peer != preferred);
+            peers.insert(0, preferred);
+        }
+        peers
     }
-    if degree != 0 {
-        peers.truncate(degree);
+}
+
+async fn refresh_ordered_peers<T, F, Fut>(
+    connected_peers: &[PeerId],
+    ordered_peers: &mut Option<T>,
+    order: F,
+) -> T
+where
+    T: Clone,
+    F: FnOnce(Vec<PeerId>) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    match ordered_peers {
+        Some(peers) => peers.clone(),
+        None => {
+            let peers = order(connected_peers.to_vec()).await;
+            *ordered_peers = Some(peers.clone());
+            peers
+        }
     }
-    peers
 }
 
 /// Pick at most one connected Full/bootstrap peer for ACK-topic eager.
@@ -2755,6 +3590,75 @@ fn verify_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_bus_origin_diagnostics_exposes_unknown_generic_bus_publish() {
+        let manager = slice1_manager(1, false).await;
+        manager
+            .publish(
+                crate::dm_inbox::DM_BUS_TOPIC.to_string(),
+                Bytes::from_static(b"wire"),
+            )
+            .await
+            .expect("generic bus publish");
+        let snap = manager.egress_diagnostics();
+        assert_eq!(
+            snap["legacy_dm_bus_origin"]["outbound"]["unknown"]["count"],
+            1
+        );
+        assert_eq!(
+            snap["legacy_dm_bus_origin"]["outbound"]["unknown"]["wire_bytes"],
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_bus_origin_counts_labeled_and_unknown_publishes() {
+        let manager = slice1_manager(1, false).await;
+        let before = manager.legacy_dm_bus_origin_snapshot();
+        for kind in [
+            LegacyBusMessageKind::ControlBlobReference,
+            LegacyBusMessageKind::ControlBlobFetch,
+            LegacyBusMessageKind::ControlBlobChunk,
+            LegacyBusMessageKind::ControlBlobRelease,
+            LegacyBusMessageKind::OtherPayload,
+            LegacyBusMessageKind::Ack,
+        ] {
+            manager
+                .publish_legacy_dm_bus(Bytes::from_static(b"wire"), kind)
+                .await
+                .expect("local bus publish");
+        }
+        manager
+            .publish(
+                crate::dm_inbox::DM_BUS_TOPIC.to_string(),
+                Bytes::from_static(b"unlabeled"),
+            )
+            .await
+            .expect("unlabeled publish");
+        let failed = manager
+            .publish_signed_kv_v3(
+                crate::dm_inbox::DM_BUS_TOPIC.to_string(),
+                Bytes::from_static(b"rejected"),
+            )
+            .await;
+        assert!(failed.is_err(), "unsigned V3 bus publish must fail");
+        let after = manager.legacy_dm_bus_origin_snapshot();
+        for key in [
+            "control_blob_reference",
+            "control_blob_fetch",
+            "control_blob_chunk",
+            "control_blob_release",
+            "other_payload",
+            "ack",
+        ] {
+            assert_eq!(after["outbound"][key]["count"].as_u64(), Some(1));
+            assert_eq!(after["outbound"][key]["wire_bytes"].as_u64(), Some(4));
+            assert_eq!(before["outbound"][key]["count"].as_u64(), Some(0));
+        }
+        assert_eq!(after["outbound"]["unknown"]["count"].as_u64(), Some(1));
+        assert_eq!(after["outbound"]["unknown"]["wire_bytes"].as_u64(), Some(9));
+    }
     use crate::identity::AgentKeypair;
     use crate::network::NetworkConfig;
 
@@ -3015,6 +3919,29 @@ mod tests {
             .await
             .expect("Failed to create test node"),
         )
+    }
+
+    struct TestGroupIdentity {
+        bindings: crate::dm_inbox::AuthenticatedMachineBindings,
+        revoked: Arc<RwLock<crate::revocation::RevocationSet>>,
+    }
+
+    fn group_identity_for_test(manager: &PubSubManager) -> TestGroupIdentity {
+        let bindings = Arc::new(RwLock::new(
+            crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        let revoked = Arc::new(RwLock::new(crate::revocation::RevocationSet::new()));
+        let moves = Arc::new(RwLock::new(crate::key_move::MoveState::default()));
+        manager.set_group_identity_context(Arc::clone(&bindings), Arc::clone(&revoked), moves);
+        TestGroupIdentity { bindings, revoked }
+    }
+
+    async fn authorize_group_peer_for_test(
+        bindings: &crate::dm_inbox::AuthenticatedMachineBindings,
+        agent: AgentId,
+        machine: MachineId,
+    ) {
+        crate::dm_inbox::record_authenticated_machine_binding(bindings, agent, machine, 1).await;
     }
 
     async fn slice1_manager(degree: usize, full: bool) -> PubSubManager {
@@ -3384,18 +4311,23 @@ mod tests {
                     "metered publish attempts must match the selected ceiling"
                 );
                 if expected <= 2 {
+                    // #774: only the preferred Full/bootstrap pick is
+                    // deterministic. The remaining eager slots are
+                    // saorsa-gossip's score-based choice (equal scores are
+                    // not tie-broken), so assert the preferred peer plus
+                    // the configured count rather than exact identities.
                     let actual = sends
                         .iter()
                         .map(|(peer, _)| *peer.as_bytes())
                         .collect::<HashSet<_>>();
-                    let wanted = if degree == 1 {
-                        HashSet::from([[8; 32]])
-                    } else {
-                        HashSet::from([[8; 32], [1; 32]])
-                    };
                     assert_eq!(
-                        actual, wanted,
-                        "all writers preserve preferred + deterministic remainder"
+                        actual.len(),
+                        expected,
+                        "writer {writer}, D={degree}, full={full}"
+                    );
+                    assert!(
+                        actual.contains(&[8; 32]),
+                        "all writers keep the pinned preferred peer eager"
                     );
                 }
                 recorded_eager(&manager);
@@ -3411,7 +4343,7 @@ mod tests {
                 let payload = encode_v1(name, &Bytes::from(format!("remote-{writer}"))).unwrap();
                 let frame = slice1_signed_frame(MessageKind::Eager, topic, payload, inbound_msg_id);
                 let inbound_before = eager_outbound_attempt_msgs(&manager);
-                manager.handle_incoming(inbound_from, frame).await;
+                manager.handle_incoming(inbound_from, None, frame).await;
                 let inbound_attempted =
                     (eager_outbound_attempt_msgs(&manager) - inbound_before) as usize;
                 let sends =
@@ -3529,7 +4461,9 @@ mod tests {
         );
         // Real cached IWANT handler + spawned send task + outbound recorder.
         let repair_before = eager_outbound_attempt_msgs(&manager);
-        manager.handle_incoming(PeerId::new([7; 32]), request).await;
+        manager
+            .handle_incoming(PeerId::new([7; 32]), None, request)
+            .await;
         let repair_attempted = (eager_outbound_attempt_msgs(&manager) - repair_before) as usize;
         let repaired = await_eager_settled_for_msg(&manager, id, repair_attempted).await;
         assert_eq!(repaired.len(), 1);
@@ -3614,10 +4548,12 @@ mod tests {
         let manager = slice1_manager(2, false).await;
         let name = "slice1-failover";
         let mut sub = manager.subscribe(name.into()).await;
-        for (removed, expected) in [
-            (vec![8], HashSet::from([[1; 32], [2; 32]])),
-            (vec![1, 2], HashSet::from([[3; 32], [4; 32]])),
-        ] {
+        // #774: disconnect replacement is no longer lexicographic. The
+        // preferred Full/bootstrap pick is deterministic; remaining eager
+        // slots refill through saorsa-gossip's score-aware maintenance, so
+        // the invariant is the configured eager count plus continued
+        // delivery, not exact identities.
+        for removed in [vec![8], vec![1, 2]] {
             manager
                 .transport
                 .recorder
@@ -3638,8 +4574,10 @@ mod tests {
                 sends
                     .iter()
                     .map(|(peer, _)| *peer.as_bytes())
-                    .collect::<HashSet<_>>(),
-                expected
+                    .collect::<HashSet<_>>()
+                    .len(),
+                2,
+                "eager degree must be refilled after removing {removed:?}"
             );
             recorded_eager(&manager);
             assert_eq!(
@@ -3669,7 +4607,7 @@ mod tests {
                 inbound_msg_id,
             );
             let inbound_before = eager_outbound_attempt_msgs(&manager);
-            manager.handle_incoming(inbound_from, frame).await;
+            manager.handle_incoming(inbound_from, None, frame).await;
             let inbound_attempted =
                 (eager_outbound_attempt_msgs(&manager) - inbound_before) as usize;
             let sends =
@@ -3700,7 +4638,7 @@ mod tests {
                 [0; 32],
             );
             let repair_before = eager_outbound_attempt_msgs(&manager);
-            manager.handle_incoming(requester, request).await;
+            manager.handle_incoming(requester, None, request).await;
             let repair_attempted = (eager_outbound_attempt_msgs(&manager) - repair_before) as usize;
             let repair =
                 await_eager_settled_for_msg(&manager, inbound_msg_id, repair_attempted).await;
@@ -3767,7 +4705,35 @@ mod tests {
         for _ in 0..2 {
             tokio::time::sleep(Duration::from_secs(31)).await;
         }
-        let frames = (3..=6)
+        // #807/#774: the whole connected plane is topic membership and only
+        // sg's ceiling caps eager. Which non-preferred peers are eager is
+        // sg's score choice (ties are not broken), so the unsolicited
+        // senders must be drawn from the LAZY members: sg never forwards an
+        // EAGER back to its sender, and a sender that happened to be eager
+        // would legitimately reach only one peer.
+        let plane: Vec<[u8; 32]> = (1..=8).map(|id| [id; 32]).collect();
+        let roles = plane_roles(&manager, topic, &plane);
+        assert!(
+            roles
+                .iter()
+                .all(|(_, role)| role == "eager" || role == "lazy"),
+            "every connected peer stays eager-or-lazy after maintenance: {roles:?}"
+        );
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "eager").count(),
+            2,
+            "maintenance keeps eager at the Leaf ceiling D=2: {roles:?}"
+        );
+        assert_eq!(role_for(&manager, topic, [8; 32]), "eager");
+        let senders: Vec<u8> = roles
+            .iter()
+            .filter(|(_, role)| role == "lazy")
+            .map(|(peer, _)| peer[0])
+            .take(4)
+            .collect();
+        assert_eq!(senders.len(), 4, "six lazy members exist: {roles:?}");
+        let frames = senders
+            .into_iter()
             .map(|peer| {
                 (
                     PeerId::new([peer; 32]),
@@ -3784,7 +4750,7 @@ mod tests {
         tokio::join!(
             async {
                 for (peer, frame) in frames {
-                    manager.handle_incoming(peer, frame).await;
+                    manager.handle_incoming(peer, None, frame).await;
                 }
             },
             async {
@@ -3873,7 +4839,9 @@ mod tests {
             postcard::to_stdvec(&vec![id]).unwrap().into(),
             [0; 32],
         );
-        receiver.handle_incoming(PeerId::new([3; 32]), ihave).await;
+        receiver
+            .handle_incoming(PeerId::new([3; 32]), None, ihave)
+            .await;
         let sends = std::mem::take(
             &mut receiver
                 .transport
@@ -3893,7 +4861,9 @@ mod tests {
             .expect("real IHAVE handler emits IWANT")
             .1;
         let repair_before = eager_outbound_attempt_msgs(&owner);
-        owner.handle_incoming(PeerId::new([4; 32]), request).await;
+        owner
+            .handle_incoming(PeerId::new([4; 32]), None, request)
+            .await;
         let repair_attempted = (eager_outbound_attempt_msgs(&owner) - repair_before) as usize;
         let repair = await_eager_settled_for_msg(&owner, id, repair_attempted).await;
         assert_eq!(repair.len(), 1);
@@ -3902,6 +4872,7 @@ mod tests {
         receiver
             .handle_incoming(
                 PeerId::new([3; 32]),
+                None,
                 postcard::to_stdvec(&repair[0].1).unwrap().into(),
             )
             .await;
@@ -3921,40 +4892,1279 @@ mod tests {
         assert!(!after_sends.is_empty());
     }
 
-    #[test]
-    fn slice1_deterministic_full_width_ties_duplicates_and_replacements() {
-        let mut peers = (1..=8).map(|id| PeerId::new([id; 32])).collect::<Vec<_>>();
-        peers.push(PeerId::new([1; 32]));
-        for _ in 0..peers.len() {
-            peers.rotate_left(1);
-            let selected = ordered_leaf_peers(
-                peers.clone(),
-                &[[8; 32], [7; 32]],
-                &[[6; 32]],
-                &HashSet::new(),
-                2,
-            );
-            assert_eq!(selected, vec![PeerId::new([7; 32]), PeerId::new([1; 32])]);
+    /// #774 harness: a Leaf manager whose connected plane and optional
+    /// pinned preferred peer are fully controlled by the test.
+    async fn membership_manager(
+        degree: usize,
+        pinned: Option<[u8; 32]>,
+        plane: Vec<PeerId>,
+    ) -> PubSubManager {
+        let mut network_config = NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: vec![],
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..Default::default()
+        };
+        if let Some(pinned) = pinned {
+            network_config.pinned_bootstrap_peers.insert(pinned);
         }
-        let mut a = [1; 32];
-        a[31] = 2;
-        let mut b = a;
-        b[31] = 3;
+        let node = Arc::new(NetworkNode::new(network_config, None, None).await.unwrap());
+        let mut manager = PubSubManager::new_with_participation(
+            node,
+            None,
+            None,
+            ParticipationMode::Leaf,
+            "membership_774",
+        )
+        .unwrap();
+        manager
+            .configure_egress(&GossipConfig {
+                leaf_max_eager_degree: degree,
+                ..Default::default()
+            })
+            .await
+            .expect("sg accepts the default observe-only budget");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: plane,
+            sends: Vec::new(),
+        });
+        manager
+    }
+
+    /// #774: live sg role for one peer on one topic ("absent" when the peer
+    /// is not a topic member at all — the pre-fix failure shape).
+    fn role_for(manager: &PubSubManager, topic: TopicId, peer: [u8; 32]) -> String {
+        manager
+            .stage_stats()
+            .peer_scores_by_topic
+            .get(&topic.to_string())
+            .and_then(|by_peer| by_peer.get(&PeerId::new(peer).to_string()))
+            .map_or_else(|| "absent".to_string(), |row| row.role.clone())
+    }
+
+    fn set_plane(manager: &PubSubManager, plane: Vec<[u8; 32]>) {
+        manager
+            .transport
+            .recorder
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .peers = plane.into_iter().map(PeerId::new).collect();
+    }
+
+    /// Poll the recorder until the recorded EAGER fan-out targets equal
+    /// `expected` (bounded; publish sends are spawned tasks).
+    async fn until_eager_targets(manager: &PubSubManager, expected: &HashSet<[u8; 32]>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let targets: HashSet<[u8; 32]> = manager
+                    .transport
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .sends
+                    .iter()
+                    .filter(|(_, bytes)| {
+                        peek_pubsub_header(bytes).is_some_and(|h| h.kind == MessageKind::Eager)
+                    })
+                    .map(|(peer, _)| *peer.as_bytes())
+                    .collect();
+                if &targets == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("eager fanout did not settle to {expected:?}"));
+    }
+
+    /// Poll the recorder for the first frame of `kind` sent to `peer`
+    /// (bounded; IHAVE batches ride sg's 100 ms flusher).
+    async fn await_frame_to(manager: &PubSubManager, peer: [u8; 32], kind: MessageKind) -> Bytes {
+        let peer_id = PeerId::new(peer);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = manager
+                    .transport
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .sends
+                    .iter()
+                    .find(|(to, bytes)| {
+                        *to == peer_id && peek_pubsub_header(bytes).is_some_and(|h| h.kind == kind)
+                    })
+                    .map(|(_, bytes)| bytes.clone());
+                if let Some(frame) = frame {
+                    return frame;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {kind:?} frame recorded to {peer:?} within 2s"))
+    }
+
+    /// #774: role snapshot for a whole plane, in plane order — compared for
+    /// equality across membership passes (steady state must not churn).
+    fn plane_roles(
+        manager: &PubSubManager,
+        topic: TopicId,
+        plane: &[[u8; 32]],
+    ) -> Vec<([u8; 32], String)> {
+        plane
+            .iter()
+            .map(|peer| (*peer, role_for(manager, topic, *peer)))
+            .collect()
+    }
+
+    /// WHY (#774): G5→D5 failed because the Leaf eager-degree truncation was
+    /// applied to the connected plane BEFORE saorsa-gossip saw it — the
+    /// discarded peer was in neither the eager nor the lazy set, so no IHAVE
+    /// could ever announce to it and IWANT repair had nothing to repair.
+    /// Membership must be the full plane; only the eager degree is capped.
+    /// With no preferred peer on the plane, WHICH two of the three
+    /// equal-score peers are eager is saorsa-gossip's choice — the pinned
+    /// invariant is full membership, exactly two eager, one lazy, and lazy
+    /// repair. Fails on the old bytes at the membership assertion (the
+    /// beyond-degree peer read "absent").
+    #[tokio::test]
+    async fn leaf_full_plane_membership_keeps_beyond_degree_peers_lazy_and_repair_eligible() {
+        let plane = [[1; 32], [2; 32], [3; 32]];
+        let manager =
+            membership_manager(2, None, plane.into_iter().map(PeerId::new).collect()).await;
+        let name = "x0x/dm/v1/inbox/774-membership";
+        let topic = TopicId::new([77; 32]);
+        let mut sub = manager.subscribe_topic_id(name.into(), topic).await;
+
+        let roles = plane_roles(&manager, topic, &plane);
+        assert!(
+            roles.iter().all(|(_, role)| role != "absent"),
+            "every connected peer must be a topic member: {roles:?}"
+        );
+        let eager: HashSet<[u8; 32]> = roles
+            .iter()
+            .filter(|(_, role)| role == "eager")
+            .map(|(peer, _)| *peer)
+            .collect();
+        let lazy: Vec<[u8; 32]> = roles
+            .iter()
+            .filter(|(_, role)| role == "lazy")
+            .map(|(peer, _)| *peer)
+            .collect();
         assert_eq!(
-            ordered_leaf_peers(
-                vec![PeerId::new(b), PeerId::new(a)],
-                &[],
-                &[],
-                &HashSet::new(),
-                1
+            eager.len(),
+            2,
+            "Leaf eager degree is capped at two: {roles:?}"
+        );
+        assert_eq!(
+            lazy.len(),
+            1,
+            "the beyond-degree peer stays lazy: {roles:?}"
+        );
+        let lazy_peer = lazy[0];
+
+        recorded_eager(&manager);
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("m1"))
+            .await
+            .unwrap();
+        until_eager_targets(&manager, &eager).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            Bytes::from("m1")
+        );
+        // The eager-degree cap must not strip the lazy repair arm: the 100 ms
+        // IHAVE flusher announces the publish to the lazy member.
+        await_frame_to(&manager, lazy_peer, MessageKind::IHave).await;
+
+        // Periodic refresh must preserve full membership and the settled
+        // roles — never re-truncate, never churn.
+        manager.refresh_topic_peers().await;
+        manager.refresh_topic_peers().await;
+        assert_eq!(
+            plane_roles(&manager, topic, &plane),
+            roles,
+            "steady-state refresh must not change any role"
+        );
+
+        recorded_eager(&manager);
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("m2"))
+            .await
+            .unwrap();
+        until_eager_targets(&manager, &eager).await;
+        await_frame_to(&manager, lazy_peer, MessageKind::IHave).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            Bytes::from("m2")
+        );
+    }
+
+    /// WHY (#774 + C5b): the preferred Full/bootstrap pick stays eager, the
+    /// per-ACK prefer-one pass must not churn a steady topic, and a
+    /// disconnected non-preferred eager peer is replaced (here from the sole
+    /// remaining lazy member, so the replacement is exact).
+    #[tokio::test]
+    async fn leaf_eager_seed_keeps_preferred_bootstrap_and_replaces_disconnected_eager() {
+        let plane = [[3; 32], [5; 32], [8; 32]];
+        let manager = membership_manager(
+            2,
+            Some([8; 32]),
+            plane.into_iter().map(PeerId::new).collect(),
+        )
+        .await;
+        let name = "x0x/dm/v1/inbox/774-preferred";
+        let topic = TopicId::new([78; 32]);
+        let mut sub = manager.subscribe_topic_id(name.into(), topic).await;
+
+        let roles = plane_roles(&manager, topic, &plane);
+        assert_eq!(role_for(&manager, topic, [8; 32]), "eager");
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "eager").count(),
+            2,
+            "eager degree is capped at two: {roles:?}"
+        );
+        let eager: HashSet<[u8; 32]> = roles
+            .iter()
+            .filter(|(_, role)| role == "eager")
+            .map(|(peer, _)| *peer)
+            .collect();
+        let other_eager = *eager.iter().find(|peer| **peer != [8; 32]).unwrap();
+
+        // Steady-state C5b pass: the atomic reconciliation is idempotent for
+        // an already-eager preference — roles must not change at all.
+        manager.prefer_one_full_bootstrap_eager(&[topic]).await;
+        assert_eq!(
+            plane_roles(&manager, topic, &plane),
+            roles,
+            "repeated preferred call must not churn any role"
+        );
+
+        recorded_eager(&manager);
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("ack-path"))
+            .await
+            .unwrap();
+        until_eager_targets(&manager, &eager).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            Bytes::from("ack-path")
+        );
+
+        // Disconnect the non-preferred eager peer (keep the lazy member):
+        // the preferred bootstrap peer is retained and the sole remaining
+        // lazy member is promoted to refill the degree.
+        let lazy_id = roles
+            .iter()
+            .find(|(_, role)| role == "lazy")
+            .map(|(peer, _)| *peer)
+            .unwrap();
+        set_plane(&manager, vec![[8; 32], lazy_id]);
+        manager.refresh_topic_peers().await;
+        assert_eq!(role_for(&manager, topic, [8; 32]), "eager");
+        assert_eq!(
+            role_for(&manager, topic, lazy_id),
+            "eager",
+            "the lazy member must be promoted to refill the eager degree"
+        );
+        assert_eq!(
+            role_for(&manager, topic, other_eager),
+            "excluded",
+            "the disconnected eager peer must leave the topic"
+        );
+    }
+
+    /// WHY (#807 Full parity): #807 is a Leaf-only defect. The #808 port
+    /// made every Full writer, including the per-publish initialize, force
+    /// one preferred Full/bootstrap peer eager, displacing a working eager
+    /// peer that sg's score had chosen. Pre-#807 Full never forced a
+    /// preferred eager peer, and R10 saw Full-node KV delivery slow from
+    /// 0.7 s to 110 s. The switch from add-only to replace at publish time
+    /// is NOT observable on Full: sg's 1 s connected-peers refresh (sg
+    /// 0.5.85 lib.rs:2233-2280) prunes unconnected members on every version,
+    /// so this test does not assert add-only. Fails on b2b2a746: the publish
+    /// forces the pinned [8] eager over a full eager set.
+    #[tokio::test]
+    async fn full_publish_initialize_is_add_only_and_never_forces_preferred_eager() {
+        // Full, ceiling 6, pinned bootstrap [8]; six connected peers fill eager.
+        let manager = slice1_manager(2, true).await;
+        let initial: Vec<[u8; 32]> = (1..=6).map(|id| [id; 32]).collect();
+        set_plane(&manager, initial.clone());
+        let name = "x0x/dm/v1/inbox/807-full-parity";
+        let topic = TopicId::new([81; 32]);
+        let _sub = manager.subscribe_topic_id(name.into(), topic).await;
+        assert!(
+            plane_roles(&manager, topic, &initial)
+                .iter()
+                .all(|(_, role)| role == "eager"),
+            "six connected peers fill the Full eager ceiling"
+        );
+
+        // The pinned Full/bootstrap peer connects; the publish re-seeds.
+        let mut grown = initial.clone();
+        grown.push([8; 32]);
+        set_plane(&manager, grown);
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("full-parity"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            role_for(&manager, topic, [8; 32]),
+            "lazy",
+            "Full never forces the preferred peer eager over a full eager set"
+        );
+        assert!(
+            plane_roles(&manager, topic, &initial)
+                .iter()
+                .all(|(_, role)| role == "eager"),
+            "no working eager peer is displaced"
+        );
+    }
+
+    /// Rule 9: a Full publisher with a saturated non-member mesh must push a
+    /// two-member store write to the other member. No IHAVE/IWANT is ferried.
+    #[tokio::test]
+    async fn full_group_store_write_eager_reaches_roster_member_on_wire() {
+        let publisher = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "group_roster_test",
+        )
+        .expect("publisher");
+        *publisher.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let receiver = PubSubManager::new(test_node().await, None).expect("receiver");
+        let receiver_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(receiver.transport.as_ref());
+        let publisher_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(publisher.transport.as_ref());
+        let topic_name = format!("x0x/group/{}/kv/{}", "ab".repeat(32), "cd".repeat(32));
+        let topic = TopicId::from_entity(topic_name.as_bytes());
+        let identity = group_identity_for_test(&publisher);
+        let member_agent = AgentId([42; 32]);
+        authorize_group_peer_for_test(
+            &identity.bindings,
+            member_agent,
+            MachineId(*receiver_peer.as_bytes()),
+        )
+        .await;
+        let mut nonmembers: Vec<[u8; 32]> = (1..=13).map(|n| [n; 32]).collect();
+        set_plane(&publisher, nonmembers.clone());
+        let _publisher_sub = publisher.subscribe(topic_name.clone()).await;
+        let mut receiver_sub = receiver.subscribe(topic_name.clone()).await;
+        nonmembers.push(*receiver_peer.as_bytes());
+        set_plane(&publisher, nonmembers);
+        publisher.refresh_topic_peers().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while role_for(&publisher, topic, *receiver_peer.as_bytes()) == "absent" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("connected member becomes a topic peer");
+        let connected = publisher.transport.connected_peer_ids().await;
+        assert!(
+            publisher
+                .preferred_roster_peers(topic, &connected)
+                .await
+                .is_empty(),
+            "a member has no roster preference before the roster is installed"
+        );
+
+        publisher
+            .replace_group_rosters(vec![("ab".repeat(32), String::new(), vec![member_agent])])
+            .await;
+        assert_eq!(
+            publisher.preferred_roster_peers(topic, &connected).await,
+            vec![receiver_peer]
+        );
+        assert_eq!(
+            role_for(&publisher, topic, *receiver_peer.as_bytes()),
+            "eager"
+        );
+        publisher
+            .publish(topic_name, Bytes::from_static(b"owner-gss"))
+            .await
+            .expect("publish store write");
+        let frame = await_frame_to(&publisher, *receiver_peer.as_bytes(), MessageKind::Eager).await;
+        receiver.handle_incoming(publisher_peer, None, frame).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), receiver_sub.recv())
+            .await
+            .expect("wire delivery timeout")
+            .expect("subscriber delivery");
+        assert_eq!(delivered.payload, Bytes::from_static(b"owner-gss"));
+    }
+
+    #[tokio::test]
+    async fn anonymous_authenticated_group_member_is_eager_without_discovery_certificate() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "anonymous_group_member",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let identity = group_identity_for_test(&manager);
+        let member = AgentId([40; 32]);
+        let group_id = "ab".repeat(32);
+        let topic_name = format!("x0x/group/{group_id}/kv/{}", "cd".repeat(32));
+        let topic = TopicId::from_entity(topic_name.as_bytes());
+        let plane: Vec<[u8; 32]> = (1..=14).map(|n| [n; 32]).collect();
+        set_plane(&manager, plane.clone());
+        let _sub = manager.subscribe(topic_name).await;
+        let machine = MachineId(
+            plane
+                .into_iter()
+                .find(|peer| role_for(&manager, topic, *peer) == "lazy")
+                .expect("fourteen peers leave an ordinary lazy peer"),
+        );
+        authorize_group_peer_for_test(&identity.bindings, member, machine).await;
+        assert_eq!(role_for(&manager, topic, machine.0), "lazy");
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), vec![member])])
+            .await;
+        assert_eq!(role_for(&manager, topic, machine.0), "eager");
+    }
+
+    #[tokio::test]
+    async fn metadata_and_state_sync_subscribed_before_roster_are_reclassified() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "group_topic_mapping_before_roster",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let group_id = "ab".repeat(32);
+        let metadata = format!("x0x/group/{group_id}/metadata");
+        let state_sync = format!("x0x/group/{group_id}/kv/{}/state-sync", "cd".repeat(32));
+        let identity = group_identity_for_test(&manager);
+        let member = AgentId([40; 32]);
+        let machine = MachineId([90; 32]);
+        authorize_group_peer_for_test(&identity.bindings, member, machine).await;
+        let mut plane: Vec<[u8; 32]> = (1..=13).map(|n| [n; 32]).collect();
+        plane.push(machine.0);
+        set_plane(&manager, plane);
+
+        let _metadata_sub = manager.subscribe(metadata.clone()).await;
+        let _state_sync_sub = manager.subscribe(state_sync.clone()).await;
+        manager.refresh_topic_peers().await;
+        let connected = manager.transport.connected_peer_ids().await;
+        for name in [&metadata, &state_sync] {
+            let topic = TopicId::from_entity(name.as_bytes());
+            assert_ne!(
+                role_for(&manager, topic, machine.0),
+                "absent",
+                "{name} must include the connected member before roster loading"
+            );
+            assert!(
+                manager
+                    .preferred_roster_peers(topic, &connected)
+                    .await
+                    .is_empty(),
+                "{name} must have no roster preference before rosters load"
+            );
+        }
+
+        manager
+            .replace_group_rosters(vec![(group_id, metadata.clone(), vec![member])])
+            .await;
+        for name in [&metadata, &state_sync] {
+            let topic = TopicId::from_entity(name.as_bytes());
+            assert_eq!(
+                manager.preferred_roster_peers(topic, &connected).await,
+                vec![PeerId::new(machine.0)],
+                "{name} must map to its group's authenticated roster member"
+            );
+            assert_eq!(
+                role_for(&manager, topic, machine.0),
+                "eager",
+                "{name} must promote the member after roster loading"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn roster_change_refreshes_only_affected_group_topics() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "scoped_roster_refresh",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let group_a = "ab".repeat(32);
+        let group_b = "cd".repeat(32);
+        let topic_a_name = format!("x0x/group/{group_a}/kv/{}", "01".repeat(32));
+        let topic_b_name = format!("x0x/group/{group_b}/kv/{}", "02".repeat(32));
+        let topic_a = TopicId::from_entity(topic_a_name.as_bytes());
+        let topic_b = TopicId::from_entity(topic_b_name.as_bytes());
+        let passthrough = TopicId::from_entity(b"unrelated-full-passthrough");
+        let identity = group_identity_for_test(&manager);
+        for n in [70, 71, 72] {
+            authorize_group_peer_for_test(
+                &identity.bindings,
+                AgentId([n - 30; 32]),
+                MachineId([n; 32]),
+            )
+            .await;
+        }
+        set_plane(&manager, vec![[70; 32], [71; 32], [72; 32]]);
+        let _sub_a = manager.subscribe(topic_a_name).await;
+        let _sub_b = manager.subscribe(topic_b_name).await;
+        manager.set_known_plumtree_topics_for_test(vec![topic_a, topic_b, passthrough]);
+        manager
+            .replace_group_rosters(vec![
+                (group_a.clone(), String::new(), vec![AgentId([40; 32])]),
+                (group_b.clone(), String::new(), vec![AgentId([42; 32])]),
+            ])
+            .await;
+        manager.take_refreshed_topic_ids();
+
+        manager
+            .replace_group_rosters(vec![
+                (group_a, String::new(), vec![AgentId([41; 32])]),
+                (group_b, String::new(), vec![AgentId([42; 32])]),
+            ])
+            .await;
+        let refreshed = manager.take_refreshed_topic_ids();
+        assert_eq!(refreshed, vec![topic_a], "only group A changed");
+        let connected = manager.transport.connected_peer_ids().await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic_a, &connected).await,
+            vec![PeerId::new([71; 32])]
+        );
+        assert_eq!(
+            manager.preferred_roster_peers(topic_b, &connected).await,
+            vec![PeerId::new([72; 32])]
+        );
+    }
+
+    #[tokio::test]
+    async fn group_roster_change_replaces_preference_and_rendezvous_is_stable() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "group_roster_change",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let group_id = "ef".repeat(32);
+        let name = format!("x0x/group/{group_id}/kv/{}", "12".repeat(32));
+        let topic = TopicId::from_entity(name.as_bytes());
+        let identity = group_identity_for_test(&manager);
+        for n in 20..=30 {
+            authorize_group_peer_for_test(
+                &identity.bindings,
+                AgentId([n; 32]),
+                MachineId([n + 40; 32]),
+            )
+            .await;
+        }
+        let mut plane: Vec<[u8; 32]> = (1..=13).map(|n| [n; 32]).collect();
+        plane.extend((20..=30).map(|n| [n + 40; 32]));
+        set_plane(&manager, plane);
+        let _sub = manager.subscribe(name).await;
+        let first: Vec<AgentId> = (20..=29).map(|n| AgentId([n; 32])).collect();
+        manager
+            .replace_group_rosters(vec![(group_id.clone(), String::new(), first.clone())])
+            .await;
+        let connected = manager.transport.connected_peer_ids().await;
+        let chosen = manager.preferred_roster_peers(topic, &connected).await;
+        assert_eq!(chosen.len(), 8);
+        let mut reversed = first;
+        reversed.reverse();
+        manager
+            .replace_group_rosters(vec![(group_id.clone(), String::new(), reversed)])
+            .await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            chosen
+        );
+
+        // Remove one selected member and add a connected replacement. A
+        // removed member may remain ordinary eager by score, but is no longer
+        // protected by the roster preference.
+        let removed = AgentId([chosen[0].as_bytes()[0] - 40; 32]);
+        let updated: Vec<AgentId> = (20..=30)
+            .map(|n| AgentId([n; 32]))
+            .filter(|id| *id != removed)
+            .collect();
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), updated)])
+            .await;
+        let refreshed = manager.preferred_roster_peers(topic, &connected).await;
+        assert_eq!(refreshed.len(), 8);
+        assert!(!refreshed.contains(&chosen[0]));
+        assert!(
+            refreshed
+                .iter()
+                .filter(|peer| !chosen.contains(peer))
+                .count()
+                <= 1,
+            "one roster replacement changes at most one rendezvous winner"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_preference_requires_authenticated_binding_and_current_pairing() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "group_roster_identity",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let identity = group_identity_for_test(&manager);
+        let member = AgentId([40; 32]);
+        let legitimate = MachineId([90; 32]);
+        let attacker = MachineId([91; 32]);
+        let group_id = "ef".repeat(32);
+        let topic_name = format!("x0x/group/{group_id}/kv/{}", "12".repeat(32));
+        let topic = TopicId::from_entity(topic_name.as_bytes());
+        set_plane(&manager, vec![legitimate.0, attacker.0]);
+        let _sub = manager.subscribe(topic_name).await;
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), vec![member])])
+            .await;
+        let connected = manager.transport.connected_peer_ids().await;
+        assert!(
+            manager
+                .preferred_roster_peers(topic, &connected)
+                .await
+                .is_empty(),
+            "connected roster claim without authenticated binding is not preferred"
+        );
+        authorize_group_peer_for_test(&identity.bindings, member, legitimate).await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new(legitimate.0)]
+        );
+
+        // Both transport peers are connected, but only the legitimate
+        // machine has authenticated binding evidence for this roster AgentId.
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new(legitimate.0)]
+        );
+
+        // The authenticated cache intentionally survives revocation; a
+        // retired pairing must nonetheless lose its roster preference.
+        identity.revoked.write().await.union_bundle_retired(&[
+            crate::revocation::AgentMachineBinding {
+                agent: member,
+                machine: legitimate,
+                move_epoch: 1,
+            },
+        ]);
+        assert!(manager
+            .preferred_roster_peers(topic, &connected)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn leaf_group_topic_keeps_bootstrap_when_roster_is_empty() {
+        let manager = slice1_manager(2, false).await;
+        let group_id = "aa".repeat(32);
+        let name = format!("x0x/group/{group_id}/kv/{}", "bb".repeat(32));
+        let topic = TopicId::from_entity(name.as_bytes());
+        set_plane(&manager, vec![[1; 32], [2; 32]]);
+        let _sub = manager.subscribe(name).await;
+        set_plane(&manager, vec![[1; 32], [2; 32], [8; 32]]);
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), Vec::new())])
+            .await;
+        assert_eq!(
+            role_for(&manager, topic, [8; 32]),
+            "eager",
+            "an empty roster must retain the #774 bootstrap fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_group_roster_and_bootstrap_stay_eager_through_refresh_and_publish() {
+        let manager = slice1_manager(2, false).await;
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let group_id = "ac".repeat(32);
+        let name = format!("x0x/group/{group_id}/kv/{}", "bd".repeat(32));
+        let topic = TopicId::from_entity(name.as_bytes());
+        let identity = group_identity_for_test(&manager);
+        let members: Vec<AgentId> = (9..=11).map(|n| AgentId([n + 38; 32])).collect();
+        for (member, machine) in members.iter().zip(9..=11) {
+            authorize_group_peer_for_test(&identity.bindings, *member, MachineId([machine; 32]))
+                .await;
+        }
+        set_plane(
+            &manager,
+            vec![[1; 32], [2; 32], [8; 32], [9; 32], [10; 32], [11; 32]],
+        );
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), members)])
+            .await;
+        let _sub = manager.subscribe(name.clone()).await;
+        let before = manager.stage_stats().message_kinds;
+        for _ in 0..2 {
+            manager.refresh_topic_peers().await;
+            for id in 8..=11 {
+                assert_eq!(role_for(&manager, topic, [id; 32]), "eager");
+            }
+            manager
+                .publish(name.clone(), Bytes::from_static(b"leaf-group-write"))
+                .await
+                .expect("group publish");
+            for id in 8..=11 {
+                assert_eq!(role_for(&manager, topic, [id; 32]), "eager");
+            }
+            let after = manager.stage_stats().message_kinds;
+            assert_eq!(
+                after.prune, before.prune,
+                "refresh/publish pruned eager peers"
+            );
+            assert_eq!(
+                after.graft, before.graft,
+                "refresh/publish regrafted eager peers"
+            );
+        }
+        let _frame = await_frame_to(&manager, [9; 32], MessageKind::Eager).await;
+
+        // Negative control: the former singular bootstrap wrapper collapses
+        // the four-peer preferred ceiling to two, then re-grafting the roster
+        // visibly churns the tree. The zero-delta assertions above would
+        // reject that order if restored to refresh or publish.
+        let connected = manager.transport.connected_peer_ids().await;
+        let before_old_order = manager.stage_stats().message_kinds;
+        manager
+            .plumtree
+            .set_topic_peers_with_preferred_eager(topic, connected, Some(PeerId::new([8; 32])))
+            .await;
+        let after_singular = manager.stage_stats().message_kinds;
+        assert!(after_singular.prune > before_old_order.prune);
+        manager
+            .plumtree
+            .set_topic_preferred_eager_set(
+                topic,
+                &[
+                    PeerId::new([8; 32]),
+                    PeerId::new([9; 32]),
+                    PeerId::new([10; 32]),
+                    PeerId::new([11; 32]),
+                ],
+            )
+            .await;
+        assert!(manager.stage_stats().message_kinds.graft > after_singular.graft);
+    }
+
+    #[tokio::test]
+    async fn group_topic_classification_clears_on_drop_unsubscribe_and_withdrawal() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let group_id = "ac".repeat(32);
+        let name = format!("x0x/group/{group_id}/kv/{}", "bd".repeat(32));
+        let topic = TopicId::from_entity(name.as_bytes());
+        manager
+            .replace_group_rosters(vec![(group_id.clone(), String::new(), Vec::new())])
+            .await;
+        let sub = manager.subscribe(name.clone()).await;
+        assert!(manager.group_topic_by_id.read().await.contains_key(&topic));
+        drop(sub);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.group_topic_by_id.read().await.contains_key(&topic) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last subscriber clears classification");
+
+        let old_sub = manager.subscribe(name.clone()).await;
+        assert!(manager.group_topic_by_id.read().await.contains_key(&topic));
+        manager.replace_group_rosters(Vec::new()).await;
+        assert!(
+            !manager.group_topic_by_id.read().await.contains_key(&topic),
+            "withdrawn group must lose its topic preference before subscription drops"
+        );
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), Vec::new())])
+            .await;
+        assert!(manager.group_topic_by_id.read().await.contains_key(&topic));
+        manager.unsubscribe(&name).await;
+        assert!(!manager.group_topic_by_id.read().await.contains_key(&topic));
+        let new_sub = manager.subscribe(name.clone()).await;
+        assert!(manager.group_topic_by_id.read().await.contains_key(&topic));
+        let completed_before = manager.drop_completed.load(Ordering::Relaxed);
+        drop(old_sub);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.drop_completed.load(Ordering::Relaxed) == completed_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old generation drop completed");
+        assert!(manager.group_topic_by_id.read().await.contains_key(&topic));
+        assert_eq!(manager.topic_ref_counts.read().await[&name].count, 1);
+        drop(new_sub);
+    }
+
+    #[tokio::test]
+    async fn group_subscribe_registration_is_serialized_with_unsubscribe() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let group_id = "ae".repeat(32);
+        let name = format!("x0x/group/{group_id}/kv/{}", "bf".repeat(32));
+        let topic = TopicId::from_entity(name.as_bytes());
+        manager
+            .replace_group_rosters(vec![(group_id, String::new(), Vec::new())])
+            .await;
+        let guard = manager
+            .group_preference_apply_locks
+            .name_shard(&name)
+            .lock()
+            .await;
+        let mut pending = Box::pin(manager.subscribe(name.clone()));
+        assert!(matches!(
+            futures::poll!(pending.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(!manager.topic_ref_counts.read().await.contains_key(&name));
+        drop(guard);
+        let sub = pending.await;
+        assert!(manager.group_topic_by_id.read().await.contains_key(&topic));
+        let completed_before = manager.drop_completed.load(Ordering::Relaxed);
+        drop(sub);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.drop_completed.load(Ordering::Relaxed) == completed_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first subscription drop completed");
+
+        let manager = Arc::new(manager);
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.subscribe_after_registration_pause.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
+        let subscribing = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move { manager.subscribe(name).await })
+        };
+        entered.wait().await;
+        manager.unsubscribe(&name).await;
+        release.wait().await;
+        let stale = subscribing.await.expect("subscribe task");
+        assert!(!manager.topic_ref_counts.read().await.contains_key(&name));
+        assert!(!manager.group_topic_by_id.read().await.contains_key(&topic));
+        assert!(!manager
+            .subscribed_topic_ids
+            .read()
+            .unwrap()
+            .contains(&topic));
+        let completed_before = manager.drop_completed.load(Ordering::Relaxed);
+        drop(stale);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.drop_completed.load(Ordering::Relaxed) == completed_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled generation drop completed");
+
+        // A pauses after registration; unsubscribe removes it, then B
+        // re-subscribes before A reaches SG subscribe_ready. A must return
+        // a closed handle and cannot consume B's later publication.
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.subscribe_after_registration_pause.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
+        let stale_task = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move { manager.subscribe(name).await })
+        };
+        entered.wait().await;
+        manager.unsubscribe(&name).await;
+        *manager.subscribe_after_registration_pause.lock().unwrap() = None;
+        let mut current = manager.subscribe(name.clone()).await;
+        release.wait().await;
+        let mut stale = stale_task.await.expect("stale subscribe task");
+        assert!(stale.recv().await.is_none(), "stale handle must be closed");
+        manager
+            .publish(name, Bytes::from_static(b"new-generation"))
+            .await
+            .expect("publish to current generation");
+        let delivered = tokio::time::timeout(Duration::from_secs(2), current.recv())
+            .await
+            .expect("current receiver timeout")
+            .expect("current receiver closed");
+        assert_eq!(delivered.payload, Bytes::from_static(b"new-generation"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_topics_do_not_wait_for_a_busy_preference_shard() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let busy = TopicId::new([1; 32]);
+        let other = TopicId::new([2; 32]);
+        assert!(!std::ptr::eq(
+            manager.group_preference_apply_locks.shard(busy),
+            manager.group_preference_apply_locks.shard(other)
+        ));
+        let busy_guard = manager
+            .group_preference_apply_locks
+            .shard(busy)
+            .lock()
+            .await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.apply_topic_membership(
+                other,
+                TopicMembership {
+                    full: Vec::new(),
+                    preferred: None,
+                },
             ),
-            vec![PeerId::new(a)]
+        )
+        .await
+        .expect("unrelated topic waited for busy shard");
+        let mut same_topic = Box::pin(manager.apply_topic_membership(
+            busy,
+            TopicMembership {
+                full: Vec::new(),
+                preferred: None,
+            },
+        ));
+        assert!(matches!(
+            futures::poll!(same_topic.as_mut()),
+            std::task::Poll::Pending
+        ));
+        drop(busy_guard);
+        same_topic.await;
+
+        let busy_name = "x0x/test/busy-name";
+        let other_name = (0..64)
+            .map(|n| format!("x0x/test/other-name-{n}"))
+            .find(|name| {
+                !std::ptr::eq(
+                    manager.group_preference_apply_locks.name_shard(busy_name),
+                    manager.group_preference_apply_locks.name_shard(name),
+                )
+            })
+            .expect("different name shard");
+        let busy_name_guard = manager
+            .group_preference_apply_locks
+            .name_shard(busy_name)
+            .lock()
+            .await;
+        let unrelated = tokio::time::timeout(Duration::from_secs(2), manager.subscribe(other_name))
+            .await
+            .expect("unrelated subscribe waited for busy name shard");
+        drop(busy_name_guard);
+        drop(unrelated);
+    }
+
+    #[tokio::test]
+    async fn metadata_topic_move_never_mix_old_classification_with_new_roster() {
+        let manager = Arc::new(
+            PubSubManager::new_with_participation(
+                test_node().await,
+                None,
+                None,
+                ParticipationMode::Full,
+                "metadata_move",
+            )
+            .expect("manager"),
         );
-        peers.retain(|peer| ![1, 7].contains(&peer.as_bytes()[0]));
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let name = "x0x/group/metadata-move".to_string();
+        let topic = TopicId::from_entity(name.as_bytes());
+        let identity = group_identity_for_test(&manager);
+        for n in 90..=92 {
+            authorize_group_peer_for_test(
+                &identity.bindings,
+                AgentId([n - 40; 32]),
+                MachineId([n; 32]),
+            )
+            .await;
+        }
+        set_plane(&manager, vec![[90; 32], [91; 32], [92; 32]]);
+        manager
+            .replace_group_rosters(vec![
+                ("A".into(), name.clone(), vec![AgentId([50; 32])]),
+                ("B".into(), "other".into(), vec![AgentId([52; 32])]),
+            ])
+            .await;
+        let _sub = manager.subscribe(name.clone()).await;
+        let connected = manager.transport.connected_peer_ids().await;
         assert_eq!(
-            ordered_leaf_peers(peers, &[[7; 32], [8; 32]], &[], &HashSet::new(), 2),
-            vec![PeerId::new([8; 32]), PeerId::new([2; 32])]
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new([90; 32])]
         );
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.roster_after_swap_pause.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let replacing = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move {
+                manager
+                    .replace_group_rosters(vec![
+                        ("A".into(), "other-new".into(), vec![AgentId([51; 32])]),
+                        ("B".into(), name, vec![AgentId([52; 32])]),
+                    ])
+                    .await;
+            })
+        };
+        entered.wait().await;
+        manager.refresh_topic_peers().await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new([90; 32])],
+            "old topic classification must retain its old roster until reconciliation"
+        );
+        release.wait().await;
+        replacing.await.expect("roster replacement");
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new([92; 32])],
+            "completed replacement must bind the metadata topic to group B"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_only_registration_cannot_escape_roster_reconciliation() {
+        let manager = Arc::new(PubSubManager::new(test_node().await, None).expect("manager"));
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let name = "x0x/group/publish-only-metadata".to_string();
+        let topic = TopicId::from_entity(name.as_bytes());
+        let identity = group_identity_for_test(&manager);
+        for (agent, machine) in [(50, 90), (52, 92)] {
+            authorize_group_peer_for_test(
+                &identity.bindings,
+                AgentId([agent; 32]),
+                MachineId([machine; 32]),
+            )
+            .await;
+        }
+        set_plane(&manager, vec![[90; 32], [92; 32]]);
+        manager
+            .replace_group_rosters(vec![
+                ("A".into(), name.clone(), vec![AgentId([50; 32])]),
+                ("B".into(), "other".into(), vec![AgentId([52; 32])]),
+            ])
+            .await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.register_after_roster_read_pause.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
+        let registering = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move { manager.register_group_topic(&name, topic).await })
+        };
+        entered.wait().await;
+        assert!(
+            manager.group_rosters.try_write().is_err(),
+            "registrar must retain its old roster read guard until binding publication"
+        );
+        let replacing = {
+            let manager = manager.clone();
+            let name = name.clone();
+            tokio::spawn(async move {
+                manager
+                    .replace_group_rosters(vec![
+                        ("A".into(), "other-new".into(), vec![AgentId([50; 32])]),
+                        ("B".into(), name, vec![AgentId([52; 32])]),
+                    ])
+                    .await;
+            })
+        };
+        *manager.register_after_roster_read_pause.lock().unwrap() = None;
+        release.wait().await;
+        registering.await.expect("registration");
+        replacing.await.expect("roster replacement");
+        let connected = manager.transport.connected_peer_ids().await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic, &connected).await,
+            vec![PeerId::new([92; 32])],
+            "writer must reclassify a publish-only binding inserted just before swap"
+        );
+    }
+
+    /// WHY (#774 + C5b): a preferred Full/bootstrap peer that connects AFTER
+    /// the topic exists must still be promoted eager by the C5b pass. The
+    /// eager slot it takes comes from demoting the lowest-scoring eager peer
+    /// — with equal scores that peer is arbitrary — so the invariant is:
+    /// preferred eager, exactly two eager, the displaced peer LAZY (a
+    /// member, never dropped).
+    #[tokio::test]
+    async fn late_connected_preferred_bootstrap_is_forced_eager_others_stay_lazy() {
+        let manager = membership_manager(
+            2,
+            Some([8; 32]),
+            vec![[1; 32], [2; 32]]
+                .into_iter()
+                .map(PeerId::new)
+                .collect(),
+        )
+        .await;
+        let name = "x0x/dm/v1/inbox/774-late-preferred";
+        let topic = TopicId::new([79; 32]);
+        let _sub = manager.subscribe_topic_id(name.into(), topic).await;
+
+        let initial = [[1; 32], [2; 32]];
+        let roles = plane_roles(&manager, topic, &initial);
+        assert!(
+            roles.iter().all(|(_, role)| role == "eager"),
+            "two connected peers at degree two are both eager: {roles:?}"
+        );
+
+        let grown = [[1; 32], [2; 32], [8; 32]];
+        set_plane(&manager, grown.into_iter().collect());
+        manager.prefer_one_full_bootstrap_eager(&[topic]).await;
+        let roles = plane_roles(&manager, topic, &grown);
+        assert_eq!(role_for(&manager, topic, [8; 32]), "eager");
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "eager").count(),
+            2,
+            "eager degree stays capped: {roles:?}"
+        );
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "lazy").count(),
+            1,
+            "the displaced eager peer must stay a lazy member, not be dropped: {roles:?}"
+        );
+    }
+
+    /// WHY (#774): end-to-end lazy repair. With degree 2 and three connected
+    /// peers, whichever peer ended beyond the eager ceiling must receive the
+    /// flusher's IHAVE for a local publish, answer with a real IWANT from a
+    /// second manager, and deliver the cached payload — the exact G5→D5
+    /// recovery arm that the pre-truncation made impossible. Uses only
+    /// inert recorder transports; fails on the old bytes at the IHAVE wait.
+    #[tokio::test]
+    async fn lazy_peer_beyond_degree_recovers_publish_via_real_ihave_iwant() {
+        let plane = [[1; 32], [2; 32], [3; 32]];
+        let sender =
+            membership_manager(2, None, plane.into_iter().map(PeerId::new).collect()).await;
+        let receiver = membership_manager(
+            2,
+            None,
+            vec![[9; 32]].into_iter().map(PeerId::new).collect(),
+        )
+        .await;
+        let name = "x0x/dm/v1/inbox/774-repair";
+        let topic = TopicId::new([80; 32]);
+        let _sender_sub = sender.subscribe_topic_id(name.into(), topic).await;
+        let mut receiver_sub = receiver.subscribe_topic_id(name.into(), topic).await;
+
+        let roles = plane_roles(&sender, topic, &plane);
+        let eager: HashSet<[u8; 32]> = roles
+            .iter()
+            .filter(|(_, role)| role == "eager")
+            .map(|(peer, _)| *peer)
+            .collect();
+        let lazy_peer = *roles
+            .iter()
+            .find(|(_, role)| role == "lazy")
+            .map(|(peer, _)| peer)
+            .unwrap();
+        assert_eq!(
+            eager.len(),
+            2,
+            "exactly the eager ceiling is eager: {roles:?}"
+        );
+
+        recorded_eager(&sender);
+        sender
+            .publish_topic_id(name.into(), topic, Bytes::from("lazy-repair"))
+            .await
+            .unwrap();
+        until_eager_targets(&sender, &eager).await;
+
+        // Lazy membership arm: the flusher announces to the beyond-degree
+        // peer. On the pre-fix bytes this times out — the peer was not a
+        // topic member, so no IHAVE target existed.
+        let ihave = await_frame_to(&sender, lazy_peer, MessageKind::IHave).await;
+
+        // The lazy peer (a real second manager) answers with a real IWANT.
+        receiver
+            .handle_incoming(PeerId::new([9; 32]), None, ihave)
+            .await;
+        let iwant = await_frame_to(&receiver, [9; 32], MessageKind::IWant).await;
+
+        // The publisher serves the cached payload to the lazy requester...
+        sender
+            .handle_incoming(PeerId::new(lazy_peer), None, iwant)
+            .await;
+        let reply = await_frame_to(&sender, lazy_peer, MessageKind::Eager).await;
+
+        // ...and the lazy peer delivers it to its subscriber.
+        receiver
+            .handle_incoming(PeerId::new([9; 32]), None, reply)
+            .await;
+        let recovered = tokio::time::timeout(Duration::from_secs(2), receiver_sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.payload, Bytes::from("lazy-repair"));
     }
 
     // -----------------------------------------------------------------------
@@ -5050,20 +7260,62 @@ mod tests {
         assert_eq!(snap.passthrough_refresh_runs, 1);
     }
 
+    #[tokio::test]
+    async fn refresh_order_snapshot_is_shared_within_pass_and_fresh_next_pass() {
+        // Pure peer ordering: no node, daemon, or socket is created.
+        // #774 removed the truncating Leaf ordering; any deterministic
+        // per-plane ranking exercises the per-pass snapshot.
+        fn sorted_plane(mut peers: Vec<PeerId>) -> Vec<PeerId> {
+            peers.sort_by_key(|peer| *peer.as_bytes());
+            peers
+        }
+        let calls = std::cell::Cell::new(0);
+        let first_plane = vec![PeerId::new([3; 32]), PeerId::new([1; 32])];
+        let mut snapshot = None;
+        for _topic in 0..3 {
+            let ordered = refresh_ordered_peers(&first_plane, &mut snapshot, |peers| {
+                calls.set(calls.get() + 1);
+                std::future::ready(sorted_plane(peers))
+            })
+            .await;
+            assert_eq!(ordered, vec![PeerId::new([1; 32]), PeerId::new([3; 32])]);
+        }
+        assert_eq!(calls.get(), 1, "all topics share one ordering pass");
+
+        let second_plane = vec![PeerId::new([4; 32]), PeerId::new([2; 32])];
+        let mut next_pass_snapshot = None;
+        let ordered = refresh_ordered_peers(&second_plane, &mut next_pass_snapshot, |peers| {
+            calls.set(calls.get() + 1);
+            std::future::ready(sorted_plane(peers))
+        })
+        .await;
+        assert_eq!(ordered, vec![PeerId::new([2; 32]), PeerId::new([4; 32])]);
+        assert_eq!(calls.get(), 2, "next refresh recomputes from its new plane");
+    }
+
     fn passthrough_frame(kind: MessageKind, topic: TopicId) -> Bytes {
+        // SG's structural `inspect_message_header` enforces exact ML-DSA
+        // signature (3309) and public key (1952) sizes before a frame is
+        // routable through x0x's topic gates, so the fixture signs with a
+        // real key instead of empty vectors.
+        let key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("gate fixture key");
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind,
+            hop: 0,
+            ttl: 10,
+            payload_hash: None,
+        };
+        let signature = key
+            .sign(&postcard::to_stdvec(&header).expect("header serializes"))
+            .expect("gate fixture signature");
         let msg = saorsa_gossip_pubsub::GossipMessage {
-            header: MessageHeader {
-                version: 1,
-                topic,
-                msg_id: [0u8; 32],
-                kind,
-                hop: 0,
-                ttl: 10,
-                payload_hash: None,
-            },
+            header,
             payload: None,
-            signature: Vec::new(),
-            public_key: Vec::new(),
+            signature,
+            public_key: key.public_key().to_vec(),
         };
         postcard::to_stdvec(&msg)
             .expect("passthrough frame serializes")
@@ -5091,7 +7343,7 @@ mod tests {
 
         for kind in [MessageKind::Eager, MessageKind::IHave, MessageKind::IWant] {
             manager
-                .handle_incoming(peer, passthrough_frame(kind, passthrough_id))
+                .handle_incoming(peer, None, passthrough_frame(kind, passthrough_id))
                 .await;
         }
 
@@ -5130,7 +7382,11 @@ mod tests {
         let subscribed_id = TopicId::from_entity(subscribed.as_bytes());
 
         manager
-            .handle_incoming(peer, passthrough_frame(MessageKind::Eager, subscribed_id))
+            .handle_incoming(
+                peer,
+                None,
+                passthrough_frame(MessageKind::Eager, subscribed_id),
+            )
             .await;
 
         let snap = manager.participation_snapshot();
@@ -5162,7 +7418,11 @@ mod tests {
         let passthrough_id = TopicId::from_entity(passthrough.as_bytes());
 
         manager
-            .handle_incoming(peer, passthrough_frame(MessageKind::Eager, passthrough_id))
+            .handle_incoming(
+                peer,
+                None,
+                passthrough_frame(MessageKind::Eager, passthrough_id),
+            )
             .await;
 
         let snap = manager.participation_snapshot();
@@ -5276,7 +7536,7 @@ mod tests {
             loop {
                 let sends = drain_sends(&publisher);
                 for (_peer, bytes) in sends {
-                    relay.handle_incoming(pub_peer, bytes).await;
+                    relay.handle_incoming(pub_peer, None, bytes).await;
                     ferried += 1;
                 }
                 if ferried > i {
@@ -5316,16 +7576,16 @@ mod tests {
 
         // --- The delivery guarantee: IHAVE → IWANT → serve → subscriber. ---
         for (_peer, bytes) in relay_frames {
-            subscriber.handle_incoming(relay_peer, bytes).await;
+            subscriber.handle_incoming(relay_peer, None, bytes).await;
         }
         let mut received: StdHashSet<String> = StdHashSet::new();
         let pull_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while received.len() < N as usize && tokio::time::Instant::now() < pull_deadline {
             for (_peer, bytes) in drain_sends(&subscriber) {
-                relay.handle_incoming(sub_peer, bytes).await;
+                relay.handle_incoming(sub_peer, None, bytes).await;
             }
             for (_peer, bytes) in drain_sends(&relay) {
-                subscriber.handle_incoming(relay_peer, bytes).await;
+                subscriber.handle_incoming(relay_peer, None, bytes).await;
             }
             while let Ok(Some(message)) =
                 tokio::time::timeout(Duration::from_millis(20), sub.recv()).await
@@ -5402,7 +7662,7 @@ mod tests {
             } else {
                 continue;
             }
-            a.handle_incoming(peer, Bytes::from(frame)).await;
+            a.handle_incoming(peer, None, Bytes::from(frame)).await;
         }
 
         let snapshot = serde_json::to_value(a.inbound_by_topic_snapshot()).unwrap();
@@ -5436,7 +7696,7 @@ mod tests {
         let peer = PeerId::new([1; 32]);
         // Should not panic on invalid data
         manager
-            .handle_incoming(peer, Bytes::from(&[0x12][..]))
+            .handle_incoming(peer, None, Bytes::from(&[0x12][..]))
             .await;
     }
 
@@ -5866,7 +8126,9 @@ mod tests {
         let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, false);
         assert_eq!(manager.outer_v1_receipts(), 0);
 
-        manager.handle_incoming(PeerId::new([9; 32]), frame).await;
+        manager
+            .handle_incoming(PeerId::new([9; 32]), None, frame)
+            .await;
 
         assert_eq!(
             manager.outer_v1_receipts(),
@@ -5894,7 +8156,9 @@ mod tests {
         let inner = encode_v1(topic, &Bytes::from("v2-payload")).expect("inner");
         let good = signed_outer_frame(&signing_key, topic_id, inner.clone(), true);
 
-        manager.handle_incoming(PeerId::new([3; 32]), good).await;
+        manager
+            .handle_incoming(PeerId::new([3; 32]), None, good)
+            .await;
 
         let delivered = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv())
             .await
@@ -5932,7 +8196,7 @@ mod tests {
             .expect("serialize tampered")
             .into();
         manager
-            .handle_incoming(PeerId::new([4; 32]), tampered_bytes)
+            .handle_incoming(PeerId::new([4; 32]), None, tampered_bytes)
             .await;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv())
@@ -5950,26 +8214,31 @@ mod tests {
         let kp = AgentKeypair::generate().expect("agent key");
         let ctx = Arc::new(SigningContext::from_keypair(&kp));
         let manager = PubSubManager::new(Arc::clone(&node), Some(ctx)).expect("manager");
+        // #774: every publish re-applies the connected plane as topic
+        // membership, so the eager peer must be on the (recorded) plane —
+        // a seeded but unconnected peer is correctly removed.
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![PeerId::new([42; 32])],
+            sends: Vec::new(),
+        });
         let topic = "adr014-publish-v2";
-        let topic_id = TopicId::from_entity(topic.as_bytes());
         let _sub = manager.subscribe(topic.to_string()).await;
-        manager
-            .set_topic_peers_for_test(topic_id, vec![PeerId::new([42; 32])])
-            .await;
-        let _ = node.take_pubsub_send_capture();
 
         manager
             .publish_with_fanout(topic.to_string(), Bytes::from("signed-modern"))
             .await
             .expect("publish");
 
-        let frames = node.take_pubsub_send_capture();
-        assert!(
-            !frames.is_empty(),
-            "publish must hand at least one PubSub frame to the recording transport"
-        );
-        let msg: saorsa_gossip_pubsub::GossipMessage =
-            postcard::from_bytes(&frames[0]).expect("decode outer GossipMessage");
+        let msg = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some((_, msg)) = recorded_eager(&manager).into_iter().next() {
+                    return msg;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("publish must hand at least one EAGER frame to the recording transport");
         assert_eq!(msg.header.version, 2, "modern publish must seal outer V2");
         let payload = msg.payload.as_ref().expect("eager payload");
         let expected = blake3::hash(payload.as_ref());
@@ -5994,7 +8263,9 @@ mod tests {
             let mut sub = manager.subscribe(topic.clone()).await;
             let inner = encode_v1(&topic, &Bytes::from("still-v1")).expect("inner");
             let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, false);
-            manager.handle_incoming(PeerId::new([5; 32]), frame).await;
+            manager
+                .handle_incoming(PeerId::new([5; 32]), None, frame)
+                .await;
             assert_eq!(manager.outer_v1_receipts(), 1);
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv())
@@ -6168,5 +8439,202 @@ mod closed_input_tests {
         assert_eq!(recv_from_either(&mut first, &mut second).await, Some(31));
         second_tx.try_send(47).expect("second still live");
         assert_eq!(recv_from_either(&mut first, &mut second).await, Some(47));
+    }
+}
+
+/// SG76: marker-aware inbound routing gates, proven without sockets.
+///
+/// x0x's pre-dispatch gates (inbound-by-topic counters, Leaf unsubscribed
+/// refusal, relay fan-out registration) consume SG's public
+/// `inspect_message_header`, which recognizes both legacy postcard frames
+/// and key-cache v3 frames. These tests prove legacy and v3 forms of the
+/// same logical message route identically, and that the reserved SG
+/// hop-local control topic is excluded from x0x's gates.
+///
+/// SG publishes no v3 frame encoder, so the fixtures mirror SG's private
+/// v3 wire shape (`marker || postcard { header, payload, signature, key }`)
+/// with serde-derived stand-in types. If SG changes that private format,
+/// `inspect_message_header` returns `None` here and these tests fail
+/// loudly — the intended drift signal. Production code never sees the
+/// marker bytes.
+#[cfg(test)]
+mod sg76_marker_gate_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::leaf_refuses_unsubscribed_passthrough;
+    use super::ParticipationMode;
+    use bytes::Bytes;
+    use saorsa_gossip_types::{MessageHeader, MessageKind, PeerId, TopicId};
+    use serde::Serialize;
+
+    /// SG key-cache v3 wire marker (private in SG; test fixture only).
+    const V3_MARKER: &[u8; 6] = b"\xffSGKC\x03";
+    /// SG key-cache reserved hop-local control topic domain (private in
+    /// SG; test fixture only).
+    const CONTROL_DOMAIN: &str = "saorsa-gossip/key-cache-control/v1";
+
+    /// Mirror of SG's private `key_cache::WireMessage` wire shape.
+    #[derive(Serialize)]
+    struct MirrorWireMessage {
+        header: MessageHeader,
+        payload: Option<Bytes>,
+        signature: Vec<u8>,
+        key: MirrorKeyMaterial,
+    }
+
+    /// Mirror of SG's private `key_cache::KeyMaterial` (variant order is
+    /// wire-significant: `Full` is variant 0).
+    #[derive(Serialize)]
+    enum MirrorKeyMaterial {
+        Full {
+            key_id: PeerId,
+            public_key: Vec<u8>,
+        },
+        #[allow(dead_code)]
+        Ref {
+            key_id: PeerId,
+        },
+    }
+
+    fn signed_header_parts(kind: MessageKind, topic: TopicId) -> (MessageHeader, Vec<u8>, Vec<u8>) {
+        let key = saorsa_gossip_identity::MlDsaKeyPair::generate().unwrap();
+        let header = MessageHeader {
+            version: 1,
+            topic,
+            msg_id: [0u8; 32],
+            kind,
+            hop: 0,
+            ttl: 10,
+            payload_hash: None,
+        };
+        let signature = key.sign(&postcard::to_stdvec(&header).unwrap()).unwrap();
+        (header, signature, key.public_key().to_vec())
+    }
+
+    fn legacy_frame(kind: MessageKind, topic: TopicId) -> Bytes {
+        let (header, signature, public_key) = signed_header_parts(kind, topic);
+        let msg = saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: None,
+            signature,
+            public_key,
+        };
+        postcard::to_stdvec(&msg).unwrap().into()
+    }
+
+    fn v3_frame(kind: MessageKind, topic: TopicId) -> Bytes {
+        let (header, signature, public_key) = signed_header_parts(kind, topic);
+        let key_id = PeerId::from_pubkey(&public_key);
+        let wire = MirrorWireMessage {
+            header,
+            payload: Some(Bytes::from_static(b"p")),
+            signature,
+            key: MirrorKeyMaterial::Full { key_id, public_key },
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(V3_MARKER);
+        bytes.extend_from_slice(&postcard::to_stdvec(&wire).unwrap());
+        bytes.into()
+    }
+
+    #[test]
+    fn legacy_and_v3_reach_the_same_topic_gates() {
+        let topic = TopicId::from_entity(b"sg76.gate-equivalence");
+        for kind in [
+            MessageKind::Eager,
+            MessageKind::IHave,
+            MessageKind::IWant,
+            MessageKind::AntiEntropy,
+        ] {
+            let legacy = saorsa_gossip_pubsub::inspect_message_header(&legacy_frame(kind, topic))
+                .unwrap_or_else(|| panic!("legacy {kind:?} must be inspectable"));
+            let v3 = saorsa_gossip_pubsub::inspect_message_header(&v3_frame(kind, topic))
+                .unwrap_or_else(|| panic!("v3 {kind:?} must be inspectable"));
+            assert_eq!(legacy.topic, v3.topic);
+            assert_eq!(legacy.topic, topic);
+            assert_eq!(legacy.kind, v3.kind);
+            assert_eq!(legacy.kind, kind);
+            assert!(!legacy.hop_local_control);
+            assert!(!v3.hop_local_control);
+
+            // The Leaf refuse gate (#380 C0) keys off (subscribed, kind)
+            // only, so both wire forms must share its verdict: refused
+            // when unsubscribed, admitted when subscribed.
+            assert_eq!(
+                leaf_refuses_unsubscribed_passthrough(ParticipationMode::Leaf, false, legacy.kind),
+                leaf_refuses_unsubscribed_passthrough(ParticipationMode::Leaf, false, v3.kind),
+            );
+            assert!(leaf_refuses_unsubscribed_passthrough(
+                ParticipationMode::Leaf,
+                false,
+                v3.kind
+            ));
+            assert!(!leaf_refuses_unsubscribed_passthrough(
+                ParticipationMode::Leaf,
+                true,
+                v3.kind
+            ));
+        }
+    }
+
+    #[test]
+    fn hop_local_control_topic_is_flagged_and_excluded_from_gates() {
+        let control = TopicId::from_entity(CONTROL_DOMAIN.as_bytes());
+        // v3 control frame on the reserved topic.
+        let v3 =
+            saorsa_gossip_pubsub::inspect_message_header(&v3_frame(MessageKind::Ping, control))
+                .expect("v3 control frame must be inspectable");
+        assert!(v3.hop_local_control);
+        assert_eq!(v3.topic, control);
+
+        // Legacy control shape (Ping on the reserved topic) is equally
+        // flagged — a legacy sender cannot smuggle the control topic past
+        // the exclusion by dropping the marker.
+        let legacy =
+            saorsa_gossip_pubsub::inspect_message_header(&legacy_frame(MessageKind::Ping, control))
+                .expect("legacy control frame must be inspectable");
+        assert!(legacy.hop_local_control);
+
+        // Non-control topics on both wire forms never set the flag.
+        let ordinary = TopicId::from_entity(b"sg76.ordinary");
+        for frame in [
+            legacy_frame(MessageKind::Eager, ordinary),
+            v3_frame(MessageKind::Eager, ordinary),
+        ] {
+            let inspected =
+                saorsa_gossip_pubsub::inspect_message_header(&frame).expect("inspectable");
+            assert!(!inspected.hop_local_control);
+        }
+    }
+
+    #[test]
+    fn structurally_invalid_frames_are_not_gate_routable() {
+        // SG's inspect enforces exact ML-DSA signature/key sizes and exact
+        // v3 framing; malformed or truncated frames yield `None` and x0x's
+        // topic gates skip them (SG's verified dispatcher still rejects
+        // the bytes). This is the tightened contract versus the old
+        // bare-postcard header peek.
+        let topic = TopicId::from_entity(b"sg76.malformed");
+        let unsigned = saorsa_gossip_pubsub::GossipMessage {
+            header: MessageHeader {
+                version: 1,
+                topic,
+                msg_id: [0u8; 32],
+                kind: MessageKind::Eager,
+                hop: 0,
+                ttl: 10,
+                payload_hash: None,
+            },
+            payload: None,
+            signature: Vec::new(),
+            public_key: Vec::new(),
+        };
+        let bytes = postcard::to_stdvec(&unsigned).unwrap();
+        assert_eq!(saorsa_gossip_pubsub::inspect_message_header(&bytes), None);
+
+        // Truncated v3 marker alone is also not routable.
+        assert_eq!(
+            saorsa_gossip_pubsub::inspect_message_header(V3_MARKER),
+            None
+        );
     }
 }

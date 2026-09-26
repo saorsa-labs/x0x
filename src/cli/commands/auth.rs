@@ -14,3 +14,14 @@ pub async fn session(client: &DaemonClient) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
 }
+
+/// `x0x auth refresh` — POST /auth/session/refresh (#893).
+///
+/// Only a live SESSION token is accepted, so run it as
+/// `X0X_API_TOKEN=<session token> x0x auth refresh`; the durable token is
+/// refused. Refresh stops working 12 h after the original session mint.
+pub async fn refresh(client: &DaemonClient) -> Result<()> {
+    let r = client.post_empty("/auth/session/refresh").await?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}

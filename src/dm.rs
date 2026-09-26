@@ -948,6 +948,36 @@ pub fn dm_attempt_timeout(peer_rtt_ms: Option<u32>) -> Duration {
     Duration::from_millis(timeout_ms)
 }
 
+/// Producer-supplied local label for legacy DM-bus origin diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyBusMessageKind {
+    /// A control-blob reference, known at its producer before encryption.
+    ControlBlobReference,
+    /// A control-blob fetch request.
+    ControlBlobFetch,
+    /// A control-blob data chunk.
+    ControlBlobChunk,
+    /// A control-blob release notice.
+    ControlBlobRelease,
+    /// Any payload without a producer-specific label.
+    OtherPayload,
+    /// A protocol acknowledgement.
+    Ack,
+}
+
+impl LegacyBusMessageKind {
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::ControlBlobReference => 0,
+            Self::ControlBlobFetch => 1,
+            Self::ControlBlobChunk => 2,
+            Self::ControlBlobRelease => 3,
+            Self::OtherPayload => 4,
+            Self::Ack => 5,
+        }
+    }
+}
+
 /// Per-call configuration for `send_direct_with_config`.
 #[derive(Debug, Clone)]
 pub struct DmSendConfig {
