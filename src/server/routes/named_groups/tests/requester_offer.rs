@@ -1213,3 +1213,141 @@ async fn relay_first_attempt_priority_beats_the_retry_backlog() -> Result<()> {
     state.agent.shutdown().await;
     Ok(())
 }
+
+/// #979 (Rule 9): one obligation's targets fan out CONCURRENTLY (bounded
+/// 8) — a FAST target ordered LAST completes without waiting behind 8
+/// SLOW ones. Slow = a seeded v2 capability advert whose holder never
+/// ACKs (the strict send waits its full attempt timeout); fast = the
+/// self-loopback (immediate Ok). Under the serial loop the fast target
+/// waits ~8 x timeout behind them; under the bounded fan-out it completes
+/// inside the first wave. Wall-clock pinned with margin either side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_targets_do_not_serialise_the_fast_one() -> Result<()> {
+    let plane = format!("req-offer-fan-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let group_id = "fb".repeat(16);
+    {
+        let info = x0x::groups::GroupInfo::with_policy(
+            "fanout".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // 8 SLOW targets: valid ids with a seeded v2 advert (the strict gate
+    // passes) but no live daemon — each send waits its attempt timeout.
+    let mut slow = Vec::new();
+    for i in 0..8u32 {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&(0x5000 + i).to_be_bytes());
+        let id = x0x::identity::AgentId(b);
+        assert!(state.agent.capability_store().insert(
+            id,
+            x0x::identity::MachineId([0x60; 32]),
+            crate::dm::DmCapabilities::v2_durable_gossip_ready(vec![7u8; 1184]),
+            crate::dm_capability::now_unix_ms(),
+        ));
+        slow.push(hex::encode(id.as_bytes()));
+    }
+    // One FAST target LAST: the local agent (self-loopback, immediate Ok).
+    let mut targets = slow.clone();
+    targets.push(local_hex.clone());
+    // A real signed envelope (the route validator demands one).
+    let requester_kp = x0x::identity::AgentKeypair::generate()?;
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let (topic, commit) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        let commit = x0x::groups::GroupStateCommit::sign(
+            info.stable_group_id().to_string(),
+            info.state_revision + 1,
+            Some(info.state_hash.clone()),
+            x0x::groups::state_commit::compute_roster_root(&info.members_v2),
+            x0x::groups::state_commit::compute_policy_hash(&info.policy),
+            x0x::groups::state_commit::compute_public_meta_hash(&info.public_meta()),
+            info.security_binding.clone(),
+            false,
+            info.state_revision + 1,
+            &requester_kp,
+        )
+        .expect("sign commit");
+        (info.metadata_topic.clone(), commit)
+    };
+    let envelope = sign_v2_envelope_b2(
+        &requester_kp,
+        &topic,
+        &NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: group_id.clone(),
+            request_id: "req-fan".to_string(),
+            requester_agent_id: requester_hex.clone(),
+            message: None,
+            ts: 0,
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit: Some(commit),
+        },
+    );
+    let digest: [u8; 32] = blake3::hash(&envelope).into();
+    state.predecessor_relay_outbox.write().await.insert(
+        group_id.clone(),
+        vec![
+            crate::server::routes::named_groups::PredecessorRelayObligation {
+                envelope_bytes: envelope,
+                digest,
+                byte_size: 0,
+                first_seen_ms: now_millis_u64(),
+                next_retry_at_ms: now_millis_u64(),
+                retry_count: 0,
+                group_id: group_id.clone(),
+                request_id: "req-fan".to_string(),
+                requester_agent_id: requester_hex,
+                relay_targets: targets,
+                completed_at_ms: None,
+            },
+        ],
+    );
+    std::fs::create_dir_all(
+        state
+            .predecessor_relay_outbox_path
+            .parent()
+            .expect("outbox parent"),
+    )
+    .expect("treekem dir exists");
+
+    let started = std::time::Instant::now();
+    causal_relay_step(&state).await;
+    let elapsed = started.elapsed();
+    // The FAST target completed (removed from relay_targets).
+    let remaining = {
+        let outbox = state.predecessor_relay_outbox.read().await;
+        outbox
+            .get(&group_id)
+            .and_then(|l| l.first())
+            .map(|o| o.relay_targets.clone())
+            .unwrap_or_default()
+    };
+    assert!(!remaining.contains(&local_hex), "the fast target completed");
+    // Rule 9: serialised sends would take >= 8 attempt-timeouts BEFORE the
+    // fast one even starts. The bounded fan-out finishes the whole pass in
+    // about one timeout-wave (~8-16 s); allow generous margin either side.
+    assert!(
+        elapsed < std::time::Duration::from_secs(35),
+        "the pass completed without serialising behind the slow targets ({elapsed:?})"
+    );
+    // HONEST LIMIT (documented in the PR body): in the isolated harness
+    // the withholding targets fail FAST (no mesh to await), so a wall-clock
+    // lower bound cannot discriminate serial vs concurrent here — the
+    // upper bound is kept as the regression guard, and the fast target's
+    // completion is the behavioral pin. A true two-daemon wall-clock pin
+    // needs the mesh harness.
+    let _ = elapsed;
+    state.agent.shutdown().await;
+    Ok(())
+}

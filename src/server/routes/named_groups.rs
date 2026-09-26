@@ -14982,6 +14982,10 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
     // oldest-due within each class.
     due_sorted.sort_by_key(|o| (o.is_retry, o.next_retry_at_ms));
     const CAUSAL_RELAY_PASS_BUDGET: usize = 16;
+    /// #979: per-obligation concurrent fan-out width. One obligation's
+    /// targets send in parallel (bounded), so a slow witness never
+    /// serialises the pass; the per-OBLIGATION pass budget is unchanged.
+    const RELAY_TARGET_FANOUT: usize = 8;
     let mut pass_budget: usize = CAUSAL_RELAY_PASS_BUDGET;
 
     // Relay to each target and observe results per obligation (audit 6).
@@ -15005,45 +15009,60 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         // fans out fully, so witnesses past the budget cannot be starved
         // by earlier failing targets and the obligation is never pruned
         // unattempted. The fan-out itself is bounded by the group size.
-        for target_hex in targets {
-            let Ok(target_id) = parse_agent_id_hex(target_hex) else {
-                // Unparseable target — skip (not added to success set).
-                continue;
-            };
-            let mut dm_payload =
-                Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope_bytes.len());
-            dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
-            dm_payload.extend_from_slice(envelope_bytes);
-            // B6: await the send result. Do NOT count record_causal_relayed
-            // yet — count only after durable persistence (persist-before-count).
-            // #942 r4 (B6): dual-wire, the #903/bootstrap pattern — a
-            // witness with a current v2 durable advert gets the strict
-            // config; one without (pre-ADR-0030 build, history disabled)
-            // gets the LEGACY v1 gossip config so it still receives the
-            // relay (the receipt is transport-level; the payload is
-            // unchanged and the witness re-verifies the envelope).
-            let send_result = if predecessor_relay_wire_version(state, &target_id).await {
-                state
-                    .agent
-                    .send_direct_with_config(
-                        &target_id,
-                        dm_payload,
-                        predecessor_relay_delivery_config(&obligation_digest),
-                    )
-                    .await
-            } else {
-                state
-                    .agent
-                    .send_direct_with_config(
-                        &target_id,
-                        dm_payload,
-                        predecessor_relay_legacy_delivery_config(),
-                    )
-                    .await
-            };
-            if send_result.is_ok() {
+        use futures::StreamExt;
+        // #979: fan ONE obligation's targets out CONCURRENTLY with bounded
+        // concurrency — one slow (ACK-withholding) witness no longer
+        // serialises the whole pass behind its 8 s timeout. Budget
+        // semantics unchanged: the pass still charges per OBLIGATION (a
+        // started obligation always fans out fully).
+        let outcomes: Vec<(String, bool)> = futures::stream::iter(targets.iter().cloned())
+            .map(|target_hex: String| {
+                let state = &state;
+                let envelope_bytes = &envelope_bytes;
+                async move {
+                    let Ok(target_id) = parse_agent_id_hex(&target_hex) else {
+                        // Unparseable target — skip (not added to the
+                        // success set).
+                        return (target_hex, false);
+                    };
+                    let mut dm_payload = Vec::with_capacity(
+                        GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope_bytes.len(),
+                    );
+                    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+                    dm_payload.extend_from_slice(envelope_bytes);
+                    // #942 r4 (B6): dual-wire, the #903/bootstrap pattern
+                    // — a witness with a current v2 durable advert gets
+                    // the strict config; one without gets the LEGACY v1
+                    // gossip config so it still receives the relay.
+                    let send_result = if predecessor_relay_wire_version(state, &target_id).await {
+                        state
+                            .agent
+                            .send_direct_with_config(
+                                &target_id,
+                                dm_payload,
+                                predecessor_relay_delivery_config(&obligation_digest),
+                            )
+                            .await
+                    } else {
+                        state
+                            .agent
+                            .send_direct_with_config(
+                                &target_id,
+                                dm_payload,
+                                predecessor_relay_legacy_delivery_config(),
+                            )
+                            .await
+                    };
+                    (target_hex, send_result.is_ok())
+                }
+            })
+            .buffer_unordered(RELAY_TARGET_FANOUT)
+            .collect()
+            .await;
+        for (target_hex, ok) in outcomes {
+            if ok {
                 success_count += 1;
-                successful_targets.push(target_hex.clone());
+                successful_targets.push(target_hex);
             }
             // Failed targets are simply not added to the success set —
             // they remain in the obligation's relay_targets after
