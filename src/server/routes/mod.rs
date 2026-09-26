@@ -5,6 +5,7 @@
 //! holds the verbatim handler bodies and request/response DTOs for one
 //! registry category; the router wiring stays in the parent module.
 
+mod acl;
 pub(super) mod calls;
 mod connect;
 mod contacts;
@@ -32,6 +33,10 @@ pub(in crate::server) mod tasks;
 mod trust;
 mod upgrade;
 
+pub(super) use acl::{
+    acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add, acl_exec_list,
+    acl_exec_remove, acl_reload,
+};
 pub(super) use connect::{
     connect_diagnostics_handler, forward_add, forward_list, forward_remove, streams_diagnostics,
 };

@@ -1,5 +1,6 @@
 //! Command implementations for the `x0x` CLI.
 
+pub mod acl;
 pub mod auth;
 pub mod call;
 pub mod connect;

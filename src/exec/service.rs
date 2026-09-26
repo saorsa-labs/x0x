@@ -46,7 +46,10 @@ pub struct ExecRunOptions {
 /// Tier-1 exec service.
 pub struct ExecService {
     agent: Arc<Agent>,
-    policy: Arc<ExecPolicy>,
+    /// Effective exec ACL. Swapped atomically by ADR-0070 §3 hot reload;
+    /// each request clones the `Arc` once, so an in-flight request keeps
+    /// the policy it was admitted under.
+    policy: std::sync::RwLock<Arc<ExecPolicy>>,
     diagnostics: Arc<ExecDiagnostics>,
     audit: ExecAudit,
     pending_clients: Mutex<HashMap<ExecRequestId, PendingClient>>,
@@ -139,7 +142,7 @@ impl ExecService {
         let audit = ExecAudit::new(&policy, Arc::clone(&diagnostics));
         let service = Arc::new(Self {
             agent,
-            policy,
+            policy: std::sync::RwLock::new(policy),
             diagnostics,
             audit,
             pending_clients: Mutex::new(HashMap::new()),
@@ -297,7 +300,42 @@ impl ExecService {
     /// Whether exec is enabled on this daemon.
     #[must_use]
     pub fn enabled(&self) -> bool {
-        self.policy.enabled()
+        self.current_policy().enabled()
+    }
+
+    /// The effective exec policy right now (a cheap `Arc` clone).
+    #[must_use]
+    pub fn current_policy(&self) -> Arc<ExecPolicy> {
+        Arc::clone(
+            &self
+                .policy
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Atomically replace the effective exec policy (ADR-0070 §3 hot
+    /// reload / API edit). Requests already admitted keep the policy they
+    /// were checked against; the next request sees `next`.
+    ///
+    /// # Errors
+    /// Refused — leaving the current policy active — when `next` would flip
+    /// exec on/off or move the audit sink (see
+    /// [`crate::exec::acl::exec_reload_compatible`]).
+    pub fn replace_policy(&self, next: Arc<ExecPolicy>) -> Result<(), String> {
+        let mut guard = self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::exec::acl::exec_reload_compatible(&guard, &next)?;
+        self.diagnostics.set_acl_summary(next.summary());
+        *guard = next;
+        Ok(())
+    }
+
+    /// Publish ADR-0070 reload bookkeeping to `/diagnostics/exec`.
+    pub fn set_acl_reload_status(&self, status: crate::exec::acl::AclReloadStatus) {
+        self.diagnostics.set_acl_reload_status(status);
     }
 
     /// Diagnostics snapshot for `/diagnostics/exec`.
@@ -829,7 +867,8 @@ impl ExecService {
             return;
         }
 
-        let acl = match self.policy.as_ref() {
+        let policy = self.current_policy();
+        let acl = match policy.as_ref() {
             ExecPolicy::Enabled(acl) => acl,
             ExecPolicy::Disabled { .. } => {
                 self.deny(
@@ -1729,7 +1768,7 @@ mod tests {
         let diagnostics = Arc::new(ExecDiagnostics::new(policy.summary()));
         Arc::new(ExecService {
             agent: Arc::new(agent),
-            policy: Arc::new(policy.clone()),
+            policy: std::sync::RwLock::new(Arc::new(policy.clone())),
             audit: ExecAudit::new(&policy, Arc::clone(&diagnostics)),
             diagnostics,
             pending_clients: Mutex::new(HashMap::new()),
