@@ -22,8 +22,55 @@ use crate::kv::{KvError, KvStore, KvStoreDelta, KvStoreId, Result};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Local, process-lifetime counters for one open store. Snapshots are not
+/// atomic across fields and do not establish a causal per-request receipt.
+#[derive(Default)]
+struct StateSyncCounters {
+    requests_sent: AtomicU64,
+    requests_received: AtomicU64,
+    requests_answered: AtomicU64,
+    retained_pages_served: AtomicU64,
+    rejected_verify: AtomicU64,
+    rejected_cooldown: AtomicU64,
+    rejected_no_retained: AtomicU64,
+    rejected_other: AtomicU64,
+    observer_merges: AtomicU64,
+}
+
+/// Cumulative state-sync activity for one currently open local store.
+#[derive(Debug, Clone, Serialize)]
+pub struct StateSyncSnapshot {
+    pub requests_sent: u64,
+    pub requests_received: u64,
+    pub requests_answered: u64,
+    pub retained_pages_served: u64,
+    pub rejected_verify: u64,
+    pub rejected_cooldown: u64,
+    pub rejected_no_retained: u64,
+    pub rejected_other: u64,
+    pub observer_merges: u64,
+}
+
+impl StateSyncCounters {
+    fn snapshot(&self) -> StateSyncSnapshot {
+        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        StateSyncSnapshot {
+            requests_sent: get(&self.requests_sent),
+            requests_received: get(&self.requests_received),
+            requests_answered: get(&self.requests_answered),
+            retained_pages_served: get(&self.retained_pages_served),
+            rejected_verify: get(&self.rejected_verify),
+            rejected_cooldown: get(&self.rejected_cooldown),
+            rejected_no_retained: get(&self.rejected_no_retained),
+            rejected_other: get(&self.rejected_other),
+            observer_merges: get(&self.observer_merges),
+        }
+    }
+}
 
 /// Suffix appended to a store topic to form its state-sync side channel.
 ///
@@ -84,6 +131,7 @@ struct RetainedHistoryPublish<'a> {
     seal: GroupHistorySeal<'a>,
     pubsub: &'a PubSubManager,
     topic: &'a str,
+    counters: Option<&'a StateSyncCounters>,
     #[cfg(test)]
     test_state: Option<&'a std::sync::Mutex<RetainedPublishTestState>>,
 }
@@ -652,6 +700,7 @@ fn bootstrap_converged(
 /// Manages automatic background synchronization using anti-entropy gossip.
 /// Changes are propagated via deltas published to a gossip topic.
 pub struct KvStoreSync {
+    state_sync_counters: Arc<StateSyncCounters>,
     /// The store being synchronized.
     store: Arc<RwLock<KvStore>>,
 
@@ -933,6 +982,7 @@ impl KvStoreSync {
         let store = Arc::new(RwLock::new(store));
 
         Ok(Self {
+            state_sync_counters: Arc::new(StateSyncCounters::default()),
             store,
             pubsub,
             topic,
@@ -958,6 +1008,11 @@ impl KvStoreSync {
             #[cfg(test)]
             loop_exits: Arc::new(LoopExitTracker::default()),
         })
+    }
+
+    /// Local counters reset when this open store is released or the process restarts.
+    pub fn state_sync_snapshot(&self) -> StateSyncSnapshot {
+        self.state_sync_counters.snapshot()
     }
 
     /// Attach the group security/authorization context and refresh hook.
@@ -1071,6 +1126,7 @@ impl KvStoreSync {
             .map_err(|e| KvError::Gossip(format!("TreeKEM record encode failed: {e}")))
     }
 
+    #[cfg(test)]
     async fn merge_treekem_record(
         protector: &SharedTreeKemKvProtector,
         store: &Arc<RwLock<KvStore>>,
@@ -1078,6 +1134,21 @@ impl KvStoreSync {
         local_peer: PeerId,
         payload: &[u8],
         pages: &Arc<std::sync::Mutex<RetainedPagePool>>,
+    ) -> bool {
+        Self::merge_treekem_record_counted(
+            protector, store, store_id, local_peer, payload, pages, None,
+        )
+        .await
+    }
+
+    async fn merge_treekem_record_counted(
+        protector: &SharedTreeKemKvProtector,
+        store: &Arc<RwLock<KvStore>>,
+        store_id: &KvStoreId,
+        local_peer: PeerId,
+        payload: &[u8],
+        pages: &Arc<std::sync::Mutex<RetainedPagePool>>,
+        counters: Option<&StateSyncCounters>,
     ) -> bool {
         let (sender_peer, record) = match decode_delta::<TreeKemKvStoreRecordV1>(payload) {
             Ok(decoded) => decoded,
@@ -1115,10 +1186,15 @@ impl KvStoreSync {
         } else {
             None
         };
-        protector
-            .merge_main_record(opened, sender_peer, local_peer, store, retained_image)
-            .await
-            .is_ok()
+        let merged = protector
+            .merge_main_record_with_outcome(opened, sender_peer, local_peer, store, retained_image)
+            .await;
+        if matches!(merged, Ok(Some(true))) {
+            if let Some(counters) = counters {
+                counters.observer_merges.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        merged.is_ok()
     }
 
     async fn seal_treekem_control(
@@ -1262,7 +1338,7 @@ impl KvStoreSync {
         } else {
             None
         };
-        for frame in frames {
+        for (frame_index, frame) in frames.into_iter().enumerate() {
             #[cfg(test)]
             if let Some(state) = publish.test_state {
                 let state = state
@@ -1320,6 +1396,13 @@ impl KvStoreSync {
             result.map_err(|error| {
                 KvError::Gossip(format!("retained image publish failed: {error}"))
             })?;
+            if frame_index > 0 {
+                if let Some(counters) = publish.counters {
+                    counters
+                        .retained_pages_served
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
             #[cfg(test)]
             if let Some(state) = publish.test_state {
                 state
@@ -2168,6 +2251,7 @@ impl KvStoreSync {
         // it legitimately holds.
         let bootstrap_active = Arc::new(std::sync::atomic::AtomicBool::new(bootstrap_needed));
         let listener_served = Arc::clone(&served_evidence);
+        let listener_counters = Arc::clone(&self.state_sync_counters);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
         // #765 r4: the loop-exit tracker wraps the WHOLE loop future, so
         // termination is recorded only after this future — and every
@@ -2215,13 +2299,14 @@ impl KvStoreSync {
                 // the payload is an EncryptedKvStoreRecordV1, and a plaintext
                 // delta can never decode, verify, or merge here.
                 if let Some(protector) = listener_treekem.as_ref() {
-                    if Self::merge_treekem_record(
+                    if Self::merge_treekem_record_counted(
                         protector,
                         &store,
                         &listener_store_id,
                         listener_local_peer_id,
                         &msg.payload,
                         &listener_pages,
+                        Some(&listener_counters),
                     )
                     .await
                     {
@@ -2260,6 +2345,9 @@ impl KvStoreSync {
                         .await
                     };
                     if merged {
+                        listener_counters
+                            .observer_merges
+                            .fetch_add(1, Ordering::Relaxed);
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
                             let _ = persist_snapshot(&store, ctx).await;
                         }
@@ -2383,6 +2471,9 @@ impl KvStoreSync {
                         // remote merges continue — replication must not
                         // wedge on this node's disk.
                         if merged {
+                            listener_counters
+                                .observer_merges
+                                .fetch_add(1, Ordering::Relaxed);
                             #[cfg(test)]
                             listener_receive_merged_test.notify_one();
                             if let Some(ctx) = loop_persist_ctx.as_ref() {
@@ -2415,6 +2506,7 @@ impl KvStoreSync {
         // sender is the claimed owner itself (see KvSyncMessage docs).
         let mut sync_sub = self.pubsub.subscribe(self.state_sync_topic()).await;
         let responder_store = Arc::clone(&self.store);
+        let responder_counters = Arc::clone(&self.state_sync_counters);
         let responder_persist_ctx = persist_ctx.clone();
         let responder_pubsub = Arc::clone(&self.pubsub);
         let responder_topic = self.topic.clone();
@@ -2478,7 +2570,12 @@ impl KvStoreSync {
                         .await
                     {
                         Some((author, message)) => (message, Some(author), None),
-                        None => continue,
+                        None => {
+                            responder_counters
+                                .rejected_verify
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     }
                 } else if let Some(ctx) = responder_secure.as_ref() {
                     if responder_is_encrypted {
@@ -2491,7 +2588,12 @@ impl KvStoreSync {
                         .await
                         {
                             Some((author, message)) => (message, Some(author), None),
-                            None => continue,
+                            None => {
+                                responder_counters
+                                    .rejected_verify
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                         }
                     } else {
                         match Self::open_public_control_message(
@@ -2503,13 +2605,23 @@ impl KvStoreSync {
                         .await
                         {
                             Some((author, message, version)) => (message, Some(author), version),
-                            None => continue,
+                            None => {
+                                responder_counters
+                                    .rejected_verify
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                         }
                     }
                 } else {
                     match bincode::deserialize::<KvSyncMessage>(&msg.payload) {
                         Ok(m) => (m, msg.sender, None),
-                        Err(_) => continue,
+                        Err(_) => {
+                            responder_counters
+                                .rejected_verify
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     }
                 };
                 match sync_msg {
@@ -2517,6 +2629,9 @@ impl KvStoreSync {
                         if requester == local_peer_id {
                             continue;
                         }
+                        responder_counters
+                            .requests_received
+                            .fetch_add(1, Ordering::Relaxed);
                         if responder_is_group_signed {
                             trace_group_signed_record(
                                 "state_request_received",
@@ -2625,6 +2740,7 @@ impl KvStoreSync {
                             is_owner,
                             checkpoint_seq,
                             has_payload,
+                            no_retained,
                             served,
                         ) = {
                             let s = responder_store.read().await;
@@ -2637,6 +2753,9 @@ impl KvStoreSync {
                             } else {
                                 !s.is_empty() || s.latest_checkpoint.is_some()
                             };
+                            let no_retained = responder_uses_retained
+                                && !has_payload
+                                && (!s.is_empty() || s.latest_checkpoint.is_some());
                             let full = if has_payload && !cooled_down && !responder_uses_retained {
                                 match s.full_delta() {
                                     Ok(delta) => Some(delta),
@@ -2668,12 +2787,25 @@ impl KvStoreSync {
                                 is_owner,
                                 cp,
                                 has_payload,
+                                no_retained,
                                 served,
                             )
                         };
+                        if cooled_down && has_payload {
+                            responder_counters
+                                .rejected_cooldown
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else if no_retained {
+                            responder_counters
+                                .rejected_no_retained
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         let mut markers: Vec<KvSyncMessage> = Vec::new();
                         if let Some(retained) = retained {
                             let Some(signing) = responder_signing.as_ref() else {
+                                responder_counters
+                                    .rejected_other
+                                    .fetch_add(1, Ordering::Relaxed);
                                 continue;
                             };
                             let published = Self::publish_retained_history_frames(
@@ -2689,6 +2821,7 @@ impl KvStoreSync {
                                     },
                                     pubsub: responder_pubsub.as_ref(),
                                     topic: &responder_topic,
+                                    counters: Some(&responder_counters),
                                     #[cfg(test)]
                                     test_state: None,
                                 },
@@ -2696,6 +2829,9 @@ impl KvStoreSync {
                             )
                             .await;
                             if published.is_ok() {
+                                responder_counters
+                                    .requests_answered
+                                    .fetch_add(1, Ordering::Relaxed);
                                 last_full_response = Some(tokio::time::Instant::now());
                                 markers.push(KvSyncMessage::StateServedV2 {
                                     responder: local_peer_id,
@@ -2703,6 +2839,9 @@ impl KvStoreSync {
                                     entry_count: served.1,
                                 });
                             } else if let Err(error) = published {
+                                responder_counters
+                                    .rejected_other
+                                    .fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!(%error, "cannot publish complete group history");
                             }
                         } else if let Some(full) = full {
@@ -2734,8 +2873,14 @@ impl KvStoreSync {
                                     )
                                     .await
                                 {
+                                    responder_counters
+                                        .rejected_other
+                                        .fetch_add(1, Ordering::Relaxed);
                                     tracing::warn!("KvStore state-response publish failed: {e}");
                                 } else {
+                                    responder_counters
+                                        .requests_answered
+                                        .fetch_add(1, Ordering::Relaxed);
                                     last_full_response = Some(tokio::time::Instant::now());
                                     markers.push(KvSyncMessage::StateServed {
                                         responder: local_peer_id,
@@ -2752,8 +2897,16 @@ impl KvStoreSync {
                                         entry_count: served.1,
                                     });
                                 }
+                            } else {
+                                responder_counters
+                                    .rejected_other
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
-                        } else if !has_payload {
+                        } else if has_payload && !cooled_down {
+                            responder_counters
+                                .rejected_other
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else if !has_payload && !no_retained {
                             // Checkpoint-less empty. The v2 digest of the
                             // empty set is universally computable, so ANY
                             // empty holder may declare it — an empty
@@ -2829,6 +2982,12 @@ impl KvStoreSync {
                                         tracing::warn!(
                                             "KvStore state-served marker publish failed: {e}"
                                         );
+                                    } else if !has_payload
+                                        && matches!(marker, KvSyncMessage::StateServedV2 { .. })
+                                    {
+                                        responder_counters
+                                            .requests_answered
+                                            .fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 Err(e) => {
@@ -3037,6 +3196,7 @@ impl KvStoreSync {
         // side-topic message per backoff interval until its first write.
         if bootstrap_needed {
             let requester_pubsub = Arc::clone(&self.pubsub);
+            let requester_counters = Arc::clone(&self.state_sync_counters);
             let sync_topic = self.state_sync_topic();
             // Weak: the requester must not keep the store alive on its own.
             // (Belt-and-braces — the sibling loops hold strong Arcs, so the
@@ -3132,6 +3292,9 @@ impl KvStoreSync {
                         bincode::serialize(&request).ok()
                     };
                     let Some(serialized) = serialized else {
+                        requester_counters
+                            .rejected_other
+                            .fetch_add(1, Ordering::Relaxed);
                         // The store can open before its group membership is
                         // learned. A failed seal uses this slot, but the next
                         // slot must retry against the refreshed context.
@@ -3180,6 +3343,9 @@ impl KvStoreSync {
                     if let Err(e) = result {
                         tracing::debug!("KvStore state-request publish failed: {e}");
                     } else {
+                        requester_counters
+                            .requests_sent
+                            .fetch_add(1, Ordering::Relaxed);
                         schedule.request_published();
                     }
                 }
@@ -3438,6 +3604,7 @@ impl KvStoreSync {
                 },
                 pubsub: &self.pubsub,
                 topic: &self.topic,
+                counters: None,
                 #[cfg(test)]
                 test_state: Some(&self.retained_publish_test),
             },
@@ -3869,6 +4036,25 @@ mod tests {
             store: &Arc<RwLock<KvStore>>,
             retained_image: Option<Vec<u8>>,
         ) -> Result<()> {
+            self.merge_main_record_with_outcome(
+                opened,
+                sender_peer,
+                local_peer,
+                store,
+                retained_image,
+            )
+            .await
+            .map(|_| ())
+        }
+
+        async fn merge_main_record_with_outcome(
+            &self,
+            opened: crate::kv::treekem::OpenedTreeKemKvRecord,
+            sender_peer: PeerId,
+            local_peer: PeerId,
+            store: &Arc<RwLock<KvStore>>,
+            retained_image: Option<Vec<u8>>,
+        ) -> Result<Option<bool>> {
             if !self.is_authorized_writer(&opened.mutation.author_id).await
                 || opened.authorization_binding != self.authorization
             {
@@ -3882,11 +4068,23 @@ mod tests {
                             .as_deref()
                             .ok_or_else(|| KvError::Gossip("missing retained image".into()))?,
                     )?;
-                    store.merge_group_retained_image(&image, opened.mutation.author_id, local_peer)
+                    let before = store.current_version();
+                    store.merge_group_retained_image(
+                        &image,
+                        opened.mutation.author_id,
+                        local_peer,
+                    )?;
+                    Ok(Some(store.current_version() != before))
                 }
                 KvMutationKind::Delta | KvMutationKind::FullState => {
                     let delta: KvStoreDelta = bincode::deserialize(&opened.mutation.payload)?;
-                    store.merge_delta(&delta, sender_peer, Some(&opened.mutation.author_id))
+                    store
+                        .merge_delta_with_outcome(
+                            &delta,
+                            sender_peer,
+                            Some(&opened.mutation.author_id),
+                        )
+                        .map(|outcome| Some(matches!(outcome, MergeOutcome::Applied)))
                 }
                 KvMutationKind::Control => {
                     Err(KvError::Unauthorized("control on main topic".into()))
@@ -7308,6 +7506,15 @@ mod tests {
         settled: std::sync::atomic::AtomicUsize,
     }
 
+    #[test]
+    fn legacy_treekem_protector_inherits_outcome_method() {
+        // GatedTreeKemProtector implements the original Result<()> method
+        // only; downstream implementations must compile unchanged.
+        fn assert_legacy_impl<T: crate::kv::TreeKemKvProtector>() {}
+        assert_legacy_impl::<GatedTreeKemProtector>();
+        let _ = <GatedTreeKemProtector as crate::kv::TreeKemKvProtector>::merge_main_record_with_outcome;
+    }
+
     #[async_trait::async_trait]
     impl crate::kv::TreeKemKvProtector for GatedTreeKemProtector {
         fn group_id(&self) -> Vec<u8> {
@@ -7676,6 +7883,11 @@ mod tests {
             assert!(message.payload.len() <= max_wire);
             wire_frames.push(message.payload);
         }
+        assert_eq!(
+            writer_sync.state_sync_snapshot().retained_pages_served,
+            (expected_frames - 1) as u64,
+            "the manifest is not a retained data page"
+        );
         wire_frames.reverse();
         let target = Arc::new(RwLock::new(target));
         let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
@@ -7698,6 +7910,47 @@ mod tests {
         );
         assert_eq!(merged.last_history_endorser(), Some(&writer));
         drop(merged);
+
+        // The adapter can accept an authenticated record whose KV delta is
+        // rejected by the store. It must not inflate applied-merge metrics.
+        let mut ambiguous = KvStoreDelta::new(99);
+        let entry = KvEntry::new(
+            "ambiguous".to_string(),
+            b"value".to_vec(),
+            "text/plain".to_string(),
+        );
+        ambiguous
+            .added
+            .insert("ambiguous".to_string(), (entry.clone(), (peer(2), 99)));
+        ambiguous.updated.insert("ambiguous".to_string(), entry);
+        let wire = writer_protector
+            .seal_record(
+                &AuthorSigning::from_keypair(&writer_kp).expect("writer signing"),
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&ambiguous).expect("ambiguous delta"),
+                false,
+            )
+            .await
+            .expect("authenticated ambiguous delta");
+        let wire = encode_delta(peer(2), &wire).expect("wire record");
+        let counters = StateSyncCounters::default();
+        let before = target.read().await.current_version();
+        assert!(
+            KvStoreSync::merge_treekem_record_counted(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &wire,
+                &pages,
+                Some(&counters),
+            )
+            .await,
+            "authenticated but rejected delta keeps the existing persistence decision"
+        );
+        assert_eq!(target.read().await.current_version(), before);
+        assert_eq!(counters.snapshot().observer_merges, 0);
 
         reader_protector
             .writers
@@ -8953,6 +9206,12 @@ mod tests {
             joiner.read().await.is_empty(),
             "replica converges to the owner's (empty) state"
         );
+        let requester = joiner.state_sync_snapshot();
+        let responder = owner_sync.state_sync_snapshot();
+        assert!(requester.requests_sent > 0);
+        assert!(requester.observer_merges > 0);
+        assert!(responder.requests_received > 0);
+        assert!(responder.requests_answered > 0);
     }
 
     /// WHY (round-1 review — missed-delta recovery): a snapshot-restored
@@ -9566,6 +9825,10 @@ mod tests {
             "an empty holder's verifiable digest must terminate the empty \
              requester's tail (genuinely-empty stores converge silently)"
         );
+        let counters = holder.state_sync_snapshot();
+        assert!(counters.requests_received > 0);
+        assert!(counters.requests_answered > 0);
+        assert_eq!(counters.rejected_no_retained, 0);
     }
 
     /// WHY: wire compatibility is additive — a fleet with only v1 (older)
