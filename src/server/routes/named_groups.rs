@@ -7,8 +7,14 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 mod control_blob;
+mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
+};
+pub(in crate::server) use seat_cert_fetch::{
+    cert_evidence_deadline_elapsed, handle_group_cert_fetch_request,
+    handle_group_cert_fetch_response, publish_group_cert_fetch, GROUP_CERT_FETCH_DOMAIN,
+    GROUP_CERT_FETCH_RESPONSE_DOMAIN,
 };
 
 use super::super::state::AppState;
@@ -13753,6 +13759,18 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                 maybe_msg = sub.recv() => {
                     let Some(msg) = maybe_msg else { break; };
                     let Some(sender) = msg.sender else { continue; };
+                    // #946 r2: group-scoped certificate fetch traffic rides
+                    // this topic BEFORE any metadata event (it is not an
+                    // event); route it to the real handler branches and
+                    // continue the listener loop.
+                    if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_DOMAIN) {
+                        handle_group_cert_fetch_request(&state_for_task, rest).await;
+                        continue;
+                    }
+                    if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {
+                        handle_group_cert_fetch_response(&state_for_task, rest).await;
+                        continue;
+                    }
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
                     let apply_result = apply_named_group_metadata_event(
                         &state_for_task,
@@ -21852,11 +21870,13 @@ async fn warranted_fetch_for_pending_seats(
     info: &x0x::groups::GroupInfo,
     members: &[String],
 ) {
-    let Some(pubsub) = state.agent.pubsub() else {
-        return;
-    };
-    let local_machine = state.agent.machine_id();
-    let mut fetches = Vec::new();
+    // #946 r2 (item D): PUBLISH the group-scoped request and return —
+    // NEVER wait on the network under the caller's membership lock. The
+    // metadata listener answers asynchronously (see seat_cert_fetch), the
+    // response handler hydrates the seat durably, and the authority's
+    // NEXT seal retry (the MemberJoined cadence) finds the bytes.
+    let stable_group_id = info.stable_group_id().to_string();
+    let metadata_topic = info.metadata_topic.clone();
     for member_hex in members.iter().take(SEAL_TIME_CERT_FETCH_CAP_SEATS) {
         let Some(seat) = info.members_v2.get(member_hex) else {
             continue;
@@ -21864,34 +21884,10 @@ async fn warranted_fetch_for_pending_seats(
         let Some(digest_hex) = seat.certificate_digest.as_ref() else {
             continue;
         };
-        let Ok(digest_bytes) = hex::decode(digest_hex) else {
-            continue;
-        };
-        let Ok(digest): Result<[u8; 32], _> = <[u8; 32]>::try_from(digest_bytes) else {
-            continue;
-        };
-        let Ok(agent_id) = parse_agent_id_hex(member_hex) else {
-            continue;
-        };
-        let cache = std::sync::Arc::clone(&state.agent.announce_blob_cache);
-        let pubsub = std::sync::Arc::clone(&pubsub);
-        fetches.push(async move {
-            cache
-                .fetch_pair_by_cert_digest(&pubsub, &digest, &agent_id, &local_machine)
-                .await
-        });
+        publish_group_cert_fetch(state, &metadata_topic, &stable_group_id, digest_hex);
     }
-    if fetches.is_empty() {
-        return;
-    }
-    // One fetch deadline for the whole batch (each fetch is internally
-    // bounded by BLOB_FETCH_TIMEOUT_SECS; the slack covers spawn lag).
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(x0x::announce_blob::BLOB_FETCH_TIMEOUT_SECS + 2),
-        futures::future::join_all(fetches),
-    )
-    .await;
 }
+
 /// ADR-0038 seal wrapper for the authority's ORDINARY commit sites: this
 /// path NEVER evicts. If any active member currently fails OwnerCertified
 /// re-verification it refuses with a typed error directing the caller to
@@ -33157,6 +33153,18 @@ async fn stage_refusal_if_certificates_unobtainable(
     if !all_digest_only {
         return;
     }
+    // Item B: the refusal is RETRYABLE first — the joiner keeps retrying
+    // while the fetch may still converge (a peer caching the certificate
+    // comes online, the owner returns). Stage the typed terminal refusal
+    // only after CERT_EVIDENCE_DEADLINE_MS of continuous unavailability.
+    if !cert_evidence_deadline_elapsed(state, group_key, member_agent_id) {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_key),
+            member = %LogHexId::agent(member_agent_id),
+            "#946: certificate-unobtainable refusal is retryable (deadline not reached); no typed refusal yet"
+        );
+        return;
+    }
     state
         .groups_diagnostics
         .record_invite_refusal(group_key, "certificate_evidence_unavailable");
@@ -36363,6 +36371,9 @@ pub(in crate::server) mod tests {
             causal_approval_queue_persistence_lock: Mutex::new(()),
             predecessor_relay_outbox_persistence_lock: Mutex::new(()),
             public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
+            cert_fetch_requested: StdMutex::new(HashMap::new()),
+            cert_fetch_answered: StdMutex::new(HashMap::new()),
+            cert_unresolvable_since: StdMutex::new(HashMap::new()),
             pending_b8_compensation: Mutex::new(None),
             pending_listener_admission: Mutex::new(None),
             group_metadata_tasks: RwLock::new(HashMap::new()),

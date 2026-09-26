@@ -340,46 +340,6 @@ impl AnnounceBlobCache {
         None
     }
 
-    /// #908/R17 Home blocker: seal-time warranted fetch by the ROSTER
-    /// SEAT digest (blake3(bincode(cert)) — what a digest-only member's
-    /// seat commits to, and the only digest the sealer has). Publishes
-    /// the real blob request on both carriers; a peer answers when its
-    /// OWN pair's certificate hashes to `cert_digest`. The response pair
-    /// is accepted only when its certificate hashes to `cert_digest` AND
-    /// binds `expected_agent_id`, then it is cached under its pair
-    /// digest. Bounded by BLOB_FETCH_TIMEOUT_SECS.
-    pub(crate) async fn fetch_pair_by_cert_digest(
-        self: &Arc<Self>,
-        pubsub: &Arc<PubSubManager>,
-        cert_digest: &[u8; 32],
-        expected_agent_id: &identity::AgentId,
-        machine_id: &identity::MachineId,
-    ) -> Option<Arc<CachedBlob>> {
-        if let Some(hit) = self.find_by_cert_digest(cert_digest).await {
-            return Some(hit);
-        }
-        match fetch_pair_by_cert_digest_inner(pubsub, cert_digest, expected_agent_id, machine_id)
-            .await
-        {
-            Ok(blob) => {
-                self.stats_fetches_ok.fetch_add(1, Ordering::Relaxed);
-                let cached = Arc::new(blob.clone());
-                self.insert_verified(blob).await;
-                Some(cached)
-            }
-            Err(reason) => {
-                self.stats_fetches_failed.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    target: "announce.blob",
-                    cert_digest = %hex::encode(cert_digest),
-                    agent = %hex::encode(expected_agent_id.0),
-                    %reason,
-                    "seal-time certificate fetch failed"
-                );
-                None
-            }
-        }
-    }
     /// Serve a blob request from our own current announcement state only.
     /// Called by the targeted-request handler when a peer asks for a
     /// digest. The response is the bincode of the served agent's
@@ -403,20 +363,16 @@ impl AnnounceBlobCache {
         if crate::announce_v3::cert_digest(current_user_id, current_agent_certificate) == *digest {
             return bincode::serialize(&(current_user_id, current_agent_certificate)).ok();
         }
-        // #908/R17: the request may carry the ROSTER SEAT digest
-        // (blake3(bincode(cert))) — the only digest a digest-only seat
-        // commits to. Our OWN pair may match it.
-        if let Some(cert) = current_agent_certificate.as_ref() {
-            if cert_digest_bincode(cert) == *digest {
-                return bincode::serialize(&(*current_user_id, Some(cert.clone()))).ok();
-            }
-        }
-        // #656 is deliberately PRESERVED: a digest that only exists in our
-        // CACHE (a peer's blob) is NOT served — cache-first serving turned
-        // every cache holder into a responder and amplified every request
-        // into a broadcast storm. The seal-time fetch therefore obtains a
-        // certificate from the member itself (online); peer-cache serving
-        // needs the fleet to revisit #656 with an admin-scoped rule.
+        // #656 is preserved HERE, on the GLOBAL identity topic: a digest
+        // that only exists in our CACHE is not served — cache-first
+        // serving turned every cache holder into a responder and amplified
+        // every request into a broadcast storm. Roster-certificate
+        // serving for digest-only seats lives in the GROUP-SCOPED path
+        // instead (named_groups::seat_cert_fetch): requests ride the
+        // group's own metadata topic, and only active roster members of
+        // THAT group answer, from verified cached pairs whose user is the
+        // group's owner — bounded by per-digest rate limits and negative
+        // caches on both sides.
         None
     }
 
@@ -585,98 +541,6 @@ impl AnnounceBlobCache {
 /// The response is matched by digest: every well-formed response carries
 /// the pair whose blake3 is the requested digest, so concurrent fetchers
 /// can share the topic and each picks out its own blob.
-/// blake3(bincode(cert)) — the roster-seat certificate digest
-/// (`owner_cert::certificate_digest_hex`'s rule, with the public-key
-/// fallback on serialize failure).
-fn cert_digest_bincode(cert: &identity::AgentCertificate) -> [u8; 32] {
-    let bytes = bincode::serialize(cert).unwrap_or_else(|_| cert.agent_public_key().to_vec());
-    *blake3::hash(&bytes).as_bytes()
-}
-
-/// #908/R17: the seal-time fetch loop. Mirrors `fetch_and_verify` but
-/// keys on the ROSTER SEAT digest: a response is accepted when its pair's
-/// CERTIFICATE hashes to the requested seat digest (the pair digest is
-/// not knowable to the requester) and binds the expected agent. Owner
-/// and expiry checks remain the caller's digest-anchored install.
-async fn fetch_pair_by_cert_digest_inner(
-    pubsub: &Arc<PubSubManager>,
-    cert_digest: &[u8; 32],
-    expected_agent_id: &identity::AgentId,
-    machine_id: &identity::MachineId,
-) -> Result<CachedBlob, String> {
-    let mut responses = pubsub.subscribe(ANNOUNCE_BLOB_TOPIC.to_string()).await;
-    let request = encode_blob_request(cert_digest, expected_agent_id);
-    let (targeted, warm) = tokio::join!(
-        pubsub.publish(
-            ANNOUNCE_BLOB_TOPIC.to_string(),
-            Bytes::from(request.clone()),
-        ),
-        pubsub.publish(
-            crate::IDENTITY_ANNOUNCE_TOPIC.to_string(),
-            Bytes::from(request),
-        ),
-    );
-    if let (Err(t), Err(w)) = (&targeted, &warm) {
-        return Err(format!(
-            "both blob request carriers failed: targeted={t}; warm={w}"
-        ));
-    }
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(BLOB_FETCH_TIMEOUT_SECS);
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err("seal-time certificate fetch timed out".to_string());
-        }
-        let message = match tokio::time::timeout(remaining, responses.recv()).await {
-            Ok(Some(message)) => message,
-            Ok(None) => return Err("blob response subscription closed".to_string()),
-            Err(_) => return Err("seal-time certificate fetch timed out".to_string()),
-        };
-        let Some(payload) = message.payload.strip_prefix(ANNOUNCE_BLOB_RESPONSE_DOMAIN) else {
-            continue;
-        };
-        let Some(response) = decode_blob_response(payload) else {
-            continue;
-        };
-        let pair: (Option<identity::UserId>, Option<identity::AgentCertificate>) =
-            match bincode::deserialize(&response.announcement_bytes) {
-                Ok(pair) => pair,
-                Err(_) => continue,
-            };
-        let Some(cert) = pair.1.as_ref() else {
-            continue;
-        };
-        if cert_digest_bincode(cert) != *cert_digest {
-            continue;
-        }
-        if !cert.agent_id().is_ok_and(|id| id == *expected_agent_id) {
-            tracing::warn!(
-                target: "announce.blob",
-                agent = %hex::encode(expected_agent_id.0),
-                machine = %machine_id
-                    .0
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .take(8)
-                    .collect::<String>(),
-                "seal-time fetch: certificate digest matched but binds a different agent; ignoring"
-            );
-            continue;
-        }
-        let digest = crate::announce_v3::cert_digest(&pair.0, &pair.1);
-        return Ok(CachedBlob {
-            digest,
-            payload_version: 0,
-            user_id: pair.0,
-            agent_certificate: pair.1,
-            fetched_at_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        });
-    }
-}
 async fn fetch_and_verify(
     pubsub: &Arc<PubSubManager>,
     cache: &AnnounceBlobCache,
