@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Share-grant redelivery outbox (#926, ADR-0070 §2).** A grant delivery
+  whose durable-DM attempts all fail is now queued in
+  `<data_dir>/share-grant-outbox.bin` (durable, 0600) and retried on bounded
+  backoff (5 s doubling to 5 min), and at once when the recipient's machine
+  connects again, until the recipient ACKs. An entry is dropped on ACK, on
+  revocation (checked before every send) or at its deadline: the grant's
+  expiry or 7 days after queueing. Bounds: 128 entries per grantee, 1024 in
+  total; past a bound the entry is refused and reported, and an over-bound
+  file loads fail-closed rather than truncated. `POST /grants` delivery rows
+  gain `queued`; `GET /grants` reports `outbox_error`. Every share-grant
+  revocation source (local `DELETE /grants/:id`, the `x0x.revocation.v3`
+  carrier, and share-grant records on the v1/v2 carriers) is serialized
+  with in-flight redeliveries. `DELETE /grants/:id` now answers `503` unless
+  both `revocations-v3.bin` and the outbox removal are durable (retry is
+  idempotent). `revocations-v3.bin` is now written durably and
+  monotonically: every writer re-reads and unions the file while holding an
+  exclusive OS advisory lock on `revocations-v3.bin.lock` (shared with the
+  daemon instance lock's primitives), so neither an older snapshot nor
+  another daemon sharing the identity dir can erase a newer revocation; the
+  union applies the same GC horizon as the in-memory sweep. Share-grant
+  revocations received on the v1/v2 carriers are now persisted to v3 too. No wire change: retries re-send the #924
+  typed DM with the same logical request id, so the receiving side is
+  unchanged.
+
 - **`[gossip] byte_policy` — opt-in Leaf egress shedding (#504 slice 2).**
   `"observe_only"` (default) | `"shed_normal"`. The byte thresholds and the
   authority to act on them are now two separate settings: a non-zero
@@ -66,6 +90,36 @@ All notable changes to this project will be documented in this file.
   `docs/diagnostics.md`.
 ### Fixed
 
+- **Group task-list deltas are now sealed with the group key (#895, security).**
+  A group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) used to publish
+  its deltas and its `/state-sync` full-state serve as plaintext on a topic
+  any peer knowing the group id could derive, while the same group's KV
+  stores were encrypted. For an `MlsEncrypted` group both are now sealed with
+  the group's current key through the same envelopes group KV stores use
+  (GSS epoch secret or the live TreeKEM ratchet; AAD binds group, list and
+  epoch). Receivers refuse plaintext and unopenable records on such a list —
+  never merged — and count them in the new per-group diagnostics counter
+  `task_deltas_seal_rejected`. **Compatibility:** an un-upgraded peer cannot
+  read the new records and its plaintext deltas are refused, so a group's
+  lists only replicate between upgraded members. Personal lists and
+  `SignedPublic` groups are unchanged. Task lists follow the group write
+  policy (`AdminOnly` groups: only admins write). The GUI space Board moves
+  from the plaintext `x0x-board-<gid16>` list to `x0x.group.<gid>.symphony.board`;
+  the first access by a member with write permission copies the legacy
+  board's tasks in once (same ids, durable marker; claims/completions are not
+  carried). Other members see `board_migration_pending` until then. The
+  legacy board answers state requests only from members of its group, and
+  once a node has migrated it that node retires it (sync stopped, not
+  rehydrated, re-creation refused with 410); its local data is kept.
+
+- **Typed DM relay admission and prefix collisions (#903).** A full predecessor
+  relay channel now leaves the gossip request unacknowledged and unclaimed for
+  the authority's outbox retry. Typed routes validate their complete payloads
+  before taking a verified DM; an ordinary message that merely starts with any
+  of the five registered prefixes reaches generic subscribers and keeps its
+  durable message history. The new public `DmTypedPayloadRoute.validator` field
+  is a source-level API change: downstream struct literals must supply it (or
+  use the `DmInboxConfig` route builders).
 - **`Agent::shutdown` now retires persistent kv snapshot paths, so an owner
   restart re-opens them instead of being fenced off (#765, follow-up to
   #760).** The #760 snapshot fence refuses to arm persistence for any open
@@ -240,6 +294,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Group KV open now requires the shared GSS publication gate (#969).**
+  `open_group_kv_store_persistent` takes a `GssPublicationGate` so encrypted
+  store publications and durable group roster changes use the same epoch barrier.
 - **The eleven `saorsa-gossip-*` dependencies now use exact 0.5.84 pins.**
   This consumes the published recovery-intent admission fairness fix
   (saorsa-gossip PR #84) and the disabled-limiter/late-offer dispatch fixes
@@ -847,6 +904,20 @@ All notable changes to this project will be documented in this file.
   nextest-isolated.sh) through success, test-failure, report-failure and
   ratchet-failure controls, asserting phase order, exit codes and argument
   preservation.
+
+### Known limitations
+
+- **Mixed-version predecessor relays can still be falsely acknowledged (#903).**
+  The new sender uses gossip so a full typed channel remains retryable when
+  both peers are upgraded. An older sender using raw QUIC can receive a
+  transport ACK from a new receiver before application admission; deferred
+  admission-aware transport ACKs are tracked in
+  [ant-quic #301](https://github.com/saorsa-labs/ant-quic/issues/301). A new
+  sender talking to an older receiver can instead receive a false v1 gossip
+  application `Accepted` ACK when that receiver's typed channel is full. Only
+  on upgraded receivers does a v1 gossip ACK confirm queue admission, and it
+  still does not confirm handler application or persistence. The initial
+  requester-to-authority offer remains a one-shot send tracked in #908.
 
 ## [v0.45.0] - 2026-09-14
 

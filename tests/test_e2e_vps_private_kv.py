@@ -150,17 +150,208 @@ class PrivateKvHarnessTests(unittest.TestCase):
     def test_home_uses_real_seat_and_pinned_join_shapes(self):
         owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
         owner.request = mock.Mock(side_effect=[
+            (200, {"ok": True, "state": "local", "group_id": "home-id"}),
             (200, {"ok": True, "group_id": "home-id", "owner_user_id": "f" * 64,
                    "intended_joiner": "2" * 64, "seated": False,
-                   "invite": "x0x://invite/real"})])
-        member.request = mock.Mock(return_value=(200, {"ok": True, "group_id": "home-id"}))
+                   "invite": "x0x://invite/real"}),
+            (200, {"members": [{"agent_id": "2" * 64}]})])
+        member.request = mock.Mock(side_effect=[
+            (200, {"ok": True, "group_id": "home-id", "join_state": "pending_authority_commit"}),
+            (200, {"ok": True, "group_id": "home-id", "membership_state": "active"}),
+        ])
         scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence())
         invite = scenario.home_invite("owner", "member", "home-id", "f" * 64)
         with mock.patch.object(self.h, "poll", return_value=(200, {"members": [{"agent_id": "2" * 64}]})):
             scenario.join_home("owner", "member", "home-id", "f" * 64, invite)
-        self.assertEqual(("POST", "/home/seat", {"agent_id": "2" * 64}), owner.request.call_args_list[0].args)
+        self.assertEqual(("GET", "/home"), owner.request.call_args_list[0].args)
+        self.assertEqual(("POST", "/home/seat", {"agent_id": "2" * 64}), owner.request.call_args_list[1].args)
         self.assertEqual({"invite": "x0x://invite/real", "mode": "home",
-                          "expected_owner_user_id": "f" * 64}, member.request.call_args.args[2])
+                          "expected_owner_user_id": "f" * 64}, member.request.call_args_list[0].args[2])
+
+    def _fake_clock(self):
+        clock = [100.0]
+        return (mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]),
+                mock.patch.object(self.h.time, "sleep",
+                                  side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+
+    def test_home_seat_waits_until_the_minter_serves_the_canonical_home(self):
+        # #824: a device that was just seated (an admin) reaches `local` with the
+        # canonical gid only after its own join completes. Seating before then
+        # is refused by the product, so the harness waits for exactly that.
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(side_effect=[
+            (200, {"ok": True, "state": "elsewhere", "canonical_group_id": "home-id"}),
+            (200, {"ok": True, "state": "local", "group_id": "home-id"}),
+            (200, {"ok": True, "group_id": "home-id", "owner_user_id": "f" * 64,
+                   "intended_joiner": "2" * 64, "seated": False, "invite": "x0x://invite/real"})])
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=5)
+        monotonic, sleep = self._fake_clock()
+        with monotonic, sleep:
+            scenario.home_invite("owner", "member", "home-id", "f" * 64)
+        self.assertEqual(("POST", "/home/seat", {"agent_id": "2" * 64}), owner.request.call_args_list[2].args)
+        self.assertTrue(all(item["passed"] for item in scenario.e.assertions))
+
+    def test_home_seat_never_mints_from_a_device_serving_a_duplicate_home(self):
+        # #824: a `local` Home with a DIFFERENT gid is the duplicate. The wait
+        # must not accept it and must never reach `POST /home/seat`.
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(return_value=(200, {"ok": True, "state": "local", "group_id": "dup-id"}))
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=3)
+        monotonic, sleep = self._fake_clock()
+        with monotonic, sleep, self.assertRaises(AssertionError):
+            scenario.home_invite("owner", "member", "home-id", "f" * 64)
+        self.assertNotIn("/home/seat", [call.args[1] for call in owner.request.call_args_list])
+
+    def test_home_reader_polls_only_through_provisioning_pending(self):
+        # #824: `provisioning_pending` is the one documented transient state.
+        # The reader waits through it and then applies the unchanged checks.
+        owner = FakeApi("1" * 64)
+        owner.request = mock.Mock(side_effect=[
+            (200, {"ok": True, "state": "provisioning_pending"}),
+            (200, {"ok": True, "state": "local", "group_id": "home-id", "owner_user_id": "f" * 64}),
+            (200, {"members": [{"agent_id": "1" * 64, "state": "active"}]})])
+        scenario = self.h.Scenario({"owner": owner}, self.h.Evidence(), timeout=5)
+        monotonic, sleep = self._fake_clock()
+        with monotonic, sleep:
+            gid, _ = scenario.home("owner")
+        self.assertEqual("home-id", gid)
+        self.assertEqual(("GET", "/home"), owner.request.call_args_list[1].args[:2])
+        self.assertTrue(all(item["passed"] for item in scenario.e.assertions))
+
+    def test_home_reader_does_not_wait_on_a_terminal_state(self):
+        owner = FakeApi("1" * 64)
+        owner.request = mock.Mock(return_value=(404, {"ok": False, "error": "no Home provisioned"}))
+        status, _ = self.h.settled_home(owner, "owner", 5)
+        self.assertEqual(404, status)
+        self.assertEqual(1, owner.request.call_count)
+
+    def test_private_join_waits_for_exact_local_group_after_owner_roster(self):
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(side_effect=[
+            (200, {"members": []}),
+            (200, {"members": [{"agent_id": "2" * 64}]}),
+        ])
+        member.request = mock.Mock(side_effect=[
+            (201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"}),
+            (200, {"group_id": "private-id", "membership_state": "pending_authority_commit"}),
+            (200, {"group_id": "private-id", "membership_state": "active"}),
+        ])
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        clock = [100.0]
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.h.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        self.assertEqual(("POST", "/groups/join", {"invite": "x0x://invite/private"}),
+                         member.request.call_args_list[0].args)
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("private_join_readiness", readiness["operation"])
+        self.assertEqual("accepted", readiness["outcome"])
+        self.assertEqual("active", readiness["local_membership_state"])
+        self.assertEqual(2, readiness["probe_count"])
+
+    def test_private_join_requires_local_readiness_when_owner_is_ready_first(self):
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(return_value=(200, {"members": [{"agent_id": "2" * 64}]}))
+        member.request = mock.Mock(side_effect=[
+            (201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"}),
+            (200, {"group_id": "private-id", "membership_state": "pending_authority_commit"}),
+            (200, {"group_id": "private-id", "membership_state": "active"}),
+        ])
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        clock = [100.0]
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.h.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("accepted", readiness["outcome"])
+        self.assertEqual(2, readiness["probe_count"])
+        self.assertEqual(2, readiness["local_probe_count"])
+        self.assertEqual(3, member.request.call_count)
+
+    def test_private_join_rejects_active_local_wrong_group(self):
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(return_value=(200, {"members": [{"agent_id": "2" * 64}]}))
+        member.request = mock.Mock(side_effect=lambda method, path, body=None: (
+            (201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"})
+            if method == "POST" else
+            (200, {"group_id": "other-group", "membership_state": "active"})
+            if path == "/groups/private-id" else
+            (200, {"last_join_outcome": {"outcome": "timed_out"}})))
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=1)
+        clock = [100.0]
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.h.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                self.assertRaisesRegex(AssertionError, "private join reaches owner and local readiness"):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("timeout", readiness["outcome"])
+        self.assertEqual("active", readiness["local_membership_state"])
+        self.assertEqual("other-group", readiness["local_observed_group_id"])
+        self.assertTrue(readiness["deadline_reached_before_acceptance"])
+
+    def test_private_join_rejects_local_activation_after_deadline(self):
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        clock = [100.0]
+        owner.request = mock.Mock(return_value=(200, {"members": [{"agent_id": "2" * 64}]}))
+
+        def member_request(method, path, body=None):
+            if method == "POST":
+                return 201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"}
+            if path == "/groups/private-id":
+                clock[0] = 103.0
+                return 200, {"group_id": "private-id", "membership_state": "active"}
+            return 200, {"last_join_outcome": {"outcome": "timed_out"}}
+
+        member.request = mock.Mock(side_effect=member_request)
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                self.assertRaisesRegex(AssertionError, "private join reaches owner and local readiness"):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("timeout", readiness["outcome"])
+        self.assertTrue(readiness["deadline_reached_before_acceptance"])
+        self.assertEqual(1, readiness["local_probe_count"])
+
+    def test_private_join_never_ready_fails_within_single_deadline_and_receipt(self):
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        owner.request = mock.Mock(return_value=(200, {"members": [{"agent_id": "2" * 64}]}))
+        member.request = mock.Mock(side_effect=lambda method, path, body=None: (
+            (201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"})
+            if method == "POST" else
+            (200, {"group_id": "private-id", "membership_state": "pending_authority_commit"})
+            if path == "/groups/private-id" else
+            (200, {"last_join_outcome": {"outcome": "timed_out"}})))
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        clock = [100.0]
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.h.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                self.assertRaisesRegex(AssertionError, "private join reaches owner and local readiness"):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("timeout", readiness["outcome"])
+        self.assertTrue(readiness["deadline_reached_before_acceptance"])
+        self.assertEqual("pending_authority_commit", readiness["local_membership_state"])
+        self.assertEqual("timed_out", readiness["terminal_join_outcome"])
+        self.assertLessEqual(readiness["elapsed_seconds"], 2)
+
+    def test_private_join_rejects_response_after_deadline_before_local_probe(self):
+        owner, member = FakeApi("1" * 64), FakeApi("2" * 64)
+        clock = [100.0]
+        owner.request = mock.Mock(side_effect=lambda method, path, body=None: (
+            clock.__setitem__(0, 103.0) or (200, {"members": [{"agent_id": "2" * 64}]})))
+        member.request = mock.Mock(side_effect=[
+            (201, {"ok": True, "group_id": "private-id", "join_state": "pending_authority_commit"}),
+            (200, {"group_id": "private-id", "membership_state": "active"}),
+            (200, {"last_join_outcome": {"outcome": "timed_out"}}),
+        ])
+        scenario = self.h.Scenario({"owner": owner, "member": member}, self.h.Evidence(), timeout=2)
+        with mock.patch.object(self.h.time, "monotonic", side_effect=lambda: clock[0]), \
+                self.assertRaisesRegex(AssertionError, "private join reaches owner and local readiness"):
+            scenario.join_private("owner", "member", "private-id", "x0x://invite/private")
+        readiness = scenario.e.polls[-1]
+        self.assertEqual("timeout", readiness["outcome"])
+        self.assertEqual(0, readiness["local_probe_count"])
+        self.assertTrue(readiness["deadline_reached_before_acceptance"])
 
     def test_missing_or_remote_home_fails_prerequisite(self):
         api = FakeApi()

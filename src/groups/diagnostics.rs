@@ -134,6 +134,15 @@ pub struct GroupCounters {
     pub causal_conflicted: u64,
     /// Entries rejected due to count or byte caps.
     pub causal_capacity_rejected: u64,
+    /// #908: requester predecessor-offer obligations DELIVERED to the
+    /// authority (application ACK) by the durable offer outbox.
+    pub requester_offer_delivered: u64,
+    /// #908: offer obligations dropped because the join RESOLVED first
+    /// (approved, denied, expired, cancelled, or the group withdrew).
+    pub requester_offer_resolved_drop: u64,
+    /// #908: offer obligations dropped after the bounded retry schedule
+    /// ran out (ADR 0028 offsets).
+    pub requester_offer_retry_exhausted: u64,
     /// #482: TreeKEM membership events queued awaiting state-chain
     /// catch-up/replay (the wedge class where a verified event — e.g. a
     /// second device's self-leave — could previously sit queued forever
@@ -164,6 +173,12 @@ pub struct GroupCounters {
     /// ADR-0068 D2: buffered task deltas APPLIED, in arrival order, after the
     /// marker cleared.
     pub task_deltas_quarantine_applied: u64,
+    /// #895: inbound task deltas REFUSED on a group-scoped list — plaintext
+    /// on an encrypted group (an un-upgraded or non-member sender), a sealed
+    /// record this node cannot open (wrong/missing epoch key, tampering,
+    /// foreign binding, non-writer author), or a sealed author that is not
+    /// the gossip sender. Fail closed: none of these is merged.
+    pub task_deltas_seal_rejected: u64,
     /// ADR-0064 slice 2: owner USER-key mandates minted by THIS install
     /// at the pre-mutation point of an invite-derived seat (owner-axis
     /// groups where the local agent holds the owner user key).
@@ -398,6 +413,9 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.task_deltas_quarantine_applied = dst
         .task_deltas_quarantine_applied
         .saturating_add(src.task_deltas_quarantine_applied);
+    dst.task_deltas_seal_rejected = dst
+        .task_deltas_seal_rejected
+        .saturating_add(src.task_deltas_seal_rejected);
     dst.owner_mandate_minted = dst
         .owner_mandate_minted
         .saturating_add(src.owner_mandate_minted);
@@ -447,6 +465,15 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.causal_capacity_rejected = dst
         .causal_capacity_rejected
         .saturating_add(src.causal_capacity_rejected);
+    dst.requester_offer_delivered = dst
+        .requester_offer_delivered
+        .saturating_add(src.requester_offer_delivered);
+    dst.requester_offer_resolved_drop = dst
+        .requester_offer_resolved_drop
+        .saturating_add(src.requester_offer_resolved_drop);
+    dst.requester_offer_retry_exhausted = dst
+        .requester_offer_retry_exhausted
+        .saturating_add(src.requester_offer_retry_exhausted);
     dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (None, Some(b)) => Some(b),
@@ -635,6 +662,14 @@ impl GroupsDiagnostics {
         self.with_counters(group_id, |c| {
             c.task_deltas_quarantine_applied =
                 c.task_deltas_quarantine_applied.saturating_add(count);
+        });
+    }
+
+    /// #895: an inbound task delta on a group-scoped list was refused
+    /// (plaintext on an encrypted group, unopenable, or author mismatch).
+    pub fn record_task_delta_seal_rejected(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.task_deltas_seal_rejected = c.task_deltas_seal_rejected.saturating_add(1);
         });
     }
 
@@ -932,6 +967,28 @@ impl GroupsDiagnostics {
     pub fn record_causal_capacity_rejected(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.causal_capacity_rejected = c.causal_capacity_rejected.saturating_add(1);
+        });
+    }
+
+    /// #908: a requester predecessor-offer obligation was DELIVERED to
+    /// the authority (application ACK).
+    pub fn record_requester_offer_delivered(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.requester_offer_delivered = c.requester_offer_delivered.saturating_add(1);
+        });
+    }
+
+    /// #908: an offer obligation was dropped because the join resolved.
+    pub fn record_requester_offer_resolved_drop(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.requester_offer_resolved_drop = c.requester_offer_resolved_drop.saturating_add(1);
+        });
+    }
+
+    /// #908: an offer obligation's bounded retry schedule ran out.
+    pub fn record_requester_offer_retry_exhausted(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.requester_offer_retry_exhausted = c.requester_offer_retry_exhausted.saturating_add(1);
         });
     }
 
@@ -1394,6 +1451,10 @@ mod tests {
             task_deltas_quarantine_buffered: base + 47,
             task_deltas_quarantine_dropped: base + 48,
             task_deltas_quarantine_applied: base + 49,
+            requester_offer_delivered: base + 50,
+            requester_offer_resolved_drop: base + 51,
+            requester_offer_retry_exhausted: base + 52,
+            task_deltas_seal_rejected: base + 53,
         };
         let src = counters_with(1_000);
         let dst = counters_with(7);
@@ -1552,6 +1613,10 @@ mod tests {
         assert_eq!(
             merged.task_deltas_quarantine_applied,
             dst.task_deltas_quarantine_applied + src.task_deltas_quarantine_applied
+        );
+        assert_eq!(
+            merged.task_deltas_seal_rejected,
+            dst.task_deltas_seal_rejected + src.task_deltas_seal_rejected
         );
         assert_eq!(
             merged.fork_quarantine_refusals,

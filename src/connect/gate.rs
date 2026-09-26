@@ -72,12 +72,71 @@ pub enum ConnectDenialReason {
 /// 4. `!target.ip().is_loopback()` ⇒ [`ConnectDenialReason::TargetNotLoopback`]
 /// 5. pair not in ACL ⇒ [`ConnectDenialReason::AgentMachineNotInAcl`]
 /// 6. target not in that entry ⇒ [`ConnectDenialReason::TargetNotAllowed`]
+///
+/// Exact-pair entries only; `principal = "owner"` entries never match here.
+/// Use [`evaluate_connect_gate_for_principal`] where owner trust is known.
 pub fn evaluate_connect_gate(
     verified: bool,
     trust_decision: Option<TrustDecision>,
     policy: &ConnectPolicy,
     agent_id: &AgentId,
     machine_id: &MachineId,
+    target: &SocketAddr,
+) -> Result<(), ConnectDenialReason> {
+    evaluate_connect_gate_for_principal(
+        verified,
+        trust_decision,
+        policy,
+        agent_id,
+        machine_id,
+        false,
+        target,
+    )
+}
+
+/// [`evaluate_connect_gate`] with the ADR-0070 §1 owner-trust input.
+///
+/// Same gate order. Steps 5–6 additionally match `principal = "owner"`
+/// entries, but only when `owner_trusted` (established by
+/// [`crate::owner_trust`]). Owner trust without an owner entry grants
+/// nothing: the pair must still be listed, and every target is exact.
+pub fn evaluate_connect_gate_for_principal(
+    verified: bool,
+    trust_decision: Option<TrustDecision>,
+    policy: &ConnectPolicy,
+    agent_id: &AgentId,
+    machine_id: &MachineId,
+    owner_trusted: bool,
+    target: &SocketAddr,
+) -> Result<(), ConnectDenialReason> {
+    evaluate_connect_gate_for_principals(
+        verified,
+        trust_decision,
+        policy,
+        agent_id,
+        machine_id,
+        owner_trusted,
+        false,
+        target,
+    )
+}
+
+/// [`evaluate_connect_gate_for_principal`] with the ADR-0070 §2 grant input.
+///
+/// `grant_port_allowed` must come from [`crate::share_grant`]: the
+/// requester holds a current ShareGrant whose `Connect { ports }` covers
+/// `target.port()`. It lets a `principal = "grant"` entry listing exactly
+/// `target` match; it never matches without such an entry, and the caller
+/// is expected to have raised `trust_decision` for the same grant only.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_connect_gate_for_principals(
+    verified: bool,
+    trust_decision: Option<TrustDecision>,
+    policy: &ConnectPolicy,
+    agent_id: &AgentId,
+    machine_id: &MachineId,
+    owner_trusted: bool,
+    grant_port_allowed: bool,
     target: &SocketAddr,
 ) -> Result<(), ConnectDenialReason> {
     // 1. Unverified peers learn nothing.
@@ -97,19 +156,28 @@ pub fn evaluate_connect_gate(
     if !crate::connect::acl::is_loopback(target.ip()) {
         return Err(ConnectDenialReason::TargetNotLoopback);
     }
-    // 5 + 6. Exact-pair + exact-target match.
-    if !acl.is_allowed(agent_id, machine_id, target) {
+    // 5 + 6. Exact-pair (or owner principal) + exact-target match.
+    if !acl.is_allowed_for_principals(
+        agent_id,
+        machine_id,
+        owner_trusted,
+        grant_port_allowed,
+        target,
+    ) {
         // Distinguish "pair unknown" from "pair known, target wrong" only for
         // diagnostics — both are deny. We split because the T4 forwarder's
         // diagnostics surface benefits from the distinction, and the peer has
         // already passed verified+trust+disabled+loopback by here, so revealing
         // the pair-vs-target split leaks nothing an authenticated member
         // couldn't already derive.
-        return Err(if acl.entry_for(agent_id, machine_id).is_some() {
-            ConnectDenialReason::TargetNotAllowed
-        } else {
-            ConnectDenialReason::AgentMachineNotInAcl
-        });
+        return Err(
+            if acl.has_entry_for_principals(agent_id, machine_id, owner_trusted, grant_port_allowed)
+            {
+                ConnectDenialReason::TargetNotAllowed
+            } else {
+                ConnectDenialReason::AgentMachineNotInAcl
+            },
+        );
     }
     Ok(())
 }
@@ -137,6 +205,8 @@ mod tests {
                 machine_id,
                 targets,
             }],
+            owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         })
     }
 
@@ -287,5 +357,71 @@ mod tests {
         let target: SocketAddr = T22.parse().unwrap();
         let r = evaluate_connect_gate(true, None, &policy, &a, &m, &target);
         assert_eq!(r, Err(ConnectDenialReason::TrustRejected));
+    }
+
+    fn owner_only_acl(targets: &[&str]) -> ConnectPolicy {
+        ConnectPolicy::Enabled(ConnectAcl {
+            loaded_from: Path::new("/tmp/x").to_path_buf(),
+            loaded_at_unix_ms: 0,
+            allow: Vec::new(),
+            owner_allow: vec![crate::connect::acl::ConnectOwnerEntry {
+                description: None,
+                targets: targets.iter().map(|t| t.parse().unwrap()).collect(),
+            }],
+            grant_allow: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn owner_principal_gate_matrix() {
+        // ADR-0070 §1 + PR #896 decision 1: owner trust opens connect only
+        // through an explicit `principal = "owner"` entry, only to its exact
+        // targets, and never for a pair that is not owner-trusted.
+        let (a, m) = pair();
+        let t22: SocketAddr = T22.parse().unwrap();
+        let t80: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let accept = Some(TrustDecision::Accept);
+
+        // Owner-trusted, no owner entry ⇒ denied.
+        let no_owner = enabled_acl_with("cd", "ef", &[T22]);
+        assert_eq!(
+            evaluate_connect_gate_for_principal(true, accept, &no_owner, &a, &m, true, &t22),
+            Err(ConnectDenialReason::AgentMachineNotInAcl)
+        );
+
+        let owner = owner_only_acl(&[T22]);
+        assert_eq!(
+            evaluate_connect_gate_for_principal(true, accept, &owner, &a, &m, true, &t22),
+            Ok(())
+        );
+        // Not owner-trusted ⇒ the owner entry does not name this pair.
+        assert_eq!(
+            evaluate_connect_gate_for_principal(true, accept, &owner, &a, &m, false, &t22),
+            Err(ConnectDenialReason::AgentMachineNotInAcl)
+        );
+        // Ports stay explicit.
+        assert_eq!(
+            evaluate_connect_gate_for_principal(true, accept, &owner, &a, &m, true, &t80),
+            Err(ConnectDenialReason::TargetNotAllowed)
+        );
+        // The legacy entry point never matches owner entries.
+        assert_eq!(
+            evaluate_connect_gate(true, accept, &owner, &a, &m, &t22),
+            Err(ConnectDenialReason::AgentMachineNotInAcl)
+        );
+        // The gate does not raise trust itself: a non-Accept decision is
+        // still refused first.
+        assert_eq!(
+            evaluate_connect_gate_for_principal(
+                true,
+                Some(TrustDecision::Unknown),
+                &owner,
+                &a,
+                &m,
+                true,
+                &t22
+            ),
+            Err(ConnectDenialReason::TrustRejected)
+        );
     }
 }
