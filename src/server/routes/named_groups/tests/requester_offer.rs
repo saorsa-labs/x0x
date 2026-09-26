@@ -340,11 +340,26 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     // (1) The strict send hits a FULL channel: no completion, no v2 ACK.
+    // Arm (2) below is the NEGATIVE CONTROL: with the channel drained,
+    // the SAME obligation, wire and gate deliver and B applies — so a
+    // keep here can only be the full channel withholding the ACK, never
+    // a gate refusal or a broken wire.
     requester_offer_step(&a).await;
     let kept =
         crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&a).await;
-    assert_eq!(kept.len(), 1, "full authority channel → obligation KEPT");
-    assert_eq!(kept[0].retry_count, 1, "the failed attempt was counted");
+    assert_eq!(
+        kept.iter().filter(|o| o.request_id == "req-r3").count(),
+        1,
+        "full authority channel → obligation KEPT"
+    );
+    assert_eq!(
+        kept.iter()
+            .find(|o| o.request_id == "req-r3")
+            .expect("req-r3 kept")
+            .retry_count,
+        1,
+        "the failed attempt was counted"
+    );
 
     // (2) DRAIN: the real consumer takes over and the retry delivers.
     let b_state = std::sync::Arc::clone(&b);
@@ -549,5 +564,227 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
         .expect("restore parent writable");
     a.agent.shutdown().await;
     b.agent.shutdown().await;
+    Ok(())
+}
+
+/// #942 r4 (bounded pass): with the full daemon cap of pending offers all
+/// due at once and an unreachable authority, ONE worker pass touches only
+/// REQUESTER_OFFER_PASS_BUDGET obligations — a pass can no longer spend
+/// minutes inside slow strict sends while a brand-new obligation waits.
+/// The untouched remainder stays due for the next tick. (Rule 9: removing
+/// the budget fails this test — every obligation gets its attempt.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pass_budget_bounds_one_workers_pass() -> Result<()> {
+    let plane = format!("req-offer-budget-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let group_id = "f7".repeat(16);
+    {
+        let info = x0x::groups::GroupInfo::with_policy(
+            "budget".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let dead_authority = "ff".repeat(32);
+    const TOTAL: usize = 64; // per-group cap is 64 — the max one group holds
+    for i in 0..TOTAL {
+        let req_id = format!("req-budget-{i}");
+        pending_join_request(&state, &group_id, &req_id, &local_hex).await;
+        let obligation = obligation_for(
+            &group_id,
+            &req_id,
+            &local_hex,
+            &dead_authority,
+            vec![i as u8; 96],
+        );
+        insert_requester_offer_obligation(&state, obligation)
+            .await
+            .expect("obligation persisted");
+    }
+    requester_offer_step(&state).await;
+    let snapshot =
+        crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&state)
+            .await;
+    assert_eq!(
+        snapshot.len(),
+        TOTAL,
+        "a failed send keeps every obligation"
+    );
+    let attempted = snapshot.iter().filter(|o| o.retry_count > 0).count();
+    assert_eq!(
+        attempted, 16,
+        "exactly one pass-budget of obligations was attempted in this pass"
+    );
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// #942 r4 (B6): a WITNESS that already holds the request via pubsub
+/// rejects the relayed copy — that rejection must ACK as an idempotent
+/// Duplicate, never an Err. Under r3 the Err made the authority retry the
+/// relay ten times and then prune the obligation as never-completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn witness_already_holding_replays_as_duplicate() -> Result<()> {
+    let plane = format!("req-offer-wit-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    // The group's creator is ANOTHER agent, so this daemon is a WITNESS.
+    let authority_kp = x0x::identity::AgentKeypair::generate()?;
+    let group_id = "e5".repeat(16);
+    let requester_kp = x0x::identity::AgentKeypair::generate()?;
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let (topic, commit) = {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "witness".to_string(),
+            String::new(),
+            authority_kp.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        // The authority's own seat, so the carrier (the authority) is an
+        // active admin for the relay-direction check.
+        info.add_member(
+            hex::encode(authority_kp.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Admin,
+            None,
+            None,
+        );
+        info.recompute_state_hash();
+        let commit = x0x::groups::GroupStateCommit::sign(
+            info.stable_group_id().to_string(),
+            info.state_revision + 1,
+            Some(info.state_hash.clone()),
+            x0x::groups::state_commit::compute_roster_root(&info.members_v2),
+            x0x::groups::state_commit::compute_policy_hash(&info.policy),
+            x0x::groups::state_commit::compute_public_meta_hash(&info.public_meta()),
+            info.security_binding.clone(),
+            false,
+            info.state_revision + 1,
+            &requester_kp,
+        )
+        .expect("sign commit");
+        let topic = info.metadata_topic.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        (topic, commit)
+    };
+    let envelope = sign_v2_envelope_b2(
+        &requester_kp,
+        &topic,
+        &NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: group_id.clone(),
+            request_id: "req-wit".to_string(),
+            requester_agent_id: requester_hex,
+            message: None,
+            ts: 0,
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit: Some(commit),
+        },
+    );
+    let mut dm_payload =
+        Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len());
+    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+    dm_payload.extend_from_slice(&envelope);
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // First delivery — carried by the AUTHORITY (the relay direction):
+    // the witness applies (accepted) → Inserted.
+    let (tx1, rx1) = tokio::sync::oneshot::channel();
+    let mut first = x0x::dm_inbox::DmTypedPayload {
+        sender: authority_kp.agent_id(),
+        machine_id: crate::identity::MachineId([0u8; 32]),
+        payload: dm_payload.clone(),
+        verified: true,
+        trust_decision: None,
+        received_at_unix_ms: 0,
+        request_id: [0u8; 16],
+        completion: None,
+    };
+    first.completion = Some(tx1);
+    crate::server::handle_predecessor_relay_typed_payload(&state, &local_hex, first).await;
+    assert_eq!(
+        rx1.await.expect("first completion"),
+        Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted),
+        "the first witness delivery applies durably"
+    );
+    // Second delivery: the request is already held — the apply rejects,
+    // and the relay must see an IDEMPOTENT Duplicate (r3 returned Err
+    // here, which retried the relay ten times and pruned it).
+    let (tx2, rx2) = tokio::sync::oneshot::channel();
+    let mut second = x0x::dm_inbox::DmTypedPayload {
+        sender: authority_kp.agent_id(),
+        machine_id: crate::identity::MachineId([0u8; 32]),
+        payload: dm_payload,
+        verified: true,
+        trust_decision: None,
+        received_at_unix_ms: 0,
+        request_id: [0u8; 16],
+        completion: None,
+    };
+    second.completion = Some(tx2);
+    crate::server::handle_predecessor_relay_typed_payload(&state, &local_hex, second).await;
+    assert_eq!(
+        rx2.await.expect("second completion"),
+        Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate),
+        "a witness that already holds the request ACKs idempotently"
+    );
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// #942 r4 (B6a): the dual-wire probe — a v2 capability binding means the
+/// strict wire; a contact card that self-reports v1 means the legacy wire;
+/// unknown defaults to strict (which fails fast and retries on schedule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_wire_probe_selects_legacy_for_v1_witnesses() -> Result<()> {
+    let plane = format!("req-offer-wire-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let v2_witness = x0x::identity::AgentKeypair::generate()?;
+    assert!(state.agent.capability_store().insert(
+        v2_witness.agent_id(),
+        crate::identity::MachineId([1; 32]),
+        crate::dm::DmCapabilities::v2_durable_gossip_ready(vec![7u8; 1184]),
+        crate::dm_capability::now_unix_ms(),
+    ));
+    assert!(
+        predecessor_relay_wire_version(&state, &v2_witness.agent_id()).await,
+        "a v2 binding uses the strict wire"
+    );
+    let v1_witness = x0x::identity::AgentKeypair::generate()?;
+    state
+        .agent
+        .contacts()
+        .write()
+        .await
+        .add(crate::contacts::Contact {
+            agent_id: v1_witness.agent_id(),
+            trust_level: crate::contacts::TrustLevel::Trusted,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: crate::contacts::IdentityType::Known,
+            machines: Vec::new(),
+            dm_capabilities: Some(crate::dm::DmCapabilities::v1_gossip_ready(vec![7u8; 1184])),
+        });
+    assert!(
+        !predecessor_relay_wire_version(&state, &v1_witness.agent_id()).await,
+        "a v1 contact card falls back to the legacy wire"
+    );
+    let stranger = x0x::identity::AgentKeypair::generate()?;
+    assert!(
+        predecessor_relay_wire_version(&state, &stranger.agent_id()).await,
+        "unknown defaults to the strict attempt"
+    );
+    state.agent.shutdown().await;
     Ok(())
 }

@@ -318,9 +318,21 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
             resolved.push(obligation);
         }
     }
+    // #942 r4 (bounded pass): oldest-due-first and a per-pass SEND
+    // budget — a hundred slow strict sends can no longer starve a
+    // brand-new obligation behind one 500 ms-tick pass. Unserved
+    // obligations stay due for the next tick.
+    let mut to_send = std::mem::take(&mut to_send);
+    to_send.sort_by_key(|o| o.next_retry_at_ms);
+    const REQUESTER_OFFER_PASS_BUDGET: usize = 16;
+    let mut pass_budget: usize = REQUESTER_OFFER_PASS_BUDGET;
     // (group_id, delivered) per send attempt.
     let mut attempts: Vec<(RequesterOfferObligation, bool)> = Vec::new();
     for obligation in to_send {
+        if pass_budget == 0 {
+            break;
+        }
+        pass_budget = pass_budget.saturating_sub(1);
         let Ok(authority) = parse_agent_id_hex(&obligation.authority_agent_id) else {
             attempts.push((obligation, false));
             continue;
