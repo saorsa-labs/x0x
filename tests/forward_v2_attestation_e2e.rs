@@ -9,6 +9,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/network_gate.rs"]
+mod network_gate;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -22,18 +25,14 @@ fn loopback_network_config() -> NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().unwrap()),
         bootstrap_nodes: Vec::new(),
         mdns_enabled: false,
+        // Loopback only: no UPnP IGD discovery on the runner's LAN.
+        port_mapping_enabled: false,
         ..NetworkConfig::default()
     }
 }
 
-fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("Operation not permitted")
-        && (message.contains("bind UDP socket")
-            || message.contains("network initialization failed"))
-}
-
 async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
+    network_gate::init_stream_tracing();
     match x0x::Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
         .with_agent_key_path(dir.path().join(format!("{name}-agent.key")))
@@ -44,7 +43,7 @@ async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
         .await
     {
         Ok(agent) => Some(agent),
-        Err(e) if is_network_bind_permission_error(&e) => None,
+        Err(e) if network_gate::skip_on_refused_network(&e) => None,
         Err(e) => panic!("agent build failed: {e}"),
     }
 }
@@ -227,6 +226,10 @@ async fn forward_v2_attestation_succeeds_on_loopback() {
             bob_stream.recv_mut().read_exact(&mut ping).await.unwrap();
             assert_eq!(&ping, b"ping");
             bob_stream.send_mut().write_all(b"pong").await.unwrap();
+            // ant-quic resets a send stream dropped without finish()
+            // (DROPPED_UNFINISHED_ERROR_CODE), which can discard "pong" before
+            // alice reads it once this branch ends. FIN it gracefully.
+            bob_stream.send_mut().finish().unwrap();
         }
     );
 }
