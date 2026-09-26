@@ -361,3 +361,85 @@ async fn replay_persistence_excludes_cross_group_roster_transaction() {
         "group-B-committed-after-replay"
     );
 }
+
+// #969: replay already owns P and G when a signed approval conflicts with a
+// durably retained sibling. The fork-evidence install must reuse that G write
+// permit; reacquiring the non-reentrant lock strands the entire causal drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_causal_replay_installs_fork_evidence_without_reacquiring_gss_gate() {
+    let (state, _dir) = secure_endpoint_test_state().await.expect("secure state");
+    let requester = AgentKeypair::generate().expect("requester keypair");
+    let requester_hex = hex::encode(requester.agent_id().as_bytes());
+    let group_id = "c3d1".repeat(8);
+    let request_id = install_group_with_pending_request(&state, &group_id, &requester_hex).await;
+    let signer = state.agent.identity().agent_keypair();
+    let base = {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("group");
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        info.seal_commit(signer, now_millis_u64())
+            .expect("retained base commit");
+        info.clone()
+    };
+    assert_eq!(
+        save_named_groups_checked(&state)
+            .await
+            .expect("persist base"),
+        AtomicWriteOutcome::Durable
+    );
+    queue_real_approval(
+        &state,
+        &group_id,
+        &request_id,
+        &requester_hex,
+        now_millis_u64(),
+    )
+    .await;
+
+    let mut sibling = base;
+    sibling.description = "durable sibling before replay".to_string();
+    sibling.roster_revision = sibling.roster_revision.saturating_add(1);
+    sibling
+        .seal_commit(signer, now_millis_u64())
+        .expect("seal competing revision");
+    assert_eq!(
+        persist_named_group_info(&state, &group_id, sibling)
+            .await
+            .expect("persist sibling"),
+        AtomicWriteOutcome::Durable
+    );
+
+    let replay_state = Arc::clone(&state);
+    let replay_group = group_id.clone();
+    let mut replay = tokio::spawn(async move {
+        let mut cleared_quarantine = std::collections::BTreeSet::new();
+        replay_pending_causal_approvals(&replay_state, &replay_group, &mut cleared_quarantine)
+            .await;
+    });
+    let completed = timeout(Duration::from_secs(10), &mut replay).await;
+    if completed.is_err() {
+        replay.abort();
+        panic!("conflicting causal replay reacquired its own GSS publication writer");
+    }
+    completed.expect("bounded replay").expect("replay task");
+
+    let groups = state.named_groups.read().await;
+    let info = &groups[&group_id];
+    assert!(info.fork_quarantine.is_some(), "conflict quarantined");
+    assert_eq!(
+        info.join_requests[&request_id].status,
+        x0x::groups::JoinRequestStatus::Pending,
+        "conflicting approval must not seat requester"
+    );
+    drop(groups);
+    let durable: HashMap<String, GroupInfo> = serde_json::from_slice(
+        &tokio::fs::read(&state.named_groups_path)
+            .await
+            .expect("read durable roster"),
+    )
+    .expect("decode durable roster");
+    assert!(
+        durable[&group_id].fork_quarantine.is_some(),
+        "fork evidence reached durable roster"
+    );
+}

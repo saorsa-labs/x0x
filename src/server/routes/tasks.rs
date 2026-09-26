@@ -171,9 +171,9 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// under disputed membership even when the CRDT data itself is recoverable
 /// (the ADR's own answer to the warn-only argument it rejected).
 ///
-/// The refusal goes through the single slice-1 helper, so it carries the §5
-/// body — machine `reason`, the human sentence, and the manual-clear remedy
-/// — and bumps `fork_quarantine_refusals` exactly once (§3e).
+/// The refusal goes through the shared marker gate and bumps
+/// `fork_quarantine_refusals` once. Sessions without an active local seat
+/// receive only a membership error; durable operators retain the §5 body.
 ///
 /// WHY it runs BEFORE [`ensure_task_list_access`] rather than after: #153's
 /// guard resolves the group with a single-spelling `named_groups.get(id)`, so
@@ -181,22 +181,28 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// request naming the stable id. Ordering the quarantine check after it would
 /// make the alias case fail closed for the wrong, undiagnosable reason — the
 /// exact "right outcome, wrong reason" defect slice 3 found on row 18 — and
-/// R5's condition for removing the warn-only window was that the user always
-/// learns WHY. Containment is a property of the group's contested state, not
-/// of who is asking, and these are daemon-local control-plane endpoints
-/// authenticated by the daemon's own token, so there is no third party to
-/// leak the marker to. Slice 3 set the same precedent on
+/// R5's condition for removing the warn-only window was that an authorized
+/// operator learns WHY. A session without a local seat must not inspect the
+/// marker, even though quarantine containment remains unconditional. Slice 3
+/// set the same precedence on
 /// `delegate_group_authority`, where the quarantine refusal precedes the
 /// ban/role checks.
 async fn reject_quarantined_task_mutation(
     state: &Arc<AppState>,
     id: &str,
+    actor: &crate::server::rider_auth::ActorContext,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let (group_id, marker) = task_list_fork_quarantine(state, id).await?;
-    Some(
-        crate::server::routes::named_groups::reject_fork_quarantined_marker(
-            state, &group_id, &marker,
-        ),
+    let scoped = parse_group_scoped_task_list_id(id)?;
+    if scoped.is_malformed() {
+        return None;
+    }
+    let groups = state.named_groups.read().await;
+    let (_, info) = crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)?;
+    crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+        state,
+        &scoped.group_id,
+        info,
+        actor,
     )
 }
 
@@ -288,6 +294,13 @@ pub(in crate::server) async fn group_task_list_binding(
     id: &str,
 ) -> x0x::TaskListBinding {
     let mut binding = x0x::TaskListBinding::default();
+    if legacy_space_board_prefix(id).is_some() {
+        // #895 (omp finding 1): a legacy plaintext board answers state
+        // requests only from members of its group, and not at all once
+        // this node has migrated it.
+        binding.state_serve_gate = Some(legacy_board_serve_gate(state, id));
+        return binding;
+    }
     let Some(scoped) = parse_group_scoped_task_list_id(id) else {
         return binding;
     };
@@ -295,11 +308,261 @@ pub(in crate::server) async fn group_task_list_binding(
         return binding;
     }
     binding.authorized_agents = active_group_members(state, &scoped.group_id).await;
+    // #895: installed for EVERY group-scoped id, including one whose group
+    // this node cannot resolve yet — the protector resolves live and fails
+    // closed (no publish, no merge) until the group is known.
+    binding.delta_protector = Some(std::sync::Arc::new(GroupTaskDeltaProtector {
+        state: Arc::downgrade(state),
+        group_id: scoped.group_id.clone(),
+        topic: id.to_string(),
+    }));
     binding.ingest_gate = Some(std::sync::Arc::new(TaskQuarantineIngestGate {
         state: Arc::downgrade(state),
         group_id: scoped.group_id,
     }));
     binding
+}
+
+/// #895: seals a group-scoped task list's wire payloads with its group's
+/// CURRENT key, using exactly the mechanism the group's KV stores use:
+///
+/// - `MlsEncrypted` on the GSS plane: [`x0x::crdt::sealed::seal_gss_task_payload`]
+///   (current shared-secret epoch; AAD binds group, record id and epoch).
+/// - `MlsEncrypted` on the TreeKEM plane: the live TreeKEM store protector
+///   ([`super::stores::treekem_task_list_protector`]).
+/// - `SignedPublic`: plaintext, as before (the group's content is public).
+/// - Unresolvable group: fail closed — nothing is sealed, opened or admitted.
+///
+/// Resolved on EVERY call, through the one both-spellings resolver, so a GSS
+/// rotation or TreeKEM commit (e.g. on member removal) applies to the very
+/// next delta.
+struct GroupTaskDeltaProtector {
+    state: std::sync::Weak<AppState>,
+    /// The group as spelled in the list id.
+    group_id: String,
+    /// The list id, which is also its gossip topic.
+    topic: String,
+}
+
+/// The group a task list is bound to, as this node holds it right now.
+enum TaskListPlane {
+    Public,
+    Gss(Box<x0x::groups::GroupInfo>),
+    TreeKem(x0x::kv::SharedTreeKemKvProtector, String),
+}
+
+impl GroupTaskDeltaProtector {
+    async fn plane(&self) -> x0x::crdt::Result<(Arc<AppState>, TaskListPlane)> {
+        let unavailable =
+            |why: &str| x0x::crdt::CrdtError::Gossip(format!("group task list sealing: {why}"));
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| unavailable("daemon is shutting down"))?;
+        let (group_key, info) = {
+            let groups = state.named_groups.read().await;
+            let (key, info) = crate::server::resolve_group_entry_locked(&groups, &self.group_id)
+                .ok_or_else(|| unavailable("group is not known on this node"))?;
+            (key.to_string(), info.clone())
+        };
+        if info.withdrawn {
+            return Err(unavailable("group is withdrawn"));
+        }
+        let plane = match info.policy.confidentiality {
+            x0x::groups::GroupConfidentiality::SignedPublic => TaskListPlane::Public,
+            x0x::groups::GroupConfidentiality::MlsEncrypted => match info.secure_plane {
+                x0x::mls::SecureGroupPlane::Gss => TaskListPlane::Gss(Box::new(info)),
+                x0x::mls::SecureGroupPlane::TreeKem => {
+                    let stable = info.stable_group_id().to_string();
+                    let protector =
+                        super::stores::treekem_task_list_protector(&state, &group_key, &info)
+                            .ok_or_else(|| unavailable("TreeKEM group is not eligible"))?;
+                    TaskListPlane::TreeKem(protector, stable)
+                }
+            },
+        };
+        Ok((state, plane))
+    }
+}
+
+impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
+    fn seal<'a>(
+        &'a self,
+        kind: x0x::kv::KvMutationKind,
+        payload: &'a [u8],
+    ) -> x0x::crdt::sealed::TaskSealFuture<'a, Option<x0x::crdt::sealed::SealedTaskRecordBody>>
+    {
+        Box::pin(async move {
+            let (state, plane) = self.plane().await?;
+            let signing =
+                x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+                    .map_err(|e| {
+                        x0x::crdt::CrdtError::Gossip(format!("task author signing: {e}"))
+                    })?;
+            match plane {
+                TaskListPlane::Public => Ok(None),
+                TaskListPlane::Gss(info) => x0x::crdt::sealed::seal_gss_task_payload(
+                    &info,
+                    &signing,
+                    kind,
+                    &self.topic,
+                    payload,
+                )
+                .map(Some),
+                TaskListPlane::TreeKem(protector, stable) => {
+                    let record_id =
+                        x0x::crdt::sealed::group_task_list_record_id(&stable, &self.topic);
+                    protector
+                        .seal_record(&signing, kind, &record_id, payload, false)
+                        .await
+                        .map(|record| {
+                            Some(x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record))
+                        })
+                        .map_err(|e| {
+                            x0x::crdt::CrdtError::Gossip(format!("TreeKEM task seal: {e}"))
+                        })
+                }
+            }
+        })
+    }
+
+    fn open<'a>(
+        &'a self,
+        body: &'a x0x::crdt::sealed::SealedTaskRecordBody,
+    ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::sealed::OpenedTaskPayload> {
+        Box::pin(async move {
+            let (_, plane) = self.plane().await?;
+            match (plane, body) {
+                (
+                    TaskListPlane::Gss(info),
+                    x0x::crdt::sealed::SealedTaskRecordBody::Gss(record),
+                ) => x0x::crdt::sealed::open_gss_task_record(&info, &self.topic, record),
+                (
+                    TaskListPlane::TreeKem(protector, stable),
+                    x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record),
+                ) => {
+                    let record_id =
+                        x0x::crdt::sealed::group_task_list_record_id(&stable, &self.topic);
+                    let opened = protector
+                        .open_record(&record_id, record)
+                        .await
+                        .map_err(|e| {
+                            x0x::crdt::CrdtError::Gossip(format!("TreeKEM task open: {e}"))
+                        })?;
+                    // `open_record` already required a current WRITER for a
+                    // non-read-only record; a read-only one is never content.
+                    x0x::crdt::sealed::accept_opened(
+                        opened.mutation.kind,
+                        !opened.reader_only,
+                        opened.mutation.author_id,
+                        opened.mutation.payload,
+                    )
+                }
+                _ => Err(x0x::crdt::CrdtError::Gossip(
+                    "sealed task record does not match the group's current plane".to_string(),
+                )),
+            }
+        })
+    }
+
+    fn admits_plaintext(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move { matches!(self.plane().await, Ok((_, TaskListPlane::Public))) })
+    }
+
+    fn on_rejected(&self, reason: x0x::crdt::TaskSealRejection) {
+        if let Some(state) = self.state.upgrade() {
+            state
+                .groups_diagnostics
+                .record_task_delta_seal_rejected(&self.group_id);
+            tracing::debug!(group_id = %self.group_id, ?reason, "[tasks] task delta refused (#895)");
+        }
+    }
+
+    fn local_agent(&self) -> Option<x0x::identity::AgentId> {
+        self.state.upgrade().map(|state| state.agent.agent_id())
+    }
+
+    /// #975: a sealed record is published only while the epoch it was
+    /// sealed under is still current, and the epoch is held fixed through the
+    /// publish call.
+    ///
+    /// - GSS: the daemon's GSS publication gate (#973). Every authoritative
+    ///   roster commit holds it exclusively from installing the rotated
+    ///   secret through durable save or rollback, so under a read permit the
+    ///   live `secret_epoch` cannot move.
+    /// - TreeKEM: the group's membership lock, then its live ratchet mutex —
+    ///   the same order `seal_record` takes them. Every ratchet epoch change
+    ///   needs the ratchet mutex.
+    ///
+    /// Called with no lock held (after `seal` has returned), and takes each
+    /// lock once: nothing here re-enters a lock the caller or `seal` holds.
+    fn confirm_publication<'a>(
+        &'a self,
+        body: &'a x0x::crdt::sealed::SealedTaskRecordBody,
+    ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::TaskPublication> {
+        Box::pin(async move {
+            let unavailable = |why: &str| {
+                x0x::crdt::CrdtError::Gossip(format!("group task list publication: {why}"))
+            };
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| unavailable("daemon is shutting down"))?;
+            match body {
+                x0x::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
+                    let permit = Arc::clone(&state.gss_publication_gate).read_owned().await;
+                    let current = {
+                        let groups = state.named_groups.read().await;
+                        crate::server::resolve_group_entry_locked(&groups, &self.group_id).map(
+                            |(_, info)| {
+                                (
+                                    info.secret_epoch,
+                                    info.secure_plane == x0x::mls::SecureGroupPlane::Gss,
+                                )
+                            },
+                        )
+                    };
+                    let (current_epoch, still_gss) =
+                        current.ok_or_else(|| unavailable("group is not known"))?;
+                    Ok(if still_gss && current_epoch == record.epoch {
+                        x0x::crdt::TaskPublication::Current(
+                            x0x::crdt::TaskPublicationPermit::holding(permit),
+                        )
+                    } else {
+                        x0x::crdt::TaskPublication::Stale
+                    })
+                }
+                x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record) => {
+                    let group_key = {
+                        let groups = state.named_groups.read().await;
+                        crate::server::resolve_group_entry_locked(&groups, &self.group_id)
+                            .map(|(key, _)| key.to_string())
+                    };
+                    let group_key = group_key.ok_or_else(|| unavailable("group is not known"))?;
+                    let membership =
+                        super::named_groups::group_membership_lock(&state, &group_key).await;
+                    let membership_guard = membership.lock_owned().await;
+                    let live = state
+                        .treekem_groups
+                        .read()
+                        .await
+                        .get(&group_key)
+                        .cloned()
+                        .ok_or_else(|| unavailable("live TreeKEM ratchet is unavailable"))?;
+                    let ratchet = live.lock_owned().await;
+                    Ok(if ratchet.epoch() == record.epoch {
+                        x0x::crdt::TaskPublication::Current(
+                            x0x::crdt::TaskPublicationPermit::holding((membership_guard, ratchet)),
+                        )
+                    } else {
+                        x0x::crdt::TaskPublication::Stale
+                    })
+                }
+            }
+        })
+    }
 }
 
 /// ADR-0068 D2: the inbound-delta admission gate for a group-scoped task list.
@@ -663,6 +926,9 @@ pub(in crate::server) async fn list_task_lists(
 /// POST /task-lists
 pub(in crate::server) async fn create_task_list(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<CreateTaskListRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: binding a NEW task list to a contested roster is
@@ -671,7 +937,7 @@ pub(in crate::server) async fn create_task_list(
     // writes a durable subscription registration and starts a sync listener
     // that publishes deltas on the group's topic. Refusing here means none
     // of that happens: no handle, no manifest row, no listener.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &req.topic).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &req.topic, &actor).await {
         return refused;
     }
     // #153: creating a group-scoped task list requires membership of that group.
@@ -679,6 +945,14 @@ pub(in crate::server) async fn create_task_list(
         return denied;
     }
     let id = req.topic.clone();
+    // #895: a legacy board this node migrated stays retired — an old GUI tab
+    // must not bring its plaintext sync back.
+    if legacy_space_board_retired(&state, &id).await {
+        return api_error(
+            StatusCode::GONE,
+            "this space board moved to the group's encrypted list (#895)",
+        );
+    }
     // Reserve the entire handle+manifest transaction for this (kind,id) so
     // a concurrent create/rehydrate for the same id cannot interleave handle
     // insertion with failure rollback, or spawn a duplicate listener.
@@ -771,6 +1045,190 @@ pub(in crate::server) async fn create_task_list(
     }
 }
 
+/// #895: the list segment of a GUI space Board's group-scoped id,
+/// `x0x.group.<gid>.symphony.board`.
+const SPACE_BOARD_LIST: &str = "board";
+
+/// #895: for a space Board id, the legacy PLAINTEXT board id the GUI used
+/// before the Board moved to the group-scoped (sealed) list:
+/// `x0x-board-<first 16 chars of the group id>`. `None` for any other list.
+pub(in crate::server) fn legacy_space_board_id(id: &str) -> Option<String> {
+    let scoped = parse_group_scoped_task_list_id(id)?;
+    if scoped.is_malformed() || scoped.list_id != SPACE_BOARD_LIST {
+        return None;
+    }
+    let prefix = scoped.group_id.get(..16).unwrap_or(&scoped.group_id);
+    Some(format!("x0x-board-{prefix}"))
+}
+
+/// #895: the durable "this node has migrated this board" marker, keyed by
+/// the LEGACY board id so both the migration and the legacy list's
+/// retirement (serve gate, rehydration, re-creation) can find it.
+fn space_board_migration_marker(state: &AppState, legacy_id: &str) -> std::path::PathBuf {
+    state.task_list_state_dir.join(format!(
+        "board-migration-{}.done",
+        blake3::hash(legacy_id.as_bytes()).to_hex()
+    ))
+}
+
+/// #895: the group-id prefix of a legacy plaintext space board id
+/// (`x0x-board-<first 16 chars of the group id>`), or `None`.
+fn legacy_space_board_prefix(id: &str) -> Option<&str> {
+    id.strip_prefix("x0x-board-")
+        .filter(|prefix| !prefix.is_empty())
+}
+
+/// #895: whether this node has migrated — and so retired — the legacy
+/// plaintext board `id`. `false` for any other list.
+pub(in crate::server) async fn legacy_space_board_retired(state: &AppState, id: &str) -> bool {
+    legacy_space_board_prefix(id).is_some()
+        && tokio::fs::try_exists(space_board_migration_marker(state, id))
+            .await
+            .unwrap_or(false)
+}
+
+/// #895: whether `sender` is an ACTIVE member of the group a legacy board id
+/// abbreviates (a group whose map key or stable id starts with the prefix).
+/// An unsigned request, an unknown group or a non-member answers `false`.
+pub(in crate::server) fn legacy_board_requester_is_member(
+    groups: &std::collections::HashMap<String, x0x::groups::GroupInfo>,
+    legacy_id: &str,
+    sender: Option<&x0x::identity::AgentId>,
+) -> bool {
+    let (Some(prefix), Some(sender)) = (legacy_space_board_prefix(legacy_id), sender) else {
+        return false;
+    };
+    let sender_hex = hex::encode(sender.as_bytes());
+    groups.iter().any(|(key, info)| {
+        (key.starts_with(prefix) || info.stable_group_id().starts_with(prefix))
+            && info.has_active_member(&sender_hex)
+    })
+}
+
+/// #895: the state-serve gate for a legacy plaintext board. It answers a
+/// `StateRequest` only from an active member of the board's group, and
+/// never once this node has migrated (retired) the board — so a non-member
+/// that derives the topic cannot make a holder broadcast the list.
+fn legacy_board_serve_gate(state: &Arc<AppState>, legacy_id: &str) -> x0x::crdt::StateServeGate {
+    let weak = Arc::downgrade(state);
+    let legacy_id = legacy_id.to_string();
+    Arc::new(move |sender: Option<x0x::identity::AgentId>| {
+        let weak = weak.clone();
+        let legacy_id = legacy_id.clone();
+        Box::pin(async move {
+            let Some(state) = weak.upgrade() else {
+                return false;
+            };
+            if legacy_space_board_retired(&state, &legacy_id).await {
+                return false;
+            }
+            let groups = state.named_groups.read().await;
+            legacy_board_requester_is_member(&groups, &legacy_id, sender.as_ref())
+        })
+    })
+}
+
+/// #895 (David, 2026-09-25): whether `agent` may write under the group's
+/// write policy — the same rule the group's encrypted stores and the task
+/// protector apply (active member; `AdminOnly` ⇒ admin or above;
+/// `ModeratedPublic` ⇒ nobody).
+fn may_write_group(info: &x0x::groups::GroupInfo, agent: &x0x::identity::AgentId) -> bool {
+    let Some(member) = info.members_v2.get(&hex::encode(agent.as_bytes())) else {
+        return false;
+    };
+    if !member.is_active() {
+        return false;
+    }
+    match info.policy.write_access {
+        x0x::groups::GroupWriteAccess::MembersOnly => true,
+        x0x::groups::GroupWriteAccess::AdminOnly => {
+            member.role.at_least(x0x::groups::GroupRole::Admin)
+        }
+        x0x::groups::GroupWriteAccess::ModeratedPublic => false,
+    }
+}
+
+/// #895: copy the legacy plaintext space Board into its group-scoped
+/// (sealed) list exactly once, then RETIRE the legacy list on this node.
+/// Returns `true` when the board needs no migration on this node (not a
+/// board, already migrated, or migrated now).
+///
+/// - Only a member with write permission migrates; anyone else gets `false`
+///   and the caller reports `board_migration_pending`.
+/// - Idempotent: the durable marker short-circuits re-runs, and the copy
+///   keeps each task's id, so a crash before the marker, or two members
+///   migrating concurrently, converge instead of duplicating.
+/// - A node that does not hold the legacy list has nothing to copy and
+///   records the marker.
+/// - Retirement (omp review finding 1): once the marker is durable, the
+///   legacy sync is cancelled (no more state serves, publishes or listening;
+///   its subscriptions drop with its loops) and its handle deregistered. The
+///   marker also keeps it from being rehydrated at boot or re-created via
+///   REST. Its local snapshot and manifest row stay on disk.
+pub(in crate::server) async fn migrate_space_board_once(state: &Arc<AppState>, id: &str) -> bool {
+    let Some(legacy) = legacy_space_board_id(id) else {
+        return true;
+    };
+    let marker = space_board_migration_marker(state, &legacy);
+    if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+        retire_legacy_space_board(state, &legacy).await;
+        return true;
+    }
+    let Some(scoped) = parse_group_scoped_task_list_id(id) else {
+        return true;
+    };
+    let may_write = {
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)
+            .is_some_and(|(_, info)| may_write_group(info, &state.agent.agent_id()))
+    };
+    if !may_write {
+        return false;
+    }
+    let (target, source) = {
+        let lists = state.task_lists.read().await;
+        (lists.get(id).cloned(), lists.get(&legacy).cloned())
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    if let Some(source) = source {
+        match target.import_tasks_from(&source).await {
+            Ok(copied) => tracing::info!(
+                board = %id,
+                legacy = %legacy,
+                copied,
+                "[tasks] migrated the legacy plaintext space board (#895)"
+            ),
+            Err(e) => {
+                tracing::warn!(board = %id, "space board migration failed (#895): {e}");
+                return false;
+            }
+        }
+    }
+    if let Err(e) = tokio::fs::write(&marker, b"").await {
+        tracing::warn!(board = %id, "space board migration marker write failed: {e}");
+        return false;
+    }
+    retire_legacy_space_board(state, &legacy).await;
+    true
+}
+
+/// #895: stop the legacy plaintext board's sync on this node and deregister
+/// its live handle. The snapshot and manifest row are kept (local data is
+/// not deleted in this slice). Idempotent.
+async fn retire_legacy_space_board(state: &AppState, legacy: &str) {
+    // Read first: this runs on every board poll once migrated.
+    if !state.task_lists.read().await.contains_key(legacy) {
+        return;
+    }
+    let retired = state.task_lists.write().await.remove(legacy);
+    if let Some(handle) = retired {
+        handle.cancel_sync_and_drain().await;
+        tracing::info!(legacy = %legacy, "[tasks] retired the legacy plaintext space board (#895)");
+    }
+}
+
 /// GET /task-lists/:id/tasks
 pub(in crate::server) async fn list_tasks(
     State(state): State<Arc<AppState>>,
@@ -783,6 +1241,9 @@ pub(in crate::server) async fn list_tasks(
     // ADR-0066 §3c row 20 (read half): resolved before the task-list lock is
     // taken, so the roster read never nests inside it.
     let quarantine = task_list_fork_quarantine(&state, &id).await;
+    // #895: a space Board's first access copies the legacy plaintext board in
+    // once (a mutation, so never while the roster is contested).
+    let board_migrated = quarantine.is_some() || migrate_space_board_once(&state, &id).await;
     let lists = state.task_lists.read().await;
     let Some(handle) = lists.get(&id) else {
         return not_found("task list not found");
@@ -805,12 +1266,24 @@ pub(in crate::server) async fn list_tasks(
                     completed_at: t.completed_at,
                 })
                 .collect();
+            let entries_empty = entries.is_empty();
             let mut body = serde_json::json!({
                 "ok": true,
                 "version": fence.revision,
                 "fence_token": fence.to_wire(),
                 "tasks": entries,
             });
+            // #895: a reader (or a writer that could not migrate yet) sees an
+            // explicit pending state instead of an unexplained empty board.
+            // Absent for every other list.
+            if !board_migrated && entries_empty {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "board_migration_pending".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+            }
             // ADR-0066 §3c row 20 (read half): reads are NEVER refused —
             // containment must not blind the operator who is reading the
             // list to work out what the contested roster has been doing —
@@ -839,6 +1312,9 @@ pub(in crate::server) async fn list_tasks(
 pub(in crate::server) async fn add_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<AddTaskRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: refuse BEFORE the handle is resolved, so nothing
@@ -846,7 +1322,7 @@ pub(in crate::server) async fn add_task(
     // snapshot or publish a delta. The ordering is observable: on a
     // quarantined group this returns 409 even for a list this daemon does
     // not hold, where the ungated path returns 404.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &id, &actor).await {
         return refused;
     }
     // #153: group-scoped task lists require local-agent membership (write too).
@@ -879,6 +1355,9 @@ pub(in crate::server) async fn add_task(
 pub(in crate::server) async fn update_task(
     State(state): State<Arc<AppState>>,
     Path((id, tid)): Path<(String, String)>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
     // ADR-0066 §3c row 20: claim/complete is a mutation, refused before any
@@ -891,7 +1370,7 @@ pub(in crate::server) async fn update_task(
     // first, a quarantined group produces exactly ONE refusal and one
     // `fork_quarantine_refusals` increment, and row 17's check stays wired
     // for the case where a future change narrows row 20's scope.
-    if let Some(refused) = reject_quarantined_task_mutation(&state, &id).await {
+    if let Some(refused) = reject_quarantined_task_mutation(&state, &id, &actor).await {
         return refused;
     }
     // #153: group-scoped task lists require local-agent membership (write too).
@@ -961,19 +1440,24 @@ pub(in crate::server) async fn update_task(
         // delegation-cited branch — gating group task mutations generally
         // is row 20 (§3c, slice 5) and is not this slice's business.
         //
-        // §5 says row 17 refuses with the full body, so the refusal goes
-        // through the shared helper rather than the local `forbidden`
-        // mapping: the caller gets the 409, the `fork_quarantined` reason
-        // and the remedy, not a bare 403.
-        let quarantine =
-            crate::server::delegations::fork_quarantine_marker(&state, &scoped.group_id).await;
-        if let Some(marker) = &quarantine {
-            return crate::server::routes::named_groups::reject_fork_quarantined_marker(
-                &state,
-                &scoped.group_id,
-                marker,
-            );
+        // Row 17 uses the shared helper. The marker and local seat are read
+        // together, so a nonmember session cannot inspect contested details.
+        let groups = state.named_groups.read().await;
+        if let Some((_, info)) =
+            crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)
+        {
+            if let Some(refused) =
+                crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+                    &state,
+                    &scoped.group_id,
+                    info,
+                    &actor,
+                )
+            {
+                return refused;
+            }
         }
+        drop(groups);
         let committed =
             crate::server::delegations::committed_delegations(&state, &scoped.group_id).await;
         let sd = committed
@@ -994,17 +1478,14 @@ pub(in crate::server) async fn update_task(
             &committed,
             // Proven `None` by the refusal above; passed rather than
             // hard-coded so the predicate's gate stays wired here.
-            quarantine.as_ref(),
+            None,
         ) {
             return forbidden(format!("delegation does not authorize this action: {why}"));
         }
         let active = crate::server::delegations::active_members_of(&state, &scoped.group_id).await;
-        if let Err(why) = crate::server::delegations::chain_members_active(
-            sd,
-            &committed,
-            &active,
-            quarantine.as_ref(),
-        ) {
+        if let Err(why) =
+            crate::server::delegations::chain_members_active(sd, &committed, &active, None)
+        {
             return forbidden(format!("delegation chain no longer active: {why}"));
         }
         authorized_via = Some(hex::encode(sd.delegation.from_agent.as_bytes()));
@@ -1263,5 +1744,534 @@ mod tests {
             std::collections::BTreeSet::from(["pruned-alias".to_string()]),
             "an unresolvable spelling keeps the pre-#759 exact-match behavior"
         );
+    }
+
+    /// #975: a task delta sealed under a group epoch must never be published
+    /// after a member removal has moved the group past that epoch — the
+    /// removed member still holds the old key and would read it.
+    ///
+    /// The interleaving is forced, not slept into: [`PauseAfterSeal`] wraps
+    /// the PRODUCTION protector and parks the publisher right after its seal
+    /// returns, the test commits the removal, then releases the publisher.
+    mod publication_epoch_975 {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use x0x::crdt::sealed::{decode_sealed_task_record, SealedTaskRecordBody};
+        use x0x::identity::AgentId;
+
+        const BOUND: Duration = Duration::from_secs(20);
+
+        type Hook = (
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        );
+
+        /// Delegates everything to the production protector; the first
+        /// `seal` after [`arm`](Self::arm) signals and then waits to be
+        /// released before returning its (already sealed) record.
+        struct PauseAfterSeal {
+            inner: Arc<dyn x0x::crdt::TaskDeltaProtector>,
+            hook: std::sync::Mutex<Option<Hook>>,
+            seals: AtomicUsize,
+        }
+
+        impl PauseAfterSeal {
+            fn arm(
+                &self,
+            ) -> (
+                tokio::sync::oneshot::Receiver<()>,
+                tokio::sync::oneshot::Sender<()>,
+            ) {
+                let (sealed_tx, sealed_rx) = tokio::sync::oneshot::channel();
+                let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+                *self.hook.lock().expect("hook") = Some((sealed_tx, resume_rx));
+                (sealed_rx, resume_tx)
+            }
+
+            fn seals(&self) -> usize {
+                self.seals.load(Ordering::SeqCst)
+            }
+        }
+
+        impl x0x::crdt::TaskDeltaProtector for PauseAfterSeal {
+            fn seal<'a>(
+                &'a self,
+                kind: x0x::kv::KvMutationKind,
+                payload: &'a [u8],
+            ) -> x0x::crdt::sealed::TaskSealFuture<'a, Option<SealedTaskRecordBody>> {
+                Box::pin(async move {
+                    let sealed = self.inner.seal(kind, payload).await;
+                    self.seals.fetch_add(1, Ordering::SeqCst);
+                    let hook = self.hook.lock().expect("hook").take();
+                    if let Some((sealed_tx, resume_rx)) = hook {
+                        let _ = sealed_tx.send(());
+                        let _ = resume_rx.await;
+                    }
+                    sealed
+                })
+            }
+
+            fn open<'a>(
+                &'a self,
+                body: &'a SealedTaskRecordBody,
+            ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::sealed::OpenedTaskPayload>
+            {
+                self.inner.open(body)
+            }
+
+            fn admits_plaintext(
+                &self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>
+            {
+                self.inner.admits_plaintext()
+            }
+
+            fn on_rejected(&self, reason: x0x::crdt::TaskSealRejection) {
+                self.inner.on_rejected(reason);
+            }
+
+            fn local_agent(&self) -> Option<AgentId> {
+                self.inner.local_agent()
+            }
+
+            fn confirm_publication<'a>(
+                &'a self,
+                body: &'a SealedTaskRecordBody,
+            ) -> x0x::crdt::sealed::TaskSealFuture<'a, x0x::crdt::TaskPublication> {
+                self.inner.confirm_publication(body)
+            }
+        }
+
+        fn test_network_config() -> x0x::network::NetworkConfig {
+            x0x::network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..x0x::network::NetworkConfig::default()
+            }
+        }
+
+        async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let data_dir = dir.path().to_path_buf();
+            let agent = Arc::new(
+                x0x::Agent::builder()
+                    .with_identity_dir(&data_dir)
+                    .with_machine_key(data_dir.join("machine.key"))
+                    .with_agent_key(x0x::identity::AgentKeypair::generate().expect("agent key"))
+                    .with_agent_cert_path(data_dir.join("agent.cert"))
+                    .with_peer_cache_disabled()
+                    .with_contact_store_path(data_dir.join("contacts.json"))
+                    .with_network_config(test_network_config())
+                    .build()
+                    .await
+                    .expect("agent"),
+            );
+            let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+                &data_dir, agent,
+            )
+            .await
+            .expect("state");
+            (state, dir)
+        }
+
+        /// A sync for `topic` carrying the production protector wrapped in
+        /// [`PauseAfterSeal`], and a pubsub the test can subscribe to.
+        async fn sealed_sync(
+            state: &Arc<AppState>,
+            topic: &str,
+        ) -> (
+            Arc<x0x::crdt::TaskListSync>,
+            Arc<x0x::gossip::PubSubManager>,
+            Arc<PauseAfterSeal>,
+        ) {
+            let node = Arc::new(
+                x0x::network::NetworkNode::new(test_network_config(), None, None)
+                    .await
+                    .expect("node"),
+            );
+            let pubsub = Arc::new(x0x::gossip::PubSubManager::new(node, None).expect("pubsub"));
+            let peer = saorsa_gossip_types::PeerId::new([1; 32]);
+            let list = x0x::crdt::TaskList::new(
+                x0x::crdt::TaskListId::new([9; 32]),
+                "Board".to_string(),
+                peer,
+            );
+            let sync =
+                x0x::crdt::TaskListSync::new(list, Arc::clone(&pubsub), topic.to_string(), peer)
+                    .expect("sync");
+            let inner = group_task_list_binding(state, topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            let protector = Arc::new(PauseAfterSeal {
+                inner,
+                hook: std::sync::Mutex::new(None),
+                seals: AtomicUsize::new(0),
+            });
+            assert!(sync.install_protector(Arc::clone(&protector) as _));
+            (Arc::new(sync), pubsub, protector)
+        }
+
+        fn spawn_publish(
+            sync: &Arc<x0x::crdt::TaskListSync>,
+        ) -> tokio::task::JoinHandle<x0x::crdt::Result<()>> {
+            let sync = Arc::clone(sync);
+            tokio::spawn(async move {
+                sync.publish_delta(
+                    saorsa_gossip_types::PeerId::new([1; 32]),
+                    x0x::crdt::TaskListDelta::new(1),
+                )
+                .await
+            })
+        }
+
+        /// A GSS group owned by this node with `removed` seated; returns the
+        /// group as it stands BEFORE the removal (what `removed` holds).
+        async fn seed_gss_group(
+            state: &AppState,
+            group_key: &str,
+            removed: AgentId,
+        ) -> x0x::groups::GroupInfo {
+            let owner = state.agent.agent_id();
+            let mut info = x0x::groups::GroupInfo::new(
+                "board".to_string(),
+                String::new(),
+                owner,
+                group_key.to_string(),
+            );
+            info.migrate_from_v1();
+            let _ = info.rotate_shared_secret();
+            info.add_member(
+                hex::encode(removed.as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(owner.as_bytes())),
+                None,
+            );
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.to_string(), info.clone());
+            info
+        }
+
+        /// `previous` with `removed` removed and the secret rotated, exactly
+        /// as a removal commit produces it.
+        fn removal_of(
+            previous: &x0x::groups::GroupInfo,
+            owner: AgentId,
+            removed: AgentId,
+        ) -> x0x::groups::GroupInfo {
+            let mut next = previous.clone();
+            next.roster_revision += 1;
+            next.remove_member(
+                &hex::encode(removed.as_bytes()),
+                Some(hex::encode(owner.as_bytes())),
+            );
+            let _ = next.rotate_shared_secret();
+            next
+        }
+
+        async fn published_record(sub: &mut x0x::gossip::Subscription) -> SealedTaskRecordBody {
+            let msg = tokio::time::timeout(BOUND, sub.recv())
+                .await
+                .expect("a sealed delta was published")
+                .expect("subscription open");
+            decode_sealed_task_record(&msg.payload)
+                .expect("an encrypted group's delta is a sealed record")
+                .1
+        }
+
+        /// THE #975 race, GSS plane. Seal at epoch E, then the production
+        /// roster writer commits a removal (E+1), then the publish continues.
+        ///
+        /// On the unfixed code `publish_delta` published the bytes its one
+        /// seal produced, so the record on the wire was the paused epoch-E
+        /// record: `record.epoch == E` and the removed member's pre-removal
+        /// group opens it — both assertions below fail. Fixed, the publisher
+        /// sees the epoch moved, discards that seal and re-seals under E+1.
+        #[tokio::test]
+        async fn gss_delta_sealed_before_removal_is_resealed_after_it() {
+            let (state, _dir) = test_state().await;
+            let owner = state.agent.agent_id();
+            let removed = AgentId([7; 32]);
+            let group_key = "97".repeat(16);
+            let pre_removal = seed_gss_group(&state, &group_key, removed).await;
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let (sync, pubsub, protector) = sealed_sync(&state, &topic).await;
+            let mut sub = pubsub.subscribe(topic.clone()).await;
+
+            let (sealed, resume) = protector.arm();
+            let publisher = spawn_publish(&sync);
+            tokio::time::timeout(BOUND, sealed)
+                .await
+                .expect("publisher reached its seal")
+                .expect("hook");
+
+            let next = removal_of(&pre_removal, owner, removed);
+            assert_eq!(next.secret_epoch, pre_removal.secret_epoch + 1);
+            let committed = tokio::time::timeout(
+                BOUND,
+                crate::server::routes::named_groups::persist_named_group_info(
+                    &state, &group_key, next,
+                ),
+            )
+            .await
+            .expect("a paused seal holds no lock the roster writer needs")
+            .expect("persist removal");
+            assert!(matches!(
+                committed,
+                crate::server::routes::named_groups::AtomicWriteOutcome::Durable
+            ));
+
+            let _ = resume.send(());
+            tokio::time::timeout(BOUND, publisher)
+                .await
+                .expect("publish completes")
+                .expect("join")
+                .expect("publish");
+
+            let SealedTaskRecordBody::Gss(record) = published_record(&mut sub).await else {
+                panic!("GSS group publishes a GSS record");
+            };
+            assert_eq!(
+                record.epoch,
+                pre_removal.secret_epoch + 1,
+                "the delta must be sealed under the post-removal epoch"
+            );
+            assert!(
+                x0x::crdt::sealed::open_gss_task_record(&pre_removal, &topic, &record).is_err(),
+                "the removed member's pre-removal key must not open the published delta"
+            );
+            let current = state.named_groups.read().await[&group_key].clone();
+            x0x::crdt::sealed::open_gss_task_record(&current, &topic, &record)
+                .expect("a current member opens it");
+            assert_eq!(
+                protector.seals(),
+                2,
+                "the stale seal was discarded, not published"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), sub.recv())
+                    .await
+                    .is_err(),
+                "exactly one record reached the wire"
+            );
+        }
+
+        /// No roster change: one seal, one publish, under the current epoch —
+        /// the gate adds no re-seal and does not refuse.
+        #[tokio::test]
+        async fn gss_delta_without_a_removal_publishes_once_under_the_current_epoch() {
+            let (state, _dir) = test_state().await;
+            let group_key = "98".repeat(16);
+            let info = seed_gss_group(&state, &group_key, AgentId([8; 32])).await;
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let (sync, pubsub, protector) = sealed_sync(&state, &topic).await;
+            let mut sub = pubsub.subscribe(topic.clone()).await;
+
+            tokio::time::timeout(BOUND, spawn_publish(&sync))
+                .await
+                .expect("publish completes")
+                .expect("join")
+                .expect("publish");
+
+            let SealedTaskRecordBody::Gss(record) = published_record(&mut sub).await else {
+                panic!("GSS group publishes a GSS record");
+            };
+            assert_eq!(record.epoch, info.secret_epoch);
+            x0x::crdt::sealed::open_gss_task_record(&info, &topic, &record)
+                .expect("every current member opens it");
+            assert_eq!(protector.seals(), 1);
+        }
+
+        /// No deadlock, and the gate really orders publication after a
+        /// commit: while a roster writer holds the GSS publication gate the
+        /// sealed publish cannot go out; once the writer finishes, it
+        /// completes within the bound under the writer's epoch. Then publishes
+        /// and real roster commits race freely and all finish in bound.
+        #[tokio::test]
+        async fn gss_publish_during_a_roster_commit_completes_without_deadlock() {
+            let (state, _dir) = test_state().await;
+            let owner = state.agent.agent_id();
+            let removed = AgentId([6; 32]);
+            let group_key = "99".repeat(16);
+            let pre_removal = seed_gss_group(&state, &group_key, removed).await;
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let (sync, pubsub, protector) = sealed_sync(&state, &topic).await;
+            let mut sub = pubsub.subscribe(topic.clone()).await;
+
+            // A commit in flight: the writer permit is held and the live map
+            // moves to the rotated epoch under it, as the writer does.
+            let writer = state.gss_publication_gate.write().await;
+            let publisher = spawn_publish(&sync);
+            tokio::time::timeout(BOUND, async {
+                while protector.seals() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("sealing does not need the gate");
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), removal_of(&pre_removal, owner, removed));
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !publisher.is_finished(),
+                "a sealed record must not publish while a roster commit holds the gate"
+            );
+            drop(writer);
+            tokio::time::timeout(BOUND, publisher)
+                .await
+                .expect("publish completes once the commit releases the gate")
+                .expect("join")
+                .expect("publish");
+            let SealedTaskRecordBody::Gss(record) = published_record(&mut sub).await else {
+                panic!("GSS group publishes a GSS record");
+            };
+            assert_eq!(record.epoch, pre_removal.secret_epoch + 1);
+
+            // Real commits (production writer) racing real publishes.
+            tokio::time::timeout(BOUND, async {
+                for round in 0..5u8 {
+                    let previous = state.named_groups.read().await[&group_key].clone();
+                    let mut next = previous.clone();
+                    next.roster_revision += 1;
+                    let _ = next.rotate_shared_secret();
+                    let publish = spawn_publish(&sync);
+                    let commit = crate::server::routes::named_groups::persist_named_group_info(
+                        &state, &group_key, next,
+                    );
+                    let (published, committed) = tokio::join!(publish, commit);
+                    published
+                        .expect("join")
+                        .unwrap_or_else(|e| panic!("round {round} publish: {e}"));
+                    committed.unwrap_or_else(|e| panic!("round {round} commit: {e}"));
+                }
+            })
+            .await
+            .expect("publishes and roster commits never deadlock");
+        }
+
+        /// THE #975 race, TreeKEM plane: seal at ratchet epoch E, then a
+        /// removal commit advances the live ratchet, then the publish
+        /// continues. Unfixed, the paused epoch-E record was published — one
+        /// the removed member's epoch-E ratchet can decrypt — so the epoch
+        /// assertion below fails. Fixed, it is re-sealed at the new epoch.
+        #[tokio::test]
+        async fn treekem_delta_sealed_before_removal_is_resealed_after_it() {
+            let (state, _dir) = test_state().await;
+            let owner = AgentId([78; 32]);
+            let writer = state.agent.agent_id();
+            let removed = AgentId([79; 32]);
+            let group_key = "4a".repeat(16);
+            let group_id = hex::decode(&group_key).expect("group id");
+            let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+                state.agent.as_ref(),
+                &group_id,
+            );
+            let mut owner_group =
+                x0x::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[78; 32])
+                    .expect("owner group");
+            let writer_prepared =
+                x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+            let writer_add = owner_group
+                .add_member(writer, writer_prepared.key_package_bytes())
+                .expect("add writer");
+            let mut writer_group =
+                x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                    .expect("writer join");
+            let removed_prepared =
+                x0x::mls::TreeKemMlsGroup::prepare_member(removed, &[79; 32]).expect("removed kp");
+            let removed_add = owner_group
+                .add_member(removed, removed_prepared.key_package_bytes())
+                .expect("add removed");
+            writer_group
+                .process_commit(&removed_add.commit)
+                .expect("writer seats the soon-removed member");
+            let pre_removal_epoch = writer_group.epoch();
+
+            let mut info = x0x::groups::GroupInfo::new(
+                "tasks".to_string(),
+                String::new(),
+                owner,
+                group_key.clone(),
+            );
+            info.migrate_from_v1();
+            info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+            info.shared_secret = None;
+            for member in [writer, removed] {
+                info.add_member(
+                    hex::encode(member.as_bytes()),
+                    x0x::groups::GroupRole::Member,
+                    Some(hex::encode(owner.as_bytes())),
+                    None,
+                );
+            }
+            info.secret_epoch = pre_removal_epoch;
+            info.security_binding = Some(format!("treekem:epoch={pre_removal_epoch}"));
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            state.treekem_groups.write().await.insert(
+                group_key.clone(),
+                Arc::new(tokio::sync::Mutex::new(writer_group)),
+            );
+
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let (sync, pubsub, protector) = sealed_sync(&state, &topic).await;
+            let mut sub = pubsub.subscribe(topic.clone()).await;
+
+            let (sealed, resume) = protector.arm();
+            let publisher = spawn_publish(&sync);
+            tokio::time::timeout(BOUND, sealed)
+                .await
+                .expect("publisher reached its seal")
+                .expect("hook");
+
+            let removal = owner_group.remove_member(removed).expect("remove");
+            let post_removal_epoch = {
+                let live = state.treekem_groups.read().await[&group_key].clone();
+                let mut ratchet = tokio::time::timeout(BOUND, live.lock())
+                    .await
+                    .expect("a paused seal holds no ratchet lock");
+                ratchet
+                    .process_commit(&removal)
+                    .expect("writer applies removal");
+                ratchet.epoch()
+            };
+            assert!(post_removal_epoch > pre_removal_epoch);
+
+            let _ = resume.send(());
+            tokio::time::timeout(BOUND, publisher)
+                .await
+                .expect("publish completes")
+                .expect("join")
+                .expect("publish");
+
+            let SealedTaskRecordBody::TreeKem(record) = published_record(&mut sub).await else {
+                panic!("TreeKEM group publishes a TreeKEM record");
+            };
+            assert_eq!(
+                record.epoch, post_removal_epoch,
+                "the delta must be sealed at the post-removal ratchet epoch, which the \
+                 removed member cannot derive"
+            );
+            assert_eq!(
+                protector.seals(),
+                2,
+                "the stale seal was discarded, not published"
+            );
+        }
     }
 }
