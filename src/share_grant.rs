@@ -61,6 +61,21 @@ use crate::DiscoveredAgent;
 /// Versioned, NUL-terminated DM prefix of a share-grant delivery.
 pub const SHARE_GRANT_DM_PREFIX: &[u8] = b"x0x-sharegrant-v1\0";
 
+/// #926 (ADR-0070 §2): grantee-attached grant fetch — a daemon that
+/// missed a grant delivery can request it from a holder by id.
+/// Request wire: `SHARE_GRANT_FETCH_DM_PREFIX ‖ grant_id[32]`.
+pub const SHARE_GRANT_FETCH_DM_PREFIX: &[u8] = b"x0x-sharegrant-fetch-v1\0";
+/// Response wire: `SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX ‖ grant_dm_payload`
+/// (the SAME signed wire form a direct delivery carries, so one verifier
+/// serves both paths).
+pub const SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX: &[u8] = b"x0x-sharegrant-fetch-response-v1\0";
+/// How long a fetch this node sent stays "in flight" (the only responses
+/// accepted for that id) and how long a re-fetch is suppressed.
+pub const GRANT_FETCH_TTL_MS: u64 = 60_000;
+/// Cap on the (peer-keyed) in-flight map — swept to the live universe on
+/// every insert, oldest evicted at the cap.
+pub const GRANT_FETCH_MAX_ENTRIES: usize = 4096;
+
 /// Domain separation for the owner signature.
 const SHARE_GRANT_SIG_DOMAIN: &[u8] = b"x0x-sharegrant-sig-v1";
 
@@ -479,6 +494,10 @@ pub struct ShareGrantStore {
     /// Set when the file on disk could not be read: the store then holds
     /// nothing and refuses writes so the file is never silently replaced.
     load_error: Option<String>,
+    /// #926: grant ids THIS node has requested by fetch, with the request
+    /// time — the only responses accepted, and the per-id re-fetch
+    /// suppression. Swept + capped (peer-supplied ids are untrusted).
+    fetch_in_flight: std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>,
 }
 
 impl ShareGrantStore {
@@ -492,6 +511,7 @@ impl ShareGrantStore {
             state: std::sync::RwLock::new(StoreState::default()),
             write_lock: tokio::sync::Mutex::new(()),
             load_error: None,
+            fetch_in_flight: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -600,6 +620,63 @@ impl ShareGrantStore {
     #[must_use]
     pub fn issued(&self, grant_id: &[u8; 32]) -> Option<ShareGrant> {
         self.read_state().issued.get(grant_id).cloned()
+    }
+
+    /// #926: one held grant by id, either role (the fetch responder serves
+    /// grants it issued OR received — a re-share is impossible: the bytes
+    /// are owner-signed and the receiver verifies against its own owner).
+    #[must_use]
+    pub fn by_id(&self, grant_id: &[u8; 32]) -> Option<ShareGrant> {
+        let state = self.read_state();
+        state
+            .issued
+            .get(grant_id)
+            .or_else(|| state.received.get(grant_id))
+            .cloned()
+    }
+
+    /// #926: record that this node requested `grant_id` by fetch. Returns
+    /// `true` when this call started a fresh in-flight window (a repeat
+    /// inside the TTL is suppressed). Sweeps expired ids and evicts the
+    /// oldest at the cap.
+    pub fn note_fetch(&self, grant_id: &[u8; 32]) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self
+            .fetch_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.retain(|_, at| (now.duration_since(*at).as_millis() as u64) < GRANT_FETCH_TTL_MS);
+        if map.contains_key(grant_id) {
+            return false;
+        }
+        if map.len() >= GRANT_FETCH_MAX_ENTRIES {
+            if let Some(oldest) = map.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k) {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(*grant_id, now);
+        true
+    }
+
+    /// #926: whether a fetch for `grant_id` is in flight (responses for
+    /// other ids are dropped).
+    #[must_use]
+    pub fn is_fetch_in_flight(&self, grant_id: &[u8; 32]) -> bool {
+        let now = std::time::Instant::now();
+        self.fetch_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(grant_id)
+            .is_some_and(|at| (now.duration_since(*at).as_millis() as u64) < GRANT_FETCH_TTL_MS)
+    }
+
+    /// #926: end the in-flight window (the grant arrived or was refused
+    /// terminally).
+    pub fn clear_fetch(&self, grant_id: &[u8; 32]) {
+        self.fetch_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(grant_id);
     }
 
     /// Issued grants that can open THIS daemon's agent at `now_unix`: signed
@@ -933,6 +1010,154 @@ pub async fn handle_share_grant_dm(
     }
     if let Some(completion) = completion {
         let _ = completion.send(result.clone());
+    }
+    result
+}
+
+/// The outcome of one grant-FETCH typed DM: the completion for the
+/// durable route plus the signed grant bytes to send back, if any.
+#[derive(Debug)]
+pub struct GrantFetchOutcome {
+    /// The handler's completion (resolved to the durable route).
+    pub result: DmTypedPayloadCompletionResult,
+    /// `Some(grant_dm_payload)` — the reply to send back to the sender.
+    pub reply: Option<Vec<u8>>,
+}
+
+/// #926: handle one grant-FETCH typed DM (the grantee-attached grant_id
+/// fetch of ADR-0070 §2). The requester is a daemon whose owner signed
+/// the grant (a shared agent) but which missed the delivery; the
+/// responder is any daemon holding the grant — grantee or another
+/// owner-trusted install.
+///
+/// Serve authorization: ONLY a sender that is a SUBJECT of the grant
+/// (`grant.agents`) may receive it — the grant names them, so serving it
+/// leaks nothing, and a stranger gets nothing. A grant this daemon does
+/// not hold resolves Err (transient: the fetch may precede the owner's
+/// delivery here), which withholds the v2 ACK so the sender retries.
+pub async fn handle_share_grant_fetch(
+    store: Option<&ShareGrantStore>,
+    typed: DmTypedPayload,
+) -> GrantFetchOutcome {
+    let DmTypedPayload {
+        sender,
+        payload,
+        completion,
+        ..
+    } = typed;
+    let outcome = match store {
+        None => GrantFetchOutcome {
+            result: Err("share grants are not enabled on this daemon".to_string()),
+            reply: None,
+        },
+        Some(store) => match parse_fetch_request(&payload) {
+            Err(reason) => GrantFetchOutcome {
+                result: Err(reason),
+                reply: None,
+            },
+            Ok(grant_id) => match store.by_id(&grant_id) {
+                None => {
+                    tracing::info!(
+                        grant_id = %hex::encode(grant_id),
+                        "#926: grant fetch for a grant this daemon does not hold; retry"
+                    );
+                    GrantFetchOutcome {
+                        result: Err("grant not held here; retry".to_string()),
+                        reply: None,
+                    }
+                }
+                Some(grant) => {
+                    if !grant.agents.contains(&sender) {
+                        tracing::warn!(
+                            sender = %hex::encode(sender.as_bytes()),
+                            grant_id = %hex::encode(grant_id),
+                            "#926: grant fetch from an agent that is not a subject of the grant; refused"
+                        );
+                        GrantFetchOutcome {
+                            result: Err("requester is not a subject of this grant".to_string()),
+                            reply: None,
+                        }
+                    } else {
+                        match grant.to_dm_payload() {
+                            Ok(reply) => GrantFetchOutcome {
+                                result: Ok(DmTypedPayloadCompletion::Inserted),
+                                reply: Some(reply),
+                            },
+                            Err(e) => GrantFetchOutcome {
+                                result: Err(e.to_string()),
+                                reply: None,
+                            },
+                        }
+                    }
+                }
+            },
+        },
+    };
+    if let Some(tx) = completion {
+        let _ = tx.send(outcome.result.clone());
+    }
+    outcome
+}
+
+/// `prefix ‖ id[32]` or a reason.
+fn parse_fetch_request(payload: &[u8]) -> Result<[u8; 32], String> {
+    let Some(id) = payload.strip_prefix(SHARE_GRANT_FETCH_DM_PREFIX) else {
+        return Err("share-grant fetch payload missing its prefix".to_string());
+    };
+    if id.len() != 32 {
+        return Err("share-grant fetch id must be exactly 32 bytes".to_string());
+    }
+    let mut grant_id = [0u8; 32];
+    grant_id.copy_from_slice(id);
+    Ok(grant_id)
+}
+
+/// #926: handle one grant-fetch RESPONSE typed DM. The response is
+/// accepted only when this node requested that id inside the window, the
+/// payload is the signed grant wire form, and the store's own accept
+/// path (verify, classify, durable persist — exactly what a direct
+/// delivery runs) succeeds. The path is idempotent, and the in-flight
+/// window closes on success.
+pub async fn handle_share_grant_fetch_response(
+    store: Option<&ShareGrantStore>,
+    typed: DmTypedPayload,
+) -> DmTypedPayloadCompletionResult {
+    let DmTypedPayload {
+        payload,
+        completion,
+        ..
+    } = typed;
+    let result = match store {
+        None => Err("share grants are not enabled on this daemon".to_string()),
+        Some(store) => match payload.strip_prefix(SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX) {
+            None => Err("share-grant fetch response missing its prefix".to_string()),
+            Some(grant_payload) => match ShareGrant::from_dm_payload(grant_payload) {
+                Err(e) => Err(e.to_string()),
+                Ok(grant) => {
+                    if !store.is_fetch_in_flight(&grant.grant_id) {
+                        tracing::warn!(
+                            grant_id = %hex::encode(grant.grant_id),
+                            "#926: grant fetch response for an id we did not request; dropped"
+                        );
+                        Err("no share-grant fetch in flight for this id".to_string())
+                    } else {
+                        let grant_id = grant.grant_id;
+                        let outcome = store
+                            .accept(grant, unix_now_secs())
+                            .await
+                            .map_err(|e| e.to_string());
+                        if outcome.is_ok() {
+                            // The window served its purpose.
+                            store.clear_fetch(&grant_id);
+                        }
+                        outcome
+                    }
+                }
+            },
+        },
+    };
+    if let Some(tx) = completion {
+        let _ = tx.send(result.clone());
     }
     result
 }

@@ -447,3 +447,147 @@ async fn zero_clock_yields_no_access() {
 }
 
 mod enforcement;
+
+// ── #926: the grantee-attached grant fetch (ADR-0070 §2) ────────────────
+
+fn fetch_payload(grant_id: &[u8; 32]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(SHARE_GRANT_FETCH_DM_PREFIX.len() + 32);
+    p.extend_from_slice(SHARE_GRANT_FETCH_DM_PREFIX);
+    p.extend_from_slice(grant_id);
+    p
+}
+
+fn fetch_response_payload(grant: &ShareGrant) -> Vec<u8> {
+    let wire = grant.to_dm_payload().expect("grant wire form");
+    let mut p = Vec::with_capacity(SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX.len() + wire.len());
+    p.extend_from_slice(SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX);
+    p.extend_from_slice(&wire);
+    p
+}
+
+fn typed_from(sender: AgentId, payload: Vec<u8>) -> DmTypedPayload {
+    DmTypedPayload {
+        sender,
+        machine_id: crate::identity::MachineId([0xEF; 32]),
+        payload,
+        verified: true,
+        trust_decision: None,
+        received_at_unix_ms: 0,
+        request_id: [0; 16],
+        completion: None,
+    }
+}
+
+/// WHY (#926 Rule 9, main arm): a daemon that MISSED the grant delivery
+/// (the shared agent's install) must be able to fetch it from a holder
+/// (the grantee), and the fetched grant must land through the same
+/// fail-closed accept path exactly ONCE — a replay is a Duplicate that
+/// stores nothing.
+#[tokio::test]
+async fn fetch_serves_a_subject_and_applies_exactly_once() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let grantee_agent = agent(0x22);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+
+    // The GRANTEE holds the grant (received); the SHARED AGENT's install
+    // (same owner, missed the delivery) starts empty.
+    let responder = ShareGrantStore::in_memory(grantee_agent, Some(grantee_user.user_id()));
+    responder.accept(grant.clone(), NOW).await.unwrap();
+    let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
+    assert!(fetcher.by_id(&grant.grant_id).is_none(), "starts empty");
+
+    // The fetcher asks; the responder serves ONLY subjects of the grant.
+    assert!(fetcher.note_fetch(&grant.grant_id), "a fresh fetch window");
+    assert!(
+        !fetcher.note_fetch(&grant.grant_id),
+        "a repeat inside the TTL is suppressed"
+    );
+    let (req, rx) = typed(fetch_payload(&grant.grant_id));
+    let mut req = req;
+    req.sender = shared;
+    let outcome = handle_share_grant_fetch(Some(&responder), req).await;
+    assert!(outcome.result.is_ok(), "a subject's fetch is answered");
+    let reply = outcome.reply.expect("the signed grant bytes come back");
+    assert_eq!(reply, grant.to_dm_payload().unwrap());
+
+    // The response lands through the fail-closed accept path.
+    let resp = reply_from(&fetch_response_payload(&grant), grantee_agent);
+    drop(rx);
+    let result = handle_share_grant_fetch_response(Some(&fetcher), resp).await;
+    assert!(matches!(result, Ok(DmTypedPayloadCompletion::Inserted)));
+    assert_eq!(
+        fetcher.by_id(&grant.grant_id),
+        Some(grant.clone()),
+        "the fetched grant is held (issued role: same owner)"
+    );
+
+    // EXACTLY ONCE: a replay of the same response is a Duplicate.
+    let replay = reply_from(&fetch_response_payload(&grant), grantee_agent);
+    let replayed = handle_share_grant_fetch_response(Some(&fetcher), replay).await;
+    assert!(replayed.is_err(), "the window closed on success");
+}
+
+fn reply_from(payload: &[u8], sender: AgentId) -> DmTypedPayload {
+    typed_from(sender, payload.to_vec())
+}
+
+/// WHY: a stranger — an agent the grant does NOT name — must get nothing:
+/// no reply bytes, no ACK. This is the serve-authorization pin.
+#[tokio::test]
+async fn fetch_refuses_a_non_subject_and_leaks_nothing() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let stranger = agent(0x99);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+    let responder = ShareGrantStore::in_memory(
+        grantee_agent_of(&grantee_user),
+        Some(grantee_user.user_id()),
+    );
+    responder.accept(grant.clone(), NOW).await.unwrap();
+
+    let outcome = handle_share_grant_fetch(
+        Some(&responder),
+        typed_from(stranger, fetch_payload(&grant.grant_id)),
+    )
+    .await;
+    assert!(outcome.result.is_err(), "a non-subject's fetch is refused");
+    assert!(outcome.reply.is_none(), "and leaks no grant bytes");
+}
+
+fn grantee_agent_of(_user: &UserKeypair) -> AgentId {
+    agent(0x22)
+}
+
+/// WHY: an unprompted response (no fetch in flight) must be dropped — a
+/// push pretending to be an answer stores nothing.
+#[tokio::test]
+async fn fetch_response_for_unrequested_id_is_dropped() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+    let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
+    // NO note_fetch: the id was never requested here.
+    let resp = typed_from(agent(0x22), fetch_response_payload(&grant));
+    let result = handle_share_grant_fetch_response(Some(&fetcher), resp).await;
+    assert!(result.is_err(), "an unprompted grant response is dropped");
+    assert!(fetcher.by_id(&grant.grant_id).is_none(), "nothing stored");
+}
+
+/// WHY: a fetch for a grant the responder does not hold is a RETRY (Err,
+/// ACK withheld) — the owner's delivery may still arrive there.
+#[tokio::test]
+async fn fetch_for_unheld_grant_is_a_retry() {
+    let grantee_user = UserKeypair::generate().unwrap();
+    let responder = ShareGrantStore::in_memory(agent(0x22), Some(grantee_user.user_id()));
+    let outcome = handle_share_grant_fetch(
+        Some(&responder),
+        typed_from(agent(0x11), fetch_payload(&[7; 32])),
+    )
+    .await;
+    assert!(outcome.result.is_err(), "an unheld grant is a retry");
+    assert!(outcome.reply.is_none());
+}

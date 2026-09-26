@@ -843,6 +843,12 @@ pub async fn serve_with_options(
     // ADR-0070 §2: durable typed route for share-grant deliveries.
     let (share_grant_dm_tx, mut share_grant_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
+    // #926 (ADR-0070 §2): durable typed routes for the grantee-attached
+    // grant fetch and its response.
+    let (share_grant_fetch_tx, mut share_grant_fetch_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(64);
+    let (share_grant_fetch_response_tx, mut share_grant_fetch_response_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(64);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -1523,6 +1529,8 @@ pub async fn serve_with_options(
         dm_inbox_kv_store_delta_route_tx,
         dm_inbox_predecessor_relay_route_tx,
         dm_inbox_share_grant_route_tx,
+        share_grant_fetch_tx,
+        share_grant_fetch_response_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -2092,6 +2100,48 @@ pub async fn serve_with_options(
             while let Some(typed) = share_grant_dm_rx.recv().await {
                 let store = grant_agent.share_grant_store();
                 let _ = x0x::share_grant::handle_share_grant_dm(store.as_deref(), typed).await;
+            }
+        }));
+    }
+
+    // #926 (ADR-0070 §2): grant fetches. The handler resolves the durable
+    // completion (ACK = "fetch handled") and, when a grant is servable,
+    // returns the signed bytes to send back to the requester.
+    {
+        let fetch_agent = Arc::clone(&agent);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = share_grant_fetch_rx.recv().await {
+                let store = fetch_agent.share_grant_store();
+                let sender = typed.sender;
+                let outcome =
+                    x0x::share_grant::handle_share_grant_fetch(store.as_deref(), typed).await;
+                if let Some(reply) = outcome.reply {
+                    let mut payload = Vec::with_capacity(
+                        x0x::share_grant::SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX.len() + reply.len(),
+                    );
+                    payload
+                        .extend_from_slice(x0x::share_grant::SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX);
+                    payload.extend_from_slice(&reply);
+                    // The reply is a plain (v1-receipt) send: the grant is
+                    // owner-signed, so its authenticity does not depend on
+                    // this hop; the RECEIVER re-verifies everything.
+                    if let Err(e) = fetch_agent.send_direct(&sender, payload).await {
+                        tracing::debug!(error = %e, "#926: grant fetch reply not delivered");
+                    }
+                }
+            }
+        }));
+    }
+    // #926: fetch responses. The handler enforces the in-flight window and
+    // the store's own fail-closed accept path.
+    {
+        let fetch_agent = Arc::clone(&agent);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = share_grant_fetch_response_rx.recv().await {
+                let store = fetch_agent.share_grant_store();
+                let _ =
+                    x0x::share_grant::handle_share_grant_fetch_response(store.as_deref(), typed)
+                        .await;
             }
         }));
     }
@@ -2735,6 +2785,8 @@ async fn start_dm_inbox_when_gossip_ready(
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    share_grant_fetch_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    share_grant_fetch_response_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -2773,6 +2825,17 @@ async fn start_dm_inbox_when_gossip_ready(
         let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
             x0x::share_grant::SHARE_GRANT_DM_PREFIX,
             share_grant_route_tx.clone(),
+        );
+        // #926 (ADR-0070 §2): the grantee-attached grant fetch and its
+        // response — durable so an unheld/refused fetch withholds the ACK
+        // and the requester's schedule retries.
+        let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
+            x0x::share_grant::SHARE_GRANT_FETCH_DM_PREFIX,
+            share_grant_fetch_route_tx.clone(),
+        );
+        let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
+            x0x::share_grant::SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX,
+            share_grant_fetch_response_route_tx.clone(),
         );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
