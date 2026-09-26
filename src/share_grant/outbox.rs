@@ -452,7 +452,7 @@ impl GrantRedeliveryOutbox {
         if revocations
             .read()
             .await
-            .is_share_grant_revoked(&grant.grant_id, &grant.owner)
+            .is_share_grant_revoked(&[0u8; 32], &grant.owner)
         {
             return Err(OutboxError::Revoked);
         }
