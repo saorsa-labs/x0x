@@ -93,6 +93,12 @@ struct Registry {
     incoming_bytes_held: u64,
     incoming_bytes_held_per_source: HashMap<String, u64>,
     next_generation: u64,
+    /// #878 r3 flake fix: how many staged entries `release_staged` has
+    /// actually freed (test observability — see
+    /// `completed_pull_sends_its_release_over_the_wire`). Lets the test
+    /// assert the terminal state WITHOUT racing the pipeline's
+    /// intermediate `staged.len() == 1` checkpoint.
+    released_notices: u32,
 }
 
 impl Registry {
@@ -339,6 +345,7 @@ impl ControlBlobState {
     pub(super) fn release_staged(&self, reference: &ControlBlobRef) {
         self.with_registry(|registry| {
             if registry.staged.remove(reference).is_some() {
+                registry.released_notices = registry.released_notices.saturating_add(1);
                 tracing::debug!(
                     kind = ?reference.kind,
                     byte_len = reference.byte_len,
@@ -346,6 +353,13 @@ impl ControlBlobState {
                 );
             }
         });
+    }
+
+    /// #878 r3 flake fix: test inspection — how many staged entries the
+    /// Release path has freed.
+    #[cfg(test)]
+    pub(super) fn released_notice_count(&self) -> u32 {
+        self.with_registry(|registry| registry.released_notices)
     }
 
     /// #878 r3 (review 4a): test inspection — entries still staged.
