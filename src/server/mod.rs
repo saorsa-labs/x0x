@@ -849,6 +849,8 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(64);
     let (share_grant_fetch_response_tx, mut share_grant_fetch_response_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(64);
+    let (share_grant_hint_tx, mut share_grant_hint_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(64);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -1061,6 +1063,9 @@ pub async fn serve_with_options(
         causal_approval_queue_persistence_lock: Mutex::new(()),
         predecessor_relay_outbox_persistence_lock: Mutex::new(()),
         public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
+        cert_fetch_requested: StdMutex::new(std::collections::HashMap::new()),
+        cert_fetch_answered: StdMutex::new(std::collections::HashMap::new()),
+        cert_unresolvable_since: StdMutex::new(std::collections::HashMap::new()),
         pending_b8_compensation: Mutex::new(None),
         pending_listener_admission: Mutex::new(None),
         group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -1129,6 +1134,7 @@ pub async fn serve_with_options(
         start_time: Instant::now(),
         health_snapshot: Arc::new(routes::status::HealthSnapshot::default()),
         broadcast_tx,
+        calls: routes::calls::new_registry(),
         file_transfers: RwLock::new(HashMap::new()),
         receive_hashers: RwLock::new(HashMap::new()),
         pending_file_chunks: RwLock::new(HashMap::new()),
@@ -1531,6 +1537,7 @@ pub async fn serve_with_options(
         dm_inbox_share_grant_route_tx,
         share_grant_fetch_tx,
         share_grant_fetch_response_tx,
+        share_grant_hint_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -1764,6 +1771,14 @@ pub async fn serve_with_options(
             }
         }));
     }
+
+    // ADR-0073 call lifecycle: inbound x0x_call_* frames + missed-call sweeper
+    bg_tasks.push(tokio::spawn(routes::calls::run_call_listener(Arc::clone(
+        &state,
+    ))));
+    bg_tasks.push(tokio::spawn(routes::calls::run_call_sweeper(Arc::clone(
+        &state,
+    ))));
 
     // Background join-result listener — joiner-initiated recovery path for
     // fresh TreeKEM members that miss the anchor's opportunistic MemberAdded push.
@@ -2154,18 +2169,55 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_fetch_response_rx.recv().await {
                 let store = fetch_agent.share_grant_store();
-                // #967 B1: the requester side refuses a revoked grant too.
-                let revocation = fetch_agent.revocation_set.read().await;
-                let is_revoked = |grant: &x0x::share_grant::ShareGrant| {
-                    revocation.is_share_grant_revoked(&grant.grant_id, &grant.owner)
+                // #967 r3 (lock fix): decode + window-check FIRST, then
+                // evaluate revocation under a SCOPED guard that is DROPPED
+                // before the accept await (the store's write lock and its
+                // disk persist run inside — no revocation writer may queue
+                // behind disk I/O).
+                match x0x::share_grant::prepare_share_grant_fetch_response(store.as_deref(), typed)
+                    .await
+                {
+                    Err(_) => continue,
+                    Ok(prepared) => {
+                        let grant_id = prepared.grant.grant_id;
+                        let owner = prepared.grant.owner;
+                        let revoked_now = {
+                            let revocation = fetch_agent.revocation_set.read().await;
+                            revocation.is_share_grant_revoked(&grant_id, &owner)
+                        };
+                        let is_revoked = |_g: &x0x::share_grant::ShareGrant| revoked_now;
+                        let _ = x0x::share_grant::finish_share_grant_fetch_response(
+                            store.as_deref(),
+                            prepared,
+                            Some(&is_revoked),
+                            x0x::share_grant::unix_now_secs(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }));
+    }
+    // #967 r3 (B3): the shared-daemon side of the attachment — every
+    // unheld id in a hint frame triggers a fetch request to the sender.
+    {
+        let hint_agent = Arc::clone(&agent);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = share_grant_hint_rx.recv().await {
+                if !typed.verified {
+                    continue;
+                }
+                let Some(body) = typed
+                    .payload
+                    .strip_prefix(x0x::share_grant::SHARE_GRANT_HINT_DM_PREFIX)
+                else {
+                    continue;
                 };
-                let _ = x0x::share_grant::handle_share_grant_fetch_response(
-                    store.as_deref(),
-                    Some(&is_revoked),
-                    x0x::share_grant::unix_now_secs(),
-                    typed,
-                )
-                .await;
+                let ids = x0x::share_grant::decode_share_grant_hint(body);
+                let started = hint_agent.on_share_grant_hints(&typed.sender, &ids).await;
+                if started > 0 {
+                    tracing::info!(started, "#967: grant hints triggered fetch requests");
+                }
             }
         }));
     }
@@ -2429,6 +2481,15 @@ pub async fn serve_with_options(
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
         .route("/exec/sessions", get(exec_sessions))
+        // ADR-0073 slice 1: call lifecycle (no media yet)
+        .route(
+            "/calls",
+            post(routes::calls::call_create).get(routes::calls::call_list),
+        )
+        .route("/calls/:id", get(routes::calls::call_get))
+        .route("/calls/:id/accept", post(routes::calls::call_accept))
+        .route("/calls/:id/reject", post(routes::calls::call_reject))
+        .route("/calls/:id/hangup", post(routes::calls::call_hangup))
         // Tailnet forwarding (#132 T6)
         .route("/forwards", post(forward_add).get(forward_list))
         .route("/forwards/:local_addr", delete(forward_remove))
@@ -2788,6 +2849,15 @@ pub(crate) fn valid_kv_store_delta_typed_dm(payload: &[u8]) -> bool {
         .is_some_and(|bytes| serde_json::from_slice::<KvStoreDirectDelta>(bytes).is_ok())
 }
 
+/// #967 r3: a hint frame is prefix + bincode(Vec<[u8; 32]>) within the cap.
+fn valid_share_grant_hint_typed_dm(payload: &[u8]) -> bool {
+    let Some(body) = payload.strip_prefix(x0x::share_grant::SHARE_GRANT_HINT_DM_PREFIX) else {
+        return false;
+    };
+    x0x::share_grant::decode_share_grant_hint(body).len()
+        <= x0x::share_grant::SHARE_GRANT_HINT_MAX_IDS
+}
+
 pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
     let Some(bytes) = payload.strip_prefix(GROUP_PREDECESSOR_RELAY_DM_PREFIX) else {
         return false;
@@ -2811,6 +2881,7 @@ async fn start_dm_inbox_when_gossip_ready(
     share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_fetch_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_fetch_response_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    share_grant_hint_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -2860,6 +2931,13 @@ async fn start_dm_inbox_when_gossip_ready(
         let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
             x0x::share_grant::SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX,
             share_grant_fetch_response_route_tx.clone(),
+        );
+        // #967 r3 (B3): the grantee-side attachment frame — a plain route
+        // (the hint needs no durable ACK; the fetches it triggers do).
+        let dm_inbox_config = dm_inbox_config.with_validated_typed_payload_route(
+            x0x::share_grant::SHARE_GRANT_HINT_DM_PREFIX,
+            share_grant_hint_route_tx.clone(),
+            valid_share_grant_hint_typed_dm,
         );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)

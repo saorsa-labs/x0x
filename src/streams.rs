@@ -331,9 +331,9 @@ pub(crate) fn stream_gate(
 /// checked here — raw byte-streams carry no target; per-target enforcement
 /// stays with the T4 forwarder's `evaluate_connect_gate` call.
 ///
-/// The accept loop calls [`stream_acl_gate_with_grants`]; this form (no
-/// grant holders) is kept for the slice-1 matrix tests.
-#[cfg(test)]
+/// The accept loop and the calling gate (ADR-0073) call the with-grants
+/// form; this no-grant form serves callers without grant holders (the
+/// calling slice and the matrix tests).
 pub(crate) fn stream_acl_gate(
     policy: &crate::connect::ConnectPolicy,
     agents: &[crate::identity::AgentId],

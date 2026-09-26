@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 195,
+  "endpoint_count": 201,
   "endpoints": [
     {
       "category": "status",
@@ -1779,6 +1779,80 @@
       "description": "List local pending and remote active exec sessions",
       "method": "GET",
       "path": "/exec/sessions",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call",
+      "description": "Ring an agent (audio, optionally video); callee must pass trust and connect-ACL gates",
+      "method": "POST",
+      "path": "/calls",
+      "request": {
+        "fields": [
+          {
+            "cli": "AGENT_ID",
+            "in": "body",
+            "name": "agent_id",
+            "required": true
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "video",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call list",
+      "description": "List calls with gate and lifecycle counters",
+      "method": "GET",
+      "path": "/calls",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call show",
+      "description": "Show one call's lifecycle state",
+      "method": "GET",
+      "path": "/calls/:id",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call accept",
+      "description": "Answer a ringing incoming call",
+      "method": "POST",
+      "path": "/calls/:id/accept",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call reject",
+      "description": "Decline a ringing incoming call",
+      "method": "POST",
+      "path": "/calls/:id/reject",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "calls",
+      "cli_name": "call hangup",
+      "description": "End or cancel a call",
+      "method": "POST",
+      "path": "/calls/:id/hangup",
       "request": {
         "kind": "none"
       }
