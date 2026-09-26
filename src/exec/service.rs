@@ -46,7 +46,10 @@ pub struct ExecRunOptions {
 /// Tier-1 exec service.
 pub struct ExecService {
     agent: Arc<Agent>,
-    policy: Arc<ExecPolicy>,
+    /// Effective exec ACL. Swapped atomically by ADR-0070 §3 hot reload;
+    /// each request clones the `Arc` once, so an in-flight request keeps
+    /// the policy it was admitted under.
+    policy: std::sync::RwLock<Arc<ExecPolicy>>,
     diagnostics: Arc<ExecDiagnostics>,
     audit: ExecAudit,
     pending_clients: Mutex<HashMap<ExecRequestId, PendingClient>>,
@@ -139,7 +142,7 @@ impl ExecService {
         let audit = ExecAudit::new(&policy, Arc::clone(&diagnostics));
         let service = Arc::new(Self {
             agent,
-            policy,
+            policy: std::sync::RwLock::new(policy),
             diagnostics,
             audit,
             pending_clients: Mutex::new(HashMap::new()),
@@ -297,7 +300,42 @@ impl ExecService {
     /// Whether exec is enabled on this daemon.
     #[must_use]
     pub fn enabled(&self) -> bool {
-        self.policy.enabled()
+        self.current_policy().enabled()
+    }
+
+    /// The effective exec policy right now (a cheap `Arc` clone).
+    #[must_use]
+    pub fn current_policy(&self) -> Arc<ExecPolicy> {
+        Arc::clone(
+            &self
+                .policy
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Atomically replace the effective exec policy (ADR-0070 §3 hot
+    /// reload / API edit). Requests already admitted keep the policy they
+    /// were checked against; the next request sees `next`.
+    ///
+    /// # Errors
+    /// Refused — leaving the current policy active — when `next` would flip
+    /// exec on/off or move the audit sink (see
+    /// [`crate::exec::acl::exec_reload_compatible`]).
+    pub fn replace_policy(&self, next: Arc<ExecPolicy>) -> Result<(), String> {
+        let mut guard = self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::exec::acl::exec_reload_compatible(&guard, &next)?;
+        self.diagnostics.set_acl_summary(next.summary());
+        *guard = next;
+        Ok(())
+    }
+
+    /// Publish ADR-0070 reload bookkeeping to `/diagnostics/exec`.
+    pub fn set_acl_reload_status(&self, status: crate::exec::acl::AclReloadStatus) {
+        self.diagnostics.set_acl_reload_status(status);
     }
 
     /// Diagnostics snapshot for `/diagnostics/exec`.
@@ -735,7 +773,12 @@ impl ExecService {
             .await;
             return;
         }
-        if inbound.trust_decision != Some(TrustDecision::Accept) {
+        let owner_trusted = self.inbound_owner_trusted(&inbound).await;
+        if inbound
+            .trust_decision
+            .map(|decision| decision.with_owner_trust(owner_trusted))
+            != Some(TrustDecision::Accept)
+        {
             self.diagnostics.record_request_received();
             self.deny(
                 inbound.sender,
@@ -804,7 +847,15 @@ impl ExecService {
             .await;
             return;
         }
-        if inbound.trust_decision != Some(TrustDecision::Accept) {
+        // ADR-0070 §1: owner trust raises Unknown/AcceptWithFlag to Accept
+        // (never a rejection) and is the only way a `principal = "owner"`
+        // entry can match below.
+        let owner_trusted = self.inbound_owner_trusted(&inbound).await;
+        if inbound
+            .trust_decision
+            .map(|decision| decision.with_owner_trust(owner_trusted))
+            != Some(TrustDecision::Accept)
+        {
             self.deny(
                 inbound.sender,
                 inbound.machine_id,
@@ -816,7 +867,8 @@ impl ExecService {
             return;
         }
 
-        let acl = match self.policy.as_ref() {
+        let policy = self.current_policy();
+        let acl = match policy.as_ref() {
             ExecPolicy::Enabled(acl) => acl,
             ExecPolicy::Disabled { .. } => {
                 self.deny(
@@ -835,6 +887,7 @@ impl ExecService {
             acl,
             inbound.sender,
             inbound.machine_id,
+            owner_trusted,
             &argv,
             stdin.as_ref(),
             timeout_ms,
@@ -927,12 +980,39 @@ impl ExecService {
         self.release_slot(inbound.sender).await;
     }
 
+    /// ADR-0070 §1 owner trust for an inbound exec request's sender pair.
+    /// Only a verified sender whose contact decision is not an explicit
+    /// rejection is checked; everything else is `false` (fail closed).
+    ///
+    /// `inbound.machine_id` is only accepted as the pairing when it equals
+    /// the agent's authenticated binding (checked inside
+    /// [`crate::owner_trust::OwnerTrust::is_owner_trusted`]): an attested
+    /// origin refreshes that binding first, and a sender-claimed fallback
+    /// (no attestation, no binding) never matches, so it never confers
+    /// owner trust.
+    async fn inbound_owner_trusted(&self, inbound: &DmTypedPayload) -> bool {
+        if !inbound.verified
+            || !matches!(
+                inbound.trust_decision,
+                Some(
+                    TrustDecision::Unknown | TrustDecision::AcceptWithFlag | TrustDecision::Accept
+                )
+            )
+        {
+            return false;
+        }
+        self.agent
+            .is_owner_trusted_pair(&inbound.sender, &inbound.machine_id)
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn check_request(
         &self,
         acl: &ExecAcl,
         agent_id: AgentId,
         machine_id: MachineId,
+        owner_trusted: bool,
         argv: &[String],
         stdin: Option<&Vec<u8>>,
         timeout_ms: u32,
@@ -947,10 +1027,12 @@ impl ExecService {
         if argv_has_shell_metachar(argv) {
             return Err(DenialReason::ShellMetacharInArgv);
         }
-        if !acl.has_agent_machine(&agent_id, &machine_id) {
+        if !acl.has_entry_for_principal(&agent_id, &machine_id, owner_trusted) {
             return Err(DenialReason::AgentMachineNotInAcl);
         }
-        let Some(matched) = acl.match_command(&agent_id, &machine_id, argv) else {
+        let Some(matched) =
+            acl.match_command_for_principal(&agent_id, &machine_id, owner_trusted, argv)
+        else {
             return Err(DenialReason::ArgvNotAllowed);
         };
         let stdin_len = stdin.map(Vec::len).unwrap_or(0) as u64;
@@ -958,14 +1040,14 @@ impl ExecService {
             return Err(DenialReason::StdinTooLarge);
         }
         let requested_secs = u64::from(timeout_ms).saturating_add(999) / 1000;
-        if requested_secs > matched.effective_max_duration_secs {
+        if requested_secs > matched.effective_max_duration_secs() {
             return Err(DenialReason::TimeoutTooLarge);
         }
         Ok(CheckedRequest {
             caps: acl.caps.clone(),
             max_duration: Duration::from_secs(requested_secs.max(1)),
             cwd: acl.caps.default_cwd.clone(),
-            description: matched.entry.description.clone(),
+            description: matched.description().cloned(),
         })
     }
 
@@ -1670,6 +1752,7 @@ mod tests {
                     ],
                 }],
             }],
+            owner_allow: Vec::new(),
         }
     }
 
@@ -1685,7 +1768,7 @@ mod tests {
         let diagnostics = Arc::new(ExecDiagnostics::new(policy.summary()));
         Arc::new(ExecService {
             agent: Arc::new(agent),
-            policy: Arc::new(policy.clone()),
+            policy: std::sync::RwLock::new(Arc::new(policy.clone())),
             audit: ExecAudit::new(&policy, Arc::clone(&diagnostics)),
             diagnostics,
             pending_clients: Mutex::new(HashMap::new()),
@@ -2020,6 +2103,7 @@ mod tests {
                     ],
                 }],
             }],
+            owner_allow: Vec::new(),
         };
         let (service, _dir) = enabled_test_service(acl).await;
         let request_id = ExecRequestId([77; 16]);
@@ -2260,6 +2344,7 @@ mod tests {
                 &acl,
                 agent,
                 machine,
+                false,
                 &argv,
                 Some(&b"in".to_vec()),
                 2_500,
@@ -2272,13 +2357,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_request_owner_principal_needs_owner_trust_and_explicit_entry() {
+        // ADR-0070 §1 + PR #896 decision 1: an owner-trusted pair runs only
+        // what a `principal = "owner"` entry lists; without the entry owner
+        // trust grants nothing, and a non-owner pair never uses the entry.
+        let service = test_service().await;
+        let listed_agent = AgentId([31; 32]);
+        let listed_machine = MachineId([32; 32]);
+        let owner_agent = AgentId([41; 32]);
+        let owner_machine = MachineId([42; 32]);
+        let argv = vec!["echo".to_string(), "ok".to_string()];
+
+        let pair_only = test_acl(listed_agent, listed_machine);
+        assert_eq!(
+            denied(service.check_request(
+                &pair_only,
+                owner_agent,
+                owner_machine,
+                true,
+                &argv,
+                None,
+                1_000,
+                None,
+            )),
+            DenialReason::AgentMachineNotInAcl
+        );
+
+        let mut with_owner = test_acl(listed_agent, listed_machine);
+        with_owner
+            .owner_allow
+            .push(crate::exec::acl::OwnerAllowEntry {
+                description: Some("owner command".to_string()),
+                max_duration_secs: None,
+                commands: vec![AllowedCommand {
+                    argv: vec![
+                        AllowedToken::Literal("echo".to_string()),
+                        AllowedToken::Literal("ok".to_string()),
+                    ],
+                }],
+            });
+        let checked = service
+            .check_request(
+                &with_owner,
+                owner_agent,
+                owner_machine,
+                true,
+                &argv,
+                None,
+                1_000,
+                None,
+            )
+            .expect("owner-trusted pair matches the owner entry");
+        assert_eq!(checked.description.as_deref(), Some("owner command"));
+        assert_eq!(
+            denied(service.check_request(
+                &with_owner,
+                owner_agent,
+                owner_machine,
+                false,
+                &argv,
+                None,
+                1_000,
+                None,
+            )),
+            DenialReason::AgentMachineNotInAcl
+        );
+        assert_eq!(
+            denied(service.check_request(
+                &with_owner,
+                owner_agent,
+                owner_machine,
+                true,
+                &["echo".to_string(), "other".to_string()],
+                None,
+                1_000,
+                None,
+            )),
+            DenialReason::ArgvNotAllowed
+        );
+    }
+
+    #[tokio::test]
     async fn check_request_rejects_empty_argv_and_cwd() {
         let service = test_service().await;
         let agent = AgentId([33; 32]);
         let machine = MachineId([34; 32]);
         let acl = test_acl(agent, machine);
         assert_eq!(
-            denied(service.check_request(&acl, agent, machine, &[], None, 1_000, None)),
+            denied(service.check_request(&acl, agent, machine, false, &[], None, 1_000, None)),
             DenialReason::ArgvNotAllowed
         );
         assert_eq!(
@@ -2286,6 +2452,7 @@ mod tests {
                 &acl,
                 agent,
                 machine,
+                false,
                 &["echo".to_string(), "ok".to_string()],
                 None,
                 1_000,
@@ -2306,6 +2473,7 @@ mod tests {
                 &acl,
                 agent,
                 machine,
+                false,
                 &["echo".to_string(), "ok;rm".to_string()],
                 None,
                 1_000,
@@ -2318,6 +2486,7 @@ mod tests {
                 &acl,
                 AgentId([99; 32]),
                 machine,
+                false,
                 &["echo".to_string(), "ok".to_string()],
                 None,
                 1_000,
@@ -2338,6 +2507,7 @@ mod tests {
                 &acl,
                 agent,
                 machine,
+                false,
                 &["echo".to_string(), "nope".to_string()],
                 None,
                 1_000,
@@ -2350,6 +2520,7 @@ mod tests {
                 &acl,
                 agent,
                 machine,
+                false,
                 &["echo".to_string(), "ok".to_string()],
                 Some(&b"too long".to_vec()),
                 1_000,
@@ -2362,6 +2533,7 @@ mod tests {
                 &acl,
                 agent,
                 machine,
+                false,
                 &["echo".to_string(), "ok".to_string()],
                 None,
                 4_000,
@@ -2874,6 +3046,7 @@ mod tests {
                 &acl,
                 agent,
                 machine,
+                false,
                 &["echo".to_string(), poison.to_string()],
                 None,
                 1_000,

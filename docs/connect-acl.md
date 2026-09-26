@@ -46,6 +46,47 @@ targets = [
 
 Each `[[connect.allow]]` entry grants the `(agent_id, machine_id)` pair access to the listed loopback targets. Matching is **exact**: `127.0.0.1:22` does not grant `[::1]:22`.
 
+### `principal = "owner"` (ADR-0070 §1)
+
+An entry may name the owner principal instead of an exact pair:
+
+```toml
+[[connect.allow]]
+description = "any of my own machines"
+principal = "owner"
+targets = ["127.0.0.1:22"]
+```
+
+It matches any **owner-trusted** requester: the agent presents a valid, unexpired `AgentCertificate` signed by this install's owner (`user.key`), its machine holds a current owner enrollment (`/sync/devices`, ADR-0041), and neither the agent, the machine nor their binding is revoked. A `Blocked` contact is never owner-trusted. An install with no owner key never matches an owner entry.
+
+- Owner trust **does not open connect by itself.** With no `principal = "owner"` entry, an owner-trusted peer is denied exactly as before. The shipped defaults contain no owner entry.
+- Targets stay explicit and exact, as for pair entries.
+- An owner entry must not also set `agent_id` or `machine_id`; an entry with neither a principal nor both ids, or with any other principal value, is a load-time error.
+- Owner entries apply to the inbound stream gate and to attested `ForwardV2` forwards. The legacy `ForwardV1` path (`require_attestation = false`) matches exact pairs only.
+- Owner entries can be added at runtime; see [Managing the ACL at runtime](#managing-the-acl-at-runtime-adr-0070-3).
+
+## Managing the ACL at runtime (ADR-0070 §3)
+
+The TOML file above is the **floor**. The daemon never rewrites it, and its entries cannot be removed through the API. The owner can add further entries through REST/CLI. They persist in a daemon-owned overlay file, `<data_dir>/acl/connect-overlay.json`. The effective ACL is the floor plus the overlay.
+
+```bash
+x0x acl connect list                       # floor (origin: file) + API (origin: api) entries, with ids
+x0x acl connect add '{"principal":"owner","targets":["127.0.0.1:22"]}'
+x0x acl connect add @entry.json            # or `-` for stdin
+x0x acl connect rm api-0123456789abcdef    # API entries only; a file entry answers 409
+x0x acl reload                             # re-read the TOML floor and the overlay
+```
+
+- **Authorization:** every `/acl/*` route requires the durable API token. Session tokens and rider tokens get `403`.
+- **Validation:** the JSON body is the `[[connect.allow]]` entry schema, and it is checked by the same parser as the TOML file (`deny_unknown_fields`, loopback-only exact targets, principal rules). Invalid input returns `400` and nothing is written.
+- **Owner entries:** adding a `principal = "owner"` entry returns `409` on an install with no owner key, because such an install has no owner trust.
+- **Disabled floor:** if the TOML floor disables connect (or the file is missing), adding an entry returns `409`. API entries never turn a plane on.
+- **Reload:** `POST /acl/reload` (`x0x acl reload`) or `SIGHUP` re-reads the floor file and the overlay, then swaps the effective ACL atomically. The reload is rejected, and the last good ACL stays active, when the file or overlay is malformed or invalid, or when the reload would switch connect between enabled and disabled (that needs a restart). A rejected reload answers `422`. Its reason, plus the `reloads_ok`/`reloads_failed` counters, appears under `acl_reload` in `GET /diagnostics/connect`.
+- **In-flight streams** keep the policy they were admitted under. Each new stream is gated against the current ACL.
+- **The overlay only adds access.** The effective ACL is always floor ∪ overlay. There is no deny entry, and no overlay entry can narrow, override or remove a floor entry.
+- **A malformed overlay does not stop the daemon.** Because the overlay only adds access, the daemon starts on the TOML floor alone, which can only withhold access. The bad file stays untouched on disk. The error is logged and appears under `acl_reload.overlay_error`, with `overlay_load_failures` counting such failures, in `GET /diagnostics/connect`. API writes answer `409` until the file is fixed (or moved aside) and a reload succeeds, so the broken file is never silently overwritten. A malformed floor still stops startup.
+- **Overlay files** are written atomically (temp file in the same directory, fsync, rename, directory fsync) with mode `0600`, inside an `acl/` directory restricted to `0700`.
+
 ## Target validation rules
 
 Every target is validated at **load time** — a bad target is a hard error that blocks daemon startup and fails `--check`. The rules:

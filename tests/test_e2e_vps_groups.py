@@ -3,6 +3,7 @@ import importlib.util
 import json
 import logging
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,143 @@ def load_groups():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+class GroupDiscoveryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.groups = load_groups()
+
+    def test_targeted_direct_discovery_reports_channel_and_latency(self):
+        groups = self.groups
+        router = groups.ResultRouter(logging.getLogger("groups-discovery-direct"))
+
+        class Client:
+            sent = []
+            published = []
+
+            def direct_send(self, aid, wire, **kwargs):
+                self.sent.append((aid, wire, kwargs))
+                command = json.loads(base64.b64decode(wire[len(groups.PREFIX_CMD):]))
+                router.deliver({
+                    "kind": "discover_reply", "node": command["target_node"],
+                    "agent_id": aid, "machine_id": "machine",
+                    "request_id": command["params"]["request_id"],
+                }, aid)
+                return {"ok": True}
+
+            def publish(self, topic, payload):
+                self.published.append((topic, payload))
+
+        client = Client()
+        with self.assertLogs("groups-discovery-direct", level=logging.INFO) as logs:
+            found = groups.discover_runners(
+                client, router, "a" * 64, "nyc", ["sfo", "sydney"], 1,
+                logging.getLogger("groups-discovery-direct"),
+                runner_agent_ids={"sfo": "b" * 64, "sydney": "c" * 64},
+            )
+        self.assertEqual({"sfo", "sydney"}, set(found))
+        self.assertEqual([], client.published)
+        self.assertEqual(2, len(client.sent))
+        request_ids = set()
+        for aid, wire, kwargs in client.sent:
+            self.assertTrue(wire.startswith(groups.PREFIX_CMD))
+            command = json.loads(base64.b64decode(wire[len(groups.PREFIX_CMD):]))
+            self.assertIn(command["target_node"], found)
+            self.assertEqual(found[command["target_node"]].agent_id, aid)
+            self.assertEqual(command["command_id"], command["params"]["request_id"])
+            self.assertLess(kwargs["timeout"], 1)
+            request_ids.add(command["command_id"])
+        self.assertEqual(2, len(request_ids))
+        self.assertEqual(2, sum("channel=direct" in line for line in logs.output))
+        self.assertRegex("\n".join(logs.output), r"announce_reply_latency_ms=[0-9]+\.[0-9]+")
+
+    def test_direct_ack_without_reply_falls_back_only_after_interval(self):
+        groups = self.groups
+        router = groups.ResultRouter(logging.getLogger("groups-discovery-fallback"))
+
+        class Client:
+            sent = []
+            published = []
+
+            def direct_send(self, aid, wire, **_kwargs):
+                self.sent.append((aid, wire))
+                return {"ok": True}
+
+            def publish(self, topic, payload):
+                self.published.append((topic, payload))
+                command = json.loads(payload)
+                router.deliver({
+                    "kind": "discover_reply", "node": command["target_node"],
+                    "agent_id": "b" * 64, "machine_id": "machine",
+                    "request_id": command["params"]["request_id"],
+                }, "b" * 64)
+
+        client = Client()
+        start = time.monotonic()
+        with self.assertLogs("groups-discovery-fallback", level=logging.INFO) as logs:
+            found = groups.discover_runners(
+                client, router, "a" * 64, "nyc", ["sfo"], 1,
+                logging.getLogger("groups-discovery-fallback"),
+                runner_agent_ids={"sfo": "b" * 64},
+                republish_every_secs=0.05,
+            )
+        self.assertGreaterEqual(time.monotonic() - start, 0.04)
+        self.assertEqual("sfo", found["sfo"].name)
+        self.assertEqual(1, len(client.sent))
+        self.assertEqual(1, len(client.published))
+        command = json.loads(client.published[0][1])
+        self.assertEqual("sfo", command["target_node"])
+        self.assertEqual(command["command_id"], command["params"]["request_id"])
+        self.assertIn("node=sfo channel=pubsub", "\n".join(logs.output))
+
+    def test_missing_or_self_id_uses_targeted_pubsub(self):
+        groups = self.groups
+        for ids in ({}, {"sfo": "invalid"}, {"sfo": "a" * 64}):
+            with self.subTest(ids=ids):
+                router = groups.ResultRouter(logging.getLogger("groups-discovery-id"))
+
+                class Client:
+                    sent = []
+                    published = []
+
+                    def direct_send(self, aid, wire, **_kwargs):
+                        self.sent.append((aid, wire))
+                        return {"ok": True}
+
+                    def publish(self, topic, payload):
+                        self.published.append((topic, payload))
+                        command = json.loads(payload)
+                        router.deliver({
+                            "kind": "discover_reply", "node": "sfo",
+                            "agent_id": "b" * 64,
+                            "request_id": command["params"]["request_id"],
+                        }, "b" * 64)
+
+                client = Client()
+                found = groups.discover_runners(
+                    client, router, "a" * 64, "nyc", ["sfo"], 1,
+                    logging.getLogger("groups-discovery-id"), runner_agent_ids=ids,
+                )
+                self.assertIn("sfo", found)
+                self.assertEqual([], client.sent)
+                self.assertEqual(groups.DISCOVER_TOPIC, client.published[0][0])
+                self.assertEqual("sfo", json.loads(client.published[0][1])["target_node"])
+
+    def test_lookup_closes_owned_tunnel_after_agent_failure(self):
+        groups = self.groups
+        handle = mock.Mock()
+        with mock.patch.object(groups, "start_ssh_tunnel", return_value=handle), \
+             mock.patch.object(groups, "stop_ssh_tunnel") as stop, \
+             mock.patch.object(groups, "X0xClient") as client_type:
+            client_type.return_value.agent.side_effect = OSError("API unavailable")
+            ids = groups.lookup_runner_agents(
+                ["nyc", "sfo"], "nyc", "a" * 64,
+                {"sfo": ("sfo.invalid", "token")}, 13600,
+                logging.getLogger("groups-discovery-lookup"),
+            )
+        self.assertEqual({"nyc": "a" * 64}, ids)
+        stop.assert_called_once_with(handle)
 
 
 class GroupDispatchDeadlineTests(unittest.TestCase):

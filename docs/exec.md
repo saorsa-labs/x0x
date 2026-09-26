@@ -19,12 +19,12 @@ Remote execution is processed only when all of the following are true:
 
 1. the DM envelope signature verifies the requester `AgentId`;
 2. the sender's `AgentId → MachineId` binding is verified;
-3. the local trust evaluator returns `Accept`;
-4. the ACL contains the exact `(agent_id, machine_id)` pair;
+3. the local trust evaluator returns `Accept` (an owner-trusted pair, ADR-0070 §1, counts as `Accept` unless it is `Blocked`);
+4. the ACL contains the exact `(agent_id, machine_id)` pair, or the pair is owner-trusted and the ACL has a `principal = "owner"` entry;
 5. the argv vector matches an allowed command;
 6. stdin, timeout, concurrency, and output caps pass.
 
-**Caller-authentication trust anchor.** Exec authorization rests on the `(agent_id, machine_id)` pair being *cryptographically* authenticated, not merely claimed: both fields are mandatory in every ACL entry, and the `machine_id` is the QUIC peer identity established by the post-quantum (ML-DSA-65) transport handshake — an attacker cannot present a forged `machine_id` without the peer's machine keypair. So an exec request is honored only from hardware the operator explicitly pinned in the ACL. This invariant must survive refactors (issue #195).
+**Caller-authentication trust anchor.** Exec authorization rests on the `(agent_id, machine_id)` pair being *cryptographically* authenticated, not merely claimed: both fields are mandatory in every ACL entry, and the `machine_id` is the QUIC peer identity established by the post-quantum (ML-DSA-65) transport handshake — an attacker cannot present a forged `machine_id` without the peer's machine keypair. So an exec request is honored only from hardware the operator explicitly pinned in the ACL. This invariant must survive refactors (issue #195). A `principal = "owner"` entry (below) replaces the explicit pin with an equally cryptographic one: the same transport-authenticated `machine_id` must hold a current enrollment signed by this install's owner key, and the agent must hold a certificate signed by that same key.
 
 ## ACL location
 
@@ -79,6 +79,43 @@ Supported templates:
 - a literal prefix ending in `<URL_PATH>`, e.g. `http://127.0.0.1:12600<URL_PATH>`.
 
 Any other `<...>` token is a parse error.
+
+### `principal = "owner"` (ADR-0070 §1)
+
+An entry may name the owner principal instead of an exact pair:
+
+```toml
+[[exec.allow]]
+description = "any of my own machines"
+principal = "owner"
+
+[[exec.allow.commands]]
+argv = ["systemctl", "status", "x0xd"]
+```
+
+It matches any **owner-trusted** requester: the agent presents a valid, unexpired `AgentCertificate` signed by this install's owner (`user.key`), its machine holds a current owner enrollment (`/sync/devices`, ADR-0041), and neither the agent, the machine nor their binding is revoked. A `Blocked` contact is never owner-trusted, and an install with no owner key never matches an owner entry.
+
+- Owner trust **does not open exec by itself.** With no `principal = "owner"` entry an owner-trusted requester is denied (`agent_machine_not_in_acl`). The shipped defaults contain no owner entry.
+- Argv stays an exact allowlist; caps and `max_duration_secs` apply as for pair entries.
+- An owner entry must not also set `agent_id` or `machine_id`; an entry with neither a principal nor both ids, or with any other principal value, is a load-time error.
+- Owner entries can be added at runtime; see below.
+
+### Managing the ACL at runtime (ADR-0070 §3)
+
+The TOML file is the **floor**. The daemon never rewrites it, and its entries cannot be removed through the API (`409`). The owner can add entries through REST/CLI (durable API token only; session and rider tokens get `403`). They persist in `<data_dir>/acl/exec-overlay.json`. The effective ACL is the floor plus the overlay.
+
+```bash
+x0x acl exec list
+x0x acl exec add '{"principal":"owner","commands":[{"argv":["uptime"]}]}'
+x0x acl exec rm api-0123456789abcdef
+x0x acl reload                  # also SIGHUP
+```
+
+- The JSON body is the `[[exec.allow]]` entry schema. It is validated by the same parser as the file. Caps, audit settings and `enabled` come only from the floor.
+- API entries are refused with `409` while the floor disables exec. `principal = "owner"` entries are refused with `409` on an install with no owner key.
+- A reload is rejected, and the last good ACL kept, when the file or overlay is malformed or invalid, when it would switch exec on or off, or when it would change `audit_log_path`/`audit_tasklist_id` (the audit sink is bound at start). The reason and counters appear under `acl_reload` in `GET /diagnostics/exec`. Caps and allow entries do hot-reload.
+- Requests already admitted keep the policy they were checked against.
+- As for connect, the overlay only adds access. A malformed `exec-overlay.json` leaves the daemon running on the floor alone, is reported under `acl_reload.overlay_error` in `/diagnostics/exec`, and blocks API writes (`409`) until a reload succeeds. Overlay writes are atomic and `0600`.
 
 Every request argv token is also checked for shell metacharacters (`;`, `|`, `&`, `>`, `<`, backtick, `$`, newline, and NUL). This is defence in depth; commands are still spawned without a shell.
 

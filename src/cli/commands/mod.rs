@@ -1,6 +1,8 @@
 //! Command implementations for the `x0x` CLI.
 
+pub mod acl;
 pub mod auth;
+pub mod call;
 pub mod connect;
 pub mod constitution;
 pub mod contacts;
@@ -18,6 +20,7 @@ pub mod identity;
 pub mod machines;
 pub mod messaging;
 pub mod network;
+pub mod onboard;
 pub mod presence;
 pub mod purge;
 pub mod store;
