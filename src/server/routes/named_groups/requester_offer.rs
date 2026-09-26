@@ -357,7 +357,7 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
                 .send_direct_with_config(
                     &authority,
                     dm_payload,
-                    predecessor_relay_delivery_config(&obligation.digest),
+                    predecessor_relay_delivery_config(&obligation.digest, &authority),
                 )
                 .await
                 .is_ok()
