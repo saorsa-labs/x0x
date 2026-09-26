@@ -21,8 +21,12 @@ All notable changes to this project will be documented in this file.
   with in-flight redeliveries. `DELETE /grants/:id` now answers `503` unless
   both `revocations-v3.bin` and the outbox removal are durable (retry is
   idempotent). `revocations-v3.bin` is now written durably and
-  monotonically: every writer re-reads and unions the file under one lock,
-  so an older snapshot can no longer erase a newer revocation. No wire change: retries re-send the #924
+  monotonically: every writer re-reads and unions the file while holding an
+  exclusive OS advisory lock on `revocations-v3.bin.lock` (shared with the
+  daemon instance lock's primitives), so neither an older snapshot nor
+  another daemon sharing the identity dir can erase a newer revocation; the
+  union applies the same GC horizon as the in-memory sweep. Share-grant
+  revocations received on the v1/v2 carriers are now persisted to v3 too. No wire change: retries re-send the #924
   typed DM with the same logical request id, so the receiving side is
   unchanged.
 
