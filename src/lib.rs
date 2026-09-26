@@ -4299,6 +4299,15 @@ impl Agent {
         runtime.pubsub().replace_group_rosters(rosters).await;
     }
 
+    /// #908/R17 Home blocker: the live pub/sub handle for seal-time
+    /// warranted certificate fetches (None when gossip is disabled -
+    /// callers treat that as unobtainable evidence, fail closed).
+    #[must_use]
+    pub(crate) fn pubsub(&self) -> Option<std::sync::Arc<gossip::PubSubManager>> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| std::sync::Arc::clone(rt.pubsub()))
+    }
     /// Leaf vs Full participation snapshot (issue #380).
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
