@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     # Cold all-feature compilation consumed the former 20-minute job budget
     # before the final selector ran; inner runtime bounds remain unchanged.
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       X0X_RUNTIME_TIMEOUT_SECONDS: 1200
     steps:
