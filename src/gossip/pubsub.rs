@@ -1020,6 +1020,21 @@ impl PubSubManager {
         if *current == next {
             return;
         }
+        let changed_groups: HashSet<String> = current
+            .keys()
+            .chain(next.keys())
+            .filter(|id| current.get(*id) != next.get(*id))
+            .cloned()
+            .collect();
+        let mut changed_metadata_topics = HashSet::new();
+        for id in &changed_groups {
+            if let Some(roster) = current.get(id) {
+                changed_metadata_topics.insert(roster.metadata_topic.clone());
+            }
+            if let Some(roster) = next.get(id) {
+                changed_metadata_topics.insert(roster.metadata_topic.clone());
+            }
+        }
         *current = next;
         drop(current);
         #[cfg(test)]
@@ -1039,7 +1054,15 @@ impl PubSubManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let mut affected_topics = HashSet::new();
         for (name, topic_id) in known {
+            if !Self::topic_affected_by_roster_change(
+                &name,
+                &changed_groups,
+                &changed_metadata_topics,
+            ) {
+                continue;
+            }
             let _topic_guard = self
                 .group_preference_apply_locks
                 .shard(topic_id)
@@ -1053,6 +1076,7 @@ impl PubSubManager {
                 == Some(&topic_id)
             {
                 self.register_group_topic_locked(&name, topic_id).await;
+                affected_topics.insert(topic_id);
             }
         }
         // Publish-only topics are absent from the local name map. Sweep all
@@ -1077,11 +1101,37 @@ impl PubSubManager {
                 .await
                 .get(&topic_id)
                 .map(|binding| binding.name.clone());
-            if let Some(name) = name {
+            if let Some(name) = name.filter(|name| {
+                Self::topic_affected_by_roster_change(
+                    name,
+                    &changed_groups,
+                    &changed_metadata_topics,
+                )
+            }) {
                 self.register_group_topic_locked(&name, topic_id).await;
+                affected_topics.insert(topic_id);
             }
         }
-        self.refresh_topic_peers().await;
+        let peers = self.transport.connected_peer_ids().await;
+        let mut ordered_peers = None;
+        for topic_id in affected_topics {
+            self.apply_topic_peers_from_snapshot(topic_id, &peers, &mut ordered_peers)
+                .await;
+        }
+    }
+
+    fn topic_affected_by_roster_change(
+        name: &str,
+        changed_groups: &HashSet<String>,
+        changed_metadata_topics: &HashSet<String>,
+    ) -> bool {
+        changed_metadata_topics.contains(name)
+            || name
+                .strip_prefix("x0x/group/")
+                .and_then(|rest| rest.split_once("/kv/"))
+                .is_some_and(|(id, store)| {
+                    !id.is_empty() && !store.is_empty() && changed_groups.contains(id)
+                })
     }
 
     async fn register_group_topic(&self, name: &str, topic_id: TopicId) {
@@ -5131,6 +5181,130 @@ mod tests {
             .replace_group_rosters(vec![(group_id, String::new(), vec![member])])
             .await;
         assert_eq!(role_for(&manager, topic, machine.0), "eager");
+    }
+
+    #[tokio::test]
+    async fn metadata_and_state_sync_subscribed_before_roster_are_reclassified() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "group_topic_mapping_before_roster",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let group_id = "ab".repeat(32);
+        let metadata = format!("x0x/group/{group_id}/metadata");
+        let state_sync = format!("x0x/group/{group_id}/kv/{}/state-sync", "cd".repeat(32));
+        let identity = group_identity_for_test(&manager);
+        let member = AgentId([40; 32]);
+        let machine = MachineId([90; 32]);
+        authorize_group_peer_for_test(&identity.bindings, member, machine).await;
+        let mut plane: Vec<[u8; 32]> = (1..=13).map(|n| [n; 32]).collect();
+        plane.push(machine.0);
+        set_plane(&manager, plane);
+
+        let _metadata_sub = manager.subscribe(metadata.clone()).await;
+        let _state_sync_sub = manager.subscribe(state_sync.clone()).await;
+        manager.refresh_topic_peers().await;
+        let connected = manager.transport.connected_peer_ids().await;
+        for name in [&metadata, &state_sync] {
+            let topic = TopicId::from_entity(name.as_bytes());
+            assert_ne!(
+                role_for(&manager, topic, machine.0),
+                "absent",
+                "{name} must include the connected member before roster loading"
+            );
+            assert!(
+                manager
+                    .preferred_roster_peers(topic, &connected)
+                    .await
+                    .is_empty(),
+                "{name} must have no roster preference before rosters load"
+            );
+        }
+
+        manager
+            .replace_group_rosters(vec![(group_id, metadata.clone(), vec![member])])
+            .await;
+        for name in [&metadata, &state_sync] {
+            let topic = TopicId::from_entity(name.as_bytes());
+            assert_eq!(
+                manager.preferred_roster_peers(topic, &connected).await,
+                vec![PeerId::new(machine.0)],
+                "{name} must map to its group's authenticated roster member"
+            );
+            assert_eq!(
+                role_for(&manager, topic, machine.0),
+                "eager",
+                "{name} must promote the member after roster loading"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn roster_change_refreshes_only_affected_group_topics() {
+        let manager = PubSubManager::new_with_participation(
+            test_node().await,
+            None,
+            None,
+            ParticipationMode::Full,
+            "scoped_roster_refresh",
+        )
+        .expect("manager");
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: Vec::new(),
+            sends: Vec::new(),
+        });
+        let group_a = "ab".repeat(32);
+        let group_b = "cd".repeat(32);
+        let topic_a_name = format!("x0x/group/{group_a}/kv/{}", "01".repeat(32));
+        let topic_b_name = format!("x0x/group/{group_b}/kv/{}", "02".repeat(32));
+        let topic_a = TopicId::from_entity(topic_a_name.as_bytes());
+        let topic_b = TopicId::from_entity(topic_b_name.as_bytes());
+        let passthrough = TopicId::from_entity(b"unrelated-full-passthrough");
+        let identity = group_identity_for_test(&manager);
+        for n in [70, 71, 72] {
+            authorize_group_peer_for_test(
+                &identity.bindings,
+                AgentId([n - 30; 32]),
+                MachineId([n; 32]),
+            )
+            .await;
+        }
+        set_plane(&manager, vec![[70; 32], [71; 32], [72; 32]]);
+        let _sub_a = manager.subscribe(topic_a_name).await;
+        let _sub_b = manager.subscribe(topic_b_name).await;
+        manager.set_known_plumtree_topics_for_test(vec![topic_a, topic_b, passthrough]);
+        manager
+            .replace_group_rosters(vec![
+                (group_a.clone(), String::new(), vec![AgentId([40; 32])]),
+                (group_b.clone(), String::new(), vec![AgentId([42; 32])]),
+            ])
+            .await;
+        manager.take_refreshed_topic_ids();
+
+        manager
+            .replace_group_rosters(vec![
+                (group_a, String::new(), vec![AgentId([41; 32])]),
+                (group_b, String::new(), vec![AgentId([42; 32])]),
+            ])
+            .await;
+        let refreshed = manager.take_refreshed_topic_ids();
+        assert_eq!(refreshed, vec![topic_a], "only group A changed");
+        let connected = manager.transport.connected_peer_ids().await;
+        assert_eq!(
+            manager.preferred_roster_peers(topic_a, &connected).await,
+            vec![PeerId::new([71; 32])]
+        );
+        assert_eq!(
+            manager.preferred_roster_peers(topic_b, &connected).await,
+            vec![PeerId::new([72; 32])]
+        );
     }
 
     #[tokio::test]

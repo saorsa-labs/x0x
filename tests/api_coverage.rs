@@ -48,6 +48,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/status", daemon_api_status),
     covered!(Post, "/shutdown", daemon_api_shutdown_with_sse_client),
     covered!(Post, "/auth/session", daemon_api_auth_session_exchange),
+    covered!(
+        Post,
+        "/auth/session/refresh",
+        daemon_api_auth_session_refresh
+    ),
     // ── ADR-0043 agent key-move ceremony + placement ledger ────────────
     covered!(Post, "/agent/move", move_routes_wired),
     covered!(Post, "/agent/move/export", move_routes_wired),
@@ -153,6 +158,11 @@ const COVERED: &[CoveredEndpoint] = &[
         Get,
         "/diagnostics/history",
         rest_history_list_search_stats_purge_roundtrip
+    ),
+    covered!(
+        Get,
+        "/diagnostics/state-sync",
+        state_sync_route_exposes_bounded_open_store_snapshot
     ),
     covered!(
         Get,
@@ -594,6 +604,10 @@ const COVERED: &[CoveredEndpoint] = &[
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
+    (
+        "src/server/routes/network.rs",
+        include_str!("../src/server/routes/network.rs"),
+    ),
     (
         "tests/daemon_api_integration.rs",
         include_str!("daemon_api_integration.rs"),
@@ -1099,6 +1113,7 @@ fn categories_are_valid() {
         "stores",
         "files",
         "exec",
+        "calls",
         "connect",
         "upgrade",
         "websocket",

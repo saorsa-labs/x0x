@@ -48,7 +48,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::connect::gate::ConnectDenialReason;
-use crate::connect::{evaluate_connect_gate, ConnectDiagnostics, ConnectPolicy};
+use crate::connect::{
+    evaluate_connect_gate, evaluate_connect_gate_for_principal, ConnectDiagnostics, ConnectPolicy,
+};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, AgentKeypair, MachineId};
 use crate::streams::{PeerStream, StreamProtocol};
@@ -465,6 +467,9 @@ struct AttestationVerifyCtx {
     now_ms: u64,
     revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
     move_state: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
+    /// ADR-0070 §1 owner trust: feeds the trust decision and the
+    /// `principal = "owner"` connect-ACL selector.
+    owner_trust: crate::owner_trust::OwnerTrust,
 }
 
 /// Inbound gate decision for a `ForwardV2` attested stream (#204).
@@ -625,23 +630,28 @@ async fn decide_inbound_attested(
     // ── Trust evaluation (#204 must-fix 3): evaluate the attested agent's
     // real trust — NOT a hard-coded Accept. A Blocked-but-announced agent
     // must be denied here (same pattern as the stream gate).
-    let trust_decision = {
-        let contacts = ctx.contact_store.read().await;
-        let evaluator = crate::trust::TrustEvaluator::new(&contacts);
-        evaluator.evaluate(&crate::trust::TrustContext {
-            agent_id: &header.opener_agent_id,
-            machine_id: peer_machine,
-        })
-    };
+    // ADR-0070 §1: owner trust is an input to that decision, and the only
+    // way a `principal = "owner"` ACL entry can match.
+    let pair = ctx
+        .owner_trust
+        .evaluate_pair(
+            &ctx.contact_store,
+            &ctx.discovery_cache,
+            &ctx.revocation_set,
+            &header.opener_agent_id,
+            peer_machine,
+        )
+        .await;
 
     // The opener is now cryptographically authenticated: ACL-check that
     // specific agent with its REAL trust decision.
-    evaluate_connect_gate(
+    evaluate_connect_gate_for_principal(
         /* verified */ true,
-        Some(trust_decision),
+        Some(pair.decision),
         policy,
         &header.opener_agent_id,
         peer_machine,
+        pair.owner_trusted,
         &target,
     )?;
 
@@ -663,7 +673,7 @@ async fn decide_inbound_attested(
     let revoked = ctx.revocation_set.read().await;
     crate::streams::stream_gate(
         &header.opener_agent_id,
-        Some(trust_decision),
+        Some(pair.decision),
         revoked.is_agent_revoked(&header.opener_agent_id),
         revoked.is_machine_revoked(peer_machine),
         crate::identity::is_expired(agent.cert_not_after, ctx.now_ms / 1000),
@@ -772,6 +782,8 @@ pub(crate) struct InboundCtx {
     pub contact_store: Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
     pub own_machine_id: MachineId,
     pub require_attestation: bool,
+    /// ADR-0070 §1 owner trust for the attested (`ForwardV2`) gate.
+    pub owner_trust: crate::owner_trust::OwnerTrust,
 }
 
 /// Drive the inbound half of a forward: read the header, run the connect
@@ -884,6 +896,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                 now_ms,
                 revocation_set: Arc::clone(&ctx.revocation_set),
                 move_state: Arc::clone(&ctx.move_state),
+                owner_trust: ctx.owner_trust.clone(),
             };
             match decide_inbound_attested(&header, &ctx.policy, &machine_id, &verify_ctx).await {
                 Ok(addr) => addr,
@@ -1436,6 +1449,7 @@ impl ForwardService {
                 contact_store: Arc::clone(&this.contact_store),
                 own_machine_id: this.agent.machine_id(),
                 require_attestation: this.require_attestation,
+                owner_trust: this.agent.owner_trust().clone(),
             };
             handle_inbound(stream, &inbound_ctx).await;
         });
@@ -1832,6 +1846,7 @@ mod tests {
                 machine_id: machine,
                 targets: vec![target],
             }],
+            owner_allow: Vec::new(),
         })
     }
 
@@ -1884,6 +1899,7 @@ mod tests {
             loaded_from: "test".into(),
             loaded_at_unix_ms: 0,
             allow: entries,
+            owner_allow: Vec::new(),
         })
     }
 
@@ -2314,6 +2330,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 },
             )
             .await,
@@ -2356,6 +2373,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 },
             )
             .await,
@@ -2389,6 +2407,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 },
             )
             .await,
@@ -2423,6 +2442,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 },
             )
             .await,
@@ -2455,6 +2475,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 },
             )
             .await,
@@ -2489,6 +2510,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 },
             )
             .await,
@@ -2524,6 +2546,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 },
             )
             .await,
@@ -2595,6 +2618,7 @@ mod tests {
             &revoked,
             &moves,
             &shared_policy,
+            &crate::owner_trust::OwnerTrust::default(),
             &machine,
         )
         .await
@@ -2607,6 +2631,7 @@ mod tests {
             now_ms: now_ms(),
             revocation_set: revoked,
             move_state: moves,
+            owner_trust: crate::owner_trust::OwnerTrust::default(),
         };
         let good = v2_wire_round_trip(&signed_v2_header("127.0.0.1", 22, &b, recipient)).await;
         assert_eq!(
@@ -2636,6 +2661,7 @@ mod tests {
                 crate::revocation::RevocationSet::new(),
             )),
             move_state: Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new())),
+            owner_trust: crate::owner_trust::OwnerTrust::default(),
         };
         let target = "127.0.0.1:22".parse().unwrap();
         let policy = policy_with_allow(kp.agent_id(), machine, target);
@@ -2647,6 +2673,7 @@ mod tests {
                 &ctx.revocation_set,
                 &ctx.move_state,
                 &shared_policy,
+                &crate::owner_trust::OwnerTrust::default(),
                 &machine
             )
             .await
@@ -2880,6 +2907,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -2904,6 +2932,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -2930,6 +2959,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -2955,6 +2985,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -2980,6 +3011,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3005,6 +3037,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3058,6 +3091,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 },
             )
             .await
@@ -3099,6 +3133,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3134,6 +3169,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3172,6 +3208,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3210,6 +3247,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3245,6 +3283,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3315,6 +3354,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3338,6 +3378,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await
@@ -3409,6 +3450,7 @@ mod tests {
                     move_state: Arc::new(tokio::sync::RwLock::new(
                         crate::key_move::MoveState::new()
                     )),
+                    owner_trust: crate::owner_trust::OwnerTrust::default(),
                 }
             )
             .await

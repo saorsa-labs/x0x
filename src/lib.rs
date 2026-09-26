@@ -84,6 +84,7 @@ pub mod key_move;
 /// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
 /// records over `SyncV1` streams between the owner's enrolled machines).
 pub mod owner_sync;
+pub mod owner_trust;
 
 pub mod announce_blob;
 /// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
@@ -484,6 +485,9 @@ pub struct Agent {
     /// [`Agent::set_connect_policy`]. `std` RwLock: gate reads are a brief
     /// clone of the inner `Arc`, never held across an await.
     connect_policy: std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+    /// ADR-0070 §1 owner trust (local owner + owner device set), consulted
+    /// by the stream gates; see [`owner_trust`].
+    owner_trust: owner_trust::OwnerTrust,
     /// ADR-0043 §2.1: this machine's ML-KEM-768 enrollment keypair — the
     /// export-envelope recipient key. Generated at first start, persisted
     /// beside the machine key (`machine-kem.key`); `None` when no
@@ -13423,14 +13427,18 @@ impl Agent {
         // returns false, preserving compatibility with pre-#130 peers.
         let expired = identity::is_expired(cert_not_after, Self::unix_timestamp_secs());
 
-        let trust_decision = {
-            let contacts = self.contact_store.read().await;
-            let evaluator = trust::TrustEvaluator::new(&contacts);
-            Some(evaluator.evaluate(&trust::TrustContext {
-                agent_id,
-                machine_id: &machine_id,
-            }))
-        };
+        let trust_decision = Some(
+            self.owner_trust
+                .evaluate_pair(
+                    &self.contact_store,
+                    &self.identity_discovery_cache,
+                    &self.revocation_set,
+                    agent_id,
+                    &machine_id,
+                )
+                .await
+                .decision,
+        );
         let (revoked_agent, revoked_machine) = {
             let revoked = self.revocation_set.read().await;
             (
@@ -13494,6 +13502,7 @@ impl Agent {
         revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
         move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
         connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
@@ -13531,18 +13540,24 @@ impl Agent {
         // agents drop from the surfaced list; if NONE survive, the
         // machine has no live pairing and is denied.
         let mut surviving: Vec<identity::AgentId> = Vec::with_capacity(agents.len());
+        let mut owner_trusted: Vec<identity::AgentId> = Vec::new();
         for (agent_id, cert_not_after) in &agents {
             // Runtime cert-expiry gate (issue #191): a cached entry whose
             // cert has expired must be refused on the live path.
             let expired = identity::is_expired(*cert_not_after, now_secs);
-            let trust_decision = {
-                let contacts = contact_store.read().await;
-                let evaluator = trust::TrustEvaluator::new(&contacts);
-                Some(evaluator.evaluate(&trust::TrustContext {
+            let pair = owner_trust
+                .evaluate_pair(
+                    contact_store,
+                    discovery_cache,
+                    revocation_set,
                     agent_id,
                     machine_id,
-                }))
-            };
+                )
+                .await;
+            if pair.owner_trusted {
+                owner_trusted.push(*agent_id);
+            }
+            let trust_decision = Some(pair.decision);
             let (revoked_agent, revoked_machine) = {
                 let revoked = revocation_set.read().await;
                 (
@@ -13622,7 +13637,7 @@ impl Agent {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::sync::Arc::clone(&guard)
         };
-        if let Err(e) = streams::stream_acl_gate(&policy, &agents, machine_id) {
+        if let Err(e) = streams::stream_acl_gate(&policy, &agents, &owner_trusted, machine_id) {
             tracing::info!(
                 target: "x0x::streams",
                 machine = %hex::encode(machine_id.as_bytes()),
@@ -13672,6 +13687,7 @@ impl Agent {
             &self.revocation_set,
             &self.move_state,
             &self.connect_policy,
+            &self.owner_trust,
             &machine_id,
         )
         .await?;
@@ -13785,6 +13801,7 @@ impl Agent {
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let move_state = std::sync::Arc::clone(&self.move_state);
         let connect_policy = std::sync::Arc::clone(&self.connect_policy);
+        let owner_trust = self.owner_trust.clone();
         let incoming = std::sync::Arc::clone(&self.stream_accept);
         let token = self.shutdown_token.clone();
 
@@ -13818,6 +13835,7 @@ impl Agent {
                     &revocation_set,
                     &move_state,
                     &connect_policy,
+                    &owner_trust,
                     &machine_id,
                 )
                 .await
@@ -15738,6 +15756,10 @@ impl AgentBuilder {
         let authenticated_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
             dm_inbox::AuthenticatedMachineBindingCache::default(),
         ));
+        let owner_trust = owner_trust::OwnerTrust::new(
+            identity.user_id(),
+            std::sync::Arc::clone(&authenticated_machine_bindings),
+        );
         if let Some(runtime) = gossip_runtime.as_ref() {
             runtime.pubsub().set_group_identity_context(
                 std::sync::Arc::clone(&authenticated_machine_bindings),
@@ -15897,6 +15919,7 @@ impl AgentBuilder {
             connect_policy: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
                 connect::ConnectPolicy::default(),
             ))),
+            owner_trust,
         })
     }
 }
@@ -17851,6 +17874,11 @@ impl std::fmt::Debug for KvStoreHandle {
 }
 
 impl KvStoreHandle {
+    /// Cumulative local state-sync counters for this open store.
+    pub fn state_sync_snapshot(&self) -> kv::sync::StateSyncSnapshot {
+        self.sync.state_sync_snapshot()
+    }
+
     pub(crate) async fn retained_content_digest_hex(&self) -> String {
         hex::encode(self.sync.read().await.served_digest())
     }
@@ -18248,6 +18276,28 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<kv::KvStoreDelta> {
+        Ok(self.put_with_outcome(key, value, content_type).await?.delta)
+    }
+
+    /// Put a key-value pair and return the published delta together with
+    /// the writer's own keys that the put evicted.
+    ///
+    /// Under [`kv::AccessPolicy::SelfKeyed`], ADR-0047 lowest-N admission can
+    /// evict the writer's lexicographically highest live keys when a put
+    /// takes it over the quota. That rule is unchanged. This method only
+    /// reports the eviction so the writer sees it (issue #849). A put whose
+    /// own key would fall outside the admitted set is refused before
+    /// anything changes, as with [`put_with_delta`](Self::put_with_delta).
+    ///
+    /// # Errors
+    ///
+    /// As [`put_with_delta`](Self::put_with_delta).
+    pub async fn put_with_outcome(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+    ) -> error::Result<KvPutOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
             .await
@@ -18265,18 +18315,21 @@ impl KvStoreHandle {
                  local writes refused until a snapshot succeeds"
             )))
         })?;
-        let delta = {
+        let (delta, evicted_keys) = {
             let mut store = self.sync.write().await;
             let would_mutate =
                 Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
             let version_before = store.current_version();
             if !would_mutate {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                });
             }
             let first_seq = store.reserve_sequences(2).map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!("kv put failed: {e}")))
             })?;
-            store
+            let evicted_keys = store
                 .put_with_reserved_sequence(
                     key.clone(),
                     value.clone(),
@@ -18297,7 +18350,10 @@ impl KvStoreHandle {
             // must not advance for a non-mutation), publish nothing, and
             // persist nothing. Retries stay observationally silent.
             if store.current_version() == version_before {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                });
             }
             let entry = store.get(&key).cloned();
             let version = store.current_version();
@@ -18337,7 +18393,7 @@ impl KvStoreHandle {
                 // (content_root binds the store name).
                 delta.name_update = Some(store.name_register().clone());
             }
-            delta
+            (delta, evicted_keys)
         };
         // Durability before announcement: persist the committed mutation and
         // DO NOT publish if the snapshot fails — announcing state the disk
@@ -18356,7 +18412,10 @@ impl KvStoreHandle {
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
         }
-        Ok(delta)
+        Ok(KvPutOutcome {
+            delta,
+            evicted_keys,
+        })
     }
 
     /// Get a value by key.
@@ -18531,6 +18590,16 @@ impl KvStoreHandle {
         let store = self.sync.read().await;
         Ok(store.name().to_string())
     }
+}
+
+/// Result of a local KV put: the published delta plus any keys it evicted.
+#[derive(Debug, Clone)]
+pub struct KvPutOutcome {
+    /// The CRDT delta that was published for this put.
+    pub delta: kv::KvStoreDelta,
+    /// The writer's own keys that this put evicted under the `SelfKeyed`
+    /// lowest-N quota (ADR-0047), sorted. Empty when nothing was evicted.
+    pub evicted_keys: Vec<String>,
 }
 
 /// Read-only snapshot of a KvStore entry.

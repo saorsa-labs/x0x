@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 188,
+  "endpoint_count": 190,
   "endpoints": [
     {
       "category": "status",
@@ -55,6 +55,16 @@
       "description": "Exchange the durable API token for a short-lived browser session token",
       "method": "POST",
       "path": "/auth/session",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "status",
+      "cli_name": "auth refresh",
+      "description": "Swap a live session token for a fresh one (12h cap from the original mint)",
+      "method": "POST",
+      "path": "/auth/session/refresh",
       "request": {
         "kind": "none"
       }
@@ -909,6 +919,16 @@
       "description": "Durable-history writer/reaper counters (ADR-0023)",
       "method": "GET",
       "path": "/diagnostics/history",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics state-sync",
+      "description": "Local state-sync counters for currently open KV stores",
+      "method": "GET",
+      "path": "/diagnostics/state-sync",
       "request": {
         "kind": "none"
       }

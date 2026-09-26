@@ -19,6 +19,7 @@ pub mod identity;
 pub mod machines;
 pub mod messaging;
 pub mod network;
+pub mod onboard;
 pub mod presence;
 pub mod purge;
 pub mod store;
