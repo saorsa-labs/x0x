@@ -3854,6 +3854,8 @@ pub(crate) async fn persist_share_grant_revocations_durable(
         .map_err(|e| format!("revocations-v3 encode: {e}"))?;
     let live = revocation::RevocationSet::from_bytes_v3(&live)
         .map_err(|e| format!("revocations-v3 re-decode: {e}"))?;
+    // RED PROOF (ci-mirror only): overwrite instead of monotonic merge.
+    let _disk = std::mem::replace(&mut merged, revocation::RevocationSet::new());
     merged.merge_v3(live);
     let bytes = merged
         .to_bytes_v3()
