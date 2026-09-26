@@ -1116,6 +1116,7 @@ fn categories_are_valid() {
         "websocket",
         "history",
         "acl",
+        "grants",
     ];
 
     for ep in ENDPOINTS {
