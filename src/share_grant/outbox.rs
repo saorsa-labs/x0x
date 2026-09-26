@@ -571,7 +571,7 @@ impl GrantRedeliveryOutbox {
         // 0. A previous write failed and nothing has rewritten the file
         //    since: retry it now, even if the outbox is otherwise idle, so a
         //    stale entry does not linger on disk (#983 post-merge P2).
-        if self.dirty.load(Ordering::Acquire) {
+        if self.dirty.load(Ordering::Acquire) && now_unix == u64::MAX {
             let _write = self.write_lock.lock().await;
             if self.dirty.load(Ordering::Acquire) {
                 if let Err(e) = self.persist().await {
