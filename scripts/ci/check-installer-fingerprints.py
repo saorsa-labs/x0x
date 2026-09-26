@@ -31,8 +31,15 @@ INSTALLERS = [
     ".deployment/install.sh",
     "docs/GPG_SIGNING.md",
 ]
-# Files that must carry the pin (the pinned installer and the doc that prints it).
-REQUIRED = {"scripts/install.py", "docs/GPG_SIGNING.md"}
+# Files that must carry the pin: every installer that downloads a release
+# (install.sh is the `curl x0x.md | sh` path, #955; install.ps1 is Windows, #937)
+# and the doc that prints it. .deployment/install.sh downloads nothing.
+REQUIRED = {
+    "scripts/install.py",
+    "scripts/install.sh",
+    "scripts/install.ps1",
+    "docs/GPG_SIGNING.md",
+}
 
 HEX40 = re.compile(r"\b[0-9A-Fa-f]{40}\b")
 
