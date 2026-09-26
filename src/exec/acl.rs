@@ -87,8 +87,13 @@ impl ExecPolicy {
                 enabled: true,
                 loaded_from: acl.loaded_from.display().to_string(),
                 loaded_at_unix_ms: acl.loaded_at_unix_ms,
-                allow_entry_count: acl.allow.len(),
-                command_entry_count: acl.allow.iter().map(|e| e.commands.len()).sum(),
+                allow_entry_count: acl.allow.len() + acl.owner_allow.len(),
+                command_entry_count: acl.allow.iter().map(|e| e.commands.len()).sum::<usize>()
+                    + acl
+                        .owner_allow
+                        .iter()
+                        .map(|e| e.commands.len())
+                        .sum::<usize>(),
                 disabled_reason: None,
             },
         }
@@ -116,6 +121,11 @@ pub struct ExecAcl {
     pub audit_log_path: PathBuf,
     pub audit_tasklist_id: Option<String>,
     pub allow: Vec<AllowEntry>,
+    /// `principal = "owner"` entries (ADR-0070 §1): argv allowlists for any
+    /// owner-trusted `(agent, machine)` pair. Kept apart from [`Self::allow`]
+    /// so the exact-pair lookups keep their meaning; only the
+    /// `*_for_principal` lookups consult it.
+    pub owner_allow: Vec<OwnerAllowEntry>,
 }
 
 /// Effective caps.
@@ -160,6 +170,71 @@ pub struct AllowEntry {
     pub commands: Vec<AllowedCommand>,
 }
 
+/// One `principal = "owner"` entry (ADR-0070 §1). Argv stays an exact
+/// allowlist, exactly as for [`AllowEntry`].
+#[derive(Debug, Clone)]
+pub struct OwnerAllowEntry {
+    pub description: Option<String>,
+    pub max_duration_secs: Option<u64>,
+    pub commands: Vec<AllowedCommand>,
+}
+
+/// Requester selector of one ACL entry (exec and connect share it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclPrincipal {
+    /// Exact `(agent_id, machine_id)` pair — the pre-ADR-0070 form.
+    Pair {
+        agent_id: AgentId,
+        machine_id: MachineId,
+    },
+    /// `principal = "owner"`: any pair that is owner-trusted per ADR-0070 §1
+    /// (see [`crate::owner_trust`]).
+    Owner,
+}
+
+/// Parse an ACL entry's requester selector.
+///
+/// Exactly one form is accepted: `principal = "owner"` with no `agent_id` /
+/// `machine_id`, or no `principal` with both ids. Anything else — an unknown
+/// principal (including the reserved slice-3 `"grant"`), a principal mixed
+/// with ids, or a missing id — is an error, so a typo cannot silently widen
+/// or narrow the policy.
+///
+/// # Errors
+/// A human-readable reason (never a panic).
+pub fn parse_principal(
+    principal: Option<&str>,
+    agent_id: Option<&str>,
+    machine_id: Option<&str>,
+) -> Result<AclPrincipal, String> {
+    match principal {
+        Some("owner") => {
+            if agent_id.is_some() || machine_id.is_some() {
+                return Err(
+                    "principal = \"owner\" entries must not also set agent_id or machine_id"
+                        .to_string(),
+                );
+            }
+            Ok(AclPrincipal::Owner)
+        }
+        Some(other) => Err(format!(
+            "unsupported principal {other:?} (supported: \"owner\")"
+        )),
+        None => {
+            let agent_id = agent_id
+                .ok_or_else(|| "missing agent_id (or principal = \"owner\")".to_string())
+                .and_then(|raw| parse_agent_id(raw).map_err(|e| format!("agent_id: {e}")))?;
+            let machine_id = machine_id
+                .ok_or_else(|| "missing machine_id".to_string())
+                .and_then(|raw| parse_machine_id(raw).map_err(|e| format!("machine_id: {e}")))?;
+            Ok(AclPrincipal::Pair {
+                agent_id,
+                machine_id,
+            })
+        }
+    }
+}
+
 /// One allowed argv pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowedCommand {
@@ -181,6 +256,43 @@ pub struct MatchedCommand<'a> {
     pub entry: &'a AllowEntry,
     pub command: &'a AllowedCommand,
     pub effective_max_duration_secs: u64,
+}
+
+/// Result of a command match against a `principal = "owner"` entry.
+#[derive(Debug, Clone)]
+pub struct OwnerMatchedCommand<'a> {
+    pub entry: &'a OwnerAllowEntry,
+    pub command: &'a AllowedCommand,
+    pub effective_max_duration_secs: u64,
+}
+
+/// Result of [`ExecAcl::match_command_for_principal`]: which selector matched.
+#[derive(Debug, Clone)]
+pub enum PrincipalMatch<'a> {
+    /// An exact `(agent_id, machine_id)` entry matched.
+    Pair(MatchedCommand<'a>),
+    /// A `principal = "owner"` entry matched (ADR-0070 §1).
+    Owner(OwnerMatchedCommand<'a>),
+}
+
+impl PrincipalMatch<'_> {
+    /// Description of the matched entry.
+    #[must_use]
+    pub fn description(&self) -> Option<&String> {
+        match self {
+            Self::Pair(m) => m.entry.description.as_ref(),
+            Self::Owner(m) => m.entry.description.as_ref(),
+        }
+    }
+
+    /// Effective duration cap of the matched entry.
+    #[must_use]
+    pub fn effective_max_duration_secs(&self) -> u64 {
+        match self {
+            Self::Pair(m) => m.effective_max_duration_secs,
+            Self::Owner(m) => m.effective_max_duration_secs,
+        }
+    }
 }
 
 /// ACL load/validation error.
@@ -254,8 +366,10 @@ struct ExecSectionToml {
 #[serde(deny_unknown_fields)]
 struct AllowEntryToml {
     description: Option<String>,
-    agent_id: String,
-    machine_id: String,
+    /// `"owner"` (ADR-0070 §1) instead of `agent_id` + `machine_id`.
+    principal: Option<String>,
+    agent_id: Option<String>,
+    machine_id: Option<String>,
     max_duration_secs: Option<u64>,
     #[serde(default)]
     commands: Vec<CommandToml>,
@@ -364,16 +478,17 @@ pub fn parse_exec_policy(
     };
 
     let mut allow = Vec::with_capacity(exec.allow.len());
+    let mut owner_allow = Vec::new();
     for (idx, entry) in exec.allow.into_iter().enumerate() {
-        let agent_id = parse_agent_id(&entry.agent_id).map_err(|reason| AclError::Invalid {
+        let principal = parse_principal(
+            entry.principal.as_deref(),
+            entry.agent_id.as_deref(),
+            entry.machine_id.as_deref(),
+        )
+        .map_err(|reason| AclError::Invalid {
             path: path.display().to_string(),
-            reason: format!("allow[{idx}].agent_id: {reason}"),
+            reason: format!("allow[{idx}]: {reason}"),
         })?;
-        let machine_id =
-            parse_machine_id(&entry.machine_id).map_err(|reason| AclError::Invalid {
-                path: path.display().to_string(),
-                reason: format!("allow[{idx}].machine_id: {reason}"),
-            })?;
         if entry.commands.is_empty() {
             return Err(AclError::Invalid {
                 path: path.display().to_string(),
@@ -394,13 +509,23 @@ pub fn parse_exec_policy(
             }
             commands.push(AllowedCommand { argv });
         }
-        allow.push(AllowEntry {
-            description: entry.description,
-            agent_id,
-            machine_id,
-            max_duration_secs: entry.max_duration_secs,
-            commands,
-        });
+        match principal {
+            AclPrincipal::Pair {
+                agent_id,
+                machine_id,
+            } => allow.push(AllowEntry {
+                description: entry.description,
+                agent_id,
+                machine_id,
+                max_duration_secs: entry.max_duration_secs,
+                commands,
+            }),
+            AclPrincipal::Owner => owner_allow.push(OwnerAllowEntry {
+                description: entry.description,
+                max_duration_secs: entry.max_duration_secs,
+                commands,
+            }),
+        }
     }
 
     Ok(ExecPolicy::Enabled(ExecAcl {
@@ -410,6 +535,7 @@ pub fn parse_exec_policy(
         audit_log_path: exec.audit_log_path,
         audit_tasklist_id: exec.audit_tasklist_id,
         allow,
+        owner_allow,
     }))
 }
 
@@ -498,12 +624,59 @@ impl ExecAcl {
             })
     }
 
+    /// Find an allowlist command for the requester across both selectors:
+    /// exact-pair entries first, then — only when `owner_trusted` —
+    /// `principal = "owner"` entries. `owner_trusted` must come from
+    /// [`crate::owner_trust`]; `false` reduces this to [`Self::match_command`].
+    #[must_use]
+    pub fn match_command_for_principal<'a>(
+        &'a self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+        argv: &[String],
+    ) -> Option<PrincipalMatch<'a>> {
+        if let Some(matched) = self.match_command(agent_id, machine_id, argv) {
+            return Some(PrincipalMatch::Pair(matched));
+        }
+        if !owner_trusted {
+            return None;
+        }
+        self.owner_allow.iter().find_map(|entry| {
+            entry.commands.iter().find_map(|command| {
+                command
+                    .matches(argv)
+                    .then_some(PrincipalMatch::Owner(OwnerMatchedCommand {
+                        entry,
+                        command,
+                        effective_max_duration_secs: entry
+                            .max_duration_secs
+                            .unwrap_or(self.caps.max_duration_secs)
+                            .min(self.caps.max_duration_secs),
+                    }))
+            })
+        })
+    }
+
     /// Whether any ACL entry matches this requester pair.
     #[must_use]
     pub fn has_agent_machine(&self, agent_id: &AgentId, machine_id: &MachineId) -> bool {
         self.allow
             .iter()
             .any(|entry| entry.agent_id == *agent_id && entry.machine_id == *machine_id)
+    }
+
+    /// Whether any entry names this requester: an exact pair, or — only
+    /// when `owner_trusted` — a `principal = "owner"` entry.
+    #[must_use]
+    pub fn has_entry_for_principal(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+    ) -> bool {
+        self.has_agent_machine(agent_id, machine_id)
+            || (owner_trusted && !self.owner_allow.is_empty())
     }
 }
 
@@ -719,6 +892,7 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
             audit_log_path: PathBuf::from("/var/log/x0x/exec-audit.jsonl"),
             audit_tasklist_id: None,
             allow: vec![],
+            owner_allow: Vec::new(),
         };
         let policy = ExecPolicy::Enabled(acl);
         assert_eq!(policy.path(), Path::new("/etc/x0x/exec-acl.toml"));
@@ -740,6 +914,7 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
             audit_log_path: PathBuf::from("audit.jsonl"),
             audit_tasklist_id: None,
             allow: vec![],
+            owner_allow: Vec::new(),
         };
         let enabled = ExecPolicy::Enabled(acl);
         assert!(enabled.enabled());
@@ -866,6 +1041,7 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
                 max_duration_secs: None,
                 commands: vec![AllowedCommand { argv }],
             }],
+            owner_allow: Vec::new(),
         }
     }
 
@@ -989,5 +1165,91 @@ argv = ["journalctl", "-u", "x0xd", "-n", "<INT>"]
             matches!(err, AclError::Parse { .. }),
             "unknown field in allow entry must be AclError::Parse: {err}"
         );
+    }
+
+    // ── ADR-0070 §1: `principal = "owner"` ─────────────────────────────
+
+    const OWNER_EXEC_TOML: &str = "[exec]\nenabled = true\n\
+         [[exec.allow]]\nprincipal = \"owner\"\nmax_duration_secs = 5\n\
+         [[exec.allow.commands]]\nargv = [\"uptime\"]\n";
+
+    fn owner_exec_acl() -> ExecAcl {
+        match parse_exec_policy(Path::new("/tmp/x"), 0, OWNER_EXEC_TOML).expect("parse") {
+            ExecPolicy::Enabled(acl) => acl,
+            ExecPolicy::Disabled { reason, .. } => panic!("expected Enabled, got {reason}"),
+        }
+    }
+
+    #[test]
+    fn owner_principal_entry_parses_into_owner_allow() {
+        let acl = owner_exec_acl();
+        assert!(acl.allow.is_empty(), "owner entry is not an exact pair");
+        assert_eq!(acl.owner_allow.len(), 1);
+        assert_eq!(acl.owner_allow[0].max_duration_secs, Some(5));
+    }
+
+    #[test]
+    fn owner_principal_matches_owner_trusted_pairs_only_with_exact_argv() {
+        // WHY: the owner selector must never authorise a non-owner pair, and
+        // argv stays an exact allowlist for owner pairs too (ADR-0046).
+        let acl = owner_exec_acl();
+        let agent = AgentId([1; 32]);
+        let machine = MachineId([2; 32]);
+        let uptime = vec!["uptime".to_string()];
+        let other = vec!["reboot".to_string()];
+
+        let matched = acl
+            .match_command_for_principal(&agent, &machine, true, &uptime)
+            .expect("owner-trusted pair matches the owner entry");
+        assert!(matches!(matched, PrincipalMatch::Owner(_)));
+        assert_eq!(matched.effective_max_duration_secs(), 5);
+        assert!(acl.has_entry_for_principal(&agent, &machine, true));
+
+        assert!(acl
+            .match_command_for_principal(&agent, &machine, false, &uptime)
+            .is_none());
+        assert!(!acl.has_entry_for_principal(&agent, &machine, false));
+        assert!(acl
+            .match_command_for_principal(&agent, &machine, true, &other)
+            .is_none());
+        // The exact-pair API never sees owner entries.
+        assert!(acl.match_command(&agent, &machine, &uptime).is_none());
+        assert!(!acl.has_agent_machine(&agent, &machine));
+    }
+
+    #[test]
+    fn owner_trust_without_owner_entry_matches_nothing() {
+        // PR #896 decision 1: owner trust does not open exec by itself.
+        let acl = acl_with_command(1, 2, vec![AllowedToken::Literal("uptime".into())]);
+        let owner_agent = AgentId([9; 32]);
+        let owner_machine = MachineId([8; 32]);
+        assert!(!acl.has_entry_for_principal(&owner_agent, &owner_machine, true));
+        assert!(acl
+            .match_command_for_principal(
+                &owner_agent,
+                &owner_machine,
+                true,
+                &["uptime".to_string()]
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn principal_selector_errors_are_invalid() {
+        let owner_with_ids = format!(
+            "[exec]\nenabled = true\n[[exec.allow]]\nprincipal = \"owner\"\n\
+             machine_id = \"{}\"\n[[exec.allow.commands]]\nargv = [\"uptime\"]\n",
+            id_hex(2)
+        );
+        let grant = "[exec]\nenabled = true\n[[exec.allow]]\nprincipal = \"grant\"\n\
+                     [[exec.allow.commands]]\nargv = [\"uptime\"]\n"
+            .to_string();
+        let no_selector = "[exec]\nenabled = true\n[[exec.allow]]\n\
+                           [[exec.allow.commands]]\nargv = [\"uptime\"]\n"
+            .to_string();
+        for toml in [owner_with_ids, grant, no_selector] {
+            let err = parse_exec_policy(Path::new("/tmp/x"), 0, &toml).unwrap_err();
+            assert!(matches!(err, AclError::Invalid { .. }), "{toml}: {err}");
+        }
     }
 }

@@ -48,6 +48,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/status", daemon_api_status),
     covered!(Post, "/shutdown", daemon_api_shutdown_with_sse_client),
     covered!(Post, "/auth/session", daemon_api_auth_session_exchange),
+    covered!(
+        Post,
+        "/auth/session/refresh",
+        daemon_api_auth_session_refresh
+    ),
     // ── ADR-0043 agent key-move ceremony + placement ledger ────────────
     covered!(Post, "/agent/move", move_routes_wired),
     covered!(Post, "/agent/move/export", move_routes_wired),

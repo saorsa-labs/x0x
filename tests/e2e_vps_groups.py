@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """x0x Phase-B VPS dogfood — groups + contacts on the live 6-node fleet.
 
-Reuses the Phase-A discover protocol on `x0x.test.discover.v1` to learn
-every runner's agent_id, then drives `e2e_dogfood_groups.py`-style
+Uses targeted direct discovery with PubSub fallback to learn every runner's
+agent_id, then drives `e2e_dogfood_groups.py`-style
 scenarios against the fleet:
 
     - Anchor node (default NYC) creates a public_open named group.
@@ -38,12 +38,14 @@ import logging
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -53,6 +55,7 @@ from result_framing import RESULT_PREFIX_V2, ResultReassembler
 DISCOVER_TOPIC = "x0x.test.discover.v1"
 LEGACY_RESULTS_TOPIC = "x0x.test.results.v1"
 COMMAND_HTTP_TIMEOUT_SECS = 15.0
+DISCOVER_DIRECT_WORKERS = 8
 COMMAND_RETRY_BACKOFF_SECS = sum(min(8, 2 * attempt) for attempt in range(1, 5))
 COMMAND_DISPATCH_BUDGET_SECS = (
     (5 * COMMAND_HTTP_TIMEOUT_SECS) + COMMAND_RETRY_BACKOFF_SECS + 1.0
@@ -242,6 +245,8 @@ class Runner:
     name: str
     agent_id: str
     machine_id: str = ""
+    request_id: Optional[str] = None
+    received_at_monotonic: Optional[float] = None
 
 
 @dataclass
@@ -298,11 +303,14 @@ class ResultRouter:
     ) -> None:
         kind = envelope.get("kind")
         if kind in ("discover_reply", "runner_ready"):
+            request_id = envelope.get("request_id")
             self._discover_q.put(
                 Runner(
                     name=envelope.get("node", "?"),
                     agent_id=envelope.get("agent_id", ""),
                     machine_id=envelope.get("machine_id", ""),
+                    request_id=request_id if isinstance(request_id, str) else None,
+                    received_at_monotonic=time.monotonic(),
                 )
             )
             return
@@ -1103,6 +1111,55 @@ class FleetHarness:
 # ─── discover ──────────────────────────────────────────────────────────
 
 
+def discover_command(anchor_aid: str, request_id: str, node: str) -> Dict[str, Any]:
+    return {
+        "command_id": request_id,
+        "target_node": node,
+        "action": "discover",
+        "anchor_aid": anchor_aid,
+        "params": {"request_id": request_id, "anchor_aid": anchor_aid},
+    }
+
+
+def lookup_runner_agents(
+    expected: List[str],
+    anchor_name: str,
+    anchor_aid: str,
+    tokens: Dict[str, Tuple[str, str]],
+    remote_port: int,
+    log: logging.Logger,
+) -> Dict[str, str]:
+    """Read selected runner IDs through owned, short-lived API tunnels."""
+    ids: Dict[str, str] = {}
+    for node in dict.fromkeys(expected):
+        if node == anchor_name:
+            ids[node] = anchor_aid
+            continue
+        if node not in tokens:
+            log.warning("discover /agent lookup unavailable for %s: no token", node)
+            continue
+        ip, token = tokens[node]
+        tunnel = None
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                local_port = probe.getsockname()[1]
+            tunnel = start_ssh_tunnel(ip, local_port, remote_port=remote_port)
+            aid = X0xClient(f"http://127.0.0.1:{local_port}", token).agent().get("agent_id")
+            if not isinstance(aid, str) or re.fullmatch(r"[0-9a-fA-F]{64}", aid) is None:
+                log.warning("discover /agent lookup invalid for %s", node)
+            elif aid == anchor_aid:
+                log.warning("discover /agent lookup for %s returned anchor ID", node)
+            else:
+                ids[node] = aid
+        except Exception as exc:
+            log.warning("discover /agent lookup failed for %s: %s", node, exc)
+        finally:
+            if tunnel is not None:
+                stop_ssh_tunnel(tunnel)
+    return ids
+
+
 def discover_runners(
     client: X0xClient,
     router: ResultRouter,
@@ -1111,37 +1168,100 @@ def discover_runners(
     expected: List[str],
     timeout_secs: int,
     log: logging.Logger,
+    runner_agent_ids: Optional[Dict[str, str]] = None,
+    republish_every_secs: float = 12.0,
 ) -> Dict[str, Runner]:
     log.info("discover: expecting %d runners (anchor=%s…)",
              len(expected), anchor_aid[:16])
     found: Dict[str, Runner] = {}
     deadline = time.time() + timeout_secs
     next_publish = 0.0
+    retry_interval = min(republish_every_secs, max(0.1, timeout_secs / 4))
+    runner_agent_ids = runner_agent_ids or {}
+    direct_attempted = set()
+    announcements: Dict[str, Tuple[str, str, float]] = {}
     while time.time() < deadline and len(found) < len(expected):
         if time.time() >= next_publish:
-            payload = json.dumps({
-                "command_id": str(uuid.uuid4()),
-                "target_node": "*",
-                "action": "discover",
-                "anchor_aid": anchor_aid,
-                "params": {
-                    "request_id": str(uuid.uuid4()),
-                    "anchor_aid": anchor_aid,
-                },
-            }).encode("utf-8")
-            try:
-                client.publish(DISCOVER_TOPIC, payload)
-            except Exception as exc:
-                log.warning("discover publish failed: %s", exc)
-            next_publish = time.time() + 12
-        info = router.discover_pop(timeout=2)
+            fallback_nodes = []
+            direct_targets = []
+            for node in dict.fromkeys(expected):
+                if node in found:
+                    continue
+                aid = runner_agent_ids.get(node)
+                if (not isinstance(aid, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{64}", aid) is None
+                        or aid == anchor_aid or node in direct_attempted):
+                    fallback_nodes.append(node)
+                elif len(direct_targets) < DISCOVER_DIRECT_WORKERS:
+                    direct_targets.append((node, aid))
+                else:
+                    fallback_nodes.append(node)
+            if direct_targets:
+                # Reserve part of the discovery window for PubSub fallback.
+                direct_budget = min(
+                    COMMAND_HTTP_TIMEOUT_SECS,
+                    max(0.1, (deadline - time.time()) * 0.45),
+                )
+                executor = ThreadPoolExecutor(max_workers=len(direct_targets))
+                try:
+                    futures = {}
+                    for node, aid in direct_targets:
+                        request_id = str(uuid.uuid4())
+                        announcements[request_id] = (node, "direct", time.monotonic())
+                        command = discover_command(anchor_aid, request_id, node)
+                        wire = PREFIX_CMD + base64.b64encode(json.dumps(command).encode())
+                        futures[executor.submit(
+                            client.direct_send, aid, wire, timeout=direct_budget,
+                        )] = node
+                    _, pending = wait(futures, timeout=direct_budget)
+                    for future, node in futures.items():
+                        if future in pending:
+                            log.warning("discover DM to %s exceeded %.1fs", node, direct_budget)
+                            fallback_nodes.append(node)
+                            continue
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            log.warning("discover DM to %s failed: %s", node, exc)
+                            result = None
+                        if not result or result.get("ok") is False:
+                            fallback_nodes.append(node)
+                        else:
+                            direct_attempted.add(node)
+                finally:
+                    executor.shutdown(wait=True, cancel_futures=True)
+            for node in fallback_nodes:
+                request_id = str(uuid.uuid4())
+                announcements[request_id] = (node, "pubsub", time.monotonic())
+                try:
+                    client.publish(
+                        DISCOVER_TOPIC,
+                        json.dumps(discover_command(anchor_aid, request_id, node)).encode(),
+                    )
+                except Exception as exc:
+                    log.warning("discover publish to %s failed: %s", node, exc)
+            next_publish = time.time() + retry_interval
+        info = router.discover_pop(timeout=max(0.0, min(
+            next_publish - time.time(), deadline - time.time(),
+        )))
         if info is None:
             continue
         if info.name in expected and info.name not in found:
             found[info.name] = info
+            announcement = announcements.get(info.request_id or "")
+            channel = "unknown"
+            latency = "unknown"
+            if (announcement is not None and announcement[0] == info.name
+                    and info.received_at_monotonic is not None):
+                elapsed_ms = (info.received_at_monotonic - announcement[2]) * 1000
+                if elapsed_ms >= 0:
+                    channel = announcement[1]
+                    latency = f"{elapsed_ms:.3f}"
             log.info(
-                "  ✓ %-12s agent=%s…",
-                info.name, info.agent_id[:16],
+                "  ✓ node=%s channel=%s announce_reply_latency_ms=%s "
+                "agent=%s… machine=%s…",
+                info.name, channel, latency,
+                info.agent_id[:16], info.machine_id[:16],
             )
     missing = [n for n in expected if n not in found]
     if missing:
@@ -1247,9 +1367,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             t.start()
         time.sleep(2)
 
+        runner_agent_ids = lookup_runner_agents(
+            args.nodes, args.anchor, anchor_aid, tokens, _net.api_port, log,
+        )
         runners = discover_runners(
             client, router, anchor_aid, args.anchor,
             args.nodes, args.discover_secs, log,
+            runner_agent_ids=runner_agent_ids,
         )
         missing = sorted(set(args.nodes) - set(runners))
         if missing and not args.allow_skips:
