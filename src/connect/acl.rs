@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::exec::acl::{parse_agent_id, parse_machine_id, LoadMode};
+use crate::exec::acl::{parse_principal, AclPrincipal, LoadMode};
 use crate::identity::{AgentId, MachineId};
 use crate::server::InstanceName;
 
@@ -138,8 +138,14 @@ impl ConnectPolicy {
                 enabled: true,
                 loaded_from: acl.loaded_from.display().to_string(),
                 loaded_at_unix_ms: acl.loaded_at_unix_ms,
-                allow_entry_count: acl.allow.len(),
-                target_entry_count: acl.allow.iter().map(|e| e.targets.len()).sum(),
+                allow_entry_count: acl.allow.len() + acl.owner_allow.len() + acl.grant_allow.len(),
+                target_entry_count: acl.allow.iter().map(|e| e.targets.len()).sum::<usize>()
+                    + acl
+                        .owner_allow
+                        .iter()
+                        .chain(acl.grant_allow.iter())
+                        .map(|e| e.targets.len())
+                        .sum::<usize>(),
                 disabled_reason: None,
             },
         }
@@ -168,6 +174,15 @@ pub struct ConnectAcl {
     /// Allowed (agent, machine, target) triples. v1 has **no caps struct** —
     /// per-flow stream limits are T4 forwarder config, not ACL policy.
     pub allow: Vec<ConnectAllowEntry>,
+    /// `principal = "owner"` entries (ADR-0070 §1): targets allowed to any
+    /// owner-trusted `(agent, machine)` pair. Kept apart from [`Self::allow`]
+    /// so the exact-pair lookups ([`Self::entry_for`], [`Self::is_allowed`])
+    /// keep their meaning; only the `*_for_principal` lookups consult it.
+    pub owner_allow: Vec<ConnectOwnerEntry>,
+    /// `principal = "grant"` entries (ADR-0070 §2): targets allowed to a
+    /// requester holding a current ShareGrant whose `Connect { ports }`
+    /// covers the target's port. Same shape as owner entries.
+    pub grant_allow: Vec<ConnectOwnerEntry>,
 }
 
 impl ConnectAcl {
@@ -196,6 +211,93 @@ impl ConnectAcl {
         self.entry_for(agent_id, machine_id)
             .is_some_and(|e| e.targets.iter().any(|t| t == target))
     }
+
+    /// Whether the ACL has any `principal = "owner"` entry.
+    #[must_use]
+    pub fn has_owner_entries(&self) -> bool {
+        !self.owner_allow.is_empty()
+    }
+
+    /// Whether any entry names this requester: an exact `(agent, machine)`
+    /// pair, or — only when `owner_trusted` — a `principal = "owner"` entry.
+    ///
+    /// `owner_trusted` must come from [`crate::owner_trust`]; passing `false`
+    /// reduces this to the exact-pair check.
+    #[must_use]
+    pub fn has_entry_for_principal(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+    ) -> bool {
+        self.entry_for(agent_id, machine_id).is_some()
+            || (owner_trusted && self.has_owner_entries())
+    }
+
+    /// Exact-target membership test across both selectors: the exact pair's
+    /// targets, plus — only when `owner_trusted` — every `principal =
+    /// "owner"` entry's targets. Target matching stays exact `SocketAddr`
+    /// equality for both.
+    #[must_use]
+    pub fn is_allowed_for_principal(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+        target: &SocketAddr,
+    ) -> bool {
+        self.is_allowed(agent_id, machine_id, target)
+            || (owner_trusted
+                && self
+                    .owner_allow
+                    .iter()
+                    .any(|e| e.targets.iter().any(|t| t == target)))
+    }
+
+    /// [`Self::has_entry_for_principal`] plus — only when `grant_connect`
+    /// (the requester holds a current `Connect` grant) — a `principal =
+    /// "grant"` entry.
+    #[must_use]
+    pub fn has_entry_for_principals(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+        grant_connect: bool,
+    ) -> bool {
+        self.has_entry_for_principal(agent_id, machine_id, owner_trusted)
+            || (grant_connect && !self.grant_allow.is_empty())
+    }
+
+    /// [`Self::is_allowed_for_principal`] plus the ADR-0070 §2 grant
+    /// selector: a `principal = "grant"` entry listing exactly `target`
+    /// matches only when `grant_port_allowed` — the requester's current
+    /// `Connect { ports }` grant covers `target.port()`. Both the entry and
+    /// the grant must allow the target.
+    #[must_use]
+    pub fn is_allowed_for_principals(
+        &self,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        owner_trusted: bool,
+        grant_port_allowed: bool,
+        target: &SocketAddr,
+    ) -> bool {
+        self.is_allowed_for_principal(agent_id, machine_id, owner_trusted, target)
+            || (grant_port_allowed
+                && self
+                    .grant_allow
+                    .iter()
+                    .any(|e| e.targets.iter().any(|t| t == target)))
+    }
+}
+
+/// One `principal = "owner"` entry (ADR-0070 §1): loopback targets allowed
+/// to any owner-trusted pair. Targets are explicit, exactly as for pairs.
+#[derive(Debug, Clone)]
+pub struct ConnectOwnerEntry {
+    pub description: Option<String>,
+    pub targets: Vec<SocketAddr>,
 }
 
 /// One allowed requester pair + their permitted loopback targets.
@@ -311,47 +413,217 @@ pub fn parse_connect_policy(
     }
 
     let mut allow = Vec::with_capacity(connect.allow.len());
+    let mut owner_allow = Vec::new();
+    let mut grant_allow = Vec::new();
     for (idx, entry) in connect.allow.into_iter().enumerate() {
-        let agent_id =
-            parse_agent_id(&entry.agent_id).map_err(|reason| ConnectAclError::Invalid {
-                path: path.display().to_string(),
-                reason: format!("allow[{idx}].agent_id: {reason}"),
-            })?;
-        let machine_id =
-            parse_machine_id(&entry.machine_id).map_err(|reason| ConnectAclError::Invalid {
-                path: path.display().to_string(),
-                reason: format!("allow[{idx}].machine_id: {reason}"),
-            })?;
-        if entry.targets.is_empty() {
-            return Err(ConnectAclError::Invalid {
-                path: path.display().to_string(),
-                reason: format!("allow[{idx}] must contain at least one target"),
-            });
+        match build_connect_entry(path, &format!("allow[{idx}]"), entry)? {
+            BuiltConnectEntry::Pair(entry) => allow.push(entry),
+            BuiltConnectEntry::Owner(entry) => owner_allow.push(entry),
+            BuiltConnectEntry::Grant(entry) => grant_allow.push(entry),
         }
-        // Each target must be a numeric-IP loopback address. parse_target is
-        // the loopback-only crown jewel — every non-loopback address (and any
-        // hostname such as `localhost`) is a hard error at load time.
-        let mut targets = Vec::with_capacity(entry.targets.len());
-        for (tidx, raw) in entry.targets.into_iter().enumerate() {
-            let addr = parse_target(&raw).map_err(|reason| ConnectAclError::Invalid {
-                path: path.display().to_string(),
-                reason: format!("allow[{idx}].targets[{tidx}]: {reason}"),
-            })?;
-            targets.push(addr);
-        }
-        allow.push(ConnectAllowEntry {
-            description: entry.description,
-            agent_id,
-            machine_id,
-            targets,
-        });
     }
 
     Ok(ConnectPolicy::Enabled(ConnectAcl {
         loaded_from: path.to_path_buf(),
         loaded_at_unix_ms,
         allow,
+        owner_allow,
+        grant_allow,
     }))
+}
+
+/// One validated entry, split by requester selector.
+enum BuiltConnectEntry {
+    Pair(ConnectAllowEntry),
+    Owner(ConnectOwnerEntry),
+    Grant(ConnectOwnerEntry),
+}
+
+/// Validate one allow entry — the single code path for TOML floor entries
+/// and ADR-0070 §3 API-managed entries alike. `label` names the entry in
+/// error messages (`allow[3]`, `api[0]`).
+fn build_connect_entry(
+    path: &Path,
+    label: &str,
+    entry: ConnectAclEntrySpec,
+) -> Result<BuiltConnectEntry, ConnectAclError> {
+    let principal = parse_principal(
+        entry.principal.as_deref(),
+        entry.agent_id.as_deref(),
+        entry.machine_id.as_deref(),
+    )
+    .map_err(|reason| ConnectAclError::Invalid {
+        path: path.display().to_string(),
+        reason: format!("{label}: {reason}"),
+    })?;
+    if entry.targets.is_empty() {
+        return Err(ConnectAclError::Invalid {
+            path: path.display().to_string(),
+            reason: format!("{label} must contain at least one target"),
+        });
+    }
+    // Each target must be a numeric-IP loopback address. parse_target is
+    // the loopback-only crown jewel — every non-loopback address (and any
+    // hostname such as `localhost`) is a hard error at load time.
+    let mut targets = Vec::with_capacity(entry.targets.len());
+    for (tidx, raw) in entry.targets.into_iter().enumerate() {
+        let addr = parse_target(&raw).map_err(|reason| ConnectAclError::Invalid {
+            path: path.display().to_string(),
+            reason: format!("{label}.targets[{tidx}]: {reason}"),
+        })?;
+        targets.push(addr);
+    }
+    Ok(match principal {
+        AclPrincipal::Pair {
+            agent_id,
+            machine_id,
+        } => BuiltConnectEntry::Pair(ConnectAllowEntry {
+            description: entry.description,
+            agent_id,
+            machine_id,
+            targets,
+        }),
+        AclPrincipal::Owner => BuiltConnectEntry::Owner(ConnectOwnerEntry {
+            description: entry.description,
+            targets,
+        }),
+        AclPrincipal::Grant => BuiltConnectEntry::Grant(ConnectOwnerEntry {
+            description: entry.description,
+            targets,
+        }),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0070 §3 — API-managed overlay entries on top of the TOML floor
+// ---------------------------------------------------------------------------
+
+/// Validate one API-supplied entry exactly as the TOML parser validates a
+/// floor entry (same struct, same `deny_unknown_fields`, same checks).
+///
+/// # Errors
+/// [`ConnectAclError::Invalid`] naming the offending field.
+pub fn validate_connect_entry_spec(
+    path: &Path,
+    spec: &ConnectAclEntrySpec,
+) -> Result<(), ConnectAclError> {
+    build_connect_entry(path, "api", spec.clone()).map(|_| ())
+}
+
+/// Effective policy = TOML floor ∪ API overlay (ADR-0070 §3).
+///
+/// A `Disabled` floor stays `Disabled`: overlay entries never enable a
+/// plane the operator's file leaves off. Every overlay entry is validated
+/// by the same code path as a floor entry; one invalid entry fails the
+/// whole composition (fail closed — callers keep the last good policy).
+///
+/// # Errors
+/// [`ConnectAclError::Invalid`] naming the offending `api[i]` entry.
+pub fn compose_connect_policy(
+    floor: &ConnectPolicy,
+    overlay: &[ConnectAclEntrySpec],
+) -> Result<ConnectPolicy, ConnectAclError> {
+    let ConnectPolicy::Enabled(floor_acl) = floor else {
+        return Ok(floor.clone());
+    };
+    let mut acl = floor_acl.clone();
+    for (idx, spec) in overlay.iter().enumerate() {
+        match build_connect_entry(&acl.loaded_from, &format!("api[{idx}]"), spec.clone())? {
+            BuiltConnectEntry::Pair(entry) => acl.allow.push(entry),
+            BuiltConnectEntry::Owner(entry) => acl.owner_allow.push(entry),
+            BuiltConnectEntry::Grant(entry) => acl.grant_allow.push(entry),
+        }
+    }
+    Ok(ConnectPolicy::Enabled(acl))
+}
+
+/// Whether `next` may replace `current` by hot reload (ADR-0070 §3).
+///
+/// Only allow entries are hot-reloadable. Flipping the plane between
+/// enabled and disabled is refused: the forwarder is only started for an
+/// enabled policy at boot, and a `Disabled` connect policy lifts the
+/// byte-stream accept constraint entirely, so a reload that disables
+/// connect would widen access. Both directions require a restart.
+///
+/// # Errors
+/// A human-readable reason.
+pub fn connect_reload_compatible(
+    current: &ConnectPolicy,
+    next: &ConnectPolicy,
+) -> Result<(), String> {
+    if current.enabled() != next.enabled() {
+        return Err(format!(
+            "reload would change connect from {} to {}; enabling or disabling the \
+             connect plane requires a daemon restart",
+            enabled_word(current.enabled()),
+            enabled_word(next.enabled())
+        ));
+    }
+    Ok(())
+}
+
+fn enabled_word(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+impl ConnectAllowEntry {
+    /// The entry in its TOML/API schema form (for listings).
+    #[must_use]
+    pub fn to_spec(&self) -> ConnectAclEntrySpec {
+        ConnectAclEntrySpec {
+            description: self.description.clone(),
+            principal: None,
+            agent_id: Some(hex::encode(self.agent_id.as_bytes())),
+            machine_id: Some(hex::encode(self.machine_id.as_bytes())),
+            targets: self.targets.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
+impl ConnectOwnerEntry {
+    /// The entry in its TOML/API schema form (for listings).
+    #[must_use]
+    pub fn to_spec(&self) -> ConnectAclEntrySpec {
+        self.to_spec_as("owner")
+    }
+
+    /// The entry as a `principal = "grant"` spec (ADR-0070 §2).
+    #[must_use]
+    pub fn to_grant_spec(&self) -> ConnectAclEntrySpec {
+        self.to_spec_as("grant")
+    }
+
+    fn to_spec_as(&self, principal: &str) -> ConnectAclEntrySpec {
+        ConnectAclEntrySpec {
+            description: self.description.clone(),
+            principal: Some(principal.to_string()),
+            agent_id: None,
+            machine_id: None,
+            targets: self.targets.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
+impl ConnectAcl {
+    /// Every entry in TOML/API schema form: exact pairs, then owner
+    /// entries, then grant entries.
+    #[must_use]
+    pub fn entry_specs(&self) -> Vec<ConnectAclEntrySpec> {
+        self.allow
+            .iter()
+            .map(ConnectAllowEntry::to_spec)
+            .chain(self.owner_allow.iter().map(ConnectOwnerEntry::to_spec))
+            .chain(
+                self.grant_allow
+                    .iter()
+                    .map(ConnectOwnerEntry::to_grant_spec),
+            )
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,16 +724,29 @@ struct ConnectSectionToml {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
-    allow: Vec<ConnectAllowEntryToml>,
+    allow: Vec<ConnectAclEntrySpec>,
 }
 
-#[derive(Debug, Deserialize)]
+/// One connect allow entry in its wire schema — the `[[connect.allow]]`
+/// TOML table and, identically, the `POST /acl/connect` JSON body
+/// (ADR-0070 §3). `deny_unknown_fields` applies to both surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ConnectAllowEntryToml {
-    description: Option<String>,
-    agent_id: String,
-    machine_id: String,
-    targets: Vec<String>,
+pub struct ConnectAclEntrySpec {
+    /// Free-text note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `"owner"` (ADR-0070 §1) instead of `agent_id` + `machine_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// Requester agent id (64 hex chars) for an exact-pair entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Requester machine id (64 hex chars) for an exact-pair entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// Loopback `IP:port` targets (numeric, exact).
+    pub targets: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
