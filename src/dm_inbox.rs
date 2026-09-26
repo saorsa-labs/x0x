@@ -1400,7 +1400,12 @@ impl InboxPipeline {
         // authenticated binding. See docs/adr/0021-dm-origin-machine-attestation.md.
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let claimed_machine_id = MachineId(envelope.sender_machine_id);
-        let sender_machine_id = match envelope.verify_origin_attestation() {
+        //
+        // #927: `origin_authenticated` records whether the resolved machine
+        // came from an attestation or an authenticated binding. A bare
+        // sender claim is still delivered (annotated unverified) but may
+        // never mark connected or rebind DirectMessaging routing.
+        let (sender_machine_id, origin_authenticated) = match envelope.verify_origin_attestation() {
             Ok(Some(attested_machine)) => {
                 tracing::info!(
                     target: "dm.trace",
@@ -1421,7 +1426,7 @@ impl InboxPipeline {
                     envelope.created_at_unix_ms / 1000,
                 )
                 .await;
-                attested_machine
+                (attested_machine, true)
             }
             Err(rejection) => {
                 self.dm.record_incoming_trust_rejected(sender_agent_id);
@@ -1454,7 +1459,7 @@ impl InboxPipeline {
                         );
                         return;
                     }
-                    Some(authenticated) => authenticated,
+                    Some(authenticated) => (authenticated, true),
                     None => {
                         tracing::info!(
                             target: "dm.trace",
@@ -1463,7 +1468,7 @@ impl InboxPipeline {
                             claimed_machine = %hex::encode(claimed_machine_id.as_bytes()),
                             "DM origin has no attestation and no authenticated binding; checking sender claim only"
                         );
-                        claimed_machine_id
+                        (claimed_machine_id, false)
                     }
                 }
             }
@@ -1534,6 +1539,7 @@ impl InboxPipeline {
                     envelope,
                     payload,
                     sender_machine_id,
+                    origin_authenticated,
                     sender_pubkey,
                     ack_legacy_bus,
                 )
@@ -1547,6 +1553,7 @@ impl InboxPipeline {
         envelope: DmEnvelope,
         payload: DmPayload,
         sender_machine_id: MachineId,
+        origin_authenticated: bool,
         sender_pubkey: Vec<u8>,
         ack_legacy_bus: bool,
     ) {
@@ -1650,13 +1657,19 @@ impl InboxPipeline {
             // happens on inbound connections where the PeerConnected
             // handler could not resolve the agent_id from the machine_id
             // (fresh cache, no DM history yet). The envelope carries both
-            // identities and just passed signature verification; this is
-            // the strongest binding evidence we will get.
-            {
-                let sender_agent = AgentId(envelope.sender_agent_id);
-                let sender_machine = MachineId(envelope.sender_machine_id);
-                self.dm.mark_connected(sender_agent, sender_machine).await;
-            }
+            // identities and just passed signature verification. #927: the
+            // agent signature does NOT cover the machine claim, so only an
+            // attested origin or an authenticated binding may register it;
+            // an unattested claim would let an agent rebind its own routing
+            // entry (which `connect_to_agent` copies into discovery) to any
+            // machine it names.
+            mark_gossip_dm_sender_connected(
+                &self.dm,
+                sender_agent_id,
+                sender_machine_id,
+                origin_authenticated,
+            )
+            .await;
 
             let _decision = self
                 .handle_payload_durable(
@@ -1664,6 +1677,7 @@ impl InboxPipeline {
                     plaintext.payload,
                     decision,
                     sender_machine_id,
+                    origin_authenticated,
                     sender_pubkey,
                     ack_legacy_bus,
                 )
@@ -1728,7 +1742,7 @@ impl InboxPipeline {
                 sender: sender_agent_id,
                 machine_id: sender_machine_id,
                 payload: plaintext.payload.clone(),
-                verified: true,
+                verified: origin_authenticated,
                 trust_decision: Some(decision),
                 received_at_unix_ms: now_unix_ms(),
                 request_id: envelope.request_id,
@@ -1767,7 +1781,7 @@ impl InboxPipeline {
                     sender_machine_id,
                     sender_agent_id,
                     plaintext.payload,
-                    true,
+                    origin_authenticated,
                     Some(decision),
                     // Gossip-inbox deliveries carry no point-to-point
                     // transport observation (issue #120).
@@ -1804,12 +1818,14 @@ impl InboxPipeline {
     /// arrived, which is the defect this protocol exists to remove. No branch
     /// here may fall back to a v1 ACK: that would answer a durable request
     /// with a weaker receipt the sender cannot distinguish (ADR 0030 §2).
+    #[allow(clippy::too_many_arguments)]
     async fn handle_payload_durable(
         &self,
         envelope: DmEnvelope,
         application_payload: Vec<u8>,
         decision: TrustDecision,
         sender_machine_id: MachineId,
+        origin_authenticated: bool,
         sender_pubkey: Vec<u8>,
         ack_legacy_bus: bool,
     ) -> DurableAckDecision {
@@ -1932,6 +1948,7 @@ impl InboxPipeline {
                 .dispatch_durable_typed_route(
                     sender_agent_id,
                     sender_machine_id,
+                    origin_authenticated,
                     request_id,
                     application_payload,
                     Some(decision),
@@ -2047,7 +2064,7 @@ impl InboxPipeline {
                 sender_machine_id,
                 sender_agent_id,
                 application_payload.clone(),
-                true,
+                origin_authenticated,
                 Some(decision),
                 // Gossip-inbox deliveries carry no point-to-point transport
                 // observation (issue #120).
@@ -2143,6 +2160,7 @@ impl InboxPipeline {
         &self,
         sender_agent_id: AgentId,
         sender_machine_id: MachineId,
+        origin_authenticated: bool,
         request_id: [u8; 16],
         payload: Vec<u8>,
         trust_decision: Option<TrustDecision>,
@@ -2159,7 +2177,7 @@ impl InboxPipeline {
             sender: sender_agent_id,
             machine_id: sender_machine_id,
             payload,
-            verified: true,
+            verified: origin_authenticated,
             trust_decision,
             received_at_unix_ms: now_unix_ms(),
             request_id,
@@ -2449,6 +2467,35 @@ fn drop_if_sender_revoked(
     } else {
         false
     }
+}
+
+/// Register a gossip-DM sender's agent→machine pairing in DirectMessaging —
+/// but only when the machine was AUTHENTICATED (#927, mirroring #898).
+///
+/// `origin_authenticated` is true only for a fresh origin-machine
+/// attestation or an `AuthenticatedMachineBindings` entry. A bare envelope
+/// `sender_machine_id` claim is not covered by the agent signature's proof
+/// of machine ownership, so recording it would let an agent rebind its own
+/// connected-machine entry (which `connect_to_agent` copies into the
+/// discovery cache) to any machine it names. Returns whether it marked.
+async fn mark_gossip_dm_sender_connected(
+    dm: &DirectMessaging,
+    agent_id: AgentId,
+    machine_id: MachineId,
+    origin_authenticated: bool,
+) -> bool {
+    if !origin_authenticated {
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "inbound_unattested_machine_not_bound",
+            sender = %hex::encode(agent_id.as_bytes()),
+            claimed_machine = %hex::encode(machine_id.as_bytes()),
+            "unattested gossip DM machine claim: routing left unchanged (#927)"
+        );
+        return false;
+    }
+    dm.mark_connected(agent_id, machine_id).await;
+    true
 }
 
 pub fn verify_envelope_signature(envelope: &DmEnvelope, public_key_bytes: &[u8]) -> bool {
@@ -2927,6 +2974,7 @@ mod tests {
                 b"durable hello".to_vec(),
                 TrustDecision::Accept,
                 machine,
+                true,
                 sender.public_key().as_bytes().to_vec(),
                 false,
             )
@@ -2963,6 +3011,7 @@ mod tests {
                 b"durable hello".to_vec(),
                 TrustDecision::Accept,
                 machine,
+                true,
                 sender.public_key().as_bytes().to_vec(),
                 false,
             )
@@ -3050,6 +3099,7 @@ mod tests {
                 b"different bytes".to_vec(),
                 TrustDecision::Accept,
                 machine,
+                true,
                 sender.public_key().as_bytes().to_vec(),
                 false,
             )
@@ -3268,6 +3318,7 @@ mod tests {
                 payload,
                 TrustDecision::Accept,
                 machine,
+                true,
                 sender.public_key().as_bytes().to_vec(),
                 false,
             )
@@ -5199,6 +5250,7 @@ mod tests {
                     _ => panic!("payload"),
                 },
                 machine,
+                true,
                 sender.public_key().as_bytes().to_vec(),
                 false,
             )
@@ -5223,6 +5275,7 @@ mod tests {
                     _ => panic!("payload"),
                 },
                 machine,
+                true,
                 sender.public_key().as_bytes().to_vec(),
                 false,
             )
@@ -5497,6 +5550,121 @@ mod tests {
             1,
             "unverified PubSubMessage must increment incoming_signature_failed \
              at the real drop site in dm_inbox (issue #296)"
+        );
+    }
+
+    // ── #927: an unattested gossip DM machine claim never rebinds ─────────
+
+    /// A signed v2 envelope WITH a valid origin attestation from `machine`.
+    fn attested_durable_payload_message(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        machine: &MachineKeypair,
+        request_byte: u8,
+    ) -> PubSubMessage {
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            harness,
+            sender,
+            machine.machine_id(),
+            request_byte,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"927 attested".to_vec(),
+        );
+        sign_envelope_with_agent(&mut envelope, sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        attestation.sign(machine).expect("machine attest");
+        envelope.origin_attestation = Some(attestation);
+        wrap_in_pubsub(harness, sender, &envelope)
+    }
+
+    /// #927: agent A (holding its own key, no attestation, no authenticated
+    /// binding) claims machine M2. The v2 path is the one that registers the
+    /// sender in DirectMessaging, which `connect_to_agent` copies into the
+    /// discovery cache — so the claim must leave A's connected machine
+    /// exactly as it was, whether A was bound to M1 or not bound at all.
+    /// The message itself is still delivered, annotated unverified, so a
+    /// legacy (pre-#213) sender is not black-holed.
+    #[tokio::test]
+    async fn unattested_claim_never_rebinds_but_is_delivered_unverified() {
+        let m1 = MachineId([0x91; 32]);
+        let m2 = MachineId([0x92; 32]);
+        for bound_to_m1 in [true, false] {
+            let sender = test_keypair();
+            // No authenticated binding: only the sender claim is available.
+            let mut harness = make_inbox_harness(&sender, None, None).await;
+            let _service = attach_history(&mut harness);
+            if bound_to_m1 {
+                harness
+                    .pipeline
+                    .dm
+                    .mark_connected(sender.agent_id(), m1)
+                    .await;
+            }
+            let before = harness.pipeline.dm.get_machine_id(&sender.agent_id()).await;
+            assert_eq!(before, bound_to_m1.then_some(m1));
+
+            let message = durable_payload_message(&harness, &sender, m2, 0x27, b"927 claim");
+            harness
+                .pipeline
+                .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+                .await;
+
+            let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+                .await
+                .expect("unattested DM must still be delivered")
+                .expect("delivery stream closed");
+            assert_eq!(delivered.sender, sender.agent_id());
+            assert_eq!(delivered.payload, b"927 claim".to_vec());
+            assert!(
+                !delivered.verified,
+                "an unattested machine claim must be annotated unverified"
+            );
+            assert_eq!(
+                harness.pipeline.dm.get_machine_id(&sender.agent_id()).await,
+                before,
+                "an unattested claim must not move A's connected machine \
+                 (bound_to_m1 = {bound_to_m1})"
+            );
+            assert_eq!(
+                harness.pipeline.dm.lookup_agent(&m2).await,
+                None,
+                "the claimed machine must not be mapped to A"
+            );
+        }
+    }
+
+    /// #927 counterpart: an ATTESTED move from M1 to M2 still updates A's
+    /// connected machine, and is delivered verified. Without this the gate
+    /// could pass by never registering anyone.
+    #[tokio::test]
+    async fn attested_move_still_rebinds_and_is_delivered_verified() {
+        let sender = test_keypair();
+        let m1 = MachineId([0x93; 32]);
+        let m2 = MachineKeypair::generate().expect("machine keygen");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let _service = attach_history(&mut harness);
+        harness
+            .pipeline
+            .dm
+            .mark_connected(sender.agent_id(), m1)
+            .await;
+
+        let message = attested_durable_payload_message(&harness, &sender, &m2, 0x28);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("attested DM delivery timeout")
+            .expect("delivery stream closed");
+        assert!(delivered.verified, "an attested origin is verified");
+        assert_eq!(
+            harness.pipeline.dm.get_machine_id(&sender.agent_id()).await,
+            Some(m2.machine_id()),
+            "an attested move must update A's connected machine"
         );
     }
 }

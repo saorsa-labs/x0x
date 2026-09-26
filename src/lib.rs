@@ -84,6 +84,7 @@ pub mod key_move;
 /// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
 /// records over `SyncV1` streams between the owner's enrolled machines).
 pub mod owner_sync;
+pub mod owner_trust;
 
 pub mod announce_blob;
 /// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
@@ -481,6 +482,9 @@ pub struct Agent {
     /// [`Agent::set_connect_policy`]. `std` RwLock: gate reads are a brief
     /// clone of the inner `Arc`, never held across an await.
     connect_policy: std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+    /// ADR-0070 §1 owner trust (local owner + owner device set), consulted
+    /// by the stream gates; see [`owner_trust`].
+    owner_trust: owner_trust::OwnerTrust,
     /// ADR-0043 §2.1: this machine's ML-KEM-768 enrollment keypair — the
     /// export-envelope recipient key. Generated at first start, persisted
     /// beside the machine key (`machine-kem.key`); `None` when no
@@ -4295,6 +4299,15 @@ impl Agent {
         runtime.pubsub().replace_group_rosters(rosters).await;
     }
 
+    /// #908/R17 Home blocker: the live pub/sub handle for seal-time
+    /// warranted certificate fetches (None when gossip is disabled -
+    /// callers treat that as unobtainable evidence, fail closed).
+    #[must_use]
+    pub(crate) fn pubsub(&self) -> Option<std::sync::Arc<gossip::PubSubManager>> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| std::sync::Arc::clone(rt.pubsub()))
+    }
     /// Leaf vs Full participation snapshot (issue #380).
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
@@ -6453,14 +6466,7 @@ impl Agent {
                 )));
             }
         }
-        if *to == self.identity.agent_id() && !config.require_durable_app_ack {
-            // #942 B2: strict (durable-ACK) sends NEVER take the loopback
-            // shortcut — it fans out to local subscribers and returns a
-            // transport-level receipt, bypassing the typed routes whose
-            // durable completion is the entire point of the strict
-            // contract (a full typed channel must surface as a failed
-            // send, and an ACK must mean the handler's disposition).
-            // Strict self-sends fall through to the real gossip inbox path.
+        if *to == self.identity.agent_id() {
             self.direct_messaging.record_outgoing_started(*to, None);
             if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
                 self.direct_messaging.record_outgoing_failed(*to);
@@ -13427,14 +13433,18 @@ impl Agent {
         // returns false, preserving compatibility with pre-#130 peers.
         let expired = identity::is_expired(cert_not_after, Self::unix_timestamp_secs());
 
-        let trust_decision = {
-            let contacts = self.contact_store.read().await;
-            let evaluator = trust::TrustEvaluator::new(&contacts);
-            Some(evaluator.evaluate(&trust::TrustContext {
-                agent_id,
-                machine_id: &machine_id,
-            }))
-        };
+        let trust_decision = Some(
+            self.owner_trust
+                .evaluate_pair(
+                    &self.contact_store,
+                    &self.identity_discovery_cache,
+                    &self.revocation_set,
+                    agent_id,
+                    &machine_id,
+                )
+                .await
+                .decision,
+        );
         let (revoked_agent, revoked_machine) = {
             let revoked = self.revocation_set.read().await;
             (
@@ -13498,6 +13508,7 @@ impl Agent {
         revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
         move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
         connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
@@ -13535,18 +13546,24 @@ impl Agent {
         // agents drop from the surfaced list; if NONE survive, the
         // machine has no live pairing and is denied.
         let mut surviving: Vec<identity::AgentId> = Vec::with_capacity(agents.len());
+        let mut owner_trusted: Vec<identity::AgentId> = Vec::new();
         for (agent_id, cert_not_after) in &agents {
             // Runtime cert-expiry gate (issue #191): a cached entry whose
             // cert has expired must be refused on the live path.
             let expired = identity::is_expired(*cert_not_after, now_secs);
-            let trust_decision = {
-                let contacts = contact_store.read().await;
-                let evaluator = trust::TrustEvaluator::new(&contacts);
-                Some(evaluator.evaluate(&trust::TrustContext {
+            let pair = owner_trust
+                .evaluate_pair(
+                    contact_store,
+                    discovery_cache,
+                    revocation_set,
                     agent_id,
                     machine_id,
-                }))
-            };
+                )
+                .await;
+            if pair.owner_trusted {
+                owner_trusted.push(*agent_id);
+            }
+            let trust_decision = Some(pair.decision);
             let (revoked_agent, revoked_machine) = {
                 let revoked = revocation_set.read().await;
                 (
@@ -13626,7 +13643,7 @@ impl Agent {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::sync::Arc::clone(&guard)
         };
-        if let Err(e) = streams::stream_acl_gate(&policy, &agents, machine_id) {
+        if let Err(e) = streams::stream_acl_gate(&policy, &agents, &owner_trusted, machine_id) {
             tracing::info!(
                 target: "x0x::streams",
                 machine = %hex::encode(machine_id.as_bytes()),
@@ -13676,6 +13693,7 @@ impl Agent {
             &self.revocation_set,
             &self.move_state,
             &self.connect_policy,
+            &self.owner_trust,
             &machine_id,
         )
         .await?;
@@ -13789,6 +13807,7 @@ impl Agent {
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let move_state = std::sync::Arc::clone(&self.move_state);
         let connect_policy = std::sync::Arc::clone(&self.connect_policy);
+        let owner_trust = self.owner_trust.clone();
         let incoming = std::sync::Arc::clone(&self.stream_accept);
         let token = self.shutdown_token.clone();
 
@@ -13822,6 +13841,7 @@ impl Agent {
                     &revocation_set,
                     &move_state,
                     &connect_policy,
+                    &owner_trust,
                     &machine_id,
                 )
                 .await
@@ -14427,6 +14447,15 @@ impl Agent {
         if let Some(gate) = binding.ingest_gate {
             sync.ingest_gate().install(gate);
         }
+        // #895: the protector is captured by the loops at start, so it too
+        // must be in place first — otherwise a group list would publish and
+        // merge plaintext until it was installed.
+        if let Some(protector) = binding.delta_protector {
+            sync.install_protector(protector);
+        }
+        if let Some(gate) = binding.state_serve_gate {
+            sync.install_serve_gate(gate);
+        }
         let sync = std::sync::Arc::new(sync);
         if storage.is_some() {
             // Fail closed at registration: refuse to run a "persistent"
@@ -14524,6 +14553,12 @@ pub struct TaskListBinding {
     /// The ADR-0068 D2 inbound-delta gate. `None` for a list with no group
     /// binding.
     pub ingest_gate: Option<std::sync::Arc<dyn crdt::TaskIngestGate>>,
+    /// #895: the group-key protector for a list bound to a named group.
+    /// `None` for a personal list (plaintext wire format, unchanged).
+    pub delta_protector: Option<std::sync::Arc<dyn crdt::TaskDeltaProtector>>,
+    /// #895: who may trigger a full-state serve of this list. `None` answers
+    /// any requester (the pre-#895 behaviour).
+    pub state_serve_gate: Option<crdt::StateServeGate>,
 }
 
 impl std::fmt::Debug for TaskListBinding {
@@ -14537,6 +14572,8 @@ impl std::fmt::Debug for TaskListBinding {
                     .map(std::collections::HashSet::len),
             )
             .field("ingest_gate", &self.ingest_gate.is_some())
+            .field("delta_protector", &self.delta_protector.is_some())
+            .field("state_serve_gate", &self.state_serve_gate.is_some())
             .finish()
     }
 }
@@ -15742,6 +15779,10 @@ impl AgentBuilder {
         let authenticated_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
             dm_inbox::AuthenticatedMachineBindingCache::default(),
         ));
+        let owner_trust = owner_trust::OwnerTrust::new(
+            identity.user_id(),
+            std::sync::Arc::clone(&authenticated_machine_bindings),
+        );
         if let Some(runtime) = gossip_runtime.as_ref() {
             runtime.pubsub().set_group_identity_context(
                 std::sync::Arc::clone(&authenticated_machine_bindings),
@@ -15901,6 +15942,7 @@ impl AgentBuilder {
             connect_policy: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
                 connect::ConnectPolicy::default(),
             ))),
+            owner_trust,
         })
     }
 }
@@ -16291,6 +16333,82 @@ impl TaskListHandle {
             tracing::warn!("failed to publish add_task delta: {}", e);
         }
         Ok((task_id, version))
+    }
+
+    /// #895 one-time board migration: copy every task of `source` into this
+    /// list under its EXISTING id, title, description, priority, creator and
+    /// creation time. Returns how many tasks were added.
+    ///
+    /// Ids already present are skipped, so a re-run — or another member
+    /// migrating the same board concurrently — converges on one entry per
+    /// task instead of duplicating (CRDT adds keyed by the same id merge).
+    ///
+    /// Copies arrive unclaimed: claim/complete attestations are bound to the
+    /// SOURCE list's scope and signed by the agents who made them, so this
+    /// agent cannot re-sign them without misattributing the work.
+    ///
+    /// # Errors
+    ///
+    /// The durability gate, a local add, or the snapshot write fails. Nothing
+    /// is published unless the snapshot succeeded.
+    pub async fn import_tasks_from(&self, source: &TaskListHandle) -> error::Result<usize> {
+        self.sync.ensure_durable().await.map_err(durability_err)?;
+        let copies: Vec<(crdt::TaskId, crdt::TaskMetadata)> = source
+            .sync
+            .read()
+            .await
+            .tasks_ordered()
+            .into_iter()
+            .map(|task| {
+                (
+                    *task.id(),
+                    crdt::TaskMetadata::new(
+                        task.title(),
+                        task.description(),
+                        task.priority(),
+                        *task.created_by(),
+                        task.created_at(),
+                    ),
+                )
+            })
+            .collect();
+        let delta = {
+            let mut list = self.sync.write().await;
+            let mut added = Vec::new();
+            for (task_id, metadata) in copies {
+                if list.get_task(&task_id).is_some() {
+                    continue;
+                }
+                let seq = list.next_seq();
+                let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
+                list.add_task(task.clone(), self.peer_id, seq)
+                    .map_err(|e| {
+                        error::IdentityError::Storage(std::io::Error::other(format!(
+                            "board migration add failed: {e}"
+                        )))
+                    })?;
+                added.push((task_id, task, (self.peer_id, seq)));
+            }
+            if added.is_empty() {
+                return Ok(0);
+            }
+            let mut delta = crdt::TaskListDelta::new(list.current_version());
+            for (task_id, task, tag) in added {
+                delta.added_tasks.insert(task_id, (task, tag));
+            }
+            delta
+        };
+        let count = delta.added_tasks.len();
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "board migration applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; task list is durability-degraded"
+            )))
+        })?;
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish board migration delta: {}", e);
+        }
+        Ok(count)
     }
 
     /// Claim a task in the list.
@@ -17855,6 +17973,11 @@ impl std::fmt::Debug for KvStoreHandle {
 }
 
 impl KvStoreHandle {
+    /// Cumulative local state-sync counters for this open store.
+    pub fn state_sync_snapshot(&self) -> kv::sync::StateSyncSnapshot {
+        self.sync.state_sync_snapshot()
+    }
+
     pub(crate) async fn retained_content_digest_hex(&self) -> String {
         hex::encode(self.sync.read().await.served_digest())
     }
@@ -18252,6 +18375,28 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<kv::KvStoreDelta> {
+        Ok(self.put_with_outcome(key, value, content_type).await?.delta)
+    }
+
+    /// Put a key-value pair and return the published delta together with
+    /// the writer's own keys that the put evicted.
+    ///
+    /// Under [`kv::AccessPolicy::SelfKeyed`], ADR-0047 lowest-N admission can
+    /// evict the writer's lexicographically highest live keys when a put
+    /// takes it over the quota. That rule is unchanged. This method only
+    /// reports the eviction so the writer sees it (issue #849). A put whose
+    /// own key would fall outside the admitted set is refused before
+    /// anything changes, as with [`put_with_delta`](Self::put_with_delta).
+    ///
+    /// # Errors
+    ///
+    /// As [`put_with_delta`](Self::put_with_delta).
+    pub async fn put_with_outcome(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+    ) -> error::Result<KvPutOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
             .await
@@ -18269,18 +18414,21 @@ impl KvStoreHandle {
                  local writes refused until a snapshot succeeds"
             )))
         })?;
-        let delta = {
+        let (delta, evicted_keys) = {
             let mut store = self.sync.write().await;
             let would_mutate =
                 Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
             let version_before = store.current_version();
             if !would_mutate {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                });
             }
             let first_seq = store.reserve_sequences(2).map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!("kv put failed: {e}")))
             })?;
-            store
+            let evicted_keys = store
                 .put_with_reserved_sequence(
                     key.clone(),
                     value.clone(),
@@ -18301,7 +18449,10 @@ impl KvStoreHandle {
             // must not advance for a non-mutation), publish nothing, and
             // persist nothing. Retries stay observationally silent.
             if store.current_version() == version_before {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                });
             }
             let entry = store.get(&key).cloned();
             let version = store.current_version();
@@ -18341,7 +18492,7 @@ impl KvStoreHandle {
                 // (content_root binds the store name).
                 delta.name_update = Some(store.name_register().clone());
             }
-            delta
+            (delta, evicted_keys)
         };
         // Durability before announcement: persist the committed mutation and
         // DO NOT publish if the snapshot fails — announcing state the disk
@@ -18360,7 +18511,10 @@ impl KvStoreHandle {
         if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
             tracing::warn!("failed to publish kv put delta: {e}");
         }
-        Ok(delta)
+        Ok(KvPutOutcome {
+            delta,
+            evicted_keys,
+        })
     }
 
     /// Get a value by key.
@@ -18535,6 +18689,16 @@ impl KvStoreHandle {
         let store = self.sync.read().await;
         Ok(store.name().to_string())
     }
+}
+
+/// Result of a local KV put: the published delta plus any keys it evicted.
+#[derive(Debug, Clone)]
+pub struct KvPutOutcome {
+    /// The CRDT delta that was published for this put.
+    pub delta: kv::KvStoreDelta,
+    /// The writer's own keys that this put evicted under the `SelfKeyed`
+    /// lowest-N quota (ADR-0047), sorted. Empty when nothing was evicted.
+    pub evicted_keys: Vec<String>,
 }
 
 /// Read-only snapshot of a KvStore entry.
@@ -22490,6 +22654,168 @@ mod tests {
             matches!(outcome2, crate::TaskMutationOutcome::Committed { .. }),
             "a post-restart token at the current revision must commit"
         );
+
+        agent.shutdown().await;
+    }
+
+    /// GSS protector for the #895 board-migration fixture: seals and opens
+    /// with the same library functions the daemon's protector calls.
+    struct BoardFixtureProtector {
+        info: crate::groups::GroupInfo,
+        topic: String,
+        signing: crate::kv::AuthorSigning,
+    }
+
+    impl crate::crdt::TaskDeltaProtector for BoardFixtureProtector {
+        fn seal<'a>(
+            &'a self,
+            kind: crate::kv::KvMutationKind,
+            payload: &'a [u8],
+        ) -> crate::crdt::sealed::TaskSealFuture<
+            'a,
+            Option<crate::crdt::sealed::SealedTaskRecordBody>,
+        > {
+            Box::pin(async move {
+                crate::crdt::sealed::seal_gss_task_payload(
+                    &self.info,
+                    &self.signing,
+                    kind,
+                    &self.topic,
+                    payload,
+                )
+                .map(Some)
+            })
+        }
+
+        fn open<'a>(
+            &'a self,
+            body: &'a crate::crdt::sealed::SealedTaskRecordBody,
+        ) -> crate::crdt::sealed::TaskSealFuture<'a, crate::crdt::sealed::OpenedTaskPayload>
+        {
+            Box::pin(async move {
+                match body {
+                    crate::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
+                        crate::crdt::sealed::open_gss_task_record(&self.info, &self.topic, record)
+                    }
+                    crate::crdt::sealed::SealedTaskRecordBody::TreeKem(_) => {
+                        Err(crate::crdt::CrdtError::Gossip("GSS fixture".to_string()))
+                    }
+                }
+            })
+        }
+
+        fn admits_plaintext(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(async move { false })
+        }
+
+        fn on_rejected(&self, _reason: crate::crdt::TaskSealRejection) {}
+
+        fn local_agent(&self) -> Option<crate::identity::AgentId> {
+            Some(self.signing.agent_id)
+        }
+    }
+
+    /// #895 (David, 2026-09-25) WHY: the space Board moves from its legacy
+    /// plaintext list to the sealed group list by copying once. The copy must
+    /// keep each task's id (so a re-run, or a second member migrating, adds
+    /// nothing), and what the new board publishes must carry no plaintext.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn board_migration_copies_once_and_publishes_only_sealed_bytes() {
+        const TITLES: [&str; 2] = ["LEGACY-BOARD-TITLE-895-A", "LEGACY-BOARD-TITLE-895-B"];
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        let legacy = agent
+            .create_task_list("Board", "x0x-board-g895migration")
+            .await
+            .expect("legacy board");
+        let mut legacy_ids = Vec::new();
+        for title in TITLES {
+            legacy_ids.push(
+                legacy
+                    .add_task(title.to_string(), "legacy".to_string())
+                    .await
+                    .expect("legacy task"),
+            );
+        }
+
+        let topic = "x0x.group.g895migration.symphony.board";
+        let mut info = crate::groups::GroupInfo::new(
+            "g895migration".to_string(),
+            String::new(),
+            agent.agent_id(),
+            "g895migration".to_string(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        let binding = TaskListBinding {
+            delta_protector: Some(std::sync::Arc::new(BoardFixtureProtector {
+                info,
+                topic: topic.to_string(),
+                signing: crate::kv::AuthorSigning::from_keypair(agent.identity().agent_keypair())
+                    .expect("signing"),
+            })),
+            ..TaskListBinding::default()
+        };
+        let board = agent
+            .create_task_list_persistent_bound("Board", topic, &dir.path().join("lists"), binding)
+            .await
+            .expect("sealed board");
+        let mut probe = agent
+            .gossip_runtime
+            .as_ref()
+            .expect("runtime")
+            .pubsub()
+            .subscribe(topic.to_string())
+            .await;
+
+        assert_eq!(
+            board.import_tasks_from(&legacy).await.expect("migrate"),
+            2,
+            "first migration copies every legacy task"
+        );
+        assert_eq!(
+            board.import_tasks_from(&legacy).await.expect("re-run"),
+            0,
+            "a second migration is a no-op"
+        );
+        let mut migrated: Vec<_> = board
+            .list_tasks()
+            .await
+            .expect("board tasks")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        migrated.sort_by_key(|id| *id.as_bytes());
+        legacy_ids.sort_by_key(|id| *id.as_bytes());
+        assert_eq!(
+            migrated, legacy_ids,
+            "stable ids: one entry per legacy task"
+        );
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), probe.recv())
+            .await
+            .expect("migration delta published")
+            .expect("probe open");
+        assert!(crate::crdt::sealed::decode_sealed_task_record(&msg.payload).is_some());
+        for title in TITLES {
+            assert!(
+                !msg.payload
+                    .windows(title.len())
+                    .any(|w| w == title.as_bytes()),
+                "plaintext title {title} on the new board's wire"
+            );
+        }
 
         agent.shutdown().await;
     }

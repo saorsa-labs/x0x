@@ -273,6 +273,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "status",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/auth/session/refresh",
+        cli_name: "auth refresh",
+        description: "Swap a live session token for a fresh one (12h cap from the original mint)",
+        category: "status",
+        request: RequestSpec::None,
+    },
     // ── Identity ────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,
@@ -674,6 +682,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         path: "/diagnostics/history",
         cli_name: "diagnostics history",
         description: "Durable-history writer/reaper counters (ADR-0023)",
+        category: "network",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/state-sync",
+        cli_name: "diagnostics state-sync",
+        description: "Local state-sync counters for currently open KV stores",
         category: "network",
         request: RequestSpec::None,
     },

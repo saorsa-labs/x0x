@@ -1061,6 +1061,19 @@ pub(super) struct AppState {
     /// Serializes bootstrap outbox mutation and durable replacement. The retry
     /// worker never holds this while awaiting network delivery.
     pub(super) public_group_bootstrap_outbox_persistence_lock: Mutex<()>,
+    /// #946 r2: requester-side per-digest suppression for group-scoped
+    /// certificate fetches (in-flight dedup + 60 s negative cache).
+    pub(super) cert_fetch_requested:
+        StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// #946: responder-side suppression deadline per (stable group id,
+    /// digest) — the answer rate limit and the miss negative cache.
+    pub(super) cert_fetch_answered: StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// #946: the current certificate-unobtainable refusal window per
+    /// (stable group id, joining member) — the typed refusal is staged only
+    /// after CERT_EVIDENCE_DEADLINE_MS of continuous refusals.
+    pub(super) cert_unresolvable_since: StdMutex<
+        std::collections::HashMap<String, crate::server::routes::named_groups::CertEvidenceStamp>,
+    >,
     /// ADR 0028 B5: write-ahead journal for the cross-file B8 operation
     /// (outbox refresh + roster save). Set before the outbox refresh save;
     /// cleared after both saves succeed. On restart, a pending entry triggers

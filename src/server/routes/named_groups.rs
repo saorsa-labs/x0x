@@ -7,8 +7,14 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 mod control_blob;
+mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
+};
+pub(in crate::server) use seat_cert_fetch::{
+    cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
+    handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
+    CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
 };
 
 mod requester_offer;
@@ -345,17 +351,65 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
 
 /// A predecessor relay can only count a recipient application ACK. Raw QUIC's
 /// receive-pipeline ACK is produced before the typed route admits the item.
-pub(in crate::server) fn predecessor_relay_delivery_config() -> x0x::dm::DmSendConfig {
+/// #942 r3 (B4): the strict-v2 delivery config, following the durable
+/// bootstrap-outbox pattern exactly — the logical request id is the first
+/// 16 bytes of the obligation's envelope digest, so a retry after a lost
+/// ACK or a restart is a REPLAY of one logical request (the recipient's
+/// dedupe re-ACKs instead of re-dispatching), and the outbox — not the
+/// send layer — owns retry scheduling (max_retries = 0).
+pub(in crate::server) fn predecessor_relay_delivery_config(
+    envelope_digest: &[u8; 32],
+) -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     config.require_gossip = true;
-    // #942 B2/M5: the predecessor route is registered DURABLE, so demand
-    // the durable application ACK — send Ok means the AUTHORITY's handler
-    // resolved the completion (Inserted/Duplicate), not a bare enqueue. A
-    // full typed channel withholds the ACK, which is exactly the failure
-    // the retry schedule absorbs ("a full typed channel is a retry,
-    // never a silent loss").
+    // The predecessor route is registered DURABLE: send Ok means the
+    // AUTHORITY's handler resolved its completion (Inserted/Duplicate),
+    // never a bare enqueue. A full typed channel withholds the ACK — that
+    // is the failure the retry schedule absorbs.
     config.require_durable_app_ack = true;
+    config.prefer_raw_quic_if_connected = false;
+    config.max_retries = 0;
+    let mut request_id = [0u8; 16];
+    request_id.copy_from_slice(&envelope_digest[..16]);
+    config.logical_request_id = Some(request_id);
     config
+}
+
+/// #942 r3 (B4): the legacy (v1) fallback for authorities without a
+/// current v2 durable-ACK advert — pre-ADR-0030 builds and daemons with
+/// history disabled. The payload is unchanged (the predecessor prefix is
+/// the v1 listener's prefix too); the receipt is transport-level, so the
+/// obligation is discharged on delivery exactly as it was before the
+/// durable route existed. Without this arm such an authority would NEVER
+/// receive the offer (compatibility regression fixed).
+pub(in crate::server) fn predecessor_relay_legacy_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    config.require_durable_app_ack = false;
+    config.prefer_raw_quic_if_connected = false;
+    config.max_retries = 0;
+    config
+}
+
+/// #942 r3 (B4): which wire an authority can receive on, mirroring the
+/// bootstrap outbox's probe — a capability binding under v2 means legacy;
+/// a contact card that self-reports v1 means legacy; unknown defaults to
+/// the strict v2 attempt (which fails fast and retries on schedule).
+pub(in crate::server) async fn predecessor_relay_wire_version(
+    state: &AppState,
+    recipient: &crate::identity::AgentId,
+) -> bool {
+    if let Some(binding) = state.agent.capability_store().lookup_binding(recipient) {
+        return binding.capabilities.max_protocol_version >= 2;
+    }
+    let card_reports_v1 = state
+        .contacts
+        .read()
+        .await
+        .get(recipient)
+        .and_then(|contact| contact.dm_capabilities.as_ref())
+        .is_some_and(|capabilities| capabilities.max_protocol_version < 2);
+    !card_reports_v1
 }
 
 /// Request body for POST /groups.
@@ -1118,15 +1172,24 @@ pub(in crate::server) enum JoinResultMessage {
 /// outcomes: the five `consume_issued_invite` failures (src/groups/mod.rs
 /// `consume_issued_invite`) plus the addressed-recipient pre-consumption
 /// refusal (an immutable fact about the invite itself). OwnerCertified-gate
-/// failures are deliberately ABSENT: certificate evidence is mutable
-/// discovery state and the authority-side attempt tombstone that would make
-/// them safely terminal is deferred (#481) — they stay retryable.
+/// failures stay retryable — certificate evidence is mutable discovery
+/// state and the authority-side attempt tombstone that would make them
+/// safely terminal is deferred (#481) — with ONE exception:
+/// [`JoinRefusalReason::CertificateEvidenceUnavailable`], staged only after
+/// a digest-only seat has blocked the same join attempt continuously for
+/// `CERT_EVIDENCE_DEADLINE_MS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)] // the shared Invite prefix IS the taxonomy
 pub(in crate::server) enum JoinRefusalReason {
     InviteSecretUnknown,
     InviteSecretConsumed,
+    /// #946: an existing member's committed certificate digest never
+    /// hydrated to bytes, so the seal refused. RETRYABLE FIRST — the joiner
+    /// keeps retrying while a group-scoped fetch may still obtain it; this
+    /// typed refusal is staged only after CERT_EVIDENCE_DEADLINE_MS of
+    /// continuous refusals for the same join attempt.
+    CertificateEvidenceUnavailable,
     InviteRoleExceedsCap,
     InviteEventBeforeCreation,
     InviteExpired,
@@ -1150,6 +1213,7 @@ impl JoinRefusalReason {
     #[must_use]
     fn as_str(self) -> &'static str {
         match self {
+            Self::CertificateEvidenceUnavailable => "certificate_evidence_unavailable",
             Self::InviteSecretUnknown => "invite_secret_unknown",
             Self::InviteSecretConsumed => "invite_secret_consumed",
             Self::InviteRoleExceedsCap => "invite_role_exceeds_cap",
@@ -10214,6 +10278,18 @@ async fn apply_named_group_metadata_event_with_binding(
     } else {
         None
     };
+    // #946 C3: a member who leaves or is removed/banned loses any
+    // certificate-unobtainable refusal window, so a later rejoin starts
+    // retryable. Captured before `event` moves.
+    let departing_member = match &event {
+        NamedGroupMetadataEvent::MemberRemoved {
+            group_id, agent_id, ..
+        }
+        | NamedGroupMetadataEvent::MemberBanned {
+            group_id, agent_id, ..
+        } => Some((group_id.clone(), agent_id.clone())),
+        _ => None,
+    };
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10234,6 +10310,9 @@ async fn apply_named_group_metadata_event_with_binding(
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
     if applied.accepted {
+        if let Some((gid, member)) = departing_member.as_ref() {
+            clear_cert_evidence_stamps_for(state, gid, Some(member)).await;
+        }
         if let Some(gid) = member_landing_group {
             replay_parked_role_updates(state, &gid).await;
         }
@@ -13398,6 +13477,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 member = %LogHexId::agent(&member_agent_id),
                                 "MemberJoined: failed to seal authoritative add: {e}"
                             );
+                            // #908/R17: a pending-certificate refusal whose
+                            // members are ALL still digest-only. The seal
+                            // published a group-scoped fetch; the refusal
+                            // stays retryable, and the typed refusal is
+                            // staged only after CERT_EVIDENCE_DEADLINE_MS of
+                            // continuous refusals for this join attempt.
+                            stage_refusal_if_certificates_unobtainable(
+                                state,
+                                &resolved_group_key,
+                                &member_agent_id,
+                                &event_for_log,
+                                &e,
+                            )
+                            .await;
                             return ApplyMetadataResult::REJECTED;
                         }
                     };
@@ -13471,6 +13564,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             member = %LogHexId::agent(&member_agent_id),
                             "MemberJoined: failed to seal authoritative add: {e}"
                         );
+                        // #908/R17: same deadline-gated refusal staging as
+                        // the TreeKEM arm above.
+                        stage_refusal_if_certificates_unobtainable(
+                            state,
+                            &resolved_group_key,
+                            &member_agent_id,
+                            &event_for_log,
+                            &e,
+                        )
+                        .await;
                         return ApplyMetadataResult::REJECTED;
                     }
                 }
@@ -13734,6 +13837,31 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                 maybe_msg = sub.recv() => {
                     let Some(msg) = maybe_msg else { break; };
                     let Some(sender) = msg.sender else { continue; };
+                    // #946 r2: group-scoped certificate fetch traffic rides
+                    // this topic BEFORE any metadata event (it is not an
+                    // event); route it to the real handler branches and
+                    // continue the listener loop.
+                    if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_DOMAIN) {
+                        handle_group_cert_fetch_request(
+                            &state_for_task,
+                            rest,
+                            Some(&sender),
+                            msg.verified,
+                            &task_group_id,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {
+                        handle_group_cert_fetch_response(
+                            &state_for_task,
+                            rest,
+                            msg.verified,
+                            &task_group_id,
+                        )
+                        .await;
+                        continue;
+                    }
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
                     let apply_result = apply_named_group_metadata_event(
                         &state_for_task,
@@ -14775,6 +14903,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         let mut successful_targets: Vec<String> = Vec::new();
         let mut success_count: usize = 0;
 
+        let obligation_digest = *digest;
         for target_hex in targets {
             let Ok(target_id) = parse_agent_id_hex(target_hex) else {
                 // Unparseable target — skip (not added to success set).
@@ -14791,7 +14920,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                 .send_direct_with_config(
                     &target_id,
                     dm_payload,
-                    predecessor_relay_delivery_config(),
+                    predecessor_relay_delivery_config(&obligation_digest),
                 )
                 .await;
             if send_result.is_ok() {
@@ -18911,6 +19040,9 @@ pub(in crate::server) async fn remove_named_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: a removed member's refusal window ends (clearing early only
+    // keeps a later rejoin retryable longer).
+    clear_cert_evidence_stamps_for(&state, &id, Some(&agent_id_hex)).await;
     let agent_id = match parse_agent_id_hex(&agent_id_hex) {
         Ok(id) => id,
         Err(e) => {
@@ -21274,6 +21406,9 @@ pub(in crate::server) async fn leave_group(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: leaving the group ends every refusal window this node
+    // tracked for it.
+    clear_cert_evidence_stamps_for(&state, &id, None).await;
     let local_agent = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent.as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
@@ -21816,6 +21951,37 @@ async fn owner_cert_seal_evidence(
     owner_cert_evidence_for_with_digests(state, &with_digests).await
 }
 
+/// #908/R17 Home blocker: how many digest-only seats one seal may fetch
+/// for (the common wedge is one seat; the bound keeps a pathological
+/// roster from stalling the seal on many sequential fetch deadlines).
+const SEAL_TIME_CERT_FETCH_CAP_SEATS: usize = 8;
+
+/// #908/R17: seal-time warranted certificate fetch. For each still
+/// digest-only seat (up to [`SEAL_TIME_CERT_FETCH_CAP_SEATS`]), publish a
+/// group-scoped request for its committed digest on the group's metadata
+/// topic and return without waiting. An active roster member holding the
+/// verified owner-issued pair answers (see `seat_cert_fetch`); the
+/// response handler hydrates the seat durably, and the NEXT seal retry
+/// finds the bytes.
+fn warranted_fetch_for_pending_seats(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    members: &[String],
+) {
+    // NEVER wait on the network under the caller's membership lock.
+    let stable_group_id = info.stable_group_id().to_string();
+    let metadata_topic = info.metadata_topic.clone();
+    for member_hex in members.iter().take(SEAL_TIME_CERT_FETCH_CAP_SEATS) {
+        let Some(seat) = info.members_v2.get(member_hex) else {
+            continue;
+        };
+        let Some(digest_hex) = seat.certificate_digest.as_ref() else {
+            continue;
+        };
+        publish_group_cert_fetch(state, &metadata_topic, &stable_group_id, digest_hex);
+    }
+}
+
 /// ADR-0038 seal wrapper for the authority's ORDINARY commit sites: this
 /// path NEVER evicts. If any active member currently fails OwnerCertified
 /// re-verification it refuses with a typed error directing the caller to
@@ -21862,6 +22028,21 @@ pub(in crate::server) async fn seal_commit_owner_certified(
                 "#483: seal-time hydrate installed certificates onto digest-only seats"
             );
         }
+        // #908/R17 Home blocker: seats the local caches could not hydrate
+        // get a group-scoped fetch request published on the group's
+        // metadata topic. It does not wait: THIS seal falls through to the
+        // pending refusal below, an active member holding the verified
+        // pair answers, the response hydrates the seat durably, and the
+        // next seal retry succeeds. This is what lets an admin seal while
+        // the certificate's owner is offline.
+        let still_pending: Vec<String> = info
+            .active_members()
+            .filter(|m| m.certificate.is_none() && m.certificate_digest.is_some())
+            .map(|m| m.agent_id.clone())
+            .collect();
+        if !still_pending.is_empty() {
+            warranted_fetch_for_pending_seats(state, info, &still_pending);
+        }
     }
     let evidence = owner_cert_seal_evidence(state, info).await;
     let verdict = info.owner_cert_verdict(&evidence);
@@ -21876,15 +22057,28 @@ pub(in crate::server) async fn seal_commit_owner_certified(
                 },
             );
         }
+        // #908/R17: the refusal lists BOTH classes — in-grace AND
+        // digest-pending — so the operator sees exactly who is pending
+        // (the R17 log's empty `[]` was this line reporting only
+        // in_grace).
+        let mut pending = verdict.in_grace();
+        pending.extend(verdict.digest_pending());
         return Err(
             x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
                 group_id,
-                members: verdict.in_grace(),
+                members: pending,
             },
         );
     }
-    info.seal_commit_with_owner_certs(signing_kp, now_ms, &verdict)
-        .map(|(commit, _evicted)| commit)
+    let sealed = info
+        .seal_commit_with_owner_certs(signing_kp, now_ms, &verdict)
+        .map(|(commit, _evicted)| commit);
+    // C3: an all-clean OwnerCertified seal ends any certificate-unobtainable
+    // refusal window for this group.
+    if sealed.is_ok() && info.policy.admission.owner_certified_user_id().is_some() {
+        clear_cert_evidence_stamps(state, info.stable_group_id(), None);
+    }
+    sealed
 }
 
 /// ADR-0064 (Decision §1/§1a; slice-3 closes the seat-path advisory):
@@ -23170,6 +23364,8 @@ pub(in crate::server) async fn ban_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // #946 C3: a banned member's refusal window ends.
+    clear_cert_evidence_stamps_for(&state, &id, Some(&agent_id_hex)).await;
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -23744,9 +23940,9 @@ pub(in crate::server) async fn create_join_request(
             // not a one-shot spawned DM. Persisted here (before the 201
             // returns), retried by the background worker on the bounded
             // ADR 0028 schedule over the gossip-only config (#913), and
-            // cleared on the authority's typed-route enqueue ACK or when
-            // the join resolves (see requester_offer.rs for the exact ACK
-            // semantics and the join-retry backstop). A failed send is a
+            // cleared on the authority's DURABLE application ACK (the
+            // handler's Inserted/Duplicate disposition — never a bare
+            // enqueue) or when the join resolves. A failed send is a
             // retry, never a silent loss, and a restart resumes it.
             let now_ms = now_millis_u64();
             let obligation = RequesterOfferObligation {
@@ -23778,12 +23974,13 @@ pub(in crate::server) async fn create_join_request(
                     dm_payload.extend_from_slice(&envelope);
                     let agent = Arc::clone(&state.agent);
                     let creator = creator_hex.clone();
+                    let fallback_digest: [u8; 32] = blake3::hash(&envelope).into();
                     tokio::spawn(async move {
                         if let Err(e) = agent
                             .send_direct_with_config(
                                 &creator_id,
                                 dm_payload,
-                                predecessor_relay_delivery_config(),
+                                predecessor_relay_delivery_config(&fallback_digest),
                             )
                             .await
                         {
@@ -30427,7 +30624,17 @@ pub(in crate::server) async fn save_predecessor_relay_outbox_unlocked(
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
     };
-    write_relay_outbox_sidecar(state, &json).await
+    let outcome = write_relay_outbox_sidecar(state, &json).await;
+    #[cfg(test)]
+    if let Err(ref e) = outcome {
+        eprintln!(
+            "#942R3 PROBE write failed at {}: {e}",
+            state.predecessor_relay_outbox_path.display()
+        );
+    }
+    #[cfg(test)]
+    eprintln!("#942R3 PROBE write outcome: {outcome:?}");
+    outcome
 }
 
 /// ADR 0028: persist the predecessor relay outbox to a durable sidecar file.
@@ -33047,6 +33254,70 @@ async fn remove_listener_if_token(state: &AppState, key: &str, token: u64) {
     }
 }
 
+/// #908/R17 Home blocker: stage the typed join refusal for a seal refusal
+/// whose pending members are ALL still digest-only (committed digest, no
+/// bytes) — but only once such refusals have continued for
+/// CERT_EVIDENCE_DEADLINE_MS for the same join attempt. The seal publishes
+/// a group-scoped fetch each time, so until then the refusal stays
+/// retryable. In-grace members (evidence in flight) never stage a refusal.
+async fn stage_refusal_if_certificates_unobtainable(
+    state: &AppState,
+    group_key: &str,
+    member_agent_id: &str,
+    event: &NamedGroupMetadataEvent,
+    error: &x0x::groups::state_commit::ApplyError,
+) {
+    let pending = match error {
+        x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. } => members,
+        _ => return,
+    };
+    if pending.is_empty() {
+        return;
+    }
+    // A refusal is bound to a join attempt; without one there is nothing
+    // to stage and no window to track.
+    let Some(attempt_id) = member_joined_event_attempt_id(event) else {
+        return;
+    };
+    let (all_digest_only, stable_group_id) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_key) else {
+            return;
+        };
+        let all_digest_only = pending.iter().all(|hex| {
+            info.members_v2
+                .get(hex)
+                .is_some_and(|seat| seat.certificate.is_none() && seat.certificate_digest.is_some())
+        });
+        (all_digest_only, info.stable_group_id().to_string())
+    };
+    if !all_digest_only {
+        return;
+    }
+    // The refusal is RETRYABLE first — the joiner keeps retrying while a
+    // fetch may still obtain the certificate (a member caching it comes
+    // online, the owner returns). Stage the typed terminal refusal only
+    // after CERT_EVIDENCE_DEADLINE_MS of continuous refusals.
+    if !cert_evidence_deadline_elapsed(state, &stable_group_id, member_agent_id, &attempt_id) {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_key),
+            member = %LogHexId::agent(member_agent_id),
+            "#946: certificate-unobtainable refusal is retryable (deadline not reached); no typed refusal yet"
+        );
+        return;
+    }
+    state
+        .groups_diagnostics
+        .record_invite_refusal(group_key, "certificate_evidence_unavailable");
+    stage_join_refusal(
+        state,
+        group_key,
+        member_agent_id,
+        event,
+        JoinRefusalReason::CertificateEvidenceUnavailable,
+    )
+    .await;
+}
 /// #477 A1 — stage a typed, attempt-bound refusal on the AUTHORITY. The
 /// receipt body is stored unsigned; the ML-DSA signature materializes
 /// lazily on first capable serve (rate-limited). Bounded + TTL-swept.
@@ -35551,6 +35822,7 @@ pub(in crate::server) mod tests {
     mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
+    mod r17_cert_hydrate;
     mod requester_offer;
     mod wp_c;
 
@@ -36244,6 +36516,9 @@ pub(in crate::server) mod tests {
             requester_offer_outbox_path: data_dir.join("requester_offer_outbox.json"),
             requester_offer_outbox_persistence_lock: Mutex::new(()),
             public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
+            cert_fetch_requested: StdMutex::new(HashMap::new()),
+            cert_fetch_answered: StdMutex::new(HashMap::new()),
+            cert_unresolvable_since: StdMutex::new(HashMap::new()),
             pending_b8_compensation: Mutex::new(None),
             pending_listener_admission: Mutex::new(None),
             group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -48397,10 +48672,18 @@ pub(in crate::server) mod tests {
 
     #[test]
     fn predecessor_relay_requires_application_ack_and_excludes_raw_fallback() {
-        let config = predecessor_relay_delivery_config();
+        let digest = [7u8; 32];
+        let config = predecessor_relay_delivery_config(&digest);
         assert!(config.require_gossip);
         assert!(config.require_gossip_ack);
+        assert!(config.require_durable_app_ack);
         assert!(!config.prefer_raw_quic_if_connected);
+        // #942 r3 (B4): the outbox owns scheduling and the logical request
+        // id is the envelope digest's first half — a retry is a replay.
+        assert_eq!(config.max_retries, 0);
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(&digest[..16]);
+        assert_eq!(config.logical_request_id, Some(expected));
     }
 
     #[test]

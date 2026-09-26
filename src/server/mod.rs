@@ -79,11 +79,11 @@ use routes::{
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
     spawn_directory_resubscribe, spawn_global_discovery_listener,
-    spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
-    store_named_group_info, streams_diagnostics, subscribe, transport_diagnostics,
-    unban_group_member, unenroll_device, unpin_machine, unsubscribe, update_contact,
-    update_group_policy, update_member_role, update_named_group, update_profile, update_task,
-    withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
+    spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
+    state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
+    transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
+    update_contact, update_group_policy, update_member_role, update_named_group, update_profile,
+    update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
     PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
     TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
@@ -987,6 +987,8 @@ pub async fn serve_with_options(
                     .await);
                 }
             };
+        // ADR-0070 §1: enrolled owner machines become owner-trusted.
+        agent.install_owner_device_store(Arc::clone(service.store()));
         Some(service)
     } else {
         None
@@ -1017,6 +1019,9 @@ pub async fn serve_with_options(
         predecessor_relay_outbox_persistence_lock: Mutex::new(()),
         requester_offer_outbox_persistence_lock: Mutex::new(()),
         public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
+        cert_fetch_requested: StdMutex::new(std::collections::HashMap::new()),
+        cert_fetch_answered: StdMutex::new(std::collections::HashMap::new()),
+        cert_unresolvable_since: StdMutex::new(std::collections::HashMap::new()),
         pending_b8_compensation: Mutex::new(None),
         pending_listener_admission: Mutex::new(None),
         group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -2312,6 +2317,7 @@ pub async fn serve_with_options(
         .route("/history/stats", get(history_stats))
         .route("/diagnostics/ack", get(ack_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
+        .route("/diagnostics/state-sync", get(state_sync_diagnostics))
         .route("/diagnostics/transport", get(transport_diagnostics))
         .route("/diagnostics/relay", get(relay_diagnostics))
         .route("/diagnostics/dm", get(dm_diagnostics))
@@ -2350,6 +2356,7 @@ pub async fn serve_with_options(
         // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
         // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))
+        .route("/auth/session/refresh", post(auth::refresh_session))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer({
             // Restrict CORS to exact loopback origins only.
@@ -2940,11 +2947,13 @@ async fn handle_predecessor_relay_typed_payload_inner(
     local_agent_hex: &str,
     typed: x0x::dm_inbox::DmTypedPayload,
 ) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
-    // #942 B2/M5: bias to ACK — end-of-handler means the authority
-    // durably applied or classified the offer. The two "stayed
-    // unavailable" blocks below flip this to Err so the sender retries.
+    // #942 r3 (B3): fail-closed default — the durable-route contract
+    // resolves Ok ONLY once the payload is durably recorded or is an
+    // idempotent replay of such a record. Every not-durable / transient
+    // 'admission true' break below inherits this Err (the sender's
+    // retry schedule re-offers); the durable tails set Ok explicitly.
     let mut ack: x0x::dm_inbox::DmTypedPayloadCompletionResult =
-        Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
+        Err("predecessor admission did not reach a durable outcome; retry".to_string());
     if !typed.verified {
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
@@ -3048,12 +3057,15 @@ async fn handle_predecessor_relay_typed_payload_inner(
     };
 
     // ADR 0028: group must exist and be active (Kimi blocker 3).
+    // #942 r3 (M8): a locally unknown/withdrawn group is usually a STALE
+    // VIEW (roster lag, admin change), not a permanent property of the
+    // offer — withhold the ACK so the sender retries after convergence.
     if !group_exists_active {
         tracing::warn!(
             group_id = %group_id_str,
             "ADR 0028: predecessor relay for unknown or withdrawn group, rejecting"
         );
-        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
+        return Err("predecessor relay for unknown or withdrawn group; retry".to_string());
     }
 
     // ADR 0028: bind signed V2 topic to the group's metadata topic
@@ -3074,12 +3086,14 @@ async fn handle_predecessor_relay_typed_payload_inner(
 
     if is_requester_offer && !is_local_authority {
         // Requester offered directly to a non-authority witness —
-        // reject. Only the authority accepts offers.
+        // reject. Only the authority accepts offers. #942 r3 (M8): the
+        // requester's authority view may be stale (admin change), so
+        // this is a RETRY, not a terminal discharge.
         tracing::warn!(
             carrier = %dm_sender_hex,
             "ADR 0028: requester offer to non-authority, rejecting"
         );
-        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
+        return Err("requester offer to non-authority; retry".to_string());
     }
     if is_authority_relay && is_local_authority {
         // Authority relaying to itself — reject (authority already
@@ -3152,7 +3166,12 @@ async fn handle_predecessor_relay_typed_payload_inner(
             ))
             .await;
             replay_after = replay_group_id;
-            let _ = apply_result;
+            // #942 r3 (B3): the witness tail ACKs only when its apply was
+            // accepted (durable); an unaccepted apply keeps the Err default
+            // so the peer re-offers later.
+            if apply_result.accepted {
+                ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
+            }
             break 'admission false;
         }
 
@@ -3378,7 +3397,9 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         break 'admission true;
                     }
                 }
-                // Exact durable pair: idempotent success.
+                // Exact durable pair: idempotent success — durable by a
+                // PREVIOUS accepted delivery, so this is a replay ACK.
+                ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
                 replay_after = None;
                 break 'admission false;
             }
@@ -3388,6 +3409,9 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     request_id = %request_id,
                     "ADR 0028: inconsistent durable state — request does not match this envelope binding"
                 );
+                // #942 r3 (B3): terminal — the durable request binding
+                // contradicts this envelope; re-offering can never fix it.
+                ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
                 replay_after = None;
                 break 'admission false;
             }
@@ -3639,8 +3663,10 @@ async fn handle_predecessor_relay_typed_payload_inner(
             let combined_count = daemon_count + completed_count;
             let combined_bytes = daemon_bytes + completed_bytes;
             let group_outbox = outbox.entry(group_id_str.clone()).or_default();
-            // Dedup by digest.
+            // Dedup by digest: an already-admitted obligation is an
+            // idempotent replay of a durable record.
             if group_outbox.iter().any(|o| o.digest == obligation.digest) {
+                ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
                 break 'admission false;
             }
             // Per-group combined count cap (live + completed).
@@ -3930,6 +3956,9 @@ async fn handle_predecessor_relay_typed_payload_inner(
         // causal_relay_step timer owns all sends through the
         // single relay engine. The obligation's next_retry_at_ms
         // is set to now, so the timer picks it up immediately.
+        // #942 r3 (B3): the success tail — the request was applied
+        // durably and the obligation admitted; ACK the delivery.
+        ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
         break 'admission false;
     };
     // Membership lock released here (dropped at end of labeled block).
