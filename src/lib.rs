@@ -6453,7 +6453,14 @@ impl Agent {
                 )));
             }
         }
-        if *to == self.identity.agent_id() {
+        if *to == self.identity.agent_id() && !config.require_durable_app_ack {
+            // #942 B2: strict (durable-ACK) sends NEVER take the loopback
+            // shortcut — it fans out to local subscribers and returns a
+            // transport-level receipt, bypassing the typed routes whose
+            // durable completion is the entire point of the strict
+            // contract (a full typed channel must surface as a failed
+            // send, and an ACK must mean the handler's disposition).
+            // Strict self-sends fall through to the real gossip inbox path.
             self.direct_messaging.record_outgoing_started(*to, None);
             if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
                 self.direct_messaging.record_outgoing_failed(*to);

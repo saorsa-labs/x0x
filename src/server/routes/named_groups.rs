@@ -348,6 +348,13 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
 pub(in crate::server) fn predecessor_relay_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     config.require_gossip = true;
+    // #942 B2/M5: the predecessor route is registered DURABLE, so demand
+    // the durable application ACK — send Ok means the AUTHORITY's handler
+    // resolved the completion (Inserted/Duplicate), not a bare enqueue. A
+    // full typed channel withholds the ACK, which is exactly the failure
+    // the retry schedule absorbs ("a full typed channel is a retry,
+    // never a silent loss").
+    config.require_durable_app_ack = true;
     config
 }
 
@@ -23737,8 +23744,9 @@ pub(in crate::server) async fn create_join_request(
             // not a one-shot spawned DM. Persisted here (before the 201
             // returns), retried by the background worker on the bounded
             // ADR 0028 schedule over the gossip-only config (#913), and
-            // cleared on the authority's application ACK or when the join
-            // resolves. A send that exhausts its in-flight retries is a
+            // cleared on the authority's typed-route enqueue ACK or when
+            // the join resolves (see requester_offer.rs for the exact ACK
+            // semantics and the join-retry backstop). A failed send is a
             // retry, never a silent loss, and a restart resumes it.
             let now_ms = now_millis_u64();
             let obligation = RequesterOfferObligation {
@@ -49330,6 +49338,35 @@ pub(in crate::server) mod tests {
                 .with_peer_cache_disabled()
                 .with_contact_store_path(data_dir.join("contacts.json"))
                 .with_network_config(isolated_loopback_config(plane))
+                .build()
+                .await?,
+        );
+        agent.join_network().await.context("join network")?;
+        let state = secure_endpoint_test_state_at(data_dir, agent).await?;
+        Ok((state, dir))
+    }
+
+    /// #942 B2: a networked test state whose agent carries a DURABLE
+    /// HISTORY handle — required for v2 durable-ACK DMs (the strict
+    /// send mode the requester offer outbox uses). Same shape as
+    /// `networked_test_state` plus `with_history`.
+    async fn networked_test_state_with_history(
+        plane: &str,
+    ) -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_network_config(isolated_loopback_config(plane))
+                .with_history(x0x::history::HistoryConfig {
+                    db_path: Some(data_dir.join("history.db")),
+                    ..x0x::history::HistoryConfig::daemon_default()
+                })
                 .build()
                 .await?,
         );

@@ -14,8 +14,11 @@
 //!   before the join-request response returns;
 //! - a bounded-backoff worker retries the offer over the gossip-only
 //!   delivery config (`predecessor_relay_delivery_config`, per #913: no
-//!   raw fallback, and a send only counts when the recipient application
-//!   ACKs), so a full typed channel is a retry, never a silent loss;
+//!   raw fallback), so a full typed channel is a retry, never a silent
+//!   loss. The backoff caps the retry INTERVAL (ADR 0028 offsets, then
+//!   the 240 s tail FOREVER — #942 B1), never the attempt count: the
+//!   obligation lives until the authority ACKs, the join resolves, or
+//!   the store caps evict it;
 //! - the obligation is cleared when the authority ACKs (send `Ok`) or
 //!   when the join resolves — approved, denied, expired, cancelled, the
 //!   request vanishing, or the group being withdrawn;
@@ -89,12 +92,9 @@ pub(in crate::server) async fn insert_requester_offer_obligation(
     let _guard = state.requester_offer_outbox_persistence_lock.lock().await;
     let snapshot = state.requester_offer_outbox.read().await.clone();
     let mut next = snapshot.clone();
-    next.entry(obligation.group_id.clone())
-        .or_default()
-        .retain(|o| o.request_id != obligation.request_id);
-    next.get_mut(&obligation.group_id)
-        .unwrap_or_else(|| unreachable!("entry just ensured"))
-        .push(obligation);
+    let group = next.entry(obligation.group_id.clone()).or_default();
+    group.retain(|o| o.request_id != obligation.request_id);
+    group.push(obligation);
     enforce_caps(&mut next);
     save_requester_offer_outbox(state, &next).await?;
     *state.requester_offer_outbox.write().await = next;
@@ -174,14 +174,25 @@ async fn save_requester_offer_outbox(
 /// Load the outbox at boot. Missing ⇒ empty. Malformed, wrong version, or
 /// over the daemon caps ⇒ empty + an error log (fail-visible, never
 /// blocking startup; the file is left untouched for the operator).
-pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> Result<(), String> {
-    let path: &Path = &state.requester_offer_outbox_path;
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
-    };
-    let file: RequesterOfferOutboxFile = serde_json::from_slice(&bytes)
+async fn validate_requester_offer_bytes(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<RequesterOfferOutboxFile, String> {
+    // #942 M3: pre-parse file-size guard — a sidecar within the daemon
+    // caps is at most ~4x the byte cap expanded (JSON Vec<u8>), so
+    // anything larger is corruption, not loadable state.
+    let size_guard = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
+        .saturating_mul(4)
+        .saturating_add(1 << 20);
+    if bytes.len() > size_guard {
+        return Err(format!(
+            "{}: requester offer outbox file is {} bytes (over the {:?}-byte guard)",
+            path.display(),
+            bytes.len(),
+            size_guard
+        ));
+    }
+    let file: RequesterOfferOutboxFile = serde_json::from_slice(bytes)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
     if file.version != REQUESTER_OFFER_OUTBOX_VERSION {
         return Err(format!(
@@ -196,14 +207,68 @@ pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> 
         .values()
         .flat_map(|l| l.iter().map(|o| o.byte_size))
         .sum();
+    let mut rejection: Option<String> = None;
     if count > CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP
         || total_bytes > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
     {
+        rejection = Some(format!(
+            "exceeds daemon caps ({count} envelopes, {total_bytes} bytes)"
+        ));
+    }
+    // #942 M3: per-group caps + accounting consistency — byte_size must
+    // match the envelope it describes and the digest must be its blake3.
+    for (group, list) in &file.by_group {
+        if list.len() > CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP
+            || list.iter().map(|o| o.byte_size).sum::<usize>()
+                > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP
+        {
+            rejection = Some(format!("group {group} exceeds per-group caps"));
+            break;
+        }
+        for o in list {
+            if o.byte_size != o.envelope_bytes.len() {
+                rejection = Some(format!("byte_size mismatch on {}", o.request_id));
+                break;
+            }
+            if blake3::hash(&o.envelope_bytes).as_bytes() != &o.digest {
+                rejection = Some(format!("digest mismatch on {}", o.request_id));
+                break;
+            }
+        }
+        if rejection.is_some() {
+            break;
+        }
+    }
+    if let Some(reason) = rejection {
         return Err(format!(
-            "{}: requester offer outbox exceeds daemon caps ({count} envelopes, {total_bytes} bytes)",
+            "{}: requester offer outbox {reason}",
             path.display()
         ));
     }
+
+    // (the caller installs the parsed store)
+    let _ = path;
+    Ok(file)
+}
+
+pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> Result<(), String> {
+    let path: &Path = &state.requester_offer_outbox_path;
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    // Run the strict validation on the raw bytes; on ANY rejection, move
+    // the file aside (#942 M2) so the operator keeps the evidence AND the
+    // next insert writes a fresh sidecar instead of silently overwriting
+    // a file we refused to load.
+    let outcome = validate_requester_offer_bytes(&bytes, path).await;
+    if let Err(error) = outcome {
+        let aside = path.with_extension(format!("corrupt-{}", now_millis_u64()));
+        let _ = tokio::fs::rename(path, &aside).await;
+        return Err(format!("{error} (file moved aside to {})", aside.display()));
+    }
+    let file = validate_requester_offer_bytes(&bytes, path).await?;
     *state.requester_offer_outbox.write().await = file.by_group;
     Ok(())
 }
@@ -264,9 +329,19 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
         );
         dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
         dm_payload.extend_from_slice(&obligation.envelope_bytes);
-        // #913: gossip-only delivery — `Ok` is the recipient APPLICATION
-        // ACK of the typed predecessor route, not a transport receipt, so
-        // it genuinely discharges the obligation.
+        // #913: gossip-only delivery. #942 M5 — what `Ok` actually means:
+        // the recipient endpoint ACCEPTED the payload into the predecessor
+        // typed-route channel (an enqueue-level ACK from the live authority
+        // daemon), not a transport receipt and not yet the authority's
+        // durable B8 persist. The residual window (authority crashes
+        // between enqueue and its durable admission) is closed by the join
+        // protocol, not this store: the request stays pending on the
+        // requester, and every unresolved join retry re-inserts the
+        // obligation (the /join path calls
+        // insert_requester_offer_obligation unconditionally), so a lost
+        // post-ACK offer is re-offered on the next join attempt. A full
+        // typed-route channel fails the enqueue — that is the failure the
+        // retry schedule below absorbs.
         let delivered = state
             .agent
             .send_direct_with_config(&authority, dm_payload, predecessor_relay_delivery_config())
@@ -280,7 +355,6 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
     let mut next = snapshot.clone();
     let mut delivered_groups: Vec<String> = Vec::new();
     let mut dropped_resolved: Vec<String> = Vec::new();
-    let mut exhausted_groups: Vec<String> = Vec::new();
     {
         for obligation in &resolved {
             if remove_obligation(&mut next, obligation) {
@@ -301,18 +375,20 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
                 delivered_groups.push(obligation.group_id.clone());
                 live.retry_count = live.retry_count.saturating_add(1);
             } else {
+                // #942 B1: bounded INTERVAL, unbounded ATTEMPTS — past the
+                // schedule's end the retry cadence stays at the last
+                // offset (240 s) until ACK/resolution/caps.
                 live.retry_count = live.retry_count.saturating_add(1);
-                if (live.retry_count as usize) < CAUSAL_RELAY_RETRY_SECS.len() {
-                    let delay_secs = CAUSAL_RELAY_RETRY_SECS[(live.retry_count as usize)
-                        .saturating_sub(1)
-                        .min(CAUSAL_RELAY_RETRY_SECS.len() - 1)];
-                    live.next_retry_at_ms = now_ms.saturating_add(delay_secs * 1000);
-                    continue;
-                }
-                exhausted_groups.push(obligation.group_id.clone());
+                let delay_secs = CAUSAL_RELAY_RETRY_SECS[(live.retry_count as usize)
+                    .saturating_sub(1)
+                    .min(CAUSAL_RELAY_RETRY_SECS.len() - 1)];
+                live.next_retry_at_ms = now_ms.saturating_add(delay_secs * 1000);
             }
         }
-        // Delivered and retry-exhausted obligations leave the store.
+        // Delivered obligations leave the store. #942 B1: a FAILED send
+        // never does — the bounded backoff caps the retry INTERVAL, not
+        // the attempt count; the obligation lives until the authority
+        // ACKs, the join resolves, or the store caps evict it.
         for (obligation, delivered) in &attempts {
             if !*delivered {
                 continue;
@@ -321,9 +397,6 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
                 list.retain(|o| o.request_id != obligation.request_id);
             }
         }
-        for list in next.values_mut() {
-            list.retain(|o| (o.retry_count as usize) < CAUSAL_RELAY_RETRY_SECS.len());
-        }
         next.retain(|_, list| !list.is_empty());
     }
     if let Err(error) = save_requester_offer_outbox(state, &next).await {
@@ -331,6 +404,16 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
             %error,
             "#908: failed to persist requester offer outbox; rolling back this pass"
         );
+        // #942 M4: the write helper is temp→fsync→rename→dir-fsync, so an
+        // error arriving AFTER the rename means the disk may already hold
+        // `next` while memory rolls back to `snapshot`. That divergence is
+        // benign for THIS store in both directions: (a) if the disk really
+        // holds `next`, the only entries it can lack versus `snapshot` are
+        // DELIVERED obligations (a crash then loads `next` — correct, they
+        // were ACKed) and undelivered obligations are present in both; (b) if
+        // the rename truly failed, disk and memory agree on `snapshot`. The
+        // worst case is a redundant re-delivery of an ACKed offer, which the
+        // authority's digest-keyed admission dedups — never a lost promise.
         *state.requester_offer_outbox.write().await = snapshot;
         return;
     }
@@ -345,11 +428,6 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
         state
             .groups_diagnostics
             .record_requester_offer_resolved_drop(group_id);
-    }
-    for group_id in &exhausted_groups {
-        state
-            .groups_diagnostics
-            .record_requester_offer_retry_exhausted(group_id);
     }
 }
 

@@ -2712,7 +2712,15 @@ async fn start_dm_inbox_when_gossip_ready(
                 kv_store_delta_route_tx.clone(),
                 valid_kv_store_delta_typed_dm,
             )
-            .with_validated_typed_payload_route(
+            // #942 B2/M5: durable, not plain. A plain typed route ACKs on
+            // recognition even when its bounded channel is FULL and the
+            // payload is dropped — a full authority channel would then
+            // silently discharge the requester's outbox obligation (the
+            // exact loss #908 exists to prevent). Durable registration
+            // withholds the v2 ACK on a failed enqueue, so a full channel
+            // is a RETRY; the handler resolves the completion below on
+            // every path, so the ACK never livelocks.
+            .with_validated_durable_typed_payload_route(
                 GROUP_PREDECESSOR_RELAY_DM_PREFIX,
                 predecessor_relay_route_tx.clone(),
                 valid_predecessor_relay_typed_dm,
@@ -2908,16 +2916,43 @@ fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<ser
 pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     relay_state: &Arc<AppState>,
     local_agent_hex: &str,
-    typed: x0x::dm_inbox::DmTypedPayload,
+    mut typed: x0x::dm_inbox::DmTypedPayload,
 ) {
+    // #942 B2/M5: the route is durable — resolve the completion on every
+    // path so the v2 ACK reflects the AUTHORITY's disposition, never a
+    // bare enqueue. Ok(Inserted): newly applied/recorded (the common
+    // admit + witness-apply tails). Ok(Duplicate): a deliberate
+    // authority rejection (bad signature, wrong direction, unknown
+    // group…) — durably decided, the sender may stop offering; the join
+    // itself stays pending on the requester. Err: the authority stayed
+    // unavailable on purpose (indurable journal transitions) — the
+    // sender's retry schedule re-offers.
+    let completion = typed.completion.take();
+    let outcome =
+        handle_predecessor_relay_typed_payload_inner(relay_state, local_agent_hex, typed).await;
+    if let Some(tx) = completion {
+        let _ = tx.send(outcome);
+    }
+}
+
+async fn handle_predecessor_relay_typed_payload_inner(
+    relay_state: &Arc<AppState>,
+    local_agent_hex: &str,
+    typed: x0x::dm_inbox::DmTypedPayload,
+) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
+    // #942 B2/M5: bias to ACK — end-of-handler means the authority
+    // durably applied or classified the offer. The two "stayed
+    // unavailable" blocks below flip this to Err so the sender retries.
+    let mut ack: x0x::dm_inbox::DmTypedPayloadCompletionResult =
+        Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
     if !typed.verified {
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
     let Some(envelope_bytes) = typed
         .payload
         .strip_prefix(GROUP_PREDECESSOR_RELAY_DM_PREFIX)
     else {
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
     // Size check: reject oversized envelopes (ADR 0028 bound).
     if envelope_bytes.len() > CAUSAL_ENVELOPE_MAX_BYTES {
@@ -2926,7 +2961,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             size = envelope_bytes.len(),
             "ADR 0028: predecessor relay envelope exceeds 64 KiB bound, rejecting"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
     // Decode the V2 envelope to verify the requester's signature
     // and extract the NamedGroupMetadataEvent payload.
@@ -2935,18 +2970,20 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             sender = %hex::encode(typed.sender.as_bytes()),
             "ADR 0028: failed to decode predecessor relay V2 envelope"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
     if !msg.verified {
         tracing::warn!(
             sender = %hex::encode(typed.sender.as_bytes()),
             "ADR 0028: predecessor relay V2 envelope signature verification failed"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
-    let Some(sender) = msg.sender else { return };
+    let Some(sender) = msg.sender else {
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
+    };
     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
 
     // ADR 0028: reject non-JoinRequestCreated before apply
@@ -2956,7 +2993,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             sender = %hex::encode(typed.sender.as_bytes()),
             "ADR 0028: predecessor relay envelope is not JoinRequestCreated, rejecting"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
     let group_id_str = named_group_metadata_event_group_id(&event).to_string();
@@ -2977,7 +3014,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             requester_agent_id,
             ..
         } => (requester_agent_id.clone(), request_id.clone()),
-        _ => return,
+        _ => return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate),
     };
     if v2_sender_hex != requester_agent_id_str {
         tracing::warn!(
@@ -2985,7 +3022,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             requester = %requester_agent_id_str,
             "ADR 0028: V2 envelope signer does not match JoinRequestCreated requester, rejecting"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
     // Load group info once to determine: local authority status,
@@ -3016,7 +3053,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             group_id = %group_id_str,
             "ADR 0028: predecessor relay for unknown or withdrawn group, rejecting"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
     // ADR 0028: bind signed V2 topic to the group's metadata topic
@@ -3028,7 +3065,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             expected = %metadata_topic,
             "ADR 0028: predecessor relay V2 topic does not match group metadata topic, rejecting"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
     // ADR 0028: direction enforcement (Kimi blocker 3).
@@ -3042,7 +3079,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             carrier = %dm_sender_hex,
             "ADR 0028: requester offer to non-authority, rejecting"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
     if is_authority_relay && is_local_authority {
         // Authority relaying to itself — reject (authority already
@@ -3051,7 +3088,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             carrier = %dm_sender_hex,
             "ADR 0028: authority→authority relay, rejecting"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
     if !is_requester_offer && !is_authority_relay {
         // Carrier is neither the requester nor an active admin — reject.
@@ -3059,7 +3096,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
             carrier = %dm_sender_hex,
             "ADR 0028: predecessor relay carrier is neither requester nor active admin, rejecting"
         );
-        return;
+        return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
     // Apply through the normal apply path so local state advances.
@@ -3830,6 +3867,9 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                         *relay_state.pending_listener_admission.lock().await = marker;
                     }
                 }
+                // #942 B2/M5: rolled back and staying unavailable — the
+                // sender must retry, so withhold the ACK.
+                ack = Err("predecessor admission rolled back (not durable); retry".to_string());
                 break 'admission true;
             }
         }
@@ -3879,6 +3919,9 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                         );
                     }
                 }
+                // #942 B2/M5: staying unavailable — withhold the ACK so the
+                // sender's retry schedule re-offers.
+                ack = Err("listener admission clear not durable; retry".to_string());
                 break 'admission true;
             }
         }
@@ -3904,6 +3947,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     // replayable approvals at all (`replay_after` is None), and the resume
     // must still fire.
     routes::named_groups::resume_task_ingest_after_durable_clear(relay_state, &cleared_after).await;
+    ack
 }
 
 // ---------------------------------------------------------------------------
