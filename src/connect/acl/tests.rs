@@ -324,6 +324,7 @@ fn is_allowed_exact_triple_semantics() {
             targets: vec![t22],
         }],
         owner_allow: Vec::new(),
+        grant_allow: Vec::new(),
     };
     assert!(acl.is_allowed(&agent, &machine, &t22));
     // wrong port

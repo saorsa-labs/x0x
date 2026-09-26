@@ -55,6 +55,9 @@ pub struct OwnerTrust {
     /// The agent's authenticated agent→machine bindings (#890). The default
     /// is an empty cache, which owner-trusts nothing.
     bindings: AuthenticatedMachineBindings,
+    /// ADR-0070 §2 share-grant store (slice 3). Shared slot like `devices`:
+    /// until the daemon installs it, no pair holds any grant.
+    grants: Arc<std::sync::RwLock<Option<Arc<crate::share_grant::ShareGrantStore>>>>,
 }
 
 impl std::fmt::Debug for OwnerTrust {
@@ -87,7 +90,83 @@ impl OwnerTrust {
             local_owner,
             devices: Arc::new(std::sync::RwLock::new(None)),
             bindings,
+            grants: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the ADR-0070 share-grant store. Every clone sees it.
+    pub fn install_share_grant_store(&self, store: Arc<crate::share_grant::ShareGrantStore>) {
+        let mut slot = self
+            .grants
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(store);
+    }
+
+    /// The installed share-grant store, if any.
+    #[must_use]
+    pub fn share_grant_store(&self) -> Option<Arc<crate::share_grant::ShareGrantStore>> {
+        self.grants
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// ADR-0070 §2: what the held share grants confer on `(agent_id,
+    /// machine_id)` for this daemon's agent. Explicit local denials win: a
+    /// `Blocked` agent or a machine-pin mismatch gets nothing. Pairing uses
+    /// the same authenticated binding as owner trust (module docs, 2); see
+    /// [`crate::share_grant::evaluate_grant_access`] for the rest.
+    pub async fn grant_access(
+        &self,
+        contact_store: &RwLock<ContactStore>,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+    ) -> crate::share_grant::GrantAccess {
+        let Some(store) = self.share_grant_store() else {
+            return crate::share_grant::GrantAccess::default();
+        };
+        let base = {
+            let contacts = contact_store.read().await;
+            TrustEvaluator::new(&contacts).evaluate(&TrustContext {
+                agent_id,
+                machine_id,
+            })
+        };
+        let rejected = |decision: TrustDecision| {
+            matches!(
+                decision,
+                TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch
+            )
+        };
+        if rejected(base) {
+            return crate::share_grant::GrantAccess::default();
+        }
+        let access = crate::share_grant::evaluate_grant_access(
+            &store,
+            &self.bindings,
+            discovery_cache,
+            revocation_set,
+            agent_id,
+            machine_id,
+            unix_now_secs(),
+        )
+        .await;
+        // Final contact read, as in `evaluate_pair`: a `Blocked` or re-pin
+        // that landed while the grant was being evaluated still wins.
+        let last = {
+            let contacts = contact_store.read().await;
+            TrustEvaluator::new(&contacts).evaluate(&TrustContext {
+                agent_id,
+                machine_id,
+            })
+        };
+        if rejected(last) {
+            return crate::share_grant::GrantAccess::default();
+        }
+        access
     }
 
     /// The local owner, if this install has one.

@@ -109,6 +109,36 @@ pub fn evaluate_connect_gate_for_principal(
     owner_trusted: bool,
     target: &SocketAddr,
 ) -> Result<(), ConnectDenialReason> {
+    evaluate_connect_gate_for_principals(
+        verified,
+        trust_decision,
+        policy,
+        agent_id,
+        machine_id,
+        owner_trusted,
+        false,
+        target,
+    )
+}
+
+/// [`evaluate_connect_gate_for_principal`] with the ADR-0070 §2 grant input.
+///
+/// `grant_port_allowed` must come from [`crate::share_grant`]: the
+/// requester holds a current ShareGrant whose `Connect { ports }` covers
+/// `target.port()`. It lets a `principal = "grant"` entry listing exactly
+/// `target` match; it never matches without such an entry, and the caller
+/// is expected to have raised `trust_decision` for the same grant only.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_connect_gate_for_principals(
+    verified: bool,
+    trust_decision: Option<TrustDecision>,
+    policy: &ConnectPolicy,
+    agent_id: &AgentId,
+    machine_id: &MachineId,
+    owner_trusted: bool,
+    grant_port_allowed: bool,
+    target: &SocketAddr,
+) -> Result<(), ConnectDenialReason> {
     // 1. Unverified peers learn nothing.
     if !verified {
         return Err(ConnectDenialReason::UnverifiedSender);
@@ -127,7 +157,13 @@ pub fn evaluate_connect_gate_for_principal(
         return Err(ConnectDenialReason::TargetNotLoopback);
     }
     // 5 + 6. Exact-pair (or owner principal) + exact-target match.
-    if !acl.is_allowed_for_principal(agent_id, machine_id, owner_trusted, target) {
+    if !acl.is_allowed_for_principals(
+        agent_id,
+        machine_id,
+        owner_trusted,
+        grant_port_allowed,
+        target,
+    ) {
         // Distinguish "pair unknown" from "pair known, target wrong" only for
         // diagnostics — both are deny. We split because the T4 forwarder's
         // diagnostics surface benefits from the distinction, and the peer has
@@ -135,7 +171,8 @@ pub fn evaluate_connect_gate_for_principal(
         // the pair-vs-target split leaks nothing an authenticated member
         // couldn't already derive.
         return Err(
-            if acl.has_entry_for_principal(agent_id, machine_id, owner_trusted) {
+            if acl.has_entry_for_principals(agent_id, machine_id, owner_trusted, grant_port_allowed)
+            {
                 ConnectDenialReason::TargetNotAllowed
             } else {
                 ConnectDenialReason::AgentMachineNotInAcl
@@ -169,6 +206,7 @@ mod tests {
                 targets,
             }],
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         })
     }
 
@@ -330,6 +368,7 @@ mod tests {
                 description: None,
                 targets: targets.iter().map(|t| t.parse().unwrap()).collect(),
             }],
+            grant_allow: Vec::new(),
         })
     }
 

@@ -330,17 +330,53 @@ pub(crate) fn stream_gate(
 /// matrix is fast unit-testable without a network. Target membership is NOT
 /// checked here — raw byte-streams carry no target; per-target enforcement
 /// stays with the T4 forwarder's `evaluate_connect_gate` call.
+///
+/// The accept loop and the calling gate (ADR-0073) call the with-grants
+/// form; this no-grant form serves callers without grant holders (the
+/// calling slice and the matrix tests).
 pub(crate) fn stream_acl_gate(
     policy: &crate::connect::ConnectPolicy,
     agents: &[crate::identity::AgentId],
     owner_trusted: &[crate::identity::AgentId],
     machine_id: &MachineId,
 ) -> NetworkResult<()> {
+    stream_acl_gate_with_grants(policy, agents, owner_trusted, &[], &[], machine_id)
+}
+
+/// [`stream_acl_gate`] with the ADR-0070 §2 grant selector.
+///
+/// * `grant_connect` — agents holding a current `Connect` ShareGrant for
+///   this daemon's agent. With an `Enabled` policy such an agent is also
+///   listed when the ACL has a `principal = "grant"` entry (per-port target
+///   checks stay with the forwarder).
+/// * `grant_only` — agents whose identity gate passed ONLY because of that
+///   grant (their contact/owner decision alone was not `Accept`). A grant
+///   never opens anything without an explicit rule, so under a `Disabled`
+///   policy — where the identity gate would be the sole boundary — such an
+///   agent is refused.
+pub(crate) fn stream_acl_gate_with_grants(
+    policy: &crate::connect::ConnectPolicy,
+    agents: &[crate::identity::AgentId],
+    owner_trusted: &[crate::identity::AgentId],
+    grant_connect: &[crate::identity::AgentId],
+    grant_only: &[crate::identity::AgentId],
+    machine_id: &MachineId,
+) -> NetworkResult<()> {
     let crate::connect::ConnectPolicy::Enabled(acl) = policy else {
+        if let Some(agent_id) = agents.iter().find(|a| grant_only.contains(a)) {
+            return Err(NetworkError::PeerNotInConnectAcl {
+                agent_id: agent_id.0,
+            });
+        }
         return Ok(());
     };
     for agent_id in agents {
-        if !acl.has_entry_for_principal(agent_id, machine_id, owner_trusted.contains(agent_id)) {
+        if !acl.has_entry_for_principals(
+            agent_id,
+            machine_id,
+            owner_trusted.contains(agent_id),
+            grant_connect.contains(agent_id),
+        ) {
             return Err(NetworkError::PeerNotInConnectAcl {
                 agent_id: agent_id.0,
             });
@@ -672,6 +708,7 @@ mod tests {
             loaded_at_unix_ms: 0,
             allow,
             owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         })
     }
 
