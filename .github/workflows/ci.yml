@@ -367,6 +367,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # #894: scripts/install.ps1 must at least parse under both Windows
+      # PowerShell 5.1 (what `irm | iex` runs on a stock machine) and pwsh 7.
+      - name: Parse-check scripts/install.ps1
+        shell: pwsh
+        run: |
+          $check = '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1).Path, [ref]$null, [ref]$e); if ($e) { $e | Out-String | Write-Host; exit 1 }'
+          foreach ($exe in @('powershell', 'pwsh')) {
+            & $exe -NoProfile -Command $check
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed to parse under $exe" }
+          }
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:

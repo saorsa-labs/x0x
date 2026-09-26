@@ -52,7 +52,7 @@ metadata:
       - kind: download
         url: "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip"
         archive: zip
-        stripComponents: 1
+        stripComponents: 0
         targetDir: ~/.local/bin
         bins: [x0xd.exe, x0x.exe]
 ---
