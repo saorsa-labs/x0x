@@ -670,10 +670,13 @@ pub enum ApplyError {
     },
 
     /// ADR-0038 round-4: members are inside the OwnerCertified grace
-    /// window (evidence missing or a replacement fetch in flight). Seals
-    /// that require a clean roster refuse; retry after the announce/blob
-    /// fetch converges, or use the explicit eviction path once the window
-    /// expires.
+    /// window (evidence missing or a replacement fetch in flight), or
+    /// seats whose committed certificate digest never hydrated to bytes
+    /// (#908/R17: listed here too, so the operator sees WHO is pending —
+    /// the seal-time warranted fetch already ran and could not obtain
+    /// them). Seals that require a clean roster refuse; retry after the
+    /// announce/blob fetch converges, or use the explicit eviction path
+    /// once the window expires.
     #[error(
         "owner-certified group {group_id} has members pending certificate resolution: {members:?} (retry after fetch convergence)"
     )]

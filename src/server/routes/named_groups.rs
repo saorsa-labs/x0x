@@ -1114,6 +1114,12 @@ pub(in crate::server) enum JoinResultMessage {
 pub(in crate::server) enum JoinRefusalReason {
     InviteSecretUnknown,
     InviteSecretConsumed,
+    /// #908/R17 Home blocker: a member's committed certificate digest
+    /// never hydrated and the seal-time warranted fetch could not obtain
+    /// it from any peer (typically the certificate's owner offline and
+    /// no peer cached it). Definitive for THIS attempt: the joiner is
+    /// told instead of polling forever.
+    CertificateEvidenceUnavailable,
     InviteRoleExceedsCap,
     InviteEventBeforeCreation,
     InviteExpired,
@@ -1137,6 +1143,7 @@ impl JoinRefusalReason {
     #[must_use]
     fn as_str(self) -> &'static str {
         match self {
+            Self::CertificateEvidenceUnavailable => "certificate_evidence_unavailable",
             Self::InviteSecretUnknown => "invite_secret_unknown",
             Self::InviteSecretConsumed => "invite_secret_consumed",
             Self::InviteRoleExceedsCap => "invite_role_exceeds_cap",
@@ -13385,6 +13392,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 member = %LogHexId::agent(&member_agent_id),
                                 "MemberJoined: failed to seal authoritative add: {e}"
                             );
+                            // #908/R17: a pending-certificate refusal whose
+                            // members are ALL still digest-only will not
+                            // converge (the seal-time warranted fetch just
+                            // ran inside the seal and could not obtain
+                            // them) — stage the typed refusal so the joiner
+                            // learns the terminal outcome instead of
+                            // retrying forever.
+                            stage_refusal_if_certificates_unobtainable(
+                                state,
+                                &resolved_group_key,
+                                &member_agent_id,
+                                &event_for_log,
+                                &e,
+                            )
+                            .await;
                             return ApplyMetadataResult::REJECTED;
                         }
                     };
@@ -13458,6 +13480,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             member = %LogHexId::agent(&member_agent_id),
                             "MemberJoined: failed to seal authoritative add: {e}"
                         );
+                        // #908/R17: same non-converging-refusal staging
+                        // as the TreeKEM arm above.
+                        stage_refusal_if_certificates_unobtainable(
+                            state,
+                            &resolved_group_key,
+                            &member_agent_id,
+                            &event_for_log,
+                            &e,
+                        )
+                        .await;
                         return ApplyMetadataResult::REJECTED;
                     }
                 }
@@ -21803,6 +21835,63 @@ async fn owner_cert_seal_evidence(
     owner_cert_evidence_for_with_digests(state, &with_digests).await
 }
 
+/// #908/R17 Home blocker: how many digest-only seats one seal may fetch
+/// for (the common wedge is one seat; the bound keeps a pathological
+/// roster from stalling the seal on many sequential fetch deadlines).
+const SEAL_TIME_CERT_FETCH_CAP_SEATS: usize = 8;
+
+/// #908/R17: seal-time warranted certificate fetch. For each still
+/// digest-only seat, ask the mesh for the blob its committed digest
+/// names (`AnnounceBlobCache::fetch_pair_now` publishes the real blob
+/// request on both carriers; any peer holding the verified pair —
+/// including via its own cache — can answer). Results land in the blob
+/// cache; the caller re-runs the local hydrate, which installs only
+/// bytes hashing to the committed digest.
+async fn warranted_fetch_for_pending_seats(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    members: &[String],
+) {
+    let Some(pubsub) = state.agent.pubsub() else {
+        return;
+    };
+    let local_machine = state.agent.machine_id();
+    let mut fetches = Vec::new();
+    for member_hex in members.iter().take(SEAL_TIME_CERT_FETCH_CAP_SEATS) {
+        let Some(seat) = info.members_v2.get(member_hex) else {
+            continue;
+        };
+        let Some(digest_hex) = seat.certificate_digest.as_ref() else {
+            continue;
+        };
+        let Ok(digest_bytes) = hex::decode(digest_hex) else {
+            continue;
+        };
+        let Ok(digest): Result<[u8; 32], _> = <[u8; 32]>::try_from(digest_bytes) else {
+            continue;
+        };
+        let Ok(agent_id) = parse_agent_id_hex(member_hex) else {
+            continue;
+        };
+        let cache = std::sync::Arc::clone(&state.agent.announce_blob_cache);
+        let pubsub = std::sync::Arc::clone(&pubsub);
+        fetches.push(async move {
+            cache
+                .fetch_pair_by_cert_digest(&pubsub, &digest, &agent_id, &local_machine)
+                .await
+        });
+    }
+    if fetches.is_empty() {
+        return;
+    }
+    // One fetch deadline for the whole batch (each fetch is internally
+    // bounded by BLOB_FETCH_TIMEOUT_SECS; the slack covers spawn lag).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(x0x::announce_blob::BLOB_FETCH_TIMEOUT_SECS + 2),
+        futures::future::join_all(fetches),
+    )
+    .await;
+}
 /// ADR-0038 seal wrapper for the authority's ORDINARY commit sites: this
 /// path NEVER evicts. If any active member currently fails OwnerCertified
 /// re-verification it refuses with a typed error directing the caller to
@@ -21849,6 +21938,35 @@ pub(in crate::server) async fn seal_commit_owner_certified(
                 "#483: seal-time hydrate installed certificates onto digest-only seats"
             );
         }
+        // #908/R17 Home blocker: when the local caches hold nothing, run
+        // a WARRANTED fetch by committed digest over the real blob
+        // request path — ANY connected peer that has ever heard the
+        // member announce can serve the verified pair (the responder
+        // also serves cached blobs). This is what lets an admin seal
+        // while the certificate's owner is offline. Bounded to
+        // SEAL_TIME_CERT_FETCH_CAP_SEATS seats and one fetch deadline;
+        // a total miss falls through to the typed refusal below.
+        let still_pending: Vec<String> = info
+            .active_members()
+            .filter(|m| m.certificate.is_none() && m.certificate_digest.is_some())
+            .map(|m| m.agent_id.clone())
+            .collect();
+        if !still_pending.is_empty() {
+            warranted_fetch_for_pending_seats(state, info, &still_pending).await;
+            let hydrated_after = hydrate_digest_only_seats_at_seat_time(
+                state,
+                &stable_group_id,
+                info,
+                &still_pending,
+            )
+            .await;
+            if hydrated_after > 0 {
+                tracing::info!(
+                    hydrated_after,
+                    "#908: seal-time warranted fetch hydrated digest-only seats from peers"
+                );
+            }
+        }
     }
     let evidence = owner_cert_seal_evidence(state, info).await;
     let verdict = info.owner_cert_verdict(&evidence);
@@ -21863,10 +21981,16 @@ pub(in crate::server) async fn seal_commit_owner_certified(
                 },
             );
         }
+        // #908/R17: the refusal lists BOTH classes — in-grace AND
+        // digest-pending — so the operator sees exactly who is pending
+        // (the R17 log's empty `[]` was this line reporting only
+        // in_grace).
+        let mut pending = verdict.in_grace();
+        pending.extend(verdict.digest_pending());
         return Err(
             x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
                 group_id,
-                members: verdict.in_grace(),
+                members: pending,
             },
         );
     }
@@ -33000,6 +33124,51 @@ async fn remove_listener_if_token(state: &AppState, key: &str, token: u64) {
     }
 }
 
+/// #908/R17 Home blocker: stage the typed join refusal when a seal
+/// refusal is a pending-certificate verdict that cannot converge: every
+/// listed member is still digest-only (committed digest, no bytes) —
+/// the seal-time warranted fetch already ran and no peer served them.
+/// In-grace members (evidence in flight) stay retryable: no refusal.
+async fn stage_refusal_if_certificates_unobtainable(
+    state: &AppState,
+    group_key: &str,
+    member_agent_id: &str,
+    event: &NamedGroupMetadataEvent,
+    error: &x0x::groups::state_commit::ApplyError,
+) {
+    let pending = match error {
+        x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. } => members,
+        _ => return,
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let all_digest_only = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_key) else {
+            return;
+        };
+        pending.iter().all(|hex| {
+            info.members_v2
+                .get(hex)
+                .is_some_and(|seat| seat.certificate.is_none() && seat.certificate_digest.is_some())
+        })
+    };
+    if !all_digest_only {
+        return;
+    }
+    state
+        .groups_diagnostics
+        .record_invite_refusal(group_key, "certificate_evidence_unavailable");
+    stage_join_refusal(
+        state,
+        group_key,
+        member_agent_id,
+        event,
+        JoinRefusalReason::CertificateEvidenceUnavailable,
+    )
+    .await;
+}
 /// #477 A1 — stage a typed, attempt-bound refusal on the AUTHORITY. The
 /// receipt body is stored unsigned; the ML-DSA signature materializes
 /// lazily on first capable serve (rate-limited). Bounded + TTL-swept.
@@ -35504,6 +35673,7 @@ pub(in crate::server) mod tests {
     mod issue877_error_body_session;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
+    mod r17_cert_hydrate;
     mod wp_c;
 
     fn fake_group_state_commit(
