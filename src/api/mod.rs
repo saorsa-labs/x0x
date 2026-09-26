@@ -273,6 +273,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "status",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/auth/session/refresh",
+        cli_name: "auth refresh",
+        description: "Swap a live session token for a fresh one (12h cap from the original mint)",
+        category: "status",
+        request: RequestSpec::None,
+    },
     // ── Identity ────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,
@@ -677,6 +685,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "network",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/state-sync",
+        cli_name: "diagnostics state-sync",
+        description: "Local state-sync counters for currently open KV stores",
+        category: "network",
+        request: RequestSpec::None,
+    },
     // ── History (ADR-0023 durable local history) ────────────────────────
     EndpointDef {
         method: Method::Get,
@@ -1051,6 +1067,55 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "exec sessions",
         description: "List local pending and remote active exec sessions",
         category: "exec",
+        request: RequestSpec::None,
+    },
+    // ── Calls (ADR-0073 slice 1: lifecycle only, no media) ─────────────
+    EndpointDef {
+        method: Method::Post,
+        path: "/calls",
+        cli_name: "call",
+        description: "Ring an agent (audio, optionally video); callee must pass trust and connect-ACL gates",
+        category: "calls",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body("video", false)]),
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/calls",
+        cli_name: "call list",
+        description: "List calls with gate and lifecycle counters",
+        category: "calls",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/calls/:id",
+        cli_name: "call show",
+        description: "Show one call's lifecycle state",
+        category: "calls",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/calls/:id/accept",
+        cli_name: "call accept",
+        description: "Answer a ringing incoming call",
+        category: "calls",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/calls/:id/reject",
+        cli_name: "call reject",
+        description: "Decline a ringing incoming call",
+        category: "calls",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/calls/:id/hangup",
+        cli_name: "call hangup",
+        description: "End or cancel a call",
+        category: "calls",
         request: RequestSpec::None,
     },
     // ── MLS groups ──────────────────────────────────────────────────────
