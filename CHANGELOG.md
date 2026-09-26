@@ -270,6 +270,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Group KV open now requires the shared GSS publication gate (#969).**
+  `open_group_kv_store_persistent` takes a `GssPublicationGate` so encrypted
+  store publications and durable group roster changes use the same epoch barrier.
 - **The eleven `saorsa-gossip-*` dependencies now use exact 0.5.84 pins.**
   This consumes the published recovery-intent admission fairness fix
   (saorsa-gossip PR #84) and the disabled-limiter/late-offer dispatch fixes

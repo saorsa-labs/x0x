@@ -3089,6 +3089,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 None,
                 true,
                 false,
+                None,
             ))
             .await;
             replay_after = replay_group_id;
@@ -3503,6 +3504,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 None,
                 true, // lock_already_held
                 false,
+                None,
             ))
             .await;
             replay_after = replay_group_id;
