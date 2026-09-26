@@ -14438,6 +14438,15 @@ impl Agent {
         if let Some(gate) = binding.ingest_gate {
             sync.ingest_gate().install(gate);
         }
+        // #895: the protector is captured by the loops at start, so it too
+        // must be in place first — otherwise a group list would publish and
+        // merge plaintext until it was installed.
+        if let Some(protector) = binding.delta_protector {
+            sync.install_protector(protector);
+        }
+        if let Some(gate) = binding.state_serve_gate {
+            sync.install_serve_gate(gate);
+        }
         let sync = std::sync::Arc::new(sync);
         if storage.is_some() {
             // Fail closed at registration: refuse to run a "persistent"
@@ -14535,6 +14544,12 @@ pub struct TaskListBinding {
     /// The ADR-0068 D2 inbound-delta gate. `None` for a list with no group
     /// binding.
     pub ingest_gate: Option<std::sync::Arc<dyn crdt::TaskIngestGate>>,
+    /// #895: the group-key protector for a list bound to a named group.
+    /// `None` for a personal list (plaintext wire format, unchanged).
+    pub delta_protector: Option<std::sync::Arc<dyn crdt::TaskDeltaProtector>>,
+    /// #895: who may trigger a full-state serve of this list. `None` answers
+    /// any requester (the pre-#895 behaviour).
+    pub state_serve_gate: Option<crdt::StateServeGate>,
 }
 
 impl std::fmt::Debug for TaskListBinding {
@@ -14548,6 +14563,8 @@ impl std::fmt::Debug for TaskListBinding {
                     .map(std::collections::HashSet::len),
             )
             .field("ingest_gate", &self.ingest_gate.is_some())
+            .field("delta_protector", &self.delta_protector.is_some())
+            .field("state_serve_gate", &self.state_serve_gate.is_some())
             .finish()
     }
 }
@@ -16307,6 +16324,82 @@ impl TaskListHandle {
             tracing::warn!("failed to publish add_task delta: {}", e);
         }
         Ok((task_id, version))
+    }
+
+    /// #895 one-time board migration: copy every task of `source` into this
+    /// list under its EXISTING id, title, description, priority, creator and
+    /// creation time. Returns how many tasks were added.
+    ///
+    /// Ids already present are skipped, so a re-run — or another member
+    /// migrating the same board concurrently — converges on one entry per
+    /// task instead of duplicating (CRDT adds keyed by the same id merge).
+    ///
+    /// Copies arrive unclaimed: claim/complete attestations are bound to the
+    /// SOURCE list's scope and signed by the agents who made them, so this
+    /// agent cannot re-sign them without misattributing the work.
+    ///
+    /// # Errors
+    ///
+    /// The durability gate, a local add, or the snapshot write fails. Nothing
+    /// is published unless the snapshot succeeded.
+    pub async fn import_tasks_from(&self, source: &TaskListHandle) -> error::Result<usize> {
+        self.sync.ensure_durable().await.map_err(durability_err)?;
+        let copies: Vec<(crdt::TaskId, crdt::TaskMetadata)> = source
+            .sync
+            .read()
+            .await
+            .tasks_ordered()
+            .into_iter()
+            .map(|task| {
+                (
+                    *task.id(),
+                    crdt::TaskMetadata::new(
+                        task.title(),
+                        task.description(),
+                        task.priority(),
+                        *task.created_by(),
+                        task.created_at(),
+                    ),
+                )
+            })
+            .collect();
+        let delta = {
+            let mut list = self.sync.write().await;
+            let mut added = Vec::new();
+            for (task_id, metadata) in copies {
+                if list.get_task(&task_id).is_some() {
+                    continue;
+                }
+                let seq = list.next_seq();
+                let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
+                list.add_task(task.clone(), self.peer_id, seq)
+                    .map_err(|e| {
+                        error::IdentityError::Storage(std::io::Error::other(format!(
+                            "board migration add failed: {e}"
+                        )))
+                    })?;
+                added.push((task_id, task, (self.peer_id, seq)));
+            }
+            if added.is_empty() {
+                return Ok(0);
+            }
+            let mut delta = crdt::TaskListDelta::new(list.current_version());
+            for (task_id, task, tag) in added {
+                delta.added_tasks.insert(task_id, (task, tag));
+            }
+            delta
+        };
+        let count = delta.added_tasks.len();
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "board migration applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; task list is durability-degraded"
+            )))
+        })?;
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish board migration delta: {}", e);
+        }
+        Ok(count)
     }
 
     /// Claim a task in the list.
@@ -22552,6 +22645,168 @@ mod tests {
             matches!(outcome2, crate::TaskMutationOutcome::Committed { .. }),
             "a post-restart token at the current revision must commit"
         );
+
+        agent.shutdown().await;
+    }
+
+    /// GSS protector for the #895 board-migration fixture: seals and opens
+    /// with the same library functions the daemon's protector calls.
+    struct BoardFixtureProtector {
+        info: crate::groups::GroupInfo,
+        topic: String,
+        signing: crate::kv::AuthorSigning,
+    }
+
+    impl crate::crdt::TaskDeltaProtector for BoardFixtureProtector {
+        fn seal<'a>(
+            &'a self,
+            kind: crate::kv::KvMutationKind,
+            payload: &'a [u8],
+        ) -> crate::crdt::sealed::TaskSealFuture<
+            'a,
+            Option<crate::crdt::sealed::SealedTaskRecordBody>,
+        > {
+            Box::pin(async move {
+                crate::crdt::sealed::seal_gss_task_payload(
+                    &self.info,
+                    &self.signing,
+                    kind,
+                    &self.topic,
+                    payload,
+                )
+                .map(Some)
+            })
+        }
+
+        fn open<'a>(
+            &'a self,
+            body: &'a crate::crdt::sealed::SealedTaskRecordBody,
+        ) -> crate::crdt::sealed::TaskSealFuture<'a, crate::crdt::sealed::OpenedTaskPayload>
+        {
+            Box::pin(async move {
+                match body {
+                    crate::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
+                        crate::crdt::sealed::open_gss_task_record(&self.info, &self.topic, record)
+                    }
+                    crate::crdt::sealed::SealedTaskRecordBody::TreeKem(_) => {
+                        Err(crate::crdt::CrdtError::Gossip("GSS fixture".to_string()))
+                    }
+                }
+            })
+        }
+
+        fn admits_plaintext(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(async move { false })
+        }
+
+        fn on_rejected(&self, _reason: crate::crdt::TaskSealRejection) {}
+
+        fn local_agent(&self) -> Option<crate::identity::AgentId> {
+            Some(self.signing.agent_id)
+        }
+    }
+
+    /// #895 (David, 2026-09-25) WHY: the space Board moves from its legacy
+    /// plaintext list to the sealed group list by copying once. The copy must
+    /// keep each task's id (so a re-run, or a second member migrating, adds
+    /// nothing), and what the new board publishes must carry no plaintext.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn board_migration_copies_once_and_publishes_only_sealed_bytes() {
+        const TITLES: [&str; 2] = ["LEGACY-BOARD-TITLE-895-A", "LEGACY-BOARD-TITLE-895-B"];
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        let legacy = agent
+            .create_task_list("Board", "x0x-board-g895migration")
+            .await
+            .expect("legacy board");
+        let mut legacy_ids = Vec::new();
+        for title in TITLES {
+            legacy_ids.push(
+                legacy
+                    .add_task(title.to_string(), "legacy".to_string())
+                    .await
+                    .expect("legacy task"),
+            );
+        }
+
+        let topic = "x0x.group.g895migration.symphony.board";
+        let mut info = crate::groups::GroupInfo::new(
+            "g895migration".to_string(),
+            String::new(),
+            agent.agent_id(),
+            "g895migration".to_string(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        let binding = TaskListBinding {
+            delta_protector: Some(std::sync::Arc::new(BoardFixtureProtector {
+                info,
+                topic: topic.to_string(),
+                signing: crate::kv::AuthorSigning::from_keypair(agent.identity().agent_keypair())
+                    .expect("signing"),
+            })),
+            ..TaskListBinding::default()
+        };
+        let board = agent
+            .create_task_list_persistent_bound("Board", topic, &dir.path().join("lists"), binding)
+            .await
+            .expect("sealed board");
+        let mut probe = agent
+            .gossip_runtime
+            .as_ref()
+            .expect("runtime")
+            .pubsub()
+            .subscribe(topic.to_string())
+            .await;
+
+        assert_eq!(
+            board.import_tasks_from(&legacy).await.expect("migrate"),
+            2,
+            "first migration copies every legacy task"
+        );
+        assert_eq!(
+            board.import_tasks_from(&legacy).await.expect("re-run"),
+            0,
+            "a second migration is a no-op"
+        );
+        let mut migrated: Vec<_> = board
+            .list_tasks()
+            .await
+            .expect("board tasks")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        migrated.sort_by_key(|id| *id.as_bytes());
+        legacy_ids.sort_by_key(|id| *id.as_bytes());
+        assert_eq!(
+            migrated, legacy_ids,
+            "stable ids: one entry per legacy task"
+        );
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), probe.recv())
+            .await
+            .expect("migration delta published")
+            .expect("probe open");
+        assert!(crate::crdt::sealed::decode_sealed_task_record(&msg.payload).is_some());
+        for title in TITLES {
+            assert!(
+                !msg.payload
+                    .windows(title.len())
+                    .any(|w| w == title.as_bytes()),
+                "plaintext title {title} on the new board's wire"
+            );
+        }
 
         agent.shutdown().await;
     }
