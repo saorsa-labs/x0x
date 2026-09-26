@@ -14,7 +14,9 @@
 //!   any byte from (or connection to) the refused loopback target.
 //!
 //! Both are `#[ignore]`: they bind UDP and wait on convergence (integration
-//! tier, `--run-ignored ignored-only`).
+//! tier, `--run-ignored ignored-only`). The CI `tailnet` job runs them with
+//! `X0X_REQUIRE_NETWORK_TESTS=1`, where a refused bind fails instead of
+//! skipping.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -29,6 +31,9 @@ use x0x::network::NetworkConfig;
 use x0x::streams::StreamProtocol;
 use x0x::DiscoveredAgent;
 
+#[path = "common/network_gate.rs"]
+mod network_gate;
+
 const RESPONSE_LEN: usize = 1024 * 1024;
 
 fn loopback_network_config() -> NetworkConfig {
@@ -40,14 +45,10 @@ fn loopback_network_config() -> NetworkConfig {
     }
 }
 
-fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("Operation not permitted")
-        && (message.contains("bind UDP socket")
-            || message.contains("network initialization failed"))
-}
-
+/// Skips on a refused UDP bind, but FAILS when `X0X_REQUIRE_NETWORK_TESTS=1`
+/// (the CI tailnet job), so a sandboxed run can never report a silent pass.
 async fn build_agent(dir: &TempDir, name: &str) -> Option<Arc<x0x::Agent>> {
+    network_gate::init_stream_tracing();
     match x0x::Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
         .with_agent_key_path(dir.path().join(format!("{name}-agent.key")))
@@ -58,7 +59,7 @@ async fn build_agent(dir: &TempDir, name: &str) -> Option<Arc<x0x::Agent>> {
         .await
     {
         Ok(agent) => Some(Arc::new(agent)),
-        Err(e) if is_network_bind_permission_error(&e) => None,
+        Err(e) if network_gate::skip_on_refused_network(&e) => None,
         Err(e) => panic!("agent build failed: {e}"),
     }
 }

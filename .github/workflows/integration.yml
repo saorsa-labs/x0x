@@ -128,7 +128,8 @@ jobs:
         run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
 
   # Tailnet (ADR-0074 slice 0): the ignored loopback stream/forward suites
-  # (7 in tailnet_streams_integration + 1 in forward_v2_attestation_e2e).
+  # (7 in tailnet_streams_integration + 1 in forward_v2_attestation_e2e
+  # + 2 in forward_half_close_e2e, the #961 FIN/denial proofs).
   # The ninth ignored tailnet test (forward.rs port-zero regression) already
   # runs in integration-core. --test-threads 1 keeps the backpressure and
   # bounded-acceptor timing proofs from contending with each other.
@@ -161,7 +162,8 @@ jobs:
         run: |
           bash scripts/ci/nextest-isolated.sh --all-features \
             --test tailnet_streams_integration \
-            --test forward_v2_attestation_e2e -- \
+            --test forward_v2_attestation_e2e \
+            --test forward_half_close_e2e -- \
             --run-ignored ignored-only \
             --no-tests=fail \
             --no-fail-fast \
