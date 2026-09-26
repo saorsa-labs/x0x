@@ -79,11 +79,11 @@ use routes::{
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
     spawn_directory_resubscribe, spawn_global_discovery_listener,
-    spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
-    store_named_group_info, streams_diagnostics, subscribe, transport_diagnostics,
-    unban_group_member, unenroll_device, unpin_machine, unsubscribe, update_contact,
-    update_group_policy, update_member_role, update_named_group, update_profile, update_task,
-    withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
+    spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
+    state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
+    transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
+    update_contact, update_group_policy, update_member_role, update_named_group, update_profile,
+    update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
     PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
     TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
@@ -987,6 +987,8 @@ pub async fn serve_with_options(
                     .await);
                 }
             };
+        // ADR-0070 §1: enrolled owner machines become owner-trusted.
+        agent.install_owner_device_store(Arc::clone(service.store()));
         Some(service)
     } else {
         None
@@ -1017,6 +1019,9 @@ pub async fn serve_with_options(
         predecessor_relay_outbox_persistence_lock: Mutex::new(()),
         requester_offer_outbox_persistence_lock: Mutex::new(()),
         public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
+        cert_fetch_requested: StdMutex::new(std::collections::HashMap::new()),
+        cert_fetch_answered: StdMutex::new(std::collections::HashMap::new()),
+        cert_unresolvable_since: StdMutex::new(std::collections::HashMap::new()),
         pending_b8_compensation: Mutex::new(None),
         pending_listener_admission: Mutex::new(None),
         group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -2312,6 +2317,7 @@ pub async fn serve_with_options(
         .route("/history/stats", get(history_stats))
         .route("/diagnostics/ack", get(ack_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
+        .route("/diagnostics/state-sync", get(state_sync_diagnostics))
         .route("/diagnostics/transport", get(transport_diagnostics))
         .route("/diagnostics/relay", get(relay_diagnostics))
         .route("/diagnostics/dm", get(dm_diagnostics))
@@ -2350,6 +2356,7 @@ pub async fn serve_with_options(
         // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
         // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))
+        .route("/auth/session/refresh", post(auth::refresh_session))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer({
             // Restrict CORS to exact loopback origins only.

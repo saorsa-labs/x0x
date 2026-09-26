@@ -363,6 +363,16 @@ impl AnnounceBlobCache {
         if crate::announce_v3::cert_digest(current_user_id, current_agent_certificate) == *digest {
             return bincode::serialize(&(current_user_id, current_agent_certificate)).ok();
         }
+        // #656 is preserved HERE, on the GLOBAL identity topic: a digest
+        // that only exists in our CACHE is not served — cache-first
+        // serving turned every cache holder into a responder and amplified
+        // every request into a broadcast storm. Roster-certificate
+        // serving for digest-only seats lives in the GROUP-SCOPED path
+        // instead (named_groups::seat_cert_fetch): requests ride the
+        // group's own metadata topic, and only active roster members of
+        // THAT group answer, from verified cached pairs whose user is the
+        // group's owner — bounded by per-digest rate limits and negative
+        // caches on both sides.
         None
     }
 

@@ -1,6 +1,7 @@
 # ADR 0024: GSS Rotation on Admin Remove Is Fail-Closed and Seals Before It Persists
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-25 by David Irvine (vision-alignment review; status change applied by Claude at his instruction)
 - **Date:** 2026-07-27
 - **Decision owners:** David Irvine
 - **Reviewers:** Sam, Dario (author), Watson

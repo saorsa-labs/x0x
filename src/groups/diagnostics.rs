@@ -173,6 +173,12 @@ pub struct GroupCounters {
     /// ADR-0068 D2: buffered task deltas APPLIED, in arrival order, after the
     /// marker cleared.
     pub task_deltas_quarantine_applied: u64,
+    /// #895: inbound task deltas REFUSED on a group-scoped list — plaintext
+    /// on an encrypted group (an un-upgraded or non-member sender), a sealed
+    /// record this node cannot open (wrong/missing epoch key, tampering,
+    /// foreign binding, non-writer author), or a sealed author that is not
+    /// the gossip sender. Fail closed: none of these is merged.
+    pub task_deltas_seal_rejected: u64,
     /// ADR-0064 slice 2: owner USER-key mandates minted by THIS install
     /// at the pre-mutation point of an invite-derived seat (owner-axis
     /// groups where the local agent holds the owner user key).
@@ -407,6 +413,9 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.task_deltas_quarantine_applied = dst
         .task_deltas_quarantine_applied
         .saturating_add(src.task_deltas_quarantine_applied);
+    dst.task_deltas_seal_rejected = dst
+        .task_deltas_seal_rejected
+        .saturating_add(src.task_deltas_seal_rejected);
     dst.owner_mandate_minted = dst
         .owner_mandate_minted
         .saturating_add(src.owner_mandate_minted);
@@ -653,6 +662,14 @@ impl GroupsDiagnostics {
         self.with_counters(group_id, |c| {
             c.task_deltas_quarantine_applied =
                 c.task_deltas_quarantine_applied.saturating_add(count);
+        });
+    }
+
+    /// #895: an inbound task delta on a group-scoped list was refused
+    /// (plaintext on an encrypted group, unopenable, or author mismatch).
+    pub fn record_task_delta_seal_rejected(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.task_deltas_seal_rejected = c.task_deltas_seal_rejected.saturating_add(1);
         });
     }
 
@@ -1437,6 +1454,7 @@ mod tests {
             requester_offer_delivered: base + 50,
             requester_offer_resolved_drop: base + 51,
             requester_offer_retry_exhausted: base + 52,
+            task_deltas_seal_rejected: base + 53,
         };
         let src = counters_with(1_000);
         let dst = counters_with(7);
@@ -1595,6 +1613,10 @@ mod tests {
         assert_eq!(
             merged.task_deltas_quarantine_applied,
             dst.task_deltas_quarantine_applied + src.task_deltas_quarantine_applied
+        );
+        assert_eq!(
+            merged.task_deltas_seal_rejected,
+            dst.task_deltas_seal_rejected + src.task_deltas_seal_rejected
         );
         assert_eq!(
             merged.fork_quarantine_refusals,

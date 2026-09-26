@@ -139,7 +139,7 @@ pub enum KvError {
     /// candidate live set reached; `max_keys`/`max_bytes` are the protocol
     /// constants. Raising them is a coordinated protocol change — divergent
     /// constants would split-brain on which keys exist.
-    #[error("self_keyed quota exceeded for agent {agent:?}: candidates {keys} keys / {bytes} bytes exceed max {max_keys} keys / {max_bytes} bytes (lowest-N admission)")]
+    #[error("self_keyed quota exceeded for agent {agent:?}: candidates {keys} keys / {bytes} bytes exceed max {max_keys} keys / {max_bytes} bytes (lowest-N admission): the key sorts outside the writer's admitted set and was NOT admitted; nothing was stored or evicted")]
     AgentQuotaExceeded {
         /// The writer whose candidate live set exceeded the cap.
         agent: AgentId,

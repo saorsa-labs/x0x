@@ -43,7 +43,7 @@ Every endpoint except `GET /health` and `GET /constitution*` requires an
 | Class | Lifetime | Source | Can act as |
 |---|---|---|---|
 | **Durable API token** | until rotated | `<data_dir>/api-token` | the local owner (full control) |
-| **Session token** | 10 minutes | `POST /auth/session` (exchanged from the durable token) | browser/GUI surfaces |
+| **Session token** | 10 minutes; refreshable up to 12 h after the original mint | `POST /auth/session` (exchanged from the durable token); `POST /auth/session/refresh` (session token only, old token revoked) | browser/GUI surfaces |
 | **Rider token** | ≤ 90 days (default 7) | `POST /owner/riders` | a scoped sub-agent principal |
 
 Auth-class labels used throughout this reference:
@@ -199,6 +199,7 @@ table (#446–#451). This reference documents **175 endpoints — exactly the se
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
+| POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a live **session** token for a fresh 10-minute one; the durable token gets `403`, the replaced token stops working at once, and refresh is refused (`401`) 12 h after the original `/auth/session` mint (#893) |
 | GET | `/constitution` | `x0x constitution` | Display the x0x Constitution (Markdown) |
 | GET | `/constitution/json` | `x0x constitution --json` | Constitution with version metadata (JSON) |
 
@@ -2481,6 +2482,7 @@ x0x accept-file <transfer_id>
 x0x reject-file <transfer_id> --reason "not now"
 x0x ws sessions
 x0x gui
+x0x gui --view dm/<agent_id>        # also groups/<group_id>[/board|files|…], people, network
 ```
 
 ## Diagnostics
@@ -2495,6 +2497,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
+| GET | `/diagnostics/state-sync` | `x0x diagnostics state-sync` | Cumulative local counters for currently open KV stores. `stores` is keyed by local store topic and includes `requests_sent`, `request_seal_failed`, `requests_received`, `requests_answered`, `retained_pages_served`, `incoming_record_merges`, and fixed rejection buckets: `rejected_verify`, `rejected_unauthorized_request`, `rejected_unauthorized_control`, `rejected_authorization_version`, `rejected_cooldown`, `rejected_no_retained`, `rejected_other`. Verify includes malformed or unverifiable control messages of any kind; authorization-version failures may have an unknown message type. `incoming_record_merges` includes live main-topic records and receives on any local role, and is not tied to a state request. Counters reset on store close or process restart; snapshots are approximate and contain no keys or payloads. |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
@@ -2587,6 +2590,7 @@ Key counter fields (flattened into each group row):
 | `task_deltas_quarantine_buffered` | Receiver | ADR-0068 D2: inbound peer task-CRDT deltas HELD (not applied) because this group's fork-quarantine marker is live. The CRDT state stays byte-identical while this climbs, from the first delta that observes the marker — the live admission path is not roster-pinned, so at most one already-admitted delta per listener can still merge just after the marker installs (accepted residual, see the runbook). Held deltas apply in arrival order once the marker clears. |
 | `task_deltas_quarantine_dropped` | Receiver | ADR-0068 D2: held task deltas dropped because the per-list bound (1024 deltas / 1 MiB) was reached — oldest first. Not silent loss (merges are idempotent and anti-entropy refills after the clear), but a climbing value means the quarantine is outlasting the buffer. |
 | `task_deltas_quarantine_applied` | Receiver | ADR-0068 D2: held task deltas applied, in arrival order, after the marker cleared. |
+| `task_deltas_seal_rejected` | Receiver | #895: task deltas refused on a group-scoped list — plaintext on an encrypted group (un-upgraded or non-member sender), a sealed record that cannot be opened with the group's current key, or a sealed author that is not the gossip sender. Never merged. |
 | `invites_refused_reasons` | Joiner / inviter | `{"<reason>": count}` map of signed-invite refusals for this group, keyed by the typed reason. Joiner-side (`POST /groups/join`): `invite_unsigned`, `invite_signature_invalid`, `inviter_key_mismatch`, `inviter_key_revoked`, `invite_owner_countersignature_missing`, `invite_owner_countersignature_invalid`, `invite_malformed`, plus the base/addressing/mode-matrix refusals the join route answers with 409. Inviter-side: `invite_not_addressed_to_joiner` when an addressed invite's `MemberJoined` arrives from a different agent (the secret is not consumed). **Omitted from the row while empty.** |
 
 ### `GET /diagnostics/connect`

@@ -113,7 +113,7 @@ pub(super) use named_groups::{
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
     gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,
-    probe_peer_handler, relay_diagnostics, transport_diagnostics,
+    probe_peer_handler, relay_diagnostics, state_sync_diagnostics, transport_diagnostics,
 };
 pub(super) use owner::{
     owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
@@ -134,7 +134,7 @@ pub(super) use stores::{
 pub(super) use sync::{enroll_device, get_sync_devices, unenroll_device, DaemonView};
 pub(super) use tasks::{
     add_task, apply_group_authorization, create_task_list, group_task_list_binding,
-    list_task_lists, list_tasks, update_task,
+    legacy_space_board_retired, list_task_lists, list_tasks, update_task,
 };
 pub(super) use trust::evaluate_trust;
 pub(super) use upgrade::{

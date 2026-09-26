@@ -618,11 +618,115 @@ pub(in crate::server) async fn gossip_diagnostics(
     }
 }
 
+/// GET /diagnostics/state-sync — cumulative local activity for open stores.
+pub(in crate::server) async fn state_sync_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let stores = state.kv_stores.read().await;
+    let snapshots: std::collections::BTreeMap<_, _> = stores
+        .iter()
+        .map(|(topic, handle)| (topic.clone(), handle.state_sync_snapshot()))
+        .collect();
+    Json(serde_json::json!({
+        "ok": true,
+        "scope": "local_open_stores",
+        "reset": "store_close_or_process_restart",
+        "stores": snapshots,
+    }))
+}
+
 #[cfg(test)]
 mod participation_diagnostics_tests {
     use super::*;
     use axum::{body::Body, http::Request, routing::get, Router};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn state_sync_route_exposes_bounded_open_store_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let handle = agent
+            .create_kv_store("Diagnostics", "diagnostics/state-sync-test")
+            .await
+            .unwrap();
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert("diagnostics/state-sync-test".to_string(), handle);
+        let app = Router::new()
+            .route("/diagnostics/state-sync", get(state_sync_diagnostics))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics/state-sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["scope"], "local_open_stores");
+        assert_eq!(json["reset"], "store_close_or_process_restart");
+        let counters = &json["stores"]["diagnostics/state-sync-test"];
+        let keys = counters
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "incoming_record_merges",
+                "rejected_authorization_version",
+                "rejected_cooldown",
+                "rejected_no_retained",
+                "rejected_other",
+                "rejected_unauthorized_control",
+                "rejected_unauthorized_request",
+                "rejected_verify",
+                "request_seal_failed",
+                "requests_answered",
+                "requests_received",
+                "requests_sent",
+                "retained_pages_served",
+            ]
+        );
+        assert!(counters
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value.is_u64()));
+    }
 
     /// The C0 soak needs the subscription-aware relay meter, not the older
     /// origin-based counter that also includes subscribed-topic forwarding.
