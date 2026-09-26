@@ -359,26 +359,41 @@ struct ExecSectionToml {
     #[serde(default)]
     audit_tasklist_id: Option<String>,
     #[serde(default)]
-    allow: Vec<AllowEntryToml>,
+    allow: Vec<ExecAclEntrySpec>,
 }
 
-#[derive(Debug, Deserialize)]
+/// One exec allow entry in its wire schema — the `[[exec.allow]]` TOML
+/// table and, identically, the `POST /acl/exec` JSON body (ADR-0070 §3).
+/// `deny_unknown_fields` applies to both surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AllowEntryToml {
-    description: Option<String>,
+pub struct ExecAclEntrySpec {
+    /// Free-text note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// `"owner"` (ADR-0070 §1) instead of `agent_id` + `machine_id`.
-    principal: Option<String>,
-    agent_id: Option<String>,
-    machine_id: Option<String>,
-    max_duration_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// Requester agent id (64 hex chars) for an exact-pair entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Requester machine id (64 hex chars) for an exact-pair entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// Per-entry duration cap (clamped to the floor's `max_duration_secs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_secs: Option<u64>,
+    /// Exact argv allowlist (ADR-0046 templates).
     #[serde(default)]
-    commands: Vec<CommandToml>,
+    pub commands: Vec<ExecAclCommandSpec>,
 }
 
-#[derive(Debug, Deserialize)]
+/// One allowed argv pattern in wire schema (`[[exec.allow.commands]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CommandToml {
-    argv: Vec<String>,
+pub struct ExecAclCommandSpec {
+    /// Argv tokens: literals or `<INT>` / `<URL_PATH>` templates.
+    pub argv: Vec<String>,
 }
 
 fn default_max_stdout_bytes() -> u64 {
@@ -480,51 +495,9 @@ pub fn parse_exec_policy(
     let mut allow = Vec::with_capacity(exec.allow.len());
     let mut owner_allow = Vec::new();
     for (idx, entry) in exec.allow.into_iter().enumerate() {
-        let principal = parse_principal(
-            entry.principal.as_deref(),
-            entry.agent_id.as_deref(),
-            entry.machine_id.as_deref(),
-        )
-        .map_err(|reason| AclError::Invalid {
-            path: path.display().to_string(),
-            reason: format!("allow[{idx}]: {reason}"),
-        })?;
-        if entry.commands.is_empty() {
-            return Err(AclError::Invalid {
-                path: path.display().to_string(),
-                reason: format!("allow[{idx}] must contain at least one command"),
-            });
-        }
-        let mut commands = Vec::with_capacity(entry.commands.len());
-        for (cmd_idx, cmd) in entry.commands.into_iter().enumerate() {
-            if cmd.argv.is_empty() {
-                return Err(AclError::Invalid {
-                    path: path.display().to_string(),
-                    reason: format!("allow[{idx}].commands[{cmd_idx}].argv must not be empty"),
-                });
-            }
-            let mut argv = Vec::with_capacity(cmd.argv.len());
-            for token in cmd.argv {
-                argv.push(parse_allowed_token(path, idx, cmd_idx, &token)?);
-            }
-            commands.push(AllowedCommand { argv });
-        }
-        match principal {
-            AclPrincipal::Pair {
-                agent_id,
-                machine_id,
-            } => allow.push(AllowEntry {
-                description: entry.description,
-                agent_id,
-                machine_id,
-                max_duration_secs: entry.max_duration_secs,
-                commands,
-            }),
-            AclPrincipal::Owner => owner_allow.push(OwnerAllowEntry {
-                description: entry.description,
-                max_duration_secs: entry.max_duration_secs,
-                commands,
-            }),
+        match build_exec_entry(path, &format!("allow[{idx}]"), entry)? {
+            BuiltExecEntry::Pair(entry) => allow.push(entry),
+            BuiltExecEntry::Owner(entry) => owner_allow.push(entry),
         }
     }
 
@@ -561,9 +534,223 @@ fn validate_caps(path: &Path, exec: &ExecSectionToml) -> Result<(), AclError> {
     Ok(())
 }
 
+/// One validated entry, split by requester selector.
+enum BuiltExecEntry {
+    Pair(AllowEntry),
+    Owner(OwnerAllowEntry),
+}
+
+/// Validate one allow entry — the single code path for TOML floor entries
+/// and ADR-0070 §3 API-managed entries alike. `label` names the entry in
+/// error messages (`allow[3]`, `api[0]`).
+fn build_exec_entry(
+    path: &Path,
+    label: &str,
+    entry: ExecAclEntrySpec,
+) -> Result<BuiltExecEntry, AclError> {
+    let principal = parse_principal(
+        entry.principal.as_deref(),
+        entry.agent_id.as_deref(),
+        entry.machine_id.as_deref(),
+    )
+    .map_err(|reason| AclError::Invalid {
+        path: path.display().to_string(),
+        reason: format!("{label}: {reason}"),
+    })?;
+    if entry.commands.is_empty() {
+        return Err(AclError::Invalid {
+            path: path.display().to_string(),
+            reason: format!("{label} must contain at least one command"),
+        });
+    }
+    let mut commands = Vec::with_capacity(entry.commands.len());
+    for (cmd_idx, cmd) in entry.commands.into_iter().enumerate() {
+        if cmd.argv.is_empty() {
+            return Err(AclError::Invalid {
+                path: path.display().to_string(),
+                reason: format!("{label}.commands[{cmd_idx}].argv must not be empty"),
+            });
+        }
+        let mut argv = Vec::with_capacity(cmd.argv.len());
+        for token in cmd.argv {
+            argv.push(parse_allowed_token(path, label, cmd_idx, &token)?);
+        }
+        commands.push(AllowedCommand { argv });
+    }
+    Ok(match principal {
+        AclPrincipal::Pair {
+            agent_id,
+            machine_id,
+        } => BuiltExecEntry::Pair(AllowEntry {
+            description: entry.description,
+            agent_id,
+            machine_id,
+            max_duration_secs: entry.max_duration_secs,
+            commands,
+        }),
+        AclPrincipal::Owner => BuiltExecEntry::Owner(OwnerAllowEntry {
+            description: entry.description,
+            max_duration_secs: entry.max_duration_secs,
+            commands,
+        }),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0070 §3 — API-managed overlay entries on top of the TOML floor
+// ---------------------------------------------------------------------------
+
+/// Validate one API-supplied entry exactly as the TOML parser validates a
+/// floor entry (same struct, same `deny_unknown_fields`, same checks).
+///
+/// # Errors
+/// [`AclError::Invalid`] naming the offending field.
+pub fn validate_exec_entry_spec(path: &Path, spec: &ExecAclEntrySpec) -> Result<(), AclError> {
+    build_exec_entry(path, "api", spec.clone()).map(|_| ())
+}
+
+/// Effective policy = TOML floor ∪ API overlay (ADR-0070 §3).
+///
+/// A `Disabled` floor stays `Disabled`: overlay entries never enable a
+/// plane the operator's file leaves off. Caps and audit settings come only
+/// from the floor. Every overlay entry is validated by the same code path
+/// as a floor entry; one invalid entry fails the whole composition (fail
+/// closed — callers keep the last good policy).
+///
+/// # Errors
+/// [`AclError::Invalid`] naming the offending `api[i]` entry.
+pub fn compose_exec_policy(
+    floor: &ExecPolicy,
+    overlay: &[ExecAclEntrySpec],
+) -> Result<ExecPolicy, AclError> {
+    let ExecPolicy::Enabled(floor_acl) = floor else {
+        return Ok(floor.clone());
+    };
+    let mut acl = floor_acl.clone();
+    for (idx, spec) in overlay.iter().enumerate() {
+        match build_exec_entry(&acl.loaded_from, &format!("api[{idx}]"), spec.clone())? {
+            BuiltExecEntry::Pair(entry) => acl.allow.push(entry),
+            BuiltExecEntry::Owner(entry) => acl.owner_allow.push(entry),
+        }
+    }
+    Ok(ExecPolicy::Enabled(acl))
+}
+
+/// Whether `next` may replace `current` by hot reload (ADR-0070 §3).
+///
+/// Allow entries and caps are hot-reloadable. Enabling/disabling exec and
+/// changing the audit sink (`audit_log_path`, `audit_tasklist_id`) are not:
+/// the audit writer is bound once at service start, so a reload that moved
+/// it would silently keep writing to the old sink. Both require a restart.
+///
+/// # Errors
+/// A human-readable reason.
+pub fn exec_reload_compatible(current: &ExecPolicy, next: &ExecPolicy) -> Result<(), String> {
+    match (current, next) {
+        (ExecPolicy::Enabled(cur), ExecPolicy::Enabled(nxt)) => {
+            if cur.audit_log_path != nxt.audit_log_path
+                || cur.audit_tasklist_id != nxt.audit_tasklist_id
+            {
+                return Err("reload would change the exec audit sink (audit_log_path / \
+                     audit_tasklist_id); that requires a daemon restart"
+                    .to_string());
+            }
+            Ok(())
+        }
+        (ExecPolicy::Disabled { .. }, ExecPolicy::Disabled { .. }) => Ok(()),
+        _ => Err(format!(
+            "reload would change exec from {} to {}; enabling or disabling the exec \
+             plane requires a daemon restart",
+            if current.enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if next.enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )),
+    }
+}
+
+/// Hot-reload bookkeeping for one ACL plane (ADR-0070 §3), surfaced in
+/// `/diagnostics/exec` and `/diagnostics/connect`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AclReloadStatus {
+    /// Successful reloads since start.
+    pub reloads_ok: u64,
+    /// Rejected reloads since start (last good ACL kept each time).
+    pub reloads_failed: u64,
+    /// Time of the last reload attempt, success or failure.
+    pub last_attempt_unix_ms: Option<u64>,
+    /// Why the last reload was rejected; cleared by the next success.
+    pub last_error: Option<String>,
+    /// API-managed entries currently in the effective ACL.
+    pub api_entry_count: usize,
+    /// Times the API overlay file was found malformed or invalid (at
+    /// startup or on reload). The file is left untouched on disk.
+    pub overlay_load_failures: u64,
+    /// Why the overlay on disk is not in force. While set, the effective
+    /// ACL excludes the overlay and API writes are refused (`409`) so the
+    /// broken file is never silently overwritten; cleared by a successful
+    /// reload.
+    pub overlay_error: Option<String>,
+}
+
+impl AllowedToken {
+    /// The token in its TOML/API template form (`<INT>`, `<URL_PATH>`,
+    /// `prefix<URL_PATH>`, or the literal).
+    #[must_use]
+    pub fn to_template(&self) -> String {
+        match self {
+            Self::Literal(lit) => lit.clone(),
+            Self::Int => "<INT>".to_string(),
+            Self::UrlPath => "<URL_PATH>".to_string(),
+            Self::LiteralWithUrlPathSuffix(prefix) => format!("{prefix}<URL_PATH>"),
+        }
+    }
+}
+
+fn command_specs(commands: &[AllowedCommand]) -> Vec<ExecAclCommandSpec> {
+    commands
+        .iter()
+        .map(|c| ExecAclCommandSpec {
+            argv: c.argv.iter().map(AllowedToken::to_template).collect(),
+        })
+        .collect()
+}
+
+impl ExecAcl {
+    /// Every entry in TOML/API schema form: exact pairs, then owner entries.
+    #[must_use]
+    pub fn entry_specs(&self) -> Vec<ExecAclEntrySpec> {
+        self.allow
+            .iter()
+            .map(|e| ExecAclEntrySpec {
+                description: e.description.clone(),
+                principal: None,
+                agent_id: Some(hex::encode(e.agent_id.as_bytes())),
+                machine_id: Some(hex::encode(e.machine_id.as_bytes())),
+                max_duration_secs: e.max_duration_secs,
+                commands: command_specs(&e.commands),
+            })
+            .chain(self.owner_allow.iter().map(|e| ExecAclEntrySpec {
+                description: e.description.clone(),
+                principal: Some("owner".to_string()),
+                agent_id: None,
+                machine_id: None,
+                max_duration_secs: e.max_duration_secs,
+                commands: command_specs(&e.commands),
+            }))
+            .collect()
+    }
+}
+
 fn parse_allowed_token(
     path: &Path,
-    allow_idx: usize,
+    label: &str,
     cmd_idx: usize,
     token: &str,
 ) -> Result<AllowedToken, AclError> {
@@ -581,7 +768,7 @@ fn parse_allowed_token(
             return Err(AclError::Invalid {
                 path: path.display().to_string(),
                 reason: format!(
-                    "allow[{allow_idx}].commands[{cmd_idx}] has unsupported template token in {token:?}"
+                    "{label}.commands[{cmd_idx}] has unsupported template token in {token:?}"
                 ),
             });
         }
@@ -591,7 +778,7 @@ fn parse_allowed_token(
         return Err(AclError::Invalid {
             path: path.display().to_string(),
             reason: format!(
-                "allow[{allow_idx}].commands[{cmd_idx}] has unsupported template token in {token:?}"
+                "{label}.commands[{cmd_idx}] has unsupported template token in {token:?}"
             ),
         });
     }

@@ -754,6 +754,7 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/sse.rs",
     "src/server/ws.rs",
     "src/server/routes/mod.rs",
+    "src/server/routes/acl.rs",
     "src/server/routes/calls.rs",
     "src/server/routes/connect.rs",
     "src/server/routes/contacts.rs",

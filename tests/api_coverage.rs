@@ -601,6 +601,14 @@ const COVERED: &[CoveredEndpoint] = &[
         daemon_api_forwards_remove_disabled
     ),
     covered!(Get, "/streams", daemon_api_streams),
+    // ── ACL management (ADR-0070 §3) ────────────────────────────────────
+    covered!(Get, "/acl/connect", acl_routes_wired),
+    covered!(Post, "/acl/connect", acl_routes_wired),
+    covered!(Delete, "/acl/connect/:id", acl_routes_wired),
+    covered!(Get, "/acl/exec", acl_routes_wired),
+    covered!(Post, "/acl/exec", acl_routes_wired),
+    covered!(Delete, "/acl/exec/:id", acl_routes_wired),
+    covered!(Post, "/acl/reload", acl_routes_wired),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
@@ -652,6 +660,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/sync.rs",
         include_str!("../src/server/routes/sync.rs"),
+    ),
+    (
+        "src/server/routes/acl.rs",
+        include_str!("../src/server/routes/acl.rs"),
     ),
     (
         "tests/peer_lifecycle_integration.rs",
@@ -1118,6 +1130,7 @@ fn categories_are_valid() {
         "upgrade",
         "websocket",
         "history",
+        "acl",
     ];
 
     for ep in ENDPOINTS {

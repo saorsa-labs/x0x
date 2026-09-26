@@ -40,6 +40,16 @@ GET /gui
 # ── Admin/daemon — intentionally absent from end-user GUI ──
 POST /shutdown
 
+# ── ADR-0070 §3 ACL management — durable API token only; the GUI runs on a
+# session token, which these routes refuse by design. ──
+GET /acl/connect
+POST /acl/connect
+DELETE /acl/connect/*
+GET /acl/exec
+POST /acl/exec
+DELETE /acl/exec/*
+POST /acl/reload
+
 # ── Identity card — the GUI calls it via the agentCardPath() helper
 # (share links need the query params), so the first argument is a
 # function call, not a path literal the crawler can statically match.

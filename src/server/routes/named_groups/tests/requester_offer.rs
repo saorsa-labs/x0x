@@ -400,7 +400,7 @@ async fn two_daemons_full_channel_drain_exactly_once_and_nondurable_keeps() -> R
     // converge across two in-process agents within 74 s of retries, so
     // the requester-side DISCHARGE is not asserted here (its keep-on-
     // failure contract is pinned by failed_offer_send_keeps... and arm
-    // (4) below). What IS pinned deterministically is the durable
+    // (1)'s drop-counter check). What IS pinned deterministically is the
     // disposition B resolves for each delivery, and B's durable state.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let mut saw_inserted = false;
@@ -690,9 +690,9 @@ async fn pass_budget_bounds_one_workers_pass() -> Result<()> {
     Ok(())
 }
 
-/// #942 r4 (B6): a WITNESS that already holds the request via pubsub
-/// rejects the relayed copy — that rejection must ACK as an idempotent
-/// Duplicate, never an Err. Under r3 the Err made the authority retry the
+/// #942 r4 (B6): a WITNESS that already holds the request (a prior
+/// delivery of the same envelope) rejects the relayed copy — that
+/// rejection must ACK as an idempotent Duplicate, never an Err. Under r3 the Err made the authority retry the
 /// relay ten times and then prune the obligation as never-completed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn witness_already_holding_replays_as_duplicate() -> Result<()> {

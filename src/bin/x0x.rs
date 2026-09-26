@@ -406,6 +406,50 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         card_file: Option<PathBuf>,
     },
+    /// Manage connect/exec ACL entries over the TOML floor (ADR-0070;
+    /// durable API token only).
+    Acl {
+        #[command(subcommand)]
+        sub: AclSub,
+    },
+}
+
+/// `x0x acl` sub-actions.
+#[derive(Subcommand)]
+enum AclSub {
+    /// Connect (port-forward) ACL entries.
+    Connect {
+        #[command(subcommand)]
+        sub: AclPlaneSub,
+    },
+    /// Remote exec ACL entries.
+    Exec {
+        #[command(subcommand)]
+        sub: AclPlaneSub,
+    },
+    /// Re-read both ACL TOML floors and API overlays; a rejected file keeps
+    /// the last good ACL.
+    Reload,
+}
+
+/// `x0x acl connect|exec` sub-actions.
+#[derive(Subcommand)]
+enum AclPlaneSub {
+    /// List floor (`origin: file`) and API (`origin: api`) entries with ids.
+    List,
+    /// Add an API-managed entry: the TOML allow-entry schema as JSON
+    /// (literal, `@path`, or `-` for stdin).
+    Add {
+        /// Entry JSON, e.g. '{"principal":"owner","targets":["127.0.0.1:22"]}'.
+        #[arg(value_name = "ENTRY_JSON")]
+        entry: String,
+    },
+    /// Remove an API-managed entry by id (floor entries cannot be removed).
+    #[command(alias = "rm")]
+    Remove {
+        /// Entry id from `list` (e.g. `api-0123456789abcdef`).
+        id: String,
+    },
 }
 
 // ── Nested subcommands ──────────────────────────────────────────────────
@@ -3069,6 +3113,15 @@ async fn run(
             }
         },
         Commands::Streams => commands::forward::streams(&client).await,
+        Commands::Acl { sub } => match sub {
+            AclSub::Reload => commands::acl::reload(&client).await,
+            AclSub::Connect { sub } => {
+                run_acl_plane(&client, commands::acl::AclPlane::Connect, sub).await
+            }
+            AclSub::Exec { sub } => {
+                run_acl_plane(&client, commands::acl::AclPlane::Exec, sub).await
+            }
+        },
         Commands::Onboard {
             json,
             no_card,
@@ -3101,6 +3154,19 @@ async fn run(
 }
 
 // ── Tree view ──────────────────────────────────────────────────────────────
+
+/// Dispatch `x0x acl connect|exec <action>`.
+async fn run_acl_plane(
+    client: &DaemonClient,
+    plane: commands::acl::AclPlane,
+    sub: AclPlaneSub,
+) -> anyhow::Result<()> {
+    match sub {
+        AclPlaneSub::List => commands::acl::list(client, plane).await,
+        AclPlaneSub::Add { entry } => commands::acl::add(client, plane, &entry).await,
+        AclPlaneSub::Remove { id } => commands::acl::remove(client, plane, &id).await,
+    }
+}
 
 /// Build the `#/<route>` URL fragment for `x0x gui --view` (#893).
 ///

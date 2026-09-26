@@ -1798,6 +1798,63 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "connect",
         request: RequestSpec::None,
     },
+    // ── ACL management (ADR-0070 §3; durable owner token only) ─────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/acl/connect",
+        cli_name: "acl connect list",
+        description: "List connect ACL entries (TOML floor + API-managed) and reload status",
+        category: "acl",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/acl/connect",
+        cli_name: "acl connect add",
+        description: "Add an API-managed connect ACL entry (TOML entry schema as JSON)",
+        category: "acl",
+        request: RequestSpec::Passthrough,
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/acl/connect/:id",
+        cli_name: "acl connect rm",
+        description: "Remove an API-managed connect ACL entry (floor entries: 409)",
+        category: "acl",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/acl/exec",
+        cli_name: "acl exec list",
+        description: "List exec ACL entries (TOML floor + API-managed) and reload status",
+        category: "acl",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/acl/exec",
+        cli_name: "acl exec add",
+        description: "Add an API-managed exec ACL entry (TOML entry schema as JSON)",
+        category: "acl",
+        request: RequestSpec::Passthrough,
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/acl/exec/:id",
+        cli_name: "acl exec rm",
+        description: "Remove an API-managed exec ACL entry (floor entries: 409)",
+        category: "acl",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/acl/reload",
+        cli_name: "acl reload",
+        description: "Re-read the connect/exec ACL floors and overlays; rejects keep the last good ACL",
+        category: "acl",
+        request: RequestSpec::None,
+    },
 ];
 
 /// Find an endpoint by its CLI name.
