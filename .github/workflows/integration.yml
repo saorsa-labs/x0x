@@ -164,6 +164,7 @@ jobs:
             --test forward_v2_attestation_e2e -- \
             --run-ignored ignored-only \
             --no-tests=fail \
+            --no-fail-fast \
             --test-threads 1
 
   # Groups: the heavy named-group daemon suite (28 daemon-backed tests),

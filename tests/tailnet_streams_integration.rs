@@ -36,6 +36,7 @@ fn loopback_network_config() -> NetworkConfig {
 }
 
 async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
+    network_gate::init_stream_tracing();
     match x0x::Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
         .with_agent_key_path(dir.path().join(format!("{name}-agent.key")))

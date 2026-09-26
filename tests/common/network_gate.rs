@@ -22,3 +22,13 @@ pub fn skip_on_refused_network(error: &impl std::fmt::Display) -> bool {
     }
     refused
 }
+
+/// Route `x0x::streams` gate/accept-loop decisions into the captured test
+/// output, so a CI failure shows WHY an inbound stream was reset. Idempotent.
+pub fn init_stream_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("x0x::streams=debug"))
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
+}
