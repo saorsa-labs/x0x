@@ -14771,6 +14771,9 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         digest: [u8; 32],
         envelope_bytes: Vec<u8>,
         targets: Vec<String>,
+        /// #942 r4: the source obligation's due time (oldest-due-first
+        /// ordering for the bounded pass).
+        next_retry_at_ms: u64,
     }
     let mut due: Vec<DueObligation> = Vec::new();
 
@@ -14795,6 +14798,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                     digest: obligation.digest,
                     envelope_bytes: obligation.envelope_bytes.clone(),
                     targets: obligation.relay_targets.clone(),
+                    next_retry_at_ms: obligation.next_retry_at_ms,
                 });
             }
         }
@@ -14894,8 +14898,22 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
 
     let mut relay_results: Vec<RelayResult> = Vec::new();
 
+    // #942 r4 (bounded pass): oldest-due-first, and a per-pass SEND
+    // budget so one pass cannot spend minutes on hundreds of
+    // slow-timeout strict sends while a brand-new obligation waits
+    // (head-of-line). Unserved obligations stay due and are picked up by
+    // the next 500 ms tick — the budget bounds work per tick, not the
+    // total.
+    let mut due_sorted = due;
+    due_sorted.sort_by_key(|o| o.next_retry_at_ms);
+    const CAUSAL_RELAY_PASS_BUDGET: usize = 16;
+    let mut pass_budget: usize = CAUSAL_RELAY_PASS_BUDGET;
+
     // Relay to each target and observe results per obligation (audit 6).
-    for due_obl in &due {
+    for due_obl in &due_sorted {
+        if pass_budget == 0 {
+            break;
+        }
         let group_id = &due_obl.group_id;
         let digest = &due_obl.digest;
         let envelope_bytes = &due_obl.envelope_bytes;
@@ -14905,6 +14923,10 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
 
         let obligation_digest = *digest;
         for target_hex in targets {
+            if pass_budget == 0 {
+                break;
+            }
+            pass_budget = pass_budget.saturating_sub(1);
             let Ok(target_id) = parse_agent_id_hex(target_hex) else {
                 // Unparseable target — skip (not added to success set).
                 continue;
@@ -14915,14 +14937,31 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
             dm_payload.extend_from_slice(envelope_bytes);
             // B6: await the send result. Do NOT count record_causal_relayed
             // yet — count only after durable persistence (persist-before-count).
-            let send_result = state
-                .agent
-                .send_direct_with_config(
-                    &target_id,
-                    dm_payload,
-                    predecessor_relay_delivery_config(&obligation_digest),
-                )
-                .await;
+            // #942 r4 (B6): dual-wire, the #903/bootstrap pattern — a
+            // witness with a current v2 durable advert gets the strict
+            // config; one without (pre-ADR-0030 build, history disabled)
+            // gets the LEGACY v1 gossip config so it still receives the
+            // relay (the receipt is transport-level; the payload is
+            // unchanged and the witness re-verifies the envelope).
+            let send_result = if predecessor_relay_wire_version(state, &target_id).await {
+                state
+                    .agent
+                    .send_direct_with_config(
+                        &target_id,
+                        dm_payload,
+                        predecessor_relay_delivery_config(&obligation_digest),
+                    )
+                    .await
+            } else {
+                state
+                    .agent
+                    .send_direct_with_config(
+                        &target_id,
+                        dm_payload,
+                        predecessor_relay_legacy_delivery_config(),
+                    )
+                    .await
+            };
             if send_result.is_ok() {
                 success_count += 1;
                 successful_targets.push(target_hex.clone());

@@ -3171,6 +3171,35 @@ async fn handle_predecessor_relay_typed_payload_inner(
             // so the peer re-offers later.
             if apply_result.accepted {
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
+            } else {
+                // #942 r4 (B6): a witness that ALREADY holds the request
+                // via pubsub rejects the relayed copy as a duplicate. That
+                // is SUCCESS for the relay — its goal is "the witness has
+                // the request" — not a retry. Without this, the r3
+                // fail-closed Err made the authority retry ten times, then
+                // prune the obligation as never-completed.
+                let already_held = {
+                    let request_id = match &event {
+                        NamedGroupMetadataEvent::JoinRequestCreated { request_id, .. } => {
+                            request_id.clone()
+                        }
+                        _ => String::new(),
+                    };
+                    let digest: [u8; 32] = blake3::hash(envelope_bytes).into();
+                    relay_state
+                        .named_groups
+                        .read()
+                        .await
+                        .get(&group_id_str)
+                        .is_some_and(|info| {
+                            info.join_requests
+                                .get(&request_id)
+                                .is_some_and(|r| r.predecessor_envelope_digest == Some(digest))
+                        })
+                };
+                if already_held {
+                    ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
+                }
             }
             break 'admission false;
         }
