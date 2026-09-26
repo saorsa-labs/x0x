@@ -2198,10 +2198,16 @@ pub async fn serve_with_options(
             }
         }));
     }
-    // #967 r3 (B3): the shared-daemon side of the attachment — every
-    // unheld id in a hint frame triggers a fetch request to the sender.
+    // #967 r4 (B2/B5): the shared-daemon side of the attachment — every
+    // unheld id in a hint frame triggers a fetch to an OWNER install of
+    // this daemon's owner (the revocation source; NEVER the hinter, which
+    // under design (b) is always a refusing grantee). Per-sender receive
+    // limit + a trust gate (a known contact or owner-trusted peer only),
+    // and the fetches run SPAWNED under a bounded semaphore so one hint
+    // frame can never stall the consumer or fill the channel.
     {
         let hint_agent = Arc::clone(&agent);
+        let fetch_permits = Arc::new(tokio::sync::Semaphore::new(4));
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_hint_rx.recv().await {
                 if !typed.verified {
@@ -2213,11 +2219,50 @@ pub async fn serve_with_options(
                 else {
                     continue;
                 };
-                let ids = x0x::share_grant::decode_share_grant_hint(body);
-                let started = hint_agent.on_share_grant_hints(&typed.sender, &ids).await;
-                if started > 0 {
-                    tracing::info!(started, "#967: grant hints triggered fetch requests");
+                // B5 trust gate: hints from strangers are dropped before
+                // any store work or fetch window opens.
+                let known = {
+                    let contacts = hint_agent.contacts().read().await;
+                    contacts.get(&typed.sender).is_some()
+                };
+                let sender_known = known
+                    || hint_agent
+                        .is_owner_trusted_pair(&typed.sender, &typed.machine_id)
+                        .await;
+                if !sender_known {
+                    tracing::debug!("#967: hint frame from an unknown sender dropped");
+                    continue;
                 }
+                let Some(store) = hint_agent.share_grant_store() else {
+                    continue;
+                };
+                // B5 receive limit: one accepted hint per sender per window.
+                if !store.note_hint_received(&typed.sender) {
+                    continue;
+                }
+                let ids = x0x::share_grant::decode_share_grant_hint(body);
+                if ids.is_empty() {
+                    continue;
+                }
+                // B2: fetch from an owner install, never the hinter.
+                let Some(owner_install) =
+                    x0x::share_grant::owner_install_candidates(&hint_agent, 3)
+                        .await
+                        .into_iter()
+                        .next()
+                else {
+                    tracing::debug!("#967: no owner install known; hint deferred");
+                    continue;
+                };
+                for id in ids {
+                    let agent = Arc::clone(&hint_agent);
+                    let permits = Arc::clone(&fetch_permits);
+                    tokio::spawn(async move {
+                        let _permit = permits.acquire_owned().await;
+                        let _ = agent.request_share_grant_fetch(id, &owner_install).await;
+                    });
+                }
+                tracing::info!("#967: grant hints scheduled fetches from an owner install");
             }
         }));
     }

@@ -1401,6 +1401,8 @@ async fn handle_ws_command(
                     },
                     stats,
                 );
+            } else {
+                crate::share_grant::spawn_grant_hints(&state.agent, &aid);
             }
         }
     }

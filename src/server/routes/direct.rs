@@ -377,12 +377,17 @@ pub(in crate::server) async fn direct_send(
         );
     }
 
+    // #967 r4 (B3): the ADR-0070 par-2 DM-open attachment — after a
+    // successful user DM, attach this grantee's held grant ids for the
+    // recipient. SPAWNED: the receipt is returned without awaiting the
+    // hint (r3 awaited inline on Agent::send_direct, delaying callers).
     match state
         .agent
         .send_direct_with_config_with_provenance(&agent_id, payload, send_config)
         .await
     {
         Ok((receipt, observed_ack_ingress)) => {
+            x0x::share_grant::spawn_grant_hints(&state.agent, &agent_id);
             let path_str = match receipt.path {
                 x0x::dm::DmPath::Loopback => "loopback",
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",

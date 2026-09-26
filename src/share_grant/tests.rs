@@ -500,9 +500,12 @@ async fn fetch_serves_a_subject_and_applies_exactly_once() {
     assert!(fetcher.by_id(&grant.grant_id).is_none(), "starts empty");
 
     // The fetcher asks; the responder serves ONLY subjects of the grant.
-    assert!(fetcher.note_fetch(&grant.grant_id), "a fresh fetch window");
     assert!(
-        !fetcher.note_fetch(&grant.grant_id),
+        fetcher.note_fetch(&grant.grant_id, Some(&agent(0x22))),
+        "a fresh fetch window"
+    );
+    assert!(
+        !fetcher.note_fetch(&grant.grant_id, Some(&agent(0x22))),
         "a repeat inside the TTL is suppressed"
     );
     let (req, rx) = typed(fetch_payload(&grant.grant_id));
@@ -516,7 +519,7 @@ async fn fetch_serves_a_subject_and_applies_exactly_once() {
     // The response lands through the fail-closed accept path.
     let resp = reply_from(&fetch_response_payload(&grant), grantee_agent);
     drop(rx);
-    let result = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, resp).await;
+    let result = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, true, resp).await;
     assert!(matches!(result, Ok(DmTypedPayloadCompletion::Inserted)));
     assert_eq!(
         fetcher.by_id(&grant.grant_id),
@@ -526,7 +529,7 @@ async fn fetch_serves_a_subject_and_applies_exactly_once() {
 
     // EXACTLY ONCE: a replay of the same response is a Duplicate.
     let replay = reply_from(&fetch_response_payload(&grant), grantee_agent);
-    let replayed = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, replay).await;
+    let replayed = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, true, replay).await;
     assert!(replayed.is_err(), "the window closed on success");
 }
 
@@ -575,7 +578,7 @@ async fn fetch_response_for_unrequested_id_is_dropped() {
     let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
     // NO note_fetch: the id was never requested here.
     let resp = typed_from(agent(0x22), fetch_response_payload(&grant));
-    let result = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, resp).await;
+    let result = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, true, resp).await;
     assert!(result.is_err(), "an unprompted grant response is dropped");
     assert!(fetcher.by_id(&grant.grant_id).is_none(), "nothing stored");
 }
@@ -640,13 +643,14 @@ async fn fetch_response_revoked_here_is_not_stored() {
     let shared = agent(0x11);
     let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
     let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
-    assert!(fetcher.note_fetch(&grant.grant_id));
+    assert!(fetcher.note_fetch(&grant.grant_id, Some(&agent(0x22))));
     let revoked_list = [grant.grant_id];
     let is_revoked = revoked_ids(&revoked_list);
     let result = handle_share_grant_fetch_response(
         Some(&fetcher),
         Some(&is_revoked),
         NOW,
+        true,
         typed_from(agent(0x22), fetch_response_payload(&grant)),
     )
     .await;
@@ -724,11 +728,12 @@ async fn fetch_response_with_a_foreign_owner_grant_is_refused() {
         vec![shared],
     );
     let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
-    assert!(fetcher.note_fetch(&forged.grant_id));
+    assert!(fetcher.note_fetch(&forged.grant_id, None));
     let result = handle_share_grant_fetch_response(
         Some(&fetcher),
         None,
         NOW,
+        true,
         typed_from(agent(0x22), fetch_response_payload(&forged)),
     )
     .await;
@@ -755,7 +760,7 @@ async fn offline_daemon_later_gains_access_end_to_end() {
     let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
 
     // The trigger's store half: open the window ONLY for an unheld id.
-    assert!(fetcher.note_fetch(&grant.grant_id));
+    assert!(fetcher.note_fetch(&grant.grant_id, Some(&agent(0x22))));
     // The wire half happens off-test (send_direct); here the fetch frame
     // arrives at the holder, whose serve path is gated, and the reply
     // comes back through the response door.
@@ -774,6 +779,7 @@ async fn offline_daemon_later_gains_access_end_to_end() {
         Some(&fetcher),
         None,
         NOW,
+        true,
         typed_from(grantee_agent, reply),
     )
     .await;
@@ -793,6 +799,7 @@ async fn offline_daemon_later_gains_access_end_to_end() {
         Some(&fetcher),
         None,
         NOW,
+        true,
         typed_from(grantee_agent, fetch_response_payload(&grant)),
     )
     .await;
@@ -869,24 +876,24 @@ async fn the_fetch_window_expires_and_reopens() {
     let owner = UserKeypair::generate().unwrap();
     let fetcher = ShareGrantStore::in_memory(agent(0x11), Some(owner.user_id()));
     let id = [0x61; 32];
-    assert!(fetcher.note_fetch(&id));
-    assert!(!fetcher.note_fetch(&id), "suppressed inside the TTL");
+    assert!(fetcher.note_fetch(&id, None));
+    assert!(!fetcher.note_fetch(&id, None), "suppressed inside the TTL");
     // Age the entry past the TTL (tests are a child module: direct map
     // access models the passage of time without sleeping).
     fetcher.fetch_in_flight.lock().unwrap().insert(
-        id,
+        hex::encode(id),
         std::time::Instant::now() - std::time::Duration::from_millis(GRANT_FETCH_TTL_MS + 1),
     );
     assert!(
-        fetcher.note_fetch(&id),
+        fetcher.note_fetch(&id, None),
         "an expired window reopens (a fresh fetch may start)"
     );
     // And a response for a fully-expired id is dropped.
     fetcher.fetch_in_flight.lock().unwrap().insert(
-        id,
+        hex::encode(id),
         std::time::Instant::now() - std::time::Duration::from_millis(GRANT_FETCH_TTL_MS + 1),
     );
-    assert!(!fetcher.is_fetch_in_flight(&id));
+    assert!(!fetcher.is_fetch_in_flight(&id, None));
 }
 
 /// WHY (cap bounds): both peer-keyed maps evict oldest at the cap.
@@ -955,10 +962,10 @@ async fn hint_round_trip_opens_a_real_fetch_window() {
     let id = [0x71; 32];
     assert!(store.by_id(&id).is_none());
     assert!(
-        store.note_fetch(&id),
+        store.note_fetch(&id, None),
         "the trigger's window opens for an unheld id"
     );
-    assert!(store.is_fetch_in_flight(&id));
+    assert!(store.is_fetch_in_flight(&id, None));
     // Held id: no window.
     let grantee_user = UserKeypair::generate().unwrap();
     let grant = grant_by(
@@ -971,5 +978,48 @@ async fn hint_round_trip_opens_a_real_fetch_window() {
     // The TRIGGER checks by_id first (request_share_grant_fetch returns
     // early for held ids), so no window is opened for them.
     assert!(store.by_id(&held).is_some());
-    assert!(!store.is_fetch_in_flight(&held));
+    assert!(!store.is_fetch_in_flight(&held, None));
+}
+
+/// WHY (#967 r4 B1 — THE required test): the requester holds NO
+/// revocation record, the fetch window is open, and the response arrives
+/// from a sender that is NOT owner-trusted (the hostile grantee holding
+/// the owner-signed bytes). It must NOT be stored — this is exactly the
+/// offline-through-revocation resurrection the r3 design missed.
+#[tokio::test]
+async fn a_response_from_a_non_owner_responder_is_never_stored() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+    let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
+    // The window is open FOR THE GRANTEE (the peer the daemon was tricked
+    // into asking by the hint) — the id is in flight.
+    let grantee = agent(0x22);
+    assert!(fetcher.note_fetch(&grant.grant_id, Some(&grantee)));
+    // The grantee answers with the perfectly valid, owner-signed,
+    // unexpired bytes... but the responder is NOT owner-trusted.
+    let result = handle_share_grant_fetch_response(
+        Some(&fetcher),
+        None, // no local revocation record at all
+        NOW,
+        false, // the sender is not owner-trusted
+        typed_from(grantee, fetch_response_payload(&grant)),
+    )
+    .await;
+    assert!(result.is_err(), "a non-owner responder's bytes are refused");
+    assert!(fetcher.by_id(&grant.grant_id).is_none(), "nothing stored");
+    // The same bytes from the OWNER install (trusted) DO land.
+    let owner_install = agent(0x33);
+    assert!(fetcher.note_fetch(&grant.grant_id, Some(&owner_install)));
+    let ok = handle_share_grant_fetch_response(
+        Some(&fetcher),
+        None,
+        NOW,
+        true,
+        typed_from(owner_install, fetch_response_payload(&grant)),
+    )
+    .await;
+    assert!(matches!(ok, Ok(DmTypedPayloadCompletion::Inserted)));
+    assert!(fetcher.by_id(&grant.grant_id).is_some());
 }
