@@ -1,4 +1,4 @@
-# ADR 0074: Leaf Egress Enforcement Default — `shed_normal` by Default, Observe-Only on Opt-Out
+# ADR 0078: Leaf Egress Enforcement Default — `shed_normal` by Default, Observe-Only on Opt-Out
 
 - **Status:** Proposed
 - **Date:** 2026-09-27
