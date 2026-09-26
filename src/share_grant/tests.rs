@@ -507,7 +507,7 @@ async fn fetch_serves_a_subject_and_applies_exactly_once() {
     let (req, rx) = typed(fetch_payload(&grant.grant_id));
     let mut req = req;
     req.sender = shared;
-    let outcome = handle_share_grant_fetch(Some(&responder), req).await;
+    let outcome = handle_share_grant_fetch(Some(&responder), None, NOW, req).await;
     assert!(outcome.result.is_ok(), "a subject's fetch is answered");
     let reply = outcome.reply.expect("the signed grant bytes come back");
     assert_eq!(reply, grant.to_dm_payload().unwrap());
@@ -515,7 +515,7 @@ async fn fetch_serves_a_subject_and_applies_exactly_once() {
     // The response lands through the fail-closed accept path.
     let resp = reply_from(&fetch_response_payload(&grant), grantee_agent);
     drop(rx);
-    let result = handle_share_grant_fetch_response(Some(&fetcher), resp).await;
+    let result = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, resp).await;
     assert!(matches!(result, Ok(DmTypedPayloadCompletion::Inserted)));
     assert_eq!(
         fetcher.by_id(&grant.grant_id),
@@ -525,7 +525,7 @@ async fn fetch_serves_a_subject_and_applies_exactly_once() {
 
     // EXACTLY ONCE: a replay of the same response is a Duplicate.
     let replay = reply_from(&fetch_response_payload(&grant), grantee_agent);
-    let replayed = handle_share_grant_fetch_response(Some(&fetcher), replay).await;
+    let replayed = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, replay).await;
     assert!(replayed.is_err(), "the window closed on success");
 }
 
@@ -550,6 +550,8 @@ async fn fetch_refuses_a_non_subject_and_leaks_nothing() {
 
     let outcome = handle_share_grant_fetch(
         Some(&responder),
+        None,
+        NOW,
         typed_from(stranger, fetch_payload(&grant.grant_id)),
     )
     .await;
@@ -572,7 +574,7 @@ async fn fetch_response_for_unrequested_id_is_dropped() {
     let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
     // NO note_fetch: the id was never requested here.
     let resp = typed_from(agent(0x22), fetch_response_payload(&grant));
-    let result = handle_share_grant_fetch_response(Some(&fetcher), resp).await;
+    let result = handle_share_grant_fetch_response(Some(&fetcher), None, NOW, resp).await;
     assert!(result.is_err(), "an unprompted grant response is dropped");
     assert!(fetcher.by_id(&grant.grant_id).is_none(), "nothing stored");
 }
@@ -585,9 +587,209 @@ async fn fetch_for_unheld_grant_is_a_retry() {
     let responder = ShareGrantStore::in_memory(agent(0x22), Some(grantee_user.user_id()));
     let outcome = handle_share_grant_fetch(
         Some(&responder),
+        None,
+        NOW,
         typed_from(agent(0x11), fetch_payload(&[7; 32])),
     )
     .await;
     assert!(outcome.result.is_err(), "an unheld grant is a retry");
     assert!(outcome.reply.is_none());
+}
+
+// ── #967 r2: revocation both sides, rate limit, size bound, e2e trigger ──
+
+fn revoked_ids(ids: &[[u8; 32]]) -> impl Fn(&ShareGrant) -> bool + '_ {
+    move |grant: &ShareGrant| ids.contains(&grant.grant_id)
+}
+
+/// WHY (#967 B1, responder side): a REVOKED grant must never be served —
+/// a grantee that missed the revocation gossip cannot resurrect access by
+/// fetching from a daemon that holds the (stale) bytes.
+#[tokio::test]
+async fn fetch_never_serves_a_revoked_grant() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+    let responder = ShareGrantStore::in_memory(agent(0x22), Some(grantee_user.user_id()));
+    responder.accept(grant.clone(), NOW).await.unwrap();
+    // The responder's owner has revoked exactly this grant.
+    let revoked_list = [grant.grant_id];
+    let is_revoked = revoked_ids(&revoked_list);
+    let outcome = handle_share_grant_fetch(
+        Some(&responder),
+        Some(&is_revoked),
+        NOW,
+        typed_from(shared, fetch_payload(&grant.grant_id)),
+    )
+    .await;
+    assert!(outcome.result.is_err(), "a revoked grant is never served");
+    assert!(outcome.reply.is_none(), "and no bytes leave the responder");
+}
+
+/// WHY (#967 B1, requester side): a fetched grant revoked HERE (the
+/// revocation landed while our fetch was in flight) is refused, not
+/// stored.
+#[tokio::test]
+async fn fetch_response_revoked_here_is_not_stored() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+    let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
+    assert!(fetcher.note_fetch(&grant.grant_id));
+    let revoked_list = [grant.grant_id];
+    let is_revoked = revoked_ids(&revoked_list);
+    let result = handle_share_grant_fetch_response(
+        Some(&fetcher),
+        Some(&is_revoked),
+        NOW,
+        typed_from(agent(0x22), fetch_response_payload(&grant)),
+    )
+    .await;
+    assert!(result.is_err(), "a revoked grant is refused at the door");
+    assert!(fetcher.by_id(&grant.grant_id).is_none(), "nothing stored");
+}
+
+/// WHY (#967 B2): one served fetch per peer per window — a stranger
+/// cannot hammer the responder's store scan.
+#[tokio::test]
+async fn fetch_is_rate_limited_per_peer() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+    let responder = ShareGrantStore::in_memory(agent(0x22), Some(grantee_user.user_id()));
+    responder.accept(grant.clone(), NOW).await.unwrap();
+    let first = handle_share_grant_fetch(
+        Some(&responder),
+        None,
+        NOW,
+        typed_from(shared, fetch_payload(&grant.grant_id)),
+    )
+    .await;
+    assert!(first.result.is_ok(), "the first fetch is served");
+    let second = handle_share_grant_fetch(
+        Some(&responder),
+        None,
+        NOW,
+        typed_from(shared, fetch_payload(&grant.grant_id)),
+    )
+    .await;
+    assert!(
+        second.result.is_err(),
+        "the second fetch inside the window is rate-limited"
+    );
+    assert!(second.reply.is_none());
+    // A DIFFERENT peer is not rate-limited by the first one.
+    let other = agent(0x33);
+    // other must be a subject too: issue a DISTINCT grant for it.
+    let grant2 = ShareGrant::sign(
+        &owner,
+        [0x43; 32],
+        Grantee::User(grantee_user.user_id()),
+        vec![other],
+        vec![ShareCap::Dm],
+        NOW - 60,
+        NOW + 3_600,
+    )
+    .expect("sign grant2");
+    responder.accept(grant2.clone(), NOW).await.unwrap();
+    let theirs = handle_share_grant_fetch(
+        Some(&responder),
+        None,
+        NOW,
+        typed_from(other, fetch_payload(&grant2.grant_id)),
+    )
+    .await;
+    assert!(theirs.result.is_ok(), "a different peer is served");
+}
+
+/// WHY (#967 B1): a forged or foreign-owner grant never passes the
+/// response door — the store's own accept verifies the signature against
+/// THIS install's owner, so bytes signed by anyone else are inert.
+#[tokio::test]
+async fn fetch_response_with_a_foreign_owner_grant_is_refused() {
+    let owner = UserKeypair::generate().unwrap();
+    let impostor = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let forged = grant_by(
+        &impostor,
+        Grantee::User(grantee_user.user_id()),
+        vec![shared],
+    );
+    let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
+    assert!(fetcher.note_fetch(&forged.grant_id));
+    let result = handle_share_grant_fetch_response(
+        Some(&fetcher),
+        None,
+        NOW,
+        typed_from(agent(0x22), fetch_response_payload(&forged)),
+    )
+    .await;
+    assert!(result.is_err(), "a foreign-owner grant is refused");
+    assert!(fetcher.by_id(&forged.grant_id).is_none(), "nothing stored");
+}
+
+/// WHY (#967 B3, the end-to-end arm): a daemon OFFLINE through the
+/// issuance later gains access — the trigger (request_share_grant_fetch
+/// semantics: note the window, then ask), the holder's gated serve, and
+/// the response door land the grant exactly once, and access evaluation
+/// flips from empty to the grant's caps.
+#[tokio::test]
+async fn offline_daemon_later_gains_access_end_to_end() {
+    let owner = UserKeypair::generate().unwrap();
+    let grantee_user = UserKeypair::generate().unwrap();
+    let shared = agent(0x11);
+    let grantee_agent = agent(0x22);
+    let grant = grant_by(&owner, Grantee::User(grantee_user.user_id()), vec![shared]);
+    // The grantee holds it; the shared daemon was offline at issuance.
+    let responder = ShareGrantStore::in_memory(grantee_agent, Some(grantee_user.user_id()));
+    responder.accept(grant.clone(), NOW).await.unwrap();
+    let fetcher = ShareGrantStore::in_memory(shared, Some(owner.user_id()));
+
+    // The trigger's store half: open the window ONLY for an unheld id.
+    assert!(fetcher.note_fetch(&grant.grant_id));
+    // The wire half happens off-test (send_direct); here the fetch frame
+    // arrives at the holder, whose serve path is gated, and the reply
+    // comes back through the response door.
+    let served = handle_share_grant_fetch(
+        Some(&responder),
+        None,
+        NOW,
+        typed_from(shared, fetch_payload(&grant.grant_id)),
+    )
+    .await;
+    assert!(served.result.is_ok());
+    let mut reply = Vec::with_capacity(SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX.len());
+    reply.extend_from_slice(SHARE_GRANT_FETCH_RESPONSE_DM_PREFIX);
+    reply.extend_from_slice(&served.reply.expect("signed bytes"));
+    let landed = handle_share_grant_fetch_response(
+        Some(&fetcher),
+        None,
+        NOW,
+        typed_from(grantee_agent, reply),
+    )
+    .await;
+    assert!(matches!(landed, Ok(DmTypedPayloadCompletion::Inserted)));
+    // Access flipped: the fetched grant is now an enforcement candidate
+    // for this daemon's agent (the caps evaluation reads exactly these).
+    let candidates = fetcher.candidates_for_local_agent(NOW);
+    assert!(
+        candidates.iter().any(|g| g.grant_id == grant.grant_id),
+        "the offline daemon now enforces the fetched grant"
+    );
+    assert!(candidates
+        .iter()
+        .any(|g| g.caps.contains(&ShareCap::Connect { ports: vec![22] })));
+    // EXACTLY ONCE: the window closed, a replay is refused.
+    let replay = handle_share_grant_fetch_response(
+        Some(&fetcher),
+        None,
+        NOW,
+        typed_from(grantee_agent, fetch_response_payload(&grant)),
+    )
+    .await;
+    assert!(replay.is_err(), "the window closed on success");
 }
