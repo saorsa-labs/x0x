@@ -665,10 +665,19 @@ mod participation_diagnostics_tests {
         );
         let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
             dir.path(),
-            agent,
+            Arc::clone(&agent),
         )
         .await
         .unwrap();
+        let handle = agent
+            .create_kv_store("Diagnostics", "diagnostics/state-sync-test")
+            .await
+            .unwrap();
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert("diagnostics/state-sync-test".to_string(), handle);
         let app = Router::new()
             .route("/diagnostics/state-sync", get(state_sync_diagnostics))
             .with_state(state);
@@ -687,7 +696,36 @@ mod participation_diagnostics_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["scope"], "local_open_stores");
         assert_eq!(json["reset"], "store_close_or_process_restart");
-        assert_eq!(json["stores"], serde_json::json!({}));
+        let counters = &json["stores"]["diagnostics/state-sync-test"];
+        let keys = counters
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "incoming_record_merges",
+                "rejected_authorization_version",
+                "rejected_cooldown",
+                "rejected_no_retained",
+                "rejected_other",
+                "rejected_unauthorized_control",
+                "rejected_unauthorized_request",
+                "rejected_verify",
+                "request_seal_failed",
+                "requests_answered",
+                "requests_received",
+                "requests_sent",
+                "retained_pages_served",
+            ]
+        );
+        assert!(counters
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value.is_u64()));
     }
 
     /// The C0 soak needs the subscription-aware relay meter, not the older
