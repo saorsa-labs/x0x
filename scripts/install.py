@@ -28,8 +28,10 @@ NC = '\033[0m'  # No Color
 REPO = "saorsa-labs/x0x"
 RELEASE_URL = f"https://github.com/{REPO}/releases/latest/download"
 TRUSTED_GPG_FINGERPRINTS = {
-    # Saorsa Labs release signing key. Rotate only with a reviewed installer change.
-    "9D1F3C64B5D3C2F6B4A2E6D8A5C7F8E9D0B1A2C3",
+    # Saorsa Labs release signing key (primary fingerprint of SAORSA_PUBLIC_KEY.asc).
+    # Rotate only with a reviewed installer change; scripts/ci/check-installer-fingerprints.py
+    # fails CI if any installer disagrees.
+    "CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29",
 }
 
 # Platform-specific install directory for SKILL.md

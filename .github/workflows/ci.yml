@@ -24,6 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # #939: every installer must pin the real release-signing fingerprint,
+      # and it must match the key published with the latest release.
+      - name: Check installer signing-key fingerprints
+        run: python3 scripts/ci/check-installer-fingerprints.py --release
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
