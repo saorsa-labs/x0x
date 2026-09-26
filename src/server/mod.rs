@@ -985,6 +985,8 @@ pub async fn serve_with_options(
                     .await);
                 }
             };
+        // ADR-0070 §1: enrolled owner machines become owner-trusted.
+        agent.install_owner_device_store(Arc::clone(service.store()));
         Some(service)
     } else {
         None
