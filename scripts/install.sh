@@ -5,16 +5,20 @@
 #   curl -sfL https://x0x.md | sh                    # install + start
 #   curl -sfL https://x0x.md | sh -s -- --autostart   # install + start + autostart on boot
 #   bash install.sh --name alice                      # named instance
+#   sh install.sh --verify-only                       # download + verify, install nothing
 #
 # What it does:
 #   1. Detects platform (Linux/macOS, x64/arm64)
 #   2. Downloads latest release from GitHub
-#   3. Stops any running x0xd instance
-#   4. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
-#   5. Starts the daemon
-#   6. Optionally configures autostart on boot (--autostart)
+#   3. Verifies its SHA-256 and, when gpg is present, its GPG signature against
+#      the pinned Saorsa Labs release key (fails closed on any mismatch)
+#   4. Stops any running x0xd instance
+#   5. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
+#   6. Starts the daemon
+#   7. Optionally configures autostart on boot (--autostart)
 #
-# Requirements: curl or wget, tar, sh
+# Requirements: curl or wget, tar, sh, sha256sum or shasum. gpg is strongly
+# recommended; without it only the checksum is verified (with a warning).
 # No root/sudo required (except --autostart on Linux uses systemd).
 
 set -e
@@ -25,6 +29,10 @@ BIN="$HOME/.local/bin"
 NAME=""
 NAME_SET=false
 AUTOSTART=false
+VERIFY_ONLY=false
+# Saorsa Labs release signing key (primary fingerprint of SAORSA_PUBLIC_KEY.asc).
+# Rotate only with a reviewed installer change.
+TRUSTED_FPR="CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29"
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -32,6 +40,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --autostart)
             AUTOSTART=true
+            shift
+            ;;
+        --verify-only)
+            VERIFY_ONLY=true
             shift
             ;;
         --name)
@@ -107,6 +119,112 @@ else
     INSTANCE_DIR="$SHARED_DIR"
 fi
 
+# ── Download and verify ─────────────────────────────────────────────────────
+
+echo "x0x installer"
+echo "  Platform: $PLATFORM"
+echo "  Install:  $BIN"
+
+ARCHIVE="x0x-${PLATFORM}.tar.gz"
+TMP=$(mktemp -d)
+NEW_XOXD=""
+NEW_XOX=""
+# $TMP also holds the throwaway GnuPG home, so this removes it too.
+trap 'rm -rf "$TMP"; rm -f "$NEW_XOXD" "$NEW_XOX"' EXIT
+
+if command -v curl >/dev/null 2>&1; then
+    DOWNLOADER="curl"
+elif command -v wget >/dev/null 2>&1; then
+    DOWNLOADER="wget"
+else
+    echo "Error: need curl or wget"; exit 1
+fi
+
+fetch() {
+    if [ "$DOWNLOADER" = "curl" ]; then
+        curl -sfL "$1" -o "$2" || { echo "Error: download failed: $1" >&2; exit 1; }
+    else
+        wget -qO "$2" "$1" || { echo "Error: download failed: $1" >&2; exit 1; }
+    fi
+}
+
+verify_failed() {
+    echo "" >&2
+    echo "Error: VERIFICATION FAILED for $ARCHIVE: $1" >&2
+    echo "The download may have been tampered with. Nothing was installed." >&2
+    exit 1
+}
+
+echo "Downloading..."
+fetch "$URL/$ARCHIVE" "$TMP/$ARCHIVE"
+fetch "$URL/$ARCHIVE.sha256" "$TMP/$ARCHIVE.sha256"
+
+# SHA-256: always required.
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL_SHA=$(sha256sum "$TMP/$ARCHIVE" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL_SHA=$(shasum -a 256 "$TMP/$ARCHIVE" | awk '{print $1}')
+else
+    echo "Error: need sha256sum or shasum to verify the download" >&2
+    exit 1
+fi
+EXPECTED_SHA=$(awk 'NR == 1 {print tolower($1)}' "$TMP/$ARCHIVE.sha256")
+case "$EXPECTED_SHA" in
+    *[!0-9a-f]*|"") verify_failed "malformed $ARCHIVE.sha256" ;;
+esac
+[ ${#EXPECTED_SHA} -eq 64 ] || verify_failed "malformed $ARCHIVE.sha256"
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+    verify_failed "SHA-256 mismatch (expected $EXPECTED_SHA, got $ACTUAL_SHA)"
+fi
+echo "  SHA-256 verified ($ACTUAL_SHA)"
+
+# GPG: required when gpg is present. Everything happens in a throwaway GnuPG
+# home under $TMP, so the user's own keyring is never read or written.
+if command -v gpg >/dev/null 2>&1; then
+    fetch "$URL/$ARCHIVE.asc" "$TMP/$ARCHIVE.asc"
+    fetch "$URL/SAORSA_PUBLIC_KEY.asc" "$TMP/SAORSA_PUBLIC_KEY.asc"
+    GNUPG_TMP="$TMP/gnupg"
+    mkdir -m 700 "$GNUPG_TMP"
+
+    # The downloaded key must be the pinned one before we trust anything it signs.
+    KEY_FPRS=$(gpg --homedir "$GNUPG_TMP" --batch --with-colons --show-keys \
+        --fingerprint "$TMP/SAORSA_PUBLIC_KEY.asc" 2>/dev/null \
+        | awk -F: '$1 == "fpr" {print toupper($10)}')
+    if ! printf '%s\n' "$KEY_FPRS" | grep -qx "$TRUSTED_FPR"; then
+        verify_failed "SAORSA_PUBLIC_KEY.asc is not the pinned release key ($TRUSTED_FPR)"
+    fi
+    gpg --homedir "$GNUPG_TMP" --batch --quiet --import "$TMP/SAORSA_PUBLIC_KEY.asc" \
+        >/dev/null 2>&1 || verify_failed "gpg could not import the release key"
+
+    # Accept only a VALIDSIG whose signing key or primary key is the pinned one.
+    GPG_STATUS=$(gpg --homedir "$GNUPG_TMP" --batch --status-fd 1 \
+        --verify "$TMP/$ARCHIVE.asc" "$TMP/$ARCHIVE" 2>/dev/null) \
+        || verify_failed "GPG signature is not valid"
+    SIGNERS=$(printf '%s\n' "$GPG_STATUS" \
+        | awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" {print toupper($3); if (NF >= 12) print toupper($12)}')
+    if ! printf '%s\n' "$SIGNERS" | grep -qx "$TRUSTED_FPR"; then
+        verify_failed "GPG signature was not made by the pinned release key ($TRUSTED_FPR)"
+    fi
+    if command -v gpgconf >/dev/null 2>&1; then
+        gpgconf --homedir "$GNUPG_TMP" --kill all >/dev/null 2>&1 || true
+    fi
+    echo "  GPG signature verified ($TRUSTED_FPR)"
+else
+    echo "" >&2
+    echo "################################################################" >&2
+    echo "# WARNING: gpg NOT FOUND - the GPG signature was NOT verified. #" >&2
+    echo "# Only the SHA-256 checksum was checked, and that checksum was #" >&2
+    echo "# downloaded from the same place as the archive. Install gpg   #" >&2
+    echo "# and re-run to verify this release was signed by Saorsa Labs. #" >&2
+    echo "################################################################" >&2
+    echo "" >&2
+fi
+
+if [ "$VERIFY_ONLY" = true ]; then
+    echo "Verify-only: $ARCHIVE verified; nothing installed."
+    exit 0
+fi
+
 # ── Stop any running instance ───────────────────────────────────────────────
 
 XOX="$BIN/x0x"
@@ -120,28 +238,7 @@ if [ -f "$XOX" ]; then
     sleep 1
 fi
 
-# ── Download and install ────────────────────────────────────────────────────
-
-echo "x0x installer"
-echo "  Platform: $PLATFORM"
-echo "  Install:  $BIN"
-
-ARCHIVE="x0x-${PLATFORM}.tar.gz"
-TMP=$(mktemp -d)
-NEW_XOXD=""
-NEW_XOX=""
-trap 'rm -rf "$TMP"; rm -f "$NEW_XOXD" "$NEW_XOX"' EXIT
-
-echo "Downloading..."
-if command -v curl >/dev/null 2>&1; then
-    DOWNLOADER="curl"
-    curl -sfL "$URL/$ARCHIVE" -o "$TMP/$ARCHIVE"
-elif command -v wget >/dev/null 2>&1; then
-    DOWNLOADER="wget"
-    wget -qO "$TMP/$ARCHIVE" "$URL/$ARCHIVE"
-else
-    echo "Error: need curl or wget"; exit 1
-fi
+# ── Install ─────────────────────────────────────────────────────────────────
 
 http_get() {
     if [ "$DOWNLOADER" = "curl" ]; then
