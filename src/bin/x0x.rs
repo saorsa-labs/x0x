@@ -297,7 +297,12 @@ enum Commands {
         sub: Option<WsSub>,
     },
     /// Open the x0x GUI in your browser.
-    Gui,
+    Gui {
+        /// Open a specific view (#893), e.g. `dm/<agent_id>`,
+        /// `groups/<group_id>`, `groups/<group_id>/board` or `people`.
+        #[arg(long)]
+        view: Option<String>,
+    },
     /// Print all API routes. [dev]
     #[command(hide = true)]
     Routes {
@@ -867,6 +872,8 @@ enum HistorySub {
 enum AuthSub {
     /// Exchange the durable API token for a short-lived browser session token.
     Session,
+    /// Swap a live session token (passed via `X0X_API_TOKEN`) for a fresh one.
+    Refresh,
 }
 
 /// Key lifecycle sub-actions (`x0x identity revoke`, `x0x identity revocations`).
@@ -2027,11 +2034,12 @@ async fn run(
 
     // Commands that need a running daemon.
     match command {
-        Commands::Gui => {
+        Commands::Gui { view } => {
             // Ensure daemon is running and open GUI in browser.
             // #127 / WS1.6: exchange the durable API token for a short-lived
             // session token *before* constructing the URL, so the durable
             // secret never appears in the browser's address bar / history.
+            let fragment = gui_view_fragment(view.as_deref())?;
             client.ensure_running().await?;
             let session = client.post_empty("/auth/session").await?;
             // Review round 2 (verdict item 5): no durable-token fallback —
@@ -2042,7 +2050,7 @@ async fn run(
                     "daemon did not return a session token for the GUI URL (response: {session})"
                 );
             };
-            let url = format!("{}/gui?token={token}", client.base_url());
+            let url = format!("{}/gui?token={token}{fragment}", client.base_url());
             eprintln!("x0x GUI: {}/gui", client.base_url());
 
             let opened = {
@@ -2340,6 +2348,7 @@ async fn run(
         },
         Commands::Auth { sub } => match sub {
             AuthSub::Session => commands::auth::session(&client).await,
+            AuthSub::Refresh => commands::auth::refresh(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,
@@ -3024,6 +3033,30 @@ async fn run(
 
 // ── Tree view ──────────────────────────────────────────────────────────────
 
+/// Build the `#/<route>` URL fragment for `x0x gui --view` (#893).
+///
+/// Only route-safe characters are accepted so the value can neither break out
+/// of the URL nor the platform opener's argument (e.g. `&` under Windows
+/// `cmd /C start`). The GUI itself decides whether the route names a view.
+fn gui_view_fragment(view: Option<&str>) -> anyhow::Result<String> {
+    let Some(view) = view else {
+        return Ok(String::new());
+    };
+    let route = view.trim().trim_start_matches('#').trim_start_matches('/');
+    if route.is_empty() {
+        return Ok(String::new());
+    }
+    if !route
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_'))
+    {
+        anyhow::bail!(
+            "invalid --view route {view:?}: use letters, digits, '/', '-' or '_' (e.g. dm/<agent_id>)"
+        );
+    }
+    Ok(format!("#/{route}"))
+}
+
 fn print_command_tree() -> anyhow::Result<()> {
     let tree = "\
 x0x (v{VERSION})
@@ -3412,6 +3445,27 @@ mod tests {
             Commands::Presence { sub: None } => Ok(()),
             _ => anyhow::bail!("expected bare presence to parse without nested subcommand"),
         }
+    }
+
+    // #893: `--view` becomes the GUI hash route; anything that could escape
+    // the URL or the opener's argv (`&`, quotes, spaces, `?`) must be refused
+    // before a session token is minted.
+    #[test]
+    fn gui_view_becomes_hash_route_and_rejects_unsafe_input() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "gui", "--view", "dm/abc123"])?;
+        let Commands::Gui { view } = cli.command else {
+            anyhow::bail!("expected gui command");
+        };
+        assert_eq!(gui_view_fragment(view.as_deref())?, "#/dm/abc123");
+        assert_eq!(gui_view_fragment(Some("#/people"))?, "#/people");
+        assert_eq!(gui_view_fragment(None)?, "");
+        for bad in ["dm/a&calc", "dm/a b", "dm/a?x=1", "dm/'x'", "groups/a#b"] {
+            assert!(
+                gui_view_fragment(Some(bad)).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        Ok(())
     }
 
     #[test]
